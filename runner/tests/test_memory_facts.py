@@ -462,7 +462,12 @@ def _published(options: Any) -> set[str]:
 
 
 def _boot_options(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: FakeStateApi, *, channel: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    api: FakeStateApi,
+    *,
+    channel: bool,
+    token: bool = True,
 ) -> tuple[Any, str | None]:
     """Boot against the fake API; return the SDK options and the system prompt."""
 
@@ -470,7 +475,11 @@ def _boot_options(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            config = RunnerConfig.from_env(_env(monkeypatch, tmp_path, server, channel=channel))
+            env = _env(monkeypatch, tmp_path, server, channel=channel)
+            if not token:
+                env.pop("CURIE_MEMORY_TOKEN", None)
+                monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
+            config = RunnerConfig.from_env(env)
             runner = await _fetch_and_build(config, monkeypatch)
             session = runner._factory()
             captured["options"] = session.options
@@ -1249,3 +1258,56 @@ def test_boot_logs_channel_zero_and_no_guidance_without_a_channel_ref(
     assert match, lines[0]
     assert (match.group("agent"), match.group("channel")) == ("2", "0")
     assert match.group("guidance") == "none"
+
+
+def test_boot_logs_default_guidance_when_none_is_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _boot_options(monkeypatch, tmp_path, _seeded_api(), channel=True)
+
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    assert (match.group("agent"), match.group("channel")) == ("2", "2")
+    assert match.group("guidance") == "default"
+
+
+def test_boot_logs_no_guidance_with_a_channel_ref_but_no_memory_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Guidance is stored, so without the token check the line would say "operator".
+    api = _seeded_api(guidance="OPERATOR-GUIDANCE-TEXT")
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _boot_options(monkeypatch, tmp_path, api, channel=True, token=False)
+
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    assert match.group("guidance") == "none"
+    assert "OPERATOR-GUIDANCE-TEXT" not in lines[0]
+
+
+def test_boot_log_counts_are_capped_at_the_per_memory_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    for i in range(MAX_FACTS_PER_MEMORY + 1):
+        stamp = f"2026-09-01T{i // 60:02d}:{i % 60:02d}:00Z"
+        api.seed(AGENT_NS, f"fact-{i:032x}", _fact_value(f"agent fact {i}", stamp))
+    api.seed(CHANNEL_NS, C_NEW, _fact_value("channel fact", "2026-09-04T09:00:00Z"))
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _boot_options(monkeypatch, tmp_path, api, channel=True)
+
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    assert (match.group("agent"), match.group("channel")) == (str(MAX_FACTS_PER_MEMORY), "1")
