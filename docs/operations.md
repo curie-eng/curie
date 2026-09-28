@@ -381,6 +381,14 @@ for both an existing key and a missing key through every API pod, then roll out
 the worker and runner. The new runner requires that header at boot, so a mixed
 API rollout can refuse to start a history backed turn.
 
+For caller lists (ADR 0175, 0.11.0), upgrade the API before the dispatcher, and
+set a list only once both run this version. A dispatcher that rolls first asks an
+API that has no admission route yet; it reads FastAPI's route-miss 404 as "no
+list can exist here" and admits everyone, logging the skew once, so Slack keeps
+working through the rollout. A dispatcher from before 0.11.0 never asks at all,
+so a list is not enforced in Slack until the dispatcher is upgraded too. The
+channel port enforces a list as soon as the API runs this version.
+
 ```bash
 # release build: --chart defaults to the version-pinned release asset for --to
 curie cluster upgrade --to 0.9.0

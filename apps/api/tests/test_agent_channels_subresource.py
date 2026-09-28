@@ -105,13 +105,13 @@ def _slack(address: str) -> dict[str, str]:
     return {"kind": "slack", "address": address}
 
 
-def _slack_out(address: str) -> dict[str, str]:
+def _slack_out(address: str) -> dict[str, str | None]:
     """The Slack-kind `AgentOut.channels` READ shape. The stored form is
     unchanged until the contract migration for ADR-0168 decision 3 (#3100): an
     omitted write is stored as NULL exactly as before the ADR, and the read
     side is what presents that NULL as the default identity."""
 
-    return {"kind": "slack", "address": address, "adapter": "default"}
+    return {"kind": "slack", "address": address, "adapter": "default", "allowed_callers": None}
 
 
 def _create(client: TestClient, headers: dict[str, str], **fields: Any) -> Any:
@@ -350,7 +350,7 @@ def test_patching_a_binding_moves_that_row_and_bumps_generation(
     assert _row(agent_id, "slack", "C0EXAMPLE1") == sibling
     assert _channels(client, auth_headers, agent_id) == [
         _slack_out("C0EXAMPLE1"),
-        {"kind": "webhook", "address": "moved-here", "adapter": None},
+        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None},
     ]
 
 

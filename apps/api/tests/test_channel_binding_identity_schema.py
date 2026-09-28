@@ -83,7 +83,12 @@ def test_a_non_slack_route_stays_both_or_neither() -> None:
 
 def test_the_read_side_names_the_identity_and_never_the_endpoint() -> None:
     out = ChannelBindingOut(kind="slack", address="C0EXAMPLE1", adapter="default")
-    assert out.model_dump() == {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"}
+    assert out.model_dump() == {
+        "kind": "slack",
+        "address": "C0EXAMPLE1",
+        "adapter": "default",
+        "allowed_callers": None,
+    }
 
 
 def test_a_stored_null_slack_row_reads_as_the_default_identity() -> None:

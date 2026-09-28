@@ -64,6 +64,8 @@ class DropReason(StrEnum):
     NO_ACTION_IN_PAYLOAD = "no_action_in_payload"
     EMPTY_ACTION_COMMAND = "empty_action_command"
     UNADDRESSABLE_ACTION = "unaddressable_action"
+    CALLER_NOT_ALLOWED = "caller_not_allowed"
+    ADMISSION_UNAVAILABLE = "admission_unavailable"
 
 
 #: One documented sentence per reason. Asserted total in both directions -- a
@@ -116,6 +118,18 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "An App Home or modal click carries no channel and no message, so there "
             "is no thread in which a reply could be delivered."
         ),
+        DropReason.CALLER_NOT_ALLOWED: (
+            "The binding this delivery arrived on carries a list of who may talk to "
+            "the bot, and the platform API said the caller is not on it (ADR 0175), "
+            "so no placeholder is posted and no turn is minted: a polite refusal "
+            "would tell a stranger the bot exists."
+        ),
+        DropReason.ADMISSION_UNAVAILABLE: (
+            "The platform API could not answer whether the caller may talk to the "
+            "bot and no usable answer was cached, so the delivery is refused rather "
+            "than admitted unchecked (ADR 0175 fails closed). This is an outage "
+            "signal, not a list typo: the route may carry no list at all."
+        ),
     }
 )
 
@@ -143,12 +157,16 @@ def drop(
     reason: DropReason,
     *,
     event_id: str,
+    level: int = logging.INFO,
     **extra: object,
 ) -> None:
-    """Record one refusal: exactly one INFO record naming the reason and its rationale.
+    """Record one refusal: exactly one record naming the reason and its rationale.
 
     Exactly one record per drop is the property the anti-silent-swallow suite
-    rests on, so this must not grow a second emit. Values are rendered with
+    rests on, so this must not grow a second emit. The record is INFO unless
+    the caller passes ``level``; only ``CALLER_NOT_ALLOWED`` does, at DEBUG,
+    because a busy shared channel can refuse most of its messages and the
+    ``curie.turn.refused`` counter already counts them. Values are rendered with
     ``%r`` so a newline or control character inside a Slack-supplied id cannot
     forge an extra log line; message bodies are never logged at all.
 
@@ -156,10 +174,12 @@ def drop(
         log: The dispatcher's injected logger -- the one the drop must land on.
         reason: The enumerated reason, whose value is the stable log token.
         event_id: The delivery's idempotency key, or "" when none exists yet.
+        level: The log level, INFO unless the reason is a routine refusal.
         **extra: Additional non-body context (a channel type, a subtype).
     """
     details = "".join(f" {key}={value!r}" for key, value in sorted(extra.items()))
-    log.info(
+    log.log(
+        level,
         "dropped inbound slack delivery %r: %s -- %s%s",
         event_id,
         reason.value,

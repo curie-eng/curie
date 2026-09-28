@@ -204,7 +204,7 @@ def test_moving_a_binding_onto_a_declared_identity_is_a_named_422(
     _refused_as_unstorable(moved)
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"}
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
     ]
 
 

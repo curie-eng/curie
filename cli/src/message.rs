@@ -6433,6 +6433,7 @@ mod tests {
                     kind: "slack".to_string(),
                     address: c.to_string(),
                     adapter: None,
+                    allowed_callers: None,
                 })
                 .collect(),
             repo_full_name: None,
@@ -6458,6 +6459,7 @@ mod tests {
                 kind: "slack".to_string(),
                 address: address.to_string(),
                 adapter: adapter.map(str::to_string),
+                allowed_callers: None,
             })
             .collect();
         agent
@@ -7921,6 +7923,7 @@ mod tests {
                     kind: "slack".into(),
                     address: "C1".into(),
                     adapter: None,
+                    allowed_callers: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
@@ -7944,6 +7947,7 @@ mod tests {
                     kind: "slack".into(),
                     address: "C2".into(),
                     adapter: None,
+                    allowed_callers: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,

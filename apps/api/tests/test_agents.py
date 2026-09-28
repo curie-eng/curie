@@ -54,13 +54,13 @@ def _slack(address: str) -> dict[str, str]:
     return {"kind": "slack", "address": address}
 
 
-def _slack_out(address: str) -> dict[str, str]:
+def _slack_out(address: str) -> dict[str, str | None]:
     """The Slack-kind `AgentOut.channels` READ shape. The stored form is
     unchanged until the contract migration for ADR-0168 decision 3 (#3100): an
     omitted or `"default"` write is stored as NULL exactly as before the ADR,
     and the read side is what presents that NULL as the default identity."""
 
-    return {"kind": "slack", "address": address, "adapter": "default"}
+    return {"kind": "slack", "address": address, "adapter": "default", "allowed_callers": None}
 
 
 def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
@@ -347,14 +347,16 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
     )
     assert created.status_code == 201, created.text
     assert created.json()["channels"] == [
-        {"kind": "webhook", "address": "acme-room-7", "adapter": None}
+        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
     ]
 
     fetched = client.get(f"/agents/{created.json()['id']}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     bindings = fetched.json()["channels"]
     assert isinstance(bindings, list), bindings
-    assert bindings == [{"kind": "webhook", "address": "acme-room-7", "adapter": None}]
+    assert bindings == [
+        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
+    ]
 
 
 def test_a_plural_channels_payload_is_rejected(
@@ -411,7 +413,7 @@ def test_the_slack_address_shape_check_survives_the_rename(
     ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0EXAMPLE1"))
     assert ok.status_code == 201, ok.text
     assert ok.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"}
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
     ]
 
     bad = _create(client, auth_headers, name="slack-bad", channel=_slack("#general"))
@@ -456,7 +458,7 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
     )
     assert other_kind.status_code == 201, other_kind.text
     assert other_kind.json()["channels"] == [
-        {"kind": "email", "address": "C0EXAMPLE1", "adapter": None}
+        {"kind": "email", "address": "C0EXAMPLE1", "adapter": None, "allowed_callers": None}
     ]
 
     # And the pair itself is still identity: the SAME pair still conflicts, with
@@ -507,7 +509,7 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
     )
     assert moved.status_code == 200, moved.text
     assert moved.json()["channels"] == [
-        {"kind": "webhook", "address": "moved-here", "adapter": None}
+        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
     ]
 
     # The move REPLACED the binding; the old address is now free for another
@@ -517,7 +519,7 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.json()["channels"] == [
-        {"kind": "webhook", "address": "moved-here", "adapter": None}
+        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
     ]
 
 

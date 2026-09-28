@@ -20,6 +20,7 @@ from slack_bolt import App
 from slack_sdk.web import WebClient
 
 from . import __version__
+from .admission import build_admission
 from .app import SocketModeConnection, build_app, build_redis, build_web_client
 from .config import DispatcherConfig
 from .heartbeat import start_heartbeat
@@ -107,6 +108,10 @@ def build_identity_connections(
         if (ids := preflighted.bot_ids) is not None and ids.bot_id and ids.bot_user_id
     }
     connections: list[IdentityConnection] = []
+    # One caller-list cache for the whole process (ADR 0175): its keys carry
+    # the identity, so sharing it costs nothing and saves each identity's app
+    # from asking the API about a route another identity already asked about.
+    admission = build_admission(config, redis_client)
     for preflighted in identities:
         credentials = preflighted.credentials
         web_client = build_web_client(config, credentials)
@@ -117,6 +122,7 @@ def build_identity_connections(
             redis_client=redis_client,
             logger=logger,
             identity_bots=identity_bots,
+            admission=admission,
         )
         connect = _socket_mode_connector(
             app,

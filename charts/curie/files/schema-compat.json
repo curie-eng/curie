@@ -533,8 +533,16 @@
       ],
       "revision": "0067",
       "sha256": "257e1b5c21f2e8a39c7f3631300c404c35e6df1ba7f2e0faf8730593aa9bf17e"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0067"
+      ],
+      "revision": "0068",
+      "sha256": "8e5ed2fd320974f873575e9307cfbed5375ec94d3416c70c5999ca2957c91086"
     }
   ],
-  "schema_head": "0067",
+  "schema_head": "0068",
   "schema_min": "0060"
 }
