@@ -47,7 +47,7 @@ from aci_protocol import (
     TurnSource,
     parse_queued_turn,
 )
-from aci_protocol.turn import SLACK_KIND, route_identity
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -405,13 +405,13 @@ async def ingest_hook(
                 unbound += f" as {route_identity(kind, adapter)!r}"
             elif kind == SLACK_KIND:
                 identities = sorted(
-                    route_identity(binding.kind, binding.adapter)
+                    route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
                     for binding in agent.channels
                     if binding.kind == kind and binding.address == address
                 )
                 if identities:
                     unbound += (
-                        f" as 'default'; it binds {kind}:{address} only as "
+                        f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
                         f"{', '.join(map(repr, identities))}, so pass adapter to name one"
                     )
             raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
