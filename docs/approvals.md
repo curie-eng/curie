@@ -230,6 +230,13 @@ and it is stored on the record, stamped onto the card in the approver channel, a
 carried to the requester in the resume turn below. Cancelling the dialog resolves
 nothing, so a misclick is recoverable.
 
+Once an approval ends, its card is a record of the decision
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+The buttons are gone, the header reads `Approved`, `Rejected` or `Expired`, the summary
+and the requester stay, and the last line names who decided and when, with the note
+under it. The time is a Slack date token, so each reader sees it in their own time zone.
+A resolve from the CLI or the Console settles the card the same way a click does.
+
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra
 click, and it is deliberate. A reason is the half of a rejection the requester actually
