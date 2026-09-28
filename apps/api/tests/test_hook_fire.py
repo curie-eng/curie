@@ -277,7 +277,13 @@ def test_a_target_bound_under_several_identities_fires_as_the_default_one(
     fired = _fire(client, auth_headers, "acme-fire-identities", "identity-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] is None
-    [queued] = _payloads_for("identity-check")
+    # This agent's own turn: the runs stream outlives a test, so an earlier
+    # run's turn for the same hook name can still be on it.
+    [queued] = [
+        item
+        for item in _payloads_for("identity-check")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ]
     handle = queued["reply_handle"]
     assert (handle["kind"], handle["channel"], handle["adapter"]) == (
         "slack",
@@ -301,4 +307,8 @@ def test_a_target_bound_under_several_identities_none_default_fails(
     fired = _fire(client, auth_headers, "acme-fire-no-default", "ambiguous-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "failed"
-    assert _payloads_for("ambiguous-check") == []
+    assert [
+        item
+        for item in _payloads_for("ambiguous-check")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ] == []
