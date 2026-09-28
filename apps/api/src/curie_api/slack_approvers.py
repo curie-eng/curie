@@ -41,7 +41,9 @@ from .approvers import (
     ExplicitUsers,
     InvalidApprovers,
     MembershipVerdict,
+    RequesterOnly,
     UnboundRoute,
+    answered_by_requester_only,
 )
 from .config import Settings
 from .identities import slack_bot_tokens
@@ -69,6 +71,8 @@ class SlackChannelMembers:
     console_eligible = False
     # Only the dispatcher's attested click proves Slack channel membership.
     adapter_eligible = False
+    chat_eligible = True
+    ineligible_reason = None
 
     def __init__(self, approvers_channel: str | None) -> None:
         self._approvers_channel = approvers_channel
@@ -114,6 +118,8 @@ class SlackUserGroupMembers:
     console_eligible = True
     # Group members are Slack IDs, which only the dispatcher vouches for.
     adapter_eligible = False
+    chat_eligible = True
+    ineligible_reason = None
 
     def __init__(
         self,
@@ -210,6 +216,10 @@ class SlackApproverSetSelector:
     (ADR-0123): a binding present with no ``approvers`` block and a routeless
     approval both keep channel membership, while an approval that NAMED a route
     with no binding to read is refused outright.
+
+    Before any of that, a card shown in a non-Slack conversation (routeless, or
+    a route in ``requesting_surface`` mode) takes the provider-neutral
+    ``RequesterOnly`` set (ADR-0177): no Slack set can be proven there.
     """
 
     def __init__(
@@ -240,6 +250,19 @@ class SlackApproverSetSelector:
             # approver set to everyone in the card's channel -- the opposite of
             # what the binding was trying to say.
             return InvalidApprovers(spec_error)
+        if answered_by_requester_only(approval, binding):
+            # ADR-0177 decision 3: the card is in a non-Slack conversation, so
+            # none of Slack's sets below can be proven there.
+            if approvers is not None:
+                # The worker escalates such a route at raise time, so this is an
+                # approvers block added while the approval pended. The operator
+                # narrowed the route to Slack users nobody on this channel can
+                # prove to be; falling back to the requester would widen it.
+                return InvalidApprovers(
+                    "route declares Slack approvers, which cannot be verified on a "
+                    f"{approval.reply_kind} conversation"
+                )
+            return RequesterOnly(approval.author, approval.reply_kind)
         if approvers is None:
             if approval.route and binding is None:
                 # The approval NAMED a route and there is no binding left to

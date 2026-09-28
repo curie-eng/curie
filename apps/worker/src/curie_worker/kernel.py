@@ -853,10 +853,23 @@ def _valid_notification_endpoint(endpoint: Any) -> bool:
     )
 
 
+# ADR-0177 decision 1: the other form of a route's resolution. The card is shown
+# in the conversation that asked, on whatever channel that is, exactly as a
+# routeless approval's card already is. Mirrors the API's
+# ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
+_REQUESTING_SURFACE = {"mode": "requesting_surface"}
+
+
 def _parse_approval_targets(
     binding: Any,
-) -> tuple[tuple[str, str], tuple[str, str, TargetRoute] | None] | None:
+) -> tuple[tuple[str, str] | None, tuple[str, str, TargetRoute] | None] | None:
     """Parse one stored approval binding, or fail closed with ``None``.
+
+    The first element is the fixed card target, or ``None`` when the route's
+    resolution is ``{"mode": "requesting_surface"}`` (ADR-0177): the card then
+    goes to the requesting turn's own conversation. That form is exactly the
+    one key, and it carries no notification, since the card already joins the
+    thread that asked; a mix of the mode and a fixed target is refused.
 
     The API owns complete config validation. This worker boundary independently
     reasserts the authority-bearing envelope and Slack resolution-ID shape
@@ -893,6 +906,10 @@ def _parse_approval_targets(
         return None
 
     resolution = binding.get("resolution")
+    if resolution == _REQUESTING_SURFACE:
+        if binding.get("notification") is not None:
+            return None
+        return None, None
     if (
         not isinstance(resolution, dict)
         or set(resolution) != {"kind", "address"}
@@ -6645,7 +6662,33 @@ class Kernel:
                     "to this channel.",
                 )
                 return False
-            (card_kind, card_channel), notification_target = targets
+            fixed_target, notification_target = targets
+            if fixed_target is not None:
+                card_kind, card_channel = fixed_target
+            elif (
+                handle.kind != SLACK_KIND
+                and isinstance(binding, dict)
+                and binding.get("approvers") is not None
+            ):
+                # ADR-0177 decision 3: approver lists hold Slack users, and
+                # nobody on a non-Slack conversation can prove to be one yet.
+                # Creating the approval would leave it for nobody to answer.
+                logger.warning(
+                    "approval route %r lists approvers but its card would land on a "
+                    "%s conversation for agent %s; escalating",
+                    route_name,
+                    handle.kind,
+                    agent_id,
+                )
+                await self._escalate(
+                    qevent,
+                    route,
+                    f"The run requested approval via route {route_name!r}, which "
+                    f"lists approvers, but its card would be shown here, on {handle.kind}, "
+                    "where approvers cannot be verified yet; flagging for a human "
+                    "instead of creating an approval nobody here can answer.",
+                )
+                return False
 
         if not is_publication and self._approvals is None:
             await self._escalate(

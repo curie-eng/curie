@@ -338,7 +338,12 @@ def _collect_slack_destinations(
         for route in approval_routes.values():
             if not isinstance(route, Mapping) or "resolution" not in route:
                 raise ValueError("approval route is malformed")
-            targets = [route["resolution"]]
+            resolution = route["resolution"]
+            # ADR-0177: a card shown where the request was asked names no
+            # channel of its own; it lands in one of the agent's own bindings,
+            # which the loop above already collected.
+            requesting_surface = resolution == {"mode": "requesting_surface"}
+            targets = [] if requesting_surface else [resolution]
             notification = route.get("notification")
             if notification is not None:
                 targets.append(notification)

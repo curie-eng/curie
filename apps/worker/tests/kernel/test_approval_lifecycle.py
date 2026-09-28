@@ -3465,6 +3465,24 @@ def test_unbound_route_escalates_instead_of_routing_to_the_requesting_channel(
             id="resolution-extra-key",
         ),
         pytest.param({"channel": "C0EXAMPLE3"}, id="retired-channel-key"),
+        pytest.param(
+            {
+                "resolution": {"mode": "requesting_surface"},
+                "notification": {"kind": "slack", "address": "C0EXAMPLE3"},
+            },
+            id="mode-with-notification",
+        ),
+        pytest.param(
+            {
+                "resolution": {
+                    "mode": "requesting_surface",
+                    "kind": "slack",
+                    "address": "C0EXAMPLE3",
+                }
+            },
+            id="mode-mixed-with-a-fixed-target",
+        ),
+        pytest.param({"resolution": {"mode": "anywhere"}}, id="mode-unknown"),
         *[
             pytest.param(_notification_route(**overrides), id=f"notification-{case}")
             for case, overrides in _MALFORMED_NOTIFICATION_OVERRIDES
@@ -4974,5 +4992,193 @@ def test_tool_approval_card_reaches_the_cluster_message_caller(
                     ref == expected_ref and "Awaiting approval (appr-1)" in text
                     for _, ref, text in h.sink.updates
                 )
+
+    asyncio.run(go())
+
+
+# --- ADR-0177: a route may show its card where the request was asked ----------
+
+_REQUESTING_SURFACE = {"resolution": {"mode": "requesting_surface"}}
+_MAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
+_MAIL_ADAPTER = "agentmail-sandbox"
+_MAIL_INBOX = "bot@example.com"
+
+
+def _email_qevent(text: str, *, thread: str) -> QueuedTurn:
+    return _qevent(
+        text,
+        thread=thread,
+        kind="email",
+        channel=_MAIL_INBOX,
+        endpoint=_MAIL_ENDPOINT,
+        adapter=_MAIL_ADAPTER,
+        placeholder=None,
+    )
+
+
+def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_asked(
+    make_harness,
+) -> None:
+    """ADR-0177 decision 1: the card joins the conversation that asked, over
+    that conversation's own transport, and the record says so, which is what
+    the API's served check and requester-only set read back."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_email_qevent("send it", thread="th-mail"))
+
+            req = approvals.requests[0]
+            assert req.route == "confirm"
+            assert (req.reply_kind, req.reply_channel) == ("email", _MAIL_INBOX)
+            assert req.card_channel == _MAIL_INBOX
+
+            # One card, in the asking thread, carrying the Approve/Reject intent.
+            assert len(h.sink.posts) == 1
+            address, message, requested_by, conversation_id, endpoint = h.sink.posts[0]
+            assert (address, conversation_id, endpoint) == (_MAIL_INBOX, "th-mail", _MAIL_ENDPOINT)
+            assert requested_by == "U1"
+            assert isinstance(message.interaction, ConfirmIntent)
+            assert message.interaction.id == "appr-1"
+            (card_event, card_route, _) = next(
+                entry for entry in h.sink.events if entry[0].event == "reply.post"
+            )
+            assert card_event.target.kind == "email"
+            assert card_route.adapter == _MAIL_ADAPTER
+
+            # The card ref is remembered with the email destination, so the
+            # resume settles THIS card (decision 6).
+            h.runner.default_script = [Final(text="Sent.", status=DONE)]
+            await h.kernel.process_event(
+                QueuedTurn(
+                    event_id="approval-appr-1-resolved",
+                    conversation_id="th-mail",
+                    author="requester@example.com",
+                    text="[approval resolved] approved",
+                    reply_handle=ReplyHandle(
+                        kind="email",
+                        channel=_MAIL_INBOX,
+                        placeholder=None,
+                        endpoint=_MAIL_ENDPOINT,
+                        adapter=_MAIL_ADAPTER,
+                    ),
+                    received_at="2026-07-14T00:00:00+00:00",
+                )
+            )
+            assert len(h.sink.card_updates) == 0  # no reader: no verdict to stamp
+
+    asyncio.run(go())
+
+
+def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harness) -> None:
+    """ADR-0177 decision 6: whatever ends the approval, the resume settles the
+    one card. For email the adapter turns the settled update into a follow-up,
+    so the update must reach the email thread, over its transport, with the
+    outcome read from the record."""
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        async with make_harness(
+            approvals=RecordingApprovals(), approval_reader=reader, binding=binding
+        ) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_email_qevent("send it", thread="th-mail-settle"))
+            assert len(h.sink.posts) == 1
+
+            h.runner.default_script = [Final(text="Sent.", status=DONE)]
+            await h.kernel.process_event(
+                QueuedTurn(
+                    event_id="approval-appr-1-resolved",
+                    conversation_id="th-mail-settle",
+                    author="U9",
+                    text="[approval resolved] approved by U9",
+                    reply_handle=ReplyHandle(
+                        kind="email",
+                        channel=_MAIL_INBOX,
+                        placeholder=None,
+                        endpoint=_MAIL_ENDPOINT,
+                        adapter=_MAIL_ADAPTER,
+                    ),
+                    received_at="2026-07-14T00:00:00+00:00",
+                )
+            )
+
+            assert len(h.sink.card_updates) == 1
+            address, ref, _message, endpoint, settled = h.sink.card_updates[0]
+            assert (address, ref, endpoint) == (_MAIL_INBOX, "posted-1", _MAIL_ENDPOINT)
+            assert settled is not None and settled.decision == "approved"
+            update = next(
+                event for event, _route, _ in h.sink.events if event.event == "reply.update"
+                and getattr(event, "settled", None) is not None
+            )
+            assert update.target.kind == "email"
+            assert update.target.conversation_id == "th-mail-settle"
+
+    asyncio.run(go())
+
+
+def test_a_requesting_surface_route_asked_in_slack_joins_the_slack_thread(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Refund order 42", "confirm")
+            await h.kernel.process_event(_qevent("refund?", thread="th-slack-mode"))
+
+            req = approvals.requests[0]
+            assert (req.route, req.card_channel) == ("confirm", "C1")
+            address, _message, _by, conversation_id, _endpoint = h.sink.posts[0]
+            assert (address, conversation_id) == ("C1", "th-slack-mode")
+
+    asyncio.run(go())
+
+
+def test_approvers_on_a_route_that_lands_on_email_escalate_at_raise_time(
+    make_harness,
+) -> None:
+    """ADR-0177 decision 3: approver lists hold Slack users, and nobody on an
+    email thread can prove to be one. Rather than create an approval nobody
+    there can answer, the turn escalates and says why."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding(
+            {"confirm": {**_REQUESTING_SURFACE, "approvers": {"users": ["U0EXAMPLE1"]}}}
+        )
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            ev = _email_qevent("send it", thread="th-mail-approvers")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "confirm" in h.sink.last_text
+            assert "approvers" in h.sink.last_text
+            assert "email" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approvers_on_a_requesting_surface_route_asked_in_slack_still_apply(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding(
+            {"confirm": {**_REQUESTING_SURFACE, "approvers": {"users": ["U0EXAMPLE1"]}}}
+        )
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Refund order 42", "confirm")
+            await h.kernel.process_event(_qevent("refund?", thread="th-slack-approvers"))
+
+            assert [r.route for r in approvals.requests] == ["confirm"]
+            assert len(h.sink.posts) == 1
 
     asyncio.run(go())

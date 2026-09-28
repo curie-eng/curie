@@ -2326,9 +2326,39 @@
         "title": "ApprovalRequest",
         "type": "object"
       },
+      "ApprovalRequestingSurfaceTarget": {
+        "additionalProperties": false,
+        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nthe requester alone (``approvers.RequesterOnly``).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
+        "properties": {
+          "mode": {
+            "const": "requesting_surface",
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "ApprovalRequestingSurfaceTarget",
+        "type": "object"
+      },
+      "ApprovalRequestingSurfaceTargetOut": {
+        "description": "Read projection of ``ApprovalRequestingSurfaceTarget`` (ADR-0177).\n\nTolerant like every read shape here, so a hand-edited row still reads back\nfor repair instead of failing the whole agent response.",
+        "properties": {
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "ApprovalRequestingSurfaceTargetOut",
+        "type": "object"
+      },
       "ApprovalResolutionTarget": {
         "additionalProperties": false,
-        "description": "The one target permitted to carry an approval-resolving affordance.\n\n``kind`` is an explicit extension point, but it is intentionally Slack-only\nuntil a second adapter can present the scoped verified identity ADR-0096\nrequires. Merely teaching an adapter to render buttons cannot widen this\nauthority boundary.",
+        "description": "A fixed channel for a route's approval card.\n\n``kind`` is an explicit extension point, but it is intentionally Slack-only\nuntil a second adapter can present the scoped verified identity ADR-0096\nrequires. Merely teaching an adapter to render buttons cannot widen this\nauthority boundary. A card reaches any other channel only through\n``ApprovalRequestingSurfaceTarget``, and only in the conversation that\nasked (ADR-0177).",
         "properties": {
           "address": {
             "title": "Address",
@@ -2378,7 +2408,7 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface.\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
         "properties": {
           "approvers": {
             "anyOf": [
@@ -2401,7 +2431,15 @@
             ]
           },
           "resolution": {
-            "$ref": "#/components/schemas/ApprovalResolutionTarget"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalResolutionTarget"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalRequestingSurfaceTarget"
+              }
+            ],
+            "title": "Resolution"
           }
         },
         "required": [
@@ -2434,7 +2472,15 @@
             ]
           },
           "resolution": {
-            "$ref": "#/components/schemas/ApprovalTargetOut"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalTargetOut"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalRequestingSurfaceTargetOut"
+              }
+            ],
+            "title": "Resolution"
           }
         },
         "required": [

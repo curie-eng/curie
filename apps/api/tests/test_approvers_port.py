@@ -32,6 +32,8 @@ class _EveryoneIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(member=True, evidence={"kind": "fake", "actor": actor})
@@ -42,6 +44,8 @@ class _NobodyIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
@@ -56,6 +60,8 @@ class _CannotTell:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(

@@ -190,9 +190,27 @@ service is material:
   credential carrying only `channels:token`, `approvals:read`, and
   `approvals:resolve` for the binding ids it serves. The approval boundary now
   recognizes the `adapter` kind
-  (`apps/api/src/curie_api/authorizer.py::PrincipalKind`), and an adapter can
-  resolve only routes backed by an explicit user list. It no longer needs the
-  platform-wide key at runtime for the return path.
+  (`apps/api/src/curie_api/authorizer.py::PrincipalKind`). It no longer needs
+  the platform-wide key at runtime for the return path. No Slack approver set
+  admits an adapter, since only the Slack dispatcher vouches for a Slack ID
+  (ADR-0177's separate finding).
+- **Fixed (ADR-0177): an approval is answered where it was asked.** An adapter
+  is served the approvals whose card went to one of its own bindings, and a
+  card shown on its channel is answered by the requester alone
+  (`apps/api/src/curie_api/approvers.py::RequesterOnly`). The platform half
+  needs nothing new on the wire: the worker already posts the card into the
+  thread as a `ReplyPost` carrying a `ConfirmIntent` with the approval id, and
+  settles it on resume with a `ReplyUpdate` carrying `settled`. An adapter that
+  takes approvals owes the rest: render the intent for its channel (for email,
+  "Reply with APPROVE or REJECT on the first line"), return a `ReplyAck.ref`
+  for the card so the worker can settle it, keep a random single-use reference
+  per approval, and accept a reply as an answer only when it passes the
+  adapter's sender checks, carries a live reference issued to that sender, was
+  not sent automatically, and has one decision word on the first line above
+  any quote. It then calls resolve with its credential and the sender as the
+  actor, never starts a turn from an answer, and on the settled update sends
+  one short follow-up and spends the reference. Until an adapter does this,
+  its approvals still only expire.
 - **Packaging, installation, discovery, lifecycle, and conformance remain
   unbuilt.** A binding's configured route is not an adapter registry or an
   install experience, and the generic HTTP edges do not establish a supported

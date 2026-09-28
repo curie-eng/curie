@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
+from .approvers import card_on_requesting_surface
 from .config import get_settings
 from .models import (
     ActionAuditEntry,
@@ -2535,24 +2536,38 @@ async def _adapter_served_targets(
 
 
 def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
-    """THE served predicate (ADR-0154), shared by the list and the resolver.
+    """THE served predicate (ADR-0154, ADR-0177), shared by the list and the resolver.
 
-    An approval is served when it names an agent and a route, and that agent's
-    route resolves to the ``(kind, address)`` of one of the adapter's bindings
-    ON THE SAME AGENT. A routeless approval, or a route whose resolution is
-    missing or malformed, is served by no adapter: fail closed.
+    An approval is served when its card went to one of the adapter's bindings
+    ON THE SAME AGENT, routed or not (ADR-0177 decision 4). Two ways a card
+    gets there:
+
+    - It was shown in the conversation that asked: a routeless approval, or a
+      route in ``requesting_surface`` mode (``approvers.card_on_requesting_surface``).
+      Then the asking pair, ``(reply_kind, reply_channel)``, must be one of the
+      adapter's bindings. The record stores that pair, and it is a fact about
+      the original turn that no later rebinding rewrites.
+    - Its route names a fixed target, and that target's ``(kind, address)`` is
+      one of the adapter's bindings.
+
+    An approval with no agent, or a route whose resolution is missing or
+    malformed, is served by no adapter: fail closed.
     """
 
-    if approval.agent_id is None or not approval.route:
+    if approval.agent_id is None:
         return False
     target = targets.get(approval.agent_id)
     if target is None:
         return False
     approval_routes, pairs = target
-    if not isinstance(approval_routes, dict):
-        return False
-    binding = approval_routes.get(approval.route)
-    if not isinstance(binding, dict):
+    binding = (
+        approval_routes.get(approval.route)
+        if approval.route and isinstance(approval_routes, dict)
+        else None
+    )
+    if card_on_requesting_surface(approval, binding):
+        return (approval.reply_kind, approval.reply_channel) in pairs
+    if not approval.route or not isinstance(binding, dict):
         return False
     resolution = binding.get("resolution")
     if not isinstance(resolution, dict):
@@ -2608,15 +2623,13 @@ async def list_approvals(
     targets = await _adapter_served_targets(session, served_by)
     if not targets:
         return []
-    # Narrow in SQL to the served agents' routed rows, then apply the one
-    # predicate the resolver also uses; the route map is JSONB, so the
-    # resolution match itself stays in Python. The SQL side still needs its
-    # own bound: `_approval_served` can only drop rows, never keep more than
-    # it's given, so a hard cap here (well above `limit`) keeps a busy agent's
-    # adapter listing from materializing every routed approval it has.
-    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None)).limit(
-        max(limit, 1000)
-    )
+    # Narrow in SQL to the served agents' rows, routed or not (ADR-0177), then
+    # apply the one predicate the resolver also uses; the route map is JSONB,
+    # so the resolution match itself stays in Python. The SQL side still needs
+    # its own bound: `_approval_served` can only drop rows, never keep more
+    # than it's given, so a hard cap here (well above `limit`) keeps a busy
+    # agent's adapter listing from materializing every approval it has.
+    stmt = stmt.where(Approval.agent_id.in_(targets)).limit(max(limit, 1000))
     served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
     return served[:limit]
 

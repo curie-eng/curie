@@ -22,11 +22,14 @@ first when the second is true sends them arguing with policy over an outage.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from aci_protocol.turn import SLACK_KIND
+
 from .models import Approval
+from .schemas import REQUESTING_SURFACE_MODE
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
 # class name it had before ADR-0034 turned it from an authorizer into a set. The
@@ -74,6 +77,16 @@ class ApproverSet(Protocol):
     @property
     def adapter_eligible(self) -> bool: ...
 
+    @property
+    def chat_eligible(self) -> bool: ...
+
+    @property
+    def ineligible_reason(self) -> str | None:
+        """What to tell an ineligible principal, or None for the authorizer's
+        per-kind default. A set whose eligibility is not about Slack evidence
+        says so itself, rather than the authorizer learning the set exists."""
+        ...
+
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict: ...
 
 
@@ -97,6 +110,8 @@ class ExplicitUsers:
     # listed ID would let any adapter serving the binding approve as that
     # person (ADR-0177, "A separate finding").
     adapter_eligible = False
+    chat_eligible = True
+    ineligible_reason = None
 
     def __init__(self, users: Sequence[str]) -> None:
         self._users = tuple(users)
@@ -142,6 +157,8 @@ class InvalidApprovers:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
 
     def __init__(self, error: str) -> None:
         self._error = error
@@ -189,6 +206,8 @@ class UnboundRoute:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
 
     def __init__(self, route: str) -> None:
         self._route = route
@@ -211,6 +230,99 @@ class UnboundRoute:
                 "binding_present": False,
             },
         )
+
+
+def card_on_requesting_surface(approval: Approval, binding: Any) -> bool:
+    """Whether this approval's card was shown in the conversation that asked.
+
+    True for a routeless approval, and for a route whose resolution is
+    ``{"mode": "requesting_surface"}`` (ADR-0177 decision 1). ``binding`` is the
+    route binding read fresh, like every other authority fact here, so a route
+    re-pointed to a fixed channel stops counting at once. The row must agree
+    as well: ``card_channel`` is where the worker actually posted the card, and
+    a card recorded anywhere but the asking address is not the asking
+    surface's to answer, whatever the route says now. Both halves must hold, so
+    neither a rewritten route map nor a stray row can move the answer.
+    """
+
+    if approval.card_channel is not None and approval.card_channel != approval.reply_channel:
+        return False
+    if not approval.route:
+        return True
+    if not isinstance(binding, Mapping):
+        return False
+    resolution = binding.get("resolution")
+    return isinstance(resolution, Mapping) and dict(resolution) == {
+        "mode": REQUESTING_SURFACE_MODE
+    }
+
+
+def answered_by_requester_only(approval: Approval, binding: Any) -> bool:
+    """Whether this approval's card is on a non-Slack surface (ADR-0177 decision 3).
+
+    Those cards are answered by the requester alone. A Slack card, wherever it
+    was shown, keeps Slack's approver sets (decision 2).
+    """
+
+    return approval.reply_kind != SLACK_KIND and card_on_requesting_surface(approval, binding)
+
+
+class RequesterOnly:
+    """The person who asked is the only approver (ADR-0177 decision 3).
+
+    The set for a card shown on a non-Slack channel, such as an email thread.
+    There the only identity anyone verified is the sender the channel's adapter
+    authenticated when the request came in, so that sender, carried back by the
+    same adapter, is the one actor admitted. It is a confirmation step, not a
+    second person's sign-off: ADR-0106 already lets an authorized requester
+    confirm their own action.
+
+    Only an ``adapter`` principal is eligible. An operator, a console session and
+    a Slack click cannot prove they are the email sender who asked, so each is
+    refused before membership is read, whatever subject it names. The router
+    has already checked that the adapter serves the binding the card went to
+    (``crud._approval_served``), so "the serving adapter's sender" is the
+    conjunction of that check and this one.
+
+    An interim until approvers are principals linked to every channel identity
+    (ADR-0166, #2910); then approver lists apply on every channel.
+    """
+
+    # NEW vocabulary added by ADR-0177; see the audit-vocabulary note above.
+    audit_name = "RequesterOnly"
+    operator_eligible = False
+    console_eligible = False
+    adapter_eligible = True
+    chat_eligible = False
+
+    def __init__(self, author: str, surface_kind: str) -> None:
+        self._author = author
+        self._surface_kind = surface_kind
+        self.ineligible_reason = (
+            f"on {surface_kind}, only the person who asked may answer this approval, "
+            "by replying in the conversation where it was asked"
+        )
+
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
+        # Exact comparison: the adapter presents the sender exactly as it
+        # presented the author at ingress, so any normalization belongs there,
+        # once, and a near miss fails closed here.
+        is_requester = actor == self._author
+        evidence: dict[str, Any] = {
+            "kind": "requester_only",
+            "surface_kind": self._surface_kind,
+            "actor_is_requester": is_requester,
+        }
+        if not is_requester:
+            return MembershipVerdict(
+                member=False,
+                reason=(
+                    f"you are not an approver: on {self._surface_kind}, only the "
+                    "person who asked may answer this approval"
+                ),
+                evidence=evidence,
+            )
+        return MembershipVerdict(member=True, evidence=evidence)
 
 
 class ApproverSetSelector(Protocol):
