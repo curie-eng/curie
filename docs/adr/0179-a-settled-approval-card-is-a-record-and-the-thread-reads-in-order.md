@@ -121,8 +121,8 @@ verdict line then the summary.
 
 ### 2. The notice above an in-thread card is one plain line
 
-When the card is posted as a message of its own into the requesting
-conversation, the pause notice reads:
+When the card goes into the requesting conversation as a message of its own,
+rather than on the turn's own ref, the pause notice reads:
 
 ```
 Approval requested. See the card below.
@@ -133,24 +133,29 @@ happened, so it stays true after the card settles and nothing has to edit it
 again. Any text the model wrote before the pause still precedes it.
 
 The full notice, id and paused sentence included, stays wherever something reads
-it or no card sits below it:
+it or no card follows it in the thread:
 
 - a card routed to another channel;
 - a card that rides the turn's own ref (the `cluster message` relay);
 - a publication pause, whose card the publication reconciler posts on its own
-  schedule;
-- a card whose post fails or comes back without a ref of its own. The short
-  line is written before the card is posted, as the notice is today, and the
-  full notice is written back when the card does not land, so the id stays in
-  the thread for the operator.
+  schedule.
+
+The notice is chosen before the card is posted and never rewritten after it. A
+channel that buffers its reply (email) replaces the reply text on every update
+and appends the card to it, so a notice rewritten after the card would drop the
+card from that reply. A card whose post fails therefore leaves the one line with
+no card after it; the approval is still listed, with its id, by
+`curie <tier> approvals <agent>`.
 
 The CLI keeps working in every case: where the notice is short, its stub
 received the card and read the id from it.
 
 ### 3. The resumed answer is posted below the card
 
-When the short notice stands, the worker remembers under the approval id that
-the resume answers below the card. The memory sits in the approval card store
+When the short notice stands and the card came back with a ref of its own, the
+worker remembers under the approval id that the resume answers below the card.
+A channel with no message to address (email acknowledges with no ref) keeps
+today's reply. The memory sits in the approval card store
 with the card's TTL and, unlike the card ref, is not consumed when the card
 settles, so a redelivered resume decides the same way. The resume turn then
 drops the placeholder the API replays and does not adopt the remembered notice
@@ -180,6 +185,8 @@ wait tracks the posted message instead and reports its last edit as the reply.
   chart, so the window is one rollout.
 - An operator resolve through the CLI settles the card through the worker path
   and gets the same card as a click.
+- A card that fails to post leaves "Approval requested. See the card below."
+  with no card after it; the operator finds the approval by listing them.
 - No contract package changes: the time travels in an existing wire field and
   the store gains one key.
 
@@ -203,8 +210,11 @@ wait tracks the posted message instead and reports its last edit as the reply.
 5. Keep a "Waiting for approval" line and edit it again at resume. Rejected: one
    more edit per approval for a line that can be worded to stay true.
 6. Post the card first and pick the notice from the card's result. Rejected: a
-   placeholderless turn's notice would then land below the card. Writing the
-   full notice back after a failed card costs an edit on the failure path only.
+   placeholderless turn's notice would then land below the card, and a
+   buffering channel would lose the card when the notice replaced its reply.
+8. Write the full notice back when the card does not land. Rejected for the
+   same buffering reason: on email the rewrite replaces the text the card had
+   appended.
 7. Tell the CLI apart by its endpoint, or by channel kind in the kernel.
    Rejected: kind is switched only below the reply seam (ADR-0096), an endpoint
    is transport and not identity, and the card already gives the CLI its id.
