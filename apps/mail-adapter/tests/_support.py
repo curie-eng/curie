@@ -155,8 +155,15 @@ class MailState:
         subject: str = "Hello",
         text: str | None = "body text",
         labels: list[str] | None = None,
+        full_text: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Seed one inbound message.
+
+        ``full_text`` is the whole plain-text body, quoted history included,
+        where the provider serves one beside ``extracted_text`` (the new text
+        alone). ``headers`` is the provider's optional header map
+        (https://docs.agentmail.to/api-reference/inboxes/messages/get).
 
         `text=None` seeds a body with no plain-text part at all, which is what
         Gmail and Outlook forwards look like: "Some email clients - particularly
@@ -175,6 +182,10 @@ class MailState:
         body = dict(summary)
         if text is not None:
             body["extracted_text"] = text
+        if full_text is not None:
+            body["text"] = full_text
+        if headers is not None:
+            body["headers"] = dict(headers)
         self.bodies[message_id] = body
         self.threads.setdefault(thread_id, []).append(self.bodies[message_id])
         return summary
@@ -253,6 +264,10 @@ class IngressState:
             {"event_id": "chn-1-abc", "stream_id": "1-0", "duplicate": False},
         )
         self.responses: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
+        # The platform's approval resolver, on the same API base (ADR-0177):
+        # every resolve call as (path, headers, body), and what to answer.
+        self.resolves: list[tuple[str, Any, dict[str, Any]]] = []
+        self.resolve_responses: list[tuple[int, dict[str, Any]]] = []
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -400,6 +415,14 @@ class IngressHandler(_JsonHandler):
 
     def do_POST(self) -> None:
         state = self.state
+        if self.path.startswith("/approvals/"):
+            body = self._read_body()
+            state.resolves.append((self.path, self.headers, body))
+            if state.resolve_responses:
+                status, payload = state.resolve_responses.pop(0)
+            else:
+                status, payload = 200, {"status": body.get("decision")}
+            return self._send(status, payload)
         state.attempts += 1
         state.attempt_times.append(time.monotonic())
         if state.drop_next > 0:
@@ -583,6 +606,54 @@ def reply_post(text: str, conversation_id: str = "thr-1") -> dict[str, Any]:
         "target": target(conversation_id, reply_ref=None),
         "message": {"version": "1.0", "text": text},
         "requested_by": "U9",
+    }
+
+
+def approval_card(
+    approval_id: str,
+    text: str = "Send the quote",
+    conversation_id: str = "thr-1",
+    requested_by: str = "human@example.com",
+) -> dict[str, Any]:
+    """The worker's approval card: a `reply.post` carrying a Confirm intent.
+
+    The shape `_pause_for_approval` in `apps/worker/src/curie_worker/kernel.py`
+    emits: the approval id on the intent and both actions, a note allowed, and
+    `requested_by` the turn's author.
+    """
+    event = reply_post(text, conversation_id)
+    event["requested_by"] = requested_by
+    event["message"]["interaction"] = {
+        "kind": "confirm",
+        "id": approval_id,
+        "prompt": text,
+        "confirm": {"label": "Approve", "value": approval_id},
+        "cancel": {"label": "Reject", "value": approval_id},
+        "allow_free_text": True,
+    }
+    return event
+
+
+def settled_card(
+    card_ref: str,
+    *,
+    decision: str | None,
+    resolver: str | None = None,
+    note: str | None = None,
+    conversation_id: str = "thr-1",
+) -> dict[str, Any]:
+    """The worker's settled-card update at the card's own ref (ADR-0177 decision 6)."""
+    return {
+        "version": "1.0",
+        "event": "reply.update",
+        "target": target(conversation_id, reply_ref=card_ref),
+        "message": {"version": "1.0", "text": "Send the quote"},
+        "settled": {
+            "requested_by": "human@example.com",
+            "decision": decision,
+            "resolver": resolver,
+            "note": note,
+        },
     }
 
 

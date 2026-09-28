@@ -133,6 +133,62 @@ notice, say) still sends it, and a delivered completion with no text still
 sends the empty-reply notice as before; only a drop with nothing recorded is
 silent.
 
+## Approvals by email
+
+With `CURIE_ADAPTER_PRINCIPAL` set, a person can answer an approval raised in
+their email thread by replying to it (ADR-0177). Without it, nothing below
+happens: the card's text is mailed as before and the approval can only expire.
+
+**The request.** When the worker posts the approval card into the thread, the
+adapter adds the instructions ("reply with APPROVE or REJECT on the first line;
+anything after it is your note; only the person who asked can answer") and a
+random single-use reference, and keeps that reference with the approval id, the
+thread and the requester. The card's ack carries a ref, so the worker can settle
+this card later. The reference links a reply to its approval. It proves nothing
+about who sent the reply: every reply quotes it.
+
+**The reply.** A message in a thread with an approval pending is never a turn.
+It is an answer only when all of these hold:
+
+- it passed the inbound gate above (the provider's SPF, DKIM and DMARC verdict
+  and the `labels` check);
+- it names a reference issued in this thread, and that reference is still live;
+- its sender is the requester the reference was issued to;
+- it was not sent automatically: no `Auto-Submitted` other than `no` (RFC 3834),
+  no `X-Autoreply`-style header, no `Precedence: bulk`, `junk`, `list` or
+  `auto_reply`, not a delivery report, not from `mailer-daemon` or `postmaster`.
+  A message whose headers the provider did not return is treated as automatic;
+- the first line of its new text (AgentMail's `extracted_text`, which has the
+  quoted history stripped) is `APPROVE` or `REJECT`. The rest of the new text is
+  the note.
+
+The adapter then calls `POST /approvals/{id}/resolve` with its credential and
+the sender as `X-Curie-Approval-Actor`, and the platform decides (its
+requester-only approver set admits only this adapter's sender, and only when it
+is the approval's author). A reply that is not an answer gets the instructions
+back; a copied person is told only the person who asked can answer; a reply to a
+spent reference is told it was already answered. An automatic message gets no
+response at all, so nothing loops. If the platform cannot be reached, or rejects
+this adapter's credential, the message stays pending and a later pass carries
+the same answer again.
+
+**When it ends.** A sent email cannot be edited, so when the worker settles the
+card the adapter sends one short follow-up in the thread (approved or rejected,
+by whom, with the note, or expired) and spends the reference. It also reopens
+the asking message's reply, so the resumed turn's answer is mailed in the same
+thread.
+
+**What this does not authenticate.** Read the inbound security section above:
+nothing here authenticates an individual mailbox. DMARC binds the sending
+domain, so anyone who can send authenticated mail for the requester's domain and
+has seen the thread's reference could send an answer as the requester. Approvals
+by email are a confirmation step by the requester, not a second person's
+sign-off. Keep a fixed Slack route for an approval that needs one.
+
+The adapter principal is not rotated by the adapter yet. Re-mint it with `POST
+/approvals/principals/adapter` before it expires, the same operator step as
+`CURIE_CHANNEL_TOKEN`.
+
 ## Config surface (env vars)
 
 Read from the environment by `MailAdapterConfig()` (a
@@ -147,6 +203,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_API_URL` | `http://localhost:8000` | platform API the ingress POST goes to (in-cluster: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias |
 | `CURIE_CHANNEL_TOKEN` | "" | the scoped `chn` token, sent as `X-API-Key` on ingress. Required |
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
+| `CURIE_ADAPTER_PRINCIPAL` | "" | the adapter principal credential (ADR-0156), sent as `X-Curie-Adapter-Principal` when carrying an approval answer. Set, it turns on answering approvals by email (see "Approvals by email"); empty keeps them unanswerable by email, as before |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
 | `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or any 4xx refusal arms bounded exponential backoff on top, up to 60s; a successful 200 listing resets it, while 5xx responses retain their existing semantics and neither arm nor clear an already armed delay |
 | `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |

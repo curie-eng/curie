@@ -18,15 +18,21 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
 TERMINAL_COMPLETION_MAX = 4096
 _TERMINAL_COMPLETION_SQL = "delivered=1 OR deleted=1"
 
-_TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected")
-_COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected")
+_TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected", "answered")
+# ``answered``: a reply in a thread with an approval pending, handled as an
+# answer or an instruction and never admitted as a turn (ADR-0177).
+_COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected", "answered")
+_COMPACTABLE_PLACEHOLDERS = ", ".join("?" for _ in _COMPACTABLE_TERMINAL_STATES)
+# Approval references past this many settled (answered or spent) rows are
+# compacted oldest first; a live reference is never evicted to make room.
+SETTLED_APPROVAL_REF_MAX = 4096
 _ADMISSION_BACKPRESSURE_CODES = frozenset(
     {
         sqlite3.SQLITE_BUSY,
@@ -40,6 +46,7 @@ _ADMISSION_BACKPRESSURE_CODES = frozenset(
 
 DeliveryAdmission = Literal["admitted", "known", "full"]
 EventClaim = Literal["claimed", "busy", "done", "deleted"]
+ApprovalRefState = Literal["live", "answered", "spent"]
 
 
 class MailState:
@@ -181,6 +188,31 @@ class MailState:
                 """
             )
 
+        if version < 3:
+            # ADR-0177: one random single-use reference per approval card this
+            # adapter rendered. It links a reply to its approval; it proves
+            # nothing about who sent the reply, which is why the requester is
+            # kept beside it and checked separately.
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE approval_refs (
+                    reference TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL UNIQUE,
+                    conversation_id TEXT NOT NULL,
+                    reply_ref TEXT NOT NULL,
+                    requester TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX approval_refs_conversation
+                    ON approval_refs(conversation_id, state);
+                PRAGMA user_version=3;
+                COMMIT;
+                """
+            )
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Begin one serialized write and roll it back on every failure."""
@@ -301,7 +333,7 @@ class MailState:
     ) -> None:
         count = int(
             connection.execute(
-                "SELECT count(*) FROM deliveries WHERE state IN (?, ?)",
+                f"SELECT count(*) FROM deliveries WHERE state IN ({_COMPACTABLE_PLACEHOLDERS})",
                 _COMPACTABLE_TERMINAL_STATES,
             ).fetchone()[0]
         )
@@ -310,7 +342,7 @@ class MailState:
             return
         connection.execute(
             "DELETE FROM deliveries WHERE message_id IN ("
-            "SELECT message_id FROM deliveries WHERE state IN (?, ?) "
+            f"SELECT message_id FROM deliveries WHERE state IN ({_COMPACTABLE_PLACEHOLDERS}) "
             "ORDER BY updated_at, message_id LIMIT ?)",
             (*_COMPACTABLE_TERMINAL_STATES, excess),
         )
@@ -554,6 +586,113 @@ class MailState:
                 (time.time(), event_id),
             )
             self._compact_terminal_completions(connection)
+
+
+    # -- approval references (ADR-0177) --------------------------------------
+
+    def issue_approval_ref(
+        self,
+        approval_id: str,
+        conversation_id: str,
+        reply_ref: str,
+        requester: str,
+        reference: str,
+    ) -> str:
+        """Keep ``reference`` for this approval, or return the one already kept.
+
+        Idempotent on the approval id, so a redelivered card post renders the
+        same reference rather than minting a second one for one approval.
+        """
+        now = time.time()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT reference FROM approval_refs WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+            if row is not None:
+                return str(row[0])
+            connection.execute(
+                "INSERT INTO approval_refs(reference, approval_id, conversation_id, "
+                "reply_ref, requester, state, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, 'live', ?, ?)",
+                (reference, approval_id, conversation_id, reply_ref, requester, now, now),
+            )
+            return reference
+
+    def approval_refs_in(self, conversation_id: str) -> list[dict[str, str]]:
+        """Every reference this adapter issued in one conversation, any state."""
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT reference, approval_id, reply_ref, requester, state "
+                "FROM approval_refs WHERE conversation_id=? ORDER BY created_at",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {
+                "reference": row[0],
+                "approval_id": row[1],
+                "conversation_id": conversation_id,
+                "reply_ref": row[2],
+                "requester": row[3],
+                "state": row[4],
+            }
+            for row in rows
+        ]
+
+    def approval_ref_for(self, approval_id: str) -> dict[str, str] | None:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT reference, conversation_id, reply_ref, requester, state "
+                "FROM approval_refs WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "reference": row[0],
+            "conversation_id": row[1],
+            "reply_ref": row[2],
+            "requester": row[3],
+            "state": row[4],
+        }
+
+    def set_approval_ref_state(self, reference: str, state: ApprovalRefState) -> None:
+        """Move a reference forward; a spent reference never comes back."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET state=?, updated_at=? "
+                "WHERE reference=? AND state!='spent'",
+                (state, time.time(), reference),
+            )
+            count = int(
+                connection.execute(
+                    "SELECT count(*) FROM approval_refs WHERE state!='live'"
+                ).fetchone()[0]
+            )
+            excess = count - SETTLED_APPROVAL_REF_MAX
+            if excess > 0:
+                connection.execute(
+                    "DELETE FROM approval_refs WHERE reference IN ("
+                    "SELECT reference FROM approval_refs WHERE state!='live' "
+                    "ORDER BY updated_at, reference LIMIT ?)",
+                    (excess,),
+                )
+
+    def reopen_reply(self, conversation_id: str, reply_ref: str) -> None:
+        """Make the asking message's reply owner live again for the resumed turn.
+
+        The paused turn's completion finished that owner when it sent the
+        request email; the resume streams its answer onto the same ref, so the
+        owner must accept text again, empty, before the resume arrives.
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reply_state(conversation_id, reply_ref, text, active, updated_at) "
+                "VALUES(?, ?, NULL, 1, ?) "
+                "ON CONFLICT(conversation_id, reply_ref) DO UPDATE SET "
+                "text=CASE WHEN reply_state.active=1 THEN reply_state.text ELSE NULL END, "
+                "active=1, updated_at=excluded.updated_at",
+                (conversation_id, reply_ref, time.time()),
+            )
 
 
 def _receipt_json(message_id: str) -> str:

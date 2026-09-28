@@ -7,9 +7,10 @@ the enforceable-rule summary.
 ## Load-bearing invariants
 
 - **The adapter holds no platform API key, no queue credential, and no platform
-  database access.** Its only credentials are `CURIE_CHANNEL_TOKEN` (presented as
-  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST)
-  and `AGENTMAIL_API_KEY`. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
+  database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
+  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
+  `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
+  presented only on `POST /approvals/{id}/resolve` when carrying an answer). Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
   stolen from it, and re-minting an expired `chn` token is an operator step for
   exactly that reason. Its local SQLite file is delivery state, not a platform
@@ -43,6 +44,13 @@ the enforceable-rule summary.
   an attacker-controlled `From` header. **Never describe the allow-list as
   authenticating a sender** in code, comments, docs or chart values: Curie
   performs no sender authentication.
+- **An approval answer is never a turn, and is accepted only on every ADR-0177
+  rule** (README "Approvals by email"): a live reference issued in this thread
+  to this exact sender, not sent automatically (missing headers count as
+  automatic), and the decision word on the first line of `extracted_text`
+  only, never the full body. The reference links a reply to its approval; it
+  is not proof of identity, and nothing here authenticates a mailbox. Never
+  respond to an automatic message. A settled card spends its reference.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's
