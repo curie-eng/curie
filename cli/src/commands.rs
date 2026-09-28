@@ -7155,7 +7155,8 @@ fn build_route_bindings(
                         ))
                         .with_fix(
                             "a route binding requires `resolution: {kind: \"slack\", \
-                             address: \"C...\"}` and accepts optional `notification` and \
+                             address: \"C...\"}` or `resolution: {mode: \
+                             \"requesting_surface\"}` and accepts optional `notification` and \
                              `approvers` blocks, and nothing else. The retired `channel` key \
                              is not accepted",
                         ),
@@ -7173,17 +7174,9 @@ fn build_route_bindings(
         let (name, channel) = split_route_arg("--route-resolution", raw)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| {
-                b.resolution = crate::api::ApprovalResolutionTargetWrite {
-                    kind: "slack".to_string(),
-                    address: channel.to_string(),
-                }
-            })
+            .and_modify(|b| b.resolution = crate::api::ApprovalResolutionWrite::slack(channel))
             .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
-                resolution: crate::api::ApprovalResolutionTargetWrite {
-                    kind: "slack".to_string(),
-                    address: channel.to_string(),
-                },
+                resolution: crate::api::ApprovalResolutionWrite::slack(channel),
                 notification: None,
                 approvers: None,
             });
@@ -7215,8 +7208,17 @@ fn build_route_bindings(
     for (name, binding) in &bindings {
         validate_resolution_target(name, &binding.resolution)?;
         if let Some(notification) = &binding.notification {
+            let crate::api::ApprovalResolutionWrite::Fixed(resolution) = &binding.resolution else {
+                // ADR-0177 decision 1, mirroring the API: the card already
+                // joins the conversation that asked, so there is nobody further
+                // to notify.
+                return Err(crate::exit::usage(format!(
+                    "route {name:?}: a requesting_surface resolution cannot carry a \
+                     notification; the card is already shown in the conversation that asked"
+                )));
+            };
             validate_notification_target(name, notification)?;
-            reject_identical_targets(name, &binding.resolution, notification)?;
+            reject_identical_targets(name, resolution, notification)?;
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
@@ -7226,12 +7228,26 @@ fn build_route_bindings(
     Ok(bindings)
 }
 
-/// The interactive extension point is explicit but remains Slack-only until a
-/// second channel can mint a scoped, verified resolver credential.
+/// A fixed target stays Slack-only; the only way off Slack is the
+/// `requesting_surface` mode, which shows the card in the conversation that
+/// asked (ADR-0177). Mirrors the API's `ApprovalRouteBinding.resolution`.
 fn validate_resolution_target(
     route: &str,
-    target: &crate::api::ApprovalResolutionTargetWrite,
+    resolution: &crate::api::ApprovalResolutionWrite,
 ) -> Result<()> {
+    let target = match resolution {
+        crate::api::ApprovalResolutionWrite::Fixed(target) => target,
+        crate::api::ApprovalResolutionWrite::RequestingSurface(target) => {
+            if target.mode != "requesting_surface" {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: resolution mode {:?} is unsupported; the only mode is \
+                     \"requesting_surface\"",
+                    target.mode
+                )));
+            }
+            return Ok(());
+        }
+    };
     if target.kind != "slack" {
         return Err(crate::exit::usage(format!(
             "route {route:?}: resolution kind {:?} is unsupported; only slack can carry \
@@ -7723,12 +7739,18 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        let resolution =
-                            format!("{}:{}", binding.resolution.kind, binding.resolution.address);
-                        ui.kv(
-                            name,
-                            &format!("resolution {resolution} (verified interactive card)"),
-                        );
+                        let resolution = match &binding.resolution {
+                            crate::api::ApprovalResolutionResponse::Fixed(target) => format!(
+                                "resolution {}:{} (verified interactive card)",
+                                target.kind, target.address
+                            ),
+                            crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
+                                "resolution requesting_surface (the card is shown in the \
+                                 conversation that asked)"
+                                    .to_string()
+                            }
+                        };
+                        ui.kv(name, &resolution);
                         let notification = binding
                             .notification
                             .as_ref()
@@ -7746,10 +7768,17 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 /// One line naming who may resolve a route's approvals, including the default.
 fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> String {
     match &binding.approvers {
-        None => format!(
-            "members of {}:{} (the default: no approvers block declared)",
-            binding.resolution.kind, binding.resolution.address
-        ),
+        None => match &binding.resolution {
+            crate::api::ApprovalResolutionResponse::Fixed(target) => format!(
+                "members of {}:{} (the default: no approvers block declared)",
+                target.kind, target.address
+            ),
+            crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
+                "the asking channel's members in Slack, or only the person who asked on any \
+                 other channel (the default: no approvers block declared)"
+                    .to_string()
+            }
+        },
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
             // `users` wins over `group`, so a binding carrying both must not read
@@ -11717,10 +11746,7 @@ mod tests {
                     (
                         r.to_string(),
                         crate::api::ApprovalRouteBindingWrite {
-                            resolution: crate::api::ApprovalResolutionTargetWrite {
-                                kind: "slack".to_string(),
-                                address: "C0EXAMPLE1".to_string(),
-                            },
+                            resolution: crate::api::ApprovalResolutionWrite::slack("C0EXAMPLE1"),
                             notification: None,
                             approvers: None,
                         },

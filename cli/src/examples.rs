@@ -1822,10 +1822,7 @@ fn route_binding_as_write(
     binding: &crate::api::ApprovalRouteBindingResponse,
 ) -> crate::api::ApprovalRouteBindingWrite {
     crate::api::ApprovalRouteBindingWrite {
-        resolution: crate::api::ApprovalResolutionTargetWrite {
-            kind: binding.resolution.kind.clone(),
-            address: binding.resolution.address.clone(),
-        },
+        resolution: binding.resolution.clone().into(),
         // The response omits the notification's transport (endpoint, adapter),
         // so it cannot be written back faithfully. Callers refuse any bound
         // notification first (`refuse_unwritable_notifications`).
@@ -1856,10 +1853,7 @@ fn sre_approvals_route_map(
     map.insert(
         SRE_APPROVALS_ROUTE.to_string(),
         crate::api::ApprovalRouteBindingWrite {
-            resolution: crate::api::ApprovalResolutionTargetWrite {
-                kind: "slack".to_string(),
-                address: channel.to_string(),
-            },
+            resolution: crate::api::ApprovalResolutionWrite::slack(channel),
             notification: None,
             approvers: Some(crate::api::ApprovalApprovers {
                 group: None,

@@ -362,19 +362,45 @@ fn default_publication_policy_version() -> i64 {
 /// PATCH graph below.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalRouteBindingResponse {
-    pub resolution: ApprovalResolutionTargetResponse,
+    pub resolution: ApprovalResolutionResponse,
     #[serde(default)]
     pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
 }
 
-/// Interactive target returned by the API. The current resolver supports Slack
-/// only, but response decoding stays tolerant of a future server extension.
+/// Where a route's card goes, as the API returns it: a fixed channel, or the
+/// conversation that asked (ADR-0177). Untagged, so each form decodes from its
+/// own keys; the fixed form is tried first.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApprovalResolutionResponse {
+    Fixed(ApprovalResolutionTargetResponse),
+    RequestingSurface(RequestingSurfaceTargetResponse),
+}
+
+impl ApprovalResolutionResponse {
+    /// One human-readable phrase naming where the card goes.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Fixed(target) => format!("{}:{}", target.kind, target.address),
+            Self::RequestingSurface(target) => target.mode.clone(),
+        }
+    }
+}
+
+/// Fixed interactive target returned by the API. The current resolver supports
+/// Slack only, but response decoding stays tolerant of a future server extension.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalResolutionTargetResponse {
     pub kind: String,
     pub address: String,
+}
+
+/// The `{"mode": "requesting_surface"}` resolution as the API returns it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RequestingSurfaceTargetResponse {
+    pub mode: String,
 }
 
 /// Text-only notification target returned by the API. Endpoint and adapter are
@@ -421,21 +447,66 @@ pub struct ApprovalApprovers {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRouteBindingWrite {
-    pub resolution: ApprovalResolutionTargetWrite,
+    pub resolution: ApprovalResolutionWrite,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
 }
 
-/// Slack-only interactive resolution target. `kind` is kept explicit as the
-/// future extension point, while command validation currently refuses anything
+/// Where a route's card goes, as an operator writes it: a fixed Slack channel,
+/// or `{"mode": "requesting_surface"}` for the conversation that asked
+/// (ADR-0177). Both variants refuse unknown keys, so a mix of the two forms
+/// matches neither and is refused rather than read as one of them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApprovalResolutionWrite {
+    Fixed(ApprovalResolutionTargetWrite),
+    RequestingSurface(RequestingSurfaceTargetWrite),
+}
+
+impl ApprovalResolutionWrite {
+    /// A fixed Slack channel target, the form `--route-resolution` writes.
+    pub fn slack(channel: &str) -> Self {
+        Self::Fixed(ApprovalResolutionTargetWrite {
+            kind: "slack".to_string(),
+            address: channel.to_string(),
+        })
+    }
+}
+
+impl From<ApprovalResolutionResponse> for ApprovalResolutionWrite {
+    fn from(response: ApprovalResolutionResponse) -> Self {
+        match response {
+            ApprovalResolutionResponse::Fixed(target) => {
+                Self::Fixed(ApprovalResolutionTargetWrite {
+                    kind: target.kind,
+                    address: target.address,
+                })
+            }
+            ApprovalResolutionResponse::RequestingSurface(target) => {
+                Self::RequestingSurface(RequestingSurfaceTargetWrite { mode: target.mode })
+            }
+        }
+    }
+}
+
+/// Slack-only fixed resolution target. `kind` is kept explicit as the future
+/// extension point, while command validation currently refuses anything
 /// except `slack`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalResolutionTargetWrite {
     pub kind: String,
     pub address: String,
+}
+
+/// `{"mode": "requesting_surface"}`: show the card in the conversation that
+/// asked. Command validation refuses any other mode value.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestingSurfaceTargetWrite {
+    pub mode: String,
 }
 
 /// Optional notification target with write-only transport routing.
@@ -455,7 +526,7 @@ pub struct NotificationTargetWrite {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBindingInput {
-    pub resolution: ApprovalResolutionTargetWrite,
+    pub resolution: ApprovalResolutionWrite,
     #[serde(default)]
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]

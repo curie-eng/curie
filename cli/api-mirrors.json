@@ -122,6 +122,11 @@
       "omissions": []
     },
     {
+      "struct": "RequestingSurfaceTargetResponse",
+      "schema": "ApprovalRequestingSurfaceTargetOut",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalNotificationTargetResponse",
       "schema": "ApprovalTargetOut",
       "omissions": []
@@ -139,6 +144,11 @@
     {
       "struct": "ApprovalResolutionTargetWrite",
       "schema": "ApprovalResolutionTarget",
+      "omissions": []
+    },
+    {
+      "struct": "RequestingSurfaceTargetWrite",
+      "schema": "ApprovalRequestingSurfaceTarget",
       "omissions": []
     },
     {
