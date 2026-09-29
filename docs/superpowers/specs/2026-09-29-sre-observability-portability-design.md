@@ -15,25 +15,31 @@ Secret. Alloy can be Ready while reading no files.
 ## Runtime selection and configuration
 
 Before any cluster mutation, the three SRE observability install paths inspect
-Ready, schedulable nodes using `kubectl get nodes -o json`. The Kubernetes Node
+all nodes on which the Alloy DaemonSet can run, including cordoned and NotReady
+nodes, using `kubectl get nodes -o json`. Capacity planning still considers
+only Ready, schedulable nodes. The Kubernetes Node
 API reports `status.nodeInfo.containerRuntimeVersion` (for example,
 `containerd://...` or `docker://...`). A uniform containerd or CRI-O runtime
 keeps the existing CRI configuration. A uniform Docker runtime renders the
 embedded Alloy values with the Docker container-log mount and `stage.docker`.
 Missing, unsupported, or mixed runtimes fail with the offending node names and
 runtime types before Helm starts; do not silently choose one format for a mixed
-DaemonSet. `--dry-run` does not access the cluster and states that runtime
+DaemonSet. `--dry-run`, including the full bot install path, does not access
+the cluster and states that runtime
 selection occurs on the live run. Manual values-file installation remains
 possible, with the two Docker edits and the supported runtime assumption
 documented beside the example.
 
 ## Named failures
 
-On a Helm wait timeout, inspect Pending PVCs and their Warning events in the
-target namespace. Include the PVC name and event reason/message in the CLI
-failure, retaining the existing pending-upgrade recovery instruction. If this
-read fails or no PVC is Pending, keep the original Helm error and provide the
-exact `kubectl get/describe pvc` diagnostic command. This is diagnostic only:
+On a Helm wait timeout or Tempo StatefulSet rollout timeout, inspect Pending
+PVCs and their Warning events in the target namespace. Bound these diagnostic
+reads by wall-clock time and match events by namespace and PVC UID where
+available. Include the PVC name and event reason/message in the CLI failure.
+Only present Helm pending-upgrade Secret cleanup as a conditional step after
+verifying that release state; it is not a PVC remedy. If the read fails or no
+PVC is Pending, keep the original command error and provide the exact
+`kubectl get/describe pvc` diagnostic command. This is diagnostic only:
 do not delete or mutate a PVC automatically. Document that manual Grafana
 installation requires Secret `grafana-admin` with keys `admin-user` and
 `admin-password`; the installer preserves or creates it itself and must never
@@ -53,10 +59,11 @@ Alloy chart/image, rather than inferred from a text fixture.
 
 ## Verification and limits
 
-Test runtime selection with containerd, CRI-O, Docker, mixed, missing, and
-unschedulable-node inputs. Test both rendered values and the real Helm chart
-output. Test the PVC diagnostic with a Pending PVC Warning event and a
-non-PVC timeout. Use `promtool` to prove the zero-file and read-without-send
+Test runtime selection with containerd, CRI-O, Docker, mixed, missing,
+cordoned, and NotReady-node inputs. Test both rendered values and the real Helm
+chart output. Test Helm and Tempo PVC diagnostics with a matching Pending PVC
+Warning event, a stale UID, and a non-PVC timeout. Use `promtool` to prove the
+zero-file and read-without-send
 alerts fire, and that a healthy/quiet collector does not. Run CLI lint/tests,
 the observability chart assertions, and the required local, local-release,
 cluster and external-integration tiers on the final candidate. No PR or issue
