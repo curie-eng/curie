@@ -66,6 +66,10 @@ another hardcoded handler. The five that exist:
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
   identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
+  A trusted intake that already owns a source thread may also pass a nonempty
+  `conversation_id` and `placeholder` pair, so the ordinary worker completes
+  that preposted reply in place. Message coordinates never replace the stored
+  binding's endpoint or adapter route (ADR-0182).
   This is a hardcoded platform ingress, not consumption of a bundle-declared
   `webhook` path.
 

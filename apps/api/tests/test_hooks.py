@@ -269,6 +269,30 @@ def test_an_incomplete_explicit_reply_target_is_refused_before_enqueue(
     assert _queued(valkey, runs_stream) == []
 
 
+def test_an_unsigned_caller_cannot_probe_explicit_target_validation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """Authentication precedes target validation, as it does for delivery ids."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="targetprobeagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        params={"conversation_id": "", "placeholder": ""},
+    )
+
+    assert answer.status_code == 401, answer.text
+    assert answer.json()["detail"] == "missing or invalid signature"
+    assert _queued(valkey, runs_stream) == []
+
+
 def test_a_duplicate_delivery_reports_the_original_explicit_conversation(
     hooks_client: TestClient,
     auth_headers: dict[str, str],
