@@ -1165,34 +1165,64 @@ mod tests {
         }
     }
 
+    fn approval_card_body(
+        content_type: &str,
+        client_msg_id: Option<&str>,
+        approval_id: &str,
+    ) -> String {
+        let blocks = serde_json::json!([{
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "action_id": APPROVE_ACTION_ID_PREFIX,
+                "value": approval_id,
+            }],
+        }]);
+        if content_type.contains("application/json") {
+            let mut body = serde_json::json!({"blocks": blocks});
+            if let Some(client_msg_id) = client_msg_id {
+                body["client_msg_id"] = serde_json::json!(client_msg_id);
+            }
+            return serde_json::to_string(&body).expect("encode approval card JSON");
+        }
+
+        let blocks = serde_json::to_string(&blocks).expect("encode approval card blocks");
+        let mut pairs = vec![("blocks", blocks.as_str())];
+        if let Some(client_msg_id) = client_msg_id {
+            pairs.push(("client_msg_id", client_msg_id));
+        }
+        serde_urlencoded::to_string(pairs).expect("encode approval card form")
+    }
+
     #[test]
-    fn approval_card_id_uses_the_action_value_with_a_distinct_or_missing_delivery_key() {
+    fn approval_card_id_accepts_equal_or_distinct_valid_client_keys() {
         let delivery_id = "00000000-0000-4000-8000-000000000220";
         let approval_id = "00000000-0000-4000-8000-000000000221";
-        let mismatched = format!(
-            r#"{{"client_msg_id":"{delivery_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
-        );
-        let missing_client = format!(
-            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
-        );
-        let blocks = format!(
-            r#"[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]"#
-        );
-        let form = serde_urlencoded::to_string([
-            ("client_msg_id", delivery_id),
-            ("blocks", blocks.as_str()),
-        ])
-        .expect("encode approval card form");
 
-        for (content_type, body) in [
-            ("application/json", mismatched.as_str()),
-            ("application/json", missing_client.as_str()),
-            ("application/x-www-form-urlencoded", form.as_str()),
-        ] {
-            assert_eq!(
-                approval_card_id(content_type, body).as_deref(),
-                Some(approval_id)
-            );
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [approval_id, delivery_id] {
+                let body = approval_card_body(content_type, Some(client_msg_id), approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body).as_deref(),
+                    Some(approval_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_missing_or_invalid_client_keys() {
+        let approval_id = "00000000-0000-4000-8000-000000000221";
+
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [None, Some("not-a-uuid")] {
+                let body = approval_card_body(content_type, client_msg_id, approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body),
+                    None,
+                    "{content_type} accepted client_msg_id={client_msg_id:?}",
+                );
+            }
         }
     }
 
