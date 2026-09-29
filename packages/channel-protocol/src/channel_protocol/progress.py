@@ -12,6 +12,10 @@ because no field accepts one, and an unknown field is refused rather than
 ignored. The command names no progress record at all: which record it updates
 is for the ingress to resolve from the authenticated running turn, never for the
 command to say.
+
+A card whose ``terminal`` flag disagrees with its state is refused with the
+error type ``progress_terminal``, for the reason ``channel_protocol.reply`` gives
+for its own rule types.
 """
 
 from enum import StrEnum

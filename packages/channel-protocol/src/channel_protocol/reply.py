@@ -57,6 +57,15 @@ answer text. A ``reply.post`` carrying ``progress`` still carries its
 ``message``, whose ``text`` is the mandatory plain-text fallback, and that
 message has no ``interaction``: the approval card remains the only actionable
 platform message (ADR-0130 section 3).
+
+Each of those cross-field rules refuses with its own error type, never a bare
+``value_error``: ``reply_wire_version``, ``progress_delivery_id``,
+``progress_not_an_answer`` and ``progress_not_actionable``, plus
+``progress_terminal`` from ``channel_protocol.progress``. The type is stable for
+a decoder in any language to match on, and it keeps the error list
+JSON-serializable. A ``value_error`` carries the raised exception object in its
+context, so an adapter that answers a refused body with its validation errors, as
+the Discord adapter's 422 does, would instead fail to encode its own refusal.
 """
 
 from typing import Annotated, Any, Literal, Self

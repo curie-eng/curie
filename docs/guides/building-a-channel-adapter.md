@@ -279,7 +279,10 @@ an `interaction`: the approval card stays the only actionable message.
 [`packages/channel-protocol/schema/reply-wire.corpus.json`](../../packages/channel-protocol/schema/reply-wire.corpus.json)
 holds a body for every 1.0 form, exactly as the platform serializes it, a body
 for every 1.1 form, and bodies the wire refuses, each with the reason. Decode
-it in your adapter's tests.
+it in your adapter's tests. Each cross-field rule refuses with its own error
+type (`reply_wire_version`, `progress_delivery_id`, `progress_not_an_answer`,
+`progress_not_actionable`, `progress_terminal`), so match on the type, not on
+message text.
 
 Nothing on the platform sends a 1.1 body yet. The Discord and mail adapters in
 this repository decode 1.1 through the shared package, but neither handles
