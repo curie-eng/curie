@@ -133,6 +133,8 @@ def test_real_ci_registers_its_calico_runtime_assertions() -> None:
             "charts/curie/ci/runtime/publication-job-assertions.sh",
             "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
             "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+            "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
+            "charts/curie/ci/runtime/runner-resources-assertions.sh",
         ],
     )
 
