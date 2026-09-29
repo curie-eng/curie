@@ -227,6 +227,89 @@ def test_workflow_change_without_text_hunk_fails_closed(
         SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head)
 
 
+def test_single_line_flow_job_edit_selects_upgrade(
+    git_repo: tuple[Path, str],
+) -> None:
+    repo, base = git_repo
+    flow_job = "  e2e-released-upgrade: {runs-on: ubuntu-latest, steps: [{run: echo old}]}\n"
+    block_job = (
+        "  e2e-released-upgrade:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo e2e-released-upgrade\n"
+    )
+    # Both commits use the valid compact representation; only its command changes.
+    (repo / WORKFLOW_PATH).write_text(
+        _workflow().replace(block_job, flow_job), encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "flow base")
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit_workflow(
+        repo, _workflow().replace(block_job, flow_job.replace("echo old", "echo new"))
+    )
+
+    assert SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head) is True
+
+
+def test_multiline_flow_job_final_line_selects_upgrade(
+    git_repo: tuple[Path, str],
+) -> None:
+    repo, _ = git_repo
+    block_job = (
+        "  e2e-released-upgrade:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo e2e-released-upgrade\n"
+    )
+    flow_job = (
+        "  e2e-released-upgrade: {runs-on: ubuntu-latest,\n"
+        "    steps: [{run: echo old}]}\n"
+    )
+    (repo / WORKFLOW_PATH).write_text(
+        _workflow().replace(block_job, flow_job), encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "flow base")
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit_workflow(
+        repo, _workflow().replace(block_job, flow_job.replace("echo old", "echo new"))
+    )
+
+    assert SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head) is True
+
+
+@pytest.mark.parametrize("change", ("retarget", "anchor edit"))
+def test_aliased_upgrade_job_fails_closed(
+    git_repo: tuple[Path, str], change: str
+) -> None:
+    repo, _ = git_repo
+    base_text = _workflow(("before", "second", *TARGETS, "after")).replace(
+        "  before:\n",
+        "  before: &first\n",
+        1,
+    ).replace("  second:\n", "  second: &second\n", 1)
+    block_job = (
+        "  e2e-released-upgrade:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo e2e-released-upgrade\n"
+    )
+    base_text = base_text.replace(block_job, "  e2e-released-upgrade: *first\n")
+    (repo / WORKFLOW_PATH).write_text(base_text, encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "alias base")
+    base = _git(repo, "rev-parse", "HEAD")
+    if change == "retarget":
+        changed = base_text.replace("e2e-released-upgrade: *first", "e2e-released-upgrade: *second")
+    else:
+        changed = base_text.replace("echo before", "echo changed")
+    head = _commit_workflow(repo, changed)
+
+    with pytest.raises(SELECTOR_MODULE.RegistryError):
+        SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head)
+
+
 @pytest.mark.parametrize("omit_kind", (False, True), ids=("main", "next"))
 def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
     git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool

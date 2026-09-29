@@ -276,7 +276,7 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
 
     spans: dict[str, tuple[int, int]] = {}
     seen_jobs: set[str] = set()
-    for key, value in jobs_node.value:
+    for index, (key, value) in enumerate(jobs_node.value):
         if not isinstance(key, yaml.nodes.ScalarNode):
             raise RegistryError("workflow job keys must be strings")
         if key.value in seen_jobs:
@@ -285,7 +285,32 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
         if key.value in UPGRADE_WORKFLOW_JOBS:
             if not isinstance(value, yaml.nodes.MappingNode):
                 raise RegistryError(f"workflow job {key.value} must be a mapping")
-            spans[key.value] = (key.start_mark.line + 1, value.end_mark.line + 1)
+            beginning = key.start_mark.line + 1
+            if index + 1 < len(jobs_node.value):
+                next_key, _ = jobs_node.value[index + 1]
+                end = next_key.start_mark.line + 1
+            else:
+                end = len(content.splitlines()) + 1
+            # Two flow-style job keys can share a physical line. Both own it.
+            spans[key.value] = (beginning, max(beginning + 1, end))
+
+    # PyYAML resolves aliases to the anchor's source node and keeps the anchor's
+    # marks. Until we track anchor dependencies, refuse an aliased target job
+    # instead of silently treating its external definition as unrelated.
+    try:
+        alias_lines = (
+            event.start_mark.line + 1
+            for event in yaml.parse(content)
+            if isinstance(event, yaml.events.AliasEvent)
+        )
+        if any(
+            beginning <= line < end
+            for line in alias_lines
+            for beginning, end in spans.values()
+        ):
+            raise RegistryError("released-upgrade job uses a YAML alias")
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
     return spans
 
 

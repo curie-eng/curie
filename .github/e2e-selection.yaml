@@ -66,8 +66,9 @@ rules:
     apps/ui: []
     apps/dispatcher: []
     scripts: []
-    # Edits to the released-upgrade jobs select nothing either. Dispatch CI on
-    # the branch to run them before merge.
+    # The revision-based selector inspects ci.yaml hunks and runs the full
+    # released-upgrade tier when one of its upgrade jobs changes. Other
+    # workflow edits stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []
