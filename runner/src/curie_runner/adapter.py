@@ -476,8 +476,17 @@ def build_options(
         # Empty/None means no bundle hooks; the SDK default applies. The event
         # keys are the SDK's HookEvent literals (we emit only "PreToolUse").
         hooks=cast("Any", hooks),
-        # In-process platform tools (the approval-request gate, ADR-0010).
+        # In-process platform tools (the approval-request gate, ADR-0010),
+        # connectors, and the bundle's own servers (plugin.bundle_mcp_servers).
         mcp_servers=cast("Any", mcp_servers or {}),
+        # Only the servers above may load (#2899). Without this the CLI also
+        # loads the cwd's project ``.mcp.json``, user settings and marketplace
+        # plugin servers: none of them is in the capability probe, so
+        # ``policy_disallowed_tools`` never covers them, and a mounted workspace
+        # is agent-writable, so its ``.mcp.json`` is bundle-influenced input.
+        # Strict mode also drops ``--plugin-dir`` servers, which is why callers
+        # pass the bundle's servers in ``mcp_servers`` themselves.
+        strict_mcp_config=True,
         include_partial_messages=True,
         # Commit/PR attribution off for every session this runner builds
         # (#3193); see _SDK_ATTRIBUTION_OFF_SETTINGS above.

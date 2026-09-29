@@ -1001,22 +1001,20 @@ def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -
     of a DIFFERENT server whose key merely begins ``curie__`` or
     ``curie-state__``: ``mcp__curie__extra__foo`` and
     ``mcp__curie-state__extra__bar`` both matched, and both were handed a bundle
-    toolPolicy bypass. That is reachable, not theoretical --
-    ``ClaudeAgentOptions.strict_mcp_config`` defaults to False and
-    ``adapter.build_options`` never sets it, so the CLI loads project
-    ``.mcp.json``, user settings and plugin servers BESIDE the ``--mcp-config``
-    dict ``build_mcp_servers`` controls (``check.py::evaluate`` already treats
-    those ambient servers as real). A mounted workspace is the session cwd, it is
-    writable, and it survives across sandboxes, so a ``.mcp.json`` sitting there
-    is bundle-influenced input. A connector cannot do it (a connector name may
-    not contain ``_``), an ambient project server can.
+    toolPolicy bypass. It was reachable while ``adapter.build_options`` left
+    ``strict_mcp_config`` off: the CLI then loaded project ``.mcp.json``, user
+    settings and plugin servers BESIDE the ``--mcp-config`` dict, and a mounted
+    workspace is the session cwd, writable, and survives across sandboxes, so a
+    ``.mcp.json`` sitting there was bundle-influenced input. A connector cannot
+    do it (a connector name may not contain ``_``), an ambient project server
+    could.
 
-    The residual this does NOT close, stated rather than hidden: when the
-    platform HAS mounted a server, an impostor publishing a name-identical tool
-    is exempt too, because the live name is the entire thing this gate sees --
-    ``mcp__curie-state__get`` from an ambient server and from Curie's own server
-    are the same string. Closing that needs ``strict_mcp_config`` or an
-    ambient-server policy, which is a separate change and out of scope here. The
+    The residual the exact match alone cannot close: when the platform HAS
+    mounted a server, an impostor publishing a name-identical tool is exempt
+    too, because the live name is the entire thing this gate sees. #2899 closes
+    it one layer down: the runner now sets ``strict_mcp_config``, so no server
+    outside the ``--mcp-config`` dict the runner builds can load, and this exact
+    match stays as defence in depth. The
     class this closes is the one the prefix match invented: every name on a
     platform-shaped prefix that the platform does not itself publish.
 
