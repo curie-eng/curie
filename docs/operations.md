@@ -30,6 +30,37 @@ API server typically binds loopback, which can make it unreachable from a
 pod; if `cluster message` can't auto-detect a pod-reachable host, pass
 `--listen-host` explicitly (see `cli/README.md`).
 
+**On Apple Silicon (arm64)**, two caveats:
+
+- The AVX preflight is x86-only. `preflights.avxCheck` greps the node's
+  `/proc/cpuinfo` for the `avx` flag, which no arm64 CPU reports, so the
+  check fails on every arm64 node regardless of tool. Disable it with
+  `curie cluster up --set preflights.avxCheck.enabled=false`. The chart
+  README's other remedy for a failing AVX check -- pinning an SSE4.2-safe
+  ClickHouse tag -- is no better here: those tags predate the current
+  Langfuse migration set and cannot apply it (see
+  `charts/curie/README.md`).
+- Prefer **kind** over **minikube** when the full stack matters. On
+  minikube's docker driver, ClickHouse has been observed crash-looping
+  (`std::terminate` in `MergeTreeData::loadOutdatedDataParts`, signal 5)
+  while every other component reports healthy and `cluster up` still
+  reports success -- a silent failure. The crash did not reproduce in a
+  bare `docker run` of the same image, config, and resource limits, which
+  points at minikube's node setup rather than the chart: the same chart,
+  version, and overrides converge cleanly on kind, with real traces and
+  evals working. `cluster up` reports success either way, so after startup
+  verify the ClickHouse pod yourself (shown for the default namespace and
+  release):
+
+  ```bash
+  kubectl -n curie get pod curie-clickhouse-0
+  ```
+
+  A healthy pod is `1/1 Running` with a `RESTARTS` count that stays put --
+  re-run after a minute if in doubt. `CrashLoopBackOff`, or a `RESTARTS`
+  count that keeps climbing on minikube, is the silent failure described
+  above: recreate the cluster with kind instead.
+
 **For production**, you'll likely point at a managed or self-hosted cluster
 instead. Name it on every `cluster` command with `--context` (see below), so a
 stale kubeconfig current-context cannot send a command at the wrong cluster:
@@ -444,8 +475,8 @@ revision or a pending contract/irreversible migration without
 `--forward-only` refuses before `helm upgrade`. `--forward-only` sets
 `api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
 `migrate` phase is a resumable checkpoint boundary only; it performs no
-migration of its own. Revision 0069 is such a migration; see
-[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0069)
+migration of its own. Revision 0070 is such a migration; see
+[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0070)
 before an upgrade crosses it.
 
 The redacted plan names the configuration schema version the upgrade migrates
@@ -861,7 +892,10 @@ deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
 what each round tried. No checks within 120 s of the push completes with a
-note. Checks still pending when the CI wait (by default 1200 s from the push, or the
+note only when no required check applies. A factory Python publication needs
+the selected `Python (ruff + mypy + pytest)` Actions check to run and pass;
+missing, skipped, unreadable, unrelated, or failed evidence cannot complete it.
+Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
@@ -984,8 +1018,9 @@ operators raise the delivery budget for factory agents.
 
 A work item run boots its runner with a turn budget of `worker.workItemMaxTurns`
 (default 1000), so the deadline rather than the runner's default of 20 turns
-bounds it. A run that still exhausts its turns fails as `runner_escalated` with
-the classification `max-turns`.
+bounds it. A run that still exhausts its turns fails as `max_turns` with
+failure class `max-turns`. An unclassified runner failure fails as
+`unclassified`.
 
 Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
@@ -1011,11 +1046,21 @@ once more in the same session. If it still does not publish, it ends as
 final reply, redacted and shown inside a code fence so none of it renders.
 A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
-`owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
+`owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
+`no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
 `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
-`workspace_error`, or `history_capacity`). A history capacity result tells the
+`workspace_error`, or `history_capacity`). When the cause has a runner failure
+class, the next line is `Failure class:` and that token. The same token is the
+first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
+that sees only the delivered text can tell the turn from a successful reply.
+Other escalations use that same first line with their own token
+(`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
+`approval-backend-missing`, `publication-unavailable`, or
+`approval-create-failed`). A failed run whose cause is `runner_escalated`,
+`unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
 credits ends the run as `model_credit_exhausted` without retrying. A run that a
@@ -1290,8 +1335,10 @@ or `CURIE_FACTORY_NODE_SSH_HOST`); without it the run fails rather than passing
 on SIGTERM cleanup. Path B deletes the drain Job
 while a 20 minute upgrade still waits; the marker must clear within 10 s and
 the drain pod log must say the gate was terminated. Helm treats a deleted hook
-Job as finished and goes on with the upgrade, so path B records the helm exit
-code without judging it. The evidence judges
+Job as finished, so the chart's later attest hook refuses the upgrade unless
+this revision recorded a successful drain. Path B still records the helm exit
+code without judging it: this scenario proves the marker clear, and the exit
+code is evidence for that refusal rather than a pass condition here. The evidence judges
 `seed_status_before`, `baseline_state`, the `path_a_*` helm exit, elapsed,
 state and ttl fields, `doctor_worker_claims_line`, `paused_comment_found`,
 `queued_status_while_quiesced`, `path_a_clear_seconds`,
@@ -1707,9 +1754,9 @@ move/merge every general-state row into that one shape. Re-run the preflights,
 then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
 flags, state rows, the constraint, and the Alembic revision stay unchanged.
 
-### Slack route identity migration (Alembic revision 0069)
+### Slack route identity migration (Alembic revision 0070)
 
-Revision 0069 is a contract migration (ADR-0168 decision 3), and it ships in
+Revision 0070 is a contract migration (ADR-0168 decision 3), and it ships in
 v0.11.0. It stores the identity on every Slack binding, `default` where none was
 named, and makes the binding key `(kind, address, adapter)`, so two identities
 can bind one channel. Before it changes anything it refuses, naming each row,
@@ -1750,7 +1797,7 @@ Three things they do fail against it:
 - A v0.10.x API pod answers a Slack binding write with a 500: creating an agent
   with a Slack channel, adding or changing a Slack binding (`surfaces --add`, or
   a deploy that binds a channel), or moving a binding to Slack. It writes a
-  Slack binding with no identity, which 0069's check refuses.
+  Slack binding with no identity, which 0070's check refuses.
 - A v0.10.x API pod compares a publication replay's reply adapter as stored, so
   a replay of a publication raised before the migration, which now names
   `default`, is refused as a conflict.
@@ -1774,7 +1821,7 @@ and retry any write that failed during it.
 
 A local stack runs the same schema check in its one-shot `curie-migrate`
 service, which takes no forward-only flag, so `curie local up` on a volume that
-predates 0069 fails at that service. Run `curie local up --dry-run`, with the
+predates 0070 fails at that service. Run `curie local up --dry-run`, with the
 flags you normally pass, to print the exact compose command it would run.
 Run that command with its trailing `up -d --wait` replaced by
 `run --rm -e CURIE_SCHEMA_FORWARD_ONLY=true curie-migrate`, then run

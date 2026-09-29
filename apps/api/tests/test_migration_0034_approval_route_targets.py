@@ -15,43 +15,22 @@ import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0033"
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
 
 
 def _seed_agent(name: str, routes: dict[str, Any] | None) -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name, approval_routes) "
         "VALUES (:id, :name, CAST(:routes AS jsonb))",
         {
@@ -64,15 +43,15 @@ def _seed_agent(name: str, routes: dict[str, Any] | None) -> uuid.UUID:
 
 
 def _routes_by_name() -> dict[str, dict[str, Any] | None]:
-    rows = _sql("SELECT name, approval_routes FROM curie.agents ORDER BY name")
+    rows = sql_rows("SELECT name, approval_routes FROM curie.agents ORDER BY name")
     return {row[0]: row[1] for row in rows}
 
 
 def test_upgrade_rewrites_legacy_routes_preserving_approvers(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     _seed_agent(
         "legacy-route",
         {
@@ -86,7 +65,7 @@ def test_upgrade_rewrites_legacy_routes_preserving_approvers(
     _seed_agent("empty-routes", {})
     _seed_agent("null-routes", None)
     json_null_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name, approval_routes) "
         "VALUES (:id, :name, 'null'::jsonb)",
         {"id": json_null_id, "name": "json-null-routes"},
@@ -94,7 +73,7 @@ def test_upgrade_rewrites_legacy_routes_preserving_approvers(
 
     command.upgrade(cfg, "head")
 
-    json_null_preserved = _sql(
+    json_null_preserved = sql_rows(
         "SELECT approval_routes = 'null'::jsonb FROM curie.agents WHERE id = :id",
         {"id": json_null_id},
     )
@@ -115,10 +94,10 @@ def test_upgrade_rewrites_legacy_routes_preserving_approvers(
 
 
 def test_upgrade_refuses_malformed_legacy_routes_without_partial_rewrite(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     _seed_agent("a-valid", {"managers": {"channel": "C0EXAMPLE1"}})
     _seed_agent("z-malformed", {"legal": {"channel": 17}})
     before = _routes_by_name()
@@ -133,15 +112,15 @@ def test_upgrade_refuses_malformed_legacy_routes_without_partial_rewrite(
 
 
 def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The preflight and rewrite exclude writes for the whole transaction."""
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     _seed_agent("slow-route", {"managers": {"channel": "C0EXAMPLE1"}})
     writer_id = _seed_agent("writer-agent", None)
-    _sql(
+    sql_rows(
         """
         CREATE FUNCTION curie.pause_approval_route_rewrite() RETURNS trigger
         LANGUAGE plpgsql AS $$
@@ -154,7 +133,7 @@ def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
         $$
         """
     )
-    _sql(
+    sql_rows(
         """
         CREATE TRIGGER pause_approval_route_rewrite
         BEFORE UPDATE ON curie.agents
@@ -180,7 +159,7 @@ def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
     with ThreadPoolExecutor(max_workers=1) as pool:
         migration = pool.submit(command.upgrade, cfg, "head")
         deadline = time.monotonic() + 3
-        while not _sql(
+        while not sql_rows(
             """
             SELECT 1 FROM pg_stat_activity
             WHERE query LIKE '%UPDATE curie.agents AS a%'
@@ -197,16 +176,16 @@ def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
             concurrent_write()
         migration.result(timeout=5)
 
-    assert _sql("SELECT name FROM curie.agents WHERE id = :id", {"id": writer_id}) == [
+    assert sql_rows("SELECT name FROM curie.agents WHERE id = :id", {"id": writer_id}) == [
         ("writer-agent",)
     ]
 
 
 def test_downgrade_restores_lossless_slack_only_routes(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     _seed_agent(
         "round-trip",
         {
@@ -266,14 +245,14 @@ def test_downgrade_refuses_lossy_split_routes_without_partial_rewrite(
     agent_name: str,
     routes: dict[str, Any],
     reason: str,
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent(agent_name, {"managers": {"channel": "C0EXAMPLE1"}})
     _seed_agent("healthy-agent", {"legal": {"channel": "C0EXAMPLE2"}})
     command.upgrade(cfg, "head")
-    _sql(
+    sql_rows(
         "UPDATE curie.agents SET approval_routes = CAST(:routes AS jsonb) WHERE id = :id",
         {
             "id": agent_id,

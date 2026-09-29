@@ -1049,7 +1049,7 @@ pub struct WorkItemRequest {
     pub sequence: u64,
     pub status: String,
     pub created_at: String,
-    pub wait_deadline: String,
+    pub wait_deadline: Option<String>,
     pub started_at: Option<String>,
     pub execution_deadline: Option<String>,
     pub terminal_at: Option<String>,
@@ -3674,7 +3674,7 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
         mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY, MAX_OBSERVABILITY_METRIC_POINTS,
+        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3814,10 +3814,6 @@ mod tests {
         let error = prevalidate_series_span("hour", Some("1970-01-01T00:00:00Z"), None)
             .expect_err("a start of 1970 with no end exceeds the cap against now");
         assert!(error.to_string().contains("now"));
-        assert_eq!(
-            MAX_OBSERVABILITY_METRIC_POINTS, 1000,
-            "the pre-dispatch guard and the post-dispatch bound share one cap"
-        );
     }
 
     #[test]

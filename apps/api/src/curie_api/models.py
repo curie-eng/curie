@@ -276,7 +276,7 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running. Migration 0069 widens the
+    after the cutover proves no old worker is running. Migration 0070 widens the
     key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
@@ -296,7 +296,7 @@ class AgentChannel(Base):
     __tablename__ = "agent_channels"
     __table_args__ = (
         # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
-        # decision 3, migration 0069; 0023 keyed the pair, 0021 the address).
+        # decision 3, migration 0070; 0023 keyed the pair, 0021 the address).
         # A second agent bound to the same route could never respond -- it
         # would be silently shadowed (#38). Enforced here so it fails at create
         # time. The pair leads so `(kind, address)` lookups keep the index
@@ -717,8 +717,12 @@ class ExecutionRequest(Base):
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
+            "status IN ('queued', 'cancelled') OR wait_deadline IS NOT NULL",
+            name="execution_requests_wait_deadline_ck",
+        ),
+        CheckConstraint(
             "status IS NOT NULL AND status IN "
-            "('waiting', 'running', 'cancellation_requested', 'completed', "
+            "('queued', 'waiting', 'running', 'cancellation_requested', 'completed', "
             "'failed', 'expired', 'cancelled')",
             name="execution_requests_status_ck",
         ),
@@ -740,7 +744,10 @@ class ExecutionRequest(Base):
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'waiting' AND started_at IS NULL "
+            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'running' AND started_at IS NOT NULL "
@@ -771,7 +778,7 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NOT NULL))) "
             "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause = 'issue_cancelled' AND "
+            "AND terminal_cause IN ('issue_cancelled', 'lineage_closed') AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
@@ -843,6 +850,12 @@ class ExecutionRequest(Base):
             postgresql_where=text("status = 'waiting'"),
         ),
         Index(
+            "ix_execution_requests_queued",
+            "work_item_id",
+            "sequence",
+            postgresql_where=text("status = 'queued'"),
+        ),
+        Index(
             "ix_execution_requests_runtime_liveness",
             "runtime_heartbeat_expires_at",
             postgresql_where=text(
@@ -857,7 +870,7 @@ class ExecutionRequest(Base):
     )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
-    wait_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

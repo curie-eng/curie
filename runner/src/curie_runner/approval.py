@@ -277,8 +277,13 @@ _PUBLISH_DESCRIPTION = (
     " identify the repository's own documented test or check command for the"
     " area you changed, run it from /workspace, and report the exact command,"
     " its exit status, and a concise result in the session thread. If you"
-    " cannot identify or run an appropriate command, report that and do not"
-    " publish. If the command fails, report the failure and do not publish. If"
+    " cannot identify an appropriate command, report that and do not publish."
+    " If the command cannot run because a required binary or service is unavailable,"
+    " report that cause and publish only through a declared required CI route that"
+    " selects the changed paths. The pull request must state that in-sandbox"
+    " verification was unavailable and CI is pending proof. If no matching route"
+    " exists, do not publish. If the command runs and fails, report the failure"
+    " and do not publish. If"
     " verification generates artifacts, do not publish unrequested artifacts:"
     " use the repository's documented cleanup procedure when one exists and"
     " remove only artifacts this verification created, never requested or"
@@ -691,6 +696,12 @@ class ApprovalGate:
     policy_rejected: bool = False
     policy_route: str | None = None
     grant_tool: str | None = None
+    # The canonical arguments the approver saw (#3174), carried on the trusted
+    # resume boot input (#3255). When set, the grant admits only a call whose
+    # arguments are canonically equal; None (a policy grant, which authorizes a
+    # business decision rather than one call, or an approval recorded before
+    # arguments were carried) keeps the tool-name-only match.
+    grant_arguments: dict[str, Any] | None = None
     grantable_by_route: dict[str, str] = field(default_factory=dict)
     publication_title: str | None = None
     publication_body: str | None = None
@@ -758,6 +769,7 @@ class ApprovalGate:
         # leaks into a subsequent turn.
         if self._boot_turn_seen:
             self.grant_tool = None
+            self.grant_arguments = None
         self._boot_turn_seen = True
 
     def bind_publication_context(self, context: PublicationContext | None) -> None:
@@ -801,13 +813,34 @@ class ApprovalGate:
             self._publication_pending_id = None
         return refusal
 
-    def consume_grant(self, tool_name: str) -> bool:
-        """Spend the one-shot grant iff it names ``tool_name`` (single use)."""
+    def grant_argument_mismatch(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        """Whether an unspent grant names ``tool_name`` but not these arguments (#3174)."""
 
-        if self.grant_tool is not None and tool_name == self.grant_tool:
-            self.grant_tool = None
-            return True
-        return False
+        return (
+            self.grant_tool is not None
+            and tool_name == self.grant_tool
+            and self.grant_arguments is not None
+            and _canonical_arguments(tool_input) != _canonical_arguments(self.grant_arguments)
+        )
+
+    def consume_grant(self, tool_name: str, tool_input: dict[str, Any] | None = None) -> bool:
+        """Spend the one-shot grant iff it names ``tool_name`` (single use).
+
+        When the grant carries the approved arguments, the call's arguments
+        must also be canonically equal to them (#3174). A mismatch leaves the
+        grant unspent so the exact approved call can still run once.
+        """
+
+        if self.grant_tool is None or tool_name != self.grant_tool:
+            return False
+        if self.grant_arguments is not None and (
+            tool_input is None
+            or _canonical_arguments(tool_input) != _canonical_arguments(self.grant_arguments)
+        ):
+            return False
+        self.grant_tool = None
+        self.grant_arguments = None
+        return True
 
     def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         # Outside the first-block guard on purpose (#1852): the FIRST blocked
@@ -1061,6 +1094,21 @@ def policy_disallowed_tools(
     )
 
 
+def _canonical_arguments(arguments: dict[str, Any]) -> str:
+    """Canonical JSON for argument equality: sorted keys, no insignificant space."""
+
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _grant_mismatch_refusal(tool_name: str) -> str:
+    return (
+        f"The approval for {tool_name} covers only the exact arguments the approver "
+        "saw, and this call's arguments differ. It was not run. Retry with exactly "
+        "the approved arguments, or tell the user what changed so they can approve "
+        "the new call."
+    )
+
+
 async def _decide_gate(
     gate: ApprovalGate,
     tool_name: str,
@@ -1098,7 +1146,14 @@ async def _decide_gate(
     # Policy gates are additive to legacy/operator gates. A policy allow never
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
-        if gate.consume_grant(tool_name):
+        if gate.grant_argument_mismatch(tool_name, tool_input):
+            return _GateDecision(
+                blocked=False,
+                ungated=False,
+                refusal=_grant_mismatch_refusal(tool_name),
+                continue_turn=True,
+            )
+        if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False)
         gate.block(tool_name, tool_input)
         return _GateDecision(blocked=True, ungated=False)
@@ -1106,7 +1161,16 @@ async def _decide_gate(
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
     # injected or stale grant must never let the in-sandbox tool execute.
-    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
+    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
+        tool_name, tool_input
+    ):
+        return _GateDecision(
+            blocked=False,
+            ungated=False,
+            refusal=_grant_mismatch_refusal(tool_name),
+            continue_turn=True,
+        )
+    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
     if (
@@ -1558,6 +1622,8 @@ def build_approval_gate(
     operator_tools: Sequence[str] | None,
     policy_routes: dict[str, str],
     grant_tool: str | None = None,
+    grant_arguments: dict[str, Any] | None = None,
+    resumed_kind: str | None = None,
     grantable_by_route: dict[str, str] | None = None,
     summary_by_tool: dict[str, str] | None = None,
     bundle_name: str | None = None,
@@ -1683,10 +1749,26 @@ def build_approval_gate(
     if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PLATFORM_PUBLISH_TOOL_NAME else grant_tool
+    # #3174: only a policy grant may be admitted by name alone, and it must be
+    # one on both counts: the resume is recorded as a policy approval AND the
+    # tool is one some grantableViaPolicy route maps to. ``resumed_kind`` only
+    # narrows here; it never creates a grant. A permission grant without the
+    # approved arguments (an old row, or a malformed carrier) cannot prove what
+    # the approver saw, so it is dropped and the call asks for a fresh approval.
+    policy_grant = resumed_kind == "policy" and safe_grant_tool in set(
+        (grantable_by_route or {}).values()
+    )
+    if safe_grant_tool is not None and grant_arguments is None and not policy_grant:
+        logger.warning(
+            "dropping resume grant for %s: no approved arguments were carried",
+            safe_grant_tool,
+        )
+        safe_grant_tool = None
     return ApprovalGate(
         required=gated_tools,
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
+        grant_arguments=grant_arguments if safe_grant_tool is not None else None,
         grantable_by_route=grantable_by_route or {},
         summary_by_tool=summary_by_tool or {},
         tool_policy=tool_policy,

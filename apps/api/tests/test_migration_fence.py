@@ -77,13 +77,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows, stamped_revision
 from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Targeted explicitly, never as a relative "-1" (#1391).
 BELOW_0022 = "0021a"
@@ -126,40 +125,18 @@ PAUSE_SECONDS = 2.0
 BOUND_SECONDS = 20.0
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    """Run one statement against the isolated migration database."""
-
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
-def _at(revision: str) -> Config:
-    cfg = _alembic_config()
-    command.upgrade(cfg, revision)
-    return cfg
+def _at(db: IsolatedMigrationDb, revision: str) -> Config:
+    db.at(revision)
+    return alembic_config()
 
 
 def _seed_binding(name: str, kind: str, address: str) -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": name},
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, :kind, :addr)",
         {"id": uuid.uuid4(), "agent": agent_id, "kind": kind, "addr": address},
@@ -181,7 +158,7 @@ def _seed_approval(
     approval_id = uuid.uuid4()
     columns = "" if reply_kind is None else ", reply_kind"
     values = "" if reply_kind is None else ", :kind"
-    _sql(
+    sql_rows(
         "INSERT INTO curie.approvals "
         f"(id, conversation_id, author, summary, reply_channel, reply_placeholder, "
         f" dedupe_key, status{columns}) "
@@ -203,7 +180,7 @@ def _seed_approval(
 
 def _seed_audit_row(approval_id: uuid.UUID, action: str) -> uuid.UUID:
     entry_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.approval_audit_entries "
         "(id, approval_id, action, actor, decision, authorizer, authorized, reason) "
         "VALUES (:id, :ap, :action, 'U0HUMAN', 'none', 'route', true, 'pre-existing')",
@@ -213,7 +190,7 @@ def _seed_audit_row(approval_id: uuid.UUID, action: str) -> uuid.UUID:
 
 
 def _audit_rows(approval_id: uuid.UUID) -> list[Any]:
-    return _sql(
+    return sql_rows(
         "SELECT id, action, actor, decision, authorizer, authorized, reason, evidence "
         "FROM curie.approval_audit_entries WHERE approval_id = :id ORDER BY created_at, id",
         {"id": approval_id},
@@ -221,7 +198,7 @@ def _audit_rows(approval_id: uuid.UUID) -> list[Any]:
 
 
 def _audit_table_columns() -> set[str]:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'approval_audit_entries'"
     )
@@ -229,20 +206,15 @@ def _audit_table_columns() -> set[str]:
 
 
 def _approvals_columns() -> set[str]:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'approvals'"
     )
     return {row[0] for row in rows}
 
 
-def _stamped_revision() -> str | None:
-    rows = _sql("SELECT version_num FROM curie.alembic_version")
-    return rows[0][0] if rows else None
-
-
 def _reply_identity(approval_id: uuid.UUID) -> tuple[str | None, str | None]:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT reply_kind, reply_adapter FROM curie.approvals WHERE id = :id",
         {"id": approval_id},
     )
@@ -306,7 +278,7 @@ def _install_version_stamp_pause(revision: str) -> None:
     fence -- and works for a revision that backfills and one that does not.
     """
 
-    _sql(
+    sql_rows(
         f"""
         CREATE FUNCTION curie.pause_at_version_stamp() RETURNS trigger
         LANGUAGE plpgsql AS $$
@@ -319,7 +291,7 @@ def _install_version_stamp_pause(revision: str) -> None:
         $$
         """
     )
-    _sql(
+    sql_rows(
         """
         CREATE TRIGGER pause_at_version_stamp
         BEFORE UPDATE ON curie.alembic_version
@@ -332,7 +304,7 @@ def _await_paused_migration(migration: Any) -> None:
     """Block until the migration is inside the pause, or fail. Never hangs."""
 
     deadline = time.monotonic() + BOUND_SECONDS
-    while not _sql(
+    while not sql_rows(
         "SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep' "
         "AND datname = current_database()"
     ):
@@ -348,7 +320,7 @@ def _await_waiting_on_lock(probe: Any, needle: str) -> None:
 
     deadline = time.monotonic() + BOUND_SECONDS
     while True:
-        waiting = _sql(
+        waiting = sql_rows(
             "SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
             "AND datname = current_database() AND query LIKE :needle",
             {"needle": f"%{needle}%"},
@@ -410,7 +382,7 @@ def _hold_conflicting_lock(table: str, ready: Any, release: Any) -> None:
 
 
 def test_a_concurrent_approval_insert_blocks_on_the_fence_and_then_succeeds(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """AC1/AC2's load-bearing property, and the replacement for every 503.
 
@@ -428,7 +400,7 @@ def test_a_concurrent_approval_insert_blocks_on_the_fence_and_then_succeeds(
     the raced INSERT is shaped exactly like the live one it stands in for.
     """
 
-    cfg = _at(BELOW_0024)
+    cfg = _at(isolated_migration_db, BELOW_0024)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     _install_version_stamp_pause(REVISION_0024)
 
@@ -450,11 +422,11 @@ def test_a_concurrent_approval_insert_blocks_on_the_fence_and_then_succeeds(
         probe.result(timeout=BOUND_SECONDS)
 
     # It was queued, never refused.
-    assert _sql("SELECT status FROM curie.approvals WHERE id = :id", {"id": raced}) == [
+    assert sql_rows("SELECT status FROM curie.approvals WHERE id = :id", {"id": raced}) == [
         ("pending",)
     ]
     # And it landed AFTER the preflight, so it was never in the preflight's set.
-    assert _stamped_revision() == REVISION_0024
+    assert stamped_revision() == REVISION_0024
 
 
 def _read_then_write(read_done: Any, proceed: Any) -> None:
@@ -486,7 +458,7 @@ def _read_then_write(read_done: Any, proceed: Any) -> None:
 
 
 def test_a_reader_that_becomes_a_writer_is_not_deadlocked_by_the_fence(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The deadlock the weaker fence created, as a test. AC1/AC2.
 
@@ -508,7 +480,7 @@ def test_a_reader_that_becomes_a_writer_is_not_deadlocked_by_the_fence(
 
     import threading
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(reply_channel="C0EXAMPLE1")
 
@@ -525,7 +497,7 @@ def test_a_reader_that_becomes_a_writer_is_not_deadlocked_by_the_fence(
         # Either way it is the state from which releasing the resolver's write
         # closes the cycle.
         deadline = time.monotonic() + BOUND_SECONDS
-        while not _sql(
+        while not sql_rows(
             "SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
             "AND datname = current_database() AND query LIKE '%curie.approvals%'"
         ):
@@ -541,17 +513,17 @@ def test_a_reader_that_becomes_a_writer_is_not_deadlocked_by_the_fence(
         resolver.result(timeout=BOUND_SECONDS)
         migration.result(timeout=BOUND_SECONDS)
 
-    assert _stamped_revision() == REVISION_0022
+    assert stamped_revision() == REVISION_0022
     # The resolver's write survived, and the approval kept the identity the
     # migration established behind the fence.
-    assert _sql(
+    assert sql_rows(
         "SELECT reply_placeholder FROM curie.approvals WHERE id = :id", {"id": approval}
     ) == [("resolved",)]
     assert _reply_identity(approval) == ("slack", None)
 
 
 def test_the_fence_refuses_within_its_timeout_and_mutates_nothing(
-    isolated_migration_db: None, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC2's bound, and the second negative control.
 
@@ -563,12 +535,12 @@ def test_the_fence_refuses_within_its_timeout_and_mutates_nothing(
     """
 
     monkeypatch.setenv(LOCK_TIMEOUT_ENV, "500")
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(reply_channel="C0EXAMPLE1")
 
     columns_before = _approvals_columns()
-    rows_before = _sql("SELECT id, status, reply_channel FROM curie.approvals ORDER BY id")
+    rows_before = sql_rows("SELECT id, status, reply_channel FROM curie.approvals ORDER BY id")
 
     import threading
 
@@ -594,9 +566,10 @@ def test_the_fence_refuses_within_its_timeout_and_mutates_nothing(
 
     # Nothing moved: no new columns, no stamped revision, no touched rows.
     assert _approvals_columns() == columns_before
-    assert _stamped_revision() == BELOW_0022
-    assert _sql("SELECT id, status, reply_channel FROM curie.approvals ORDER BY id") == rows_before
-    assert _sql("SELECT id FROM curie.approvals WHERE id = :id", {"id": approval})
+    assert stamped_revision() == BELOW_0022
+    rows_after = sql_rows("SELECT id, status, reply_channel FROM curie.approvals ORDER BY id")
+    assert rows_after == rows_before
+    assert sql_rows("SELECT id FROM curie.approvals WHERE id = :id", {"id": approval})
 
 
 # ==========================================================================
@@ -613,13 +586,13 @@ def _seed_unreconstructable() -> uuid.UUID:
     """
 
     _seed_binding("slack-agent", "slack", "shared@example.test")
-    _sql(f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {ADDRESS_CONSTRAINT}")
+    sql_rows(f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {ADDRESS_CONSTRAINT}")
     _seed_binding("mail-agent", "email", "shared@example.test")
     return _seed_approval(reply_channel="shared@example.test", summary="which one?")
 
 
 def test_without_a_declaration_the_refusal_names_the_report_and_declare_workflow(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """AC4, "never fabricate provenance", plus the disposition the operator gets.
 
@@ -630,7 +603,7 @@ def test_without_a_declaration_the_refusal_names_the_report_and_declare_workflow
     names the bounded round trip instead.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     ambiguous = _seed_unreconstructable()
 
     with pytest.raises(RuntimeError) as caught:
@@ -641,11 +614,11 @@ def test_without_a_declaration_the_refusal_names_the_report_and_declare_workflow
     assert "--report-identity" in message, message
     assert "delete the approvals" not in message, message
     # The row is still there to be declared over.
-    assert _sql("SELECT count(*) FROM curie.approvals") == [(1,)]
+    assert sql_rows("SELECT count(*) FROM curie.approvals") == [(1,)]
 
 
 def test_a_declaration_for_an_unreconstructable_row_beats_what_a_binding_implies(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC4's positive case. The declared kind is neither kind at the address.
 
@@ -655,7 +628,7 @@ def test_a_declaration_for_an_unreconstructable_row_beats_what_a_binding_implies
     and guessing.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     ambiguous = _seed_unreconstructable()
     _write_declarations(
         tmp_path,
@@ -674,11 +647,11 @@ def test_a_declaration_for_an_unreconstructable_row_beats_what_a_binding_implies
     command.upgrade(cfg, REVISION_0022)
 
     assert _reply_identity(ambiguous) == ("sms", "twilio-main")
-    assert _stamped_revision() == REVISION_0022
+    assert stamped_revision() == REVISION_0022
 
 
 def test_a_honored_declaration_writes_exactly_one_audit_row_and_deletes_nothing(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC4, "never silently bypass a migration guard" and "never delete history".
 
@@ -688,7 +661,7 @@ def test_a_honored_declaration_writes_exactly_one_audit_row_and_deletes_nothing(
     untouched, which is also AC1's audit-history clause.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     ambiguous = _seed_unreconstructable()
     pre_existing = _seed_audit_row(ambiguous, "created")
     _write_declarations(
@@ -725,12 +698,12 @@ def test_a_honored_declaration_writes_exactly_one_audit_row_and_deletes_nothing(
 
     # Nothing deleted, and no column written that does not exist at 0022:
     # `principal_kind` / `authenticated` arrive at 0038, three revisions later.
-    assert _sql("SELECT count(*) FROM curie.approvals") == [(1,)]
+    assert sql_rows("SELECT count(*) FROM curie.approvals") == [(1,)]
     assert _audit_table_columns() == AUDIT_COLUMNS_AT_0013
 
 
 def test_a_declaration_for_a_reconstructable_row_is_refused_by_name(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC4's honoring rule: the preflight's own answer wins, loudly.
 
@@ -739,7 +712,7 @@ def test_a_declaration_for_a_reconstructable_row_is_refused_by_name(
     reconstructable row keeps nothing from the declaration.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     reconstructable = _seed_approval(reply_channel="C0EXAMPLE1")
     _write_declarations(
@@ -753,12 +726,12 @@ def test_a_declaration_for_a_reconstructable_row_is_refused_by_name(
 
     message = str(caught.value)
     assert str(reconstructable) in message, message
-    assert _stamped_revision() == BELOW_0022
+    assert stamped_revision() == BELOW_0022
     assert "reply_kind" not in _approvals_columns()
 
 
 def test_0024_honors_a_declaration_for_its_own_unroutable_rows(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """0024's preflight is a different question, and takes the same disposition.
 
@@ -769,7 +742,7 @@ def test_0024_honors_a_declaration_for_its_own_unroutable_rows(
     the 0013 column set too.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("mail-agent", "email", "ops@example.test")
     email_approval = _seed_approval(reply_channel="ops@example.test")
     command.upgrade(cfg, BELOW_0024)
@@ -797,7 +770,7 @@ def test_0024_honors_a_declaration_for_its_own_unroutable_rows(
 
 
 def test_0024_refuses_a_declaration_that_contradicts_the_kind_0022_established(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC1/AC4: 0024 recovers the MISSING half, it does not rewrite the known one.
 
@@ -810,7 +783,7 @@ def test_0024_refuses_a_declaration_that_contradicts_the_kind_0022_established(
     silently reroute the reply to a different transport entirely.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("mail-agent", "email", "ops@example.test")
     email_approval = _seed_approval(reply_channel="ops@example.test")
     command.upgrade(cfg, BELOW_0024)
@@ -830,11 +803,11 @@ def test_0024_refuses_a_declaration_that_contradicts_the_kind_0022_established(
     assert "'email'" in message and "'slack'" in message, message
     # Nothing moved: the established kind is intact and 0024 did not stamp.
     assert _reply_identity(email_approval) == ("email", None)
-    assert _stamped_revision() == BELOW_0024
+    assert stamped_revision() == BELOW_0024
 
 
 def test_one_declaration_document_survives_a_full_upgrade_head(
-    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The documented workflow is `alembic upgrade head` with ONE mounted file.
 
@@ -850,7 +823,7 @@ def test_one_declaration_document_survives_a_full_upgrade_head(
     never overwrite an identity an earlier one established.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
     _write_declarations(
         tmp_path,
@@ -867,7 +840,7 @@ def test_one_declaration_document_survives_a_full_upgrade_head(
 
     command.upgrade(cfg, "head")
 
-    # 0069 backfills the default identity onto every Slack reply.
+    # 0070 backfills the default identity onto every Slack reply.
     assert _reply_identity(orphan) == ("slack", "default")
     # Honored exactly once, by 0022, and never re-applied by a later revision.
     honored = [r for r in _audit_rows(orphan) if r.action == HONORED_ACTION]
@@ -881,7 +854,7 @@ def test_one_declaration_document_survives_a_full_upgrade_head(
 
 
 def test_the_full_upgrade_still_reaches_head_from_an_empty_database(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The edits to two already-applied revisions take no new decision.
 
@@ -890,19 +863,18 @@ def test_the_full_upgrade_still_reaches_head_from_an_empty_database(
     and lands on head.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    command.upgrade(alembic_config(), "head")
     assert "reply_kind" in _approvals_columns()
 
 
 def test_0022_and_0024_still_apply_from_the_pre_0022_state(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The same, seeded: a real installation sitting below 0022 upgrades through
     both edited revisions with no declaration file present, and the fence is a
     no-op nobody notices."""
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(reply_channel="C0EXAMPLE1")
 
@@ -911,7 +883,7 @@ def test_0022_and_0024_still_apply_from_the_pre_0022_state(
     command.upgrade(cfg, REVISION_0024)
     assert _reply_identity(approval) == ("slack", None)
     command.upgrade(cfg, "head")
-    # 0069 backfills the default identity onto every Slack reply.
+    # 0070 backfills the default identity onto every Slack reply.
     assert _reply_identity(approval) == ("slack", "default")
 
 
@@ -921,7 +893,7 @@ def test_0022_and_0024_still_apply_from_the_pre_0022_state(
 
 
 def test_a_retained_installation_upgrades_with_its_pending_approvals_intact(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """AC1 end to end: upgrade, then resolve, on a database that was already live.
 
@@ -944,7 +916,7 @@ def test_a_retained_installation_upgrades_with_its_pending_approvals_intact(
     from curie_api.main import create_app
     from fastapi.testclient import TestClient
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     _seed_binding("slack-agent", "slack", "C1")
     approval = _seed_approval(reply_channel="C1", summary="Give ACME a 20% discount")
     audit_ids = [
@@ -955,8 +927,8 @@ def test_a_retained_installation_upgrades_with_its_pending_approvals_intact(
     command.upgrade(cfg, "head")
 
     # Pending, with its original reply identity (the default Slack app, which
-    # 0069 names), and its history whole.
-    assert _sql("SELECT status FROM curie.approvals WHERE id = :id", {"id": approval}) == [
+    # 0070 names), and its history whole.
+    assert sql_rows("SELECT status FROM curie.approvals WHERE id = :id", {"id": approval}) == [
         ("pending",)
     ]
     assert _reply_identity(approval) == ("slack", "default")
@@ -998,7 +970,7 @@ def test_a_retained_installation_upgrades_with_its_pending_approvals_intact(
 
 
 def test_the_refusal_is_self_sufficient_for_a_blocked_installation(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The failed Job log has to be the whole disposition, not a pointer to a
     command that cannot run.
@@ -1011,7 +983,7 @@ def test_the_refusal_is_self_sufficient_for_a_blocked_installation(
     document pre-populated with their ids, ready to fill in.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     ambiguous = _seed_unreconstructable()
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
 

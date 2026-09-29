@@ -107,6 +107,9 @@ state on stdout --
 - a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
   (the model's reply, which is null on a no-edit completion, plus the thread
   the turn ran under);
+- a failed runner turn emits `{"reply": ..., "thread": ..., "finalized":
+  false, "failed": true, "failure_class": ...}` and exits 1. When the worker
+  wrote the marker, `reply` starts with `curie-turn-failure: <failure_class>`;
 - a turn parked on a human approval gate emits `{"reply": ..., "thread":
   ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
   approval card rather than finalizing, and `reply` is the card's placeholder
@@ -122,7 +125,7 @@ state on stdout --
   "reply_endpoint": ...}` (`channel` is null when it would be resolved from
   the sole bound `(agent, Slack channel)` pair).
 
-The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
+The six shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
 exceptions still print human text instead of JSON on success (tracked in
 #485): `curie skill message`, and the operator verbs (`up`, `down`,
 `status`, `comms`, `deploy`). On generic failure under `--json`, the error is

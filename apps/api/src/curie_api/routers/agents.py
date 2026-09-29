@@ -75,14 +75,14 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
     # (ADR-0096 phase 2). Without this the create succeeded and the second agent
     # was silently shadowed by the resolver at runtime. Stated without the word
     # "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
-    # belong to every channel kind. 0069 replaced this key; kept for its wording
+    # belong to every channel kind. 0070 replaced this key; kept for its wording
     # on a database that still has it.
     "agent_channels_kind_address_key": (
         "another agent is already bound to that channel kind and address; one "
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
-    # Migration 0069's key: the route is the triple (ADR-0168 decision 3).
+    # Migration 0070's key: the route is the triple (ADR-0168 decision 3).
     "agent_channels_route_key": (
         "another agent is already bound to that channel kind and address under that "
         "identity; one agent per route (bind another identity, move or delete the "

@@ -4466,9 +4466,11 @@ case_local_otel_runner_failure() {
     inject_local_runner_failure
     failure_out="$("$BIN" --json local message --channel C0LOCALDEV "runner failure control" 2>&1)" || failure_code=$?
     printf '%s\n' "$failure_out"
-    if (( failure_code != 0 )) && [[ "$failure_out" != *'"finalized":true'* ]]; then
+    if (( failure_code != 0 )) && [[ "$failure_out" != *'"finalized":true'* ]] \
+        && [[ "$failure_out" != *'"failed":true'* ]]; then
         # An unexpectedly shaped failure cannot be allowed to strand the
-        # injected worker configuration.
+        # injected worker configuration. A failed runner turn exits 1 with
+        # failed:true (#3401); a finalized reply remains the older shape.
         restore_local_runner_health
         echo "local: injected runner failure produced neither a finalized escalation nor a queryable reply" >&2
         return 1
@@ -5033,7 +5035,11 @@ rung_local_release() {
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down -f compose.release.yaml ==="
-        "$BIN" local down -f "$release_compose"
+        local down_args=(local down --project "$COMPOSE_PROJECT" -f "$release_compose")
+        for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+            down_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+        done
+        "$BIN" "${down_args[@]}"
         LOCAL_STACK_OWNED=0
 
         echo

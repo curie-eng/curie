@@ -17,8 +17,9 @@ from aci_protocol import (
     TurnSource,
 )
 from redis.exceptions import ResponseError
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from . import factory_ci, factory_label_reconcile, factory_notices, workitems
 from .config import Settings
@@ -314,6 +315,39 @@ class WorkItemReconciler:
                     + timedelta(
                         seconds=self._settings.work_item_wait_budget_seconds
                     ),
+                )
+        async with self._sessionmaker() as session:
+            active = aliased(ExecutionRequest)
+            queued_ids = (
+                await session.scalars(
+                    select(WorkItem.id)
+                    .join(
+                        ExecutionRequest,
+                        ExecutionRequest.work_item_id == WorkItem.id,
+                    )
+                    .where(
+                        ExecutionRequest.status == "queued",
+                        WorkItem.readmit_request_id.is_(None),
+                        ~exists().where(
+                            active.work_item_id == WorkItem.id,
+                            active.status.in_(
+                                ("waiting", "running", "cancellation_requested")
+                            ),
+                        ),
+                    )
+                    .group_by(WorkItem.id)
+                    .order_by(func.min(ExecutionRequest.created_at), WorkItem.id)
+                    .limit(self._settings.work_item_batch_limit)
+                )
+            ).all()
+        for work_item_id in queued_ids:
+            async with self._sessionmaker() as session:
+                now = await workitems._database_now(session)
+                await workitems.admit_next_revision(
+                    session,
+                    work_item_id=work_item_id,
+                    wait_deadline=now
+                    + timedelta(seconds=self._settings.work_item_wait_budget_seconds),
                 )
 
     async def _settle_publications(self) -> None:

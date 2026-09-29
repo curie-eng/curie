@@ -129,6 +129,32 @@ describe("WiredWorkItems (#2577)", () => {
     expect(within(waiting).queryByRole("link", { name: /pull/ })).toBeNull();
   });
 
+  it("shows a queued revision with no wait deadline", async () => {
+    const queued = outcome({
+      state: "queued",
+      actionable_cause: "revision waiting for the current run",
+      publication: null,
+      requests: [{
+        ...outcome().requests[0],
+        status: "queued",
+        wait_deadline: null,
+        started_at: null,
+        execution_deadline: null,
+        terminal_at: null,
+        terminal_cause: null,
+      }],
+    });
+    vi.mocked(listWorkItems).mockResolvedValue({ items: [queued], limit: 50, truncated: false });
+    vi.mocked(getWorkItem).mockResolvedValue(queued);
+    renderView();
+
+    const row = await screen.findByTestId("work-item-row");
+    expect(within(row).getByText("queued")).toBeInTheDocument();
+    expect(row).toHaveTextContent("revision waiting for the current run");
+    await userEvent.click(row);
+    expect(await screen.findByTestId("work-item-detail")).toHaveTextContent("#1 queued");
+  });
+
   it("renders the empty state, not an error, for an empty install", async () => {
     vi.mocked(listWorkItems).mockResolvedValue({ items: [], limit: 50, truncated: false });
     renderView();

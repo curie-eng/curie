@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 import threading
-import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -53,6 +54,30 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
+
+
+def _qevent(
+    text: str,
+    *,
+    thread: str = "th-att",
+    attachments: Sequence[Attachment] = (),
+    event_id: str | None = None,
+    placeholder: str = "p-1",
+) -> QueuedTurn:
+    # This file has always derived a deterministic event id from the turn shape.
+    return qevent(
+        text,
+        thread=thread,
+        attachments=attachments,
+        placeholder=placeholder,
+        event_id=event_id or f"ev-{thread}-{len(text)}-{len(attachments)}",
+    )
 
 DONE = SessionStatus.DONE
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
@@ -91,37 +116,8 @@ WORKSPACES_OFF_REPLY = (
 )
 
 
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-att",
-    attachments: Sequence[Attachment] = (),
-    event_id: str | None = None,
-    placeholder: str = "p-1",
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or f"ev-{thread}-{len(text)}-{len(attachments)}",
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder=placeholder),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=TurnSource.SLACK,
-        attachments=list(attachments),
-    )
-
-
 def _thread_key(thread: str) -> str:
     return f"slack:C1:{thread}"
-
-
-async def _wait_until(pred: Callable[[], bool], what: str, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting for {what}")
 
 
 class _FakeAttachmentLane:

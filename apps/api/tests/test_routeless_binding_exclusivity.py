@@ -1,6 +1,6 @@
 """A route-less non-Slack binding holds its pair alone across agents (ADR-0168 decision 3).
 
-Migration 0069's key is the triple, `UNIQUE NULLS NOT DISTINCT (kind, address,
+Migration 0070's key is the triple, `UNIQUE NULLS NOT DISTINCT (kind, address,
 adapter)`, so `(email, x, NULL)` and `(email, x, 'inbox-a')` are different
 keys. But a turn from a route-less binding carries no adapter, and an omitted
 non-Slack adapter selects every route on the pair (`matching_routes`), so the

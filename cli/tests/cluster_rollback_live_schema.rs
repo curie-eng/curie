@@ -5,17 +5,11 @@
 //! overridable. This file talks to the clap binary only so the selected pin
 //! still compiles against the parent `RollbackOpts` (no new struct field).
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+#[path = "support/executable.rs"]
+mod test_executable;
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut perms = fs::metadata(&path).expect("stat fake").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod fake executable");
-}
+use std::fs;
+use std::path::Path;
 
 fn run_rollback_json_args(dir: &Path, extra: &[&str]) -> std::process::Output {
     let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -35,7 +29,7 @@ fn run_rollback_json_args(dir: &Path, extra: &[&str]) -> std::process::Output {
 fn write_fake_helm(dir: &Path, history_json: &str) {
     let history = dir.join("history.json");
     fs::write(&history, history_json).expect("write history");
-    write_exec(
+    test_executable::install_in(
         dir,
         "helm",
         &format!(
@@ -53,7 +47,7 @@ fn write_fake_helm(dir: &Path, history_json: &str) {
 }
 
 fn write_failing_kubectl(dir: &Path) {
-    write_exec(
+    test_executable::install_in(
         dir,
         "kubectl",
         &format!(
@@ -126,7 +120,7 @@ fn unreadable_api_pod_names_the_live_schema_override() {
 fn unparseable_api_pod_output_names_the_override() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fake_helm(dir.path(), issue_2296_history_json());
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "kubectl",
         "#!/bin/sh\necho 'INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.'\n",

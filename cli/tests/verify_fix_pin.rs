@@ -1,5 +1,7 @@
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -22,16 +24,6 @@ fn write_file(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().expect("file has a parent")).expect("create parent");
     fs::write(path, body).expect("write fixture file");
-}
-
-fn write_exec(root: &Path, name: &str, body: &str) {
-    let path = root.join(name);
-    fs::write(&path, body).expect("write executable");
-    let mut permissions = fs::metadata(&path)
-        .expect("executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make executable");
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -368,7 +360,7 @@ fn direct_verifier_rejects_rust_test_flag_before_cargo_can_report_pinned() {
         "Fix Rust behavior",
     );
     let cargo_log = fixture.external_path("cargo.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "cargo",
         r#"#!/bin/sh
@@ -614,7 +606,7 @@ fn assert_tool_selector_route(
         "Fix behavior with routed assertion",
     );
     let route_log = fixture.external_path("route.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         tool,
         r#"#!/bin/sh
@@ -836,7 +828,7 @@ fn local_python_selector_reports_unpinned_when_reversal_stays_green() {
         "Add weak local assertion",
     );
     let run_log = fixture.external_path("uv-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -941,7 +933,7 @@ def test_other():
         "Change only another Python test",
     );
     let run_log = fixture.external_path("uv-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1026,7 +1018,7 @@ fn other_pin() {
         "Change only another Rust test",
     );
     let run_log = fixture.external_path("cargo-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "cargo",
         r#"#!/bin/sh
@@ -1079,7 +1071,7 @@ fn changed_selected_python_node_refuses_an_unrelated_collection_failure() {
         ],
         "Change selected Python test",
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1130,7 +1122,7 @@ fn assert_local_python_reversed_failure_refused(junit: &str, reversed_exit: &str
         "Change selected local Python test",
     );
     let run_log = fixture.external_path("uv-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1205,7 +1197,7 @@ fn forged_selected_python_failure_followed_by_unrelated_teardown_error_refuses()
         "Change selected Python test",
     );
     let junit_copy = fixture.external_path("reversed.junit.xml");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1267,7 +1259,7 @@ fn assert_python_junit_cardinality_refused(junit: &str) {
         ],
         "Change selected Python test",
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1746,7 +1738,7 @@ fn pr_url_uses_the_resolved_patch_and_reports_the_same_pinned_result() {
     let patch_path = fixture.external_path("pr.patch");
     fs::write(&patch_path, fixture.patch(&base, &head)).expect("write PR patch");
     let gh_log = fixture.external_path("gh.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "gh",
         r#"#!/bin/sh
@@ -1807,7 +1799,7 @@ fn numeric_pr_uses_gh_even_when_git_would_resolve_the_number_as_a_commit() {
     fs::write(&patch_path, fixture.patch(&base, &head)).expect("write PR patch");
     let gh_log = fixture.external_path("gh.log");
     let git_log = fixture.external_path("git.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "gh",
         r#"#!/bin/sh
@@ -1831,7 +1823,7 @@ fi
 exit 64
 "#,
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "git",
         r#"#!/bin/sh

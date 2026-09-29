@@ -611,7 +611,7 @@ def test_a_context_resolving_outside_the_bundle_is_refused(tmp_path: Path) -> No
     (bundle / "connectors" / "k8s-write").mkdir(parents=True)
     (tmp_path / "outside").mkdir()
 
-    for context in ("../outside", "/etc"):
+    for context in ("../outside", str(tmp_path / "outside")):
         with pytest.raises(ValueError, match="outside the bundle"):
             connector_lock.resolve_context(bundle, context)
 

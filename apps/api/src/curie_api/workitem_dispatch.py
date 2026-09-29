@@ -315,6 +315,55 @@ async def admit(
     return await _admit_new(session, facts, resolved.adapter)
 
 
+async def admit_revision(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Accept a verified mention even while its WorkItem has a live run."""
+
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
+    existing = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
+    )
+    if existing is not None:
+        return await _replay_existing(session, existing, facts, resolved.adapter)
+    work_item = await session.scalar(
+        select(WorkItem).where(
+            WorkItem.github_repository_id == facts.github_repository_id,
+            WorkItem.github_issue_number == facts.github_issue_number,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if work_item is None:
+        return await _refuse(session, "not_found")
+    if not _work_item_matches(work_item, facts, resolved.adapter):
+        return await _refuse(
+            session, "identity_mismatch", work_item_id=work_item.id
+        )
+    now = await _database_now(session)
+    requested = await workitems.create_revision_request(
+        session,
+        work_item_id=work_item.id,
+        request_id=facts.request_id,
+        wait_deadline=now
+        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        expected_work_item_version=work_item.version,
+        snapshot=_snapshot_values(facts),
+    )
+    if isinstance(requested, WorkItemConflict):
+        return requested
+    assert requested.request is not None
+    if requested.request.status == "queued":
+        return requested
+    written = await _write_snapshot(session, facts.request_id, facts)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await _reload_work_item(session, work_item.id)
+    return await _outcome(session, reloaded, written, replayed=requested.replayed)
+
+
 async def readmit(
     session: AsyncSession, facts: Any
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
@@ -537,6 +586,15 @@ async def acquire(
             request_id=request.id,
             status=request.status,
         )
+    deadline = request.wait_deadline
+    if deadline is None:
+        return await _refuse(
+            session,
+            "not_dispatchable",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
     if generation != request.dispatch_generation:
         return await _refuse(
             session,
@@ -545,7 +603,7 @@ async def acquire(
             request_id=request.id,
         )
     now = await _database_now(session)
-    if now >= request.wait_deadline:
+    if now >= deadline:
         return await _refuse(
             session,
             "waiting_deadline_elapsed",
@@ -571,7 +629,7 @@ async def acquire(
             generation=generation,
             work_item_id=work_item.id,
             conversation_id=work_item.conversation_id,
-            wait_deadline=request.wait_deadline,
+            wait_deadline=deadline,
             repo_full_name=work_item.repo_full_name,
         )
         await session.execute(
@@ -614,7 +672,7 @@ async def acquire(
         generation=generation,
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
-        wait_deadline=request.wait_deadline,
+        wait_deadline=deadline,
         repo_full_name=work_item.repo_full_name,
     )
     await session.commit()

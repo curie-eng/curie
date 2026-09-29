@@ -69,9 +69,7 @@ def test_route_ttl_override_is_independent_of_claim_timeout() -> None:
     # reach the DEADLINE but not the ACCUMULATION term, so the only available
     # lever made a doomed turn fail slower instead of reducing how many
     # sandboxes were alive. Setting one must not disturb the other.
-    cfg = _substrate_config(
-        {"CURIE_ROUTE_TTL_SECONDS": "300", "CURIE_CLAIM_TIMEOUT_SECONDS": "45"}
-    )
+    cfg = _substrate_config({"CURIE_ROUTE_TTL_SECONDS": "300", "CURIE_CLAIM_TIMEOUT_SECONDS": "45"})
     assert cfg.route_ttl_seconds == 300
     assert cfg.claim_timeout_seconds == 45.0
     assert cfg.suspended_route_ttl_seconds == 86400
@@ -291,9 +289,7 @@ def test_docker_without_credential_or_fake_fails_loudly() -> None:
 def test_docker_with_sdk_credential_builds_docker_client(monkeypatch) -> None:
     # Keep hermetic: after Stream B, _sandbox_client prewarms the image via
     # DockerSandboxClient.ensure_image; stub it so this test never shells docker.
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(),
         {"CURIE_SANDBOX_SUBSTRATE": "docker", "CLAUDE_CODE_OAUTH_TOKEN": _FAKE_SDK_CRED},
@@ -305,9 +301,7 @@ def test_docker_with_sdk_credential_builds_docker_client(monkeypatch) -> None:
 def test_docker_with_curie_credentials_reference_builds_docker_client(monkeypatch) -> None:
     # CURIE_CREDENTIALS alone is a valid credential: forwarded by name and
     # mapped onto an SDK var by the runner, so the gate must accept it.
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(credentials="sk-ant-PLACEHOLDER"),
         {"CURIE_SANDBOX_SUBSTRATE": "docker"},
@@ -317,9 +311,7 @@ def test_docker_with_curie_credentials_reference_builds_docker_client(monkeypatc
 
 
 def test_docker_with_model_base_url_builds_docker_client_without_credential(monkeypatch) -> None:
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(model_base_url="http://ollama:11434"),
         {"CURIE_SANDBOX_SUBSTRATE": "docker"},
@@ -329,9 +321,7 @@ def test_docker_with_model_base_url_builds_docker_client_without_credential(monk
 
 
 def test_docker_with_explicit_fake_model_builds_docker_client(monkeypatch) -> None:
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(fake_model=True), {"CURIE_SANDBOX_SUBSTRATE": "docker"}, _SUB
     )
@@ -347,7 +337,8 @@ def test_docker_without_otlp_endpoint_warns(caplog) -> None:
         )
     assert isinstance(client, DockerSandboxClient)
     warnings = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
     assert warnings and all(r.levelno == logging.WARNING for r in warnings)
@@ -365,7 +356,8 @@ def test_docker_with_otlp_endpoint_does_not_warn(caplog) -> None:
         )
     assert isinstance(client, DockerSandboxClient)
     assert not [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
 
@@ -409,9 +401,7 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     assert isinstance(client, DockerSandboxClient)
     client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
     assert len(calls) == 1
-    assert not any(
-        arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0]
-    )
+    assert not any(arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0])
     endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
@@ -595,8 +585,18 @@ def test_crashing_supervised_task_does_not_cancel_its_siblings() -> None:
     asyncio.run(go())
 
 
-def test_supervise_emits_restart_metric_and_cause_for_publications(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("lane", "error"),
+    [
+        pytest.param("publications", "claim cas lost", id="publications"),
+        pytest.param("evals", "eval stream closed", id="evals"),
+    ],
+)
+def test_supervise_emits_restart_metric_and_cause(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    error: str,
 ) -> None:
     recorded: list[tuple[str, float, dict[str, str]]] = []
 
@@ -614,19 +614,19 @@ def test_supervise_emits_restart_metric_and_cause_for_publications(
         async def factory() -> None:
             calls["n"] += 1
             if calls["n"] < 3:
-                raise RuntimeError("claim cas lost")
+                raise RuntimeError(error)
             shutdown.set()
 
         with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
             await asyncio.wait_for(
-                _supervise("publications", factory, shutdown, restart_backoff_s=0),
+                _supervise(lane, factory, shutdown, restart_backoff_s=0),
                 timeout=2,
             )
 
         assert calls["n"] == 3
         expected = {
             "service.name": "curie-worker",
-            "operation": "publications",
+            "operation": lane,
             "outcome": "restart",
         }
         assert recorded == [
@@ -641,62 +641,9 @@ def test_supervise_emits_restart_metric_and_cause_for_publications(
         assert len(restarts) == 2
         for rec in restarts:
             message = rec.getMessage()
-            assert "publications" in message
+            assert lane in message
             assert "RuntimeError" in message
-            assert "claim cas lost" in message
-
-    asyncio.run(go())
-
-
-def test_supervise_emits_restart_metric_for_evals(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    recorded: list[tuple[str, float, dict[str, str]]] = []
-
-    def capture(
-        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
-    ) -> None:
-        recorded.append((name, value, dict(attributes or {})))
-
-    monkeypatch.setattr(run, "record_metric", capture)
-
-    async def go() -> None:
-        shutdown = asyncio.Event()
-        calls = {"n": 0}
-
-        async def factory() -> None:
-            calls["n"] += 1
-            if calls["n"] < 3:
-                raise RuntimeError("eval stream closed")
-            shutdown.set()
-
-        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
-            await asyncio.wait_for(
-                _supervise("evals", factory, shutdown, restart_backoff_s=0),
-                timeout=2,
-            )
-
-        assert calls["n"] == 3
-        expected = {
-            "service.name": "curie-worker",
-            "operation": "evals",
-            "outcome": "restart",
-        }
-        assert recorded == [
-            ("curie.worker.supervised.restart", 1, expected),
-            ("curie.worker.supervised.restart", 1, expected),
-        ]
-        restarts = [
-            r
-            for r in caplog.records
-            if r.name == "curie_worker.run" and "crashed; restarting" in r.getMessage()
-        ]
-        assert len(restarts) == 2
-        for rec in restarts:
-            message = rec.getMessage()
-            assert "evals" in message
-            assert "RuntimeError" in message
-            assert "eval stream closed" in message
+            assert error in message
 
     asyncio.run(go())
 
@@ -726,9 +673,7 @@ def test_supervise_idle_heartbeat_does_not_emit_restart(
             )
 
         assert recorded == []
-        assert not any(
-            "crashed; restarting" in r.getMessage() for r in caplog.records
-        )
+        assert not any("crashed; restarting" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
 
@@ -1172,9 +1117,7 @@ def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the cut-short migration
     cut_short = [
-        r
-        for r in caplog.records
-        if r.name == "curie_worker.run" and "cut short" in r.getMessage()
+        r for r in caplog.records if r.name == "curie_worker.run" and "cut short" in r.getMessage()
     ]
     assert len(cut_short) == 1
     assert cut_short[0].levelno == logging.WARNING
@@ -1200,10 +1143,7 @@ def test_valkey_kwargs_selects_the_plain_connection_by_default() -> None:
     sync_client = redis.Redis(**kwargs)
     assert sync_client.connection_pool.connection_class is redis.connection.Connection
     async_client = redis.asyncio.Redis(**kwargs)
-    assert (
-        async_client.connection_pool.connection_class
-        is redis.asyncio.connection.Connection
-    )
+    assert async_client.connection_pool.connection_class is redis.asyncio.connection.Connection
 
 
 def test_valkey_kwargs_selects_ssl_connection_when_tls_is_set() -> None:
@@ -1211,10 +1151,7 @@ def test_valkey_kwargs_selects_ssl_connection_when_tls_is_set() -> None:
     sync_client = redis.Redis(**kwargs)
     assert sync_client.connection_pool.connection_class is redis.connection.SSLConnection
     async_client = redis.asyncio.Redis(**kwargs)
-    assert (
-        async_client.connection_pool.connection_class
-        is redis.asyncio.connection.SSLConnection
-    )
+    assert async_client.connection_pool.connection_class is redis.asyncio.connection.SSLConnection
 
 
 def test_valkey_kwargs_carries_host_port_password_db_unchanged() -> None:
@@ -1262,9 +1199,7 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
             assert runtime.pressure_async_redis is not runtime.async_redis
             assert runtime.pressure_async_redis is not runtime.eval_redis
 
-            pressure_kwargs = (
-                runtime.pressure_async_redis.connection_pool.connection_kwargs
-            )
+            pressure_kwargs = runtime.pressure_async_redis.connection_pool.connection_kwargs
             assert pressure_kwargs["socket_timeout"] == 1.0
             assert pressure_kwargs["socket_connect_timeout"] == 1.0
             assert pressure_kwargs["retry"].get_retries() == 0
@@ -1283,9 +1218,7 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
                 # no connection handler rather than retaining the input object.
                 assert pressure_connection.maint_notifications_config is None
             finally:
-                await runtime.pressure_async_redis.connection_pool.release(
-                    pressure_connection
-                )
+                await runtime.pressure_async_redis.connection_pool.release(pressure_connection)
         finally:
             affinity_redis.close()
             await runtime.runner.close()

@@ -22,6 +22,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from . import transcripts
 from .config import get_settings
+from .factory_reply_target import parse_reply_target
 from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -34,6 +35,7 @@ from .models import (
 )
 
 RequestStatus = Literal[
+    "queued",
     "waiting",
     "running",
     "cancellation_requested",
@@ -94,7 +96,7 @@ class ExecutionRequestSnapshot:
     work_item_id: uuid.UUID
     sequence: int
     status: RequestStatus
-    wait_deadline: datetime
+    wait_deadline: datetime | None
     started_at: datetime | None
     execution_deadline: datetime | None
     terminal_at: datetime | None
@@ -266,7 +268,35 @@ async def _settle_terminal(
     if request.terminal_at is None:
         return
     await _queue_notice(session, work_item, request, detail=detail)
-    await transcripts.expire_for_work_item(session, work_item)
+    pending = await session.scalar(
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status == "queued",
+        )
+        .limit(1)
+    )
+    if pending is None and work_item.readmit_request_id is None:
+        await transcripts.expire_for_work_item(session, work_item)
+
+
+async def _cancel_queued_requests(
+    session: AsyncSession, work_item_id: uuid.UUID, now: datetime
+) -> None:
+    await session.execute(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.status == "queued",
+        )
+        .values(
+            status="cancelled",
+            terminal_at=now,
+            terminal_cause="issue_cancelled",
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
 
 
 async def _opened_pull_request(
@@ -527,6 +557,170 @@ async def create_execution_request(
     return await _outcome(session, work_item, request)
 
 
+async def create_revision_request(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    wait_deadline: datetime,
+    expected_work_item_version: int,
+    snapshot: Mapping[str, str],
+) -> WorkItemResult:
+    """Store a mention in sequence without interrupting the live request."""
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _conflict(session, "not_found", work_item_id=work_item_id)
+    if work_item.cancelled_at is not None:
+        return await _conflict(session, "work_item_cancelled", work_item=work_item)
+    existing = await _lock_request_by_id(session, request_id)
+    if existing is not None:
+        return await _outcome(session, work_item, existing, replayed=True)
+    if work_item.version != expected_work_item_version:
+        return await _conflict(session, "stale_version", work_item=work_item)
+    active = await _lock_active_request(session, work_item_id)
+    older_queued = await session.scalar(
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.status == "queued",
+        )
+        .limit(1)
+    )
+    if active is None and older_queued is None and work_item.readmit_request_id is None:
+        return await create_execution_request(
+            session,
+            work_item_id=work_item_id,
+            request_id=request_id,
+            wait_deadline=wait_deadline,
+            expected_work_item_version=expected_work_item_version,
+        )
+    sequence = work_item.next_sequence
+    try:
+        async with session.begin_nested():
+            changed_id = await session.scalar(
+                update(WorkItem)
+                .where(
+                    WorkItem.id == work_item_id,
+                    WorkItem.version == expected_work_item_version,
+                    WorkItem.cancelled_at.is_(None),
+                )
+                .values(
+                    version=WorkItem.version + 1,
+                    next_sequence=WorkItem.next_sequence + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+                .returning(WorkItem.id)
+            )
+            assert changed_id is not None
+            session.add(
+                ExecutionRequest(
+                    id=request_id,
+                    work_item_id=work_item_id,
+                    sequence=sequence,
+                    status="queued",
+                    wait_deadline=None,
+                    version=1,
+                    **snapshot,
+                )
+            )
+            session.add(
+                FactoryStatusComment(
+                    execution_request_id=request_id,
+                    work_item_id=work_item_id,
+                    applied_label=None,
+                )
+            )
+            await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        return await _conflict(session, "stale_version", work_item_id=work_item_id)
+    work_item = await _reload_work_item(session, work_item_id)
+    request = await _reload_request(session, request_id)
+    return await _outcome(session, work_item, request)
+
+
+async def admit_next_revision(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    wait_deadline: datetime,
+) -> WorkItemResult | None:
+    """Promote only the oldest queued mention after its predecessor ends."""
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None or work_item.readmit_request_id is not None:
+        await session.commit()
+        return None
+    if await _lock_active_request(session, work_item_id) is not None:
+        await session.commit()
+        return None
+    request = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.status == "queued",
+        )
+        .order_by(ExecutionRequest.sequence)
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if request is None:
+        await session.commit()
+        return None
+    now = await _database_now(session)
+    cause: str | None = None
+    if work_item.cancelled_at is not None:
+        cause = "issue_cancelled"
+    elif request.objective is not None:
+        target = parse_reply_target(
+            request.objective,
+            repo_full_name=work_item.repo_full_name,
+            clone_base=get_settings().github_clone_base,
+        )
+        if target.pr_number is not None:
+            lineage = await session.get(
+                ThreadPublicationLineage, work_item.publication_lineage_id
+            ) if work_item.publication_lineage_id is not None else None
+            if (
+                lineage is None
+                or lineage.status != "open"
+                or lineage.pr_number != target.pr_number
+            ):
+                cause = "lineage_closed"
+    if cause is not None:
+        status = "cancelled"
+        values: dict[str, Any] = {"terminal_at": now, "terminal_cause": cause}
+    else:
+        status = "waiting"
+        values = {"wait_deadline": wait_deadline, "dispatch_not_before": now}
+    await session.execute(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.version == request.version,
+            ExecutionRequest.status == "queued",
+        )
+        .values(
+            status=status,
+            **values,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
+    await session.execute(
+        update(WorkItem)
+        .where(WorkItem.id == work_item_id)
+        .values(version=WorkItem.version + 1, updated_at=func.clock_timestamp())
+    )
+    work_item = await _reload_work_item(session, work_item_id)
+    request = await _reload_request(session, request.id)
+    if cause is not None:
+        await _settle_terminal(session, work_item, request, detail=None)
+    return await _outcome(session, work_item, request)
+
+
 async def _start_execution(
     session: AsyncSession,
     *,
@@ -563,9 +757,14 @@ async def _start_execution(
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
         )
+    deadline = request.wait_deadline
+    if deadline is None:
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
 
     now = await _database_now(session)
-    if now >= request.wait_deadline:
+    if now >= deadline:
         return await _conflict(
             session, "waiting_deadline_elapsed", work_item=work_item, request=request
         )
@@ -600,7 +799,12 @@ async def _start_execution(
     )
     if changed_id is None:
         request = await _reload_request(session, request_id)
-        if await _database_now(session) >= request.wait_deadline:
+        deadline = request.wait_deadline
+        if (
+            request.status == "waiting"
+            and deadline is not None
+            and await _database_now(session) >= deadline
+        ):
             return await _conflict(
                 session,
                 "waiting_deadline_elapsed",
@@ -665,8 +869,13 @@ async def expire_waiting(
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
         )
+    deadline = request.wait_deadline
+    if deadline is None:
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
     now = await _database_now(session)
-    if now < request.wait_deadline:
+    if now < deadline:
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
         )
@@ -1188,6 +1397,7 @@ async def request_cancellation(
         return await _conflict(session, "stale_version", work_item=work_item)
     if work_item.cancelled_at is not None:
         active = await _lock_active_request(session, work_item_id)
+        await _cancel_queued_requests(session, work_item_id, await _database_now(session))
         if work_item.readmit_request_id is None:
             return await _outcome(session, work_item, active, replayed=True)
         # The last label action wins: an unlabel drops a pending relabel.
@@ -1222,6 +1432,8 @@ async def request_cancellation(
     if changed_id is None:
         work_item = await _reload_work_item(session, work_item_id)
         return await _conflict(session, "stale_version", work_item=work_item)
+
+    await _cancel_queued_requests(session, work_item_id, now)
 
     active = await _lock_active_request(session, work_item_id)
     if active is not None and active.status == "waiting":

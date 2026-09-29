@@ -444,7 +444,7 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     sink.annotations = {
         81001: [
             {
-                "path": "src/widget.py",
+                "path": "src/widget.txt",
                 "start_line": 12,
                 "end_line": 12,
                 "annotation_level": "failure",
@@ -487,7 +487,7 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
         revision=2,
         head_sha=HEAD_B,
         title="Fix the widget parser off-by-one",
-        paths=["src/widget.py"],
+        paths=["src/widget.txt"],
     )
     _reconcile()
 
@@ -507,7 +507,7 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
         revision=3,
         head_sha=HEAD_C,
         title="Handle empty widget input",
-        paths=["src/widget.py", "tests/test_widget.py"],
+        paths=["src/widget.txt", "tests/test_widget.txt"],
     )
     _reconcile()
 
@@ -548,7 +548,7 @@ def test_ci_fix_turn_reads_failing_actions_job_log_when_available(
     sink.ci_script = [ci_entry(run)]
     sink.annotations[job_id] = [
         {
-            "path": "src/widget.py",
+            "path": "src/widget.txt",
             "start_line": 12,
             "end_line": 12,
             "annotation_level": "failure",
@@ -623,7 +623,7 @@ def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:
         revision=2,
         head_sha=HEAD_B,
         title="Fix the test",
-        paths=["src/widget.py"],
+        paths=["src/widget.txt"],
     )
     _reconcile()
 
@@ -804,7 +804,7 @@ def test_an_unpublished_fix_turn_with_a_publication_in_flight_defers(
         revision=2,
         head_sha=HEAD_B,
         title="Fix the test",
-        paths=["src/widget.py"],
+        paths=["src/widget.txt"],
         status="pending",
     )
 
@@ -939,7 +939,7 @@ def _push_during_observation(
                 revision=2,
                 head_sha=HEAD_B,
                 title="A newer push",
-                paths=["src/widget.py"],
+                paths=["src/widget.txt"],
             )
         return detail
 
@@ -1237,7 +1237,7 @@ def test_a_fix_turn_finishing_after_its_publication_succeeded_stays_running(
         revision=2,
         head_sha=HEAD_B,
         title="Fix the test",
-        paths=["src/widget.py"],
+        paths=["src/widget.txt"],
         status="succeeded",
     )
 
@@ -1540,7 +1540,7 @@ def test_pending_ci_shows_publish_done_and_wait_for_ci_in_progress(admitted: Any
         revision=2,
         head_sha=HEAD_B,
         title="Fix the widget",
-        paths=["src/widget.py"],
+        paths=["src/widget.txt"],
     )
     _reconcile()
     _reconcile()

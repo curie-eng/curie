@@ -31,20 +31,12 @@ itself via `isolated_migration_db`, real Postgres, no mocking.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, column_names, sql_rows
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # The revision immediately below 0029, targeted explicitly rather than as "-1":
 # a later migration moving head would make "-1" stop short of undoing 0029 and
@@ -58,28 +50,9 @@ BELOW_0032 = "0031"
 BELOW_0033 = "0032"
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
 def _table_exists(table: str) -> bool:
     return bool(
-        _sql(
+        sql_rows(
             "SELECT 1 FROM information_schema.tables "
             "WHERE table_schema = 'curie' AND table_name = :t",
             {"t": table},
@@ -87,20 +60,9 @@ def _table_exists(table: str) -> bool:
     )
 
 
-def _columns(table: str) -> set[str]:
-    return {
-        row[0]
-        for row in _sql(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = 'curie' AND table_name = :t",
-            {"t": table},
-        )
-    }
-
-
 def _insert_action(dedupe_key: str, call_id: str = "toolu_01") -> uuid.UUID:
     action_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_actions "
         "(id, conversation_id, call_id, tool, dedupe_key, status) "
         "VALUES (:id, 'C1', :call_id, 'scale_deployment', :key, 'pending')",
@@ -109,17 +71,20 @@ def _insert_action(dedupe_key: str, call_id: str = "toolu_01") -> uuid.UUID:
     return action_id
 
 
-def test_the_upgrade_creates_both_ledger_tables(isolated_migration_db: None) -> None:
-    command.upgrade(_alembic_config(), "head")
+def test_the_upgrade_creates_both_ledger_tables(isolated_migration_db: IsolatedMigrationDb) -> None:
+    isolated_migration_db.at("head")
 
     assert _table_exists("agent_actions")
     assert _table_exists("action_audit_entries")
-    assert {"prior_state", "target", "arguments", "result", "status"} <= _columns("agent_actions")
+    columns = column_names("agent_actions")
+    assert {"prior_state", "target", "arguments", "result", "status"} <= columns
 
 
-def test_the_ledger_round_trips_upgrade_downgrade_upgrade(isolated_migration_db: None) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+def test_the_ledger_round_trips_upgrade_downgrade_upgrade(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
 
     command.downgrade(cfg, BELOW)
     assert not _table_exists("agent_actions")
@@ -130,32 +95,34 @@ def test_the_ledger_round_trips_upgrade_downgrade_upgrade(isolated_migration_db:
     assert _table_exists("action_audit_entries")
 
 
-def test_one_call_cannot_be_recorded_twice(isolated_migration_db: None) -> None:
+def test_one_call_cannot_be_recorded_twice(isolated_migration_db: IsolatedMigrationDb) -> None:
     """At-least-once redelivery must adopt the row, not fork a second record."""
 
-    command.upgrade(_alembic_config(), "head")
+    isolated_migration_db.at("head")
     _insert_action("event-1:toolu_01")
 
     with pytest.raises(IntegrityError):
         _insert_action("event-1:toolu_01")
 
 
-def test_audit_rows_die_with_the_action_they_audit(isolated_migration_db: None) -> None:
-    command.upgrade(_alembic_config(), "head")
+def test_audit_rows_die_with_the_action_they_audit(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at("head")
     action_id = _insert_action("event-2:toolu_01")
-    _sql(
+    sql_rows(
         "INSERT INTO curie.action_audit_entries "
         "(id, action_id, action, actor, authorizer, authorized) "
         "VALUES (:id, :action_id, 'undo_refused', 'someone', 'route', false)",
         {"id": uuid.uuid4(), "action_id": action_id},
     )
 
-    _sql("DELETE FROM curie.agent_actions WHERE id = :id", {"id": action_id})
+    sql_rows("DELETE FROM curie.agent_actions WHERE id = :id", {"id": action_id})
 
-    assert _sql("SELECT 1 FROM curie.action_audit_entries") == []
+    assert sql_rows("SELECT 1 FROM curie.action_audit_entries") == []
 
 
-def test_0032_round_trips_the_post_state_column(isolated_migration_db: None) -> None:
+def test_0032_round_trips_the_post_state_column(isolated_migration_db: IsolatedMigrationDb) -> None:
     """A column-add has to undo cleanly too.
 
     A downgrade that leaves the column behind passes a shape check on the way
@@ -163,18 +130,18 @@ def test_0032_round_trips_the_post_state_column(isolated_migration_db: None) -> 
     state an operator rolling back an incident discovers at the worst moment.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
-    assert "post_state" in _columns("agent_actions")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
+    assert "post_state" in column_names("agent_actions")
 
     command.downgrade(cfg, BELOW_0032)
-    assert "post_state" not in _columns("agent_actions")
+    assert "post_state" not in column_names("agent_actions")
 
     command.upgrade(cfg, "head")
-    assert "post_state" in _columns("agent_actions")
+    assert "post_state" in column_names("agent_actions")
 
 
-def test_0033_round_trips_the_gate_column(isolated_migration_db: None) -> None:
+def test_0033_round_trips_the_gate_column(isolated_migration_db: IsolatedMigrationDb) -> None:
     """The gate column undoes cleanly too.
 
     Worth its own assertion rather than trusting the 0030 pattern: this column is
@@ -182,12 +149,12 @@ def test_0033_round_trips_the_gate_column(isolated_migration_db: None) -> None:
     re-upgrade at exactly the moment an operator is rolling back.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
-    assert "gate_approval_id" in _columns("agent_actions")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
+    assert "gate_approval_id" in column_names("agent_actions")
 
     command.downgrade(cfg, BELOW_0033)
-    assert "gate_approval_id" not in _columns("agent_actions")
+    assert "gate_approval_id" not in column_names("agent_actions")
 
     command.upgrade(cfg, "head")
-    assert "gate_approval_id" in _columns("agent_actions")
+    assert "gate_approval_id" in column_names("agent_actions")

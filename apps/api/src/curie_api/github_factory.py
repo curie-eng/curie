@@ -232,7 +232,7 @@ async def lock_issue(session: AsyncSession, repository_id: int, issue_number: in
 
 
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    # `agent_channels_route_key` (migration 0069) lets one repository pair
+    # `agent_channels_route_key` (migration 0070) lets one repository pair
     # hold several routes, so the query can return more than one row. The
     # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
     # belongs to some OTHER agent's repo, e.g. a stale rename), not what
@@ -307,6 +307,8 @@ def _admission_result(
     if isinstance(result, WorkItemOutcome):
         if result.replayed:
             return WebhookResult(status="factory_duplicate")
+        if result.request is not None and result.request.status == "queued":
+            return WebhookResult(status="factory_queued")
         if result.request is not None and result.request.id != request_id:
             return WebhookResult(status="factory_readmit_pending")
         return WebhookResult(status="factory_admitted")
@@ -328,7 +330,7 @@ async def admit_notice(
             raise FactoryRefused("not_admitted")
     facts = _facts(notice, binding, settings)
     if notice.disposition == "mention":
-        result = await workitem_dispatch.admit(session, facts)
+        result = await workitem_dispatch.admit_revision(session, facts)
     else:
         result = await workitem_dispatch.readmit(session, facts)
     return _admission_result(result, facts.request_id)

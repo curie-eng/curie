@@ -241,14 +241,19 @@ def check_api_reachable(
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
+            probe_timeout = min(_MAX_PROBE_TIMEOUT_S, remaining)
             try:
-                response = http.get(
-                    f"{base}/health", timeout=min(_MAX_PROBE_TIMEOUT_S, remaining)
-                )
+                response = http.get(f"{base}/health", timeout=probe_timeout)
                 if response.status_code == 200:
                     logger.info("platform API reachable at %s", logged_base)
                     return
                 last_error = f"HTTP {response.status_code}"
+            except httpx.TimeoutException as exc:
+                # A probe clipped to the tail of the budget times out because the
+                # budget ran out, not because the API misbehaved. Keep the error
+                # the API actually returned so the operator sees the real cause.
+                if not (last_error and probe_timeout < _MAX_PROBE_TIMEOUT_S):
+                    last_error = str(exc)
             except httpx.HTTPError as exc:
                 last_error = str(exc)
 

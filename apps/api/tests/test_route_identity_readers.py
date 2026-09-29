@@ -1,7 +1,7 @@
 """Every other API reader of a channel route resolves by its IDENTITY
 (ADR-0168 decision 3), not the raw `adapter` column.
 
-Migration 0069 stores the default Slack identity by name, `'default'`, but a
+Migration 0070 stores the default Slack identity by name, `'default'`, but a
 value arriving over the WIRE -- from an older caller, or a handle queued
 before the upgrade -- can still name none. Every reader below compares a
 route's identity through `route_identity`: an omitted adapter, a NULL and
@@ -419,10 +419,10 @@ def test_honor_declarations_stores_a_slack_declaration_as_the_default_identity(
 ) -> None:
     """A Slack declaration names the default identity, and honoring it writes
     that name into `approvals.reply_adapter` at the revision that honors it --
-    the stored form 0069 backfills everywhere else. The audit keeps the
+    the stored form 0070 backfills everywhere else. The audit keeps the
     normalized value and the operator's own spelling."""
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
     _write_declarations(
         tmp_path,
@@ -455,7 +455,7 @@ def test_honor_declarations_admits_a_non_slack_adapter_named_default(
     """`default` is an ordinary adapter slug for any kind but Slack, and 0022
     honored one before the Slack identity had a name."""
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
     _write_declarations(
         tmp_path,

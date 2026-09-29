@@ -142,6 +142,7 @@ api:
   S3_SECRET_KEY: rustfs.existingSecret
   SLACK_BOT_TOKEN: dispatcher.slack.botTokenExistingSecret
   SLACK_USERGROUP_CACHE_TTL_S: api.slackUsergroupCacheTtlSeconds
+  TRANSCRIPT_MAX_THREAD_BYTES: api.transcriptMaxThreadBytes
   VALKEY_HOST: valkey.host
   VALKEY_PASSWORD: valkey.existingSecret / valkey.password
   VALKEY_PORT: valkey.port

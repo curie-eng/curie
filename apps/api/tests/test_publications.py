@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -31,7 +32,7 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import approval_principal, crud
+from curie_api import approval_principal, crud, sandbox_token
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
@@ -47,6 +48,23 @@ from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_factory_terminus import (  # noqa: F401
+    _label as _factory_label,
+)
+from test_factory_terminus import (
+    _request as _factory_request,
+)
+from test_factory_terminus import (
+    _rows as _factory_rows,
+)
+from test_factory_terminus import (
+    _start_running as _start_factory_request,
+)
+from test_factory_terminus import admitted, comments  # noqa: F401
+from test_github_factory_ingress import REPO as FACTORY_REPO
+
 REPO = "acme-corp/acme-bot"
 WORKER_TOKEN = "remote-dev-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
@@ -60,6 +78,7 @@ PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 _PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
 _REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
+FACTORY_WORKER_HEADERS = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 
 
 @pytest.fixture
@@ -6330,7 +6349,7 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """ADR-0168 decision 3: migration 0069 backfills the default Slack identity
+    """ADR-0168 decision 3: migration 0070 backfills the default Slack identity
     to 'default', and a caller that names none means the same identity. A
     replay compares the identities, so the two spellings match."""
     client, _ = publication_stack
@@ -6357,7 +6376,7 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """A publication raised from a handle queued before migration 0069 can
+    """A publication raised from a handle queued before migration 0070 can
     still store NULL for the default Slack identity, while its replay now
     arrives as 'default'. Same identity, same replay."""
     client, _ = publication_stack
@@ -6377,3 +6396,220 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
 
     assert replay.status_code in {200, 201}, replay.text
     assert replay.json()["id"] == first["id"]
+
+
+@pytest.fixture
+def _factory_publication_case(
+    clean_db: None, admitted: Any  # noqa: F811
+) -> Iterator[tuple[TestClient, uuid.UUID, dict[str, Any]]]:
+    """Build a live factory request and its deployment for publication API tests."""
+
+    client, github, _comments = admitted
+    issue_number = 20_000 + int(uuid.uuid4().hex[:6], 16)
+    _factory_label(client, github, issue_number)
+    request = _factory_request(issue_number)
+    request_id = request["id"]
+    runtime_epoch = _start_factory_request(request_id)
+    work_item = _factory_rows(
+        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w "
+        "WHERE w.id = :id",
+        {"id": request["work_item_id"]},
+    )[0]
+
+    auth_headers = {"X-API-Key": get_settings().api_key}
+    agent_id = str(work_item["agent_id"])
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "operator"},
+        headers=auth_headers,
+    )
+    assert version.status_code == 201, version.text
+    deployment = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version.json()["id"],
+            "environment": "dev",
+            "workspace_enabled": True,
+        },
+        headers=auth_headers,
+    )
+    assert deployment.status_code == 201, deployment.text
+
+    payload = {
+        "deployment_id": deployment.json()["id"],
+        "conversation_id": work_item["conversation_id"],
+        "reply_conversation_id": f"issue-{issue_number}",
+        "repo_full_name": FACTORY_REPO,
+        "author": "github:77:maintainer",
+        "summary": "Publish the factory changes",
+        "reply_kind": "github",
+        "reply_channel": FACTORY_REPO,
+        "reply_placeholder": f"issue-comment-{issue_number}",
+        "dedupe_key": f"factory-publication-{uuid.uuid4().hex}",
+        "base_sha": BASE_SHA,
+        "work_item_request_id": str(request_id),
+        "work_item_runtime_epoch": runtime_epoch,
+        "patch_b64": base64.b64encode(b"diff --git a/example.py b/example.py\n").decode(),
+        "changed_paths": ["apps/api/src/example.py"],
+        "expires_in_seconds": 600,
+        "title": "Verify the factory publication route",
+        "body": "The change updates the factory verification route.",
+    }
+    yield client, request_id, payload
+
+
+def _record_factory_verification(
+    client: TestClient,
+    request_id: uuid.UUID,
+    *,
+    outcome: str = "unavailable",
+) -> Any:
+    observation: dict[str, Any] = {
+        "command": "uv run pytest runner/tests -q",
+        "outcome": outcome,
+        "exit_status": None if outcome == "unavailable" else 1,
+        "missing_binaries": ["uv"] if outcome == "unavailable" else [],
+        "blocked_services": [],
+    }
+    token = sandbox_token.mint(
+        get_settings().api_key,
+        agent=str(request_id),
+        scope="work_item.progress",
+        exp=int(time.time()) + 3600,
+    )
+    return client.post(
+        f"/v1/work-item-progress/{request_id}/verification",
+        headers={"X-API-Key": token},
+        json=observation,
+    )
+
+
+def _post_factory_publication(
+    client: TestClient, payload: dict[str, Any]
+) -> Any:
+    selected = client.post(
+        f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": payload["repo_full_name"],
+        },
+        headers=FACTORY_WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+    return client.post(
+        "/v1/internal/publications",
+        json=payload,
+        headers=FACTORY_WORKER_HEADERS,
+    )
+
+
+def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_body(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    publication_id = created.json()["id"]
+    body = _factory_rows(
+        "SELECT body FROM curie.publications WHERE id = :id",
+        {"id": publication_id},
+    )[0]["body"]
+    assert payload["body"] in body
+    assert "In-sandbox verification was unavailable." in body
+    assert "Python (ruff + mypy + pytest) is pending proof." in body
+    assert "verification passed" not in body.casefold()
+
+
+def test_factory_python_publication_refuses_a_missing_preflight_observation(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_missing"
+    assert "preflight" in refused.json()["detail"]["message"].casefold()
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_a_failed_preflight_observation(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="failed")
+    assert recorded.status_code == 201, recorded.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+    assert "rerun" in refused.json()["detail"]["message"].casefold()
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
+    assert "examples/coder/factory_fixture.py" in refused.json()["detail"]["message"]
+
+
+def test_factory_non_python_publication_keeps_its_existing_body_without_python_claims(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["README.md"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["body"] == payload["body"]
+
+
+def test_later_non_python_publication_keeps_prior_python_proof_pending(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+    first = _post_factory_publication(client, payload)
+    assert first.status_code == 201, first.text
+    _execute(
+        "UPDATE curie.publications SET status = 'succeeded', "
+        "outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(first.json()["id"])},
+    )
+
+    later = payload.copy()
+    later["dedupe_key"] = f"factory-publication-{uuid.uuid4().hex}"
+    later["changed_paths"] = ["README.md"]
+    later["patch_b64"] = base64.b64encode(b"diff --git a/README.md b/README.md\n").decode()
+    later["body"] = "Update the documentation after the Python change."
+    created = _post_factory_publication(client, later)
+
+    assert created.status_code == 201, created.text
+    assert "In-sandbox verification was unavailable." in created.json()["body"]
+    assert "Python (ruff + mypy + pytest) is pending proof." in created.json()["body"]

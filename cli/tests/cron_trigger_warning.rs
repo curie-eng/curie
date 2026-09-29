@@ -4,10 +4,12 @@
 //! product change is reversed. Docker is the boundary outside the changed CLI
 //! component and returns the runner report that `skill check` consumes.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -35,15 +37,6 @@ const INVALID_BUNDLE_REPORT: &str = r#"{
   "hints": []
 }"#;
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make executable");
-}
-
 fn stub_path(tools: &Path) -> OsString {
     let mut entries = vec![tools.to_path_buf()];
     entries.extend(["/bin", "/usr/bin"].iter().map(PathBuf::from));
@@ -66,7 +59,7 @@ fn run_skill_check(manifest: Value, report: &str) -> Output {
     .expect("write manifest");
 
     let script = format!("#!/bin/sh\nprintf '%s\\n' '{report}'\n");
-    write_executable(&tools.join("docker"), &script);
+    test_executable::install(&tools.join("docker"), &script);
 
     Command::new(env!("CARGO_BIN_EXE_curie"))
         .args([

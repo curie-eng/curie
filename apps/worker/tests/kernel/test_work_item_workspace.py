@@ -695,6 +695,69 @@ def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
     asyncio.run(exercise())
 
 
+def _max_turns_script() -> list:
+    return [
+        ErrorEvent(message="reached max turns", classification="max-turns"),
+        Final(text="f", status=SessionStatus.CLASSIFIED_FAILURE),
+    ]
+
+
+def test_work_item_max_turns_escalation_names_the_work_item_budget(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3403: a work item that exhausts its budget names the work-item setting
+    and the value it actually ran under."""
+
+    caplog.set_level("WARNING", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = _max_turns_script()
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            # A work item has no chat sink; the escalation is the kernel's
+            # escalation record.
+            text = " ".join(
+                r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()
+            )
+            assert "max-turns" in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS, currently 5" in text, text
+            assert "through runner.extraEnv" not in text, text
+
+    asyncio.run(exercise())
+
+
+def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None:
+    """#3403: a chat delivery runs under the runner's CURIE_MAX_TURNS, so its
+    escalation must name that setting, not the work-item budget it never had."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
+            h.runner.default_script = _max_turns_script()
+
+            await h.kernel.process_event(
+                _turn(f"slack-{uuid.uuid4()}", f"Please look at {ISSUE_URL}")
+            )
+
+            text = h.sink.last_text
+            assert text is not None and "max-turns" in text, text
+            assert "raise CURIE_MAX_TURNS through runner.extraEnv" in text, text
+            assert "runner default 20 when unset" in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
+            assert "currently 5" not in text, text
+
+    asyncio.run(exercise())
+
+
 def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
     make_harness,
 ) -> None:

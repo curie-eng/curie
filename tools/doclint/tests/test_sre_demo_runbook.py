@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from .conftest import RunLint, write
 
 _RUNBOOK = "examples/sre-bot/DEMO.md"
@@ -37,36 +39,38 @@ def test_missing_sre_demo_runbook_fails(clean_repo: Path, run_lint: RunLint) -> 
     assert _RUNBOOK in out
 
 
-def test_sre_demo_runbook_bogus_flag_fails(clean_repo: Path, run_lint: RunLint) -> None:
-    # THE ticket's own defect class: the runbook names a flag the CLI does not
-    # declare. Mutating the doc, not the manifest, is the operator-facing
+# The resolver is shared by every gated document, so the drift cases run
+# against the agents contract and the runbook alike. Each case replaces the
+# whole document, leaving only the line under test.
+_GATED_DOCUMENTS = pytest.mark.parametrize("document", ["docs/agents.md", _RUNBOOK])
+
+
+@_GATED_DOCUMENTS
+def test_gated_document_bogus_flag_fails(
+    clean_repo: Path, run_lint: RunLint, document: str
+) -> None:
+    # THE ticket's own defect class: the document names a flag the CLI does
+    # not declare. Mutating the doc, not the manifest, is the operator-facing
     # direction (an editor invents `--workpace`).
-    _write_runbook(
-        clean_repo,
-        "# Fixture runbook\n\n```bash\ncurie schema --not-a-real-flag\n```\n",
-    )
+    write(clean_repo, document, "# Fixture\n\n```bash\ncurie schema --not-a-real-flag\n```\n")
     code, out = run_lint(clean_repo)
     assert code != 0
     assert "--not-a-real-flag" in out
-    assert _RUNBOOK in out
+    assert document in out
 
 
-def test_sre_demo_runbook_bogus_subcommand_fails(
-    clean_repo: Path, run_lint: RunLint
+@_GATED_DOCUMENTS
+def test_gated_document_bogus_subcommand_fails(
+    clean_repo: Path, run_lint: RunLint, document: str
 ) -> None:
-    _write_runbook(
-        clean_repo,
-        "# Fixture runbook\n\nRun `curie skill bogusverb --json` next.\n",
-    )
+    write(clean_repo, document, "# Fixture\n\nRun `curie skill bogusverb --json` next.\n")
     code, out = run_lint(clean_repo)
     assert code != 0
     assert "bogusverb" in out
-    assert _RUNBOOK in out
+    assert document in out
 
 
-def test_sre_demo_runbook_without_commands_fails(
-    clean_repo: Path, run_lint: RunLint
-) -> None:
+def test_sre_demo_runbook_without_commands_fails(clean_repo: Path, run_lint: RunLint) -> None:
     # Vacuity guard: a reword that drops the backticks would otherwise leave a
     # green gate over an unverified runbook.
     _write_runbook(
@@ -79,14 +83,12 @@ def test_sre_demo_runbook_without_commands_fails(
     assert "no `curie` command appears" in out
 
 
-def test_sre_demo_runbook_valid_command_passes(
-    clean_repo: Path, run_lint: RunLint
+@_GATED_DOCUMENTS
+def test_gated_document_valid_command_passes(
+    clean_repo: Path, run_lint: RunLint, document: str
 ) -> None:
     # Positive control. `curie schema` is hidden in the fixture manifest and
     # must still resolve: hidden means unadvertised, not nonexistent.
-    _write_runbook(
-        clean_repo,
-        "# Fixture runbook\n\n```bash\ncurie schema\n```\n",
-    )
+    write(clean_repo, document, "# Fixture\n\n```bash\ncurie schema\n```\n")
     code, out = run_lint(clean_repo)
     assert code == 0, out

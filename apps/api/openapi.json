@@ -7049,6 +7049,65 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VerificationObservation": {
+        "additionalProperties": false,
+        "description": "Exact sandbox command result recorded before the model starts.",
+        "properties": {
+          "blocked_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Blocked Services",
+            "type": "array"
+          },
+          "command": {
+            "maxLength": 180,
+            "minLength": 1,
+            "title": "Command",
+            "type": "string"
+          },
+          "exit_status": {
+            "anyOf": [
+              {
+                "maximum": 255.0,
+                "minimum": -255.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Status"
+          },
+          "missing_binaries": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Missing Binaries",
+            "type": "array"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "unavailable",
+              "failed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "outcome",
+          "exit_status",
+          "missing_binaries",
+          "blocked_services"
+        ],
+        "title": "VerificationObservation",
+        "type": "object"
+      },
       "VersionCreate": {
         "properties": {
           "bundle_ref": {
@@ -7463,6 +7522,7 @@
           },
           "state": {
             "enum": [
+              "queued",
               "waiting",
               "running",
               "cancellation_requested",
@@ -7656,9 +7716,16 @@
             "title": "Termination Observation"
           },
           "wait_deadline": {
-            "format": "date-time",
-            "title": "Wait Deadline",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wait Deadline"
           }
         },
         "required": [
@@ -12404,7 +12471,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12415,7 +12482,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12522,7 +12589,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12533,7 +12600,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12918,7 +12985,7 @@
         "parameters": [
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12929,7 +12996,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -16802,6 +16869,75 @@
           }
         },
         "summary": "Report Work Item Usage",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}/verification": {
+      "post": {
+        "operationId": "report_work_item_verification_v1_work_item_progress__request_id__verification_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Verification V1 Work Item Progress  Request Id  Verification Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Verification",
         "tags": [
           "factory-status"
         ]

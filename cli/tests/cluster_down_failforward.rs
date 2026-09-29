@@ -19,22 +19,15 @@
 //! message, so scenario 1's message assertion fails), and any nonzero helm exit
 //! returns Transient (so scenario 2's permanent case is mislabeled retryable).
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use curie::exit::{classify, ExitClass};
 use curie::ops::{down, down_commands, CommonOpts, DownOpts};
-
-/// Write `body` to `dir/name` and mark it executable (0o755).
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut perms = fs::metadata(&path).expect("stat fake").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod fake executable");
-}
 
 /// Prepend `dir` to the current process PATH so its fake binaries win resolution.
 fn prepend_path(dir: &Path) {
@@ -79,12 +72,12 @@ async fn cluster_down_fails_forward_through_real_down() {
     std::env::set_var("SWEEP_MARKER", &marker1);
     let unreachable =
         "Error: Kubernetes cluster unreachable: Get \"https://h:6443/version\": net/http: TLS handshake timeout";
-    write_exec(
+    test_executable::install_in(
         dir1.path(),
         "helm",
         &format!("#!/bin/sh\necho '{unreachable}' >&2\nexit 1\n"),
     );
-    write_exec(
+    test_executable::install_in(
         dir1.path(),
         "kubectl",
         &format!(
@@ -128,12 +121,12 @@ async fn cluster_down_fails_forward_through_real_down() {
     std::env::set_var("SWEEP_MARKER", &marker2);
     let forbidden =
         "Error: uninstall: namespaces is forbidden: User \"x\" cannot delete resource \"namespaces\"";
-    write_exec(
+    test_executable::install_in(
         dir2.path(),
         "helm",
         &format!("#!/bin/sh\necho '{forbidden}' >&2\nexit 1\n"),
     );
-    write_exec(
+    test_executable::install_in(
         dir2.path(),
         "kubectl",
         "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho 'namespace \"prod-release-agent-sandbox\" deleted'\nexit 0\n",
@@ -181,12 +174,12 @@ async fn cluster_down_fails_forward_through_real_down() {
     std::env::set_var("SWEEP_MARKER", &marker3);
     let unreachable3 =
         "Error: Kubernetes cluster unreachable: Get \"https://h:6443/version\": connection refused";
-    write_exec(
+    test_executable::install_in(
         dir3.path(),
         "helm",
         &format!("#!/bin/sh\necho '{unreachable3}' >&2\nexit 1\n"),
     );
-    write_exec(
+    test_executable::install_in(
         dir3.path(),
         "kubectl",
         "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\nexit 0\n",
@@ -233,7 +226,7 @@ async fn cluster_down_fails_forward_through_real_down() {
     let helm_log = dir4.path().join("helm.log");
     let kubectl_log = dir4.path().join("kubectl.log");
     let kubectl_switched = dir4.path().join("kubectl-switched");
-    write_exec(
+    test_executable::install_in(
         dir4.path(),
         "helm",
         &format!(
@@ -241,7 +234,7 @@ async fn cluster_down_fails_forward_through_real_down() {
             helm_log.display()
         ),
     );
-    write_exec(
+    test_executable::install_in(
         dir4.path(),
         "kubectl",
         &format!(

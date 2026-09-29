@@ -26,16 +26,18 @@ def test_specific_family_wins_over_shorter_prefix() -> None:
     assert cost_usd("claude-opus-4-1-20250805", 1_000_000, 0) == pytest.approx(15.0)
 
 
-def test_unknown_model_is_none_not_guessed() -> None:
-    assert cost_usd("some-unpriced-model", 1_000_000, 200_000) is None
-
-
-def test_none_model_is_none() -> None:
-    assert cost_usd(None, 1_000_000, 200_000) is None
-
-
-def test_no_usage_at_all_is_none() -> None:
-    assert cost_usd("claude-opus-4-8", None, None) is None
+@pytest.mark.parametrize(
+    ("model", "input_tokens", "output_tokens"),
+    [
+        pytest.param("some-unpriced-model", 1_000_000, 200_000, id="unknown-model-not-guessed"),
+        pytest.param(None, 1_000_000, 200_000, id="none-model"),
+        pytest.param("claude-opus-4-8", None, None, id="no-usage-at-all"),
+    ],
+)
+def test_cost_is_none(
+    model: str | None, input_tokens: int | None, output_tokens: int | None
+) -> None:
+    assert cost_usd(model, input_tokens, output_tokens) is None
 
 
 def test_partial_usage_prices_the_known_side() -> None:

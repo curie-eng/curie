@@ -383,8 +383,13 @@ the timeout branch instead of staying pending.
 - **Roll the API before the dispatcher.** The identity contract intentionally has no
   assertion-compatible dual mode. During an upgrade, bring up the verifier first, then
   the attester; the reverse order is rejected rather than reopening asserted identity.
-- **Console resolution requires HTTPS.** Its session cookie is `Secure`, `HttpOnly`, and
-  same-site. A browser on a plain-HTTP endpoint will not retain the credential.
+- **Console resolution requires HTTPS.** Its session cookie is `__Host-curie_console_session`:
+  `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, and no `Domain`. A browser on a plain-HTTP
+  endpoint will not retain the credential. `SameSite` does not stop another origin on the same
+  site, so a cookie-authenticated resolve or recover also requires a matching `Origin` (or
+  `Referer` when `Origin` is absent). The host must match; the scheme may differ because the
+  UI proxy speaks HTTP to the API. Sessions minted under the old name `curie_console_session`
+  stop working on upgrade. The TTL is 12 hours; exchange a new login code.
 
 ## Common failures
 
@@ -393,7 +398,8 @@ the timeout branch instead of staying pending.
 | `401 missing or invalid approval principal` | A platform API key alone cannot resolve. For an explicit-user route, mint an operator principal, export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and retry; otherwise use the authenticated Slack card or a live Console session. |
 | `403 operator approval principals can resolve only routes bound to an explicit user list` | Terminal credentials carry no Slack membership evidence. Add the subject to an explicit `approvers.users` binding, or resolve through the authenticated card. |
 | `403 console approval principals can resolve only routes bound to an explicit user list or verifiable user group` | The Console session carries no channel evidence. Use an explicit `approvers.users` binding, a group the API can verify, or the authenticated card. |
-| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. |
+| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. After an upgrade that renames the cookie to `__Host-curie_console_session`, an older session also returns 401 until the operator exchanges a new login code. |
+| `403 console session origin rejected` | The console cookie was the only principal on an unsafe call, and `Origin` (or `Referer` if `Origin` was absent) was missing or named a different host. Retry from the console page itself. Header principals are not checked. |
 | `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |

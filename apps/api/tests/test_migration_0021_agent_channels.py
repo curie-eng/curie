@@ -34,19 +34,11 @@ itself via `isolated_migration_db`, real Postgres, no mocking.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, constraint_exists, sql_rows
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # The revision immediately below 0021. Targeted explicitly rather than as a
 # relative "-1": a later migration moving head would make "-1" stop short of
@@ -61,21 +53,6 @@ BELOW = "0020"
 LEGACY_CONSTRAINT = "agents_slack_channel_key"
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    """Run one statement against the isolated migration database."""
-
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
 def _seed_pre_0021_agent(name: str, channel: str) -> uuid.UUID:
     """Insert one agent on the PRE-0021 schema, straight into the old column.
 
@@ -87,21 +64,15 @@ def _seed_pre_0021_agent(name: str, channel: str) -> uuid.UUID:
         The new agent's id.
     """
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name, slack_channel) VALUES (:id, :name, :ch)",
         {"id": agent_id, "name": name, "ch": channel},
     )
     return agent_id
 
 
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
 def _column_exists(table: str, column: str) -> bool:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT 1 FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = :t AND column_name = :c",
         {"t": table, "c": column},
@@ -110,7 +81,7 @@ def _column_exists(table: str, column: str) -> bool:
 
 
 def _is_nullable(table: str, column: str) -> bool:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT is_nullable FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = :t AND column_name = :c",
         {"t": table, "c": column},
@@ -119,30 +90,13 @@ def _is_nullable(table: str, column: str) -> bool:
     return rows[0][0] == "YES"
 
 
-def _constraint_named(name: str) -> bool:
-    """Look the constraint up BY NAME in the catalog.
-
-    Deliberately not a shape check: a unique constraint restored under a
-    generated name has the right shape and the wrong identity, which is exactly
-    the failure this asserts against.
-    """
-    rows = _sql(
-        "SELECT 1 FROM pg_constraint c "
-        "JOIN pg_class t ON t.oid = c.conrelid "
-        "JOIN pg_namespace n ON n.oid = t.relnamespace "
-        "WHERE n.nspname = 'curie' AND c.conname = :name",
-        {"name": name},
-    )
-    return bool(rows)
-
-
 def test_the_upgrade_backfills_one_binding_per_agent_and_drops_the_column(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T8, upgrade half / AC5. Existing installs migrate without data loss."""
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, BELOW)
 
     bindings = {
@@ -153,7 +107,7 @@ def test_the_upgrade_backfills_one_binding_per_agent_and_drops_the_column(
 
     command.upgrade(cfg, "head")
 
-    rows = _sql(
+    rows = sql_rows(
         "SELECT agent_id, kind, address FROM curie.agent_channels ORDER BY address"
     )
     assert {r[0]: r[2] for r in rows} == bindings
@@ -171,7 +125,7 @@ def test_the_upgrade_backfills_one_binding_per_agent_and_drops_the_column(
 
 
 def test_the_downgrade_restores_the_column_its_not_null_and_its_named_constraint(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T8, downgrade half / AC5. Restoring the values is not enough.
 
@@ -182,8 +136,8 @@ def test_the_downgrade_restores_the_column_its_not_null_and_its_named_constraint
     #38 conflict becomes a 500).
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, BELOW)
 
     bindings = {
@@ -194,10 +148,10 @@ def test_the_downgrade_restores_the_column_its_not_null_and_its_named_constraint
     command.upgrade(cfg, "head")
     command.downgrade(cfg, BELOW)
 
-    restored = _sql("SELECT id, slack_channel FROM curie.agents ORDER BY slack_channel")
+    restored = sql_rows("SELECT id, slack_channel FROM curie.agents ORDER BY slack_channel")
     assert {r[0]: r[1] for r in restored} == bindings
     assert not _is_nullable("agents", "slack_channel")
-    assert _constraint_named(LEGACY_CONSTRAINT), (
+    assert constraint_exists(LEGACY_CONSTRAINT), (
         f"the downgrade must restore the unique constraint as {LEGACY_CONSTRAINT!r}: "
         "the API's 409 message map is keyed on that exact name, and a "
         "Postgres-generated name turns the #38 conflict into an opaque 500"
@@ -207,13 +161,13 @@ def test_the_downgrade_restores_the_column_its_not_null_and_its_named_constraint
     # rebuilds the same bindings, which a downgrade that quietly lost NOT NULL
     # or the constraint would not survive.
     command.upgrade(cfg, "head")
-    again = _sql("SELECT agent_id, kind, address FROM curie.agent_channels")
+    again = sql_rows("SELECT agent_id, kind, address FROM curie.agent_channels")
     assert {r[0]: r[2] for r in again} == bindings
     assert {r[1] for r in again} == {"slack"}
 
 
 def test_the_upgrade_is_refused_rather_than_guessed_when_the_column_holds_a_duplicate(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T8's pre-flight half. Migration 0017 already guarantees address
     uniqueness, so the backfill provably cannot collide -- but "provably" rests
@@ -223,15 +177,15 @@ def test_the_upgrade_is_refused_rather_than_guessed_when_the_column_holds_a_dupl
     that names one.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, BELOW)
 
     _seed_pre_0021_agent("dupe-a", "C0EXAMPLE1")
     # Reachable only out of band, which is the point: 0017's constraint is what
     # normally forbids it, and this proves 0021 does not simply inherit that
     # assumption unchecked.
-    _sql(f"ALTER TABLE curie.agents DROP CONSTRAINT {LEGACY_CONSTRAINT}")
+    sql_rows(f"ALTER TABLE curie.agents DROP CONSTRAINT {LEGACY_CONSTRAINT}")
     _seed_pre_0021_agent("dupe-b", "C0EXAMPLE1")
 
     with pytest.raises(Exception) as caught:
@@ -241,7 +195,7 @@ def test_the_upgrade_is_refused_rather_than_guessed_when_the_column_holds_a_dupl
 
 @pytest.mark.parametrize("kind", ["webhook", "teams"])
 def test_the_downgrade_refuses_a_non_slack_binding(
-    isolated_migration_db: None, kind: str
+    isolated_migration_db: IsolatedMigrationDb, kind: str
 ) -> None:
     """T9 / AC6, first unrepresentable state. A non-`slack` binding has no
     representation in a single `slack_channel` column, so writing its address
@@ -249,15 +203,15 @@ def test_the_downgrade_refuses_a_non_slack_binding(
     worker routes a Slack turn to it that it was never meant to serve.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, BELOW)
     agent_id = _seed_pre_0021_agent("non-slack", "C0EXAMPLE1")
     command.upgrade(cfg, "head")
 
-    _sql(
+    sql_rows(
         # Route-less, as any other kind may be: a Slack row's identity is no
-        # route for it (migration 0069's agent_channels_route_ck).
+        # route for it (migration 0070's agent_channels_route_ck).
         "UPDATE curie.agent_channels SET kind = :kind, address = :addr, adapter = NULL "
         "WHERE agent_id = :id",
         {"kind": kind, "addr": "acme-room-7", "id": agent_id},
@@ -271,7 +225,7 @@ def test_the_downgrade_refuses_a_non_slack_binding(
 
 
 def test_the_downgrade_refuses_an_agent_with_no_binding(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T9 / AC6, second unrepresentable state, and the one an implementation is
     most likely to leave to the driver.
@@ -283,8 +237,8 @@ def test_the_downgrade_refuses_an_agent_with_no_binding(
     the problem. The error must name the AGENT.
     """
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, BELOW)
     bound = _seed_pre_0021_agent("still-bound", "C0EXAMPLE1")
     orphan = _seed_pre_0021_agent("unbound-agent", "C0EXAMPLE2")
@@ -293,7 +247,7 @@ def test_the_downgrade_refuses_an_agent_with_no_binding(
     # Reachable only out of band: the API requires a binding on create and
     # rejects an explicit null on PATCH. Out of band is exactly the state a
     # downgrade has to survive.
-    _sql("DELETE FROM curie.agent_channels WHERE agent_id = :id", {"id": orphan})
+    sql_rows("DELETE FROM curie.agent_channels WHERE agent_id = :id", {"id": orphan})
 
     with pytest.raises(Exception) as caught:
         command.downgrade(cfg, BELOW)

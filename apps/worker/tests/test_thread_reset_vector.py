@@ -26,8 +26,7 @@ def test_thread_reset_keys_match_the_frozen_vector() -> None:
     unknown = set(parsed) - _EXPECTED_KEYS
     assert not unknown, (
         f"unknown keys in tests/vectors/thread-reset-set.json: {sorted(unknown)}. "
-        "Teach them to this test, apps/api/tests/test_thread_reset_vector.py, "
-        "and the CLI queue.rs vector test."
+        "Teach them to this test and the CLI queue.rs vector test."
     )
     assert parsed["thread_reset_set"] == THREAD_RESET_SET
     assert parsed["thread_reset_inflight_set"] == THREAD_RESET_INFLIGHT_SET
