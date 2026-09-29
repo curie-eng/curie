@@ -426,7 +426,7 @@ _TOOL_RESULT_ATTRIBUTES = {
     "service.name": ["curie-runner"],
     "source": ["runner"],
     "origin": ["connector", "platform", "builtin"],
-    "outcome": ["success", "error", "awaiting_approval", "cancelled"],
+    "outcome": ["success", "error", "awaiting_approval", "cancelled", "refused", "unavailable"],
 }
 
 

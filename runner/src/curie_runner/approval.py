@@ -713,6 +713,10 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # The metric observer must attribute a hold to the exact SDK call. A tool
+    # name is insufficient when a granted call and a held sibling share it.
+    held_call_ids: set[str] = field(default_factory=set)
+    refused_call_ids: set[str] = field(default_factory=set)
     # A declared tool policy plus the bundle identity needed to translate live
     # SDK MCP names back to the canonical "<server>/<tool>" policy surface.
     tool_policy: ToolPolicy | None = None
@@ -764,6 +768,8 @@ class ApprovalGate:
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
         self.pending_halt = False
+        self.held_call_ids.clear()
+        self.refused_call_ids.clear()
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
         # expire any unspent grant on the second and later resets so it never
         # leaks into a subsequent turn.
@@ -1132,6 +1138,8 @@ async def _decide_gate(
             )
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
@@ -1145,6 +1153,8 @@ async def _decide_gate(
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
         if gate.grant_argument_mismatch(tool_name, tool_input):
+            if tool_use_id is not None:
+                gate.refused_call_ids.add(tool_use_id)
             return _GateDecision(
                 blocked=False,
                 ungated=False,
@@ -1154,6 +1164,8 @@ async def _decide_gate(
         if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False)
         gate.block(tool_name, tool_input)
+        if tool_use_id is not None:
+            gate.held_call_ids.add(tool_use_id)
         return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
@@ -1162,6 +1174,8 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
         tool_name, tool_input
     ):
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
@@ -1171,6 +1185,8 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
+    if tool_use_id is not None:
+        gate.held_call_ids.add(tool_use_id)
     if (
         tool_name == PLATFORM_PUBLISH_TOOL_NAME
         and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
