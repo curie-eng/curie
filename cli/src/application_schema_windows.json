@@ -66,11 +66,14 @@
     "0064",
     "0065",
     "0066",
-    "0067"
+    "0067",
+    "0068",
+    "0069",
+    "0070"
   ],
   "candidate": {
-    "schema_min": "0060",
-    "schema_head": "0067"
+    "schema_min": "0070",
+    "schema_head": "0070"
   },
   "windows": {
     "0.8.0": {
@@ -151,9 +154,13 @@
       "schema_min": "0060",
       "schema_head": "0062"
     },
+    "0.10.3": {
+      "schema_min": "0063",
+      "schema_head": "0063"
+    },
     "0.11.0": {
-      "schema_min": "0060",
-      "schema_head": "0067"
+      "schema_min": "0070",
+      "schema_head": "0070"
     }
   }
 }

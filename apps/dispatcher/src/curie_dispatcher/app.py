@@ -17,6 +17,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 
+from .admission import AdmissionGate
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
 from .identities import SlackIdentityCredentials, default_identity_credentials
@@ -79,6 +80,7 @@ def build_app(
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
     identity_bots: Mapping[str, str] | None = None,
+    admission: AdmissionGate | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
@@ -87,6 +89,9 @@ def build_app(
     turn this app mints carries (ADR-0168 decision 2). ``identity_bots`` is
     every identity's bot id and bot user id (ADR-0168 decision 6); None admits
     no sibling.
+
+    ``admission`` is the caller-list gate (ADR 0175). ``run`` passes one gate
+    shared by every identity; None builds one for this app from config.
     """
     credentials = identity if identity is not None else default_identity_credentials(config)
     signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -119,6 +124,8 @@ def build_app(
         register_kwargs["resolver"] = resolver
     if identity_bots is not None:
         register_kwargs["identity_bots"] = identity_bots
+    if admission is not None:
+        register_kwargs["admission"] = admission
     register_handlers(app, **register_kwargs)
     return app
 

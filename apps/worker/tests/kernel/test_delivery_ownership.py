@@ -31,14 +31,16 @@ hide exactly the difference that matters.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import sys
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
@@ -46,6 +48,14 @@ from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heart
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
 from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until  # noqa: E402
+
+_wait_until = functools.partial(wait_until, timeout=10.0)
 
 DONE = SessionStatus.DONE
 
@@ -63,26 +73,6 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": _HEARTBEAT_S,
     "runner_total_timeout_s": 30.0,
 }
-
-
-def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 async def _read_one(h: Any, consumer_name: str) -> tuple[str, dict[str, str]]:

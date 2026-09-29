@@ -5,7 +5,10 @@ A succeeded publication does not end the request. The reconciler hands each
 statuses on the published head (``workitem_outcomes.observe_ci_detail``) and
 decides with the pure ``decide``:
 
-- green, or no checks after the grace period, completes the request;
+- green, or no checks after the grace period when no required check applies,
+  completes the request;
+- selected Python changes require valid preflight evidence and a successful
+  ``Python (ruff + mypy + pytest)`` GitHub Actions check;
 - a failure below the round cap enqueues ONE continuation turn for the same
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
@@ -77,6 +80,20 @@ _ANNOTATIONS_MAX = 10
 _TITLE_MAX = 100
 _CHECKS_LINE_MAX = 400
 _NO_CI_NOTE = f"No CI checks appeared within {CI_GRACE_SECONDS} s."
+_REQUIRED_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+# Conservative subset of the release train's MUST_RUN_PYTEST_PREFIXES and
+# nonignored fallback paths in tools/e2e-ci-selection/select_tiers.py.
+# Unknown Python paths fail closed instead of assuming the selector fallback.
+_PYTHON_CI_SELECTED_PREFIXES = (
+    "apps",
+    "runner",
+    "cli",
+    "adapters",
+    "packages",
+    "examples/tests",
+    "tools",
+    "release",
+)
 
 VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]
@@ -108,6 +125,32 @@ def ci_key(request_id: uuid.UUID, round_: int) -> str:
 
 def _str(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _matches_path_prefix(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(f"{prefix}/")
+
+
+def _python_paths(changed_paths: Sequence[str]) -> list[str]:
+    return [path for path in changed_paths if path.endswith(".py")]
+
+
+def _python_path_is_selected(path: str) -> bool:
+    return any(
+        _matches_path_prefix(path, prefix)
+        for prefix in _PYTHON_CI_SELECTED_PREFIXES
+    )
+
+
+def _unselected_python_path(changed_paths: Sequence[str]) -> str | None:
+    return next(
+        (path for path in _python_paths(changed_paths) if not _python_path_is_selected(path)),
+        None,
+    )
+
+
+def _publication_changed_paths(publications: Sequence[Publication]) -> list[str]:
+    return [path for publication in publications for path in publication.changed_paths]
 
 
 def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
@@ -160,10 +203,20 @@ def decide(
     published_at: datetime,
     execution_deadline: datetime,
     ci_wait_seconds: int,
+    changed_paths: Sequence[str],
     prior_round_had_checks: bool = False,
     fresh_after: datetime | None = None,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument."""
+
+    changed_python_paths = _python_paths(changed_paths)
+    unselected_path = _unselected_python_path(changed_paths)
+    if unselected_path is not None:
+        return Verdict(
+            kind="unverified",
+            reason=f"required_python_ci_unselected: {unselected_path}",
+        )
+    requires_python_ci = bool(changed_python_paths)
 
     ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
@@ -219,6 +272,30 @@ def decide(
         # suite on the unchanged commit. Keep its passing or pending evidence.
         effective = _metadata_revision_detail(detail, fresh_after)
         check_runs, statuses = effective.check_runs, effective.statuses
+
+    required_python_runs = [
+        run
+        for run in check_runs
+        if run.get("name") == _REQUIRED_PYTHON_CI_CHECK
+        and isinstance(run.get("app"), dict)
+        and run["app"].get("slug") == "github-actions"
+    ]
+    if requires_python_ci and any(
+        run.get("status") == "completed"
+        and run.get("conclusion") in {"skipped", "neutral"}
+        for run in required_python_runs
+    ):
+        conclusion = next(
+            run.get("conclusion")
+            for run in required_python_runs
+            if run.get("status") == "completed"
+            and run.get("conclusion") in {"skipped", "neutral"}
+        )
+        return Verdict(
+            kind="unverified",
+            reason=f"required_python_ci_{conclusion}",
+        )
+
     failing: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     for run in check_runs:
@@ -238,7 +315,30 @@ def decide(
             pending.append({"context": context, "state": _str(state)})
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
-        return Verdict(kind="failing", failing=failing, pending=pending)
+        required_python_failed = requires_python_ci and any(
+            run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            for run in required_python_runs
+        )
+        return Verdict(
+            kind="failing",
+            failing=failing,
+            pending=pending,
+            reason="required_python_ci_failed" if required_python_failed else None,
+        )
+
+    if requires_python_ci and not required_python_runs:
+        in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
+        if in_grace and not expired and not prior_round_had_checks:
+            return Verdict(kind="pending", reason="required_python_ci_missing")
+        has_unrelated_checks = bool(check_runs or statuses)
+        reason = (
+            "required_python_ci_unrelated"
+            if has_unrelated_checks
+            else "required_python_ci_missing"
+        )
+        return Verdict(kind="unverified", reason=reason)
+
     if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
         if in_grace and not expired:
@@ -557,35 +657,78 @@ async def gate(
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"
-    if not may_observe(request.id):
-        return "waiting"
     latest = facts.publications[-1]
     observed_sha = lineage.head_sha
-    detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
-    metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
-    fresh_after = latest.metadata_updated_at if metadata_only else None
-    async with sessionmaker() as session:
-        now = await workitems._database_now(session)
-        await session.rollback()
-    head_sha = detail.head_sha or observed_sha or ""
-    if metadata_only and fresh_after is None:
-        verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
-    else:
-        verdict = decide(
-            detail,
-            now=now,
-            published_at=facts.published_at,
-            execution_deadline=request.execution_deadline,
-            ci_wait_seconds=settings.github_factory_ci_wait_s,
-            prior_round_had_checks=round_ > 1,
-            fresh_after=fresh_after,
+    changed_paths = _publication_changed_paths(facts.publications)
+    changed_python_paths = _python_paths(changed_paths)
+    unselected_path = _unselected_python_path(changed_paths)
+    preflight_verdict: Verdict | None = None
+    if unselected_path is not None:
+        preflight_verdict = Verdict(
+            kind="unverified",
+            reason=f"required_python_ci_unselected: {unselected_path}",
         )
+    elif changed_python_paths:
+        verification: factory_progress.VerificationObservation | None
+        try:
+            async with sessionmaker() as session:
+                verification = await factory_progress.read_verification_observation(
+                    session, request.id
+                )
+                await session.rollback()
+        except ValueError:
+            preflight_verdict = Verdict(
+                kind="unverified", reason="python_preflight_unreadable"
+            )
+        else:
+            if verification is None:
+                preflight_verdict = Verdict(
+                    kind="unverified", reason="python_preflight_missing"
+                )
+            elif verification.outcome == "failed":
+                preflight_verdict = Verdict(
+                    kind="unverified",
+                    reason=(
+                        "python_preflight_failed_exit_status_"
+                        f"{verification.exit_status}"
+                    ),
+                )
+
+    detail: CiDetail | None = None
+    fresh_after: datetime | None = None
+    if preflight_verdict is not None:
+        verdict = preflight_verdict
+        head_sha = observed_sha or ""
+    else:
+        if not may_observe(request.id):
+            return "waiting"
+        detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
+        metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
+        fresh_after = latest.metadata_updated_at if metadata_only else None
+        async with sessionmaker() as session:
+            now = await workitems._database_now(session)
+            await session.rollback()
+        head_sha = detail.head_sha or observed_sha or ""
+        if metadata_only and fresh_after is None:
+            verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
+        else:
+            verdict = decide(
+                detail,
+                now=now,
+                published_at=facts.published_at,
+                execution_deadline=request.execution_deadline,
+                ci_wait_seconds=settings.github_factory_ci_wait_s,
+                changed_paths=changed_paths,
+                prior_round_had_checks=round_ > 1,
+                fresh_after=fresh_after,
+            )
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
     next_poll.pop(request.id, None)
     pr_url = lineage.pr_url
     if verdict.kind == "failing" and round_ < CI_MAX_ROUNDS:
+        assert detail is not None
         return await _continue(
             sessionmaker,
             valkey,

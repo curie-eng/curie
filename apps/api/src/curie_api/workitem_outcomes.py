@@ -82,6 +82,7 @@ _CI_AZURE_LOG_HOST = re.compile(r"productionresults[a-z0-9]+\.blob\.core\.window
 _CI_CREDENTIAL_GUARD = threading.BoundedSemaphore(CI_CREDENTIAL_SLOTS)
 
 _PUBLISHING = frozenset({"approved", "launching", "running"})
+_ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
 _FAILING_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 )
@@ -121,6 +122,8 @@ def _cause(
             "admits one"
         )
     cause = req.terminal_cause
+    if state == "queued":
+        return "revision waiting on the current run"
     if state == "cancellation_requested":
         reasons = {
             "issue_cancelled": "the issue was cancelled (label removed or issue closed)",
@@ -134,25 +137,31 @@ def _cause(
             "termination is awaiting a runtime observation"
         )
     if state == "waiting":
+        deadline = req.wait_deadline
+        if deadline is None:
+            raise ValueError("a waiting request has no capacity deadline")
         text = "waiting for sandbox capacity"
         if req.capacity_deferrals:
             text += (
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"
             )
-        if now >= req.wait_deadline:
+        if now >= deadline:
             return (
-                f"{text}; the waiting deadline elapsed at {_iso(req.wait_deadline)} "
+                f"{text}; the waiting deadline elapsed at {_iso(deadline)} "
                 "and expiry is pending the reconciler"
             )
-        return f"{text}; waiting deadline {_iso(req.wait_deadline)}"
+        return f"{text}; waiting deadline {_iso(deadline)}"
     if state == "running":
         return (
             f"running since {_iso(req.started_at)}, bounded by the execution "
             f"deadline {_iso(req.execution_deadline)}"
         )
     if state == "cancelled":
-        text = "cancelled: the issue label was removed or the issue was closed"
+        if cause == "lineage_closed":
+            text = "cancelled: the pull request closed before this revision could start"
+        else:
+            text = "cancelled: the issue label was removed or the issue was closed"
         if lineage is not None and lineage.pr_number is not None:
             text += f"; pull request #{lineage.pr_number} is retained"
         return text
@@ -208,6 +217,29 @@ def _cause(
     return f"execution completed; publication {publication.status}, no pull request"
 
 
+def _current_request(ordered: Sequence[ExecutionRequest]) -> ExecutionRequest | None:
+    """Prefer the live run, then the last revision that reached execution.
+
+    A revision refused because its pull request closed never ran, so its
+    cancellation must not replace the preceding completed run's outcome.
+    """
+
+    active = next(
+        (req for req in reversed(ordered) if req.status in _ACTIVE_REQUEST_STATUSES),
+        None,
+    )
+    if active is not None:
+        return active
+    return next(
+        (
+            req
+            for req in reversed(ordered)
+            if not (req.status == "cancelled" and req.terminal_cause == "lineage_closed")
+        ),
+        ordered[-1] if ordered else None,
+    )
+
+
 def derive_outcome(
     item: WorkItem,
     requests: Sequence[ExecutionRequest],
@@ -222,10 +254,12 @@ def derive_outcome(
     """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
 
     ordered = sorted(requests, key=lambda r: r.sequence)
-    req = ordered[-1] if ordered else None
+    req = _current_request(ordered)
     state: WorkItemOutcomeState
     if req is None:
         state = "cancelled" if item.cancelled_at is not None else "waiting"
+    elif req.status == "queued":
+        state = "queued"
     elif req.status == "cancellation_requested":
         state = "cancellation_requested"
     elif req.status == "waiting":
@@ -265,7 +299,14 @@ def derive_outcome(
     else:
         state = "completed_unpublished"
 
-    snapshot = next((r for r in reversed(ordered) if r.objective is not None), None)
+    snapshot = next(
+        (
+            r
+            for r in reversed(ordered)
+            if req is not None and r.sequence <= req.sequence and r.objective is not None
+        ),
+        None,
+    )
     objective = snapshot.objective if snapshot is not None else None
     truncated = objective is not None and len(objective) > OBJECTIVE_LIMIT
     pr = (
@@ -464,17 +505,17 @@ async def _views(
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
-        latest = max(item_requests, key=lambda r: r.sequence, default=None)
+        current_request = _current_request(sorted(item_requests, key=lambda r: r.sequence))
         pending_turn = (
-            latest is not None
-            and latest.reply_kind is not None
-            and latest.reply_address is not None
-            and latest.reply_conversation_id is not None
+            current_request is not None
+            and current_request.reply_kind is not None
+            and current_request.reply_address is not None
+            and current_request.reply_conversation_id is not None
             and (
                 item.agent_id,
-                latest.reply_kind,
-                latest.reply_address,
-                latest.reply_conversation_id,
+                current_request.reply_kind,
+                current_request.reply_address,
+                current_request.reply_conversation_id,
             )
             in pending_tuples
         )

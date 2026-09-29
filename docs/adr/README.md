@@ -191,6 +191,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0167 | [Agent and channel memory are written by the agent, guided by editable guidance](0167-agent-and-channel-memory-are-written-by-the-agent-guided-by-editable-guidance.md) | Draft |
 | 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
 | 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
 | 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
@@ -200,5 +201,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0174 | [Publication prechecks use an execution scoped capability](0174-publication-prechecks-use-an-execution-scoped-capability.md) | Accepted |
 | 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
 | 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
+| 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
 | 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
 <!-- END GENERATED: adr-index -->

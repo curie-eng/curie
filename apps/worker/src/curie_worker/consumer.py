@@ -178,6 +178,7 @@ class Consumer(StreamConsumer):
             redis,
             leases=leases,
             on_lease_lost=self._interrupt_on_lease_lost,
+            on_entry_vanished=self._notice_vanished_entry,
             drain=drain,
             liveness_store=ConsumerLivenessStore(redis),
         )
@@ -347,13 +348,24 @@ class Consumer(StreamConsumer):
                 exc_info=True,
             )
         finally:
-            await self._waits.finish_notice(
-                record.event_id,
-                record.generation,
-                token,
-                delivered=delivered,
-                reply_ref=reply_ref,
+            # Cancellation of the notice loop must not skip this write. The
+            # lock is what stops a wake from finishing the turn while the
+            # queued edit is still in flight; leaving it behind, or leaving
+            # notice_pending set, lets that edit land after the answer.
+            finish = asyncio.create_task(
+                self._waits.finish_notice(
+                    record.event_id,
+                    record.generation,
+                    token,
+                    delivered=delivered,
+                    reply_ref=reply_ref,
+                )
             )
+            try:
+                await asyncio.shield(finish)
+            except asyncio.CancelledError:
+                await finish
+                raise
 
     async def _repair_wait_notices(self) -> None:
         for record in await self._waits.notices_due():
@@ -393,13 +405,20 @@ class Consumer(StreamConsumer):
                     exc_info=True,
                 )
             finally:
-                await self._waits.finish_expiry_notice(
-                    record.event_id,
-                    record.generation,
-                    token,
-                    delivered=delivered,
-                    reply_ref=reply_ref,
+                finish = asyncio.create_task(
+                    self._waits.finish_expiry_notice(
+                        record.event_id,
+                        record.generation,
+                        token,
+                        delivered=delivered,
+                        reply_ref=reply_ref,
+                    )
                 )
+                try:
+                    await asyncio.shield(finish)
+                except asyncio.CancelledError:
+                    await finish
+                    raise
 
     async def _expire_wait_delivery(
         self,
@@ -831,6 +850,18 @@ class Consumer(StreamConsumer):
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "
                 "lease was lost; the fence still refuses every terminal write",
+                entry_id,
+            )
+
+    async def _notice_vanished_entry(self, entry_id: str, fields: dict[str, str]) -> None:
+        """Post the not-started edit when the broker entry itself is gone."""
+        try:
+            qevent = from_stream_fields(fields)
+            lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
+            await self._kernel.notify_broker_entry_vanished(qevent, lease=lease)
+        except Exception:
+            logger.exception(
+                "could not post the vanished-entry notice for entry %s",
                 entry_id,
             )
 

@@ -9,15 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from runner_dockerfile_support import logical_instructions
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOCKERFILE = _REPO_ROOT / "runner" / "Dockerfile"
 _EXPORTER = _REPO_ROOT / "runner" / "export_dependency_pins.py"
 _UV_LOCK = _REPO_ROOT / "uv.lock"
 _REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
-_EXACT_NPM_VERSION = re.compile(
-    r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
-)
+_EXACT_NPM_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
 _NPM_PACKAGE = re.compile(r"(?:@[0-9A-Za-z._-]+/)?[0-9A-Za-z._-]+")
 _PIP_EXECUTABLE = re.compile(r"pip(?:\d+(?:\.\d+)?)?$")
 _NPM_INSTALL_ALIASES = {"install", "i", "add"}
@@ -77,22 +76,6 @@ class Violation:
 
 def _normalize_python_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _logical_instructions(dockerfile_text: str) -> list[str]:
-    instructions: list[str] = []
-    pending: list[str] = []
-    for raw_line in dockerfile_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        continues = line.endswith("\\")
-        pending.append(line[:-1].rstrip() if continues else line)
-        if not continues:
-            instructions.append(" ".join(pending))
-            pending = []
-    assert not pending, "Dockerfile ends with an unfinished continuation"
-    return instructions
 
 
 def _shell_tokens(instruction: str) -> list[str]:
@@ -192,14 +175,14 @@ def _dockerfile_pip_violations(instructions: list[str]) -> list[Violation]:
                 if operand in {"-r", "--requirement"}:
                     skip_next = True
                     continue
-                if operand.startswith("-") or operand == "pip" or operand.startswith(
-                    ("./", "../", "/")
+                if (
+                    operand.startswith("-")
+                    or operand == "pip"
+                    or operand.startswith(("./", "../", "/"))
                 ):
                     continue
                 if "==" not in operand:
-                    violations.append(
-                        Violation(operand, "pip install is missing an exact version")
-                    )
+                    violations.append(Violation(operand, "pip install is missing an exact version"))
     return violations
 
 
@@ -247,8 +230,7 @@ def _generated_runner_requirements_install_command(
                     break
                 command.append(operand)
             if any(
-                option in {"-r", "--requirement"}
-                and requirement == _REQUIREMENTS_PATH
+                option in {"-r", "--requirement"} and requirement == _REQUIREMENTS_PATH
                 for option, requirement in zip(command, command[1:], strict=False)
             ):
                 matches.append(command)
@@ -271,9 +253,7 @@ def _npm_violations(instructions: list[str]) -> list[Violation]:
         if not tokens or tokens[0].upper() != "RUN":
             continue
         for index, token in enumerate(tokens[:-1]):
-            if token.rsplit("/", 1)[-1] != "npm" or (
-                tokens[index + 1] not in _NPM_INSTALL_ALIASES
-            ):
+            if token.rsplit("/", 1)[-1] != "npm" or (tokens[index + 1] not in _NPM_INSTALL_ALIASES):
                 continue
             command: list[str] = []
             for operand in tokens[index + 2 :]:
@@ -298,14 +278,12 @@ def _npm_violations(instructions: list[str]) -> list[Violation]:
 def _dockerfile_global_npm_operands(dockerfile_text: str) -> list[str]:
     operands: list[str] = []
     controls = {"&&", "||", ";"}
-    for instruction in _logical_instructions(dockerfile_text):
+    for instruction in logical_instructions(dockerfile_text):
         tokens = _shell_tokens(instruction)
         if not tokens or tokens[0].upper() != "RUN":
             continue
         for index, token in enumerate(tokens[:-1]):
-            if token.rsplit("/", 1)[-1] != "npm" or (
-                tokens[index + 1] not in _NPM_INSTALL_ALIASES
-            ):
+            if token.rsplit("/", 1)[-1] != "npm" or (tokens[index + 1] not in _NPM_INSTALL_ALIASES):
                 continue
             command: list[str] = []
             for operand in tokens[index + 2 :]:
@@ -313,15 +291,13 @@ def _dockerfile_global_npm_operands(dockerfile_text: str) -> list[str]:
                     break
                 command.append(operand)
             if {"-g", "--global"} & set(command):
-                operands.extend(
-                    operand for operand in command if not operand.startswith("-")
-                )
+                operands.extend(operand for operand in command if not operand.startswith("-"))
     return operands
 
 
 def _find_violations(lock_text: str, dockerfile_text: str) -> list[Violation]:
     expected = _locked_runner_dependencies(lock_text)
-    instructions = _logical_instructions(dockerfile_text)
+    instructions = logical_instructions(dockerfile_text)
     pins = _dockerfile_python_pins(instructions)
     violations = _dockerfile_pip_violations(instructions) + _npm_violations(instructions)
 
@@ -377,9 +353,7 @@ def _export_runner_dependencies(lock_text: str) -> list[str]:
     return result.stdout.splitlines()
 
 
-def _replace_locked_package_version(
-    lock_text: str, package: str, replacement: str
-) -> str:
+def _replace_locked_package_version(lock_text: str, package: str, replacement: str) -> str:
     pattern = re.compile(
         rf'(?m)(^\[\[package\]\]\nname = "{re.escape(package)}"\nversion = ")[^"]+("$)'
     )
@@ -404,8 +378,7 @@ def test_dependency_exporter_emits_sorted_complete_registry_closure() -> None:
     ]
 
 
-def test_dependency_exporter_propagates_markers_through_transitives() -> None:
-    lock_text = """\
+_EXPORTER_LOCK_HEADER = """\
 version = 1
 revision = 3
 requires-python = ">=3.13"
@@ -415,6 +388,14 @@ name = "curie-runner"
 version = "0.0.0"
 source = { editable = "runner" }
 dependencies = [
+"""
+
+
+@pytest.mark.parametrize(
+    ("root_and_packages", "expected"),
+    [
+        pytest.param(
+            """\
     { name = "always" },
     { name = "windows-only", marker = "sys_platform == 'win32'" },
 ]
@@ -436,33 +417,21 @@ dependencies = [
 name = "windows-child"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
-"""
-
-    assert _export_runner_dependencies(lock_text) == [
-        "always==1.0.0",
-        "windows-child==3.0.0 ; sys_platform == 'win32'",
-        "windows-only==2.0.0 ; sys_platform == 'win32'",
-    ]
-
-
-def test_dependency_exporter_pins_a_shared_transitive_reached_both_ways() -> None:
-    """A package reached under a marker and again unconditionally pins unconditionally.
-
-    The unconditional path has to widen the recorded reachability of a package
-    already recorded as conditional. The exporter runs inside the runner image
-    build, so failing that widening takes the whole image build down rather than
-    emitting a wrong pin.
-    """
-    lock_text = """\
-version = 1
-revision = 3
-requires-python = ">=3.13"
-
-[[package]]
-name = "curie-runner"
-version = "0.0.0"
-source = { editable = "runner" }
-dependencies = [
+""",
+            [
+                "always==1.0.0",
+                "windows-child==3.0.0 ; sys_platform == 'win32'",
+                "windows-only==2.0.0 ; sys_platform == 'win32'",
+            ],
+            id="markers-propagate-through-transitives",
+        ),
+        # A package reached under a marker and again unconditionally pins
+        # unconditionally. The unconditional path has to widen the recorded
+        # reachability of a package already recorded as conditional; the exporter
+        # runs inside the runner image build, so failing that widening takes the
+        # whole image build down rather than emitting a wrong pin.
+        pytest.param(
+            """\
     { name = "windows-only", marker = "sys_platform == 'win32'" },
     { name = "everywhere" },
 ]
@@ -487,13 +456,89 @@ dependencies = [
 name = "shared"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
-"""
+""",
+            [
+                "everywhere==1.0.0",
+                "shared==2.0.0",
+                "windows-only==1.0.0 ; sys_platform == 'win32'",
+            ],
+            id="shared-transitive-pins-unconditionally",
+        ),
+        pytest.param(
+            """\
+    { name = "provider", extra = ["crypto", "crypto"] },
+]
 
-    assert _export_runner_dependencies(lock_text) == [
-        "everywhere==1.0.0",
-        "shared==2.0.0",
-        "windows-only==1.0.0 ; sys_platform == 'win32'",
-    ]
+[[package]]
+name = "provider"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[package.optional-dependencies]
+crypto = [
+    { name = "extra-child" },
+]
+
+[[package]]
+name = "extra-child"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "extra-leaf" },
+]
+
+[[package]]
+name = "extra-leaf"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+optional-dependencies = "unused malformed table"
+""",
+            [
+                "extra-child==2.0.0",
+                "extra-leaf==3.0.0",
+                "provider==1.0.0",
+            ],
+            id="selected-extra-closure",
+        ),
+    ],
+)
+def test_dependency_exporter_pins_the_reachable_closure(
+    root_and_packages: str, expected: list[str]
+) -> None:
+    assert _export_runner_dependencies(_EXPORTER_LOCK_HEADER + root_and_packages) == expected
+
+
+def test_dependency_exporter_rejects_a_missing_referenced_transitive() -> None:
+    second_level_record = """\
+[[package]]
+name = "registry-second-level"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "registry-root" },
+]
+
+"""
+    assert second_level_record in _SYNTHETIC_RECURSIVE_LOCK
+    incomplete_lock = _SYNTHETIC_RECURSIVE_LOCK.replace(second_level_record, "")
+
+    result = _run_dependency_exporter(incomplete_lock)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "invalid uv.lock" in result.stderr
+
+
+def test_dependency_exporter_reflects_a_lock_version_bump() -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    expected = _locked_runner_dependencies(lock_text)
+    replacement = f"{expected['claude-agent-sdk']}.post1"
+    bumped_lock = _replace_locked_package_version(lock_text, "claude-agent-sdk", replacement)
+
+    pins = _export_runner_dependencies(bumped_lock)
+
+    assert "claude-agent-sdk==" + replacement in pins
+    assert f"claude-agent-sdk=={expected['claude-agent-sdk']}" not in pins
 
 
 @pytest.mark.parametrize(
@@ -502,7 +547,7 @@ source = { registry = "https://pypi.org/simple" }
         '""',
         r'"\r"',
         r'"\n"',
-        '"sys_platform == \'win32\'; python_version > \'3.13\'"',
+        "\"sys_platform == 'win32'; python_version > '3.13'\"",
     ],
 )
 def test_dependency_exporter_rejects_malformed_markers(
@@ -534,87 +579,6 @@ source = {{ registry = "https://pypi.org/simple" }}
     assert "invalid uv.lock" in result.stderr
 
 
-def test_dependency_exporter_follows_selected_extra_dependency_closure() -> None:
-    lock_text = """\
-version = 1
-revision = 3
-requires-python = ">=3.13"
-
-[[package]]
-name = "curie-runner"
-version = "0.0.0"
-source = { editable = "runner" }
-dependencies = [
-    { name = "provider", extra = ["crypto", "crypto"] },
-]
-
-[[package]]
-name = "provider"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-
-[package.optional-dependencies]
-crypto = [
-    { name = "extra-child" },
-]
-
-[[package]]
-name = "extra-child"
-version = "2.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "extra-leaf" },
-]
-
-[[package]]
-name = "extra-leaf"
-version = "3.0.0"
-source = { registry = "https://pypi.org/simple" }
-optional-dependencies = "unused malformed table"
-"""
-
-    assert _export_runner_dependencies(lock_text) == [
-        "extra-child==2.0.0",
-        "extra-leaf==3.0.0",
-        "provider==1.0.0",
-    ]
-
-
-def test_dependency_exporter_rejects_a_missing_referenced_transitive() -> None:
-    second_level_record = """\
-[[package]]
-name = "registry-second-level"
-version = "3.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "registry-root" },
-]
-
-"""
-    assert second_level_record in _SYNTHETIC_RECURSIVE_LOCK
-    incomplete_lock = _SYNTHETIC_RECURSIVE_LOCK.replace(second_level_record, "")
-
-    result = _run_dependency_exporter(incomplete_lock)
-
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "invalid uv.lock" in result.stderr
-
-
-def test_dependency_exporter_reflects_a_lock_version_bump() -> None:
-    lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    expected = _locked_runner_dependencies(lock_text)
-    replacement = f"{expected['claude-agent-sdk']}.post1"
-    bumped_lock = _replace_locked_package_version(
-        lock_text, "claude-agent-sdk", replacement
-    )
-
-    pins = _export_runner_dependencies(bumped_lock)
-
-    assert "claude-agent-sdk==" + replacement in pins
-    assert f"claude-agent-sdk=={expected['claude-agent-sdk']}" not in pins
-
-
 def test_dependency_exporter_rejects_malformed_lock_input() -> None:
     result = _run_dependency_exporter("[[package]\nname = ")
 
@@ -625,12 +589,11 @@ def test_dependency_exporter_rejects_malformed_lock_input() -> None:
 
 def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    instructions = _logical_instructions(dockerfile)
+    instructions = logical_instructions(dockerfile)
 
     assert "COPY uv.lock ./uv.lock" in instructions
     assert any(
-        "python3 runner/export_dependency_pins.py < uv.lock "
-        f"> {_REQUIREMENTS_PATH}" in instruction
+        f"python3 runner/export_dependency_pins.py < uv.lock > {_REQUIREMENTS_PATH}" in instruction
         for instruction in instructions
     )
     assert "--no-deps" in _generated_runner_requirements_install_command(instructions)
@@ -638,7 +601,7 @@ def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> No
 
 
 def test_runner_image_installs_the_shared_telemetry_workspace_dependency() -> None:
-    instructions = _logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
+    instructions = logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
 
     assert "COPY packages/telemetry ./packages/telemetry" in instructions
     assert any(
@@ -649,17 +612,19 @@ def test_runner_image_installs_the_shared_telemetry_workspace_dependency() -> No
 
 
 def test_actual_runner_dockerfile_matches_locked_dependencies() -> None:
-    assert _find_violations(
-        _UV_LOCK.read_text(encoding="utf-8"),
-        _DOCKERFILE.read_text(encoding="utf-8"),
-    ) == []
+    assert (
+        _find_violations(
+            _UV_LOCK.read_text(encoding="utf-8"),
+            _DOCKERFILE.read_text(encoding="utf-8"),
+        )
+        == []
+    )
 
 
 def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
     mutated = (
-        dockerfile
-        + "\nRUN /app/.venv/bin/pip install --no-cache-dir --upgrade "
+        dockerfile + "\nRUN /app/.venv/bin/pip install --no-cache-dir --upgrade "
         "claude-agent-sdk aiohttp\n"
     )
 
@@ -693,13 +658,11 @@ RUN /app/.venv/bin/pip install \\
         ),
         Violation(
             "aiohttp",
-            "expected lock version "
-            f"{expected['aiohttp']}, found Dockerfile version 3.14.1",
+            f"expected lock version {expected['aiohttp']}, found Dockerfile version 3.14.1",
         ),
         Violation(
             "anyio",
-            "expected lock version "
-            f"{expected['anyio']}, found Dockerfile version 4.14.1",
+            f"expected lock version {expected['anyio']}, found Dockerfile version 4.14.1",
         ),
         Violation(
             "claude-agent-sdk",
@@ -725,11 +688,14 @@ def test_python_pin_revert_is_rejected() -> None:
     mutated = _dockerfile_with_python_pins(pins)
 
     violations = _find_violations(lock_text, mutated)
-    assert Violation(
-        "claude-agent-sdk",
-        "expected lock version "
-        f"{expected['claude-agent-sdk']}, found Dockerfile version {stale_version}",
-    ) in violations
+    assert (
+        Violation(
+            "claude-agent-sdk",
+            "expected lock version "
+            f"{expected['claude-agent-sdk']}, found Dockerfile version {stale_version}",
+        )
+        in violations
+    )
 
 
 def test_runner_image_uses_bundled_claude_cli_and_does_not_bless_bundle_mcp() -> None:
@@ -752,7 +718,7 @@ def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
         _REPO_ROOT / "examples" / "mean-tester" / "runner.Dockerfile"
     ).read_text(encoding="utf-8")
     for text in (github_issues, dark_factory, mean_tester):
-        assert _npm_violations(_logical_instructions(text)) == []
+        assert _npm_violations(logical_instructions(text)) == []
     assert _dockerfile_global_npm_operands(github_issues) == [
         "@modelcontextprotocol/server-github@2025.4.8"
     ]
@@ -772,7 +738,7 @@ def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
             "@modelcontextprotocol/server-github",
             "global npm install is missing an exact version",
         )
-        in _npm_violations(_logical_instructions(unpinned))
+        in _npm_violations(logical_instructions(unpinned))
     )
 
 
@@ -782,9 +748,9 @@ def test_npm_global_install_aliases_require_exact_versions(command: str) -> None
         _UV_LOCK.read_text(encoding="utf-8"),
         f"RUN npm {command} -g @example/tool\n",
     )
-    assert Violation(
-        "@example/tool", "global npm install is missing an exact version"
-    ) in violations
+    assert (
+        Violation("@example/tool", "global npm install is missing an exact version") in violations
+    )
 
 
 @pytest.mark.parametrize("executable", ["pip", "pip3"])
@@ -794,8 +760,11 @@ def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> Non
         package: f"{package}=={version}"
         for package, version in _locked_runner_dependencies(lock_text).items()
     }
-    synthetic = "RUN " + executable + " install " + " ".join(
-        f'"{operand}"' for operand in operands.values()
+    synthetic = (
+        "RUN "
+        + executable
+        + " install "
+        + " ".join(f'"{operand}"' for operand in operands.values())
     )
 
     assert _find_violations(lock_text, synthetic) == []
@@ -804,12 +773,8 @@ def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> Non
 def test_python_pin_set_must_match_all_direct_registry_dependencies() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
-    operands = {
-        package: f"{package}=={version}" for package, version in expected.items()
-    }
-    baseline = "RUN pip install " + " ".join(
-        f'"{operand}"' for operand in operands.values()
-    )
+    operands = {package: f"{package}=={version}" for package, version in expected.items()}
+    baseline = "RUN pip install " + " ".join(f'"{operand}"' for operand in operands.values())
     missing = baseline.replace(f' "{operands["anyio"]}"', "")
     extra = baseline + ' "httpx==1.0.0"'
     duplicate = baseline + f' "{operands["aiohttp"]}"'

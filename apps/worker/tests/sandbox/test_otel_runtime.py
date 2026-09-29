@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any
+import sys
+from pathlib import Path
 
 import pytest
 from curie_telemetry import operation_span, record_metric
@@ -18,45 +16,10 @@ from curie_worker.sandbox import substrate as substrate_module
 
 from .conftest import FakeSandboxClient
 
+# importlib import mode does not add the tests directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-@dataclass(frozen=True)
-class _Metric:
-    name: str
-    value: float
-    attributes: dict[str, str]
-
-
-class _Probe:
-    def __init__(self) -> None:
-        self.spans: list[str] = []
-        self.metrics: list[_Metric] = []
-
-    @contextmanager
-    def operation_span(
-        self,
-        name: str,
-        *,
-        kind: Any,
-        parent: Any = None,
-        attributes: Mapping[str, str] | None = None,
-    ) -> Iterator[Any]:
-        del kind, parent, attributes
-        self.spans.append(name)
-        yield _Span()
-
-    def record_metric(
-        self,
-        name: str,
-        value: float = 1,
-        *,
-        attributes: Mapping[str, str] | None = None,
-    ) -> None:
-        self.metrics.append(_Metric(name, float(value), dict(attributes or {})))
-
-
-class _Span:
-    def add_event(self, _name: str, _attributes: Mapping[str, str] | None = None) -> None:
-        pass
+from otel_fixtures import Metric, Probe, install  # noqa: E402
 
 
 @pytest.fixture
@@ -68,21 +31,12 @@ def substrate(
     return SandboxSubstrate(fake_k8s, affinity, config)
 
 
-def _install(monkeypatch: pytest.MonkeyPatch) -> _Probe:
-    import curie_telemetry
-
-    probe = _Probe()
-    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
-    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
-    if hasattr(substrate_module, "operation_span"):
-        monkeypatch.setattr(substrate_module, "operation_span", probe.operation_span)
-    if hasattr(substrate_module, "record_metric"):
-        monkeypatch.setattr(substrate_module, "record_metric", probe.record_metric)
-    return probe
+def _install(monkeypatch: pytest.MonkeyPatch) -> Probe:
+    return install(monkeypatch, substrate_module)
 
 
-def _points(probe: _Probe, name: str) -> list[_Metric]:
-    return [point for point in probe.metrics if point.name == name]
+def _points(probe: Probe, name: str) -> list[Metric]:
+    return probe.points(name)
 
 
 def test_claim_reuse_suspend_resume_release_emit_durations_counts_and_bounded_outcomes(
@@ -127,7 +81,7 @@ def test_claim_reuse_suspend_resume_release_emit_durations_counts_and_bounded_ou
         "curie.sandbox.claim",
         "curie.sandbox.resume",
         "curie.sandbox.release",
-    } <= set(probe.spans)
+    } <= set(probe.span_names())
 
     for point in probe.metrics:
         assert set(point.attributes) <= {
@@ -172,9 +126,7 @@ def test_inventory_gauges_retain_siblings_across_release_and_suspend(
     # Every observation updates one stable series; operation-specific series
     # would preserve stale 1/0 values and make aggregation ambiguous.
     for name in ("curie.sandbox.active", "curie.sandbox.suspended"):
-        assert {
-            tuple(sorted(point.attributes.items())) for point in _points(probe, name)
-        } == {
+        assert {tuple(sorted(point.attributes.items())) for point in _points(probe, name)} == {
             (
                 ("operation", "observe"),
                 ("outcome", "observed"),

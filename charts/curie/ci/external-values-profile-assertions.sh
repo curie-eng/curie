@@ -302,14 +302,14 @@ for container in ("langfuse-web", "langfuse-worker"):
         docs, container, "DATABASE_URL", "sslmode=require", "pg-tls"
     )
 
-# Valkey consumers: api, worker, drain jobs, both Langfuse deployments.
+# Valkey consumers: api, worker, drain, attest, and release jobs, both Langfuse deployments.
 # Dispatcher is omitted: curie.dispatcher.enabled is false on a token-less
 # default install, so that Deployment does not render.
 for container in ("api", "worker"):
     require_literal(docs, container, "VALKEY_HOST", EXPECTED_VALKEY, "vk")
     require_secret(docs, container, "VALKEY_PASSWORD", VALKEY_CREDS, "valkeyPassword", "vk")
     require_literal(docs, container, "VALKEY_TLS", "true", "vk-tls")
-for container in ("upgrade-drain", "upgrade-drain-release"):
+for container in ("upgrade-drain", "upgrade-drain-release", "upgrade-drain-attest"):
     require_literal(docs, container, "VALKEY_HOST", EXPECTED_VALKEY, "vd")
     require_secret(docs, container, "VALKEY_PASSWORD", VALKEY_CREDS, "valkeyPassword", "vd")
 for container in ("langfuse-web", "langfuse-worker"):

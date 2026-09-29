@@ -322,7 +322,7 @@ tool can inspect exactly what inbound entry died and why:
 |---|---|
 | `dl_original_id` | the entry's id on the source stream |
 | `dl_delivery_count` | deliveries made before it was given up on |
-| `dl_reason` | `max-delivery-exceeded`, or `unparseable` |
+| `dl_reason` | `max-delivery-exceeded`, `unparseable`, or `broker-entry-vanished` |
 | `dl_dead_lettered_at` | UTC ISO-8601 timestamp |
 
 Completion-outbox rows are written by `Markers.dead_letter_completion` only for
@@ -459,7 +459,7 @@ user-visible effect.
 | Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
-| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. |
+| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
 | Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
 | Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |

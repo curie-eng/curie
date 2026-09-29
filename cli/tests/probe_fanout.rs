@@ -73,10 +73,12 @@
 //! and would make the stage count depend on socket timing rather than on the
 //! CLI's own await structure. The API leg is covered by `doctor_api.rs`.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
@@ -196,17 +198,6 @@ fn golden_dir() -> PathBuf {
 /// `CURIE_TEST_PROBE_FANOUT_KEEP_STUBS` several tests install into the SAME
 /// directory concurrently, and a partially written or busy script would fail
 /// as a mysterious `exit 26`/short read rather than as a test failure.
-fn write_executable(path: &Path, body: &str) {
-    let staging = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&staging, body).expect("write stub executable");
-    let mut permissions = fs::metadata(&staging)
-        .expect("read stub metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&staging, permissions).expect("make stub executable");
-    fs::rename(&staging, path).expect("install stub executable");
-}
-
 fn stub_path(tools: &Path) -> OsString {
     let mut entries = vec![tools.to_path_buf()];
     entries.extend(["/bin", "/usr/bin"].iter().map(PathBuf::from));
@@ -238,7 +229,7 @@ fn fixture() -> Fixture {
         fs::create_dir_all(dir).expect("create fixture dir");
     }
     for tool in ["docker", "kubectl", "helm"] {
-        write_executable(tools.join(tool).as_path(), STUB);
+        test_executable::install(tools.join(tool).as_path(), STUB);
     }
     let log = temp.path().join("probes.log");
     fs::write(&log, "").expect("create probe log");

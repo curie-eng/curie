@@ -586,6 +586,14 @@ as a whole; remembered only):
   cannot share code across Python/Rust, so they are frozen together in
   `tests/vectors/eval-memory-isolation.json`.
   [vector: `tests/vectors/eval-memory-isolation.json`]
+- worker vs API workspace-selection refusal codes -- the 409 `detail.code`
+  values the API's selection router emits
+  (`apps/api/src/curie_api/routers/workspaces.py`) and the worker's prose map
+  (`_SELECTION_REFUSAL_MESSAGES` in `apps/worker/src/curie_worker/workspace.py`)
+  cannot share code because the worker does not import the API package at
+  runtime; the worker maps each code to its own prose and treats an unmapped
+  code as an invalid refusal response (#2684).
+  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]

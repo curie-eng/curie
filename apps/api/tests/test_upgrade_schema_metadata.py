@@ -3,11 +3,10 @@
 import hashlib
 import json
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
+from _migration_support import run_script
 from alembic.script import ScriptDirectory
 
 REPO = Path(__file__).resolve().parents[3]
@@ -59,8 +58,8 @@ def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path, mutation:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / source, target)
     shutil.copytree(REPO / "apps/api/alembic", tmp_path / "apps/api/alembic")
-    command = [sys.executable, str(tmp_path / "scripts/check-alembic-revisions.py")]
-    healthy = subprocess.run(command, capture_output=True, text=True, check=False)
+    checker = tmp_path / "scripts/check-alembic-revisions.py"
+    healthy = run_script(checker)
     assert healthy.returncode == 0, healthy.stderr
     artifact = tmp_path / ARTIFACT
     metadata = json.loads(artifact.read_text())
@@ -79,7 +78,7 @@ def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path, mutation:
     elif mutation == "digest":
         metadata["revisions"][0]["sha256"] = "0" * 64
     artifact.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-    stale = subprocess.run(command, capture_output=True, text=True, check=False)
+    stale = run_script(checker)
     assert stale.returncode == 1
     assert "schema compatibility metadata" in stale.stderr.lower()
 
@@ -89,17 +88,11 @@ def test_metadata_write_cannot_claim_to_generate_from_a_non_authoritative_tree(
 ) -> None:
     tree = tmp_path / "alembic"
     shutil.copytree(REPO / "apps/api/alembic", tree)
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(REPO / "scripts/check-alembic-revisions.py"),
-            "--script-location",
-            str(tree),
-            "--write-upgrade-metadata",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    result = run_script(
+        REPO / "scripts/check-alembic-revisions.py",
+        "--script-location",
+        str(tree),
+        "--write-upgrade-metadata",
     )
     assert result.returncode == 2
     assert "authoritative" in result.stderr

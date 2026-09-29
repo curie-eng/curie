@@ -203,14 +203,6 @@ def test_the_default_config_ships_the_lane_off(built: Any) -> None:
     assert WorkerConfig(slack_bot_token=_FAKE_BOT_TOKEN).attachment_enabled is False
 
 
-def test_the_switch_on_its_own_does_not_wire_the_lane_without_a_credential(
-    built: Any,
-) -> None:
-    """Both conditions still hold. The credential guard is unchanged."""
-
-    assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
-
-
 # --- the lane reaches the kernel -------------------------------------------
 
 
@@ -255,6 +247,7 @@ def test_no_bot_token_leaves_the_lane_unwired_rather_than_half_wired(built: Any)
     # kernel treats a wired lane as authoritative. A deployment with no bot
     # token (compose smoke, a mail-only install) must run every turn exactly as
     # it does today rather than failing on the first message with a file.
+    # The switch on its own is not enough: both conditions still hold.
     assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
 
 

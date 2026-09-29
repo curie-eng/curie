@@ -1455,6 +1455,13 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
 
                     async def observe_lineage_lock_wait() -> None:
                         while True:
+                            # pg_stat_get_activity is STABLE. The first read in
+                            # this observer transaction freezes the activity
+                            # snapshot, so a cold connection that samples before
+                            # the waiter parks never sees it. Drop that snapshot
+                            # on every poll; pg_locks and pg_blocking_pids are
+                            # already volatile.
+                            await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
                             row = (
                                 await observer.execute(
                                     text(
@@ -1468,8 +1475,8 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                                     ),
                                     {"holder": holder_pid, "service": service_pid},
                                 )
-                            ).mappings().one()
-                            if (
+                            ).mappings().one_or_none()
+                            if row is not None and (
                                 row.wait_event_type == "Lock"
                                 and row.waiting_lock
                                 and row.blocked_by_holder

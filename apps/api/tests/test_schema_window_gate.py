@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _migration_support import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "scripts" / "check-schema-window.py"
@@ -111,25 +112,24 @@ def _write_linear_migrations(repo_root: Path) -> None:
 
 
 def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]:
-    command = [sys.executable, str(CHECKER)]
-    if repo_root is not None:
-        command.extend(["--repo-root", str(repo_root)])
-    return subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    args = [] if repo_root is None else ["--repo-root", str(repo_root)]
+    return run_script(CHECKER, *args)
 
 
 def test_real_tree_window_matches_alembic_head() -> None:
+    """The one real CLI run; every other case drives the gate in-process."""
     chart = yaml.safe_load((REPO_ROOT / "charts" / "curie" / "Chart.yaml").read_text())
     app_version = str(chart["appVersion"])
     catalog = json.loads(
         (REPO_ROOT / "cli" / "src" / "application_schema_windows.json").read_text()
     )
-    result = _run_gate()
+    result = subprocess.run(
+        [sys.executable, str(CHECKER)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
     assert result.returncode == 0, result.stderr
     assert app_version in catalog["windows"]
@@ -470,15 +470,15 @@ def test_python_ci_job_runs_schema_window_after_alembic_gate() -> None:
         for index, step in enumerate(steps)
         if step.get("name") == "Alembic revision gate"
     )
-    stack_index = next(
-        index for index, step in enumerate(steps) if step.get("name") == "Start dev stack"
-    )
-    assert alembic_index < gate_index < stack_index
+    assert alembic_index < gate_index
+    # The dev stack boots only in the pytest shards, so the gate stays cheap and
+    # cluster-free in the required Python job.
+    assert not any(step.get("name") == "Start dev stack" for step in steps)
 
 
 def test_rust_ci_job_runs_schema_window_gate() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
-    steps = workflow["jobs"]["rust"]["steps"]
+    steps = workflow["jobs"]["rust-lint"]["steps"]
 
     matching_steps = [step for step in steps if step.get("run") == CHECK_COMMAND]
     assert len(matching_steps) == 1

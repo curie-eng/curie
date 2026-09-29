@@ -1139,13 +1139,6 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
-    /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
-    /// MCP server and a live provider
-    /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
-    /// `curie cluster message`. Approvals resolve through
-    /// `curie cluster approvals` and an operator principal. Missing the live
-    /// provider skips with the reason in the run summary.
-    SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
     /// Drive the dark factory against a disposable install on a named kube
@@ -2343,6 +2336,38 @@ enum LocalAction {
         #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
         remove: Option<String>,
     },
+    /// Show, set, or clear who may talk to the bot through one surface
+    /// (`PUT /agents/{id}/channels/callers`, ADR 0175).
+    ///
+    /// With neither `--set` nor `--clear` this shows the list. `--set`
+    /// replaces it with exactly the ids given; `--clear` removes it so
+    /// everyone may talk to the bot again. Anyone not on a list gets no
+    /// reply at all. Editing the list does not revoke the surface's adapter
+    /// token.
+    Callers {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        /// The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        surface: String,
+        /// The Slack identity whose route to select when several share the
+        /// surface (default: the one route on it).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Allow exactly these caller ids, comma separated: Slack user or bot
+        /// ids for a Slack surface, bare email addresses for an email one.
+        /// Replaces the whole list.
+        #[arg(
+            long,
+            value_name = "ID[,ID...]",
+            value_delimiter = ',',
+            conflicts_with = "clear"
+        )]
+        set: Vec<String>,
+        /// Remove the list, so everyone may talk to the bot again.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
     Budget {
         /// Agent name or id.
@@ -3278,6 +3303,43 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show, set, or clear who may talk to the bot through one surface
+    /// (`PUT /agents/{id}/channels/callers`, ADR 0175).
+    ///
+    /// With neither `--set` nor `--clear` this shows the list. `--set`
+    /// replaces it with exactly the ids given; `--clear` removes it so
+    /// everyone may talk to the bot again. Anyone not on a list gets no
+    /// reply at all. Editing the list does not revoke the surface's adapter
+    /// token.
+    Callers {
+        /// Agent name or id.
+        agent: String,
+        /// The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        surface: String,
+        /// The Slack identity whose route to select when several share the
+        /// surface (default: the one route on it).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Allow exactly these caller ids, comma separated: Slack user or bot
+        /// ids for a Slack surface, bare email addresses for an email one.
+        /// Replaces the whole list.
+        #[arg(
+            long,
+            value_name = "ID[,ID...]",
+            value_delimiter = ',',
+            conflicts_with = "clear"
+        )]
+        set: Vec<String>,
+        /// Remove the list, so everyone may talk to the bot again.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mint or inspect the mail adapter's channel token
     /// (`POST /channels/token`).
     ///
@@ -3588,6 +3650,7 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::Callers { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
@@ -3706,6 +3769,7 @@ fn retarget_cluster_action(
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::Callers { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
@@ -4261,7 +4325,6 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
-            DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
             }
@@ -5069,6 +5132,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 commands::channel_bindings(
                     target.into(),
                     commands::ChannelChange::resolve(add, remove, endpoint, adapter)?,
+                )
+                .await?,
+            ),
+            LocalAction::Callers {
+                target,
+                surface,
+                adapter,
+                set,
+                clear,
+            } => emit(
+                commands::channel_callers(
+                    target.into(),
+                    &surface,
+                    adapter,
+                    commands::CallersChange::resolve(set, clear)?,
                 )
                 .await?,
             ),
@@ -6252,6 +6330,35 @@ async fn run(command: Option<Command>) -> Result<()> {
                             agent,
                             dry_run,
                         },
+                        change,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::Callers {
+                agent,
+                surface,
+                adapter,
+                set,
+                clear,
+                conn,
+                dry_run,
+            } => {
+                // Resolved before the connection for the same reason as
+                // `Surfaces`: a malformed id must be a usage error, not a
+                // cluster lookup that then fails for an unrelated reason.
+                let change = commands::CallersChange::resolve(set, clear)?;
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::channel_callers(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        &surface,
+                        adapter,
                         change,
                     )
                     .await?,
@@ -7618,14 +7725,6 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::E2eLadder
-            })
-        ));
-        let cli = try_parse_from(["curie", "dev", "sre-demo-e2e"])
-            .expect("dev sre-demo-e2e should parse");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Dev {
-                action: DevAction::SreDemoE2e
             })
         ));
         let cli = try_parse_from(["curie", "dev", "two-release-approval-e2e"])

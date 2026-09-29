@@ -699,13 +699,13 @@ explicit `scheme: https` plus both ports.
 A BYO Valkey that only accepts TLS -- in-transit-encrypted ElastiCache, Azure
 Cache for Redis, Redis Cloud, Upstash -- also needs `valkey.tls: true` alongside
 `valkey.deploy: false` and `valkey.host`. It reaches every consumer of that
-store at once: the api, worker and dispatcher, both `worker-upgrade-drain` hook
-Jobs, and both Langfuse Deployments. It requires `valkey.deploy: false` --
-`valkey.tls: true` against the in-chart Valkey fails the render, because that
-StatefulSet serves no TLS listener. Verification uses the system CA bundle, so a
-store fronted by a private CA (or one requiring mutual TLS) is not supported by
-this knob; that needs CA material distributed to all seven containers, which is
-a separate decision.
+store at once: the api, worker and dispatcher, the drain, attest, and release
+`worker-upgrade-drain` hook Jobs, and both Langfuse Deployments. It requires
+`valkey.deploy: false` -- `valkey.tls: true` against the in-chart Valkey fails
+the render, because that StatefulSet serves no TLS listener. Verification uses
+the system CA bundle, so a store fronted by a private CA (or one requiring
+mutual TLS) is not supported by this knob; that needs CA material distributed
+to all eight containers, which is a separate decision.
 
 BYO Langfuse requires a bare external hostname in `langfuse.host`. Consumers
 compose its URL as
@@ -1855,13 +1855,9 @@ on a later `up`. The one shape `up` refuses outright is a list explicitly
 recorded as empty (`[]`, as opposed to the key being absent); leave the key out
 rather than clearing it to an empty list.
 
-The API validates a Slack binding's identity against this declared list, but
-the database refuses to store a Slack binding naming any identity other than
-`default` until
-[#3146](https://github.com/curie-eng/curie/issues/3146). Such a binding is
-answered with a 422 that says so, on create, add and move alike. Declaring an
-identity readies the chart and the services for it; no binding can route to
-it.
+The API validates a Slack binding's identity against this declared list and
+stores it on the binding, so a declared identity can be bound to any channel,
+including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
 worker sets the assistant status, edits the reply, posts and settles approval

@@ -61,9 +61,12 @@
   "0060": "contract",
   "0061": "expand",
   "0062": "expand",
-  "0063": "expand",
+  "0063": "contract",
   "0064": "expand",
   "0065": "expand",
   "0066": "expand",
-  "0067": "expand"
+  "0067": "expand",
+  "0068": "expand",
+  "0069": "expand",
+  "0070": "contract"
 }

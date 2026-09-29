@@ -11,22 +11,14 @@
 //! The targeting cases empty `PATH` so they need no cluster. The model remedy
 //! case uses temporary command stubs to expose a floating release model.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 #[cfg(unix)]
-fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::write(path, body).expect("write tool stub");
-    let mut permissions = fs::metadata(path)
-        .expect("read tool stub metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make tool stub executable");
-}
-
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
 }
@@ -154,8 +146,8 @@ fn explicit_context_keeps_the_file_model_remedy_on_curie_apply() {
     let temp = tempfile::tempdir().expect("create temporary directory");
     let tools = temp.path().join("tools");
     fs::create_dir_all(&tools).expect("create tool directory");
-    write_executable(&tools.join("docker"), "#!/bin/sh\nexit 0\n");
-    write_executable(
+    test_executable::install(&tools.join("docker"), "#!/bin/sh\nexit 0\n");
+    test_executable::install(
         &tools.join("kubectl"),
         r#"#!/bin/sh
 case "$*" in
@@ -165,7 +157,7 @@ case "$*" in
 esac
 "#,
     );
-    write_executable(
+    test_executable::install(
         &tools.join("helm"),
         r#"#!/bin/sh
 case "$*" in

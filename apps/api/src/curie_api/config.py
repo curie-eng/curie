@@ -483,10 +483,13 @@ class Settings(BaseSettings):
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
     # Conversation transcripts (ADR-0170, #3070) live in their own table, capped
     # per thread with no agent-wide total, so many threads never share a budget.
-    # The default matches the runner's own transcript bound, which compacts the
-    # thread when an append is refused. A thread with no WorkItem expires after
-    # this long without an append; a WorkItem thread is deleted at its terminal.
-    transcript_max_thread_bytes: int = 64 * 1024  # 64 KiB per thread
+    # The runner bounds each turn to this cap less its append reserve and
+    # compacts the thread when an append is refused. The default holds a whole
+    # factory turn (several plan-review rounds with subagent reviewer output,
+    # #3301); 64 KiB did not. Chart value api.transcriptMaxThreadBytes. A thread
+    # with no WorkItem expires after this long without an append; a WorkItem
+    # thread is deleted at its terminal.
+    transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
     transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context

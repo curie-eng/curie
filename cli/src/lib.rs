@@ -61,6 +61,10 @@ pub mod state;
 pub mod ui;
 pub(crate) mod worker_claims;
 
+#[cfg(test)]
+#[path = "../tests/support/executable.rs"]
+pub(crate) mod test_executable;
+
 pub use retired::retired_hint;
 
 #[cfg(test)]

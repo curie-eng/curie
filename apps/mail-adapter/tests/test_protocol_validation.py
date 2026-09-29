@@ -22,6 +22,7 @@ from _support import (
     update,
     wait_until,
 )
+from curie_mail_adapter import egress
 from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
 
@@ -117,31 +118,64 @@ def test_oversize_rejection_survives_a_raised_configured_limit(
 
 
 def test_incomplete_headers_release_the_bounded_request_slots(
-    egress_url: str,
+    egress_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Held header blocks exhaust the slots, and the header deadline frees them.
+
+    The two halves use different header deadlines so neither races the other:
+    saturation holds slots under a deadline far longer than any runner stall,
+    while release uses a short one and waits for the server to cut each
+    trickling connection, proving the deadline is absolute rather than idle.
+    """
     parsed = urllib.parse.urlsplit(egress_url)
+    host = parsed.hostname or "127.0.0.1"
     sockets: list[socket.socket] = []
     stop = threading.Event()
     tricklers: list[threading.Thread] = []
 
     def trickle(connection: socket.socket) -> None:
-        while not stop.wait(0.25):
+        while not stop.wait(0.1):
             try:
                 connection.sendall(b"x")
             except OSError:
                 return
 
-    try:
+    def hold_slots() -> list[socket.socket]:
+        held: list[socket.socket] = []
         for _ in range(MAX_CONCURRENT_REQUESTS):
-            connection = socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port))
+            connection = socket.create_connection((host, parsed.port))
             connection.sendall(b"POST / HTTP/1.1\r\nHost: adapter\r\n")
+            held.append(connection)
             sockets.append(connection)
+        return held
+
+    def server_closed(connection: socket.socket) -> bool:
+        connection.settimeout(10.0)
+        try:
+            while connection.recv(1024):
+                pass
+        except TimeoutError:
+            return False
+        except OSError:
+            pass
+        return True
+
+    try:
+        monkeypatch.setattr(egress, "REQUEST_HEADER_SECONDS", 60.0)
+        saturating = hold_slots()
+        assert wait_until(lambda: get(egress_url)[0] == 503)
+        for connection in saturating:
+            connection.close()
+        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200)
+
+        monkeypatch.setattr(egress, "REQUEST_HEADER_SECONDS", 0.5)
+        expiring = hold_slots()
+        for connection in expiring:
             thread = threading.Thread(target=trickle, args=(connection,), daemon=True)
             thread.start()
             tricklers.append(thread)
-
-        assert wait_until(lambda: get(egress_url)[0] == 503)
-        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200, timeout=4.0)
+        assert all(server_closed(connection) for connection in expiring)
+        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200)
     finally:
         stop.set()
         for connection in sockets:

@@ -62,17 +62,13 @@ def _runner() -> tuple[SessionRunner, FakeModelSession]:
     return runner, fake
 
 
-def _boot_runner(
-    tmp_path: Path, *, managed_workspace: bool
-) -> tuple[SessionRunner, Path | None]:
+def _boot_runner(tmp_path: Path, *, managed_workspace: bool) -> tuple[SessionRunner, Path | None]:
     """Build the actual fake-model boot path with claim identity and workspace state."""
 
     plugin_dir = tmp_path / "bundle"
     manifest_dir = plugin_dir / ".claude-plugin"
     manifest_dir.mkdir(parents=True)
-    (manifest_dir / "plugin.json").write_text(
-        json.dumps({"name": "acme-bot"}), encoding="utf-8"
-    )
+    (manifest_dir / "plugin.json").write_text(json.dumps({"name": "acme-bot"}), encoding="utf-8")
     workspace_path: Path | None = None
     if managed_workspace:
         workspace_path = tmp_path / "workspace"
@@ -82,9 +78,7 @@ def _boot_runner(
             "CURIE_PLUGIN_DIR": str(plugin_dir),
             "CURIE_SESSION_ID": "session-acme-workspace",
             "CURIE_SANDBOX_ID": "sandbox-acme-workspace",
-            "CURIE_BUDGET": (
-                '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-            ),
+            "CURIE_BUDGET": ('{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'),
         }
     )
     return (
@@ -170,13 +164,16 @@ def test_event_header_uses_explicit_parent_and_missing_or_malformed_is_safe_root
     assert inherited.parent.span_id == int(parent_span_id, 16)
     assert missing.parent is None
     assert malformed.parent is None
-    assert len(
-        {
-            inherited.context.trace_id,
-            missing.context.trace_id,
-            malformed.context.trace_id,
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                inherited.context.trace_id,
+                missing.context.trace_id,
+                malformed.context.trace_id,
+            }
+        )
+        == 3
+    )
 
 
 def test_event_rejects_non_event_frame() -> None:
@@ -480,10 +477,7 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
             first = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
             first_epoch = first.headers[_TURN_EPOCH_HEADER]
             assert 32 <= len(first_epoch) <= 256
-            assert all(
-                character.isalnum() or character in "-_"
-                for character in first_epoch
-            )
+            assert all(character.isalnum() or character in "-_" for character in first_epoch)
             await session.entered[0].wait()
 
             unauthenticated = await client.post(
@@ -513,9 +507,7 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
             assert malformed.status == 400
             assert oversized.status == 400
 
-            guessed_epoch = (
-                ("A" if first_epoch[0] != "A" else "B") + first_epoch[1:]
-            )
+            guessed_epoch = ("A" if first_epoch[0] != "A" else "B") + first_epoch[1:]
             spoofed = await client.post(
                 "/v1/timeout",
                 headers={**_AUTH, _TURN_EPOCH_HEADER: guessed_epoch},
@@ -587,6 +579,7 @@ def test_capacity_admission_uses_the_turn_that_owns_the_lock() -> None:
         )
         await runner.start()
         async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+
             async def control_status() -> dict[str, object]:
                 response = await client.get("/v1/status", headers=_AUTH)
                 assert response.status == 200
@@ -708,52 +701,35 @@ def test_steer_without_auth_header_is_401() -> None:
     anyio.run(go)
 
 
-def test_empty_token_passes_through() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
+@pytest.mark.parametrize(
+    "token",
+    [
         # An empty token is a falsy token: create_app must not gate, so a
         # header-less POST proceeds rather than 401-ing on an unusable token.
-        async with TestClient(TestServer(create_app(runner, token=""))) as client:
+        pytest.param("", id="empty-token"),
+        pytest.param(None, id="no-token-configured"),
+    ],
+)
+def test_unconfigured_token_passes_through(token: str | None) -> None:
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=token))) as client:
             resp = await client.post("/v1/event", json=_EVENT_FRAME)
             assert resp.status == 200
 
     anyio.run(go)
 
 
-def test_healthz_never_gated() -> None:
+@pytest.mark.parametrize("path", ["/healthz", "/status"])
+def test_probe_endpoints_never_gated(path: str) -> None:
     runner, _ = _runner()
 
     async def go() -> None:
         await runner.start()
         async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
-            resp = await client.get("/healthz")
-            assert resp.status == 200
-
-    anyio.run(go)
-
-
-def test_status_never_gated() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
-        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
-            resp = await client.get("/status")
-            assert resp.status == 200
-
-    anyio.run(go)
-
-
-def test_no_token_configured_passes_through() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
-        # An app built with token=None does not gate: a header-less POST proceeds.
-        async with TestClient(TestServer(create_app(runner, token=None))) as client:
-            resp = await client.post("/v1/event", json=_EVENT_FRAME)
+            resp = await client.get(path)
             assert resp.status == 200
 
     anyio.run(go)

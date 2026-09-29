@@ -62,8 +62,11 @@ another hardcoded handler. The five that exist:
   one at all -- outbound always works (#1239).
 - **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
   `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over the raw body,
-  claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. This
-  is a hardcoded platform ingress, not consumption of a bundle-declared
+  claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
+  turn replies through one of the agent's bindings: its only one, or the route
+  the `kind`, `address` and optional `adapter` query parameters name (the
+  identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
+  This is a hardcoded platform ingress, not consumption of a bundle-declared
   `webhook` path.
 
 The five share no abstraction: a Slack Bolt event listener, two paths through a FastAPI

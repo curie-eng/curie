@@ -1,6 +1,8 @@
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -74,10 +76,8 @@ const ARRAY_VALUES: &str = "[{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRI
 /// lost, which is the successful migration the AC2 test asserts.
 const STAGED_OBJECT: &str = "100 bundle.tar";
 
-/// Writes `body` to `dir/name` and makes it executable (mode 0o755), the
-/// dance both the helm and kubectl stubs need identically. Returns the path
-/// written.
-fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
+/// Add the shared installation read to Helm and kubectl stubs and return the path.
+fn install_converged_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}",
@@ -88,13 +88,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
         body.to_string()
     };
     let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name} stub: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("{name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} stub executable: {error}"));
+    test_executable::install(&path, &body);
     path
 }
 
@@ -124,7 +118,7 @@ impl HelmFixture {
 
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir).expect("create stub bin directory");
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -350,7 +344,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "kubectl",
             &format!(
@@ -4405,7 +4399,7 @@ fn migrate_store_source_listing_shell_preserves_a_failed_aws_status() {
     let shell_bin = fixture.temp.path().join("source-listing-shell-bin");
     fs::create_dir(&shell_bin).expect("create source listing shell bin directory");
     let aws_log = fixture.temp.path().join("source-aws-calls.log");
-    write_exec(
+    install_converged_stub(
         &shell_bin,
         "aws",
         r#"#!/bin/sh
@@ -4421,12 +4415,12 @@ printf 'unexpected aws invocation: %s\n' "$*" >&2
 exit 64
 "#,
     );
-    write_exec(
+    install_converged_stub(
         &shell_bin,
         "cat",
         "#!/bin/sh\nprintf '%s\\n' 'fixture-secret'\n",
     );
-    write_exec(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
+    install_converged_stub(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
     let source_raw = fixture.temp.path().join("source.raw");
     let source_tmp = fixture.temp.path().join("source.list.tmp");
     let target_tmp = fixture.temp.path().join("target.tmp");
@@ -4502,7 +4496,7 @@ fn migrate_store_listing_shell_preserves_a_failed_aws_status() {
     let shell_bin = fixture.temp.path().join("listing-shell-bin");
     fs::create_dir(&shell_bin).expect("create listing shell bin directory");
     let aws_log = fixture.temp.path().join("aws-calls.log");
-    write_exec(
+    install_converged_stub(
         &shell_bin,
         "aws",
         r#"#!/bin/sh
@@ -4518,12 +4512,12 @@ printf 'unexpected aws invocation: %s\n' "$*" >&2
 exit 64
 "#,
     );
-    write_exec(
+    install_converged_stub(
         &shell_bin,
         "cat",
         "#!/bin/sh\nprintf '%s\\n' 'fixture-secret'\n",
     );
-    write_exec(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
+    install_converged_stub(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
     let bash_env = fixture.temp.path().join("listing-bash-env");
     fs::write(&bash_env, "enable -n [\n").expect("write bash environment");
     let mut paths = vec![shell_bin];

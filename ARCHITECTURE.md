@@ -30,6 +30,9 @@ detail, and documentation drift on one version-selectable system diagram.
 ## Table of contents
 
 - [Clause status](#clause-status)
+  - [Local to production parity](#local-to-production-parity)
+  - [Git flow deploy](#git-flow-deploy)
+  - [Eval gate](#eval-gate)
 - [Overview](#overview)
 - [Component map](#component-map)
   - [Adopted, not built](#adopted-not-built)
@@ -727,9 +730,10 @@ ladder; see the workflow file for the complete, current list. Notable ones:
 
 - `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
 - `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
-- `images`, `worker-local-image`, `dispatcher-image-smoke`, `mail-adapter-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+- `ci-images`, `images`, `dispatcher-image-smoke`, `mail-adapter-image-smoke`, `ui-image-smoke` — the **image build gates**. `ci-images` builds every image CI runs (api, dispatcher, worker, ui, runner, mail-adapter, the worker-local overlay, and a Postgres fixture) once per run and uploads each as an artifact; every smoke and ladder job loads those archives instead of rebuilding. `images` cross-builds the two example connectors for both architectures. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
 - `eval-falsifiability`, `commit-messages` (no AI attribution)
 - `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
+- `e2e-cluster-chart-regressions` — the Langfuse Postgres readiness, connector readiness, and runner BYO egress proofs on their own Calico kind cluster, in parallel with the cluster rung and on the same cluster tier; `e2e-cluster-rollout-recovery` — the rollout-free first invocation and dead-consumer recovery proof, on pushes and dispatches (including the nightly kind dispatch on `next`), never on pull requests
 
 **Release** ([`.github/workflows/release.yaml`](.github/workflows/release.yaml))
 publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,mail-adapter,worker,ui}` as

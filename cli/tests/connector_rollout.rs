@@ -3,24 +3,17 @@
 //! it uses only `prepare`/`sync` (already on main) plus a fake kubectl, not the
 //! new wait helpers.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use curie::connectors::{bind_current_cluster, prepare, sync};
 use curie::exit::{classify, ExitClass};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake kubectl");
-    let mut perms = fs::metadata(&path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod");
-}
 
 fn prepend_path(dir: &Path) -> Option<OsString> {
     let previous = std::env::var_os("PATH");
@@ -43,7 +36,7 @@ fn restore_path(previous: Option<OsString>) {
 async fn crashloop_observation_fails_named_connector() {
     let _lock = PATH_LOCK.lock().await;
     let bin = tempfile::tempdir().expect("bin");
-    write_exec(
+    test_executable::install_in(
         bin.path(),
         "kubectl",
         r#"#!/bin/sh

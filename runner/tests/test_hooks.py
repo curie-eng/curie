@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import os
+import signal
+import time
 from pathlib import Path
 
 import anyio
@@ -117,35 +119,79 @@ def test_first_denying_command_short_circuits(tmp_path: Path) -> None:
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
-def test_command_hook_kills_child_on_timeout(monkeypatch) -> None:
-    """A hook command that outlives the timeout must not orphan its shell child."""
+def test_command_hook_kills_child_on_timeout(monkeypatch, tmp_path) -> None:
+    """A hook command that outlives the timeout must not orphan its children.
 
-    monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 0.2)
+    The hook runs under ``/bin/sh -c``; killing only the shell leaves the
+    command it started (here a backgrounded ``sleep``) running as an orphan.
+    """
 
-    spawned: list[asyncio.subprocess.Process] = []
-    real_create_subprocess_exec = asyncio.create_subprocess_exec
-
-    async def spy_create_subprocess_exec(*args, **kwargs):
-        proc = await real_create_subprocess_exec(*args, **kwargs)
-        spawned.append(proc)
-        return proc
-
-    monkeypatch.setattr(hooks.asyncio, "create_subprocess_exec", spy_create_subprocess_exec)
+    monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 0.5)
+    pid_file = tmp_path / "grandchild.pid"
 
     async def go() -> dict:
         return await hooks._run_command_hook(
-            "sleep 30", {"tool_name": "Bash", "tool_input": {}}, Path.cwd()
+            f"sleep 30 & echo $! > {pid_file}; wait",
+            {"tool_name": "Bash", "tool_input": {}},
+            Path.cwd(),
         )
 
+    started = time.monotonic()
     result = anyio.run(go)
+    elapsed = time.monotonic() - started
 
     output = result["hookSpecificOutput"]
     assert "permissionDecision" not in output
     assert "failed to run" in output["additionalContext"]
 
-    assert len(spawned) == 1
-    proc = spawned[0]
-    assert proc.returncode is not None, "timed-out hook child was left running (orphaned)"
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _process_alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    alive = _process_alive(grandchild)
+    if alive:
+        os.kill(grandchild, signal.SIGKILL)
+    assert not alive, "timed-out hook left its grandchild running (orphaned)"
+    assert elapsed < 10, f"hook timeout took {elapsed:.1f}s to return"
+
+
+def test_command_hook_kills_its_group_when_cancelled(monkeypatch, tmp_path) -> None:
+    """An aborted turn cancels the hook callback; its process group must die too.
+
+    The hook runs in its own session, so nothing else would signal it.
+    """
+
+    monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 30)
+    pid_file = tmp_path / "grandchild.pid"
+
+    async def go() -> None:
+        with anyio.move_on_after(0.5):
+            await hooks._run_command_hook(
+                f"sleep 30 & echo $! > {pid_file}; wait",
+                {"tool_name": "Bash", "tool_input": {}},
+                Path.cwd(),
+            )
+
+    anyio.run(go)
+
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _process_alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    alive = _process_alive(grandchild)
+    if alive:
+        os.kill(grandchild, signal.SIGKILL)
+    assert not alive, "a cancelled hook left its grandchild running (orphaned)"
+
+
+def _process_alive(pid: int) -> bool:
+    """True while ``pid`` exists and is not a zombie awaiting reaping."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 def _gated_callback(gate: ApprovalGate, availability: ConnectorAvailability):

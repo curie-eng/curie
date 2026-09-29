@@ -120,6 +120,7 @@ from .binding import (
     PROGRESS_URL_ENV,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
+    AmbiguousRoute,
     BindingResolver,
 )
 from .capacity_wait import (
@@ -537,6 +538,12 @@ _ESCALATION_CAUSES = {
     "runner-timeout-unconfirmed": "runner_timeout",
     "workspace-error": "workspace_error",
     "history-persistence-error": "history_capacity",
+    # #3401: max-turns and an unclassified runner failure used to collapse into
+    # runner_escalated, so a consumer that only read the terminus cause could
+    # not tell them apart. Each keeps its own cause. Anything still unnamed
+    # stays runner_escalated.
+    "max-turns": "max_turns",
+    "unclassified": "unclassified",
 }
 
 
@@ -594,18 +601,81 @@ def _join_reply_blocks(*parts: str | None) -> str:
 _CLASSIFICATION_GUIDANCE = {
     "history-persistence-error": (
         "Conversation history capacity exceeded. Work already performed may have side "
-        "effects; inspect the result. The run can be retried."
-    ),
-    "max-turns": (
-        "The run used its whole turn budget; raise worker.workItemMaxTurns "
-        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns."
+        "effects; inspect the result. The run can be retried; if one turn is over the "
+        "cap, raise api.transcriptMaxThreadBytes (TRANSCRIPT_MAX_THREAD_BYTES)."
     ),
 }
 
+# The runner's own turn cap when no CURIE_MAX_TURNS reaches its boot env
+# (runner/src/curie_runner/config.py).
+_RUNNER_DEFAULT_MAX_TURNS = 20
 
-def _with_guidance(lead: str, token: str) -> str:
-    guidance = _CLASSIFICATION_GUIDANCE.get(token)
+
+def _max_turns_guidance(delivered_max_turns: str | None) -> str:
+    """Name the turn limit this delivery actually ran under (#3403).
+
+    Only a work-item delivery writes CURIE_MAX_TURNS into the boot env, from
+    worker.workItemMaxTurns. Every other delivery runs under the runner's own
+    CURIE_MAX_TURNS, which the operator sets through runner.extraEnv.
+    """
+
+    if delivered_max_turns is not None:
+        return (
+            f"The work item used its whole turn budget of {delivered_max_turns} "
+            "turns; raise worker.workItemMaxTurns (CURIE_WORK_ITEM_MAX_TURNS, "
+            f"currently {delivered_max_turns}) to allow more turns."
+        )
+    return (
+        "The run used the runner's whole turn budget; raise CURIE_MAX_TURNS "
+        "through runner.extraEnv (runner default "
+        f"{_RUNNER_DEFAULT_MAX_TURNS} when unset) to allow more turns. "
+        "worker.workItemMaxTurns applies only to work items."
+    )
+
+
+def _with_guidance(
+    lead: str, token: str, *, delivered_max_turns: str | None
+) -> str:
+    if token == "max-turns":
+        guidance: str | None = _max_turns_guidance(delivered_max_turns)
+    else:
+        guidance = _CLASSIFICATION_GUIDANCE.get(token)
     return f"{lead} {guidance}" if guidance else lead
+
+
+# First line of a failed turn's delivered reply (#3401). Frozen with the CLI
+# reader in tests/vectors/turn-failure-reply.json. One token, no spaces, so a
+# model sentence cannot satisfy the parser by mentioning the prefix.
+TURN_FAILURE_REPLY_PREFIX = "curie-turn-failure:"
+
+
+def failure_class_from_reply(text: str) -> str | None:
+    """The failure class on a delivered reply, or None when it is not a failure.
+
+    Only a first line of ``curie-turn-failure: <token>`` counts. A later mention,
+    or a token that contains whitespace, is model text and is not a failure.
+    """
+
+    if not text or not text.strip():
+        return None
+    line = text.lstrip("\n").splitlines()[0].strip()
+    if not line.startswith(TURN_FAILURE_REPLY_PREFIX):
+        return None
+    token = line[len(TURN_FAILURE_REPLY_PREFIX) :].strip()
+    if not token or any(char.isspace() for char in token):
+        return None
+    return token
+
+
+def turn_failure_reply(failure_class: str, message: str) -> str:
+    """Prefix ``message`` so a text-only consumer can see the failed turn."""
+
+    if failure_class_from_reply(f"{TURN_FAILURE_REPLY_PREFIX} {failure_class}") != failure_class:
+        raise ValueError("failure class must be one token")
+    body = message.strip()
+    if not body:
+        return f"{TURN_FAILURE_REPLY_PREFIX} {failure_class}"
+    return f"{TURN_FAILURE_REPLY_PREFIX} {failure_class}\n\n{body}"
 
 
 def _escalation_text(
@@ -866,24 +936,11 @@ def _parse_approval_targets(
     or duplicate targets must not produce a durable approval with ambiguous
     authority.
 
-    ADR-0168 decision 3 splits the notification target's both-or-neither rule
-    by kind. A Slack notification WITH an endpoint is the pre-ADR
-    custom-transport form and keeps both-or-neither: ``adapter`` there is a
-    credential slug, not an identity, and a stray endpoint with no adapter (or
-    the reverse) is a half-configured transport. A Slack notification with NO
-    endpoint may name an identity in ``adapter``, or none (the default) --
-    ``adapter`` alone is a complete, resolvable Slack route (D4.4), not a
-    half-configured one. Any other kind still requires both, unconditionally
-    (enforced below by ``kind != POLICY_CARD_KIND`` on its own).
-
-    Duplicate detection against the resolution target follows the same split:
-    a Slack notification with no endpoint duplicates the resolution when they
-    name the SAME IDENTITY (``route_identity``), because that is the same
-    Slack route by decision 3; a Slack notification WITH an endpoint (custom
-    transport) and any other kind duplicate the resolution on the raw
-    ``(kind, address)`` pair, as they always have -- ``adapter`` there is a
-    credential slug, not an identity, so comparing it would let two different
-    credentials on the SAME pair pass as distinct targets.
+    ADR-0168 decision 3: a Slack notification names its identity in
+    ``adapter``, or none for the default, and has no endpoint; any other kind
+    needs both. A Slack notification duplicates the resolution when it names
+    the same identity (``route_identity``) on the same channel; any other kind
+    duplicates it on the raw ``(kind, address)`` pair.
     """
 
     if not isinstance(binding, dict) or set(binding) - {
@@ -920,13 +977,7 @@ def _parse_approval_targets(
     endpoint = notification.get("endpoint")
     adapter = notification.get("adapter")
     address_shape = _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
-    # True for every shape EXCEPT a Slack notification with no endpoint: a
-    # non-Slack kind (always) or a Slack custom-transport notification (an
-    # endpoint present). That one exception is where `adapter` names an
-    # ADR-0168 decision 3 IDENTITY rather than a credential slug, so both the
-    # both-or-neither gate and the duplicate check below treat it apart from
-    # every other shape, which still goes by the raw `(kind, address)` pair.
-    not_slack_identity_form = kind != POLICY_CARD_KIND or endpoint is not None
+    not_slack = kind != POLICY_CARD_KIND
     if (
         not isinstance(kind, str)
         or _CHANNEL_SLUG.fullmatch(kind) is None
@@ -938,12 +989,12 @@ def _parse_approval_targets(
             adapter is not None
             and (not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None)
         )
-        or (not_slack_identity_form and (endpoint is None) != (adapter is None))
+        or (endpoint is None if not_slack else endpoint is not None)
+        or (not_slack and adapter is None)
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
-        or (kind != POLICY_CARD_KIND and endpoint is None)
         or (
             (kind, address) == resolution_pair
-            if not_slack_identity_form
+            if not_slack
             else (kind, route_identity(kind, adapter), address)
             == (POLICY_CARD_KIND, DEFAULT_IDENTITY, resolution_pair[1])
         )
@@ -1746,7 +1797,108 @@ class Kernel:
                 exc_info=True,
             )
 
+    async def notify_broker_entry_vanished(
+        self, qevent: QueuedTurn, *, lease: DeliveryLease | None
+    ) -> None:
+        """Edit the placeholder after the broker entry is gone.
+
+        Unlike :meth:`notify_turn_not_started`, lease loss is not a reason to
+        stay silent. ADR-0131 skips the notice when a successor owns the fence.
+        A vanished entry has no successor, so this edit is allowed only when
+        ``lease.entry_vanished`` is set. It is still best-effort and it still
+        refuses to overwrite a terminal reply.
+        """
+        if lease is None or not lease.entry_vanished.is_set():
+            return
+
+        event_id = qevent.event_id
+        attempted = event_id in self._terminal_reply_attempted
+        self._terminal_reply_attempted.discard(event_id)
+        factory_work_item_turn = self._is_factory_work_item_turn(event_id)
+        self._factory_work_item_events.discard(event_id)
+
+        if factory_work_item_turn:
+            logger.debug(
+                "event %s belongs to a factory execution; no not started notice",
+                event_id,
+            )
+            return
+
+        handle = qevent.reply_handle
+        if handle is None:
+            logger.debug(
+                "event %s has no reply target; no not started notice",
+                event_id,
+            )
+            return
+
+        if handle.placeholder is None:
+            logger.debug(
+                "event %s has no placeholder to edit; no not-started notice",
+                event_id,
+            )
+            return
+
+        if attempted:
+            logger.warning(
+                "skipping the not-started notice for event %s: this delivery had "
+                "already sent the person a result, and an ambiguous send may still "
+                "have landed",
+                event_id,
+            )
+            return
+
+        try:
+            already_terminal = await self._markers.is_terminal(event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "terminality unreadable for event %s; skipping the not-started "
+                "notice rather than risk overwriting a delivered answer",
+                event_id,
+                exc_info=True,
+            )
+            return
+
+        if already_terminal:
+            logger.warning(
+                "event %s failed after settling terminally; leaving its delivered "
+                "reply in place rather than promising a retry that cannot happen",
+                event_id,
+            )
+            return
+
+        try:
+            await self._reply_for(
+                qevent,
+                _route_from_handle(qevent),
+                self._config.turn_not_started_text,
+                terminal=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "the not-started notice for event %s could not be delivered",
+                event_id,
+                exc_info=True,
+            )
+
     async def notify_capacity_queued(self, qevent: QueuedTurn) -> ReplyAck:
+        # A queued edit that starts after the answer must not replace it. An
+        # edit already inside the sink is a different window: the notice lock
+        # holds the wake until that send finishes. An unreadable terminality
+        # check raises so the notice loop reschedules instead of recording the
+        # notice as delivered.
+        if qevent.event_id in self._terminal_reply_attempted:
+            return ReplyAck()
+        try:
+            terminal = await self._markers.is_terminal(qevent.event_id)
+        except asyncio.CancelledError:
+            raise
+        if terminal:
+            return ReplyAck()
         try:
             return await self._reply_for(
                 qevent,
@@ -2291,6 +2443,7 @@ class Kernel:
                     route,
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
+                    failure_class="prior-side-effect",
                 )
                 await self._complete(
                     qevent,
@@ -2390,16 +2543,26 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
-                resolved = await self._binding.resolve(handle.kind, handle.adapter, handle.channel)
+                try:
+                    resolved = await self._binding.resolve(
+                        handle.kind, handle.adapter, handle.channel
+                    )
+                except AmbiguousRoute as exc:
+                    await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                    return
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
                     # on those doubles on the established polite-drop path.
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
-                    undeployed = (
-                        await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
-                        if undeployed_lookup is not None
-                        else None
-                    )
+                    try:
+                        undeployed = (
+                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            if undeployed_lookup is not None
+                            else None
+                        )
+                    except AmbiguousRoute as exc:
+                        await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                        return
                     if undeployed is not None:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
@@ -2659,6 +2822,7 @@ class Kernel:
                             "The run exceeded its delivery deadline after "
                             f"{attempt - 1} attempt(s) and was not restarted. "
                             "Flagging for a human.",
+                            failure_class="delivery-deadline",
                         )
                         await self._complete(
                             qevent,
@@ -2825,9 +2989,13 @@ class Kernel:
                                 f"The run hit an error ({token}) after starting an action; "
                                 "not retrying automatically.",
                                 token,
+                                delivered_max_turns=(boot_env or {}).get(
+                                    MAX_TURNS_ENV
+                                ),
                             ),
                             detail=outcome.error_message,
                         ),
+                        failure_class=token,
                     )
                     await self._complete(
                         qevent,
@@ -2853,6 +3021,7 @@ class Kernel:
                         "The run exceeded its delivery deadline after "
                         f"{attempt} attempt(s) and was not restarted. "
                         "Flagging for a human.",
+                        failure_class="delivery-deadline",
                     )
                     await self._complete(
                         qevent,
@@ -2874,9 +3043,13 @@ class Kernel:
                             lead=_with_guidance(
                                 f"The run failed ({token}) after {attempt} attempt(s).",
                                 token,
+                                delivered_max_turns=(boot_env or {}).get(
+                                    MAX_TURNS_ENV
+                                ),
                             ),
                             detail=outcome.error_message,
                         ),
+                        failure_class=token,
                     )
                     await self._complete(
                         qevent,
@@ -3499,6 +3672,31 @@ class Kernel:
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
         await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
+
+    async def _drop_ambiguous_route(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        exc: AmbiguousRoute,
+        *,
+        lease: DeliveryLease | None = None,
+    ) -> None:
+        """Complete a turn whose route selects several agents' bindings.
+
+        It runs under no deployment and replies through no route: every route
+        on the pair belongs to an agent the turn may not be from, so a reply
+        through any of them is the misroute being refused (ADR-0168 decision 3).
+        """
+
+        logger.error("dropping event %s without a run or a reply: %s", qevent.event_id, exc)
+        await self._complete(
+            qevent,
+            route,
+            "dropped",
+            telemetry_outcome="interrupted",
+            lease=lease,
+            hook_outcome="failed",
+        )
 
     async def _drop_sibling_turn(
         self,
@@ -5553,25 +5751,36 @@ class Kernel:
             # A capacity wake may meet a different live turn on this thread.
             # Keep its original deadline and retry after that turn finishes;
             # steering would inject the message before its admission grant.
-            wait_budget_s = await check_capacity_before_request()
-            try:
-                capacity_status = await self._runner.capacity_status(
-                    handle.base_url, token=handle.token or None,
-                    remaining_s=min(1.0, wait_budget_s or 1.0),
-                )
-            except Exception:
-                logger.warning(
-                    "capacity runner status unavailable for event %s",
-                    wait[1], exc_info=True,
-                )
-                raise CapacityWaitRequested() from None
-            # An older runner does not implement the admission gate. Never
-            # submit a capacity event to a runner that would start it directly.
-            if (
-                capacity_status.get("capacity_admission") is not True
-                or capacity_status.get("turn_active") is not False
-            ):
-                raise CapacityWaitRequested()
+            # A grant that already started is not that case. Re-parking it
+            # edits the thread back to "queued" after the turn was admitted,
+            # which is what a replacement sees when the previous owner's
+            # runner is still marked busy or its status read blips.
+            wait_record = await wait[0].get(wait[1])
+            already_granted = (
+                wait_record is not None
+                and wait_record.state == "active"
+                and wait_record.grant_confirmed
+            )
+            if not already_granted:
+                wait_budget_s = await check_capacity_before_request()
+                try:
+                    capacity_status = await self._runner.capacity_status(
+                        handle.base_url, token=handle.token or None,
+                        remaining_s=min(1.0, wait_budget_s or 1.0),
+                    )
+                except Exception:
+                    logger.warning(
+                        "capacity runner status unavailable for event %s",
+                        wait[1], exc_info=True,
+                    )
+                    raise CapacityWaitRequested() from None
+                # An older runner does not implement the admission gate. Never
+                # submit a capacity event to a runner that would start it directly.
+                if (
+                    capacity_status.get("capacity_admission") is not True
+                    or capacity_status.get("turn_active") is not False
+                ):
+                    raise CapacityWaitRequested()
         elif source.is_job or verified_review is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
@@ -6508,7 +6717,8 @@ class Kernel:
                         # may not share a kind or a transport with, so rebuilding
                         # either from the turn addresses the wrong place; ``kind``
                         # empty is the pre-upgrade entry, which falls back to the
-                        # turn exactly as it did before.
+                        # turn's kind but NOT its identity: the historical card
+                        # was posted by the default transport.
                         kind=ref.kind or handle.kind,
                         address=ref.channel,
                         conversation_id=qevent.conversation_id,
@@ -6519,7 +6729,7 @@ class Kernel:
                 ),
                 route=TargetRoute(
                     endpoint=ref.endpoint,
-                    adapter=ref.adapter if ref.kind else route.adapter,
+                    adapter=ref.adapter if ref.kind else None,
                 ),
             )
             consumed = await self._card_store.consume(approval_id, raw_ref)
@@ -6664,6 +6874,7 @@ class Kernel:
                     "route is not bound to a valid resolution target for this "
                     "agent; flagging for a human instead of widening the request "
                     "to this channel.",
+                    failure_class="approval-route-unbound",
                 )
                 return False
             (card_kind, card_channel), notification_target = targets
@@ -6674,6 +6885,7 @@ class Kernel:
                 route,
                 "The run requested an approval, but no approval backend is "
                 "configured on this worker; flagging for a human instead of pausing.",
+                failure_class="approval-backend-missing",
             )
             return False
 
@@ -6683,6 +6895,7 @@ class Kernel:
                 route,
                 "Repository publication is unavailable on this installation; nothing was "
                 "published and no approval was created.",
+                failure_class="publication-unavailable",
             )
             return False
 
@@ -6855,6 +7068,7 @@ class Kernel:
                 route,
                 "The run requested an approval, but the approval record could "
                 "not be created; flagging for a human instead of pausing.",
+                failure_class="approval-create-failed",
             )
             return False
 
@@ -7012,17 +7226,11 @@ class Kernel:
         # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
         # names only a channel, never an adapter -- so it must borrow the
         # TURN's, or a named identity's card posts as ``default`` in a channel
-        # where only that identity may be a member (ADR-0168 decision 5). That
-        # borrow applies only to a Slack turn in IDENTITY form (no endpoint): a
-        # Slack turn carrying its own endpoint is the pre-ADR custom-transport
-        # form, whose ``adapter`` is a credential slug rather than an identity
-        # (``aci_protocol.turn.slack_speaking_identity``), and any other kind's
-        # adapter is that kind's own egress credential -- neither belongs on a
-        # Slack policy card.
+        # where only that identity may be a member (ADR-0168 decision 5). Only
+        # a Slack turn lends it: any other kind's adapter is that kind's own
+        # egress credential, which does not belong on a Slack policy card.
         card_adapter = (
-            None
-            if not in_requesting_channel and (handle.kind != SLACK_KIND or handle.endpoint)
-            else route.adapter
+            None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
         )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
@@ -7555,9 +7763,19 @@ class Kernel:
         qevent: QueuedTurn,
         route: TargetRoute,
         message: str,
+        *,
+        failure_class: str,
     ) -> None:
-        logger.warning("escalating event %s: %s", qevent.event_id, message)
-        await self._reply_for(qevent, route, message)
+        """Deliver ``message`` as a failed turn, with the class on the first line.
+
+        The class marker is what a consumer that sees only the reply text uses
+        to tell this from a successful task reply (#3401). Factory executions
+        still skip the channel write; their status comment carries the class.
+        """
+
+        text = turn_failure_reply(failure_class, message)
+        logger.warning("escalating event %s: %s", qevent.event_id, text)
+        await self._reply_for(qevent, route, text)
 
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))

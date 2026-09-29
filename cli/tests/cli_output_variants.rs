@@ -40,9 +40,10 @@ use curie::api::{
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, HookFireOutput, HookOutput,
-    KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
-    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, HookFireOutput,
+    HookOutput, KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
+    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -338,6 +339,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "CallersOutput",
+        samples![
+            "DryRun" => CallersOutput::DryRun(plan()),
+            // A restricted surface; the open (null list) shape is pinned by
+            // cli/tests/callers_verb.rs against the same schema.
+            "Done" => CallersOutput::Done {
+                agent: "a".to_string(),
+                surface: ChannelBinding {
+                    kind: "slack".to_string(),
+                    address: "C0EXAMPLE1".to_string(),
+                    adapter: Some("default".to_string()),
+                    allowed_callers: Some(vec!["U0EXAMPLE1".to_string()]),
+                },
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
         "ChannelsOutput",
         samples![
             "DryRun" => ChannelsOutput::DryRun(plan()),
@@ -351,6 +370,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         kind: "slack".to_string(),
                         address: "#legacy-alerts".to_string(),
                         adapter: None,
+                        allowed_callers: None,
                     },
                     // A named, non-default identity (ADR-0168 decision 3)
                     // alongside the default-identity row above, so the schema
@@ -359,6 +379,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         kind: "slack".to_string(),
                         address: "C0EXAMPLE1".to_string(),
                         adapter: Some("ops-secondary".to_string()),
+                        allowed_callers: None,
                     },
                 ],
                 changed: true,
@@ -673,6 +694,11 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Replied" => MessageOutcomeOutput::Replied {
                 thread: "1700000000.000100".to_string(),
                 reply: "the answer is 42".to_string(),
+            },
+            "Failed" => MessageOutcomeOutput::Failed {
+                thread: "1700000000.000100".to_string(),
+                reply: "curie-turn-failure: max-turns\n\nThe run failed (max-turns).".to_string(),
+                failure_class: "max-turns".to_string(),
             },
             "NoEdit" => MessageOutcomeOutput::NoEdit { thread: "1700000000.000100".to_string() },
             "AwaitingApproval" => MessageOutcomeOutput::AwaitingApproval {

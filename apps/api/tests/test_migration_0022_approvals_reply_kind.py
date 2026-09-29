@@ -41,19 +41,12 @@ itself via `isolated_migration_db`, real Postgres, no mocking.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows
 from alembic import command
 from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # The revision immediately below 0022, targeted explicitly rather than as a
 # relative "-1": a later migration moving head would make "-1" stop short of
@@ -69,36 +62,15 @@ REVISION = "0022"
 ADDRESS_CONSTRAINT = "agent_channels_address_key"
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    """Run one statement against the isolated migration database."""
-
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
 def _seed_binding(name: str, kind: str, address: str) -> uuid.UUID:
     """One agent and its `agent_channels` row, on the pre-0022 schema."""
 
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": name},
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, :kind, :addr)",
         {"id": uuid.uuid4(), "agent": agent_id, "kind": kind, "addr": address},
@@ -110,7 +82,7 @@ def _seed_approval(*, reply_channel: str, status: str, summary: str) -> uuid.UUI
     """One approval on the PRE-0022 schema (no `reply_kind` column yet)."""
 
     approval_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.approvals "
         "(id, conversation_id, author, summary, reply_channel, reply_placeholder, "
         " dedupe_key, status) "
@@ -130,7 +102,7 @@ def _seed_approval(*, reply_channel: str, status: str, summary: str) -> uuid.UUI
 
 
 def _reply_kind(approval_id: uuid.UUID) -> str | None:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT reply_kind FROM curie.approvals WHERE id = :id", {"id": approval_id}
     )
     assert rows, f"approval {approval_id} vanished"
@@ -138,7 +110,7 @@ def _reply_kind(approval_id: uuid.UUID) -> str | None:
 
 
 def _is_nullable(table: str, column: str) -> bool:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT is_nullable FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = :t AND column_name = :c",
         {"t": table, "c": column},
@@ -147,16 +119,15 @@ def _is_nullable(table: str, column: str) -> bool:
     return rows[0][0] == "YES"
 
 
-def _at_below() -> Config:
+def _at_below(db: IsolatedMigrationDb) -> Config:
     """A config with the database sitting exactly at the revision below 0022."""
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
-    return cfg
+    db.at(BELOW)
+    return alembic_config()
 
 
 def test_the_upgrade_backfills_each_approval_from_its_own_binding(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A7 / AC3, the provenance half.
 
@@ -165,7 +136,7 @@ def test_the_upgrade_backfills_each_approval_from_its_own_binding(
     'slack'` gets right for exactly one of them and silently wrong for the other.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("mail-agent", "email", "ops@example.test")
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     email_approval = _seed_approval(
@@ -189,13 +160,13 @@ def test_the_upgrade_backfills_each_approval_from_its_own_binding(
     # Slack legitimately has no adapter, and nothing in the schema records what a
     # pre-0022 approval's adapter would have been.
     assert _is_nullable("approvals", "reply_adapter")
-    adapters = _sql("SELECT DISTINCT reply_adapter FROM curie.approvals")
+    adapters = sql_rows("SELECT DISTINCT reply_adapter FROM curie.approvals")
     assert [row[0] for row in adapters] == [None]
 
 
 @pytest.mark.parametrize("status", ["approved", "rejected", "expired"])
 def test_the_upgrade_refuses_an_unreconstructable_row_of_any_settled_status(
-    isolated_migration_db: None, status: str
+    isolated_migration_db: IsolatedMigrationDb, status: str
 ) -> None:
     """T-A10, status-blind half / AC3.
 
@@ -212,7 +183,7 @@ def test_the_upgrade_refuses_an_unreconstructable_row_of_any_settled_status(
     allow-list gets one status right by accident.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     healthy = _seed_approval(
         reply_channel="C0EXAMPLE1", status=status, summary="resolvable one"
@@ -232,7 +203,7 @@ def test_the_upgrade_refuses_an_unreconstructable_row_of_any_settled_status(
 
 @pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
 def test_the_only_backfill_to_slack_is_a_row_bound_to_a_slack_binding(
-    isolated_migration_db: None, status: str
+    isolated_migration_db: IsolatedMigrationDb, status: str
 ) -> None:
     """T-A7's other half, and the positive control for the refusal above.
 
@@ -243,7 +214,7 @@ def test_the_only_backfill_to_slack_is_a_row_bound_to_a_slack_binding(
     lane it skipped.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
         reply_channel="C0EXAMPLE1", status=status, summary="ordinary slack"
@@ -255,7 +226,7 @@ def test_the_only_backfill_to_slack_is_a_row_bound_to_a_slack_binding(
 
 
 def test_the_upgrade_refuses_a_pending_approval_that_matches_no_binding(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A10, refusal half / AC3. A pending row carries a live resume
     obligation, and guessing its kind is the silent misroute. (The refusal is
@@ -270,7 +241,7 @@ def test_the_upgrade_refuses_a_pending_approval_that_matches_no_binding(
     there is deliberately no force-through flag.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     healthy = _seed_approval(
         reply_channel="C0EXAMPLE1", status="pending", summary="fine one"
@@ -290,7 +261,7 @@ def test_the_upgrade_refuses_a_pending_approval_that_matches_no_binding(
 
 
 def test_the_upgrade_refuses_a_pending_approval_whose_address_spans_two_kinds(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A10, the ambiguous-provenance half.
 
@@ -302,9 +273,9 @@ def test_the_upgrade_refuses_a_pending_approval_whose_address_spans_two_kinds(
     shape.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "shared@example.test")
-    _sql(f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {ADDRESS_CONSTRAINT}")
+    sql_rows(f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {ADDRESS_CONSTRAINT}")
     _seed_binding("mail-agent", "email", "shared@example.test")
     ambiguous = _seed_approval(
         reply_channel="shared@example.test", status="pending", summary="which one?"
@@ -319,14 +290,14 @@ def test_the_upgrade_refuses_a_pending_approval_whose_address_spans_two_kinds(
 
 
 def test_the_downgrade_refuses_while_any_approval_is_not_slack(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A11 / finding 17. Dropping the column destroys durable routing identity
     for exactly the rows that need it: after the drop, an email approval's resume
     has no way to know it is an email approval.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("mail-agent", "email", "ops@example.test")
     email_approval = _seed_approval(
         reply_channel="ops@example.test", status="pending", summary="send the quote"
@@ -345,7 +316,7 @@ def test_the_downgrade_refuses_while_any_approval_is_not_slack(
 
 
 def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A11, the round-2 predicate. This row is `'slack'`, so the first
     predicate passes it -- and it is still unreconstructable: its address is
@@ -354,7 +325,7 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
     direction.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
         reply_channel="C0EXAMPLE1", status="pending", summary="raised on slack"
@@ -365,7 +336,7 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
     # The operator re-points that address at a different adapter (`crud.
     # update_agent_binding` mutates the row in place, so this is an ordinary
     # PATCH, not an exotic state).
-    _sql(
+    sql_rows(
         "UPDATE curie.agent_channels SET kind = 'email' WHERE address = 'C0EXAMPLE1'"
     )
 
@@ -378,13 +349,13 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
 
 
 def test_the_downgrade_round_trips_when_every_row_is_reconstructable(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A11's positive control. Without this, a `downgrade` that raised
     unconditionally would pass every refusal test above while being unusable.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
         reply_channel="C0EXAMPLE1", status="pending", summary="ordinary slack"
@@ -393,7 +364,7 @@ def test_the_downgrade_round_trips_when_every_row_is_reconstructable(
     command.upgrade(cfg, REVISION)
     command.downgrade(cfg, BELOW)
 
-    rows = _sql(
+    rows = sql_rows(
         "SELECT 1 FROM information_schema.columns WHERE table_schema = 'curie' "
         "AND table_name = 'approvals' AND column_name IN ('reply_kind', 'reply_adapter')"
     )

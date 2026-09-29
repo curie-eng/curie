@@ -248,11 +248,11 @@ class IngressState:
         self.attempts = 0  # includes the ones dropped mid-flight
         self.attempt_times: list[float] = []
         self.drop_next = 0  # simulate N transport failures before answering
-        self.response: tuple[int, dict[str, Any]] = (
+        self.response: tuple[int, dict[str, Any] | str] = (
             200,
             {"event_id": "chn-1-abc", "stream_id": "1-0", "duplicate": False},
         )
-        self.responses: list[tuple[int, dict[str, Any], dict[str, str]]] = []
+        self.responses: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -415,9 +415,12 @@ class IngressHandler(_JsonHandler):
         else:
             status, payload = state.response
             headers = {}
-        body_bytes = json.dumps(payload).encode()
+        # A str payload is sent raw as HTML, the way a proxy or firewall in
+        # front of the platform answers; a dict is the platform's own JSON.
+        is_raw = isinstance(payload, str)
+        body_bytes = payload.encode() if is_raw else json.dumps(payload).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/html" if is_raw else "application/json")
         self.send_header("Content-Length", str(len(body_bytes)))
         for name, value in headers.items():
             self.send_header(name, value)
@@ -488,7 +491,9 @@ def serve(handler: type[BaseHTTPRequestHandler], state: Any) -> ThreadingHTTPSer
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.state = state  # type: ignore[attr-defined]
     server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+    ).start()
     return server
 
 

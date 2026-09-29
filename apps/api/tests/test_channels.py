@@ -886,18 +886,19 @@ def test_channel_http_parent_is_observation_context_never_ingress_authority(
     ]
 
 
-def test_a_slack_binding_enqueues_with_neither_endpoint_nor_adapter(
+def test_a_slack_binding_enqueues_its_identity_and_no_endpoint(
     channels_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """T-C2's parity half. `slack` carries neither route field, because its
-    egress is the worker's CONFIGURED Slack origin (D4.4) -- and a mint that
-    invented an endpoint for it would hand the bot token to a wire-supplied URL,
-    which is the live leak T-B10 closes on the other side. The kind still rides
-    the wire, so the resolver never has to guess it.
+    """T-C2's parity half. `slack` carries no endpoint, because its egress is
+    the worker's CONFIGURED Slack origin (D4.4) -- and a mint that invented an
+    endpoint for it would hand the bot token to a wire-supplied URL, which is
+    the live leak T-B10 closes on the other side. Its adapter is the identity
+    the row names (ADR-0168 decision 3), and the kind still rides the wire, so
+    the resolver never has to guess either.
     """
 
     _bind(
@@ -914,7 +915,7 @@ def test_a_slack_binding_enqueues_with_neither_endpoint_nor_adapter(
     (turn,) = _turns_on(valkey, runs_stream)
     assert turn.reply_handle.kind == "slack"
     assert turn.reply_handle.endpoint is None
-    assert turn.reply_handle.adapter is None
+    assert turn.reply_handle.adapter == "default"
 
 
 def test_an_endpoint_or_adapter_in_the_body_is_ignored(
@@ -970,7 +971,8 @@ def test_a_token_minted_for_one_binding_is_refused_for_another(
     The second case is the sharp one -- since migration 0023 the same address
     can be bound under two kinds, so a containment check keyed on the address
     alone would let an email adapter enqueue into the Slack agent at the same
-    address. `channel_id` is the claim, and the pair is what resolves it.
+    address. `channel_id` is the claim: it names the row, and that row must be
+    the pair the body claims.
     """
 
     _bind(
@@ -1480,7 +1482,7 @@ def test_a_half_configured_route_is_rejected_on_create_and_on_patch(
 ) -> None:
     """T-C11 (round-2 P2). Both-or-neither, on BOTH write verbs.
 
-    `agent_channels_route_pair_ck` states the same invariant at the database for
+    `agent_channels_route_ck` states the same invariant at the database for
     out-of-band writers (T-A16); this is the half that gives an operator a
     message instead of an IntegrityError. Both verbs, because the reviewer's
     failure mode was a row that "accepts ingress and fails later in the worker",
@@ -1522,12 +1524,11 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
     """T-C12 (round-2 P2, E17), narrowed: the write rule is pair INTEGRITY, not
     route presence (driver adjudication, 2026-08-13).
 
-    A binding with NO route is legal at rest -- `agent_channels_route_pair_ck`
-    deliberately permits both-NULL, migration 0024 backfills every existing row
-    to exactly that, and the cutover binds the agent first and PATCHes the route
-    in later (step 10). Rejecting it at write would make that sequence
-    impossible and would break every Slack binding, whose route is legitimately
-    implicit (D4.4).
+    A non-Slack binding with NO route is legal at rest --
+    `agent_channels_route_ck` deliberately permits both-NULL, and the cutover
+    binds the agent first and PATCHes the route in later (step 10). Rejecting
+    it at write would make that sequence impossible. A Slack binding's route is
+    its identity alone (D4.4; ADR-0168 decision 3).
 
     The gate for an unroutable binding is therefore the MINT, not the write:
     `POST /channels/token` refuses it (409), so the operator error surfaces
@@ -1556,11 +1557,11 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
         # identity, only an unset egress credential.
         read_adapter = "default" if kind == "slack" else None
         assert created.json()["channels"] == [
-            {"kind": kind, "address": address, "adapter": read_adapter}
+            {"kind": kind, "address": address, "adapter": read_adapter, "allowed_callers": None}
         ]
 
         row = _binding_row(created.json()["id"])
-        assert row["endpoint"] is None and row["adapter"] is None
+        assert row["endpoint"] is None and row["adapter"] == read_adapter
 
         minted = channels_client.post(
             "/channels/token",
@@ -1691,7 +1692,12 @@ def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["channels"] == [
-        {"kind": "email", "address": "ordinary@example.test", "adapter": EMAIL_ADAPTER}
+        {
+            "kind": "email",
+            "address": "ordinary@example.test",
+            "adapter": EMAIL_ADAPTER,
+            "allowed_callers": None,
+        }
     ]
     row = _binding_row(agent_id)
     assert row["adapter"] == EMAIL_ADAPTER
@@ -1722,7 +1728,12 @@ def test_a_valid_route_stores_the_endpoint_and_reads_back_only_the_identity(
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["channels"] == [
-        {"kind": "email", "address": "routed@example.test", "adapter": EMAIL_ADAPTER}
+        {
+            "kind": "email",
+            "address": "routed@example.test",
+            "adapter": EMAIL_ADAPTER,
+            "allowed_callers": None,
+        }
     ]
 
     row = _binding_row(agent_id)

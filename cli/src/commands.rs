@@ -3232,12 +3232,18 @@ impl ChannelChange {
         match (add, remove) {
             (Some(spec), _) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
-                // A non-Slack kind still needs BOTH endpoint and adapter for
-                // the custom-transport form (ADR-0168 decision 3): clap only
-                // enforces `--endpoint` requires `--adapter`, not the other
-                // way, so `--adapter` alone on a non-Slack kind reaches here
-                // and must be refused before any I/O -- the API would refuse
-                // it too, but only after a round trip.
+                if kind == "slack" && endpoint.is_some() {
+                    return Err(crate::exit::usage(
+                        "--endpoint on a Slack binding: a Slack route names its identity with \
+                         --adapter and takes no endpoint (ADR-0168 decision 3)"
+                            .to_string(),
+                    ));
+                }
+                // A non-Slack reply route needs BOTH endpoint and adapter:
+                // clap only enforces `--endpoint` requires `--adapter`, not
+                // the other way, so `--adapter` alone on a non-Slack kind
+                // reaches here and must be refused before any I/O -- the API
+                // would refuse it too, but only after a round trip.
                 if kind != "slack" && adapter.is_some() && endpoint.is_none() {
                     return Err(crate::exit::usage(format!(
                         "--adapter on a non-Slack kind ({kind}) also needs --endpoint; \
@@ -3441,11 +3447,11 @@ pub async fn channel_bindings(
                 endpoint,
                 adapter,
             } => {
-                // Three reply-route shapes (ADR-0168 decision 3): the
-                // pre-ADR custom transport (endpoint + adapter together),
-                // a named Slack identity (adapter alone), or the implicit
-                // default nothing names.
-                let reply_route = if endpoint.is_some() && adapter.is_some() {
+                // Three reply-route shapes (ADR-0168 decision 3): a
+                // non-Slack route (endpoint + adapter together), a named
+                // Slack identity (adapter alone), or the implicit default
+                // nothing names.
+                let reply_route = if kind != "slack" && endpoint.is_some() && adapter.is_some() {
                     "configured".to_string()
                 } else if let Some(adapter) = adapter {
                     format!("identity {adapter}")
@@ -3538,6 +3544,248 @@ pub async fn channel_bindings(
     Ok(ChannelsOutput::Done {
         agent: saved.name,
         channels: saved.channels,
+        changed: true,
+    })
+}
+
+/// What one `curie <tier> callers <agent> --surface KIND=ADDRESS` invocation
+/// does to that surface's caller list (ADR 0175): show it, replace it, or clear
+/// it so everyone may talk to the bot again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallersChange {
+    /// No `--set` and no `--clear`: read the list and write nothing.
+    Show,
+    /// `--set`: replace the list with exactly these ids.
+    Set(Vec<String>),
+    /// `--clear`: remove the list, so everyone may talk to the bot.
+    Clear,
+}
+
+impl CallersChange {
+    /// Resolve `--set` / `--clear` into one intent, before any I/O.
+    ///
+    /// clap already refuses the two together (`conflicts_with`). This mirrors
+    /// only the API's kind-free rules (convention: validate at the API, mirror
+    /// in the CLI): an entry must be non-empty with no whitespace. The id shape
+    /// per kind (a Slack U/W/B id, one bare email address) stays the API's
+    /// call, because only the API knows the selected binding's kind for sure.
+    ///
+    /// Args:
+    ///   set: the `--set` ids, comma separated or repeated; empty when absent.
+    ///   clear: whether `--clear` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error naming the malformed entry.
+    pub fn resolve(set: Vec<String>, clear: bool) -> Result<Self> {
+        if clear {
+            return Ok(CallersChange::Clear);
+        }
+        if set.is_empty() {
+            return Ok(CallersChange::Show);
+        }
+        for id in &set {
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return Err(crate::exit::usage(format!(
+                    "--set takes exact caller ids, comma separated, with no spaces \
+                     (e.g. --set U0123ABCD,U0456EFGH or --set person@example.com); got {id:?}"
+                )));
+            }
+        }
+        Ok(CallersChange::Set(set))
+    }
+}
+
+/// Output of `<tier> callers <agent>`: the dry-run plan, or the surface as the
+/// API holds it after this invocation. `allowed_callers` is `None` when the
+/// surface carries no list (everyone may talk to the bot), which is emitted as
+/// JSON `null` rather than omitted, so a consumer never mistakes "open" for "not
+/// reported". `changed` distinguishes a show from a write.
+#[derive(Debug)]
+pub enum CallersOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        surface: crate::api::ChannelBinding,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for CallersOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            CallersOutput::DryRun(plan) => plan.to_json(),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "kind": surface.kind,
+                "address": surface.address,
+                "adapter": surface.adapter,
+                "allowed_callers": surface.allowed_callers,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            CallersOutput::DryRun(plan) => plan.render(ui),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => {
+                let route = match channel_binding_named_identity(surface) {
+                    Some(identity) => format!("{}:{} ({identity})", surface.kind, surface.address),
+                    None => format!("{}:{}", surface.kind, surface.address),
+                };
+                let verb = if *changed { " now" } else { "" };
+                let who = match &surface.allowed_callers {
+                    None => "everyone (no caller list)".to_string(),
+                    Some(ids) => ids.join(", "),
+                };
+                ui.payload(&format!("callers for {agent} on {route}{verb}: {who}"));
+            }
+        }
+    }
+}
+
+/// The surface `(kind, address, adapter)` names among one agent's bindings.
+///
+/// Matched as the API's `_binding_for` matches: the pair always, and the
+/// identity only when `adapter` names one, compared on the identity the read
+/// side reports (a Slack binding with none reads back `default`).
+fn find_surface<'a>(
+    channels: &'a [crate::api::ChannelBinding],
+    kind: &str,
+    address: &str,
+    adapter: Option<&str>,
+) -> Option<&'a crate::api::ChannelBinding> {
+    channels.iter().find(|binding| {
+        binding.kind == kind
+            && binding.address == address
+            && adapter.is_none_or(|wanted| binding.adapter.as_deref() == Some(wanted))
+    })
+}
+
+/// `curie <tier> callers <agent> --surface KIND=ADDRESS [--set IDS | --clear]`.
+///
+/// With neither flag this SHOWS the surface's caller list, from the agent read
+/// alone. With `--set` it replaces the list, and with `--clear` it removes it,
+/// through `PUT /agents/{id}/channels/callers` (ADR 0175), and reports the
+/// surface as the API stored it. The write leaves the binding's generation
+/// alone, so an adapter's channel token keeps working.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   surface: the `--surface KIND=ADDRESS` value.
+///   adapter: `--adapter`, the identity that selects one of several routes on
+///     a pair (ADR-0168 decision 3); omitted selects as the API does.
+///   change: the intent already parsed from `--set` / `--clear`.
+///
+/// Returns:
+///   The surface and its caller list, or the dry-run plan.
+pub async fn channel_callers(
+    opts: AgentActionOpts,
+    surface: &str,
+    adapter: Option<String>,
+    change: CallersChange,
+) -> Result<CallersOutput> {
+    let (kind, address) = parse_channel_pair(surface)?;
+    if opts.dry_run {
+        let selector = match &adapter {
+            Some(adapter) => format!("kind={kind}&address={address}&adapter={adapter}"),
+            None => format!("kind={kind}&address={address}"),
+        };
+        let plan = match &change {
+            CallersChange::Show => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print the caller list \
+                 of {kind}:{address})",
+                opts.api_url, opts.agent
+            ),
+            CallersChange::Set(ids) => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {}  (would resolve agent {:?} first)",
+                opts.api_url,
+                serde_json::json!({ "allowed_callers": ids }),
+                opts.agent
+            ),
+            CallersChange::Clear => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {{\"allowed_callers\":null}}  \
+                 (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(CallersOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let not_bound = || {
+        crate::exit::CliError::usage(format!(
+            "agent {} has no {kind}:{address} surface{}",
+            agent.name,
+            adapter
+                .as_deref()
+                .map(|a| format!(" as {a:?}"))
+                .unwrap_or_default()
+        ))
+        .with_fix(format!(
+            "List the agent's surfaces with `curie <tier> surfaces {}` and pass one of them \
+             as --surface KIND=ADDRESS.",
+            agent.name
+        ))
+    };
+    let callers = match &change {
+        CallersChange::Show => {
+            let found = find_surface(&agent.channels, &kind, &address, adapter.as_deref())
+                .cloned()
+                .ok_or_else(not_bound)?;
+            return Ok(CallersOutput::Done {
+                agent: agent.name.clone(),
+                surface: found,
+                changed: false,
+            });
+        }
+        CallersChange::Set(ids) => Some(ids.as_slice()),
+        CallersChange::Clear => None,
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let verb = if callers.is_some() {
+        "setting"
+    } else {
+        "clearing"
+    };
+    let step = cl.step(&format!(
+        "{verb} the caller list of {kind}:{address} on {}",
+        agent.name
+    ));
+    let saved = match client
+        .set_channel_callers(&agent.id, &kind, &address, adapter.as_deref(), callers)
+        .await
+    {
+        Ok(saved) => {
+            step.done(if callers.is_some() { "set" } else { "cleared" });
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    let stored = find_surface(&saved.channels, &kind, &address, adapter.as_deref())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the API accepted the caller list but its answer carries no {kind}:{address} surface"
+            )
+        })?;
+    Ok(CallersOutput::Done {
+        agent: saved.name,
+        surface: stored,
         changed: true,
     })
 }
@@ -3685,8 +3933,8 @@ mod channels_tests {
         )
         .is_ok());
 
-        // Both endpoint and adapter together on a non-Slack kind is the
-        // pre-ADR custom-transport form and must still succeed.
+        // Both endpoint and adapter together on a non-Slack kind is that
+        // kind's reply route and must still succeed.
         assert!(ChannelChange::resolve(
             Some("discord=111111111111111111".into()),
             None,
@@ -3694,6 +3942,21 @@ mod channels_tests {
             Some("discord-main".into()),
         )
         .is_ok());
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_binding_takes_no_endpoint() {
+        let err = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("http://127.0.0.1:1".into()),
+            Some("proof-offline".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
     }
 
     #[test]
@@ -7018,14 +7281,14 @@ fn validate_notification_target(
             "route {route:?}: notification address must be non-empty and contain no whitespace"
         )));
     }
-    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
-    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
-    if !complete_transport && !empty_transport {
-        return Err(crate::exit::usage(format!(
-            "route {route:?}: notification endpoint and adapter must be supplied together"
-        )));
-    }
-    if target.kind != "slack" && !complete_transport {
+    if target.kind == "slack" {
+        if target.endpoint.is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: a Slack notification names its identity in adapter and takes \
+                 no endpoint"
+            )));
+        }
+    } else if target.endpoint.is_none() || target.adapter.is_none() {
         return Err(crate::exit::CliError::usage(format!(
             "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
             target.kind
@@ -9619,12 +9882,31 @@ mod tests {
         replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
         route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
         select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
-        validate_channel_binding, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
-        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        validate_channel_binding, validate_notification_target, ApprovalGateDecl, DeclaringVersion,
+        DeployTier, DownPlan, EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown,
+        SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_notification_names_an_identity_and_no_transport() {
+        let named = crate::api::NotificationTargetWrite {
+            kind: "slack".into(),
+            address: "C0EXAMPLE2".into(),
+            endpoint: None,
+            adapter: Some("ops-bot".into()),
+        };
+        validate_notification_target("finance", &named).expect("an identity alone is complete");
+        let transport = crate::api::NotificationTargetWrite {
+            endpoint: Some("https://adapter.example.com/replies".into()),
+            ..named
+        };
+        let err = validate_notification_target("finance", &transport).unwrap_err();
+        assert!(err.to_string().contains("no endpoint"), "{err}");
+    }
 
     #[test]
     fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {
@@ -11816,76 +12098,133 @@ mod tests {
     // returns {} -- zero gates armed. Reporting the well-formed sibling as armed
     // would claim a safety control the runner never arms.
 
+    // Also covers `--gate`/`--clear` argument misuse, and the set path, which
+    // must not be more credulous than the view path: both emit an answer ABOUT
+    // a specific bundle, so a missing or invalid manifest is a usage error on
+    // either path (previously `--plugin-dir /does/not/exist` exited 0 on set).
     #[tokio::test]
-    async fn skill_approvals_view_gate_missing_route_key_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"gate":"NoRoute"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-        // The sibling must not be reported as armed anywhere in the message.
-        assert!(
-            !format!("{err:#}").contains("Bash -> eng"),
-            "a key-missing gate disarms every gate: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_gate_missing_gate_key_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"route":"eng"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_manifest_without_name_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // `PluginManifest` requires `name`; without it the runner's parse raises
-        // and it arms zero gates, so listing `Bash` here would be a false report.
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_malformed_json_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x",,}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
+    async fn skill_approvals_invalid_input_is_usage_error() {
+        struct Case {
+            name: &'static str,
+            manifest: Option<&'static str>,
+            gates: &'static [&'static str],
+            clear: bool,
+            must_not_contain: Option<&'static str>,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "view_gate_missing_route_key",
+                manifest: Some(
+                    r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"gate":"NoRoute"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                // The sibling must not be reported as armed anywhere in the message.
+                must_not_contain: Some("Bash -> eng"),
+            },
+            Case {
+                name: "view_gate_missing_gate_key",
+                manifest: Some(
+                    r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"route":"eng"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                // `PluginManifest` requires `name`; without it the runner's parse
+                // raises and it arms zero gates, so listing `Bash` would be false.
+                name: "view_manifest_without_name",
+                manifest: Some(
+                    r#"{"version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "view_malformed_json",
+                manifest: Some(r#"{"name":"x",,}"#),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "view_without_manifest",
+                manifest: None,
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "clear_with_gate",
+                manifest: None,
+                gates: &["X"],
+                clear: true,
+                must_not_contain: None,
+            },
+            Case {
+                // A comma cannot round-trip through the CSV env encoding.
+                name: "comma_in_gate",
+                manifest: None,
+                gates: &["a,b"],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "whitespace_gate",
+                manifest: None,
+                gates: &["  "],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "set_without_manifest",
+                manifest: None,
+                gates: &["A"],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "clear_without_manifest",
+                manifest: None,
+                gates: &[],
+                clear: true,
+                must_not_contain: None,
+            },
+            Case {
+                // The view path rejects a manifest the runner's parse would
+                // reject; the set path names the same bundle, so it must too.
+                name: "set_with_invalid_manifest",
+                manifest: Some(r#"{"name":"x",,}"#),
+                gates: &["A"],
+                clear: false,
+                must_not_contain: None,
+            },
+        ];
+        for case in CASES {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(body) = case.manifest {
+                write_manifest(dir.path(), ".claude-plugin/plugin.json", body);
+            }
+            let gates = case.gates.iter().map(|g| g.to_string()).collect();
+            let err = super::skill_approvals(dir.path().to_path_buf(), gates, case.clear)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                usage_class(&err),
+                crate::exit::ExitClass::Usage,
+                "case {}: {err:#}",
+                case.name
+            );
+            if let Some(fragment) = case.must_not_contain {
+                assert!(
+                    !format!("{err:#}").contains(fragment),
+                    "case {}: a key-missing gate disarms every gate: {err:#}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -12053,57 +12392,11 @@ mod tests {
         assert_eq!(super::shell_quote("/tmp/plain"), "'/tmp/plain'");
     }
 
-    #[tokio::test]
-    async fn skill_approvals_clear_with_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["X".into()], true)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_comma_in_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // A comma cannot round-trip through the CSV env encoding.
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["a,b".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_whitespace_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["  ".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
     // --- the set path must not be more credulous than the view path ----------
     // Both emit an answer ABOUT a specific bundle. The view path errors when the
     // bundle has no manifest; the set path emitted export-then-reboot guidance
     // naming a directory it had never opened, so `--plugin-dir /does/not/exist`
     // exited 0 and the guidance failed later at `skill up`.
-
-    #[tokio::test]
-    async fn skill_approvals_set_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["A".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_clear_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], true)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
 
     #[tokio::test]
     async fn skill_approvals_set_with_valid_manifest_and_no_policy_succeeds() {
@@ -12121,22 +12414,6 @@ mod tests {
             out.to_json()["env"].as_str().unwrap(),
             "CURIE_APPROVAL_REQUIRED_TOOLS=A"
         );
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_set_with_invalid_manifest_is_usage_error() {
-        // The view path rejects a manifest the runner's parse would reject; the
-        // set path names the same bundle, so it must reject it identically.
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x",,}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["A".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
     }
 
     /// AC2: an unavailable verb must name the concept's absence AND point at the

@@ -402,6 +402,11 @@
       ]
     },
     {
+      "output": "CallersOutput",
+      "struct": "ChannelBinding",
+      "omissions": []
+    },
+    {
       "output": "VersionsOutput",
       "struct": "Version",
       "omissions": [

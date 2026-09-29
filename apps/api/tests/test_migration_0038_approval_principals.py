@@ -2,65 +2,26 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-
-
-def _alembic_config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _execute(sql: str, params: dict[str, Any] | None = None) -> None:
-    async def run() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                await connection.execute(text(sql), params or {})
-        finally:
-            await engine.dispose()
-
-    asyncio.run(run())
-
-
-def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as connection:
-                result = await connection.execute(text(sql), params or {})
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
 
 
 def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _alembic_config()
-    command.upgrade(config, "0037")
+    config = alembic_config()
+    isolated_migration_db.at("0037")
 
     approval_id = uuid.uuid4()
     old_audit_id = uuid.uuid4()
     old_session_id = uuid.uuid4()
     now = datetime.now(UTC).replace(tzinfo=None)
-    _execute(
+    sql_rows(
         """
         INSERT INTO curie.approvals
           (id, conversation_id, author, summary, reply_kind, reply_channel,
@@ -79,7 +40,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
             "dedupe_key": f"migration-0038-{uuid.uuid4()}",
         },
     )
-    _execute(
+    sql_rows(
         """
         INSERT INTO curie.approval_audit_entries
           (id, approval_id, action, actor, actor_channel, decision, authorizer,
@@ -91,7 +52,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         """,
         {"id": old_audit_id, "approval_id": approval_id},
     )
-    _execute(
+    sql_rows(
         """
         INSERT INTO curie.console_sessions
           (id, login_code_hash, login_code_expires_at)
@@ -106,7 +67,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
 
     command.upgrade(config, "0038")
 
-    historical_audit = _rows(
+    historical_audit = sql_dicts(
         """
         SELECT principal_kind, authenticated
         FROM curie.approval_audit_entries
@@ -115,7 +76,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         {"id": old_audit_id},
     )
     assert historical_audit == [{"principal_kind": None, "authenticated": False}]
-    historical_session = _rows(
+    historical_session = sql_dicts(
         "SELECT subject FROM curie.console_sessions WHERE id = :id",
         {"id": old_session_id},
     )
@@ -124,7 +85,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
     # An old-shaped system writer (the expiry sweeper) gets the same honest
     # false/NULL defaults after the migration rather than being retro-labeled.
     system_audit_id = uuid.uuid4()
-    _execute(
+    sql_rows(
         """
         INSERT INTO curie.approval_audit_entries
           (id, approval_id, action, actor, decision, authorizer, authorized)
@@ -134,7 +95,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         """,
         {"id": system_audit_id, "approval_id": approval_id},
     )
-    assert _rows(
+    assert sql_dicts(
         """
         SELECT principal_kind, authenticated
         FROM curie.approval_audit_entries
@@ -144,7 +105,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
     ) == [{"principal_kind": None, "authenticated": False}]
 
     principal_audit_id = uuid.uuid4()
-    _execute(
+    sql_rows(
         """
         INSERT INTO curie.approval_audit_entries
           (id, approval_id, action, actor, decision, authorizer, authorized,
@@ -155,7 +116,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         """,
         {"id": principal_audit_id, "approval_id": approval_id},
     )
-    assert _rows(
+    assert sql_dicts(
         """
         SELECT principal_kind, authenticated
         FROM curie.approval_audit_entries
@@ -164,17 +125,17 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         {"id": principal_audit_id},
     ) == [{"principal_kind": "operator", "authenticated": True}]
 
-    _execute(
+    sql_rows(
         "UPDATE curie.console_sessions SET subject = :subject WHERE id = :id",
         {"subject": "U0EXAMPLE2", "id": old_session_id},
     )
-    assert _rows(
+    assert sql_dicts(
         "SELECT subject FROM curie.console_sessions WHERE id = :id",
         {"id": old_session_id},
     ) == [{"subject": "U0EXAMPLE2"}]
 
     with pytest.raises(IntegrityError):
-        _execute(
+        sql_rows(
             """
             INSERT INTO curie.approval_audit_entries
               (id, approval_id, action, actor, decision, authorizer, authorized,
@@ -186,7 +147,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
             {"id": uuid.uuid4(), "approval_id": approval_id},
         )
 
-    checks = _rows(
+    checks = sql_dicts(
         """
         SELECT conname, pg_get_constraintdef(oid) AS definition
         FROM pg_constraint
@@ -201,7 +162,7 @@ def test_0038_backfills_asserted_history_and_round_trips_principal_proof(
         assert kind in checks[0]["definition"]
 
     command.downgrade(config, "0037")
-    assert _rows(
+    assert sql_dicts(
         """
         SELECT column_name
         FROM information_schema.columns

@@ -309,6 +309,132 @@ def _validate_channel_endpoint(endpoint: str) -> str:
     return endpoint
 
 
+# The caller list a binding may carry (ADR 0175 decision 1). Exact ids only: no
+# wildcards, domains or patterns, because a pattern is a rule an operator has to
+# reason about and an id is a fact they can check.
+MAX_ALLOWED_CALLERS = 100
+# The kind whose caller ids are email addresses, compared lowercase because the
+# mail adapter sends the sender that way (`_bare_address` lowercases it).
+EMAIL_KIND = "email"
+# A Slack caller is a user (U), an enterprise-grid user (W) or a bot (B). Same
+# allowlist discipline as `_SLACK_USER_ID`, widened by exactly the bot prefix:
+# the dispatcher asks with the bot id when a bot sent the message.
+_SLACK_CALLER_ID = re.compile(r"^[UWB][A-Z0-9]{7,}$")
+# One bare address: exactly one `@`, something on each side, and none of the
+# characters that would make it a display-name form, a list or a wildcard. `*`
+# is legal in a mailbox name but refused here: `*@example.com` is how an
+# operator spells "the whole domain", and an exact match would silently read it
+# as one mailbox literally named `*`.
+_EMAIL_CALLER = re.compile(r'^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$')
+# Longer than any real address (RFC 5321 caps a path at 256 octets) or provider
+# id, so a longer entry is a paste error rather than a caller.
+_CALLER_MAX_CHARS = 256
+
+
+def normalize_caller_id(kind: str, caller: str) -> str:
+    """The form a caller id is stored and compared in, for this binding kind.
+
+    Email ids are lowercased, exactly as the mail adapter sends a sender; every
+    other kind's ids are compared as sent, because Slack ids are uppercase by
+    construction and an unknown kind's ids are opaque.
+
+    Args:
+        kind: the binding's channel kind.
+        caller: one caller id, as sent or as stored.
+
+    Returns:
+        The id in its comparison form.
+    """
+
+    return caller.lower() if kind == EMAIL_KIND else caller
+
+
+def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] | None:
+    """Check a binding's caller list against its kind and return the stored form.
+
+    The authoritative gate for every caller of the list's endpoint (CLI, API,
+    console): None means everyone and passes through; an empty list is refused
+    because one operator reads it as "no limit" and the next as "nobody"; every
+    entry must be an exact id of the binding's kind. Duplicates are dropped
+    (after normalizing, so two spellings of one address count once) and the
+    order of first appearance is kept, so a read shows the list as written.
+
+    Args:
+        kind: the binding's channel kind, which chooses the id shape.
+        callers: the list as sent, or None.
+
+    Returns:
+        None, or the deduplicated, normalized list.
+
+    Raises:
+        ValueError: the list is empty, too long, or holds an id the kind rejects.
+    """
+
+    if callers is None:
+        return None
+    if not callers:
+        raise ValueError(
+            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
+            "to one operator and \"no limit\" to the next. Send null to let "
+            "everyone talk to the bot through this binding, or list at least one "
+            "caller id."
+        )
+    stored: list[str] = []
+    for caller in callers:
+        if len(caller) > _CALLER_MAX_CHARS:
+            raise ValueError(
+                f"caller id is longer than {_CALLER_MAX_CHARS} characters, which "
+                "no real id is; the value is not echoed here."
+            )
+        if kind == SLACK_KIND:
+            if not _SLACK_CALLER_ID.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not a Slack user or bot id: a Slack "
+                    "binding's callers are exact ids starting with U, W or B "
+                    "(e.g. U0123ABCD), never a @handle, a display name or an "
+                    "email. Find a person's id in their profile, under "
+                    "\"Copy member ID\"."
+                )
+        elif kind == EMAIL_KIND:
+            if not _EMAIL_CALLER.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not one bare email address: an email "
+                    "binding's callers are exact addresses like "
+                    "person@example.com, with no display name, no angle "
+                    "brackets and no domain-only or wildcard entries."
+                )
+        elif not caller or _ADDRESS_WHITESPACE.search(caller):
+            raise ValueError(
+                f"caller {caller!r} is not a caller id: it must be non-empty and "
+                "contain no whitespace, because it is matched exactly against "
+                "the id the channel reports for the sender."
+            )
+        normalized = normalize_caller_id(kind, caller)
+        if normalized not in stored:
+            stored.append(normalized)
+    if len(stored) > MAX_ALLOWED_CALLERS:
+        raise ValueError(
+            f"allowed_callers holds {len(stored)} distinct ids; the limit is "
+            f"{MAX_ALLOWED_CALLERS} per binding."
+        )
+    return stored
+
+
+class ChannelCallersWrite(BaseModel):
+    """The body of `PUT /agents/{agent_id}/channels/callers` (ADR 0175).
+
+    `allowed_callers` is REQUIRED, with null as an explicit value: a body that
+    omits it is a 422 rather than a silent "clear", so removing a binding's
+    protection is always something the caller wrote down. The kind-specific
+    checks run in the handler, since the kind comes from the selected binding
+    rather than from this body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_callers: list[str] | None
+
+
 class AppConfig(BaseModel):
     """Open app-level config the UI reads before auth (org/workspace name)."""
 
@@ -895,6 +1021,10 @@ class ChannelBindingOut(BaseModel):
     `adapter` is part of the route's identity, not a credential, so it belongs
     on the read side; `endpoint` stays write-only, unchanged from before.
     `ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.
+
+    `allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the
+    exact ids that may start a turn through this binding. It is written only by
+    `PUT /agents/{agent_id}/channels/callers`, never by a binding write.
     """
 
     model_config = ConfigDict(extra="forbid", from_attributes=True)
@@ -902,21 +1032,17 @@ class ChannelBindingOut(BaseModel):
     kind: str
     address: str
     adapter: str | None = None
+    allowed_callers: list[str] | None = None
 
     @model_validator(mode="after")
     def _present_route_identity(self) -> "ChannelBindingOut":
-        # The stored form is unchanged until the contract migration for
-        # ADR-0168 decision 3 (#3100): a Slack route with no identity is
-        # still stored as NULL, exactly as it was before the ADR, so an older
-        # app reads back exactly what it wrote.
-        # `route_identity` is the one place every reader compares that
-        # identity, so the presentation happens here rather than on the raw
-        # column, and a non-Slack row with no adapter stays untouched. A Slack
-        # row that carries an endpoint is the OLD custom-transport form
-        # (below), whose `adapter` is a credential, not an identity;
-        # `route_identity` only ever substitutes the default name for a NULL,
-        # so it is a no-op on a real credential slug and safe to apply here
-        # unconditionally.
+        # Migration 0070 names every Slack row's identity, but a stored
+        # approval notification target keeps the default implicit
+        # (`ApprovalNotificationTarget`), and `ApprovalTargetOut` reads it
+        # through this class. `route_identity` is the one place every reader
+        # compares that identity, so the presentation happens here rather than
+        # on the raw column, and a non-Slack row with no adapter stays
+        # untouched.
         self.__dict__["adapter"] = route_identity(self.kind, self.adapter)
         return self
 
@@ -934,19 +1060,20 @@ class ChannelBindingWrite(ChannelBinding):
     sides. A write-side policy on the shared model would 422 valid reads and
     leak a write rule into a read contract.
 
-    Three rules, stated here because this is the write path every caller (UI,
-    API, CLI) passes through; `agent_channels_route_pair_ck` states the first of
-    them at the database for out-of-band writers:
+    The rules, stated here because this is the write path every caller (UI,
+    API, CLI) passes through; `agent_channels_route_ck` states the first two
+    at the database for out-of-band writers:
 
-    - **Both or neither.** A half-configured route is an operator error that
-      would otherwise surface as a fail-closed escalation mid-turn, in the
-      worker, far from the request that caused it.
-    - **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,
-      migration 0024 backfills every existing row to exactly that, and the
-      cutover binds the agent first and PATCHes the route in later. The gate for
-      an unroutable binding is `POST /channels/token`, which refuses (409) to
-      mint for a non-`slack` binding with no route -- `slack`'s route is
-      legitimately implicit (the worker's configured Slack origin).
+    - **A Slack route names its identity**, `default` when omitted, and has no
+      endpoint (ADR-0168 decision 3): its replies go through the worker's
+      configured Slack origin, so an endpoint is refused by field name.
+    - **Any other kind is both or neither.** A half-configured route is an
+      operator error that would otherwise surface as a fail-closed escalation
+      mid-turn, in the worker, far from the request that caused it.
+    - **Both absent is legal** for a non-Slack kind: the cutover binds the
+      agent first and PATCHes the route in later. The gate for an unroutable
+      binding is `POST /channels/token`, which refuses (409) to mint for a
+      non-`slack` binding with no route.
     - **`adapter` is a lowercase slug**, on the same pattern as `kind`, because
       it is a CONFIG-MAP KEY on the worker
       (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a
@@ -983,44 +1110,22 @@ class ChannelBindingWrite(ChannelBinding):
                 "cannot be configured on an operator binding."
             )
 
-        if self.kind == SLACK_KIND and self.endpoint is not None:
-            # ADR-0168 decision 3 keeps this form for now: a Slack route
-            # that carries an endpoint is the pre-ADR "custom transport"
-            # binding (e.g. the offline hook-approval proof rig), and its
-            # `adapter` is an egress CREDENTIAL slug like any other kind's,
-            # not an identity -- so it follows the ordinary both-or-neither
-            # rule below and is stored exactly as sent, with no declared-
-            # identity check. The contract migration for that decision
-            # (#3100) is what refuses a Slack endpoint outright and retires
-            # this form; until then, refusing it here would 422 the shape the
-            # CI e2e ladder uses.
-            if self.adapter is None:
+        if self.kind == SLACK_KIND:
+            if self.endpoint is not None:
+                # ADR-0168 decision 3: the custom-transport form is retired.
                 raise ValueError(
-                    "channel route is half-configured: endpoint is set but "
-                    "adapter is not. A reply route needs both halves -- where "
-                    "the reply goes (endpoint) and which egress credential "
-                    "authenticates it (adapter) -- so set adapter too, or send "
-                    "neither and configure the route later."
+                    "a Slack route takes no endpoint: its replies go through the "
+                    "worker's configured Slack origin, and adapter names the bot "
+                    "identity. Remove endpoint."
                 )
-        elif self.kind == SLACK_KIND:
-            # No endpoint: this Slack route names its IDENTITY (ADR-0168
-            # decision 3) rather than a credential. Checked against the
-            # RESOLVED identity, not the raw column: an omitted adapter means
-            # the default app (`route_identity`), and comparing the raw
-            # `None` here would refuse the common case of naming none at all.
+            # Checked against the RESOLVED identity: an omitted adapter means
+            # the default app (`route_identity`), and that is what is stored.
             identity = route_identity(self.kind, self.adapter)
             refuse_undeclared(self.kind, identity)
-            if identity == DEFAULT_IDENTITY:
-                # The stored form is unchanged: the default identity is
-                # stored exactly as every Slack route was stored before the
-                # ADR, as NULL, so an older app reading this row back still
-                # sees what it always wrote. Setting `self.adapter` directly
-                # would mark it as an explicitly-SENT field even when the
-                # caller omitted it (pydantic's `__setattr__` updates
-                # `model_fields_set`), which a PATCH reads to decide whether a
-                # route was touched at all -- so write straight to `__dict__`
-                # instead, bypassing that bookkeeping.
-                self.__dict__["adapter"] = None
+            # `__dict__`, not setattr: pydantic's `__setattr__` would mark an
+            # omitted adapter as SENT, and a PATCH reads `model_fields_set` to
+            # decide whether a route was touched at all.
+            self.__dict__["adapter"] = identity
         elif (self.endpoint is None) != (self.adapter is None):
             missing = "adapter" if self.endpoint is not None else "endpoint"
             present = "endpoint" if missing == "adapter" else "adapter"
@@ -1076,11 +1181,7 @@ class ChannelBindingPatch(ChannelBindingWrite):
         endpoint_sent = "endpoint" in self.model_fields_set
         adapter_sent = "adapter" in self.model_fields_set
         if self.kind == SLACK_KIND and adapter_sent and not endpoint_sent:
-            # ADR-0168 decision 3: naming a Slack identity alone,
-            # with no endpoint, is legal (moving TO the identity form) -- the
-            # PAIR is only required when an endpoint is sent too (moving to
-            # or staying on the old custom-transport form), which the check
-            # below still enforces.
+            # A Slack route is its identity alone (ADR-0168 decision 3).
             return self
         if endpoint_sent != adapter_sent:
             missing = "adapter" if endpoint_sent else "endpoint"
@@ -1106,15 +1207,19 @@ class ApprovalResolutionTarget(ChannelBinding):
 class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
     """A visibility-only approval ping target and its server-side transport.
 
-    Slack may use the worker's configured default transport. Every other kind
-    needs the full endpoint/adapter pair at write time, so a declared
-    notification cannot persist as a permanently undeliverable best-effort
-    branch. Inheriting `ChannelBindingWrite` also inherits its Slack branch
-    (ADR-0168 decision 3): a Slack notification target still needs
-    no endpoint or adapter (the identity form), and may still carry the old
-    endpoint-plus-adapter custom-transport pair instead -- either is valid
-    here, exactly as on any other Slack binding.
+    A Slack target names no transport, and may name its identity in
+    `adapter`. Every other kind needs the full endpoint/adapter pair at write
+    time, so a declared notification cannot persist as a permanently
+    undeliverable best-effort branch.
     """
+
+    @model_validator(mode="after")
+    def _default_identity_stays_implicit(self) -> "ApprovalNotificationTarget":
+        # A stored JSON document, not a route row: keep the default implicit so
+        # stored routes and every comparison of them are unchanged.
+        if self.kind == SLACK_KIND and self.adapter == DEFAULT_IDENTITY:
+            self.__dict__["adapter"] = None
+        return self
 
     @model_validator(mode="after")
     def _require_non_slack_transport(self) -> "ApprovalNotificationTarget":
@@ -1176,6 +1281,11 @@ class ApprovalTargetOut(ChannelBindingOut):
     model_config = ConfigDict(extra="ignore")
 
     adapter: str | None = Field(default=None, exclude=True)
+    # A binding's caller list (ADR 0175), inherited from `ChannelBindingOut`,
+    # has no meaning on an approval target, which is where a card is posted,
+    # not a place a caller starts a turn; excluded for the same reason as
+    # `adapter` above, so this read shape stays exactly as it was.
+    allowed_callers: list[str] | None = Field(default=None, exclude=True)
 
 
 class ApprovalApproversOut(BaseModel):
@@ -1720,29 +1830,12 @@ class PublicationCreate(BaseModel):
                 raise ValueError(
                     "the built-in cluster-message publication reply route must not set an endpoint"
                 )
-        elif slack and self.reply_endpoint is not None:
-            # ADR-0168 decision 3 keeps the old custom-transport form for
-            # now: a Slack reply route WITH an endpoint (e.g. the offline
-            # hook-approval proof rig) carries a CREDENTIAL in reply_adapter,
-            # not an identity, so it follows the ordinary both-or-neither rule
-            # below and no declared-identity check applies. The contract
-            # migration for that decision (#3100) refuses a Slack endpoint.
-            if self.reply_adapter is None:
-                raise ValueError("publication reply route must set endpoint and adapter together")
         elif slack:
-            # No endpoint: this Slack route names its IDENTITY instead of a
-            # credential. Checked against the RESOLVED identity, not the raw
-            # column, for the same reason `ChannelBindingWrite._check_route`
-            # is: an omitted adapter means the default app.
+            # For Slack, reply_adapter is the identity with or without an
+            # endpoint; an endpoint is the CLI stub's per-turn origin (#19).
             identity = route_identity(self.reply_kind, self.reply_adapter)
             refuse_undeclared(self.reply_kind, identity)
-            if identity == DEFAULT_IDENTITY:
-                # The stored form is unchanged: kept as the
-                # pre-ADR-0168 stored form (NULL) so an older app reads what
-                # it wrote. Written straight to `__dict__`, bypassing
-                # pydantic's `model_fields_set` bookkeeping, so an omitted
-                # `reply_adapter` is not marked as explicitly sent.
-                self.__dict__["reply_adapter"] = None
+            self.__dict__["reply_adapter"] = identity
         elif (self.reply_endpoint is None) != (self.reply_adapter is None):
             raise ValueError("publication reply route must set endpoint and adapter together")
 
@@ -1950,6 +2043,7 @@ class PublicationOut(BaseModel):
 
 
 WorkItemOutcomeState = Literal[
+    "queued",
     "waiting",
     "running",
     "cancellation_requested",
@@ -1971,7 +2065,7 @@ class WorkItemRequestOut(BaseModel):
     sequence: int
     status: str
     created_at: datetime
-    wait_deadline: datetime
+    wait_deadline: datetime | None
     started_at: datetime | None
     execution_deadline: datetime | None
     terminal_at: datetime | None

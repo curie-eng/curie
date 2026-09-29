@@ -58,6 +58,13 @@ loss) stops renewing and the fleet resumes within one lease. Only after a clean
 drain is the marker extended to the roll hold (``upgrade_quiesce_ttl_s``), which
 the chart caps at the effective drain wait; the post-upgrade release clears it
 long before that in the normal path.
+
+**A deleted drain Job is not a successful drain (#3360).** Helm treats deletion
+of that Job as the hook finishing, so a later pre-upgrade attest hook reads a
+success record written only after a clean drain and refuses the upgrade when
+the record is missing, unreadable, or for another revision. The record is this
+revision's key. Attest does not write it and does not touch the quiesce
+marker. The post-upgrade release deletes it.
 """
 
 from __future__ import annotations
@@ -536,22 +543,87 @@ async def _read_claim_status(config: WorkerConfig) -> ClaimStatus:
         await redis.aclose()
 
 
+def _hook_revision(config: WorkerConfig) -> int:
+    """The integer stored in the success record. An unset hook revision is 0."""
+    return 0 if config.upgrade_revision is None else config.upgrade_revision
+
+
+def _success_record_matches(raw: str | bytes | None, revision: int) -> bool:
+    """True only for an object whose ``revision`` is this hook's integer."""
+    if raw is None:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    stored = parsed.get("revision")
+    # ``bool`` is an ``int`` subclass; a boolean is not a revision.
+    if isinstance(stored, bool) or not isinstance(stored, int):
+        return False
+    return stored == revision
+
+
+async def _record_drain_success(redis: Redis, config: WorkerConfig) -> None:
+    """SET this revision's success record for the roll hold. Never touches quiesce."""
+    payload = json.dumps(
+        {"revision": _hook_revision(config)},
+        separators=(",", ":"),
+    )
+    ttl_ms = max(1, int(config.upgrade_quiesce_ttl_s * 1000))
+    await redis.set(config.upgrade_drain_success_key(), payload, px=ttl_ms)
+
+
+async def _attest_recorded_drain(redis: Redis, config: WorkerConfig) -> int:
+    """Read the success record and nothing else.
+
+    Exit 0 only when it names this hook revision. Missing, non-JSON, the wrong
+    type, a different revision, or a Valkey error is a refusal (exit 1). This
+    path does not SET the key and does not write or clear the quiesce marker.
+    """
+    try:
+        raw = await redis.get(config.upgrade_drain_success_key())
+    except Exception:
+        logger.error(
+            "refusing the upgrade: no successful drain is recorded for this "
+            "revision and nothing was rolled. The success record could not be read."
+        )
+        return 1
+    if _success_record_matches(raw, _hook_revision(config)):
+        logger.info(
+            "upgrade drain success is recorded for revision %d",
+            _hook_revision(config),
+        )
+        return 0
+    logger.error(
+        "refusing the upgrade: no successful drain is recorded for this "
+        "revision and nothing was rolled."
+    )
+    return 1
+
+
 async def run_gate(config: WorkerConfig, *, mode: str) -> int:
     """The chart hook's body, factored out so tests drive it without a process.
 
     ``drain`` is the pre-upgrade hook: quiesce, wait, and answer with the exit
-    code Helm reads as "proceed" (0) or "do not roll" (1). ``release`` is the
-    post-upgrade hook: clear the flag so the new pods start claiming.
+    code Helm reads as "proceed" (0) or "do not roll" (1). A clean drain also
+    records success for this revision. ``attest`` only reads that record and
+    refuses when it is absent. ``release`` is the post-upgrade hook: clear the
+    flag and delete this revision's success record so the new pods start claiming.
     """
     redis = _client(config)
     try:
         if mode == "release":
             await UpgradeDrainGate(redis, config).clear_quiesce()
+            await redis.delete(config.upgrade_drain_success_key())
             logger.info(
                 "upgrade quiesce release processing completed; run with --mode status "
                 "to confirm the current claim state"
             )
             return 0
+        if mode == "attest":
+            return await _attest_recorded_drain(redis, config)
         gate = UpgradeDrainGate(redis, config)
         # Job deletion and activeDeadlineSeconds deliver SIGTERM. Cancel the
         # wait and clear the marker at once rather than leaving the fleet paused
@@ -595,6 +667,28 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             for sig in installed:
                 loop.remove_signal_handler(sig)
         if outcome.drained:
+            # The roll hold is already written inside await_drained. Record
+            # success only now: SIGTERM, a refused drain, and an exception
+            # return above without this write. Handlers are already removed,
+            # so SIGTERM during this write kills the process instead of
+            # taking the cleanup path. A failed SET drops the roll hold so a
+            # refused upgrade does not leave the fleet paused.
+            try:
+                await _record_drain_success(redis, config)
+            except Exception:
+                logger.error(
+                    "refusing the upgrade: the drain finished but its success "
+                    "record could not be written. Nothing was rolled."
+                )
+                try:
+                    await gate.clear_quiesce()
+                except Exception:
+                    logger.error(
+                        "refusing the upgrade: the quiesce marker could not be "
+                        "cleared after the success record write failed. Nothing "
+                        "was rolled."
+                    )
+                return 1
             logger.info(
                 "upgrade drain complete after %.1fs; no delivery is in flight",
                 outcome.waited_s,
@@ -635,11 +729,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("drain", "release", "status"),
+        choices=("drain", "release", "status", "attest"),
         default="drain",
         help=(
-            "drain: pre-upgrade gate. release: post-upgrade quiesce clear. "
-            "status: read worker claim state."
+            "drain: pre-upgrade gate. attest: pre-upgrade check that this "
+            "revision's drain recorded success. release: post-upgrade quiesce "
+            "clear. status: read worker claim state."
         ),
     )
     parser.add_argument(

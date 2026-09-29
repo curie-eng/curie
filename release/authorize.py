@@ -72,8 +72,8 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # a reviewed branch, restricted to jobs that speak to release confidence: the
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
-# (including the worker-local overlay and the dispatcher's own import
-# smoke-test), and the behavioral gates (eval falsifiability, the E2E
+# (the one ci-images job, which includes the worker-local overlay, plus the
+# dispatcher's own import smoke-test), and the behavioral gates (eval falsifiability, the E2E
 # parity ladder, the repository-toolchain proof) that ci.yaml's own
 # comments describe as catching bug classes no unit test does. Checks
 # from other workflows (CodeQL, the
@@ -115,14 +115,9 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Contracts (generated TypeScript compiles)",
         "UI (lint + vitest + build + Playwright)",
         "Compose (release stack validates)",
-        "Build runner image (no push)",
-        "Build api image (no push)",
-        "Build dispatcher image (no push)",
-        "Build worker image (no push)",
-        "Build ui image (no push)",
+        "Build CI images (no push)",
         "Build sre-bot-tempo image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
-        "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
         "Repository toolchain proof (runner image)",
         "Eval falsifiability gate (fake model, offline)",

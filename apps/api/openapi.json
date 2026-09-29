@@ -744,6 +744,70 @@
         "title": "AdmissionFacts",
         "type": "object"
       },
+      "AdmissionIn": {
+        "additionalProperties": false,
+        "description": "One admission question from the Slack dispatcher (ADR 0175 decision 2).\n\nSubclasses `ChannelBinding` so the route pair is judged by the same\n`_validate_channel_binding` every other binding surface runs. `adapter`\nnames the identity half of the route (ADR-0168 decision 3), resolved\nexactly as `POST /channels/token` resolves it: omitted means the default\nSlack identity. `callers` is every id the channel reports for the caller;\nany one of them on the list admits.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "callers": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Callers",
+            "type": "array"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "AdmissionIn",
+        "type": "object"
+      },
+      "AdmissionOut": {
+        "description": "The admission answer.\n\n`restricted` says whether the route carries a list at all, so the\ndispatcher can cache an unrestricted route as open to every caller and ask\nagain only when that entry expires.",
+        "properties": {
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "install_restricted": {
+            "title": "Install Restricted",
+            "type": "boolean"
+          },
+          "restricted": {
+            "title": "Restricted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "allowed",
+          "restricted",
+          "install_restricted"
+        ],
+        "title": "AdmissionOut",
+        "type": "object"
+      },
       "AgentCreate": {
         "properties": {
           "approval_required_tools": {
@@ -1677,7 +1741,7 @@
       },
       "ApprovalNotificationTarget": {
         "additionalProperties": false,
-        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch. Inheriting `ChannelBindingWrite` also inherits its Slack branch\n(ADR-0168 decision 3): a Slack notification target still needs\nno endpoint or adapter (the identity form), and may still carry the old\nendpoint-plus-adapter custom-transport pair instead -- either is valid\nhere, exactly as on any other Slack binding.",
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nA Slack target names no transport, and may name its identity in\n`adapter`. Every other kind needs the full endpoint/adapter pair at write\ntime, so a declared notification cannot persist as a permanently\nundeliverable best-effort branch.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2618,7 +2682,7 @@
       },
       "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.\n\n`allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the\nexact ids that may start a turn through this binding. It is written only by\n`PUT /agents/{agent_id}/channels/callers`, never by a binding write.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2634,6 +2698,20 @@
           "address": {
             "title": "Address",
             "type": "string"
+          },
+          "allowed_callers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Callers"
           },
           "kind": {
             "title": "Kind",
@@ -2691,7 +2769,7 @@
       },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThe rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_ck` states the first two\nat the database for out-of-band writers:\n\n- **A Slack route names its identity**, `default` when omitted, and has no\n  endpoint (ADR-0168 decision 3): its replies go through the worker's\n  configured Slack origin, so an endpoint is refused by field name.\n- **Any other kind is both or neither.** A half-configured route is an\n  operator error that would otherwise surface as a fail-closed escalation\n  mid-turn, in the worker, far from the request that caused it.\n- **Both absent is legal** for a non-Slack kind: the cutover binds the\n  agent first and PATCHes the route in later. The gate for an unroutable\n  binding is `POST /channels/token`, which refuses (409) to mint for a\n  non-`slack` binding with no route.\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2729,6 +2807,31 @@
           "address"
         ],
         "title": "ChannelBindingWrite",
+        "type": "object"
+      },
+      "ChannelCallersWrite": {
+        "additionalProperties": false,
+        "description": "The body of `PUT /agents/{agent_id}/channels/callers` (ADR 0175).\n\n`allowed_callers` is REQUIRED, with null as an explicit value: a body that\nomits it is a 422 rather than a silent \"clear\", so removing a binding's\nprotection is always something the caller wrote down. The kind-specific\nchecks run in the handler, since the kind comes from the selected binding\nrather than from this body.",
+        "properties": {
+          "allowed_callers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Callers"
+          }
+        },
+        "required": [
+          "allowed_callers"
+        ],
+        "title": "ChannelCallersWrite",
         "type": "object"
       },
       "ChannelTokenOut": {
@@ -6946,6 +7049,65 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VerificationObservation": {
+        "additionalProperties": false,
+        "description": "Exact sandbox command result recorded before the model starts.",
+        "properties": {
+          "blocked_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Blocked Services",
+            "type": "array"
+          },
+          "command": {
+            "maxLength": 180,
+            "minLength": 1,
+            "title": "Command",
+            "type": "string"
+          },
+          "exit_status": {
+            "anyOf": [
+              {
+                "maximum": 255.0,
+                "minimum": -255.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Status"
+          },
+          "missing_binaries": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Missing Binaries",
+            "type": "array"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "unavailable",
+              "failed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "outcome",
+          "exit_status",
+          "missing_binaries",
+          "blocked_services"
+        ],
+        "title": "VerificationObservation",
+        "type": "object"
+      },
       "VersionCreate": {
         "properties": {
           "bundle_ref": {
@@ -7360,6 +7522,7 @@
           },
           "state": {
             "enum": [
+              "queued",
               "waiting",
               "running",
               "cancellation_requested",
@@ -7553,9 +7716,16 @@
             "title": "Termination Observation"
           },
           "wait_deadline": {
-            "format": "date-time",
-            "title": "Wait Deadline",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wait Deadline"
           }
         },
         "required": [
@@ -9112,6 +9282,110 @@
           }
         },
         "summary": "Add Agent Channel",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/agents/{agent_id}/channels/callers": {
+      "put": {
+        "description": "Set or clear who may talk to the bot through one binding (ADR 0175).\n\nThe route is selected exactly as the move and delete endpoints select it:\n`(kind, address)` as query parameters plus the optional `adapter` identity\n(ADR-0168 decision 3). `allowed_callers: null` clears the list so everyone\nmay talk to the bot again; a list replaces the stored one whole.\n\nIts own endpoint, apart from `PATCH /agents/{agent_id}/channels`, because\nthat write bumps the binding's generation and so revokes the adapter's\ntoken (#2379). Who may use a route is a separate question from the route\nitself (decision 4), so this write leaves the generation alone and an\ninbox keeps receiving mail while its list is edited.\n\nThe entries are checked against the SELECTED binding's kind, under the same\nper-agent lock every binding write takes, so a concurrent move cannot\nchange the kind between the check and the store. A refused list is a 422\nin FastAPI's own shape, like any other body error.",
+        "operationId": "set_agent_channel_callers_agents__agent_id__channels_callers_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelCallersWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Agent Channel Callers",
         "tags": [
           "agents"
         ]
@@ -12197,7 +12471,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12208,7 +12482,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12315,7 +12589,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12326,7 +12600,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12365,6 +12639,66 @@
         "summary": "Resolve Approval",
         "tags": [
           "approvals"
+        ]
+      }
+    },
+    "/channels/admission": {
+      "post": {
+        "description": "Answer whether a caller may start a turn on a route (platform key only).\n\nThe Slack dispatcher's half of ADR 0175 decision 2: it has no database, so\nit asks here, after its own filters and before it claims the event or posts\na placeholder. The answer comes from the same `admission.admit` the channel\nport runs, so the two channels cannot disagree about one list.\n\nPlatform key only, never a `chn` token or an adapter principal: an adapter\nalready gets its answer as the 403 on `POST /channels/turns`, and this\nroute would otherwise let a token scoped to one binding ask about every\nother binding's list.\n\nAn unbound route answers allowed and unrestricted: the list lives on the\nbinding, and what happens to a mention of an unbound channel is routing's\ncall, unchanged by this ADR.",
+        "operationId": "check_admission_channels_admission_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdmissionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdmissionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Admission",
+        "tags": [
+          "channels"
         ]
       }
     },
@@ -12446,7 +12780,7 @@
     },
     "/channels/turns": {
       "post": {
-        "description": "Enqueue one inbound delivery for the binding the body names.\n\nOrder is load-bearing, and every step of it earns its place:\n\n1. the size bound, before authentication and before JSON parsing, so an\n   oversized body is refused without the server ever HMAC-verifying or\n   deserializing it;\n2. the body, parsed next because the credential is scoped to the binding the\n   body CLAIMS and a 422 costs no database work either;\n3. the credential's SIGNATURE, verified statelessly -- no row, no query. An\n   attacker with no valid credential must not be able to make this route\n   query the database, or a flood of small well-formed bodies exhausts the\n   connection pool behind a 401;\n4. the binding row, loaded only for a caller that already authenticated;\n5. the claims bound to that row, and only then does an unknown pair earn a\n   404 -- a caller with no credential learns nothing about which bindings\n   exist.",
+        "description": "Enqueue one inbound delivery for the binding the body names.\n\nOrder is load-bearing, and every step of it earns its place:\n\n1. the size bound, before authentication and before JSON parsing, so an\n   oversized body is refused without the server ever HMAC-verifying or\n   deserializing it;\n2. the body, parsed next because the credential is scoped to the binding the\n   body CLAIMS and a 422 costs no database work either;\n3. the credential's SIGNATURE, verified statelessly -- no row, no query. An\n   attacker with no valid credential must not be able to make this route\n   query the database, or a flood of small well-formed bodies exhausts the\n   connection pool behind a 401;\n4. the binding row, loaded only for a caller that already authenticated;\n5. the claims bound to that row, and only then does an unknown pair earn a\n   404 -- a caller with no credential learns nothing about which bindings\n   exist;\n6. the binding's caller list (ADR 0175), before any claim, quota slot or\n   queue write, so a refused author costs nothing but this request and\n   answers 403.",
         "operationId": "ingest_turn_channels_turns_post",
         "parameters": [
           {
@@ -12651,7 +12985,7 @@
         "parameters": [
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12662,7 +12996,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -13500,6 +13834,22 @@
                 }
               ],
               "title": "Address"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
             }
           },
           {
@@ -16519,6 +16869,75 @@
           }
         },
         "summary": "Report Work Item Usage",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}/verification": {
+      "post": {
+        "operationId": "report_work_item_verification_v1_work_item_progress__request_id__verification_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Verification V1 Work Item Progress  Request Id  Verification Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Verification",
         "tags": [
           "factory-status"
         ]

@@ -247,7 +247,11 @@ installation_id = base64.b64decode(
 ).decode()
 assert installation_id.strip(), "stored installation identity is blank"
 
-components = {"upgrade-drain": "drain", "upgrade-drain-release": "release"}
+components = {
+    "upgrade-drain": "drain",
+    "upgrade-drain-release": "release",
+    "upgrade-drain-attest": "attest",
+}
 jobs = {}
 for doc in yaml.safe_load_all(open(hooks_path)):
     if not doc or doc.get("kind") != "Job":
@@ -258,7 +262,7 @@ for doc in yaml.safe_load_all(open(hooks_path)):
     if component in components:
         assert component not in jobs, f"duplicate stored hook {component}"
         jobs[component] = doc
-assert set(jobs) == set(components), "release does not store both upgrade-drain hooks"
+assert set(jobs) == set(components), "release does not store the upgrade-drain hooks"
 
 identities = []
 revisions = []
@@ -296,11 +300,11 @@ for component, mode in components.items():
     revisions.append(revision["value"])
     legacy_values.append(legacy["value"])
 
-assert identities == [installation_id, installation_id], (
+assert identities == [installation_id, installation_id, installation_id], (
     "stored hook identities do not match the decoded managed Secret value"
 )
 assert len(set(revisions)) == 1, "stored hooks disagree on Helm revision"
-assert legacy_values == [expected_legacy, expected_legacy], (
+assert legacy_values == [expected_legacy, expected_legacy, expected_legacy], (
     "stored hooks disagree on legacy compatibility"
 )
 PY

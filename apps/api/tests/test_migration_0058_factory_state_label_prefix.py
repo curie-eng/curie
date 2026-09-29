@@ -7,57 +7,29 @@ revisions add columns.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 REPO = "acme-corp/acme-bot"
 LEGACY = "curie:queued"
 NEW = "curie-factory:queued"
 
 
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                if not result.returns_rows:
-                    return []
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
-
-
 def _revision() -> str:
-    return str(_sql("SELECT version_num FROM curie.alembic_version")[0]["version_num"])
+    return str(sql_dicts("SELECT version_num FROM curie.alembic_version")[0]["version_num"])
 
 
 def _seed_request(number: int) -> tuple[uuid.UUID, uuid.UUID]:
     agent_id, work_item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"acme-bot-{agent_id.hex[:8]}"},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.work_items "
         "(id, github_repository_id, github_issue_number, github_installation_id, "
         "agent_id, repo_full_name, conversation_id) "
@@ -70,7 +42,7 @@ def _seed_request(number: int) -> tuple[uuid.UUID, uuid.UUID]:
             "conversation": f"issue-{number}",
         },
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, objective, "
         "requester, reply_kind, reply_address, reply_conversation_id) "
@@ -85,12 +57,12 @@ def _seed_request(number: int) -> tuple[uuid.UUID, uuid.UUID]:
             "conversation": f"issue-{number}",
         },
     )
-    _sql("UPDATE curie.work_items SET next_sequence = 2 WHERE id = :id", {"id": work_item_id})
+    sql_dicts("UPDATE curie.work_items SET next_sequence = 2 WHERE id = :id", {"id": work_item_id})
     return work_item_id, request_id
 
 
 def _seed_notice(work_item_id: uuid.UUID, request_id: uuid.UUID, applied_label: str) -> None:
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.factory_terminal_notices "
         "(execution_request_id, work_item_id, card_token, applied_label) "
         "VALUES (:id, :work_item, :token, :label)",
@@ -104,7 +76,7 @@ def _seed_notice(work_item_id: uuid.UUID, request_id: uuid.UUID, applied_label: 
 
 
 def _applied(request_id: uuid.UUID) -> str | None:
-    rows = _sql(
+    rows = sql_dicts(
         "SELECT applied_label FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
         {"id": request_id},
     )
@@ -113,7 +85,7 @@ def _applied(request_id: uuid.UUID) -> str | None:
 
 
 def _set_applied(request_id: uuid.UUID, label: str) -> None:
-    _sql(
+    sql_dicts(
         "UPDATE curie.factory_terminal_notices SET applied_label = :label "
         "WHERE execution_request_id = :id",
         {"id": request_id, "label": label},
@@ -121,12 +93,12 @@ def _set_applied(request_id: uuid.UUID, label: str) -> None:
 
 
 def test_0058_accepts_legacy_and_new_labels_and_downgrades_clean_rows(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """N-1 can still write a legacy name, and the new name is a successful write."""
 
-    config = _config()
-    command.upgrade(config, "head")
+    config = alembic_config()
+    isolated_migration_db.at("head")
     try:
         work_item_id, legacy_id = _seed_request(9101)
         _seed_notice(work_item_id, legacy_id, LEGACY)
@@ -156,10 +128,10 @@ def test_0058_accepts_legacy_and_new_labels_and_downgrades_clean_rows(
 
 
 def test_0058_downgrade_refuses_a_stored_new_state_label(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, "0058")
+    config = alembic_config()
+    isolated_migration_db.at("0058")
     try:
         work_item_id, request_id = _seed_request(9103)
         _seed_notice(work_item_id, request_id, NEW)

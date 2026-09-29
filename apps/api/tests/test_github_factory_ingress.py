@@ -390,7 +390,7 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
     assert len(_requests(number)) == 1
 
 
-def test_authorized_mention_waits_until_the_active_request_finishes(
+def test_authorized_issue_mention_is_queued_while_a_request_is_active(
     factory_app: tuple[TestClient, GitHubAPI],
 ) -> None:
     client, api = factory_app
@@ -403,15 +403,25 @@ def test_authorized_mention_waits_until_the_active_request_finishes(
         == "factory_admitted"
     )
     api.comment_body = f"Please revise @{MENTION}"
+    payload = _comment_event(number, api.comment_body, 7002)
+    delivery = str(uuid.uuid4())
     mention = _post(
         client,
         "issue_comment",
-        _comment_event(number, api.comment_body, 7002),
+        payload,
+        delivery=delivery,
     )
+    same = _post(client, "issue_comment", payload, delivery=delivery)
+    redelivery = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
 
     assert mention.status_code == 200, mention.text
-    assert _code(mention) == "active_request"
-    assert len(_requests(number)) == 1
+    assert mention.json()["status"] == "factory_queued", mention.text
+    assert same.json()["status"] == "factory_duplicate", same.text
+    assert redelivery.json()["status"] == "factory_duplicate", redelivery.text
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["waiting", "queued"]
+    assert rows[1]["work_item_id"] == rows[0]["work_item_id"]
+    assert rows[1]["objective"].endswith("#issuecomment-7002")
 
 
 def test_label_removal_cancels_waiting_work_and_blocks_publication(

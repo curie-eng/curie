@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 56 outputs behind one trait
+impls: 57 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 56 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 57 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -65,7 +65,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-56 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+57 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -81,7 +81,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `HookOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
-  `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`,
+  `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
@@ -126,17 +126,15 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 57 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 58 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 80 tests in `cli/tests/json_contract.rs`. Those tests
-  drive each output type's `to_json()` once per output variant rather than calling
-  the pure builder functions behind it, so a variant whose `to_json()` arm drifts
-  from the schema is caught even when the builder it delegates to still validates.
-  For the multi-variant `message` outcome the covered set is not hand-written: a
-  `syn` walk (`cli/tests/support/enum_variants.rs`) derives the variant names from
-  the enum declaration itself, so a sixth variant landing with no case turns the
-  gate red rather than passing vacuously (#955). Five of the added tests exercise
+  against real `to_json()` output across 79 tests in `cli/tests/json_contract.rs`.
+  Every `CliOutput` enum variant is also validated against its mapped schema by
+  `cli/tests/cli_output_variants.rs`. Its sample registry is checked against a
+  `syn` walk (`cli/tests/support/enum_variants.rs`) that derives enum and variant
+  names from their declarations, so an added variant without a sample turns the
+  gate red rather than passing vacuously (#965). Five tests exercise
   the walk's own rejection paths -- a source that fails to parse, a second
   declaration of the same enum, a `#[cfg]`-gated variant, and an enum inside a
   `#[cfg]`-gated module -- plus a positive control, so those rejections are now

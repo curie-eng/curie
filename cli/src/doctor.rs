@@ -3214,16 +3214,6 @@ case "$*" in
 esac
 "#;
 
-    fn write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write fake cluster executable");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .expect("read fake cluster executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
-    }
-
     /// Fake `kubectl`, `helm` and `docker` on `PATH`, plus the variables their
     /// bodies read, so `gather()` can be driven all the way through its
     /// cluster reads without a cluster.
@@ -3248,9 +3238,9 @@ esac
         /// `Facts::model_release_default` is fed from.
         fn install(computed: &str) -> Self {
             let tools = tempfile::tempdir().expect("create fake cluster tool directory");
-            write_executable(&tools.path().join("docker"), "#!/bin/sh\nexit 0\n");
-            write_executable(&tools.path().join("kubectl"), KUBECTL_STUB);
-            write_executable(&tools.path().join("helm"), HELM_STUB);
+            crate::test_executable::install(&tools.path().join("docker"), "#!/bin/sh\nexit 0\n");
+            crate::test_executable::install(&tools.path().join("kubectl"), KUBECTL_STUB);
+            crate::test_executable::install(&tools.path().join("helm"), HELM_STUB);
 
             let mut entries = vec![tools.path().to_path_buf()];
             entries.extend(std::env::split_paths(
@@ -3849,33 +3839,67 @@ esac
     /// The chart template consumes the existing Secret when one is set, so that
     /// is what the report must name. Reporting both would invite an operator to
     /// "fix" an install that is already working.
+    ///
+    /// #1253: an unquoted `githubAppId: 4475970` in a values file is a live,
+    /// GitOps-common shape, and a `as_str()`-only read called that install
+    /// credential-less. The scientific-notation form is the same value.
+    ///
+    /// The empty-string filter predates the coercion widening and must survive
+    /// it: a chart default of `""` is an unset field, not a credential.
     #[test]
-    fn clone_credential_prefers_the_existing_secret_over_inline_key_material() {
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppExistingSecret": "gh-app"}})),
-            Some("github app (secret=gh-app)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": "4475970"}})),
-            Some("github app (app_id=4475970)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubToken": "ghp_PLACEHOLDER"}})),
-            Some("personal access token".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {
-                "githubAppExistingSecret": "gh-app",
-                "githubAppId": "4475970"
-            }})),
-            Some("github app (secret=gh-app)".to_string()),
-            "the Secret path is what the chart consumes, so it wins the report"
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {}})),
-            None,
-            "nothing recorded is still nothing"
-        );
+    fn clone_credential_from_values_cases() {
+        let cases = [
+            (
+                "existing_secret",
+                json!({"api": {"githubAppExistingSecret": "gh-app"}}),
+                Some("github app (secret=gh-app)"),
+            ),
+            (
+                "string_app_id",
+                json!({"api": {"githubAppId": "4475970"}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            (
+                "personal_access_token",
+                json!({"api": {"githubToken": "ghp_PLACEHOLDER"}}),
+                Some("personal access token"),
+            ),
+            // The Secret path is what the chart consumes, so it wins the report.
+            (
+                "secret_wins_over_inline_app_id",
+                json!({"api": {
+                    "githubAppExistingSecret": "gh-app",
+                    "githubAppId": "4475970"
+                }}),
+                Some("github app (secret=gh-app)"),
+            ),
+            // Nothing recorded is still nothing.
+            ("nothing_recorded", json!({"api": {}}), None),
+            (
+                "numeric_app_id",
+                json!({"api": {"githubAppId": 4475970}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            // An integral float is the same app id, not a new one.
+            (
+                "integral_float_app_id",
+                json!({"api": {"githubAppId": 4.47597e6}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            // An empty app id is not a clone credential.
+            (
+                "empty_string_app_id",
+                json!({"api": {"githubAppId": ""}}),
+                None,
+            ),
+        ];
+        for (name, values, expected) in cases {
+            assert_eq!(
+                clone_credential_from_values(&values),
+                expected.map(String::from),
+                "{name}"
+            );
+        }
     }
 
     /// Names, never values (#1348). The Secret's KEY name is adjacent in the
@@ -3901,22 +3925,6 @@ esac
     }
 
     // -- D4: type-tolerant reads ---------------------------------------------
-
-    /// #1253: an unquoted `githubAppId: 4475970` in a values file is a live,
-    /// GitOps-common shape, and a `as_str()`-only read called that install
-    /// credential-less. The scientific-notation form is the same value.
-    #[test]
-    fn a_numeric_app_id_in_a_values_file_is_still_a_clone_credential() {
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": 4475970}})),
-            Some("github app (app_id=4475970)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": 4.47597e6}})),
-            Some("github app (app_id=4475970)".to_string()),
-            "an integral float is the same app id, not a new one"
-        );
-    }
 
     /// The issue's §4 symptom, asserted as the operator sees it: an install
     /// whose ingress is already on printed `MISS  Push delivery`, because
@@ -4027,54 +4035,27 @@ esac
 
     /// The empty-string filter predates the coercion widening and must survive
     /// it: a chart default of `""` is an unset field, not a credential.
-    #[test]
-    fn an_empty_string_value_is_still_absent() {
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": ""}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": ""}})),
-            None,
-            "an empty app id is not a clone credential"
-        );
-    }
-
+    ///
     /// Widening string|number|bool must not become "stringify anything": an
     /// array or an object at a scalar path is a shape this reader does not
     /// understand, and rendering its debug form into a detail is how structure
     /// leaks into a report.
     #[test]
-    fn a_non_scalar_value_is_absent() {
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": ["4475970"]}}),
-                &["api", "githubAppId"]
+    fn scalar_at_absent_cases() {
+        let cases = [
+            ("empty_string", json!({"api": {"githubAppId": ""}})),
+            ("array", json!({"api": {"githubAppId": ["4475970"]}})),
+            (
+                "object",
+                json!({"api": {"githubAppId": {"value": "4475970"}}}),
             ),
-            None
-        );
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": {"value": "4475970"}}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": null}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            scalar_at(&json!({"api": {}}), &["api", "githubAppId"]),
-            None,
-            "an absent path is absent"
-        );
+            ("null", json!({"api": {"githubAppId": null}})),
+            // An absent path is absent.
+            ("absent_path", json!({"api": {}})),
+        ];
+        for (name, values) in cases {
+            assert_eq!(scalar_at(&values, &["api", "githubAppId"]), None, "{name}");
+        }
     }
 
     // -- D5: helm-missing, could-not-answer and absent are distinguishable ----
@@ -4635,49 +4616,42 @@ esac
     }
 
     /// An absent release is still unready. Optional Slack must not paper over
-    /// a platform that is not there.
+    /// a platform that is not there. helm/kubectl not answering is an
+    /// unavailable cluster API, not optional Slack. `ready` must stay false.
     #[test]
-    fn an_absent_release_stays_unready_when_slack_is_unset() {
-        let f = Facts {
-            slack_app_token: false,
-            slack_bot_token: false,
-            release: ReleaseProbe::NotInstalled,
-            ..wired()
-        };
-        let checks = evaluate(&f);
-        let out = DoctorOutput {
-            summary: summary(&checks),
-            checks,
-        };
-        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
-        assert!(
-            !out.summary.contains("cluster message"),
-            "do not point at cluster message when there is no release: {}",
-            out.summary
-        );
-    }
-
-    /// helm/kubectl not answering is an unavailable cluster API, not optional
-    /// Slack. `ready` must stay false.
-    #[test]
-    fn a_failed_release_probe_stays_unready_when_slack_is_unset() {
-        let f = Facts {
-            slack_app_token: false,
-            slack_bot_token: false,
-            release: ReleaseProbe::ProbeFailed,
-            ..wired()
-        };
-        let checks = evaluate(&f);
-        let out = DoctorOutput {
-            summary: summary(&checks),
-            checks,
-        };
-        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
-        assert!(
-            !out.summary.contains("no way to be reached"),
-            "{}",
-            out.summary
-        );
+    fn an_unserving_release_stays_unready_when_slack_is_unset() {
+        let cases = [
+            // Do not point at cluster message when there is no release.
+            (
+                "absent_release",
+                ReleaseProbe::NotInstalled,
+                "cluster message",
+            ),
+            (
+                "failed_release_probe",
+                ReleaseProbe::ProbeFailed,
+                "no way to be reached",
+            ),
+        ];
+        for (name, release, forbidden) in cases {
+            let f = Facts {
+                slack_app_token: false,
+                slack_bot_token: false,
+                release,
+                ..wired()
+            };
+            let checks = evaluate(&f);
+            let out = DoctorOutput {
+                summary: summary(&checks),
+                checks,
+            };
+            assert_eq!(
+                out.to_json()["ready"],
+                serde_json::Value::Bool(false),
+                "{name}"
+            );
+            assert!(!out.summary.contains(forbidden), "{name}: {}", out.summary);
+        }
     }
 
     // -- D6b: curie.yaml precedence ------------------------------------------

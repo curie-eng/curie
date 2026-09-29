@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import sys
 import uuid
-from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+import curie_worker.binding as binding_module
+from aci_protocol import Final, SessionStatus, TextDelta
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -25,6 +26,12 @@ from curie_worker.binding import (
 from curie_worker.config import WorkerConfig
 from curie_worker.killswitch import kill_key
 from curie_worker.reply_sink import TargetRoute
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -51,10 +58,9 @@ class StubBinding:
     async def resolve(
         self, kind: str, adapter: str | None, address: str
     ) -> ResolvedDeployment | None:
-        # Canned per-pair, like the real resolver under migration 0023's pair
-        # constraint: at most one row can be bound per pair, so there is only
-        # one identity to answer with. `adapter` is accepted (the real
-        # signature, ADR-0168 decision 3) and unused here for the same reason.
+        # Canned per-pair: every case here binds one route per pair, so there
+        # is only one identity to answer with. `adapter` is accepted (the real
+        # signature, ADR-0168 decision 3) and unused here for that reason.
         return self._by_route.get((kind, address))
 
     async def undeployed_binding(self, kind: str, adapter: str | None, address: str) -> Any | None:
@@ -120,36 +126,6 @@ def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> R
         max_usd_per_day=None,
         max_output_tokens_per_run=None,
     )
-
-
-def _qevent(
-    text: str,
-    *,
-    channel: str,
-    thread: str = "th-1",
-    placeholder: str = "p-1",
-    kind: str = "slack",
-    adapter: str | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind=kind, channel=channel, placeholder=placeholder, adapter=adapter
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 def test_unmapped_channel_is_a_polite_drop(make_harness) -> None:
@@ -842,5 +818,44 @@ def test_disabled_greeting_pack_never_short_circuits(make_harness) -> None:
             assert h.sink.last_text == "MODEL"
             assert len(h.fake_k8s.claim_envs) == 1
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_a_routeless_turn_two_agents_bind_is_dropped_without_a_run_or_a_reply(
+    make_harness, caplog
+) -> None:
+    """ADR-0168 decision 3: the resolver refuses an omitted non-Slack adapter
+    whose pair two agents bind, and the kernel runs it under no deployment.
+
+    No reply either: the only routes on the pair belong to agents the turn may
+    not be from, so any reply would be a guess at who should hear it.
+    """
+
+    first, second = uuid.uuid4(), uuid.uuid4()
+
+    class AmbiguousBinding(StubBinding):
+        async def resolve(
+            self, kind: str, adapter: str | None, address: str
+        ) -> ResolvedDeployment | None:
+            raise binding_module.AmbiguousRoute(kind, address, [first, second])
+
+    async def go() -> None:
+        async with make_harness(binding=AmbiguousBinding({})) as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            ev = _qevent("hello", channel="ops@example.com", kind="email")
+            with caplog.at_level(logging.ERROR, logger="curie_worker.kernel"):
+                await h.kernel.process_event(ev)
+
+            assert h.runner.opened == []
+            assert h.sink.last_text is None
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert any(
+                record.levelno == logging.ERROR
+                and ev.event_id in record.message
+                and str(first) in record.message
+                and str(second) in record.message
+                for record in caplog.records
+            ), caplog.records
 
     asyncio.run(go())

@@ -203,12 +203,19 @@ pub struct ConnectorManifests {
 /// a Slack binding stored with none reads back `"default"`, a non-Slack binding
 /// reads its adapter slug or `null` when no route is configured. `#[serde(default)]`
 /// keeps a platform that predates the field parsing to `None`.
+///
+/// `allowed_callers` is who may talk to the bot through this binding (ADR 0175):
+/// `None` means everyone, which is also what a platform that predates the field
+/// reads as. Skipped when serializing a `None`, so no request built from this
+/// struct can send a key the binding write models refuse.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
     pub address: String,
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 /// The identity every Slack binding had before ADR-0168: the installation's one
@@ -1042,7 +1049,7 @@ pub struct WorkItemRequest {
     pub sequence: u64,
     pub status: String,
     pub created_at: String,
-    pub wait_deadline: String,
+    pub wait_deadline: Option<String>,
     pub started_at: Option<String>,
     pub execution_deadline: Option<String>,
     pub terminal_at: Option<String>,
@@ -1600,8 +1607,7 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
 /// A binding write the platform refused over the identity it names.
 ///
 /// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
-/// identity, or a database that cannot yet store one), so it is carried
-/// verbatim rather than restated.
+/// identity, for instance), so it is carried verbatim rather than restated.
 fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
     let detail = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1649,13 +1655,11 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
 /// it speaks through. Pure so the shape is testable without a live API. The
 /// kind is never inferred -- a channel-neutral binding carries it explicitly.
 ///
-/// `adapter` alone (no `endpoint`) names a Slack identity (ADR-0168 decision
-/// 3): Slack is an in-process ingress, so it has no transport to configure.
-/// `endpoint` and `adapter` together are the pre-ADR custom-transport form,
-/// still both-or-neither for a non-Slack ingress -- `ChannelChange::resolve`
-/// refuses a non-Slack `adapter` with no `endpoint` before this function ever
-/// sees the arguments, and clap's `--endpoint` `requires` `--adapter` covers
-/// the other direction.
+/// `adapter` alone names a Slack identity (ADR-0168 decision 3); a non-Slack
+/// route sends `endpoint` and `adapter` together. `ChannelChange::resolve`
+/// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
+/// before this function ever sees the arguments, and clap's `--endpoint`
+/// `requires` `--adapter` covers the other direction.
 fn add_channel_body(
     kind: &str,
     address: &str,
@@ -2251,6 +2255,46 @@ impl ApiClient {
             .context("DELETE /agents/{id}/channels")?;
         Self::expect_ok(resp, "removing the channel binding").await?;
         Ok(())
+    }
+
+    /// Set or clear one binding's caller list:
+    /// `PUT /agents/{id}/channels/callers?kind=&address=[&adapter=]` (ADR 0175).
+    ///
+    /// `callers` of `None` sends an explicit JSON `null`, which clears the list
+    /// so everyone may talk to the bot again; a list replaces the stored one
+    /// whole. The API checks the entries against the binding's kind and answers
+    /// the agent as stored, so the caller reports what took rather than what it
+    /// sent. This write does not bump the binding generation, so it never
+    /// revokes an adapter's channel token.
+    pub async fn set_channel_callers(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+        adapter: Option<&str>,
+        callers: Option<&[String]>,
+    ) -> Result<Agent> {
+        let mut query = vec![("kind", kind), ("address", address)];
+        if let Some(adapter) = adapter {
+            query.push(("adapter", adapter));
+        }
+        let resp = self
+            .http
+            .put(format!(
+                "{}/agents/{agent_id}/channels/callers",
+                self.base_url
+            ))
+            .query(&query)
+            .header("X-API-Key", &self.api_key)
+            .json(&serde_json::json!({ "allowed_callers": callers }))
+            .send()
+            .await
+            .context("PUT /agents/{id}/channels/callers")?;
+        Self::expect_ok(resp, "setting the surface's caller list")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent after the caller list write")
     }
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
@@ -3630,7 +3674,7 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
         mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY, MAX_OBSERVABILITY_METRIC_POINTS,
+        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3770,10 +3814,6 @@ mod tests {
         let error = prevalidate_series_span("hour", Some("1970-01-01T00:00:00Z"), None)
             .expect_err("a start of 1970 with no end exceeds the cap against now");
         assert!(error.to_string().contains("now"));
-        assert_eq!(
-            MAX_OBSERVABILITY_METRIC_POINTS, 1000,
-            "the pre-dispatch guard and the post-dispatch bound share one cap"
-        );
     }
 
     #[test]
@@ -3877,9 +3917,8 @@ mod tests {
     }
 
     #[test]
-    fn add_channel_body_keeps_the_custom_transport_form() {
-        // The pre-ADR non-Slack form is unchanged: endpoint and adapter still
-        // travel together.
+    fn add_channel_body_sends_a_non_slack_route_whole() {
+        // A non-Slack route's endpoint and adapter travel together.
         assert_eq!(
             add_channel_body(
                 "discord",
@@ -3925,6 +3964,7 @@ mod tests {
             kind: kind.into(),
             address: "C0EXAMPLE1".into(),
             adapter: adapter.map(str::to_string),
+            allowed_callers: None,
         };
         assert_eq!(binding("slack", Some("default")).named_adapter(), None);
         assert_eq!(

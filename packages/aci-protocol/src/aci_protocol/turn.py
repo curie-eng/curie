@@ -96,8 +96,8 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
     """The identity a route's ``adapter`` names (ADR-0168 decision 3).
 
     A Slack route with no adapter predates the identity: a handle still queued
-    across the upgrade, an approval row decision 5 has not backfilled, a write
-    from an API pod that has not rolled. It means the default app, so every
+    across the upgrade, or a row written by an API pod that has not rolled
+    (migration 0069 backfills every row stored before it). It means the default app, so every
     reader compares identities through this function and never on the raw
     column. ``CLUSTER_MESSAGE_ADAPTER`` on a Slack route is a delivery
     selector, not an identity, so it is the default too. Any other kind is
@@ -115,33 +115,31 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
 def slack_speaking_identity(kind: str, adapter: str | None, endpoint: str | None) -> str:
     """The identity whose bot token a route's Slack calls carry (ADR-0168 decision 5).
 
-    A Slack route with an endpoint is the pre-ADR custom-transport form, whose
-    ``adapter`` is a credential slug and not an identity (see
-    ``matching_routes``), so it keeps ``DEFAULT_IDENTITY``. So does any other
-    kind: its ``adapter`` names that kind's egress adapter, never a Slack app.
-    Every other Slack route speaks as ``route_identity`` resolves it. This is
-    not a wire field; the worker and the API each call it on the route they
-    already hold.
+    A Slack route speaks as ``route_identity`` resolves it. Its ``endpoint``,
+    when set, is a per-turn Slack origin (a CLI stub turn's), never a
+    credential selector, so it does not change the answer. Any other kind
+    keeps ``DEFAULT_IDENTITY``: its ``adapter`` names that kind's egress
+    adapter, never a Slack app. This is not a wire field; the worker and the
+    API each call it on the route they already hold.
     """
 
-    if kind != SLACK_KIND or endpoint:
+    if kind != SLACK_KIND:
         return DEFAULT_IDENTITY
     return route_identity(SLACK_KIND, adapter) or DEFAULT_IDENTITY
 
 
 class RouteRow(Protocol):
-    """The four columns ``matching_routes`` reads off a candidate row.
+    """The three columns ``matching_routes`` reads off a candidate row.
 
     Structural on purpose: an ORM row (`apps/api`'s ``AgentChannel``), a raw
     SQLAlchemy ``Row`` from a labeled SELECT, or any other object exposing
-    these four attributes satisfies it, so the one matching rule can run over
+    these three attributes satisfies it, so the one matching rule can run over
     whichever shape its caller already holds.
     """
 
     kind: str
     address: str
     adapter: str | None
-    endpoint: str | None
 
 
 def matching_routes[R: RouteRow](
@@ -158,10 +156,9 @@ def matching_routes[R: RouteRow](
     For Slack, ``adapter`` names an IDENTITY and the match is on the RESOLVED
     identity (``route_identity``), never the raw column, so an omitted
     adapter means 'default'. For any other kind, an omitted adapter selects
-    every row on ``(kind, address)`` -- migration 0023's pair constraint holds
-    that to one row until the contract migration for ADR-0168 decision 3
-    (#3100), so a caller narrowing to one row sees at most one, and a
-    non-Slack ``adapter=other`` selects none.
+    every row on ``(kind, address)`` -- the triple key (migration 0069) lets
+    several routes share a pair, and a caller that needs one row narrows
+    further -- and a non-Slack ``adapter=other`` selects none.
     """
 
     if kind == SLACK_KIND and adapter == CLUSTER_MESSAGE_ADAPTER:
@@ -170,22 +167,11 @@ def matching_routes[R: RouteRow](
         adapter = None
     wanted = route_identity(kind, adapter)
     same_route = [r for r in rows if r.kind == kind and r.address == address]
-    matches = [
+    return [
         r
         for r in same_route
         if (adapter is None and kind != SLACK_KIND) or route_identity(r.kind, r.adapter) == wanted
     ]
-    if not matches and kind == SLACK_KIND and adapter is None:
-        # The pre-ADR custom-transport Slack binding (e.g. the offline
-        # hook-approval proof rig) stores a
-        # CREDENTIAL slug in `adapter`, not an identity, so it never matches
-        # the 'default' identity above. Its old callers never send `adapter`
-        # either, so the omitted-adapter selector falls back to the one row
-        # on this pair that carries an endpoint. Retired by the contract
-        # migration for ADR-0168 decision 3 (#3100), which refuses a Slack
-        # endpoint outright.
-        matches = [r for r in same_route if r.endpoint is not None]
-    return matches
 
 
 class ReplyHandle(_AciModel):

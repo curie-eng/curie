@@ -66,7 +66,15 @@ class HistoryAppendError(HistoryError):
 
 
 class HistoryCapacityError(HistoryAppendError):
-    """The state API refused a transcript append because a byte cap was reached."""
+    """The state API refused a transcript append because a byte cap was reached.
+
+    ``detail`` names the cap and the turn's size when the runner itself refused
+    a turn that cannot be bounded (#3301), so the run's failure says why.
+    """
+
+    def __init__(self, status: int, detail: str | None = None) -> None:
+        super().__init__(status)
+        self.detail = detail
 
 
 class HistoryConflictError(HistoryAppendError):
@@ -586,8 +594,9 @@ def bound_turn_record(
 
     irreducible_size = _state_value_size(raw)
     raise HistoryError(
-        "history turn cannot fit without dropping portable message roles or order: "
-        f"minimum value is {irreducible_size} bytes, cap is {max_value_bytes} bytes"
+        f"history turn cannot fit: one turn is {irreducible_size} bytes after compaction, over the "
+        f"{max_value_bytes}-byte turn bound of the per-thread transcript cap "
+        "(raise api.transcriptMaxThreadBytes)"
     )
 
 
@@ -859,8 +868,8 @@ class StateApiTranscriptStore:
                         record,
                         max_value_bytes=self._max_value_bytes - HISTORY_APPEND_RESERVE_BYTES,
                     )
-                except HistoryError:
-                    raise HistoryCapacityError(413) from None
+                except HistoryError as exc:
+                    raise HistoryCapacityError(413, str(exc)) from None
             item = record.to_dict()
             status = await self._post(session, item)
             if status in (200, 201):

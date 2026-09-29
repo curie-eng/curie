@@ -78,10 +78,12 @@ class ApprovalCardRef:
     may not even share a transport with), so the settle path must re-use the
     whole destination rather than rebuild two thirds of it from the resume turn.
     ``kind`` is the discriminator for a pre-upgrade entry: ``""`` means the
-    destination was never recorded, and the kernel falls back to the resume
-    turn's kind and route exactly as it did before. A non-empty ``kind`` means
-    the triple is authoritative, and ``adapter=None`` there means the worker's
-    default transport for that kind rather than "unknown".
+    destination kind and identity were never recorded. The kernel falls back to
+    the resume turn's kind, but keeps the historical default transport identity:
+    those cards predate identity-aware routes and were posted by that default.
+    A non-empty ``kind`` means the triple is authoritative, and ``adapter=None``
+    there means the worker's default transport for that kind rather than
+    "unknown".
     """
 
     channel: str

@@ -61,6 +61,7 @@ dev = [
     "curie-test-support",
     "pytest>=8.3",
     "pytest-xdist>=3.6",
+    "pytest-rerunfailures>=15.0",
     "ruff>=0.16.2",
     "mypy>=2.3.0",
     "import-linter>=2.0",
@@ -185,8 +186,10 @@ testpaths = [
     "apps/worker/tests",
     "runner/tests",
     "compose/tests",
+    "charts/curie/ci",
     "release/tests",
     "examples/tests",
+    "examples/sre-bot/observability/alert-signer",
     # The two source-built SRE-bot connectors (tempo and self-upgrade) are built
     # by CI and published by release.yaml, but each
     # ships its own test_server.py outside every collection root above -- so
@@ -200,14 +203,13 @@ testpaths = [
     "tools/e2e-ci-selection/tests",
     "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
-    "tools/fix-pin-ci/tests",
     "tools/close-on-next/tests",
     "tools/p0-closes-ci/tests",
-    "tools/xdist-characterise/tests",
     "tools/ci-release-target-parity/tests",
     "tools/restore-drill/tests",
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
+    "tools/runtime-assertion-gate/tests",
 ]
 
 [tool.ruff]
