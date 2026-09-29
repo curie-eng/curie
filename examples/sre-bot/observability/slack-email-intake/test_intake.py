@@ -7,6 +7,8 @@ import hmac
 import importlib.util
 import json
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -315,6 +317,36 @@ def test_hook_client_signs_exact_body_and_rejects_a_detached_receipt(
             placeholder="reply-ts",
             delivery_id="delivery-id",
         )
+
+
+# @spec SRE-EMAIL-3
+def test_slack_bearer_redirect_never_leaves_slack(intake: ModuleType) -> None:
+    request = urllib.request.Request(
+        "https://files.slack.com/files-pri/T-F/alert.html",
+        headers={"Authorization": "Bearer secret"},
+    )
+    redirect = intake.SlackRedirectHandler()
+
+    with pytest.raises(urllib.error.HTTPError, match="outside slack.com"):
+        redirect.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://attacker.example/collect",
+        )
+
+    allowed = redirect.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://downloads.slack.com/files-pri/T-F/alert.html",
+    )
+    assert allowed is not None
+    assert allowed.get_header("Authorization") == "Bearer secret"
 
 
 # @spec SRE-EMAIL-3
