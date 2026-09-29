@@ -118,9 +118,7 @@ def _read_only_bash(action: dict[str, Any]) -> bool:
     return any(re.fullmatch(pattern, command.strip()) for pattern in _READ_ONLY_COMMANDS)
 
 
-def render_receipt(
-    actions: list[dict[str, Any]], mode: TurnReceiptMode = "all"
-) -> str | None:
+def render_receipt(actions: list[dict[str, Any]], mode: TurnReceiptMode = "all") -> str | None:
     """One line per action, or None when the turn changed nothing.
 
     Most turns are reads, and a receipt on every one of them is noise. This
