@@ -104,6 +104,99 @@ class TestExtractSignatures:
         assert first.signature_id == second.signature_id
 
 
+def stamp(log: str, start: str = "2026-09-27T12:43:03") -> str:
+    """Prefix every line the way the Actions job-logs API does (#3365)."""
+    lines = log.split("\n")
+    return "\n".join(
+        f"{start}.{index:07d}Z {line}" for index, line in enumerate(lines)
+    )
+
+
+REFUSAL_LINES = (
+    "  Error: refusing to recreate curie-demo: directory exists and is not empty\n"
+    "  Error: refusing to overwrite curie-demo\n"
+)
+TRACE_ASSERTION = "AssertionError: healthy trace {} contains an ERROR span\n"
+
+
+def signature_of(log: str, name: str = "job") -> object:
+    return nightly.extract_signatures(
+        [{"name": name, "conclusion": "failure", "log": log}]
+    )[0]
+
+
+class TestTimestampedLogs:
+    def test_fake_model_failure_after_banner_beats_the_banner(self) -> None:
+        log = (
+            SKILL_UP_LOG
+            + "AssertionError: expected a new end-to-end trace after the "
+            "before snapshot; span names=['GET /v1.48/info']\n"
+            "\n=== teardown: curie local down ===\n"
+            "##[error]Process completed with exit code 1.\n"
+        )
+        sig = signature_of(stamp(log))
+        assert sig.text.startswith("AssertionError: expected a new end-to-end trace")
+        assert "skill up" not in sig.text.lower()
+        assert "2026-09-27" not in sig.text
+
+    def test_indented_refusal_lines_before_the_banner_never_win(self) -> None:
+        log = (
+            REFUSAL_LINES
+            + SKILL_UP_LOG
+            + "AssertionError: expected a new end-to-end trace\n"
+            + "\n=== teardown: curie local down ===\n"
+        )
+        sig = signature_of(stamp(log))
+        assert sig.text == "AssertionError: expected a new end-to-end trace"
+
+    def test_live_model_log_ignores_indented_refusal_lines(self) -> None:
+        log = (
+            REFUSAL_LINES
+            + "AssertionError: expected a new end-to-end trace\n"
+            + "\n=== teardown: curie local down ===\n"
+        )
+        sig = signature_of(stamp(log))
+        assert sig.text == "AssertionError: expected a new end-to-end trace"
+
+    def test_refusal_lines_alone_are_not_recognized(self) -> None:
+        sig = signature_of(stamp(REFUSAL_LINES))
+        assert "no recognized error line" in sig.text
+
+    def test_different_timestamps_share_a_signature_id(self) -> None:
+        log = SKILL_UP_LOG + "AssertionError: expected a new end-to-end trace\n"
+        first = signature_of(stamp(log, "2026-09-27T12:43:03"), "a")
+        second = signature_of(stamp(log, "2026-09-28T03:01:59"), "b")
+        assert first.signature_id == second.signature_id
+
+    def test_trace_ids_are_normalized_out_of_the_signature(self) -> None:
+        first = signature_of(
+            stamp(TRACE_ASSERTION.format("3a7ea1dac34c99c379f5d9b7f4f1dd5a"))
+        )
+        second = signature_of(
+            stamp(TRACE_ASSERTION.format("04c420dff81bbdfc4fcc7101a70291ee"))
+        )
+        assert "<id>" in first.text
+        assert "3a7ea1dac34c99c3" not in first.text
+        assert first.signature_id == second.signature_id
+
+    def test_cli_diagnostic_line_is_recognized(self) -> None:
+        log = (
+            "  Error: refusing to recreate curie-demo: directory exists\n"
+            "✗ error [model-credit-exhausted]: model error: unknown: "
+            "API Error: 402 insufficient credits\n"
+            "##[error]Process completed with exit code 1.\n"
+        )
+        sig = signature_of(stamp(log))
+        assert "model-credit-exhausted" in sig.text
+        assert "no recognized error line" not in sig.text
+
+    def test_known_pattern_matches_the_same_with_timestamps(self) -> None:
+        plain = signature_of(DISPATCHER_LOG)
+        stamped = signature_of(stamp(DISPATCHER_LOG))
+        assert stamped.text == plain.text
+        assert stamped.signature_id == plain.signature_id
+
+
 class TestPlanIssueActions:
     def test_unknown_signature_is_created(self) -> None:
         signatures = nightly.extract_signatures(
