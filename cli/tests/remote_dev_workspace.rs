@@ -49,6 +49,7 @@ fn deploy_response(req: &support::Request, existing: ExistingAgent) -> Response 
             };
             Response::json(200, &agents.to_string())
         }
+        ("GET", "/deployments?agent_id=agent-acme-bot") => Response::json(200, "[]"),
         ("POST", "/agents") => {
             let body: Value = serde_json::from_slice(&req.body).expect("agent body is JSON");
             let repo = body.get("repo_full_name").and_then(Value::as_str);

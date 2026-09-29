@@ -3191,8 +3191,9 @@ enum ClusterAction {
         /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
-        /// Target environment. Defaults to dev; a `--target` supplies it
-        /// instead, and an explicit value here still wins over the target.
+        /// Target environment. Infers the sole active deployment on redeploy,
+        /// or defaults to dev on a first deploy. A `--target` supplies it
+        /// instead, and an explicit value wins over the target.
         #[arg(long, value_enum)]
         env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
