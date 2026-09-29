@@ -555,7 +555,7 @@ Every key is built by a `WorkerConfig` helper under `key_prefix`
 | Key | Type | Holds |
 |---|---|---|
 | `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
-| `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` the sweeper reads. |
+| `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` its scripts and the sweeper read. |
 | `<key_prefix>:progress:pending` | set | The index of pending delivery ids, so the sweeper never scans the keyspace. |
 | `<key_prefix>:progress:chain:{event_id}` | string | The `pid` an approval resume event continues. |
 
@@ -671,8 +671,8 @@ read at delivery time rather than stored in the edit.
 - `sweep_pending_progress` is bounded: it samples at most 64 members, stops
   after 30 seconds, and bounds each delivery by the time left. For each member:
   - a malformed record is quarantined: its index membership is removed, the
-    payload is left for inspection until it expires, and an ERROR is logged, so
-    one bad record cannot crash-loop the tick;
+    payload is left in place for an operator to inspect, and an ERROR is
+    logged, so one bad record cannot crash-loop the tick;
   - a member whose delivery has expired or been cleared is dropped from the
     index;
   - a delivery that has used its 5 attempts (`PROGRESS_MAX_ATTEMPTS`) is

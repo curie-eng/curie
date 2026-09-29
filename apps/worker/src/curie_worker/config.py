@@ -1313,6 +1313,24 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
+    def progress_key(self, progress_id: str) -> str:
+        # One logical turn chain's progress record (ADR 0130); see the worker
+        # README's "Deliberate progress" section for its fields and expiry.
+        return f"{self.key_prefix}:progress:{progress_id}"
+
+    def progress_delivery_key(self, delivery_id: str) -> str:
+        # One pending progress delivery, keyed by its derived reply-wire id.
+        return f"{self.key_prefix}:progress:delivery:{delivery_id}"
+
+    def progress_pending_key(self) -> str:
+        # The progress sweep index: a SET, for the reason completions_pending_key
+        # gives.
+        return f"{self.key_prefix}:progress:pending"
+
+    def progress_chain_key(self, event_id: str) -> str:
+        # The pointer an approval resume event follows back to its chain's record.
+        return f"{self.key_prefix}:progress:chain:{event_id}"
+
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation
         # (#2374), shared by every replica in that installation. Standalone and

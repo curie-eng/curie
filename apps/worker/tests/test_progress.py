@@ -24,7 +24,7 @@ The API this file pins, for the implementer of ``progress.py``:
       .ack(delivery_id, *, generation, card_ref=None) -> bool
       .pending(limit) -> set[str]
       .read_delivery(delivery_id) -> StoredProgressDelivery | None
-      .charge_attempt / .dead_letter / .quarantine / .drop_pending_member
+      .charge_attempt / .dead_letter / .drop_pending_member
 
     sweep_pending_progress(store, *, deliver, batch, budget_s, grace_s,
                            max_attempts) -> ProgressSweep
@@ -890,7 +890,7 @@ def test_ack_clears_only_its_own_generation(names) -> None:  # noqa: ANN001
             # The chain expires and a redelivered root reopens it: the same
             # delivery id is written again, under a new generation.
             await client.delete(config.progress_key(pid), config.progress_delivery_key(card_id))
-            await store.open_chain(_THREAD, _ROOT)
+            await store.open_chain(_THREAD, _ROOT, answer_ref="1700000000.000200")
             await _model(store, pid, _command("u1"), seq=1)
             rewritten = await store.read_delivery(card_id)
             assert rewritten is not None
