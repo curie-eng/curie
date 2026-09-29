@@ -715,6 +715,17 @@ def _escalation_text(
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
 
+# Start-refusal codes that mean the work item settled terminally, so the
+# execution is over and the delivering worker is the only one that can release
+# the sandbox claim it just made (#3208). ``not_dispatchable`` is excluded on
+# purpose: it also covers a lapsed acquire lease, where a replacement consumer
+# re-acquires the same generation and adopts this thread's route, so the claim
+# must survive the refusal. The passthrough set is defined by the API's
+# ``_map_start_conflict``; keep the two in sync.
+_WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
+    {"work_item_cancelled", "waiting_deadline_elapsed", "not_found"}
+)
+
 # A factory execute turn that ends done or idle without calling publish_changes
 # is re-prompted once in the same session (#3128). The progress tool's canonical
 # spelling is runner/src/curie_runner/approval.py ``PROGRESS_TOOL_NAME``; the
@@ -2904,6 +2915,25 @@ class Kernel:
                         event_id,
                         exc.code,
                     )
+                    if exc.code in _WORK_ITEM_TERMINAL_START_REFUSALS:
+                        # #3208: the request settled before a turn opened, so
+                        # this delivery is the only one that can release the
+                        # claim it made. A request cancelled from ``waiting``
+                        # gets no terminate wake and carries no teardown flag,
+                        # so without this the claim holds quota until the
+                        # route TTL lapses. Marking the run finished hands the
+                        # release to the existing finally block.
+                        # ``not_dispatchable`` is deliberately excluded: it can
+                        # mean a lapsed acquire lease, where a replacement
+                        # re-acquires the same generation and adopts this
+                        # thread's route, so the claim must stay standing.
+                        run = (
+                            self._work_item_runs.get(owned_work_item_id)
+                            if owned_work_item_id is not None
+                            else None
+                        )
+                        if run is not None:
+                            run.finished = True
                     return
                 except ThreadBusyError as busy:
                     run = (
@@ -3976,6 +4006,13 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
+                if exc.code == "work_item_cancelled":
+                    # #3208: the request is already settled as cancelled, so
+                    # nothing will ever accept a marker or a finish. Count the
+                    # run as settled locally so this delivery releases its
+                    # sandbox claim now instead of holding quota until the
+                    # terminate-wake backstop catches up.
+                    run.finished = True
                 return
         elif run is not None and not run.started:
             try:
