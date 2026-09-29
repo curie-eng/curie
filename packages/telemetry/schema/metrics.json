@@ -1284,7 +1284,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4520
+      "cardinality_bound": 4560
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1432,7 +1432,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4520
+      "cardinality_bound": 4560
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1573,7 +1573,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 904
+      "cardinality_bound": 912
     },
     "curie.background.loop": {
       "type": "counter",
