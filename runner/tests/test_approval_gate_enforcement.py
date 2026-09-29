@@ -808,6 +808,10 @@ def _options_from_boot(
     *,
     workspace_path: Path | None = None,
 ) -> Any:
+    # This suite verifies approval composition, not eligibility. Make its
+    # formerly implicit human-Slack boot explicit; default-off is pinned in
+    # test_harness_boot_wiring.py.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, workspace_path=workspace_path)
     session = runner._factory()

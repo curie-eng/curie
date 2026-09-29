@@ -76,7 +76,7 @@ from curie_worker.progress import (
     sweep_pending_progress_inboxes,
 )
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.turn_progress import TurnProgressPlan, deactivate_turn_progress
+from curie_worker.turn_progress import ProgressPump, TurnProgressPlan, deactivate_turn_progress
 from pydantic import TypeAdapter
 from redis.asyncio import Redis as AsyncRedis
 
@@ -289,9 +289,15 @@ def test_turn_generation_is_durable_monotonic_and_fenced(names) -> None:  # noqa
             assert (record.turn_generation, record.active_generation) == (1, 1)
             now_ms = int(time.time() * 1000)
             assert now_ms < record.active_until_ms
-            assert record.active_until_ms <= now_ms + int(
-                (config.runner_total_timeout_s + 31) * 1000
-            )
+            assert record.active_until_ms <= now_ms + 5_100
+
+            first_deadline = record.active_until_ms
+            await asyncio.sleep(0.01)
+            assert await first.renew_turn(pid, 1)
+            renewed = await first.read(pid)
+            assert renewed is not None
+            assert renewed.active_until_ms > first_deadline
+            assert not await first.renew_turn(pid, 999)
 
             # A new store models a worker restart. The next generation comes
             # from Valkey, not a process clock or process-local counter.
@@ -316,7 +322,8 @@ def test_failed_deactivation_leaves_only_a_bounded_active_generation(names) -> N
             raise ConnectionError("Valkey unavailable at turn close")
 
     async def go() -> None:
-        async with _store(names) as (store, config, _client):
+        async with _store(names) as (_store_default, config, client):
+            store = ProgressStore(client, config, active_lease_ms=50)
             pid = await store.open_chain(_THREAD, _ROOT)
             generation = await store.begin_turn(pid)
             plan = TurnProgressPlan(
@@ -332,7 +339,52 @@ def test_failed_deactivation_leaves_only_a_bounded_active_generation(names) -> N
             assert record is not None
             assert record.active_generation == generation
             remaining_ms = record.active_until_ms - int(time.time() * 1000)
-            assert 0 < remaining_ms <= int((config.runner_total_timeout_s + 30) * 1000)
+            assert 0 < remaining_ms <= 50
+            await asyncio.sleep(0.075)
+            assert not await store.renew_turn(pid, generation)
+            expired = await store.read(pid)
+            assert expired is not None
+            assert expired.active_until_ms <= int(time.time() * 1000)
+
+    asyncio.run(go())
+
+
+def test_the_live_pump_renews_its_generation_until_stopped() -> None:
+    """@spec ADR-0130 d1: only the live owner keeps ingress authority alive."""
+
+    class _RenewingStore:
+        def __init__(self) -> None:
+            self.renewals: list[tuple[str, int]] = []
+
+        async def renew_turn(self, progress_id: str, generation: int) -> bool:
+            self.renewals.append((progress_id, generation))
+            return True
+
+        async def read_inbox(self, progress_id: str, *, after: str, count: int):  # noqa: ANN201
+            del progress_id, after, count
+            return []
+
+        async def release_inbox_if_drained(self, progress_id: str) -> bool:
+            del progress_id
+            return True
+
+    async def go() -> None:
+        store = _RenewingStore()
+        pump = ProgressPump(
+            store,  # type: ignore[arg-type]
+            progress_id="pid",
+            generation=7,
+            route=_ROUTE,
+            target=lambda: _TARGET,
+            render=False,
+            cursor="",
+            interval_s=0.01,
+        )
+        pump.start()
+        await asyncio.sleep(0.035)
+        await pump.stop()
+        assert len(store.renewals) >= 2
+        assert set(store.renewals) == {("pid", 7)}
 
     asyncio.run(go())
 

@@ -26,8 +26,9 @@ from aci_protocol import Final, SessionStatus, TextDelta, TurnSource
 from curie_worker import sandbox_token
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel import _boots_differently, _thread_key_for
 from curie_worker.progress import ProgressStore, progress_id_for, sweep_pending_progress
+from curie_worker.sandbox.types import SandboxHandle
 from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -146,6 +147,9 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
                 env is not None and env.get(ELIGIBILITY_ENV) == "1"
                 for env in h.fake_k8s.claim_envs
             )
+            route_record = h.substrate._affinity.get(_thread_key_for(ev))  # noqa: SLF001
+            assert route_record is not None
+            assert route_record.handle.carries_turn_progress
 
     asyncio.run(go())
 
@@ -174,6 +178,9 @@ def test_an_ineligible_turn_carries_no_capability(make_harness, overrides: dict[
             )
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
             assert await ProgressStore(h.async_redis, h.config).read(progress_id) is None
+            route_record = h.substrate._affinity.get(_thread_key_for(ev))  # noqa: SLF001
+            assert route_record is not None
+            assert not route_record.handle.carries_turn_progress
 
     asyncio.run(go())
 
@@ -531,3 +538,31 @@ def test_eligibility_is_a_persons_slack_turn_only() -> None:
         ),
     )
     assert not progress_eligible(targetless, factory_work_item=False)
+
+
+@pytest.mark.parametrize(
+    ("booted", "requested", "must_replace"),
+    [
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_warm_sandbox_adoption_fences_progress_eligibility_in_both_directions(
+    booted: bool, requested: bool, must_replace: bool
+) -> None:
+    """@spec ADR-0130 d1: model-surface eligibility is immutable per sandbox boot."""
+
+    handle = SandboxHandle(
+        thread_key="slack:C0EXAMPLE1:t",
+        claim_name="claim",
+        sandbox_name="sandbox",
+        namespace="curie",
+        service_fqdn="sandbox.curie.svc",
+        port=8080,
+        session_id="session",
+        carries_turn_progress=booted,
+    )
+    env = {ELIGIBILITY_ENV: "1"} if requested else {}
+    assert _boots_differently(handle, env) is must_replace

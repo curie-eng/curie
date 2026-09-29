@@ -334,6 +334,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
+        # sandbox boot fact is instead frozen across both declaration sites by
+        # tests/vectors/turn-progress-capability.json.
+        "CURIE_TURN_PROGRESS_ENABLED",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.

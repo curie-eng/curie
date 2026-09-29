@@ -200,14 +200,21 @@ def test_an_expired_token_is_refused(api: TestClient, valkey: redis.Redis, prefi
     assert _inbox(valkey, prefix, progress_id) == []
 
 
-def test_an_expired_active_generation_is_refused(
+def test_a_failed_close_loses_ingress_authority_within_the_short_lease(
     api: TestClient, valkey: redis.Redis, prefix: str
 ) -> None:
     """@spec ADR-0130 d1: a leaked turn token fails closed at its durable deadline."""
 
     progress_id = str(uuid.uuid4())
     _activate(valkey, prefix, progress_id)
-    valkey.hset(f"{prefix}:progress:{progress_id}", "active_until_ms", "1")
+    valkey.hset(
+        f"{prefix}:progress:{progress_id}",
+        "active_until_ms",
+        int(time.time() * 1000) + 50,
+    )
+    # Model an end-turn clear that never reached Valkey. The still-active
+    # generation must stop authorizing this token without another write.
+    time.sleep(0.075)
 
     response = _post(api, progress_id, _token(progress_id))
 
