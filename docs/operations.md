@@ -1476,7 +1476,7 @@ The path, and what an operator can check on each hop:
    eligibility cannot be inherited from an earlier occupant.
    A failure between runner response headers and stream consumption stops the
    startup keeper and closes the generation; worker cancellation still
-   propagates to the delivery owner.
+   propagates to the delivery owner after that close attempt finishes.
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
    The API accepts only a `turn.progress` token whose subject matches the path
