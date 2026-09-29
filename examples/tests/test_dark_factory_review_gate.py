@@ -159,6 +159,7 @@ def test_foreground_bash_build_is_allowed(
     out = session.pre("Bash", tool_input)
 
     assert out["permissionDecision"] == "allow"
+    assert out["updatedInput"]["run_in_background"] is False
 
 
 def test_description_outranks_the_prompt_when_inferring(session: Session) -> None:

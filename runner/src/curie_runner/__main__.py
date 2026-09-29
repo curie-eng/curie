@@ -66,7 +66,7 @@ from .history import (
     build_conversation_replay,
     resolve_history,
 )
-from .hooks import build_gated_pre_tool_use_hooks, load_bundle_hooks
+from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -328,8 +328,9 @@ def _compose_system_prompt(
 def _merge_pre_tool_use_hooks(
     approval_hooks: dict[str, list[HookMatcher]] | None,
     bundle_hooks: dict[str, list[HookMatcher]] | None,
+    factory_hooks: dict[str, list[HookMatcher]] | None,
 ) -> dict[str, list[HookMatcher]] | None:
-    """Merge the approval gate's PreToolUse matcher with the bundle's own (#1852).
+    """Merge approval, bundle, and factory PreToolUse matchers (#1852).
 
     Merge, never replace: dropping the bundle's declared PreToolUse guardrails
     (#272) would silently disarm them, and dropping the approval matcher leaves
@@ -346,7 +347,7 @@ def _merge_pre_tool_use_hooks(
     """
 
     merged: dict[str, list[HookMatcher]] = {}
-    for source in (approval_hooks, bundle_hooks):
+    for source in (approval_hooks, bundle_hooks, factory_hooks):
         if not source:
             continue
         for event, matchers in source.items():
@@ -609,6 +610,7 @@ def build_runner(
                 connector_availability,
             ),
             bundle_hooks,
+            build_factory_foreground_hooks() if progress_url and progress_token else None,
         )
         policy_hidden_tools = (
             policy_disallowed_tools(approval_gate, capability.observed_tools)
