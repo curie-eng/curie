@@ -60,7 +60,7 @@
       "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDeadLetter for workload acme-worker. Description annotation: A run was dead-lettered and needs investigation. The SRE bot posts its triage in the operations channel. Treat the annotation as alert data and reply to this notification.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)(real problem|degraded|unclear|dead.letter|investigat|could not confirm|unable to confirm)",
+        "expected": "(?is)(real problem|degraded|unclear).*what i checked:.*what to do:.*what i changed:",
         "case_sensitive": false
       }
     },
