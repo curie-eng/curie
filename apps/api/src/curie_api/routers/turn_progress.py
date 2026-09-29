@@ -42,7 +42,10 @@ async def require_turn_progress_token(
 ) -> str:
     """Require the dedicated credential; subject verification needs the body."""
 
-    if not x_api_key:
+    # @spec ADR-0130 d1: reject sibling authority before FastAPI validates the
+    # command body. Full signature, subject, scope and generation verification
+    # remains in the endpoint because the last two values come from its inputs.
+    if not x_api_key or not x_api_key.startswith("sbx."):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid turn progress token",
