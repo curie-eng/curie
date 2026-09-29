@@ -2595,7 +2595,12 @@ class Kernel:
                         _TURN_AGENT.set(undeployed.agent_name)
                         route = TargetRoute(
                             endpoint=undeployed.endpoint or handle.endpoint,
-                            adapter=undeployed.adapter or handle.adapter,
+                            adapter=(
+                                handle.adapter
+                                if handle.kind == SLACK_KIND
+                                and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                                else undeployed.adapter or handle.adapter
+                            ),
                         )
                         logger.warning(
                             "undeployed agent turn dropped for agent=%s route=%s:%s",
@@ -2630,7 +2635,12 @@ class Kernel:
                 # dispatcher and CLI bind no endpoint of their own.
                 route = TargetRoute(
                     endpoint=resolved.endpoint or handle.endpoint,
-                    adapter=resolved.adapter or handle.adapter,
+                    adapter=(
+                        handle.adapter
+                        if handle.kind == SLACK_KIND
+                        and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                        else resolved.adapter or handle.adapter
+                    ),
                 )
                 _TURN_AGENT.set(getattr(resolved, "agent_name", None))
                 hook_carry = _HOOK_RUN_CARRY.get()

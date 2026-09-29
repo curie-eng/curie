@@ -4805,12 +4805,15 @@ class _TokenBinding:
     header. The claim-time minting itself is covered by the binding unit tests;
     this proves the claim->handle->kernel->runner delivery path."""
 
-    def __init__(self, token: str, agent_id: uuid.UUID) -> None:
+    def __init__(self, token: str, agent_id: uuid.UUID, adapter: str | None = None) -> None:
         self._token = token
         self._agent_id = agent_id
+        self._adapter = adapter
 
     async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
-        return _FakeResolved(self._agent_id)
+        resolved = _FakeResolved(self._agent_id)
+        resolved.adapter = self._adapter
+        return resolved
 
     def boot_env(
         self,
@@ -4826,19 +4829,22 @@ class _TokenBinding:
         return BehaviorPacks()
 
 
-def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
+@pytest.mark.parametrize(
+    ("handle_adapter", "expected_adapter"),
+    [
+        ("curie-cluster-message", "curie-cluster-message"),
+        (None, "default"),
+    ],
+)
+def test_cluster_relay_survives_default_slack_binding(
     make_harness,
+    handle_adapter: str | None,
+    expected_adapter: str,
 ) -> None:
-    """The existing kernel copy keeps the built-in route after binding.
-
-    ``curie cluster message`` still binds as Slack. Its deployment row normally
-    has no adapter, so the queue handle's reserved adapter must reach every sink
-    event instead of being erased during resolution. This is verify-only for
-    #2096: production kernel behavior already has the required fallback.
-    """
+    """The relay stays internal while an ordinary turn uses the bound identity."""
 
     async def go() -> None:
-        binding = _TokenBinding("tok-route", uuid.uuid4())
+        binding = _TokenBinding("tok-route", uuid.uuid4(), adapter="default")
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(
@@ -4846,13 +4852,13 @@ def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
                     "hi",
                     thread="tClusterMessageAdapter",
                     placeholder="123e4567-e89b-42d3-a456-426614174000",
-                    adapter="curie-cluster-message",
+                    adapter=handle_adapter,
                 )
             )
 
             routes = h.sink.routes_for("reply.update")
             assert routes, "the completed turn emitted no reply update"
-            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+            assert set(routes) == {TargetRoute(endpoint=None, adapter=expected_adapter)}
 
     asyncio.run(go())
 
