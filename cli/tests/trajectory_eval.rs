@@ -306,6 +306,9 @@ fn weather_case_fails_when_fetch_capability_is_removed() {
 
 #[test]
 fn sre_rollout_case_requires_two_replica_set_reads() {
+    // ToolNote exposes tool names, not call arguments or MCP results. The
+    // example's static test pins distinct old/new identities in the prompt;
+    // this integration test only proves the evaluator requires two calls.
     let evals = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/sre-bot/evals/rollout");
     let cases_path = evals.join("cases.json");
     let cases = std::fs::read(&cases_path)
