@@ -1,0 +1,1305 @@
+{
+  "_comment": "Reply-wire compatibility fixtures (ADR-0130 section 4), decoded by packages/channel-protocol/tests/test_reply_corpus.py through the same TypeAdapter(ReplyEvent) the Discord and mail adapters use. v1_0 holds every 1.0 form exactly as the 1.0-only package serialized it, captured from origin/next at 522dd55eb before 1.1 existed: each must decode and re-serialize to the same bytes, so a 1.0-built adapter keeps accepting everything the platform sends it. v1_1 holds every 1.1 form in the platform's canonical serialization. refused holds bodies every conforming decoder must refuse, each with the error type the Python models raise, a fragment of its message for a cross-field rule, and, under at, the last element of its location where that pins which field refused it. Bytes are compared as compact JSON: separators (',', ':'), keys in the order written here, non-ASCII unescaped.",
+  "v1_0": [
+    {
+      "name": "turn-status-caption",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "turn.status",
+        "status": "Reading the ledger"
+      }
+    },
+    {
+      "name": "turn-status-clear",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "turn.status",
+        "status": ""
+      }
+    },
+    {
+      "name": "reply-update-text",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "The answer is 42.",
+        "message": null,
+        "settled": null,
+        "nav": null
+      }
+    },
+    {
+      "name": "reply-update-text-with-nav",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.update",
+        "text": "Done. Anything else?",
+        "message": null,
+        "settled": null,
+        "nav": {
+          "label": "Home",
+          "command": "hub"
+        }
+      }
+    },
+    {
+      "name": "reply-update-placeholderless",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "event": "reply.update",
+        "text": "Scheduled report ready.",
+        "message": null,
+        "settled": null,
+        "nav": null
+      }
+    },
+    {
+      "name": "reply-update-settled-resolved",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000300"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "settled": {
+          "requested_by": "U0EXAMPLE1",
+          "decision": "approved",
+          "resolver": "U0EXAMPLE2",
+          "note": "ship it"
+        },
+        "nav": null
+      }
+    },
+    {
+      "name": "reply-update-settled-expired",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000300"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "settled": {
+          "requested_by": "U0EXAMPLE1",
+          "decision": null,
+          "resolver": null,
+          "note": null
+        },
+        "nav": null
+      }
+    },
+    {
+      "name": "reply-post-approval-card",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1"
+      }
+    },
+    {
+      "name": "reply-post-top-level-card",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": null,
+          "reply_ref": null
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1"
+      }
+    },
+    {
+      "name": "turn-completed-delivered",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "turn.completed",
+        "event_id": "chn-example-0001",
+        "outcome": "delivered"
+      }
+    },
+    {
+      "name": "turn-completed-awaiting-approval",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "turn.completed",
+        "event_id": "chn-example-0002",
+        "outcome": "awaiting-approval"
+      }
+    }
+  ],
+  "v1_1": [
+    {
+      "name": "reply-post-progress-card-first-revision",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Queued: Waiting for a free sandbox",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000001",
+        "progress": {
+          "kind": "card",
+          "state": "queued",
+          "summary": "Waiting for a free sandbox",
+          "revision": 1,
+          "terminal": false
+        }
+      }
+    },
+    {
+      "name": "reply-update-progress-card-revision",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000002",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      }
+    },
+    {
+      "name": "reply-update-progress-card-terminal",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000003",
+        "progress": {
+          "kind": "card",
+          "state": "complete",
+          "summary": "Fix verified and published",
+          "revision": 5,
+          "terminal": true
+        }
+      }
+    },
+    {
+      "name": "reply-update-progress-card-failed",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000004",
+        "progress": {
+          "kind": "card",
+          "state": "failed",
+          "summary": "Sandbox lost before tests ran",
+          "revision": 4,
+          "terminal": true
+        }
+      }
+    },
+    {
+      "name": "reply-post-progress-milestone-evidence",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Found the failing migration in the deploy log",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000005",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "evidence",
+          "summary": "Found the failing migration in the deploy log",
+          "ordinal": 1
+        }
+      }
+    },
+    {
+      "name": "reply-post-progress-milestone-scope",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Scope narrowed to the ledger importer",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000006",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "scope",
+          "summary": "Scope narrowed to the ledger importer",
+          "ordinal": 2
+        }
+      }
+    },
+    {
+      "name": "reply-post-progress-milestone-verification",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "All 212 importer tests pass",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000007",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "verification",
+          "summary": "All 212 importer tests pass",
+          "ordinal": 3
+        }
+      }
+    },
+    {
+      "name": "reply-post-approval-card-with-delivery-id",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000008"
+      }
+    },
+    {
+      "name": "reply-update-text-with-delivery-id",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "The answer is 42.",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000009"
+      }
+    }
+  ],
+  "refused": [
+    {
+      "name": "v1-0-update-with-delivery-id",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "hi",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000000a"
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "need reply wire 1.1"
+      }
+    },
+    {
+      "name": "v1-0-post-with-progress",
+      "body": {
+        "version": "1.0",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Queued",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-00000000000b",
+        "progress": {
+          "kind": "card",
+          "state": "queued",
+          "summary": "Waiting for a free sandbox",
+          "revision": 1,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "need reply wire 1.1"
+      }
+    },
+    {
+      "name": "v1-1-update-without-delivery-id",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "hi",
+        "message": null,
+        "settled": null,
+        "nav": null
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries a delivery_id"
+      }
+    },
+    {
+      "name": "v1-1-post-without-delivery-id",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1"
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries a delivery_id"
+      }
+    },
+    {
+      "name": "progress-without-delivery-id",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "progress needs a delivery_id"
+      }
+    },
+    {
+      "name": "turn-status-at-1-1",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "turn.status",
+        "status": "Reading the ledger"
+      },
+      "error": {
+        "type": "literal_error",
+        "at": "version"
+      }
+    },
+    {
+      "name": "turn-completed-at-1-1",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "turn.completed",
+        "event_id": "chn-example-0001",
+        "outcome": "delivered"
+      },
+      "error": {
+        "type": "literal_error",
+        "at": "version"
+      }
+    },
+    {
+      "name": "unknown-wire-version",
+      "body": {
+        "version": "1.2",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "The answer is 42.",
+        "message": null,
+        "settled": null,
+        "nav": null
+      },
+      "error": {
+        "type": "literal_error",
+        "at": "version"
+      }
+    },
+    {
+      "name": "progress-update-with-text",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": "the answer",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000000c",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries no text, message, settled or nav"
+      }
+    },
+    {
+      "name": "progress-update-with-settled-message",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": {
+          "version": "1.0",
+          "text": "Deploy?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "settled": {
+          "requested_by": "U0EXAMPLE1",
+          "decision": "approved",
+          "resolver": "U0EXAMPLE2",
+          "note": "ship it"
+        },
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000000d",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries no text, message, settled or nav"
+      }
+    },
+    {
+      "name": "progress-update-with-nav",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": {
+          "label": "Home",
+          "command": "hub"
+        },
+        "delivery_id": "00000000-0000-4000-8000-00000000000e",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries no text, message, settled or nav"
+      }
+    },
+    {
+      "name": "progress-update-carrying-a-milestone",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000000f",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "evidence",
+          "summary": "Found it",
+          "ordinal": 1
+        }
+      },
+      "error": {
+        "type": "literal_error",
+        "at": "kind"
+      }
+    },
+    {
+      "name": "progress-post-with-interaction",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Deploy acme-bot to production?",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000014",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "verification",
+          "summary": "All tests pass",
+          "ordinal": 1
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "carries no interaction"
+      }
+    },
+    {
+      "name": "delivery-id-uppercase",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "hi",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-0000000000AB"
+      },
+      "error": {
+        "type": "string_pattern_mismatch",
+        "at": "delivery_id"
+      }
+    },
+    {
+      "name": "delivery-id-without-hyphens",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "hi",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000000040008000000000000011"
+      },
+      "error": {
+        "type": "string_pattern_mismatch",
+        "at": "delivery_id"
+      }
+    },
+    {
+      "name": "delivery-id-urn-form",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "email",
+          "address": "agent@example.com",
+          "conversation_id": "thr_example_1",
+          "reply_ref": "msg_example_1"
+        },
+        "event": "reply.update",
+        "text": "hi",
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "urn:uuid:00000000-0000-4000-8000-000000000012"
+      },
+      "error": {
+        "type": "string_pattern_mismatch",
+        "at": "delivery_id"
+      }
+    },
+    {
+      "name": "card-terminal-state-not-marked-terminal",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000013",
+        "progress": {
+          "kind": "card",
+          "state": "complete",
+          "summary": "Done",
+          "revision": 5,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "terminal must be true exactly when",
+        "at": "progress"
+      }
+    },
+    {
+      "name": "card-open-state-marked-terminal",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000015",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running tests",
+          "revision": 3,
+          "terminal": true
+        }
+      },
+      "error": {
+        "type": "value_error",
+        "contains": "terminal must be true exactly when",
+        "at": "progress"
+      }
+    },
+    {
+      "name": "card-revision-zero",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000016",
+        "progress": {
+          "kind": "card",
+          "state": "queued",
+          "summary": "Queued",
+          "revision": 0,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "greater_than_equal",
+        "at": "revision"
+      }
+    },
+    {
+      "name": "card-unknown-state",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000017",
+        "progress": {
+          "kind": "card",
+          "state": "paused",
+          "summary": "Paused",
+          "revision": 2,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "enum",
+        "at": "state"
+      }
+    },
+    {
+      "name": "card-unmodelled-field",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-000000000018",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false,
+          "blocks": []
+        }
+      },
+      "error": {
+        "type": "extra_forbidden",
+        "at": "blocks"
+      }
+    },
+    {
+      "name": "milestone-fourth-slot",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "One more",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000019",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "verification",
+          "summary": "One more",
+          "ordinal": 4
+        }
+      },
+      "error": {
+        "type": "less_than_equal",
+        "at": "ordinal"
+      }
+    },
+    {
+      "name": "milestone-slot-zero",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "None yet",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-00000000001a",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "evidence",
+          "summary": "None yet",
+          "ordinal": 0
+        }
+      },
+      "error": {
+        "type": "greater_than_equal",
+        "at": "ordinal"
+      }
+    },
+    {
+      "name": "milestone-unknown-class",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000200"
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "Guess",
+          "status": null,
+          "header": null,
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-00000000001b",
+        "progress": {
+          "kind": "milestone",
+          "milestone": "hypothesis",
+          "summary": "Guess",
+          "ordinal": 1
+        }
+      },
+      "error": {
+        "type": "enum",
+        "at": "milestone"
+      }
+    },
+    {
+      "name": "summary-with-a-line-break",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000001c",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running tests\nthen publishing",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "string_pattern_mismatch",
+        "at": "summary"
+      }
+    },
+    {
+      "name": "summary-over-200-characters",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000001d",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "string_too_long",
+        "at": "summary"
+      }
+    },
+    {
+      "name": "summary-blank",
+      "body": {
+        "version": "1.1",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": null,
+        "settled": null,
+        "nav": null,
+        "delivery_id": "00000000-0000-4000-8000-00000000001e",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "   ",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "string_too_short",
+        "at": "summary"
+      }
+    }
+  ]
+}
