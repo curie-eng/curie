@@ -59,15 +59,41 @@ message has no ``interaction``: the approval card remains the only actionable
 platform message (ADR-0130 section 3).
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    model_serializer,
+    model_validator,
+)
 
 from .models import OutboundMessage
+from .progress import ProgressCard, ProgressMilestone
 
-ReplyWireVersion = Literal["1.0"]
-REPLY_WIRE_VERSION: ReplyWireVersion = "1.0"
+ReplyWireVersion = Literal["1.0", "1.1"]
+REPLY_WIRE_VERSION: Literal["1.0"] = "1.0"
+PROGRESS_REPLY_WIRE_VERSION: Literal["1.1"] = "1.1"
 _STRICT = ConfigDict(extra="forbid")
+
+DeliveryId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+]
+"""A UUID in its canonical form, the one ``str(uuid.UUID(...))`` produces."""
+
+# The fields 1.1 added. Absent, each is left out of the serialized body rather
+# than sent as null: a 1.0-built adapter's closed models refuse an unknown key
+# even when its value is null.
+_PROGRESS_WIRE_FIELDS = ("delivery_id", "progress")
+_DELIVERY_ID_DESCRIPTION = (
+    "Reply wire 1.1. The platform-minted idempotency key of this one post or edit; "
+    "a retry of an ambiguous attempt carries the same value. Outbound, and unrelated "
+    "to the inbound delivery_id an adapter sends to POST /channels/turns."
+)
 
 
 class ReplyTarget(BaseModel):
@@ -124,19 +150,60 @@ class _ReplyEventBase(BaseModel):
     target: ReplyTarget
 
 
+class _DeliveredEvent(_ReplyEventBase):
+    """The shared 1.1 rules of the two events that carry a delivery identity.
+
+    The fields themselves are declared on each subclass, after every 1.0 field,
+    because a field declared here would be serialized ahead of ``event``.
+    """
+
+    def _progress_wire(self) -> tuple[str | None, ProgressCard | ProgressMilestone | None]:
+        """This body's ``(delivery_id, progress)``."""
+        raise NotImplementedError
+
+    @model_validator(mode="after")
+    def _version_names_the_wire_the_body_uses(self) -> Self:
+        delivery_id, progress = self._progress_wire()
+        if self.version == REPLY_WIRE_VERSION:
+            if delivery_id is not None or progress is not None:
+                raise ValueError(
+                    "delivery_id and progress need reply wire 1.1; a 1.0 body carries neither"
+                )
+        elif delivery_id is None:
+            if progress is not None:
+                raise ValueError("progress needs a delivery_id")
+            raise ValueError(
+                "a reply wire 1.1 body carries a delivery_id; send a body without one as 1.0"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_progress_wire_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = handler(self)
+        for name in _PROGRESS_WIRE_FIELDS:
+            if getattr(self, name) is None:
+                body.pop(name, None)
+        return body
+
+
 class TurnStatus(_ReplyEventBase):
     """The channel's liveness caption. An EMPTY status is the clear."""
 
+    version: Literal["1.0"]
     event: Literal["turn.status"]
     status: str
 
 
-class ReplyUpdate(_ReplyEventBase):
+class ReplyUpdate(_DeliveredEvent):
     """The turn's reply, edited in place where the channel supports it.
 
     ``text`` is a streamed or final reply. ``message`` plus ``settled`` is the
     other form: an already-posted platform message being settled (an approval
-    card that expired or was resolved).
+    card that expired or was resolved). ``progress`` is the third, 1.1 only: an
+    edit of the progress card ``target.reply_ref`` names, carrying none of the
+    answer fields.
     """
 
     event: Literal["reply.update"]
@@ -144,14 +211,62 @@ class ReplyUpdate(_ReplyEventBase):
     message: OutboundMessage | None = None
     settled: SettledOutcome | None = None
     nav: NavAffordance | None = None
+    delivery_id: DeliveryId | None = Field(default=None, description=_DELIVERY_ID_DESCRIPTION)
+    progress: ProgressCard | None = Field(
+        default=None,
+        description=(
+            "Reply wire 1.1. An edit of the progress card target.reply_ref names; "
+            "the body then carries no text, message, settled or nav."
+        ),
+    )
+
+    def _progress_wire(self) -> tuple[str | None, ProgressCard | None]:
+        return self.delivery_id, self.progress
+
+    @model_validator(mode="after")
+    def _progress_is_not_an_answer(self) -> Self:
+        if self.progress is not None and any(
+            value is not None for value in (self.text, self.message, self.settled, self.nav)
+        ):
+            raise ValueError(
+                "a progress update carries no text, message, settled or nav: a card "
+                "edit is never answer text or an approval settlement"
+            )
+        return self
 
 
-class ReplyPost(_ReplyEventBase):
-    """A NEW platform-owned message (the approval card), acked with its ref."""
+class ReplyPost(_DeliveredEvent):
+    """A NEW platform-owned message, acked with its ref.
+
+    The approval card, or, 1.1 only, a progress card's first revision or a
+    milestone. ``message.text`` is the complete plain-text fallback either way.
+    """
 
     event: Literal["reply.post"]
     message: OutboundMessage
     requested_by: str
+    delivery_id: DeliveryId | None = Field(default=None, description=_DELIVERY_ID_DESCRIPTION)
+    progress: Annotated[ProgressCard | ProgressMilestone, Field(discriminator="kind")] | None = (
+        Field(
+            default=None,
+            description=(
+                "Reply wire 1.1. A progress card's first revision or a milestone; "
+                "message.text is its plain-text fallback and carries no interaction."
+            ),
+        )
+    )
+
+    def _progress_wire(self) -> tuple[str | None, ProgressCard | ProgressMilestone | None]:
+        return self.delivery_id, self.progress
+
+    @model_validator(mode="after")
+    def _progress_is_not_actionable(self) -> Self:
+        if self.progress is not None and self.message.interaction is not None:
+            raise ValueError(
+                "a progress post's message carries no interaction: the approval "
+                "card stays the only actionable platform message"
+            )
+        return self
 
 
 class TurnCompleted(_ReplyEventBase):
@@ -161,6 +276,7 @@ class TurnCompleted(_ReplyEventBase):
     unavoidable, so it is made identifiable rather than pretended away.
     """
 
+    version: Literal["1.0"]
     event: Literal["turn.completed"]
     event_id: str
     outcome: Literal["delivered", "dropped", "escalated", "awaiting-approval"]

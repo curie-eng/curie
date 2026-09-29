@@ -18,7 +18,18 @@ from .models import (
     MessageLink,
     OutboundMessage,
 )
+from .progress import (
+    MAX_PROGRESS_MILESTONES,
+    PROGRESS_COMMAND_VERSION,
+    TERMINAL_PROGRESS_STATES,
+    MilestoneClass,
+    ProgressCard,
+    ProgressCommand,
+    ProgressMilestone,
+    ProgressState,
+)
 from .reply import (
+    PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyAck,
@@ -32,8 +43,12 @@ from .reply import (
 )
 
 __all__ = [
+    "MAX_PROGRESS_MILESTONES",
     "MESSAGE_VERSION",
+    "PROGRESS_COMMAND_VERSION",
+    "PROGRESS_REPLY_WIRE_VERSION",
     "REPLY_WIRE_VERSION",
+    "TERMINAL_PROGRESS_STATES",
     "ScopedConversation",
     "Action",
     "ChannelCapability",
@@ -43,8 +58,13 @@ __all__ = [
     "InteractionIntent",
     "MessageField",
     "MessageLink",
+    "MilestoneClass",
     "NavAffordance",
     "OutboundMessage",
+    "ProgressCard",
+    "ProgressCommand",
+    "ProgressMilestone",
+    "ProgressState",
     "ReplyAck",
     "ReplyEvent",
     "ReplyPost",
