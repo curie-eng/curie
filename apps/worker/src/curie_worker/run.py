@@ -55,6 +55,7 @@ from .hook_runs import HookRunRecorder
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
+from .progress import ProgressStore
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
@@ -548,6 +549,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
         sibling_limit=sibling_limit,
+        # Deliberate progress (ADR 0130): the durable record a person's turn
+        # reports on, the one the maintenance tick sweeps.
+        progress=ProgressStore(async_redis, config),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)

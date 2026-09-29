@@ -3,9 +3,10 @@
 One logical turn chain owns one progress record: its current task state, its
 milestone budget, and the card and milestone deliveries it owes its channel.
 The rules are specified in the worker README's "Deliberate progress (ADR 0130)"
-section; this module is where they run. Nothing reaches it yet: no ingress
-applies a model's command, the kernel opens no chain, and the maintenance tick
-sweeps the outbox without a deliverer.
+section; this module is where they run. A model's command reaches it through
+the API's ingress, the chain's inbox and the kernel's per-turn pump
+(``curie_worker.turn_progress``); nothing delivers from the outbox yet, and the
+maintenance tick sweeps it without a deliverer.
 
 Three structural choices carry the ADR's guarantees:
 
@@ -252,6 +253,24 @@ if ARGV[3] ~= '' and KEYS[3] ~= '' and redis.call('HGET', KEYS[1], 'slot') == 'c
 end
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[2])
+return 1
+"""
+
+# Move the record's inbox cursor forward to a stream id, never back, and never
+# onto an expired record. Stream ids compare as (milliseconds, sequence).
+_ADVANCE_CURSOR_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local nm, ns = string.match(ARGV[1], '^(%d+)-(%d+)$')
+if not nm then return 0 end
+local current = redis.call('HGET', KEYS[1], 'inbox_cursor')
+if current and current ~= '' then
+  local cm, cs = string.match(current, '^(%d+)-(%d+)$')
+  if cm then
+    nm, ns, cm, cs = tonumber(nm), tonumber(ns), tonumber(cm), tonumber(cs)
+    if nm < cm or (nm == cm and ns <= cs) then return 0 end
+  end
+end
+redis.call('HSET', KEYS[1], 'inbox_cursor', ARGV[1])
 return 1
 """
 
@@ -649,7 +668,51 @@ class ProgressStore:
             f"progress record {progress_id} moved on each of {_MAX_APPLY_ROUNDS} reads"
         )
 
+    # -- the inbox ------------------------------------------------------------
+
+    async def read_inbox(
+        self, progress_id: str, *, after: str, count: int
+    ) -> list[tuple[str, dict[str, str]]]:
+        """Up to ``count`` inbox entries after the stream id ``after`` ('' for all)."""
+        entries: Any = await self._redis.xrange(
+            self._config.progress_inbox_key(progress_id),
+            min=f"({after}" if after else "-",
+            max="+",
+            count=count,
+        )
+        return [
+            (
+                str(_as_str(entry_id)),
+                {str(_as_str(key)): str(_as_str(value)) for key, value in fields.items()},
+            )
+            for entry_id, fields in entries
+        ]
+
+    async def advance_cursor(self, progress_id: str, entry_id: str) -> bool:
+        """Record that the chain's inbox is applied through ``entry_id``.
+
+        Only forward, and never onto an expired record. Returns whether it moved.
+        """
+        moved = await self._redis.eval(
+            _ADVANCE_CURSOR_LUA, 1, self._config.progress_key(progress_id), entry_id
+        )
+        return int(moved) == 1
+
     # -- the outbox -----------------------------------------------------------
+
+    async def discard_deliveries(self, delivery_ids: Sequence[str]) -> None:
+        """Remove owed deliveries that nothing will make.
+
+        For the pump while rendering is off: the record keeps its state and
+        reservations, and no delivery is left for a later deliverer to replay.
+        """
+        if not delivery_ids:
+            return
+        async with self._redis.pipeline(transaction=True) as pipe:
+            for delivery_id in delivery_ids:
+                pipe.delete(self._config.progress_delivery_key(delivery_id))
+            pipe.srem(self._config.progress_pending_key(), *delivery_ids)
+            await pipe.execute()
 
     async def ack(
         self, delivery_id: str, *, generation: str, card_ref: str | None = None

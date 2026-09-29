@@ -354,6 +354,14 @@ class WorkerConfig(BaseSettings):
     # ledger records or what the no-retry rule reads.
     turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
 
+    # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
+    # exists until the rendering change lands, and the chart does not set it.
+    # Off, the kernel's progress pump records each command's state and
+    # milestone reservation and removes the deliveries it enqueued, so nothing
+    # is shown and nothing is left owed. This worker has no progress deliverer,
+    # so ``_progress_render_needs_a_deliverer`` refuses it on.
+    progress_render: Bool = Field(default=False, validation_alias="CURIE_PROGRESS_RENDER")
+
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
     # the redelivery is waited out (#2433).
@@ -428,6 +436,22 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
+        """Refuse to start with progress rendering on (ADR 0130).
+
+        Nothing in this worker delivers progress to an adapter. Accepting the
+        switch would claim a rendering that does not happen, and leaving each
+        owed delivery in the outbox for a later deliverer would replay a
+        backlog of stale cards into old threads the day one exists.
+        """
+        if self.progress_render:
+            raise ValueError(
+                "CURIE_PROGRESS_RENDER=true needs progress rendering, which this worker "
+                "does not include; leave it unset"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_self_targeting_graveyard(self) -> WorkerConfig:
@@ -1338,6 +1362,12 @@ class WorkerConfig(BaseSettings):
     def progress_chain_key(self, event_id: str) -> str:
         # The pointer an approval resume event follows back to its chain's record.
         return f"{self.key_prefix}:progress:chain:{event_id}"
+
+    def progress_inbox_key(self, progress_id: str) -> str:
+        # The chain's inbox stream. The API appends to it under the same
+        # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
+        # tests/vectors/turn-progress-capability.json.
+        return f"{self.key_prefix}:progress:inbox:{progress_id}"
 
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation

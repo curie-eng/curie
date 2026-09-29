@@ -135,6 +135,7 @@ from .delivery_lease import DeliveryLease, LeaseLostError
 from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, retry_expiry
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, DoneMarkerValue, MalformedCompletionError, Markers
+from .progress import ProgressStore
 from .publication_validation import validate_snapshot_against_base
 from .receipt import TurnReceiptMode, render_receipt
 from .reply_sink import (
@@ -170,6 +171,14 @@ from .sandbox.types import (
 from .sibling_turns import SIBLING_LIMIT_NOTICE, SiblingLimitReason, SiblingTurnLimit
 from .slack_tokens import token_identity
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
+from .turn_progress import (
+    ProgressPump,
+    TurnProgressPlan,
+    link_progress_resume,
+    mint_capability,
+    plan_turn_progress,
+    start_progress_pump,
+)
 from .workitem_dispatch import (
     TerminationObservation,
     WorkItemAcquireGrant,
@@ -1253,6 +1262,11 @@ _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(
     "curie_worker_publication_context", default=None
 )
+# The deliberate progress chain this delivery reports on (ADR 0130), or None.
+# Per delivery like the two above; see ``curie_worker.turn_progress``.
+_TURN_PROGRESS: ContextVar[TurnProgressPlan | None] = ContextVar(
+    "curie_worker_turn_progress", default=None
+)
 
 
 def _hook_success_outcome() -> HookRunOutcome | None:
@@ -1511,6 +1525,7 @@ class Kernel:
         suspended_route_ttl_seconds: int = 86400,
         work_items: WorkItemDispatchClient | None = None,
         sibling_limit: SiblingTurnLimit | None = None,
+        progress: ProgressStore | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -1563,6 +1578,8 @@ class Kernel:
         # write to each other. None on an install with no sibling, which then
         # makes no call for it at all.
         self._sibling_limit = sibling_limit
+        # Deliberate progress (ADR 0130). None sends no capability to any turn.
+        self._progress = progress
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -2237,6 +2254,7 @@ class Kernel:
         owned_work_item_id: uuid.UUID | None = None
         owned_token = _OWNED_WORK_ITEM.set(None)
         publication_token = _PUBLICATION_CONTEXT.set(None)
+        progress_token = _TURN_PROGRESS.set(None)
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -2829,6 +2847,19 @@ class Kernel:
             # so it cannot leak into another thread's turn. A reclaimed redelivery
             # starts fresh.
             workspace_inference = _WorkspaceInferenceCarry()
+            # ADR 0130: name the progress chain a person's turn reports on. The
+            # record is opened only when a turn's stream is consumed, so an
+            # event that only steers a live turn opens none.
+            if not targetless and self._progress is not None:
+                _TURN_PROGRESS.set(
+                    await plan_turn_progress(
+                        self._progress,
+                        qevent,
+                        thread_key,
+                        factory_work_item=self._is_factory_work_item_turn(event_id),
+                        resume=self._is_approval_resume(event_id),
+                    )
+                )
             attempt = 0
             while True:
                 attempt += 1
@@ -3139,6 +3170,7 @@ class Kernel:
                             await self._release_work_item_sandbox(owned_run.thread_key)
             _OWNED_WORK_ITEM.reset(owned_token)
             _PUBLICATION_CONTEXT.reset(publication_token)
+            _TURN_PROGRESS.reset(progress_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -4991,6 +5023,10 @@ class Kernel:
         """Serialize runner admission with the operator pause action."""
 
         extra: dict[str, Any] = {"capacity_admission": True} if capacity_admission else {}
+        plan = _TURN_PROGRESS.get()
+        progress = mint_capability(self._config, plan.progress_id) if plan is not None else None
+        if progress is not None:
+            extra["progress"] = progress
         carry = _HOOK_RUN_CARRY.get()
         if carry is not None and carry.recorder is not None and carry.ref is not None:
             async with carry.recorder.start_guard(carry.ref) as allowed:
@@ -7183,6 +7219,11 @@ class Kernel:
             )
             return False
 
+        progress_plan = _TURN_PROGRESS.get()
+        if progress_plan is not None and self._progress is not None:
+            # The resume continues this chain and its milestone budget (ADR 0130).
+            await link_progress_resume(self._progress, progress_plan, created.id)
+
         if self._workspace is not None:
             async with self._lock.hold(self._config.lock_key(thread_key)):
                 retain_workspace = not is_publication
@@ -7694,6 +7735,7 @@ class Kernel:
                 else lambda: self._terminal_reply_attempted.add(qevent.event_id)
             ),
         )
+        pump = await self._start_progress_pump(qevent, route)
         try:
             # ``async with`` releases the aiohttp response on every exit path
             # (normal end, apply-frame error, or a mid-stream transport drop), so
@@ -7768,8 +7810,29 @@ class Kernel:
                 error_message=acc.error_message,
                 text=acc.rendered(),
             )
+        finally:
+            # The runner has answered every progress post it made before the
+            # stream ended, so the drain sees all of this turn's commands.
+            if pump is not None:
+                await pump.stop()
 
         return await self._finish(acc, reply)
+
+    async def _start_progress_pump(
+        self, qevent: QueuedTurn, route: TargetRoute
+    ) -> ProgressPump | None:
+        """The pump for this delivery's progress chain, or None (ADR 0130)."""
+
+        plan = _TURN_PROGRESS.get()
+        if plan is None or self._progress is None:
+            return None
+        return await start_progress_pump(
+            self._progress,
+            plan,
+            route=route,
+            target=lambda: self._target_for(qevent),
+            render=self._config.progress_render,
+        )
 
     async def _apply_frame(
         self,

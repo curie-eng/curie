@@ -162,13 +162,24 @@ def test_an_ineligible_turn_carries_no_capability(
 
 
 def test_a_factory_execution_carries_no_turn_progress_capability(make_harness) -> None:
-    from test_work_item_workspace import ISSUE_URL, _Binding, _turn, _WorkItems, _Workspace
+    from test_work_item_workspace import (
+        ISSUE_URL,
+        _Binding,
+        _NoExistingPublication,
+        _turn,
+        _WorkItems,
+        _Workspace,
+    )
 
     async def go() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, progress_factory=_progress
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+            progress_factory=_progress,
         ) as h:
             h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=DONE)]
             request_id = uuid.uuid4()
 
             await h.kernel.process_event(

@@ -16,7 +16,9 @@ from channel_protocol.progress import ProgressCommand
 from curie_worker import turn_progress
 from curie_worker.config import WorkerConfig
 
-_VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-progress-capability.json"
+_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-progress-capability.json"
+)
 _EXPECTED_KEYS = {
     "comment",
     "url_header",
