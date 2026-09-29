@@ -56,7 +56,14 @@ def _resolve(client: TestClient, headers: dict, content: str, target: str):
 def test_resolves_the_named_target(client: TestClient, auth_headers: dict) -> None:
     r = _resolve(client, auth_headers, REAL, "prod")
     assert r.status_code == 200, r.text
-    assert r.json() == {"agent": "acme-bot", "env": "prod", "slack_channel": "C000000A02"}
+    # @spec ADR-0168 d8: a target naming neither field resolves as it always did.
+    assert r.json() == {
+        "agent": "acme-bot",
+        "env": "prod",
+        "slack_channel": "C000000A02",
+        "identity": "default",
+        "connectors": None,
+    }
 
 
 def test_each_target_resolves_differently(client: TestClient, auth_headers: dict) -> None:
@@ -232,3 +239,46 @@ def test_list_of_an_empty_file_is_empty_not_an_error(
     )
     assert r.status_code == 200
     assert r.json()["targets"] == []
+
+
+# `slack_channel` is left out on purpose: the only Slack id this repository may
+# commit is the documentation placeholder, which this parser refuses.
+_NAMED = (
+    "targets:\n"
+    "  dev:\n"
+    "    agent: acme-dev\n"
+    "  prod:\n"
+    "    agent: acme-bot\n"
+    "    env: prod\n"
+    "    identity: ops-bot\n"
+    "    connectors: [grafana]\n"
+)
+
+
+# @spec ADR-0168 d8
+def test_resolve_returns_the_identity_and_the_allowlist(
+    client: TestClient, auth_headers: dict
+) -> None:
+    body = _resolve(client, auth_headers, _NAMED, "prod").json()
+    assert body["identity"] == "ops-bot"
+    assert body["connectors"] == ["grafana"]
+
+
+# @spec ADR-0168 d8
+def test_an_empty_allowlist_resolves_as_empty_not_absent(
+    client: TestClient, auth_headers: dict
+) -> None:
+    content = "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    connectors: []\n"
+    assert _resolve(client, auth_headers, content, "prod").json()["connectors"] == []
+
+
+# @spec ADR-0168 d8
+def test_list_carries_the_identity_and_the_allowlist_of_every_target(
+    client: TestClient, auth_headers: dict
+) -> None:
+    r = client.post(
+        "/deploy-targets/list", json={"content": _NAMED, "target": ""}, headers=auth_headers
+    )
+    by_name = {t["name"]: t for t in r.json()["targets"]}
+    assert (by_name["dev"]["identity"], by_name["dev"]["connectors"]) == ("default", None)
+    assert (by_name["prod"]["identity"], by_name["prod"]["connectors"]) == ("ops-bot", ["grafana"])

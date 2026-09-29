@@ -450,6 +450,91 @@ fn mint_discovers_an_override_fullname_before_minting_and_patches_its_secret() {
     );
 }
 
+/// The bound identity travels with the mint (ADR-0168 decision 3): the CLI
+/// copies it from the resolved binding rather than asking the operator for it
+/// again, since the binding is the one place that identity is recorded.
+fn agent_json_with_adapter(adapter: &str) -> String {
+    format!(
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"email","address":"{INBOX}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+    )
+}
+
+#[test]
+fn mint_forwards_the_bound_adapter() {
+    let token = sample_token(EXP);
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
+    let agent = agent_json_with_adapter("ops-secondary");
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, &format!("[{agent}]")),
+        ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent),
+        ("POST", "/channels/token") => Response::json(200, &format!(r#"{{"token":"{token}"}}"#)),
+        _ => Response::json(404, r#"{"detail":"not found"}"#),
+    });
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+
+    let mint_requests = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/channels/token")
+        .collect::<Vec<_>>();
+    assert_eq!(mint_requests.len(), 1, "expected exactly one mint request");
+    let body: serde_json::Value =
+        serde_json::from_slice(&mint_requests[0].body).expect("mint request body must be JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "kind": "email",
+            "address": INBOX,
+            "adapter": "ops-secondary",
+            "ttl_s": 604_800,
+        })
+    );
+}
+
+/// The default Slack identity is what an omitted adapter already means
+/// (`aci_protocol.turn.route_identity`), and an API that predates ADR-0168
+/// decision 3 has no `adapter` field on the mint request at all, so it 422s
+/// one that carries it. The CLI therefore forwards the identity only when it
+/// is one the omission cannot express.
+#[test]
+fn mint_omits_the_default_slack_identity() {
+    let token = sample_token(EXP);
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
+    let agent = format!(
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"C0EXAMPLE1","adapter":"default"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+    );
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, &format!("[{agent}]")),
+        ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent),
+        ("POST", "/channels/token") => Response::json(200, &format!(r#"{{"token":"{token}"}}"#)),
+        _ => Response::json(404, r#"{"detail":"not found"}"#),
+    });
+    let argv = mint_argv(&server.base_url)
+        .into_iter()
+        .map(|arg| match arg {
+            "email" => "slack",
+            INBOX => "C0EXAMPLE1",
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    let run = stub.run(&argv);
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+
+    let mint_requests = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/channels/token")
+        .collect::<Vec<_>>();
+    assert_eq!(mint_requests.len(), 1, "expected exactly one mint request");
+    let body: serde_json::Value =
+        serde_json::from_slice(&mint_requests[0].body).expect("mint request body must be JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "ttl_s": 604_800})
+    );
+}
+
 #[test]
 fn mint_targets_the_existing_secret_when_configured() {
     let token = sample_token(EXP);

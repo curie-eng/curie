@@ -10,7 +10,13 @@ from typing import Any
 import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from curie_api.schema_compat import KIND_CONTRACT, load_kinds, load_window, plan_upgrade
+from curie_api.schema_compat import (
+    KIND_CONTRACT,
+    AppWindow,
+    load_kinds,
+    load_window,
+    plan_upgrade,
+)
 from sqlalchemy.exc import IntegrityError
 
 SCOPE = "slack:C0EXAMPLE1"
@@ -70,7 +76,10 @@ def _seed_copy(
 
 
 def test_0060_contract_requires_forward_only() -> None:
-    window = load_window()
+    # 0060 set the floor for the release that shipped it; a later contract
+    # (0070) raises it again, so the pin is that it never falls below 0060.
+    assert load_window().schema_min >= "0060"
+    window = AppWindow(schema_min="0060", schema_head="0067")
     kinds = load_kinds()
     assert kinds["0060"] == KIND_CONTRACT
 

@@ -607,6 +607,7 @@ def test_host_credentials_are_never_written_to_the_claim(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -621,6 +622,56 @@ def test_host_credentials_are_never_written_to_the_claim(
     assert denied_names.isdisjoint(claim_env_names)
     assert "CURIE_BUDGET" in claim_env_names
     assert "CURIE_CREDENTIALS" not in claim_env_names
+
+
+def test_the_caller_token_rides_the_claim_and_its_signing_key_never_does() -> None:
+    # ADR-0168 decision 7. The token is the sandbox's own short-lived identity
+    # and the runner needs it, so it is a claim entry like the runner token.
+    # The key that signs it is the worker's, and would let a sandbox mint a
+    # token naming any agent.
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-caller",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    entries = _env_entries(api)
+    assert {"name": "CURIE_CONNECTOR_CALLER_TOKEN", "value": "cct.payload.signature"} in entries
+    assert all(e.get("name") != "CURIE_CONNECTOR_CALLER_SIGNING_KEY" for e in entries)
+
+
+def test_no_slack_identity_token_reaches_the_claim() -> None:
+    """The k8s counterpart of
+    `test_create_claim_excludes_every_slack_identity_token_from_child_env`:
+    the same `filter_agent_child_env` backs both substrates, and this pins
+    the k8s claim's call site against the indexed Slack token prefixes."""
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-slack-identities",
+        pool="pool",
+        env={
+            "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+            "CURIE_SLACK_BOT_TOKEN__1": "placeholder",
+            "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+            "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+            "CURIE_SLACK_IDENTITIES": "[]",
+        },
+    )
+
+    claim_env_names = {entry["name"] for entry in _env_entries(api)}
+    assert claim_env_names.isdisjoint(
+        {
+            "CURIE_SLACK_BOT_TOKEN__0",
+            "CURIE_SLACK_BOT_TOKEN__1",
+            "CURIE_SLACK_APP_TOKEN__0",
+            "CURIE_SLACK_SIGNING_SECRET__0",
+        }
+    )
+    assert "CURIE_SLACK_IDENTITIES" in claim_env_names
 
 
 def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:

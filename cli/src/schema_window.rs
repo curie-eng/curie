@@ -415,7 +415,7 @@ mod tests {
         check_target_schema(
             "0.10.0",
             &n,
-            "0057",
+            "0058",
             &["0.10.0".to_string(), "0.10.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0063");
+        assert_eq!(candidate.schema_min, "0070");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -444,18 +444,18 @@ mod tests {
 
         let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert_eq!(retained.schema_min, "0063");
-        assert_eq!(retained.schema_head, "0063");
-        assert!(live_in_window("0063", &retained));
-        assert!(!live_in_window("0062", &retained));
+        assert_eq!(retained.schema_min, "0070");
+        assert_eq!(retained.schema_head, "0070");
+        assert!(live_in_window("0070", &retained));
+        assert!(!live_in_window("0069", &retained));
 
         assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
         let prior = window_for("0.10.2").expect("0.10.2 remains catalogued");
         assert_eq!(prior.schema_min, "0060");
         assert_eq!(prior.schema_head, "0062");
-        let current = window_for("0.10.3").expect("0.10.3 candidate is catalogued");
-        assert_eq!(current.schema_min, candidate.schema_min);
-        assert_eq!(current.schema_head, candidate.schema_head);
+        let current = window_for("0.10.3").expect("0.10.3 remains catalogued");
+        assert_eq!(current.schema_min, "0063");
+        assert_eq!(current.schema_head, "0063");
     }
 
     #[test]

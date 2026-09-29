@@ -93,6 +93,7 @@ fn lock_for(connector: &str) -> ConnectorLockFileDecl {
                     .to_string(),
             },
         )]),
+        ..Default::default()
     }
 }
 
@@ -100,12 +101,14 @@ fn empty_lock() -> ConnectorLockFileDecl {
     ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors: BTreeMap::new(),
+        ..Default::default()
     }
 }
 
 fn declaring(connector: &str, spec: ConnectorSpecDecl) -> ConnectorsFileDecl {
     ConnectorsFileDecl {
         connectors: BTreeMap::from([(connector.to_string(), spec)]),
+        ..Default::default()
     }
 }
 

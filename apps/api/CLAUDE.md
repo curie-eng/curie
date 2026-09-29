@@ -47,7 +47,18 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   Served is ONE predicate, `crud._approval_served`, for both. Presenting it
   with the platform key or another resolver credential is 401, never a
   precedence choice. The resolver kinds are `chat`, `console`, `operator` and
-  `adapter`; `operator` and `adapter` resolve only explicit-user routes.
+  `adapter`; `operator` resolves only explicit-user routes, and no Slack approver
+  set admits `adapter`, since only the dispatcher vouches for a Slack ID
+  (ADR-0177's separate finding).
+- **Who may start a turn is decided in ONE function (ADR 0175, #3241).**
+  `admission.admit` answers for a binding's optional `allowed_callers` list, and
+  both entry points call it: `POST /channels/turns` after token verification and
+  before any claim (403 with `detail: caller_not_allowed`, frozen in
+  `tests/vectors/channel-port-refusal.json`), and the platform-key-only
+  `POST /channels/admission` the dispatcher asks. Do not compare caller ids
+  anywhere else. The list is written only by
+  `PUT /agents/{agent_id}/channels/callers`, which does NOT bump the binding
+  generation, so editing it never revokes an adapter's `chn` token.
 - **The GitHub webhook is authenticated differently, on purpose.** `/github/webhook`
   verifies the HMAC signature GitHub sends (`x-hub-signature-256` against
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an

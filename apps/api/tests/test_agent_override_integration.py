@@ -119,7 +119,14 @@ def test_patch_without_field_leaves_it_unchanged(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["channels"] == [{"kind": "slack", "address": moved}]
+    assert body["channels"] == [
+        {
+            "kind": "slack",
+            "address": moved,
+            "adapter": "default",
+            "allowed_callers": None,
+        }
+    ]
     assert body[field] == seed
 
 

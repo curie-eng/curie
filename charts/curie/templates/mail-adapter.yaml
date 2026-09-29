@@ -226,13 +226,14 @@ Modeled on templates/dispatcher.yaml, with six deliberate divergences:
     clusterless renders stable. Scoped to this adapter's own three credentials
     so an unrelated key rotating does not restart it.
  6. The deploy gate is a bare `.Values.mailAdapter.deploy`, deliberately NOT the
-    dispatcher's three-way curie.dispatcher.enabled gate on deploy plus both
-    tokens. mailAdapter.deploy defaults to false, so an operator who sets it true
-    has made a deliberate choice and deserves a loud crash-loop naming the
-    missing variable (the adapter's own boot gates do exactly that), not a
-    Deployment that silently fails to render and leaves them hunting for a typo
-    in their values file. The same bare check appears in curie.adapterCredentials,
-    which derives this adapter's egress entry only when it is deployed.
+    dispatcher's curie.dispatcher.enabled gate, which also waits for the Slack
+    identity `default` to have both tokens. mailAdapter.deploy defaults to false,
+    so an operator who sets it true has made a deliberate choice and deserves a
+    loud crash-loop naming the missing variable (the adapter's own boot gates do
+    exactly that), not a Deployment that silently fails to render and leaves
+    them hunting for a typo in their values file. The same bare check appears
+    in curie.adapterCredentials, which derives this adapter's egress entry only
+    when it is deployed.
 */}}
 apiVersion: v1
 kind: Service

@@ -16,6 +16,7 @@ sites are asserted by T-A17 (dispatcher), T-A18 (resume) and T-C2 (ingress).
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,14 @@ from aci_protocol import (
     parse_queued_turn,
 )
 from aci_protocol.events import _READER_CONTEXT_KEY
+from aci_protocol.turn import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DEFAULT_IDENTITY,
+    SLACK_KIND,
+    matching_routes,
+    route_identity,
+    slack_speaking_identity,
+)
 from pydantic import ValidationError
 
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
@@ -281,7 +290,7 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
 
 
 def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
-    assert PROTOCOL_VERSION == "0.5.5"
+    assert PROTOCOL_VERSION == "0.5.6"
     assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
     assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
 
@@ -575,3 +584,154 @@ def test_a_targeted_turn_still_round_trips_for_every_source(
     assert restored == turn
     assert restored.reply_handle == turn.reply_handle
     assert restored.source is source
+
+
+def test_a_slack_route_without_an_adapter_is_the_default_identity() -> None:
+    # A handle queued before ADR-0168 decision 3, or an approval row decision 5
+    # has not backfilled yet, still carries NULL. It means the one Slack app.
+    assert route_identity(SLACK_KIND, None) == DEFAULT_IDENTITY == "default"
+
+
+def test_a_named_slack_identity_is_kept() -> None:
+    assert route_identity("slack", "support-bot") == "support-bot"
+
+
+def test_another_kind_keeps_its_adapter_or_its_absence() -> None:
+    assert route_identity("email", "agentmail-sandbox") == "agentmail-sandbox"
+    # A route-less non-Slack binding stays route-less: NULL is not an identity.
+    assert route_identity("email", None) is None
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint", "expected"),
+    [
+        (None, None, DEFAULT_IDENTITY),
+        ("default", None, DEFAULT_IDENTITY),
+        ("support-bot", None, "support-bot"),
+        # An empty endpoint is no endpoint: the route is the configured Slack.
+        ("support-bot", "", "support-bot"),
+        (CLUSTER_MESSAGE_ADAPTER, None, DEFAULT_IDENTITY),
+        # A CLI stub turn carries a per-turn Slack origin (#19); it still
+        # speaks as its identity.
+        ("ops-bot", "http://cli-stub.test/api/", "ops-bot"),
+        (None, "http://127.0.0.1:1", DEFAULT_IDENTITY),
+    ],
+)
+def test_a_slack_route_speaks_as_its_resolved_identity(
+    adapter: str | None, endpoint: str | None, expected: str
+) -> None:
+    assert slack_speaking_identity(SLACK_KIND, adapter, endpoint) == expected
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint"),
+    [("agentmail-sandbox", "https://mail.example.test/"), (None, None)],
+)
+def test_another_kinds_slack_calls_speak_as_the_default_identity(
+    adapter: str | None, endpoint: str | None
+) -> None:
+    # A mail route's `adapter` names a mail adapter, never a Slack identity, so
+    # a Slack call made for it (an approver group lookup) keeps the default app.
+    assert slack_speaking_identity("email", adapter, endpoint) == DEFAULT_IDENTITY
+
+
+@dataclass(frozen=True)
+class _Row:
+    """A minimal stand-in for any row `matching_routes` can read: an ORM
+    object, a SQLAlchemy `Row`, or a plain object -- the function only ever
+    touches kind, address and adapter; `endpoint` lets a case carry one."""
+
+    kind: str
+    address: str
+    adapter: str | None
+    endpoint: str | None
+
+
+def test_a_slack_turn_with_no_adapter_matches_the_stored_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    other_pair = _Row(kind="slack", address="C0EXAMPLE2", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row, other_pair], "slack", "C0EXAMPLE1", None) == [
+        default_row
+    ]
+
+
+def test_a_slack_turn_with_adapter_default_matches_the_same_null_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "default") == [default_row]
+
+
+def test_a_slack_turn_with_a_named_adapter_does_not_match_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "second") == []
+
+
+def test_an_omitted_slack_adapter_never_reaches_a_named_identitys_row() -> None:
+    # ADR-0168 decision 3: an omitted Slack adapter is the default identity and
+    # nothing else, whatever else is bound on the pair.
+    named = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+    legacy = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes([named, legacy], "slack", "C0EXAMPLE1", None) == []
+    assert matching_routes([named, legacy], "slack", "C0EXAMPLE1", "curie-cluster-message") == []
+
+
+def test_two_identities_on_one_slack_channel_each_match_their_own_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="default", endpoint=None)
+    named = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes([default_row, named], "slack", "C0EXAMPLE1", None) == [default_row]
+    assert matching_routes([default_row, named], "slack", "C0EXAMPLE1", "second") == [named]
+
+
+# `curie cluster message` relays a turn with the worker's built-in reply
+# adapter. That adapter picks where the reply is delivered, not which binding
+# answers: the turn is still the channel's own Slack turn.
+_CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
+
+def test_the_cluster_message_relay_adapter_is_not_an_identity() -> None:
+    assert route_identity(SLACK_KIND, _CLUSTER_MESSAGE_ADAPTER) == DEFAULT_IDENTITY
+
+
+def test_a_cluster_message_relay_turn_matches_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    named_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes(
+        [default_row, named_row], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [default_row]
+
+
+def test_a_non_slack_turn_with_an_adapter_matches_only_its_own_row() -> None:
+    named = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    other = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "acme") == [
+        named
+    ]
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "missing") == []
+
+
+def test_a_non_slack_turn_with_no_adapter_matches_every_row_on_the_pair() -> None:
+    # Migration 0069's triple key allows this, and the omitted selector's
+    # semantics are "every row on the pair", not "none".
+    first = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    second = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([first, second], "webhook", "https://example.test/hook", None) == [
+        first,
+        second,
+    ]

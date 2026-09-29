@@ -14,7 +14,9 @@ silent, which is the defect that ticket closes.
     processed, at root or in a thread. A *bot*-authored mention is processed
     at root; one carrying ``thread_ts`` requires an exact sender/channel pair
     in ``CURIE_SLACK_THREADED_BOT_ALLOWLIST`` or is refused as
-    ``BOT_AUTHORED_THREAD_REPLY``, because Curie's own replies are always
+    ``BOT_AUTHORED_THREAD_REPLY``, unless it comes from another of this
+    installation's own identities, whose bot ids preflight's ``auth.test``
+    reported (ADR-0168 decision 6), because Curie's own replies are always
     threaded and two installations in one workspace could otherwise mention-loop
     each other -- a case Bolt's self filter cannot see, since the two bot
     identities differ.
@@ -29,30 +31,43 @@ silent, which is the defect that ticket closes.
     self-authored events before any listener here runs.
 
 On both lanes the only content filter is the closed ``NON_CONTENT_SUBTYPES``
-denylist; unknown and future subtypes are actionable. Refusals made *above*
+denylist; unknown and future subtypes are actionable.
+
+After those filters, and before the idempotency claim, every turn-starting lane
+(mentions, direct messages and non-approval button clicks) asks the platform
+whether the caller may talk to the bot through this binding (ADR 0175,
+``admission.AdmissionGate``). A refused caller gets no placeholder and no
+reply; the refusal is logged as ``CALLER_NOT_ALLOWED`` or, when the API could
+not answer and nothing was cached, ``ADMISSION_UNAVAILABLE``, and counted on
+``curie.turn.refused``. Approval-card clicks never start a turn (ADR-0106) and
+are not asked. Refusals made *above*
 these listeners by Bolt's own middleware (self events, authorization, listener
 matching) are documented in ``docs/interfaces/channel-ingress/INTERFACE.md``
 rather than re-implemented here.
 
-We use the dispatcher's own ``WebClient`` (built from the bot token) rather than
-Bolt's per-request injected client so the Web API surface is a single, mockable
-seam. Routing, retries, and run orchestration are the worker's job (F1), not the
-dispatcher's.
+Each identity's Bolt app is registered with that identity's own ``WebClient``
+(built from its bot token) rather than Bolt's per-request injected client, so the
+Web API surface is a single, mockable seam per identity, and every placeholder,
+card stamp and ephemeral is made by the app the delivery arrived on (ADR-0168
+decision 2). Routing, retries, and run orchestration are the worker's job (F1),
+not the dispatcher's.
 """
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
-from curie_telemetry import operation_span
+from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
 from slack_bolt import App
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
+from .admission import AdmissionGate, build_admission
 from .approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
@@ -72,6 +87,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .identities import delivery_key, minted_adapter
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
@@ -194,6 +210,61 @@ def _post_placeholder(
         raise
 
 
+def _event_callers(event: dict[str, Any]) -> list[str]:
+    """Every id Slack reports for who sent this event (ADR 0175 decision 2).
+
+    The sender's user id, plus the bot id when a bot sent it: a bot-sent
+    message may carry both, and any one of them on the binding's list admits.
+    Read from the event's own identity fields, never the message text, which
+    any sender fully controls.
+    """
+    return [str(value) for value in (event.get("user"), event.get("bot_id")) if value]
+
+
+def _refused_caller(
+    *,
+    admission: AdmissionGate,
+    log: logging.Logger,
+    event_id: str,
+    channel: str,
+    slack_identity: str,
+    callers: list[str],
+    lane: str,
+) -> bool:
+    """Ask the platform whether this caller may start a turn; drop them if not.
+
+    The one admission call site for every turn-starting lane, so the three
+    lanes cannot drift apart on what they ask or how a refusal is recorded. It
+    runs after the lane's own filters and BEFORE ``claim_event``: a refused
+    caller claims nothing, gets no placeholder and no reply (decision 3), and a
+    later delivery of the same event after the list changes is judged afresh.
+
+    Returns:
+        True when the caller was refused and the delivery dropped.
+    """
+    reason = admission.refusal(
+        address=channel, adapter=minted_adapter(slack_identity), callers=callers
+    )
+    if reason is None:
+        return False
+    # A refused caller is logged at DEBUG: in a busy shared channel most
+    # people may be unlisted, and one INFO line per message would drown the
+    # log. The counter below still counts every refusal. An unavailable API is
+    # an outage signal and stays at INFO.
+    drop(
+        log,
+        reason,
+        event_id=event_id,
+        level=logging.DEBUG if reason is DropReason.CALLER_NOT_ALLOWED else logging.INFO,
+        lane=lane,
+    )
+    record_metric(
+        "curie.turn.refused",
+        attributes={"service.name": "curie-dispatcher", "reason": reason.value},
+    )
+    return True
+
+
 def _mint_turn(
     *,
     web_client: WebClient,
@@ -208,6 +279,7 @@ def _mint_turn(
     attachments: list[Attachment],
     channel: str,
     thread_ts: str,
+    slack_identity: str,
 ) -> str:
     """Post the placeholder, enqueue the turn, and return its Stream id.
 
@@ -233,6 +305,10 @@ def _mint_turn(
     at the call site, for the same reason ``source`` and ``adapter`` are stated
     rather than defaulted. A silent default here is how the next lane to grow
     files would quietly keep dropping them.
+
+    ``slack_identity`` is the identity whose app this delivery arrived on,
+    stated by the caller for the same reason. It is never read from the
+    delivery.
     """
     placeholder = _post_placeholder(
         web_client=web_client,
@@ -266,12 +342,14 @@ def _mint_turn(
         source=TurnSource.SLACK,
         # The literal "slack" is this dispatcher stating what it is; it never
         # comes from config, because a Slack Socket Mode dispatcher that could
-        # claim another kind is a misrouting vector. `adapter=None` is explicit
-        # rather than defaulted so a reader sees that Slack's route is the
-        # worker's configured origin, not an oversight (ADR-0096 D4.4). Same
-        # literal, same reason, on both lanes.
+        # claim another kind is a misrouting vector. `adapter` is the identity
+        # whose app the delivery arrived on, never a field of the delivery
+        # (ADR-0168 decisions 2 and 3). Same rule, same reason, on both lanes.
         reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
+            kind="slack",
+            channel=channel,
+            placeholder=placeholder_ts,
+            adapter=minted_adapter(slack_identity),
         ),
         received_at=clock(),
         # Refs only, and derived BESIDE the text rather than folded into it: see
@@ -281,11 +359,12 @@ def _mint_turn(
     )
     stream_id = enqueue(redis_client, config, queued)
     log.info(
-        "enqueued %s %s as stream entry %s identity=%s",
+        "enqueued %s %s as stream entry %s identity=%s slack_identity=%s",
         delivery_kind,
         slack_event_id,
         stream_id,
         release_identity(),
+        slack_identity,
     )
     return stream_id
 
@@ -298,7 +377,10 @@ def process_event(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    slack_identity: str,
+    admission: AdmissionGate,
     bot_user_id: str | None = None,
+    identity_bots: Mapping[str, str] | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -307,6 +389,21 @@ def process_event(
     ``lane`` says which subscribed lane the delivery arrived on; the
     bot-authorship rule is lane-specific (see ``relevance.classify``) and cannot
     be inferred from the event body alone.
+
+    ``slack_identity`` is the identity whose app this delivery arrived on. It
+    is fixed when the listener is registered, and nothing in ``body`` or
+    ``event`` can change it. It has no default, so a lane that forgets to pass
+    it fails instead of minting ``default``'s turn.
+
+    ``identity_bots`` maps the bot id of each identity this installation connects
+    to its bot user id, from preflight's ``auth.test`` (ADR-0168 decision 6). A
+    delivery from one of those bots is admitted in a thread, and its author is
+    that bot user, never the event's ``user``, so the worker's sibling limit can
+    recognise it. That bot user is what an approval this turn raises later
+    shows as "Requested by", and what the agent sees as the turn's ``user``.
+
+    ``admission`` is the caller-list check (ADR 0175). It has no default, so
+    no lane can start a turn without asking.
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
@@ -339,8 +436,12 @@ def process_event(
         )
         return None
 
+    bots = identity_bots or {}
     reason = classify(
-        event, lane=lane, threaded_bot_allowlist=config.slack_threaded_bot_allowlist
+        event,
+        lane=lane,
+        threaded_bot_allowlist=config.slack_threaded_bot_allowlist,
+        identity_bot_ids=bots.keys(),
     )
     if reason is not None:
         drop(log, reason, event_id=slack_event_id, lane=lane)
@@ -351,8 +452,26 @@ def process_event(
         kind=SpanKind.CONSUMER,
         attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
     ):
-        if not claim_event(redis_client, config, slack_event_id):
-            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
+        sender_bot = event.get("bot_id")
+        author = (
+            bots.get(sender_bot, "") if isinstance(sender_bot, str) else ""
+        ) or str(event.get("user") or "")
+        delivery_id = delivery_key(slack_event_id, slack_identity)
+        if _refused_caller(
+            admission=admission,
+            log=log,
+            event_id=delivery_id,
+            channel=channel,
+            slack_identity=slack_identity,
+            # The turn's author as well: for a sibling identity's bot that is
+            # its bot user id (ADR-0168 decision 6), which an operator may
+            # have listed instead of the bot id.
+            callers=list(dict.fromkeys([author, *_event_callers(event)])),
+            lane=lane,
+        ):
+            return None
+        if not claim_event(redis_client, config, delivery_id):
+            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
 
         return _mint_turn(
@@ -361,9 +480,9 @@ def process_event(
             config=config,
             log=log,
             clock=clock,
-            slack_event_id=slack_event_id,
+            slack_event_id=delivery_id,
             delivery_kind="slack event",
-            author=event.get("user", ""),
+            author=author,
             # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
             # carries an empty or fallback-only top-level `text` and its real body in
             # `blocks`/`attachments`, so that read emptied the turn while still
@@ -377,6 +496,7 @@ def process_event(
             attachments=derive_attachments(event),
             channel=channel,
             thread_ts=thread_ts,
+            slack_identity=slack_identity,
         )
 
 
@@ -407,6 +527,8 @@ def process_action(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    slack_identity: str,
+    admission: AdmissionGate,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -416,6 +538,8 @@ def process_action(
 
     Same four steps as ``process_event`` (ack is Bolt's, before this runs); no
     decision about *how* the turn is answered lives here -- that is the worker's.
+    ``slack_identity`` and ``admission`` are required for the same reasons as
+    on ``process_event``: the clicking user is the caller the list judges.
     """
     log = logger or logging.getLogger(__name__)
 
@@ -469,17 +593,26 @@ def process_action(
     if missing:
         drop(log, DropReason.MALFORMED_ENVELOPE, event_id=interaction_id, missing=missing)
         return None
-    slack_event_id = f"action-{interaction}"
+    slack_event_id = delivery_key(f"action-{interaction}", slack_identity)
     with operation_span(
         "curie.turn.ingress",
         kind=SpanKind.CONSUMER,
         attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
     ):
+        user = (body.get("user") or {}).get("id", "")
+        if _refused_caller(
+            admission=admission,
+            log=log,
+            event_id=slack_event_id,
+            channel=channel,
+            slack_identity=slack_identity,
+            callers=[str(user)] if user else [],
+            lane="action",
+        ):
+            return None
         if not claim_event(redis_client, config, slack_event_id):
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
             return None
-
-        user = (body.get("user") or {}).get("id", "")
 
         # The shared tail: same claim -> placeholder -> XADD ordering as
         # `process_event`, because it IS `process_event`'s, so the same release rule
@@ -501,6 +634,7 @@ def process_action(
             attachments=[],
             channel=channel,
             thread_ts=thread_ts,
+            slack_identity=slack_identity,
         )
 
 
@@ -513,12 +647,21 @@ def register_handlers(
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
     resolver: ApprovalResolveClient | None = None,
+    slack_identity: str = DEFAULT_IDENTITY,
+    identity_bots: Mapping[str, str] | None = None,
+    admission: AdmissionGate | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
-    injectable for tests; None builds the production client from config."""
+    injectable for tests; None builds the production client from config.
+    ``slack_identity`` is the identity this app is; every turn either lane
+    mints carries it. ``identity_bots`` is passed to both lanes' ``process_event``.
+    ``admission`` is the caller-list gate (ADR 0175); None builds the production
+    one from config, and ``run`` passes one shared gate to every identity's app
+    so they share one cache."""
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
+    admission_gate = admission if admission is not None else build_admission(config, redis_client)
     # Resolved once here rather than per listener: the lane filter below drops
     # outside `process_event`, so it needs a logger of its own, and the injected
     # one is the single logger every drop must land on.
@@ -535,7 +678,10 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
+            admission=admission_gate,
             bot_user_id=context.get("bot_user_id"),
+            identity_bots=identity_bots,
             clock=clock,
             logger=logger,
         )
@@ -549,7 +695,7 @@ def register_handlers(
         # this reason means the installed app is subscribed to something the
         # manifest does not declare. It also cannot move to the routing seam even
         # in principle: `QueuedTurn` carries no lane and no subtype, and
-        # `BindingResolver.resolve` sees only (kind, channel).
+        # `BindingResolver.resolve` sees only (kind, adapter, address).
         channel_type = event.get("channel_type")
         if channel_type != "im":
             drop(
@@ -566,7 +712,10 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
+            admission=admission_gate,
             bot_user_id=context.get("bot_user_id"),
+            identity_bots=identity_bots,
             clock=clock,
             logger=logger,
         )
@@ -744,6 +893,8 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
+            admission=admission_gate,
             clock=clock,
             logger=logger,
         )

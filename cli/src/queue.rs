@@ -27,6 +27,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::api::DEFAULT_SLACK_IDENTITY;
+use crate::message::CLUSTER_MESSAGE_RELAY_ADAPTER;
+
 pub const DEFAULT_STREAM: &str = RUNS_STREAM_DEFAULT;
 pub const DEFAULT_VALKEY_URL: &str = "redis://:valkeypass@localhost:26379";
 /// The worker's consumer group (CURIE_CONSUMER_GROUP default); used to detect
@@ -71,16 +74,41 @@ fn percent_encode_unreserved(s: &str) -> String {
 }
 
 /// The worker's internal sandbox key for a turn: percent-encoded
-/// `kind:channel:conversation_id`. Frozen with the Python `_thread_key_for`
-/// helper in `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member
-/// that is only the conversation_id cannot release the sandbox (#2259).
-pub fn thread_key_for(kind: &str, channel: &str, conversation_id: &str) -> String {
-    [
-        percent_encode_unreserved(kind),
-        percent_encode_unreserved(channel),
-        percent_encode_unreserved(conversation_id),
-    ]
-    .join(":")
+/// `kind:channel:conversation_id`, with the route's identity as a segment after
+/// `kind` unless it is none or `default` (ADR-0168 decision 4).
+/// Frozen with the Python `_thread_key_for` helper in
+/// `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member that is only
+/// the conversation_id cannot release the sandbox (#2259). A disconnected
+/// `curie cluster message` turn's built-in reply adapter
+/// (`message::CLUSTER_MESSAGE_RELAY_ADAPTER`) selects where the reply is
+/// delivered, not which binding answers: the turn is the channel's own Slack
+/// turn, so it resolves as the default identity, same as
+/// `aci_protocol.turn.route_identity`.
+pub fn thread_key_for(
+    kind: &str,
+    adapter: Option<&str>,
+    channel: &str,
+    conversation_id: &str,
+) -> String {
+    // `aci_protocol.turn.route_identity`: a Slack route with no adapter, or
+    // with the built-in disconnected-message relay adapter, is the default
+    // app; any other kind's adapter is its identity as stored.
+    let identity = if kind == "slack" {
+        Some(
+            adapter
+                .filter(|name| !name.is_empty() && *name != CLUSTER_MESSAGE_RELAY_ADAPTER)
+                .unwrap_or(DEFAULT_SLACK_IDENTITY),
+        )
+    } else {
+        adapter
+    };
+    let mut segments = vec![percent_encode_unreserved(kind)];
+    if let Some(identity) = identity.filter(|name| *name != DEFAULT_SLACK_IDENTITY) {
+        segments.push(percent_encode_unreserved(identity));
+    }
+    segments.push(percent_encode_unreserved(channel));
+    segments.push(percent_encode_unreserved(conversation_id));
+    segments.join(":")
 }
 
 /// [`thread_key_for`] from a minted `QueuedTurn`.
@@ -91,6 +119,7 @@ pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
         .expect("thread keys require a targeted turn");
     thread_key_for(
         &reply_handle.kind,
+        reply_handle.adapter.as_deref(),
         &reply_handle.channel,
         &turn.conversation_id,
     )
@@ -140,19 +169,21 @@ pub fn synthetic_turn(
     placeholder: impl Into<String>,
     endpoint: Option<String>,
 ) -> QueuedTurn {
+    let kind: String = kind.into();
+    // A Slack turn names its identity (ADR-0168 decision 3); `speak_as` and
+    // the cluster-message relay override it.
+    let adapter = (kind == "slack").then(|| DEFAULT_SLACK_IDENTITY.to_string());
     QueuedTurn {
         event_id: new_event_id(),
         conversation_id: conversation_id.into(),
         author: author.into(),
         text: text.into(),
         reply_handle: Some(ReplyHandle {
-            kind: kind.into(),
+            kind,
             channel: channel.into(),
             placeholder: Some(placeholder.into()),
             endpoint,
-            // The CLI's stub keeps the Slack shape, so its route is the
-            // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
-            adapter: None,
+            adapter,
         }),
         received_at: now_rfc3339(),
         // The CLI drives a turn on a person's behalf, so it is a message and not
@@ -167,6 +198,16 @@ pub fn synthetic_turn(
         attachments: Vec::new(),
         hook_run: None,
     }
+}
+
+/// Stamp the identity a selected route speaks through. `None` leaves the
+/// minted identity (`default` for Slack).
+/// @spec ADR-0168 d8
+pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
+    if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
+        handle.adapter = Some(identity.to_string());
+    }
+    turn
 }
 
 /// The JSON blob stored under the stream's single `payload` field.
@@ -663,6 +704,37 @@ mod tests {
         assert_eq!(value["reply_handle"]["placeholder"], "1717.42");
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn speak_as_stamps_a_named_identity_over_the_default() {
+        let turn = || synthetic_turn("slack", "C0EXAMPLE1", "U1", "hi", "1.0", "1.1", None);
+        let named = speak_as(turn(), Some("ops-bot"));
+        assert_eq!(
+            named.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some("ops-bot")
+        );
+        assert_eq!(thread_key_for_turn(&named), "slack:ops-bot:C0EXAMPLE1:1.0");
+        let default = speak_as(turn(), None);
+        assert_eq!(
+            default.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some(DEFAULT_SLACK_IDENTITY)
+        );
+        assert_eq!(thread_key_for_turn(&default), "slack:C0EXAMPLE1:1.0");
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_stub_turn_names_the_default_identity() {
+        let turn = synthetic_turn("slack", "C0EXAMPLE1", "U1", "hi", "1.0", "1.1", None);
+        assert_eq!(
+            turn.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some(DEFAULT_SLACK_IDENTITY)
+        );
+        assert_eq!(thread_key_for_turn(&turn), "slack:C0EXAMPLE1:1.0");
+        let mail = synthetic_turn("email", "a@example.com", "U1", "hi", "1.0", "1.1", None);
+        assert_eq!(mail.reply_handle.as_ref().unwrap().adapter, None);
+    }
+
     #[test]
     fn synthetic_ids_are_distinct_and_slack_shaped() {
         let (thread_ts, placeholder_ts) = synthetic_thread_and_placeholder();
@@ -757,6 +829,8 @@ mod tests {
     #[serde(deny_unknown_fields)]
     struct ThreadKeyExample {
         kind: String,
+        #[serde(default)]
+        adapter: Option<String>,
         channel: String,
         conversation_id: String,
         thread_key: String,
@@ -794,7 +868,12 @@ mod tests {
         );
         for example in parsed.thread_key_examples {
             assert_eq!(
-                thread_key_for(&example.kind, &example.channel, &example.conversation_id),
+                thread_key_for(
+                    &example.kind,
+                    example.adapter.as_deref(),
+                    &example.channel,
+                    &example.conversation_id
+                ),
                 example.thread_key,
                 "CLI thread_key_for drifted from tests/vectors/thread-reset-set.json"
             );
@@ -815,6 +894,57 @@ mod tests {
         assert_eq!(
             thread_key_for_turn(&turn),
             "slack:C-SIM-abc:eval%3A1720000000.000100"
+        );
+    }
+
+    #[test]
+    fn thread_key_names_a_non_default_identity_and_omits_the_default() {
+        let ts = "1700000000.000100";
+        assert_eq!(
+            thread_key_for("slack", None, "C0EXAMPLE1", ts),
+            "slack:C0EXAMPLE1:1700000000.000100"
+        );
+        assert_eq!(
+            thread_key_for("slack", Some("default"), "C0EXAMPLE1", ts),
+            "slack:C0EXAMPLE1:1700000000.000100"
+        );
+        assert_eq!(
+            thread_key_for("slack", Some("second-bot"), "C0EXAMPLE1", ts),
+            "slack:second-bot:C0EXAMPLE1:1700000000.000100"
+        );
+        assert_eq!(
+            thread_key_for(
+                "email",
+                Some("agentmail-sandbox"),
+                "agent@example.test",
+                "thread/9"
+            ),
+            "email:agentmail-sandbox:agent%40example.test:thread%2F9"
+        );
+        assert_eq!(
+            thread_key_for("email", None, "agent@example.test", "thread/9"),
+            "email:agent%40example.test:thread%2F9"
+        );
+    }
+
+    #[test]
+    fn thread_key_for_turn_reads_the_handles_identity() {
+        let mut turn = eval_case_turn(
+            "slack",
+            "C0EXAMPLE1",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            None,
+        );
+        turn.reply_handle
+            .as_mut()
+            .expect("an eval turn is targeted")
+            .adapter = Some("second-bot".to_string());
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:second-bot:C0EXAMPLE1:eval%3A1720000000.000100"
         );
     }
 }

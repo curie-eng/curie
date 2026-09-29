@@ -21,14 +21,16 @@ can produce and route the same payload:
                     ``ReplyHandle``)
     received_at     ISO-8601 UTC timestamp of when the adapter received it
 
-For the Slack adapter today, ``event_id`` is the Slack event id, ``conversation_id``
-is the thread ts, ``author`` is the Slack user id, and ``reply_handle`` carries the
-Slack channel plus the placeholder message ts. The Valkey Stream wire encoding (a
+How the Slack adapter fills these fields, including the ``:<identity>`` suffix
+``event_id`` carries for any Slack identity but ``default``, is stated once, in
+``docs/interfaces/channel-ingress/INTERFACE.md``. The Valkey Stream wire encoding (a
 single ``payload`` field holding this model's JSON) is a transport detail and
 stays outside this package, in the dispatcher's queue module.
 """
 
+from collections.abc import Sequence
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import model_validator
 
@@ -75,6 +77,103 @@ class TurnSource(StrEnum):
         return self is not TurnSource.SLACK
 
 
+#: The channel kind whose route is the worker's configured transport rather than
+#: an adapter endpoint (ADR-0096 D4.4).
+SLACK_KIND = "slack"
+
+#: The identity every Slack route had before ADR-0168: the installation's one
+#: Slack app (ADR-0168 decision 1).
+DEFAULT_IDENTITY = "default"
+
+#: The worker's built-in reply adapter for a disconnected ``curie cluster
+#: message`` turn. It selects where the reply is delivered, not which binding
+#: answers: the turn is the channel's own Slack turn, so it resolves as the
+#: default identity.
+CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
+
+def route_identity(kind: str, adapter: str | None) -> str | None:
+    """The identity a route's ``adapter`` names (ADR-0168 decision 3).
+
+    A Slack route with no adapter predates the identity: a handle still queued
+    across the upgrade, or a row written by an API pod that has not rolled
+    (migration 0069 backfills every row stored before it). It means the default app, so every
+    reader compares identities through this function and never on the raw
+    column. ``CLUSTER_MESSAGE_ADAPTER`` on a Slack route is a delivery
+    selector, not an identity, so it is the default too. Any other kind is
+    returned unchanged, because a NULL there is a binding whose route is not
+    configured yet, not an identity.
+    """
+
+    if kind == SLACK_KIND:
+        if adapter == CLUSTER_MESSAGE_ADAPTER:
+            return DEFAULT_IDENTITY
+        return adapter or DEFAULT_IDENTITY
+    return adapter
+
+
+def slack_speaking_identity(kind: str, adapter: str | None, endpoint: str | None) -> str:
+    """The identity whose bot token a route's Slack calls carry (ADR-0168 decision 5).
+
+    A Slack route speaks as ``route_identity`` resolves it. Its ``endpoint``,
+    when set, is a per-turn Slack origin (a CLI stub turn's), never a
+    credential selector, so it does not change the answer. Any other kind
+    keeps ``DEFAULT_IDENTITY``: its ``adapter`` names that kind's egress
+    adapter, never a Slack app. This is not a wire field; the worker and the
+    API each call it on the route they already hold.
+    """
+
+    if kind != SLACK_KIND:
+        return DEFAULT_IDENTITY
+    return route_identity(SLACK_KIND, adapter) or DEFAULT_IDENTITY
+
+
+class RouteRow(Protocol):
+    """The three columns ``matching_routes`` reads off a candidate row.
+
+    Structural on purpose: an ORM row (`apps/api`'s ``AgentChannel``), a raw
+    SQLAlchemy ``Row`` from a labeled SELECT, or any other object exposing
+    these three attributes satisfies it, so the one matching rule can run over
+    whichever shape its caller already holds.
+    """
+
+    kind: str
+    address: str
+    adapter: str | None
+
+
+def matching_routes[R: RouteRow](
+    rows: Sequence[R], kind: str, address: str, adapter: str | None
+) -> list[R]:
+    """The rows in ``rows`` that the route triple ``(kind, address, adapter)`` selects.
+
+    ADR-0168 decision 3's one matching rule: the API's
+    `apps/api/src/curie_api/crud.py::matching_bindings` and the worker's
+    binding resolver both answer "is this the same route" through this
+    function, over rows they source differently -- ORM objects, a locked
+    per-agent set, or a raw SQL result narrowed in Python.
+
+    For Slack, ``adapter`` names an IDENTITY and the match is on the RESOLVED
+    identity (``route_identity``), never the raw column, so an omitted
+    adapter means 'default'. For any other kind, an omitted adapter selects
+    every row on ``(kind, address)`` -- the triple key (migration 0069) lets
+    several routes share a pair, and a caller that needs one row narrows
+    further -- and a non-Slack ``adapter=other`` selects none.
+    """
+
+    if kind == SLACK_KIND and adapter == CLUSTER_MESSAGE_ADAPTER:
+        # A relay turn resolved on (kind, address) alone before the route
+        # triple, so it selects exactly what an omitted adapter selects.
+        adapter = None
+    wanted = route_identity(kind, adapter)
+    same_route = [r for r in rows if r.kind == kind and r.address == address]
+    return [
+        r
+        for r in same_route
+        if (adapter is None and kind != SLACK_KIND) or route_identity(r.kind, r.adapter) == wanted
+    ]
+
+
 class ReplyHandle(_AciModel):
     """Channel-neutral coordinates for where a turn's reply is delivered.
 
@@ -106,10 +205,12 @@ class ReplyHandle(_AciModel):
     the reply, so a sink call made *before* binding resolution can still select the
     right credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both
     **platform-set from the binding row** (never accepted from an ingress request
-    body); ``slack`` legitimately carries neither, because its route is the
-    worker's configured Slack origin. ``adapter`` is optional at the schema so a
-    third-party or pre-upgrade producer is not rejected outright, but every
-    first-party mint site sets it explicitly.
+    body); ``slack`` carries no endpoint, because its route is the worker's
+    configured Slack origin, and names its identity in ``adapter`` (ADR-0168
+    decision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).
+    ``adapter`` is optional at the schema so a third-party or pre-upgrade
+    producer is not rejected outright, but every first-party mint site sets it
+    explicitly.
     """
 
     kind: str

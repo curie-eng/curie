@@ -61,6 +61,23 @@
       },
       "cardinality_bound": 216
     },
+    "curie.turn.refused": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Callers refused before a turn by a binding's caller list.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher"
+        ],
+        "reason": [
+          "caller_not_allowed",
+          "admission_unavailable"
+        ]
+      },
+      "cardinality_bound": 4
+    },
     "curie.turn.duration": {
       "type": "histogram",
       "unit": "s",
@@ -94,6 +111,68 @@
         ]
       },
       "cardinality_bound": 216
+    },
+    "curie.agent.turn.completed": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ],
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired"
+        ],
+        "agent": {
+          "kind": "bounded",
+          "ceiling": 32,
+          "reserved": [
+            "other",
+            "unbound"
+          ],
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+        }
+      },
+      "cardinality_bound": 306
+    },
+    "curie.schedule.fire": {
+      "type": "counter",
+      "unit": "{fire}",
+      "description": "Durably settled hook fires.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "trigger": [
+          "cron",
+          "bind",
+          "webhook",
+          "test"
+        ],
+        "outcome": [
+          "ran",
+          "deferred",
+          "skipped",
+          "blocked",
+          "reclaimed",
+          "failed"
+        ]
+      },
+      "cardinality_bound": 24
     },
     "curie.history.resume.cache_read": {
       "type": "histogram",
@@ -1079,6 +1158,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
@@ -1095,6 +1175,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1108,6 +1190,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1167,10 +1250,15 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
           "/work-items",
           "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1194,7 +1282,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4120
+      "cardinality_bound": 4480
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1216,6 +1304,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
@@ -1232,6 +1321,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1245,6 +1336,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1304,10 +1396,15 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
           "/work-items",
           "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1331,7 +1428,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4120
+      "cardinality_bound": 4480
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1353,6 +1450,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
@@ -1369,6 +1467,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1382,6 +1482,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1441,10 +1542,15 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
           "/work-items",
           "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1461,7 +1567,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 824
+      "cardinality_bound": 896
     },
     "curie.background.loop": {
       "type": "counter",

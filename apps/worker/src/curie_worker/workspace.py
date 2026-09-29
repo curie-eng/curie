@@ -1490,6 +1490,7 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         repo_full_name: str | None = None,
         replace_handle: Any | None = None,
         revalidate_before_handoff: Callable[[], None] | None = None,
@@ -1579,6 +1580,7 @@ class WorkspaceClaimCoordinator:
                         publication_visible_outcome_revision
                     ),
                     agent_name=agent_name,
+                    runner_resources=runner_resources,
                     **candidate_guard,
                 )
             else:
@@ -1587,6 +1589,7 @@ class WorkspaceClaimCoordinator:
                         thread_key,
                         env=claim_env,
                         agent_name=agent_name,
+                        runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
                         publication_visible_outcome_revision=(
@@ -1603,6 +1606,7 @@ class WorkspaceClaimCoordinator:
                         thread_key,
                         env=claim_env,
                         agent_name=agent_name,
+                        runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
                         publication_visible_outcome_revision=(

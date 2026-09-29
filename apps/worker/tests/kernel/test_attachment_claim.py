@@ -44,8 +44,10 @@ from aci_protocol import (
     Attachment,
     Final,
     QueuedTurn,
+    ReplyHandle,
     SessionStatus,
     TextDelta,
+    TurnSource,
 )
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
@@ -221,7 +223,7 @@ class _WorkspaceBinding:
             workspace_enabled=workspace_enabled,
         )
 
-    async def resolve(self, _kind: str, _channel: str) -> _WorkspaceResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _WorkspaceResolved:
         return self.resolved
 
     def boot_env(
@@ -2095,5 +2097,39 @@ def test_workspace_route_live_again_at_adopt_refuses_the_file_turn(
                 ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
             )
             assert h.substrate.lookup(thread_key) == old
+
+    asyncio.run(go())
+
+
+def test_the_lane_is_asked_for_the_identity_the_turn_arrived_on(make_harness) -> None:
+    """ADR-0168 decision 5: a file is fetched with the addressed bot's token."""
+
+    def turn(thread: str, adapter: str | None) -> QueuedTurn:
+        return QueuedTurn(
+            event_id=f"ev-{thread}",
+            conversation_id=thread,
+            author="U1",
+            text="what does this say?",
+            reply_handle=ReplyHandle(
+                kind="slack", channel="C1", placeholder="p-1", adapter=adapter
+            ),
+            received_at="2026-07-05T00:00:00+00:00",
+            source=TurnSource.SLACK,
+            attachments=[Attachment(id="F1", name="report.csv", mime_type="text/csv")],
+        )
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+
+            await h.kernel.process_event(turn("tNamedIdentity", "ops-bot"))
+            await h.kernel.process_event(turn("tStockIdentity", None))
+
+            assert [call["extra"] for call in lane.resolve_calls] == [
+                {"identity": "ops-bot"},
+                {"identity": "default"},
+            ]
 
     asyncio.run(go())

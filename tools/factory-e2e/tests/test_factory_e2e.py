@@ -44,6 +44,8 @@ def _env(app: Path) -> dict[str, str]:
         "CURIE_FACTORY_KUBE_CONTEXT": "scratch",
         "CURIE_FACTORY_APP_DIR": str(app),
         "CURIE_FACTORY_ACTOR_TOKEN": "actor-token",
+        # The default bundle declares a runner layer and ships no lock (#3420).
+        "CURIE_FACTORY_LAYER_REGISTRY": "registry.example/factory",
     }
 
 
@@ -2766,3 +2768,73 @@ def test_judge_quiesce_does_not_require_path_b_helm_to_fail() -> None:
     obs = _passing_quiesce_obs()
     obs["path_b_helm_exit_code"] = 0
     assert fe.judge_quiesce(obs) == []
+
+
+# --- #3420: the default bundle's runner layer is built before deploy ----------
+
+
+def test_default_bundle_declares_a_runner_layer() -> None:
+    assert fe.bundle_declares_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+def test_bundle_without_connectors_declares_no_layer(tmp_path: Path) -> None:
+    assert not fe.bundle_declares_runner_layer(tmp_path)
+
+
+def test_unlocked_layer_without_a_registry_is_refused(tmp_path: Path) -> None:
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_LAYER_REGISTRY"):
+        fe.load_config(env, context=None, gh_token=_no_gh)
+
+
+def test_locked_layer_needs_no_registry(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    shutil.copytree(fe.DEFAULT_BUNDLE, bundle)
+    (bundle / "connectors.lock.yaml").write_text("version: 1\n")
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    env["CURIE_FACTORY_BUNDLE_DIR"] = str(bundle)
+    config = fe.load_config(env, context=None, gh_token=_no_gh)
+    assert config.layer_registry is None
+
+
+def test_layer_is_built_into_a_private_copy_on_the_candidate_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(fe.subprocess, "run", fake_run)
+    deployed = preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+    assert deployed != fe.DEFAULT_BUNDLE
+    assert (deployed / "connectors.yaml").is_file()
+    assert calls == [
+        [
+            "curie",
+            "build",
+            "--plugin-dir",
+            str(deployed),
+            "--registry",
+            "registry.example/factory",
+            "--runner-image",
+            f"ghcr.io/curie-eng/curie-runner:sha-{'c' * 40}",
+        ]
+    ]
+
+
+def test_failed_layer_build_fails_the_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    monkeypatch.setattr(
+        fe.subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(argv, 1, "", "push denied"),
+    )
+    with pytest.raises(fe.PreflightFailed, match="push denied"):
+        preflight.build_runner_layer(fe.DEFAULT_BUNDLE)

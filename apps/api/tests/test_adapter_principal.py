@@ -3,8 +3,9 @@
 The adapter credential (`adp.` token, header `X-Curie-Adapter-Principal`) is
 issued by the platform key, carries exactly three scopes over a set of binding
 rows, and can: mint `chn` tokens for bindings it serves, list approvals routed
-to those bindings, and resolve them on behalf of a sender it authenticated
-(`X-Curie-Approval-Actor`). Every other route keeps refusing it.
+to those bindings, and present a resolve on behalf of a sender it authenticated
+(`X-Curie-Approval-Actor`). Every Slack approver set refuses it (ADR-0177's
+separate finding), and every other route keeps refusing it.
 
 Everything drives the real HTTP surface against real Postgres and Valkey.
 """
@@ -391,31 +392,61 @@ def test_rotation_refuses_expired_token_and_platform_key(
 # --- 5. resolution and audit --------------------------------------------------
 
 
-def test_adapter_resolves_for_listed_sender_and_audits_adapter_subject(
+SLACK_REFUSAL = "only a Slack click can prove a Slack identity"
+
+
+def _assert_slack_refusal(
+    client: TestClient, auth: dict[str, str], approval_id: str, response: Any, actor: str
+) -> None:
+    """The adapter reached the authorizer and was refused on a Slack set.
+
+    403 and not 404: the approval IS served, so the refusal is the approver
+    set's, recorded with the adapter and the sender it named.
+    """
+
+    assert response.status_code == 403, response.text
+    assert SLACK_REFUSAL in response.json()["detail"]
+    assert _status(client, auth, approval_id) == "pending"
+    audit = _audit(client, auth, approval_id)
+    assert audit[-1]["action"] == "denied"
+    assert audit[-1]["authorized"] is False
+    assert audit[-1]["principal_kind"] == "adapter"
+    assert audit[-1]["actor"] == actor
+    assert audit[-1]["principal_subject"] == ADAPTER_SUBJECT
+    assert audit[-1]["actor_channel"] is None
+    assert audit[-1]["authenticated"] is True
+    assert audit[-1]["evidence"] == {
+        "kind": "principal_set_eligibility",
+        "principal_kind": "adapter",
+        "slack_identity_required": True,
+    }
+
+
+def test_adapter_naming_a_listed_slack_user_is_refused(
     adapter_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
+    runs_stream: str,
 ) -> None:
+    """ADR-0177's separate finding: an adapter serving a Slack binding used to
+    resolve a Slack explicit-user route by naming a listed Slack user id. Only
+    the Slack dispatcher vouches for a Slack id (ADR-0106), so the adapter is
+    refused however exactly it names a listed approver, and no resume is owed."""
+
     served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
     approval = _approval(adapter_client, auth_headers, served)
     token = _adapter_token([served["binding_id"]])
 
-    accepted = adapter_client.post(
+    refused = adapter_client.post(
         f"/approvals/{approval['id']}/resolve",
         json={"decision": "approved"},
         headers=_adp(token, SENDER),
     )
-    assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["resolved_by"] == SENDER
-
-    audit = _audit(adapter_client, auth_headers, approval["id"])
-    assert len(audit) == 1
-    assert audit[0]["principal_kind"] == "adapter"
-    assert audit[0]["actor"] == SENDER
-    assert audit[0]["principal_subject"] == ADAPTER_SUBJECT
-    assert audit[0]["actor_channel"] is None
-    assert audit[0]["authenticated"] is True
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], refused, SENDER)
+    assert len(audit_rows := _audit(adapter_client, auth_headers, approval["id"])) == 1
+    assert audit_rows[0]["decision"] == "approved"
+    assert valkey.xrange(runs_stream) == []
 
 
 def test_adapter_sender_not_in_explicit_list_is_403_with_denied_audit(
@@ -430,15 +461,22 @@ def test_adapter_sender_not_in_explicit_list_is_403_with_denied_audit(
         json={"decision": "approved"},
         headers=_adp(token, OTHER),
     )
-    assert denied.status_code == 403, denied.text
-    assert _status(adapter_client, auth_headers, approval["id"]) == "pending"
-    audit = _audit(adapter_client, auth_headers, approval["id"])
-    assert len(audit) == 1
-    assert audit[0]["action"] == "denied"
-    assert audit[0]["authorized"] is False
-    assert audit[0]["principal_kind"] == "adapter"
-    assert audit[0]["actor"] == OTHER
-    assert audit[0]["principal_subject"] == ADAPTER_SUBJECT
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], denied, OTHER)
+
+
+def test_adapter_on_slack_group_route_is_refused(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    served = _routed_agent(adapter_client, auth_headers, approvers={"group": "S0EXAMPLE1"})
+    approval = _approval(adapter_client, auth_headers, served)
+    token = _adapter_token([served["binding_id"]])
+
+    denied = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(token, SENDER),
+    )
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], denied, SENDER)
 
 
 def test_adapter_on_channel_membership_route_is_403_eligibility(
@@ -453,9 +491,7 @@ def test_adapter_on_channel_membership_route_is_403_eligibility(
         json={"decision": "approved"},
         headers=_adp(token, SENDER),
     )
-    assert denied.status_code == 403, denied.text
-    assert "explicit" in denied.json()["detail"].lower()
-    assert _status(adapter_client, auth_headers, approval["id"]) == "pending"
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], denied, SENDER)
 
 
 def test_adapter_resolve_without_actor_header_is_401(
@@ -604,12 +640,14 @@ def test_one_agent_two_routes_adapter_serves_only_its_own_binding(
     assert _status(adapter_client, auth_headers, approval_b["id"]) == "pending"
     assert _audit(adapter_client, auth_headers, approval_b["id"]) == []
 
-    allowed = adapter_client.post(
+    # Binding A's approval IS served, so it reaches the authorizer (403, not
+    # the 404 above), where the Slack set refuses the adapter.
+    served_a = adapter_client.post(
         f"/approvals/{approval_a['id']}/resolve",
         json={"decision": "approved"},
         headers=_adp(token, SENDER),
     )
-    assert allowed.status_code == 200, allowed.text
+    _assert_slack_refusal(adapter_client, auth_headers, approval_a["id"], served_a, SENDER)
 
 
 # --- 9. rotate with an ambiguous credential ------------------------------------
@@ -636,27 +674,23 @@ def test_rotate_refuses_adapter_token_plus_platform_key(
 # --- 10. actor header normalization --------------------------------------------
 
 
-def test_resolve_strips_whitespace_around_a_listed_actor(
+def test_resolve_strips_whitespace_around_the_actor(
     adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """Grok finding 5: the actor header is compared to the explicit user list
-    after stripping, and the audit row records the stripped value, not the
-    raw header with its surrounding whitespace."""
+    """Grok finding 5: the actor header is judged after stripping, and the audit
+    row records the stripped value, not the raw header with its surrounding
+    whitespace."""
 
     served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
     approval = _approval(adapter_client, auth_headers, served)
     token = _adapter_token([served["binding_id"]])
 
-    accepted = adapter_client.post(
+    response = adapter_client.post(
         f"/approvals/{approval['id']}/resolve",
         json={"decision": "approved"},
         headers=_adp(token, f"  {SENDER}  "),
     )
-    assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["resolved_by"] == SENDER
-
-    audit = _audit(adapter_client, auth_headers, approval["id"])
-    assert audit[-1]["actor"] == SENDER
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], response, SENDER)
 
 
 # --- 11. hand-signed cross-prefix / malformed claim rejection ------------------
@@ -799,17 +833,14 @@ def test_http_issued_and_rotated_tokens_drive_mint_resolve_and_audit(
     assert rotated.status_code == 201, rotated.text
     rotated_token = rotated.json()["token"]
 
+    # The rotated token authenticates and is served; the Slack route then
+    # refuses it at the authorizer, and the audit names the adapter.
     resolved = adapter_client.post(
         f"/approvals/{approval['id']}/resolve",
         json={"decision": "approved"},
         headers=_adp(rotated_token, SENDER),
     )
-    assert resolved.status_code == 200, resolved.text
-
-    audit = _audit(adapter_client, auth_headers, approval["id"])
-    assert audit[-1]["principal_kind"] == "adapter"
-    assert audit[-1]["actor"] == SENDER
-    assert audit[-1]["principal_subject"] == ADAPTER_SUBJECT
+    _assert_slack_refusal(adapter_client, auth_headers, approval["id"], resolved, SENDER)
 
 
 # --- 13. adapter + other resolver credential pairs -----------------------------

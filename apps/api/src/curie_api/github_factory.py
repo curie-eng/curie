@@ -18,7 +18,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import workitem_dispatch
+from . import crud, workitem_dispatch
 from .config import Settings
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import (
@@ -232,18 +232,37 @@ async def lock_issue(session: AsyncSession, repository_id: int, issue_number: in
 
 
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    binding = await session.scalar(
-        select(AgentChannel)
-        .join(Agent, Agent.id == AgentChannel.agent_id)
-        .where(
-            AgentChannel.kind == _CHANNEL_KIND,
-            AgentChannel.address == notice.repo_full_name,
-            Agent.repo_full_name == notice.repo_full_name,
+    # `agent_channels_route_key` (migration 0070) lets one repository pair
+    # hold several routes, so the query can return more than one row. The
+    # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
+    # belongs to some OTHER agent's repo, e.g. a stale rename), not what
+    # narrows multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never
+    # Slack, and this notice names no adapter, so `crud.matching_bindings`
+    # with `adapter=None` keeps every row -- shared with every other reader
+    # of a route rather than a fourth copy of the same rule.
+    rows = list(
+        await session.scalars(
+            select(AgentChannel)
+            .join(Agent, Agent.id == AgentChannel.agent_id)
+            .where(
+                AgentChannel.kind == _CHANNEL_KIND,
+                AgentChannel.address == notice.repo_full_name,
+                Agent.repo_full_name == notice.repo_full_name,
+            )
         )
     )
-    if binding is None:
+    matches = crud.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
+    if not matches:
         raise FactoryRefused("binding_missing")
-    return binding
+    if len(matches) > 1:
+        # Two routes on one repository under this repo's agents: never pick one.
+        logger.warning(
+            "github factory refused %s: %d routes are bound to it",
+            notice.repo_full_name,
+            len(matches),
+        )
+        raise FactoryRefused("binding_missing")
+    return matches[0]
 
 
 def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> _Facts:

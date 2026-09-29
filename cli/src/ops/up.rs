@@ -700,7 +700,103 @@ fn resolve_preserved_values(
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
     all.extend(resolve_preserved_sealing_values(existing, operator_sets));
+    all.extend(resolve_credential_values(
+        existing,
+        operator_sets,
+        crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS,
+    ));
     all
+}
+
+/// What `cluster up` does with the connector caller key pair (ADR-0168
+/// decision 7), decided as the sealing key's is: an operator `--set` or a
+/// named Secret wins, a recorded pair comes back unchanged, and only a release
+/// with none gains one. `--dev` mints none, as it mints no sealing key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallerKeyDisposition {
+    OperatorSet,
+    External,
+    Preserved,
+    Deferred,
+    Generated,
+}
+
+fn connector_caller_key_disposition(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> CallerKeyDisposition {
+    use crate::connector_caller::{
+        CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY,
+    };
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) || set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return CallerKeyDisposition::OperatorSet;
+    }
+    let named = operator_set_entries(operator_sets)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key.trim() == CONNECTOR_CALLER_EXISTING_SECRET)
+        .map(|(_, value)| !value.is_empty())
+        .unwrap_or_else(|| preserved_value(existing, CONNECTOR_CALLER_EXISTING_SECRET).is_some());
+    if named {
+        return CallerKeyDisposition::External;
+    }
+    if preserved_value(existing, CONNECTOR_CALLER_SIGNING_KEY).is_some() {
+        return CallerKeyDisposition::Preserved;
+    }
+    if dry_run {
+        CallerKeyDisposition::Deferred
+    } else {
+        CallerKeyDisposition::Generated
+    }
+}
+
+/// Refuse a `--set` of only one half of the connector caller key pair. The
+/// recorded other half would come back beside it, so the worker would sign
+/// with one key while every caller proxy verifies with the other, and every
+/// hosted connector would refuse every caller.
+fn refuse_half_a_caller_key_pair(operator_sets: &[String]) -> Result<()> {
+    use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) == set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to set only one half of the connector caller key pair: set both \
+         {CONNECTOR_CALLER_SIGNING_KEY} and {CONNECTOR_CALLER_VERIFY_KEY}, or neither"
+    ))
+    .with_fix(format!(
+        "pass {CONNECTOR_CALLER_VERIFY_KEY} as the public key of the \
+         {CONNECTOR_CALLER_SIGNING_KEY} you set, in the same run"
+    ))
+    .into())
+}
+
+/// The connector caller key pair to add to the values file: a new pair only
+/// when the release records none, names no Secret, and the operator set none.
+/// A recorded pair already rides [`resolve_preserved_values`].
+fn generate_connector_caller_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> Result<Vec<(String, String)>> {
+    if connector_caller_key_disposition(existing, operator_sets, dry_run)
+        != CallerKeyDisposition::Generated
+    {
+        return Ok(Vec::new());
+    }
+    let pair = crate::connector_caller::generate_keypair()?;
+    Ok(vec![
+        (
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY.to_string(),
+            pair.signing_key,
+        ),
+        (
+            crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY.to_string(),
+            pair.verify_key,
+        ),
+    ])
 }
 
 /// Resolve managed values for an actual or previewed `cluster up`.
@@ -895,6 +991,124 @@ mod sealing_preservation_tests {
     }
 }
 
+#[cfg(test)]
+mod connector_caller_preservation_tests {
+    use super::*;
+    use crate::connector_caller::{
+        verify_key_of, CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_MANAGED_KEYS,
+        CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY, CONNECTOR_CALLER_SIGNING_KEY,
+        CONNECTOR_CALLER_VERIFY_KEY,
+    };
+
+    // The first frozen seed and its public key
+    // (tests/vectors/connector-caller-token.json).
+    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const PUBLIC: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+
+    fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn recorded() -> serde_json::Value {
+        serde_json::json!({"connectorCaller": {"signingKey": SEED, "verifyKey": PUBLIC}})
+    }
+
+    /// A plain `cluster up` drops anything it does not re-pass, and a new pair
+    /// makes every live sandbox's token unverifiable.
+    #[test]
+    fn an_upgrade_re_supplies_the_recorded_pair_unchanged() {
+        let all = resolve_preserved_values(Some(&recorded()), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_SIGNING_KEY), Some(SEED));
+        assert_eq!(get(&all, CONNECTOR_CALLER_VERIFY_KEY), Some(PUBLIC));
+        assert!(
+            generate_connector_caller_values(Some(&recorded()), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_generates_a_real_pair() {
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        let seed = get(&generated, CONNECTOR_CALLER_SIGNING_KEY).expect("generated");
+        let public = get(&generated, CONNECTOR_CALLER_VERIFY_KEY).expect("generated");
+        assert_eq!(verify_key_of(seed).unwrap(), public);
+    }
+
+    /// How an install that predates the caller proxy starts enforcing.
+    #[test]
+    fn an_existing_release_without_a_pair_gains_one() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let generated = generate_connector_caller_values(Some(&existing), &[], false).unwrap();
+        assert_eq!(generated.len(), 2);
+    }
+
+    #[test]
+    fn a_named_secret_is_never_shadowed_by_a_generated_pair() {
+        let existing = serde_json::json!({"connectorCaller": {"existingSecret": "acme-caller"}});
+        assert!(
+            generate_connector_caller_values(Some(&existing), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+        let sets = vec![format!("{CONNECTOR_CALLER_EXISTING_SECRET}=acme-caller")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&all, CONNECTOR_CALLER_EXISTING_SECRET),
+            Some("acme-caller")
+        );
+    }
+
+    #[test]
+    fn an_operator_set_wins() {
+        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={SEED}")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            get(
+                &resolve_preserved_values(Some(&recorded()), &sets),
+                CONNECTOR_CALLER_SIGNING_KEY
+            ),
+            None
+        );
+    }
+
+    /// An offline preview has no evidence the release lacks a pair.
+    #[test]
+    fn a_dry_run_generates_nothing() {
+        assert!(generate_connector_caller_values(None, &[], true)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Preserved while a rotation overlaps, and never invented.
+    #[test]
+    fn a_previous_key_is_preserved_and_never_generated() {
+        let existing = serde_json::json!({"connectorCaller": {
+            "signingKey": SEED, "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
+        }});
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY), Some("OLD"));
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        assert!(get(&generated, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY).is_none());
+    }
+
+    /// `curie diff` must not report a reset of a key `up` hands straight back.
+    #[test]
+    fn diff_agrees_with_every_caller_key_up_re_supplies() {
+        for key in CONNECTOR_CALLER_MANAGED_KEYS {
+            assert!(is_preserved_by_up(key), "{key}");
+        }
+    }
+}
+
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
@@ -925,6 +1139,11 @@ const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 /// D4.4). Named here so `up`'s preservation, `diff`'s reset reporting, and the
 /// secret classifier below all read the one key.
 const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
+
+/// The declared Slack identities beyond `default` (ADR-0168 decision 1). `up`
+/// carries them with the release's other recorded values; named here so
+/// `diff`'s reset reporting and the secret classifier read the one key.
+const SLACK_IDENTITIES_KEY: &str = "dispatcher.slack.identities";
 
 /// Secret and key *names* the SRE example installer records on
 /// `grafanaConnector`. None of these leaves holds a credential value: the
@@ -1344,8 +1563,9 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// [`resolve_preserved_runner_egress_values`],
 /// [`resolve_preserved_gvisor_mode_value`],
 /// [`resolve_preserved_slack_trusted_origins_value`], and
-/// [`resolve_preserved_grafana_connector_reference_values`] re-supply, which
-/// survive untouched.
+/// [`resolve_preserved_grafana_connector_reference_values`] re-supply, plus the
+/// [`SLACK_IDENTITIES_KEY`] list the live-value overlay carries, which survive
+/// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1366,10 +1586,12 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS.contains(&key)
         || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
+        || key_is_or_descends_from(key, SLACK_IDENTITIES_KEY)
         || is_grafana_connector_reference_key(key)
 }
 
@@ -1419,11 +1641,16 @@ pub fn is_secret_value_key(key: &str) -> bool {
     // masking it would hide the very value the operator opens `curie diff` to
     // confirm survived the upgrade. Grafana connector reference names (#2921)
     // are the same kind of configuration: Secret and data-key names, not the
-    // token those names point at.
+    // token those names point at. The Slack identity list is the same: its
+    // names are configuration, and its Secret references are masked below by
+    // their key names, exactly as before the family was preserved.
     if is_grafana_connector_reference_key(key) {
         return false;
     }
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
+    if (is_preserved_by_up(key)
+        && key != GVISOR_MODE_KEY
+        && key != SLACK_TRUSTED_ORIGINS_KEY
+        && !key_is_or_descends_from(key, SLACK_IDENTITIES_KEY))
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
@@ -1989,6 +2216,7 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    refuse_half_a_caller_key_pair(&operator_sets)?;
     let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
     if preserved_value(existing, &sealing_source).is_some()
         && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
@@ -2029,6 +2257,11 @@ fn complete_up_opts_without_runner_egress(
             &operator_sets,
             opts.common.dry_run,
         ));
+        opts.secrets.extend(generate_connector_caller_values(
+            existing,
+            &operator_sets,
+            opts.common.dry_run,
+        )?);
     } else {
         // `--dev` keeps the chart's published credential defaults (#195) and
         // must not mint a sealing key, but it is still a FULL helm upgrade:
@@ -2104,6 +2337,7 @@ fn overlay_overridden_keys(
         .iter()
         .chain(GITHUB_APP_MANAGED_KEYS)
         .chain(crate::sealing::SEALING_MANAGED_KEYS)
+        .chain(crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS)
         .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
         .chain(GITHUB_TOKEN_REFERENCE_KEYS)
     {
@@ -2169,6 +2403,9 @@ fn overlay_family_is_managed(key: &str) -> bool {
             .iter()
             .any(|(managed, _)| key_is_or_descends_from(key, managed))
         || crate::sealing::SEALING_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS
             .iter()
             .any(|managed| key_is_or_descends_from(key, managed))
         || key_is_or_descends_from(key, GITHUB_TOKEN_KEY)
@@ -4503,6 +4740,11 @@ async fn run_prepared_up(
             | SealingPrivateKeyDisposition::Preserved
             | SealingPrivateKeyDisposition::External => {}
         }
+        if connector_caller_key_disposition(existing.as_ref(), &operator_sets, opts.common.dry_run)
+            == CallerKeyDisposition::Generated
+        {
+            ui.note("generated a connector caller key pair for this release; later cluster up runs preserve it");
+        }
         if existing.is_none() && !opts.common.dry_run {
             let generated_required_secrets = opts
                 .secrets
@@ -5338,6 +5580,84 @@ mod tests {
         );
     }
 
+    /// `dispatcher.slack.identities` (ADR-0168 decision 1) sits beside the
+    /// `default` block `comms` records. `up` is a full upgrade, so a list it
+    /// did not re-pass would silently undeclare every named identity, and the
+    /// API would then refuse every binding that names one.
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_identities_without_reuse_values() {
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {
+                "appToken": "xapp-EXAMPLE",
+                "botToken": "xoxb-EXAMPLE",
+                "identities": [
+                    {
+                        "name": "second",
+                        "appTokenExistingSecret": "slack-second",
+                        "botTokenExistingSecret": "slack-second",
+                        "signingSecretExistingSecret": "slack-second"
+                    },
+                    {
+                        "name": "third",
+                        "appTokenExistingSecret": "slack-third",
+                        "appTokenExistingSecretKey": "app",
+                        "botTokenExistingSecret": "slack-third",
+                        "botTokenExistingSecretKey": "bot"
+                    }
+                ]
+            }}
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                adopt: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "dispatcher.slack.identities[0].name=second",
+            "dispatcher.slack.identities[0].appTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].botTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret=slack-second",
+            "dispatcher.slack.identities[1].name=third",
+            "dispatcher.slack.identities[1].appTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].appTokenExistingSecretKey=app",
+            "dispatcher.slack.identities[1].botTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].botTokenExistingSecretKey=bot",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded Slack identity leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
     /// A plain `cluster up` for an unrelated reason must not silently switch
     /// the worker back to refusing every dev reply endpoint the operator had
     /// already trusted (issue #1897).
@@ -5503,6 +5823,62 @@ mod tests {
             !is_secret_value_key("worker.slackTrustedOrigins"),
             "the trusted-origin list is operator-visible configuration, not a credential"
         );
+    }
+
+    /// `up` hands a recorded `dispatcher.slack.identities` list straight back
+    /// (`plain_up_re_supplies_recorded_slack_identities_without_reuse_values`),
+    /// so `diff` must not announce a reset for any of its leaves. An identity's
+    /// name is configuration an operator reads to confirm which bots survive;
+    /// its Secret references stay masked exactly as their names already say.
+    #[test]
+    fn slack_identities_are_preserved_and_their_names_never_masked() {
+        for key in [
+            "dispatcher.slack.identities",
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[1].signingSecretExistingSecret",
+        ] {
+            assert!(
+                is_preserved_by_up(key),
+                "diff must not report a reset for {key}, which up re-supplies"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+        ] {
+            assert!(
+                !is_secret_value_key(key),
+                "{key} is an identity name, not a credential"
+            );
+            let expression = format!("{key}=second");
+            assert_eq!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must show {key} as written"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].appTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].botTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret",
+            "dispatcher.slack.identities[0].signingSecretExistingSecretKey",
+        ] {
+            assert!(
+                is_secret_value_key(key),
+                "{key} must stay masked as it is today"
+            );
+            let expression = format!("{key}=slack-second");
+            assert_ne!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must mask {key}"
+            );
+        }
     }
 
     fn grafana_reference_release() -> serde_json::Value {
@@ -6482,6 +6858,124 @@ mod tests {
             "a --dev rerun with nothing recorded must not invent secrets: {:?}",
             opts.secrets
         );
+    }
+
+    fn completed_sealed_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
+        let mut opts = completed_dev_up(None, vec![]);
+        opts.dev = false;
+        opts.secrets = vec![];
+        opts.set = set;
+        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+    }
+
+    /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
+    /// `up` on a release with no caller pair hands the chart a real one, and
+    /// the next `up` hands back exactly that pair.
+    #[test]
+    fn a_sealed_up_gains_a_caller_pair_and_the_next_up_keeps_it() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let first = completed_sealed_up(Some(&existing), vec![]);
+        let seed = secret_for(
+            &first,
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY,
+        )
+        .expect("generated")
+        .to_string();
+        let public = secret_for(&first, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY)
+            .expect("generated")
+            .to_string();
+        assert_eq!(
+            crate::connector_caller::verify_key_of(&seed).unwrap(),
+            public
+        );
+        let recorded =
+            serde_json::json!({"connectorCaller": {"signingKey": seed, "verifyKey": public}});
+        let next = completed_sealed_up(Some(&recorded), vec![]);
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some(seed.as_str())
+        );
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some(public.as_str())
+        );
+    }
+
+    /// `--dev` mints no pair (the no-invented-secrets rule above), but it is a
+    /// full upgrade, so a recorded pair must still come back.
+    #[test]
+    fn a_dev_upgrade_re_supplies_a_recorded_caller_pair() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some("SEED-RECORDED")
+        );
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some("PUBLIC-RECORDED")
+        );
+    }
+
+    /// Half a pair would leave the worker signing with one key while every
+    /// caller proxy verifies with the other, so every hosted connector would
+    /// refuse every caller. Refused before anything is resolved, on a sealed
+    /// and a `--dev` up alike, whichever half is given.
+    #[test]
+    fn a_set_of_one_caller_key_half_is_a_usage_error_naming_both() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        let recorded = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        for half in [CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY] {
+            for dev in [false, true] {
+                let mut opts = completed_dev_up(None, vec![]);
+                opts.dev = dev;
+                opts.secrets = vec![];
+                opts.set = vec![format!("{half}=NEW-HALF")];
+                let Err(err) = complete_up_opts_without_runner_egress(
+                    opts,
+                    Some(&recorded),
+                    None,
+                    false,
+                    true,
+                ) else {
+                    panic!("half a caller key pair must be refused: {half} dev={dev}");
+                };
+                assert_eq!(
+                    crate::exit::classify(&err).0,
+                    crate::exit::ExitClass::Usage,
+                    "{half} dev={dev}"
+                );
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(CONNECTOR_CALLER_SIGNING_KEY)
+                        && message.contains(CONNECTOR_CALLER_VERIFY_KEY),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// Both halves together, or both cleared together, stay the operator's.
+    #[test]
+    fn a_set_of_both_caller_key_halves_is_accepted() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        for (seed, public) in [("NEW-SEED", "NEW-PUBLIC"), ("", "")] {
+            let opts = completed_sealed_up(
+                None,
+                vec![
+                    format!("{CONNECTOR_CALLER_SIGNING_KEY}={seed}"),
+                    format!("{CONNECTOR_CALLER_VERIFY_KEY}={public}"),
+                ],
+            );
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_SIGNING_KEY), None);
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_VERIFY_KEY), None);
+        }
     }
 
     #[test]

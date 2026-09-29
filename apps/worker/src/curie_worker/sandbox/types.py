@@ -19,6 +19,7 @@ from typing import Literal, Protocol
 
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
+from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
 from plugin_format import is_reserved_boot_env_name
 
 # Substrate-neutral labels: every backend tags its managed objects with these
@@ -85,6 +86,12 @@ def claim_warm_pool(
         return pool
     return base_pool
 
+# The worker's own credentials, which never enter a sandbox. The connector
+# caller signing key is here and the caller token it signs
+# (``CURIE_CONNECTOR_CALLER_TOKEN``) is deliberately not: the token is this
+# sandbox's own identity, short-lived and naming only its agent, and the runner
+# must keep it to present to its hosted connectors (ADR-0168 decision 7). The
+# key could mint a token naming any agent.
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     {
         "POSTGRES_PASSWORD",
@@ -98,8 +105,20 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
 )
+
+#: A second Slack identity's tokens are indexed (ADR-0168 decision 1), so they
+#: are matched by prefix rather than listed. Every name here is under ``CURIE_``,
+#: which a connector secret may never declare, so no marker readmits one.
+HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = SLACK_CREDENTIAL_ENV_PREFIXES
+
+
+def _is_host_application_credential(name: str) -> bool:
+    return name in HOST_APPLICATION_CREDENTIAL_ENV_NAMES or name.startswith(
+        HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES
+    )
 
 
 def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
@@ -115,7 +134,7 @@ def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
     return {
         name: value
         for name, value in env.items()
-        if name not in HOST_APPLICATION_CREDENTIAL_ENV_NAMES
+        if not _is_host_application_credential(name)
         or (
             name in declared_connector_secret_names
             and not is_reserved_boot_env_name(name)
@@ -166,6 +185,10 @@ class SandboxHandle:
     # runner reads it once at boot, so a delivery wanting a different budget
     # must not adopt this route.
     max_turns: str | None = None
+    # Whether this runner booted with a connector caller token (ADR-0168
+    # decision 7). False for a record written before the field existed, which
+    # is what makes the one replacement after an install gains a caller key.
+    carries_caller_token: bool = False
 
     @property
     def sandbox_id(self) -> str:
@@ -220,8 +243,9 @@ class SubstrateConfig:
 
     namespace: str
     warm_pool: str
-    # Agents the chart renders a per-agent pool for (agentSandbox.connectorSecrets
-    # and agentSandbox.registryEgress, #3083, #2943), from CURIE_AGENT_SANDBOX_POOLS.
+    # Agents the chart renders a per-agent pool for (agentSandbox.connectorSecrets,
+    # agentSandbox.registryEgress, #3083, #2943, or agentSandbox.runnerImages,
+    # ADR-0173), from CURIE_AGENT_SANDBOX_POOLS.
     agent_pools: frozenset[str] = frozenset()
     # The subset whose pool template carries connector secrets
     # (agentSandbox.connectorSecrets), from CURIE_AGENT_CONNECTOR_SECRET_POOLS.
@@ -355,6 +379,8 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 

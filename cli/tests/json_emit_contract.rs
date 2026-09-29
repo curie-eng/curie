@@ -354,6 +354,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         cases: None,
         case_ids: Vec::new(),
         channel: None,
+        agent: None,
         namespace: "curie".into(),
         release: "curie".into(),
         listen_host: None,
@@ -795,6 +796,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         ApprovalsOutput::Pending {
             agent: "weather".to_string(),
             records: vec![record()],
+            routes: Default::default(),
             truncated: false,
         }
         .to_json(),
@@ -816,6 +818,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
                 // key by key, so a field the API carries and the CLI drops is
                 // visible in the diff rather than inferred.
                 "card_channel": "CFINANCE01",
+                "current_route_approvers": null,
             }],
             "count": 1,
             "truncated": false,
@@ -1647,6 +1650,34 @@ esac
     path
 }
 
+/// Every cluster deploy reads the release values to learn whether an earlier
+/// layered runner image must be cleared (#3260). The fixture release has
+/// nothing bound, which is what a fresh install answers.
+fn write_helm_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("helm");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$*" in
+  "get values "*)
+    printf '%s' '{}'
+    ;;
+  *)
+    printf 'unexpected helm invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("write helm stub");
+    let mut permissions = fs::metadata(&path)
+        .expect("read helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("make helm stub executable");
+    path
+}
+
 fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     let mut paths = vec![bin_dir.to_path_buf()];
     paths.extend(std::env::split_paths(
@@ -1687,6 +1718,7 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
 
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
+    write_helm_stub(tools.path());
     let deploy_failure = fixture.deploy_failure;
     let connectors = fixture.connectors;
     let target_channels = fixture.target_channels;

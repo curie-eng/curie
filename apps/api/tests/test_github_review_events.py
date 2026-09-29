@@ -1011,7 +1011,7 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
         "SELECT c.address, c.endpoint, c.adapter, l.binding_generation = c.generation AS current "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id"
-    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": None, "current": True}]
+    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": "default", "current": True}]
     response = post_review(client, truth)
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "feedback_queued"
@@ -2514,6 +2514,60 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     assert valkey.xlen(stream) == 1
 
 
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("UPDATE curie.thread_publication_lineages SET github_installation_id=12",
+         "lineage_authority_unproved"),
+        # Migration 0042 makes GitHub identity all-or-nothing, so the only
+        # identity-less lineage is a historical one with none of it.
+        ("UPDATE curie.thread_publication_lineages SET github_repository_id=NULL,"
+         "github_installation_id=NULL,github_pr_node_id=NULL,base_ref=NULL",
+         "lineage_absent_or_ambiguous"),
+        ("UPDATE curie.thread_publication_lineages SET binding_id=NULL",
+         "lineage_authority_unproved"),
+        ("UPDATE curie.thread_publication_lineages SET binding_generation=NULL",
+         "lineage_authority_unproved"),
+        ("UPDATE curie.thread_publication_lineages SET reply_conversation_id=NULL",
+         "lineage_authority_unproved"),
+        ("DELETE FROM curie.thread_workspaces", "workspace_no_longer_authorized"),
+        ("allowlist", "workspace_no_longer_authorized"),
+    ],
+    ids=[
+        "wrong-installation",
+        "identity-less",
+        "unbound",
+        "no-binding-generation",
+        "no-reply-route",
+        "no-workspace",
+        "revoked-allowlist",
+    ],
+)
+def test_open_pr_lineage_without_proven_authority_fails_closed_before_github(
+    review_stack, monkeypatch, mutation, code
+) -> None:
+    """#2275 control: an OPEN PR whose lineage is unbound, identity-less or no
+    longer allowed is refused at admission. The PR stays open so the refusal is
+    the authority guard, not the earlier closed-PR or stale-head checks."""
+    client, truth, valkey, stream = review_stack
+    if mutation == "allowlist":
+        monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["other-org/*"]')
+        get_settings.cache_clear()
+    else:
+        review_rows(mutation)
+    assert truth.pr["state"] == "open"
+    refused = post_review(client, truth)
+    assert refused.status_code == 200, refused.text
+    assert refused.json()["errors"] == [{"code": code}]
+    assert truth.calls == []
+    assert valkey.xlen(stream) == 0
+    assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
+    assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
+    assert review_rows("SELECT status,reason FROM curie.github_review_deliveries") == [
+        {"status": "rejected", "reason": code}
+    ]
+
+
 def test_forged_slack_principal_on_queued_github_feedback_is_refused_by_actual_api(
     review_stack,
 ) -> None:
@@ -3617,18 +3671,20 @@ def test_review_before_lineage_identity_is_held_then_admitted_when_identity_land
     publish_through_worker(client, pr_number=17)
 
     assert valkey.zrange(HELD_INDEX, 0, -1) == []
-    assert review_rows(
-        "SELECT event_id, status FROM curie.github_review_feedback"
-    ) == [{"event_id": truth.feedback.event_id, "status": "queued"}]
+    # The saved receipt proves enqueue without depending on live stream retention.
+    queued = review_rows(
+        "SELECT event_id, status, stream_id, turn FROM curie.github_review_feedback"
+    )
+    assert len(queued) == 1
+    assert queued[0]["event_id"] == truth.feedback.event_id
+    assert queued[0]["status"] == "queued"
+    assert queued[0]["turn"]["event_id"] == truth.feedback.event_id
+    assert all(part.isdigit() for part in queued[0]["stream_id"].split("-"))
     assert review_rows(
         "SELECT status, reason, event_id FROM curie.github_review_deliveries "
         "ORDER BY delivery_id"
     ) == [{"status": "accepted", "reason": None, "event_id": truth.feedback.event_id}] * 2
     assert valkey.exists(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == 0
-    turns = [json.loads(fields["payload"]) for _, fields in valkey.xrange(stream)]
-    assert [t["event_id"] for t in turns if t["event_id"] == truth.feedback.event_id] == [
-        truth.feedback.event_id
-    ]
 
 
 def test_review_for_an_unknown_pr_is_still_rejected_not_held(review_stack) -> None:

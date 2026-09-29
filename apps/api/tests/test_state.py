@@ -1488,6 +1488,141 @@ def test_binding_scoped_route_404s_for_a_pair_that_is_not_this_agents(
     assert "binding" in resp.text.lower()
 
 
+_TWO_IDENTITIES = json.dumps(
+    [
+        {
+            "name": "default",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "signing_secret_env": "SLACK_SIGNING_SECRET",
+        },
+        {
+            "name": "second",
+            "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+            "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+            "signing_secret_env": None,
+        },
+    ]
+)
+
+
+@pytest.fixture
+def seed_named_identity_binding(
+    client: Any, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[str, str, str], None]]:
+    """Bind a Slack channel under a named identity through the API (ADR-0168
+    decision 3)."""
+
+    monkeypatch.setenv("CURIE_SLACK_IDENTITIES", _TWO_IDENTITIES)
+    get_settings.cache_clear()
+
+    def _seed(agent_id: str, address: str, adapter: str) -> None:
+        resp = client.post(
+            f"/agents/{agent_id}/channels",
+            json={"kind": "slack", "address": address, "adapter": adapter},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    yield _seed
+    get_settings.cache_clear()
+
+
+def test_binding_scoped_state_reaches_a_binding_held_only_under_a_named_identity(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """An agent's rows on one pair share one binding-state scope whichever
+    identity holds them. Before this, `_binding_scope` resolved the pair
+    through the default identity alone (#3147), so an agent bound on a pair
+    ONLY under a named identity got a 404 from every one of its own
+    `/state/bindings/...` routes."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE10")
+    seed_named_identity_binding(aid, "C0EXAMPLE11", "second")
+
+    url = f"/agents/{aid}/state/bindings/slack/C0EXAMPLE11/ns/k"
+    put = client.put(url, json={"value": "named-identity"}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+    got = client.get(url, headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["value"] == "named-identity"
+
+
+def test_binding_scoped_route_admits_this_agent_regardless_of_row_order(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Distinguishes a check that names an arbitrary holder of the pair from
+    one that asks whether THIS agent holds a row on it. Agent B holds the
+    pair under the default identity, inserted FIRST; agent A holds the SAME
+    pair under a named identity, inserted second. A picking the pair's first
+    row would answer B for A's own request, so both agents must reach their
+    own binding state, regardless of which was inserted first."""
+    address = "C0EXAMPLE20"
+    b = _agent(client, auth_headers, address=address, name="agent-b-default")
+    a = _agent(client, auth_headers, address="C0EXAMPLE21", name="agent-a-named")
+    seed_named_identity_binding(a, address, "second")
+
+    a_url = f"/agents/{a}/state/bindings/slack/{address}/ns/k"
+    put_a = client.put(a_url, json={"value": "agent-a"}, headers=auth_headers)
+    assert put_a.status_code == 200, put_a.text
+    got_a = client.get(a_url, headers=auth_headers)
+    assert got_a.status_code == 200, got_a.text
+    assert got_a.json()["value"] == "agent-a"
+
+    b_url = f"/agents/{b}/state/bindings/slack/{address}/ns/k"
+    put_b = client.put(b_url, json={"value": "agent-b"}, headers=auth_headers)
+    assert put_b.status_code == 200, put_b.text
+    got_b = client.get(b_url, headers=auth_headers)
+    assert got_b.status_code == 200, got_b.text
+    assert got_b.json()["value"] == "agent-b"
+
+
+def test_binding_scoped_route_404s_when_this_agents_binding_on_the_address_is_a_different_kind(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Widening the check to any identity must not widen it to any kind: a
+    kind-blind existence check would let this agent's binding under a
+    DIFFERENT kind admit a Slack query for the same address string."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE12")
+    other_kind = client.post(
+        f"/agents/{aid}/channels",
+        json={"kind": "webhook", "address": "C0EXAMPLE13"},
+        headers=auth_headers,
+    )
+    assert other_kind.status_code == 201, other_kind.text
+
+    resp = client.get(
+        f"/agents/{aid}/state/bindings/slack/C0EXAMPLE13/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+def test_binding_scoped_route_404s_when_only_another_agent_holds_the_pair(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Widening the check across identities must not widen it across agents
+    -- another agent's binding on this pair, held under a named identity,
+    still does not admit a different agent."""
+    owner = _agent(client, auth_headers, address="C0EXAMPLE14", name="pair-owner")
+    seed_named_identity_binding(owner, "C0EXAMPLE15", "second")
+
+    other = _agent(client, auth_headers, address="C0EXAMPLE16", name="not-the-owner")
+    resp = client.get(
+        f"/agents/{other}/state/bindings/slack/C0EXAMPLE15/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
 def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_route(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:

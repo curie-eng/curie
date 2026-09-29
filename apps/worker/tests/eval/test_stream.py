@@ -121,9 +121,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking
+        return self._model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -135,7 +135,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -181,6 +181,8 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
@@ -1013,6 +1015,8 @@ def test_provisioned_runner_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        runner_resources: dict[str, object] | None = None,
+                        agent_name: str | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
                         super().create_claim(name, pool=pool, env=env, labels=labels)

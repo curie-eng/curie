@@ -520,3 +520,88 @@ async fn dry_run_apply_line_carries_install_and_retained_values_only_when_passed
         "helm upgrade curie charts/curie -n curie --wait --timeout 15m"
     );
 }
+
+/// #3218: an upgrade that changes the platform runner names every layered
+/// agent before it upgrades and clears each one's runner image in the same
+/// `helm upgrade`, after the retained values so the clear wins.
+#[tokio::test]
+async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
+    let mut host = FakeUpgradeHost::installed("0.10.0")
+        .with_retained_values()
+        .with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(dry_opts("0.11.0"), &mut host)
+        .await
+        .expect("dry-run plan");
+    let ClusterUpgradeOutput::DryRun(plan) = &out else {
+        panic!("dry-run must not mutate: {out:?}");
+    };
+    let apply = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("helm upgrade "))
+        .expect("plan has an apply line");
+    assert_eq!(
+        apply,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained-values> \
+         --set agentSandbox.runnerImages.factory=null --set agentSandbox.runnerImages.sre-bot=null"
+    );
+    let notice = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("runner layers:"))
+        .expect("plan names the stale runner layers");
+    assert!(notice.contains("factory, sre-bot"), "{notice}");
+    assert!(notice.contains("WITHOUT their layer"), "{notice}");
+    assert!(notice.contains("curie build --plugin-dir"), "{notice}");
+    // #3422: the plan retires each cleared agent's claims right after Apply.
+    let apply_at = plan.lines.iter().position(|l| l == apply).unwrap();
+    assert_eq!(
+        &plan.lines[apply_at + 1..apply_at + 3],
+        &[
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=factory --wait=true --ignore-not-found=true",
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=sre-bot --wait=true --ignore-not-found=true",
+        ]
+    );
+    assert!(
+        notice.contains("Their live sandboxes are retired"),
+        "{notice}"
+    );
+    let json = output_json(&out).to_string();
+    assert!(
+        json.contains("agentSandbox.runnerImages.sre-bot=null"),
+        "{json}"
+    );
+    assert_eq!(host.mutate_calls, 0);
+
+    let mut untouched = FakeUpgradeHost::installed("0.10.0").with_retained_values();
+    let ClusterUpgradeOutput::DryRun(plan) = run_lifecycle(dry_opts("0.11.0"), &mut untouched)
+        .await
+        .unwrap()
+    else {
+        panic!("dry-run must not mutate");
+    };
+    assert!(plan.lines.iter().all(|l| !l.contains("runnerImages")
+        && !l.starts_with("runner layers:")
+        && !l.contains("sandboxclaim")));
+}
+
+/// #3422: a real upgrade that clears layered agents' runner images retires
+/// their SandboxClaims after Apply, so live threads leave the old layer the
+/// way `cluster deploy` makes them (#3300). An upgrade clearing nothing
+/// retires nothing.
+#[tokio::test]
+async fn upgrade_retires_claims_of_every_cleared_runner_layer_after_apply() {
+    let mut host =
+        FakeUpgradeHost::installed("0.10.0").with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(opts("0.11.0"), &mut host)
+        .await
+        .expect("upgrade");
+    assert_eq!(output_json(&out)["status"], "succeeded", "{out:?}");
+    assert_eq!(host.retired_claims, vec!["factory", "sre-bot"]);
+
+    let mut plain = FakeUpgradeHost::installed("0.10.0");
+    run_lifecycle(opts("0.11.0"), &mut plain)
+        .await
+        .expect("upgrade");
+    assert!(plain.retired_claims.is_empty());
+}

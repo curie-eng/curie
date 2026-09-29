@@ -26,7 +26,7 @@ from .. import crud, sandbox_token, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import AgentChannel, ThreadTranscript, WorkflowStateEntry
+from ..models import ThreadTranscript, WorkflowStateEntry
 from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
@@ -112,16 +112,16 @@ async def _binding_scope(
     rejected alternative for #1525 was widening it to carry one, but a
     same-agent partition key has no privilege for that credential to carry in
     the first place).
+
+    No caller here NAMES an adapter -- the state API has no such parameter --
+    and an agent's rows on one pair share this one scope whichever identity
+    holds them, so this checks for any row of THIS agent on the pair rather
+    than resolving the default identity's route the way `crud.binding_for_route`
+    does for a turn (an identity-narrowed read would 404 every named-identity
+    binding's own state).
     """
 
-    exists = await session.scalar(
-        select(AgentChannel.id).where(
-            AgentChannel.agent_id == agent_id,
-            AgentChannel.kind == kind,
-            AgentChannel.address == address,
-        )
-    )
-    if exists is None:
+    if not await crud.agent_holds_channel_pair(session, agent_id, kind, address):
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )

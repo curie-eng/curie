@@ -191,12 +191,19 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0167 | [Agent and channel memory are written by the agent, guided by editable guidance](0167-agent-and-channel-memory-are-written-by-the-agent-guided-by-editable-guidance.md) | Draft |
 | 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
 | 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
 | 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
 | 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
 | 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
-| 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Draft |
+| 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Accepted |
 | 0174 | [Publication prechecks use an execution scoped capability](0174-publication-prechecks-use-an-execution-scoped-capability.md) | Accepted |
+| 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
+| 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
+| 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
+| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
 | 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
+| 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
+| 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
 <!-- END GENERATED: adr-index -->

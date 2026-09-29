@@ -234,6 +234,13 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     route: dict[str, str | None],
 ) -> None:
     payload = _publication_payload(str(uuid.uuid4()))
+    # An "ordinary" (non-Slack) reply route: `_publication_payload` defaults
+    # to `reply_kind="slack"`, whose route is a declared IDENTITY under
+    # ADR-0168 decision 3, not an arbitrary adapter -- "agentmail-sandbox"
+    # would be refused as an undeclared Slack identity rather than exercising
+    # the both-or-neither rule this test is actually about.
+    payload["reply_kind"] = "email"
+    payload["reply_channel"] = "ops@example.test"
     payload.update(route)
 
     with pytest.raises(ValidationError, match="endpoint and adapter together"):
@@ -246,6 +253,44 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     ordinary = PublicationCreate.model_validate(payload)
     assert ordinary.reply_endpoint == "https://adapter.example.test/replies"
     assert ordinary.reply_adapter == "agentmail-sandbox"
+
+
+def test_publication_schema_stores_the_default_slack_identity_by_name() -> None:
+    """A Slack reply route names its identity (ADR-0168 decision 3), checked
+    against the identities this installation declares; the omitted and the
+    explicit spelling both store `default`."""
+
+    omitted = _publication_payload(str(uuid.uuid4()))
+    assert PublicationCreate.model_validate(omitted).reply_adapter == "default"
+
+    explicit = _publication_payload(str(uuid.uuid4()))
+    explicit["reply_adapter"] = "default"
+    assert PublicationCreate.model_validate(explicit).reply_adapter == "default"
+
+
+def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoint() -> None:
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload["reply_adapter"] = "second"
+
+    with pytest.raises(ValidationError, match="'second'.*default"):
+        PublicationCreate.model_validate(payload)
+
+
+def test_a_slack_reply_endpoint_is_a_per_turn_origin_and_the_adapter_an_identity() -> None:
+    """A CLI stub turn carries its Slack Web API base in `reply_endpoint` (issue
+    #19); `reply_adapter` is still the identity, checked like any other, so
+    the retired custom-transport form's credential slug beside an endpoint is
+    refused as an undeclared identity."""
+
+    stub = _publication_payload(str(uuid.uuid4()))
+    stub["reply_endpoint"] = "http://cli-stub.test/api/"
+    assert PublicationCreate.model_validate(stub).reply_adapter == "default"
+
+    retired = _publication_payload(str(uuid.uuid4()))
+    retired["reply_endpoint"] = "http://127.0.0.1:1"
+    retired["reply_adapter"] = "proof-offline"
+    with pytest.raises(ValidationError, match="'proof-offline'"):
+        PublicationCreate.model_validate(retired)
 
 
 def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
@@ -286,6 +331,45 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
         "approval_endpoint": None,
         "approval_adapter": CLUSTER_MESSAGE_ADAPTER,
     }
+
+
+def test_a_named_non_slack_adapter_still_builds_the_pre_identity_workspace_key(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The workspace-key fallback (no `reply_conversation_id`) only ever runs
+    for a request shaped like a pre-#2274 producer, which wrote every route's
+    key unidentified. A NAMED non-Slack adapter must not turn into an identity
+    segment here either -- not only the built-in relay sentinel -- because
+    such a producer predates the identity segment itself and never wrote one.
+    """
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    address = "acme-legacy-mail@example.test"
+    payload = _publication_payload(deployment["id"], dedupe_key="legacy-named-mail-adapter")
+    payload.update(
+        reply_kind="email",
+        reply_channel=address,
+        reply_endpoint="http://acme-legacy-mail-adapter:8080/",
+        reply_adapter="acme-legacy-mail",
+    )
+
+    # `_workspace_identity` builds the bare form for this payload shape
+    # (no `reply_conversation_id`), same as `legacy_producer_thread_key`:
+    # the selection call and the publication create must agree on it.
+    status_code, publication = _create_publication(client, payload)
+    assert status_code == 201, publication
+
+    stored = _rows(
+        "SELECT conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": publication["lineage_id"]},
+    )[0]
+    assert stored["conversation_id"] == _workspace_identity(payload)
+    assert stored["conversation_id"] == channel_protocol.scoped_conversation_id(
+        "email", address, payload["conversation_id"]
+    )
 
 
 def _create_publication(
@@ -1880,7 +1964,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 )
 
     class WorkspaceBinding:
-        async def resolve(self, kind: str, channel: str) -> ResolvedDeployment:
+        async def resolve(self, kind: str, adapter: str | None, channel: str) -> ResolvedDeployment:
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
                 agent_name="acme-bot",
@@ -2185,7 +2269,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
 
     class WorkspaceBinding:
-        async def resolve(self, kind: str, address: str) -> ResolvedDeployment:
+        async def resolve(self, kind: str, adapter: str | None, address: str) -> ResolvedDeployment:
             assert (kind, address) == ("slack", "C0EXAMPLE1")
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
@@ -2595,8 +2679,8 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             self._resolver = resolver
             self.history_keys: list[tuple[str, str, str]] = []
 
-        async def resolve(self, kind: str, address: str) -> Any:
-            return await self._resolver.resolve(kind, address)
+        async def resolve(self, kind: str, adapter: str | None, address: str) -> Any:
+            return await self._resolver.resolve(kind, adapter, address)
 
         def boot_env(
             self,
@@ -5653,7 +5737,12 @@ def test_cluster_message_review_revision_consumes_its_reservation(
 def test_cluster_message_review_revision_cannot_take_a_configured_route(
     review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
 ) -> None:
-    """#2789 negative: the relay binding still refuses an operator-configured route."""
+    """#2789 negative: the relay binding still refuses an operator-configured route.
+
+    A Slack route names an identity and never a transport (ADR-0168 decision
+    3), so the configured route here is the default identity with an origin
+    endpoint, which the relay's route-less binding does not have.
+    """
     client, truth, _ = review_lineage_app
     deployment, _, lineage = _verified_lineage(client, truth, auth_headers, route=_relay_route())
     assert _reserve_review(client, lineage, "review:relay-routed").status_code == 201
@@ -5663,7 +5752,7 @@ def test_cluster_message_review_revision_cannot_take_a_configured_route(
     payload.update(
         review_origin_key="review:relay-routed",
         reply_endpoint="https://adapter.example.com/reply",
-        reply_adapter="agentmail-sandbox",
+        reply_adapter="default",
     )
     refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
     assert refused.status_code == 409, refused.text
@@ -6258,6 +6347,60 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "github_pr_node_id": None,
         "base_ref": None,
     }
+
+
+def test_a_replay_matches_a_default_identity_a_later_migration_names(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """ADR-0168 decision 3: migration 0070 backfills the default Slack identity
+    to 'default', and a caller that names none means the same identity. A
+    replay compares the identities, so the two spellings match."""
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    _, first = _create_publication(client, payload)
+    _execute(
+        "UPDATE curie.approvals SET reply_adapter = 'default' WHERE dedupe_key = :k",
+        {"k": payload["dedupe_key"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET reply_adapter = 'default' WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+
+    assert replay.status_code in {200, 201}, replay.text
+    assert replay.json()["id"] == first["id"]
+
+
+def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A publication raised from a handle queued before migration 0070 can
+    still store NULL for the default Slack identity, while its replay now
+    arrives as 'default'. Same identity, same replay."""
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    _, first = _create_publication(client, payload)
+    _execute(
+        "UPDATE curie.approvals SET reply_adapter = NULL WHERE dedupe_key = :k",
+        {"k": payload["dedupe_key"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET reply_adapter = NULL WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+
+    assert replay.status_code in {200, 201}, replay.text
+    assert replay.json()["id"] == first["id"]
 
 
 @pytest.fixture

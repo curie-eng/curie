@@ -44,6 +44,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
+from mcp.shared.exceptions import MCPError
 from mcp.shared.tool_name_validation import validate_tool_name
 from mcp.types import PaginatedRequestParams
 from plugin_format import PluginManifest, resolve_manifest
@@ -53,6 +54,17 @@ logger = logging.getLogger(__name__)
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PROBE_TIMEOUT_SECONDS = 15
+
+# What a hosted connector's caller proxy says when it refuses this sandbox
+# (ADR-0168 decision 7), frozen in tests/vectors/connector-caller-refusal.json:
+# the refusal's name under this key of the JSON-RPC error's `data`.
+_CALLER_REFUSAL_KEY = "curie_caller"
+_CALLER_REFUSALS = {
+    "missing": "this sandbox presented no caller token",
+    "invalid": "this sandbox's caller token is not valid",
+    "expired": "this sandbox's caller token has expired",
+    "not_admitted": "this agent is not in the connector's admits list",
+}
 
 # Bounded retry for the boot capability probe (#2945). A failed dial is
 # retried up to ``_PROBE_ATTEMPTS`` times with a doubling backoff, and each
@@ -136,11 +148,19 @@ class ConnectorCapabilityFailure:
     credential_names: tuple[str, ...]
     reason: str
     attempts: int = 1
+    # For `caller_refused` only: which refusal the connector's proxy named.
+    refusal: str | None = None
 
     def caller_message(self) -> str:
         """The exact sentence the message caller sees. Values never appear."""
 
         names = ", ".join(self.credential_names)
+        if self.reason == "caller_refused":
+            return (
+                f"declared connector '{self.connector}' refused this sandbox: "
+                f"{_CALLER_REFUSALS[self.refusal or 'invalid']}. Connector tools are "
+                "unavailable."
+            )
         if self.reason == "empty_expansion":
             detail = f"credential {names} expanded empty"
         elif self.reason == "missing_credential":
@@ -252,6 +272,27 @@ def diagnose_derived_connector_headers(
                 )
             )
     return tuple(failures)
+
+
+def _caller_refusal(exc: BaseException) -> str | None:
+    """The caller proxy's refusal inside a probe failure, or None.
+
+    The MCP client raises the JSON-RPC error from inside its task groups, so
+    the error is found by walking the exception groups, inside the last
+    dial's error when the bounded retry wrapped it in ``_ProbeFailure``.
+    """
+
+    if isinstance(exc, _ProbeFailure):
+        return _caller_refusal(exc.last_error)
+    if isinstance(exc, MCPError) and isinstance(exc.data, Mapping):
+        refusal = exc.data.get(_CALLER_REFUSAL_KEY)
+        return refusal if refusal in _CALLER_REFUSALS else None
+    if isinstance(exc, BaseExceptionGroup):
+        for inner in exc.exceptions:
+            found = _caller_refusal(inner)
+            if found is not None:
+                return found
+    return None
 
 
 def _expand(value: str, env: Mapping[str, str]) -> str:
@@ -610,11 +651,13 @@ async def probe_mcp_tool_capability(
                 exc,
             )
             if derived and name not in skip_http:
+                refusal = _caller_refusal(exc)
                 connector_failures.append(
                     ConnectorCapabilityFailure(
                         connector=name,
                         credential_names=_header_placeholders(config),
-                        reason="probe_failed",
+                        reason="probe_failed" if refusal is None else "caller_refused",
+                        refusal=refusal,
                         # The real dial count from the retry wrapper; a plain
                         # exception (patched fakes) keeps the single dial it
                         # reports.

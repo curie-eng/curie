@@ -94,6 +94,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
@@ -509,6 +510,15 @@ def build_runner(
         progress = None
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
+    # Per-model token usage for the run's cost line (#3223): reported whenever
+    # the progress URL and token are injected, phases.json or not.
+    progress_url = os.environ.get(PROGRESS_URL_ENV, "").strip()
+    progress_token = os.environ.get(PROGRESS_TOKEN_ENV, "").strip()
+    usage_reporter = (
+        UsageReporter(progress_url.rstrip("/") + USAGE_PATH, progress_token)
+        if progress_url and progress_token
+        else None
+    )
     # Tell the gate whether the platform's own ``curie-state`` tools exist this
     # session (#2286 adversarial round). The toolPolicy exemption is by exact
     # live tool name, and a name the platform never published is not ours -- an
@@ -537,6 +547,7 @@ def build_runner(
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        caller_header=config.connector_caller_token is not None,
     )
     # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
     # cannot read the PAT from the process env (#2559). The on-disk catalog
@@ -761,6 +772,8 @@ def build_runner(
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
             progress_activity=progress_activity if progress is not None else None,
+            usage_reporter=usage_reporter,
+            primary_model=config.model,
             connector_failures=connector_failures
             or (
                 capability.connector_failures
@@ -951,6 +964,7 @@ async def _load_boot_fetches(
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        caller_header=config.connector_caller_token is not None,
     )
     expansion_failures = (
         diagnose_derived_connector_headers(

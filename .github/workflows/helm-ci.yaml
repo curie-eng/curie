@@ -40,6 +40,24 @@ on:
       - "pyproject.toml"
       - "compose.yaml"
       - "compose.dev.yaml"
+      # Third obligation, and the one this gate exists for (#2741): the
+      # retained-values scalar gate below BUILDS AND EXECUTES the real CLI
+      # against the recorded upgrade boundary, so its subject is Rust and its
+      # driver is a Python stub -- neither of them under charts/. Without these
+      # entries, a PR that reverts the JSON re-serializer and puts the YAML 1.2
+      # emitter back matches nothing in this filter, the helm job is skipped,
+      # and the gate that exists to catch exactly that revert never runs.
+      - "cli/src/ops/upgrade.rs"
+      - "cli/tests/data/upgrade-driver.py"
+      # Fourth obligation, the first gate's shape: the Slack identities gate
+      # (ADR-0168 decision 1) feeds the rendered declaration through this
+      # parser, which the API, worker and dispatcher config all import, and
+      # the worker's env through the sandbox filter. The parser reads the
+      # default identity's name and the reserved delivery selector from
+      # turn.py. A PR that loosens any of them must still run it.
+      - "packages/aci-protocol/src/aci_protocol/slack_identities.py"
+      - "packages/aci-protocol/src/aci_protocol/turn.py"
+      - "apps/worker/src/curie_worker/sandbox/types.py"
       - "compose/**"
 
 permissions:
@@ -274,6 +292,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      # Opt-in Kubernetes Events receiver for the collector (#2954): off by
+      # default, namespace-scoped read-only RBAC, refused into nop-only logs.
+      - name: helm render assertions (otel collector kubernetes events)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-k8s-events-assertions.sh
+
       # Prove every first-party chart workload carries the shared OTLP env
       # (#2360). Membership is derived from rendered chart-owned images, not a
       # named allowlist, so a sixth Deployment is rejected rather than skipped.
@@ -505,6 +530,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sealing-key-assertions.sh
 
+      # Prove the connector caller signing key (ADR-0168 decision 7) renders
+      # nowhere on a stock install and, once a Secret is named, only into the
+      # worker, by reference.
+      - name: helm render assertions (connector caller key)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-caller-key-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --
@@ -514,6 +547,16 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
+
+      # Pin the end to end connector's test cluster identity (ADR 0176
+      # decision 4, #3243): off by default, no cluster scoped write beyond
+      # namespace create and delete, the per namespace role never bound cluster
+      # wide, and an admission policy that fails closed on this identity alone.
+      # The live denials are proven by ci/runtime/e2e-connector-identity-runtime.sh.
+      - name: helm render assertions (e2e connector identity)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/e2e-connector-identity-assertions.sh
 
       - name: helm render assertions (remote dev capability)
         run: |
@@ -603,6 +646,14 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/prewarm-bundle-fetch-assertions.sh
+
+      # Prove a bundle's layered runner image (agentSandbox.runnerImages,
+      # ADR-0173, #3217) reaches only that agent's SandboxTemplate, and that
+      # the prewarm DaemonSet pulls every distinct runner digest rendered.
+      - name: helm render assertions (per-agent runner images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runner-images-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
@@ -741,6 +792,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-eval-wiring-assertions.sh
 
+      # ADR-0180: worker.turnReceipt reaches the worker env as
+      # CURIE_TURN_RECEIPT, only the three modes the worker accepts render, and
+      # extraEnv cannot shadow it. A mode the chart let through would install
+      # green and crash-loop every worker at config load.
+      - name: helm render assertions (worker turn receipt mode)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-turn-receipt-assertions.sh
+
       # This otherwise Python-free chart job needs the workspace because the
       # web-identity gate below does not stop at the rendered YAML: it builds
       # the real API and worker BundleStore objects under each rendered
@@ -780,6 +840,16 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
+
+      # dispatcher.slack.identities (ADR-0168 decision 1): a stock install
+      # renders today's objects, a list renders by Secret reference only, and the
+      # EXACT rendered declaration parses through the real Settings of the
+      # dispatcher, worker and API while the worker's sandbox filter drops every
+      # token. Needs the uv workspace above for the same reason.
+      - name: helm render assertions (Slack identities)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/slack-identities-assertions.sh
 
       # Prove a BYO object store gets a runner egress allow for S3 (and STS on
       # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod

@@ -239,6 +239,7 @@ class EgressHandler(BaseHTTPRequestHandler):
                 event.event_id,
                 conversation_id,
                 event.target.reply_ref,
+                outcome=event.outcome,
             )
         return 200
 

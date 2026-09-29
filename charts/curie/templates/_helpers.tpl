@@ -523,6 +523,10 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
+{{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
+{{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must not replace built-in exporter %q." $name $name) -}}
@@ -589,6 +593,17 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+{{- if $eventsEnabled }}
+  # Kubernetes Events for the release namespace (#2954), watched so each new
+  # or updated Event becomes one log record in the logs pipeline.
+  k8sobjects/events:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        group: events.k8s.io
+        mode: watch
+        namespaces: [{{ .Release.Namespace | quote }}]
+{{- end }}
 processors:
   memory_limiter:
     check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
@@ -650,7 +665,7 @@ service:
       processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
-      receivers: [otlp]
+      receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]
       exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
     metrics:
@@ -1690,16 +1705,19 @@ key: {{ .defaultKey }}
 {{- end -}}
 
 {{/* ---- Dispatcher gating ----
-     The Slack dispatcher only deploys when it has both tokens; without them it
-     would crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command).
-     A token counts as present whether it arrives as the plain value or via its
-     *ExistingSecret (issue #1759) -- a dispatcher configured entirely through
-     BYO Secrets must still deploy. */}}
+     The Slack dispatcher only deploys when the identity `default` has both
+     tokens: from dispatcher.slack, where a token counts as present whether it
+     arrives as the plain value or via its *ExistingSecret (issue #1759), or
+     from a dispatcher.slack.identities entry named `default`. A non-empty list
+     is enough here because curie.slack.identities fails the render unless the
+     list leaves `default` with both. Without them the dispatcher would
+     crash-loop the reconnect supervisor forever, so a token-less default
+     install skips the Deployment entirely (NOTES prints the connect command). */}}
 {{- define "curie.dispatcher.enabled" -}}
 {{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
 {{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
-{{- if and .Values.dispatcher.deploy $appTokenSet $botTokenSet -}}
+{{- $listed := .Values.dispatcher.slack.identities -}}
+{{- if and .Values.dispatcher.deploy (or (and $appTokenSet $botTokenSet) $listed) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -2116,9 +2134,10 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
-array: every connectorSecrets agent plus every registryEgress agent (#3083).
+array: every connectorSecrets agent, every registryEgress agent (#3083), and
+every runnerImages agent (ADR-0173).
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}

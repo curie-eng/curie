@@ -13,7 +13,7 @@ import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from curie_worker.bundle_store import extract_bundle
@@ -118,6 +118,7 @@ def test_create_claim_excludes_host_credentials_from_child_env(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -137,6 +138,23 @@ def test_create_claim_excludes_host_credentials_from_child_env(
     assert denied_names.isdisjoint(child_env_names)
     assert "CURIE_BUDGET" in child_env_names
     assert "CURIE_CREDENTIALS" in child_env_names
+
+
+def test_create_claim_forwards_the_caller_token_and_never_its_signing_key() -> None:
+    # ADR-0168 decision 7: the same split as the claim CR, on the substrate
+    # that forwards env by value.
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-caller",
+        pool="pool",
+        env={
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    forwarded = _flag_values(client.calls[0], "-e")
+    assert "CURIE_CONNECTOR_CALLER_TOKEN=cct.payload.signature" in forwarded
+    assert not [e for e in forwarded if e.startswith("CURIE_CONNECTOR_CALLER_SIGNING_KEY=")]
 
 
 def test_create_claim_preserves_declared_connector_secret() -> None:
@@ -169,9 +187,10 @@ def test_local_substrate_claims_runner_with_connector_secret_without_a_warm_pool
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        **kwargs: Any,
     ) -> None:
         pools.append(pool)
-        original_create_claim(name, pool=pool, env=env, labels=labels)
+        original_create_claim(name, pool=pool, env=env, labels=labels, **kwargs)
 
     monkeypatch.setattr(client, "create_claim", record_claim)
     monkeypatch.setattr(
@@ -228,6 +247,36 @@ def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential(
     }
     assert "CURIE_CONNECTOR_SECRET_KEYS" in child_env_names
     assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
+
+
+def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> None:
+    """ADR-0168 decisions 1 and 5: each declared Slack identity's tokens reach
+    the worker as indexed `CURIE_SLACK_*__<n>` variables. The filter drops them
+    by prefix, at any index, and a connector marker cannot readmit one. The
+    non-secret declaration itself carries no token and may pass."""
+
+    tokens = {
+        "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+        "CURIE_SLACK_BOT_TOKEN__12": "placeholder",
+        "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+        "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+    }
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-slack-identities",
+        pool="pool",
+        env={
+            **tokens,
+            "CURIE_SLACK_IDENTITIES": "[]",
+            "CURIE_CONNECTOR_SECRET_KEYS": "CURIE_SLACK_BOT_TOKEN__0",
+        },
+    )
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert tokens.keys().isdisjoint(child_env_names)
+    assert "CURIE_SLACK_IDENTITIES" in child_env_names
 
 
 def test_create_claim_fetches_and_unwraps_bundle() -> None:

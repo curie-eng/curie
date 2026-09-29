@@ -1056,12 +1056,22 @@ fn eval_schema_gate_has_teeth() {
 // (cli/tests/schema_inventory.rs) proves the set below is exhaustive.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
-    BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput, CheckMatch, CheckReport,
-    ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer, DeployOutput, KillOutput,
-    ListAgentsOutput, LocalAgentSummary, SkillMessageOutput, SweepRow,
+    ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
+    CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
+    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryOutput,
+    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, SkillMessageOutput, SweepRow,
+    VersionsOutput,
 };
-use curie::ops::ClusterUpgradeOutput;
+use curie::comms::CommsOutput;
+use curie::local::{
+    LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
+};
+use curie::ops::{
+    ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput, ClusterUpgradeOutput,
+    PodRow,
+};
 use curie::release_accept::ReleaseAcceptOutput;
 use curie::secrets::SecretsListOutput;
 
@@ -2175,6 +2185,374 @@ fn sweep_json_carries_the_bundle_digest_and_emits_null_when_none_applies() {
         "the key is always emitted, never omitted: {without}"
     );
     assert!(without["bundle_digest"].is_null(), "{without}");
+}
+
+#[test]
+fn kill_output_validates_both_variants() {
+    let done = KillOutput::Done {
+        agent: "deal-desk".to_string(),
+        killed: true,
+    };
+    assert_valid("kill.schema.json", &done.to_json());
+    let dry = KillOutput::DryRun(DryRunPlan {
+        lines: vec!["POST /kill".to_string()],
+    });
+    assert_valid("kill.schema.json", &dry.to_json());
+}
+
+#[test]
+fn resume_output_validates_both_variants() {
+    let done = ResumeOutput::Done {
+        agent: "deal-desk".to_string(),
+        killed: false,
+    };
+    assert_valid("resume.schema.json", &done.to_json());
+    let dry = ResumeOutput::DryRun(DryRunPlan {
+        lines: vec!["POST /resume".to_string()],
+    });
+    assert_valid("resume.schema.json", &dry.to_json());
+}
+
+#[test]
+fn budget_output_validates_all_variants() {
+    let some = BudgetOutput::Done {
+        agent: "d".to_string(),
+        max_usd_per_day: Some(5.0),
+    };
+    assert_valid("budget.schema.json", &some.to_json());
+    let none = BudgetOutput::Done {
+        agent: "d".to_string(),
+        max_usd_per_day: None,
+    };
+    assert_valid("budget.schema.json", &none.to_json());
+    let dry = BudgetOutput::DryRun(DryRunPlan {
+        lines: vec!["PUT /budget".to_string()],
+    });
+    assert_valid("budget.schema.json", &dry.to_json());
+}
+
+#[test]
+fn reset_thread_output_validates_both_variants() {
+    let done = ResetThreadOutput::Done {
+        agent: "d".to_string(),
+        thread_key: "C1:U1".to_string(),
+        requested: true,
+        released: false,
+    };
+    assert_valid("reset-thread.schema.json", &done.to_json());
+    let dry = ResetThreadOutput::DryRun(DryRunPlan {
+        lines: vec!["POST /reset".to_string()],
+    });
+    assert_valid("reset-thread.schema.json", &dry.to_json());
+}
+
+#[test]
+fn delete_output_validates_both_variants() {
+    let done = DeleteOutput::Done {
+        agent: "d".to_string(),
+    };
+    assert_valid("delete.schema.json", &done.to_json());
+    let dry = DeleteOutput::DryRun(DryRunPlan {
+        lines: vec!["DELETE /agent".to_string()],
+    });
+    assert_valid("delete.schema.json", &dry.to_json());
+}
+
+#[test]
+fn versions_output_validates_all_variants() {
+    let version = Version {
+        id: "ver_1".to_string(),
+        version_label: "v1".to_string(),
+        commit_sha: Some("deadbeef".to_string()),
+        bundle_sha256: Some("abc".to_string()),
+        created_by: Some("alice".to_string()),
+        created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        agent_id: Some("a_1".to_string()),
+        bundle_ref: Some("s3://x".to_string()),
+    };
+    let list = VersionsOutput::List {
+        agent: "d".to_string(),
+        versions: vec![version],
+    };
+    assert_valid("versions.schema.json", &list.to_json());
+    let empty = VersionsOutput::Empty {
+        agent: "d".to_string(),
+    };
+    assert_valid("versions.schema.json", &empty.to_json());
+    let dry = VersionsOutput::DryRun(DryRunPlan {
+        lines: vec!["GET /versions".to_string()],
+    });
+    assert_valid("versions.schema.json", &dry.to_json());
+}
+
+#[test]
+fn memory_output_validates_all_variants() {
+    let entries = vec![MemoryEntry {
+        index: 0,
+        content: "prefer terse".to_string(),
+        version: 1,
+        provenance: Default::default(),
+    }];
+    let list = MemoryOutput::List {
+        agent: "d".to_string(),
+        entries,
+    };
+    assert_valid("memory.schema.json", &list.to_json());
+    let empty = MemoryOutput::Empty {
+        agent: "d".to_string(),
+    };
+    assert_valid("memory.schema.json", &empty.to_json());
+    let dry = MemoryOutput::DryRun(DryRunPlan {
+        lines: vec!["GET /memory".to_string()],
+    });
+    assert_valid("memory.schema.json", &dry.to_json());
+    let added = MemoryOutput::Added {
+        agent: "d".to_string(),
+        index: 0,
+        content: "prefer terse".to_string(),
+        source: "operator".to_string(),
+        fresh_session_required: true,
+        message_verb: "local".to_string(),
+    };
+    assert_valid("memory.schema.json", &added.to_json());
+}
+
+fn approval_record() -> ApprovalRecord {
+    ApprovalRecord {
+        id: "ap_1".to_string(),
+        author: "U1".to_string(),
+        route: Some("Bash".to_string()),
+        gate_kind: Some("tool".to_string()),
+        granted_tool: None,
+        status: "pending".to_string(),
+        conversation_id: "C1".to_string(),
+        summary: "run tests".to_string(),
+        expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+        resolved_by: None,
+        // #1078: the persisted card location for a route-bound approval.
+        card_channel: Some("CFINANCE01".to_string()),
+    }
+}
+
+#[test]
+fn approvals_output_validates_all_variants() {
+    let gates = ApprovalsOutput::Gates {
+        agent: "d".to_string(),
+        gated_tools: vec!["Bash".to_string()],
+        manifest_unreadable: None,
+    };
+    assert_valid("approvals.schema.json", &gates.to_json());
+    let pending = ApprovalsOutput::Pending {
+        agent: "d".to_string(),
+        records: vec![approval_record()],
+        routes: Default::default(),
+        truncated: false,
+    };
+    assert_valid("approvals.schema.json", &pending.to_json());
+    let resolved = ApprovalsOutput::Resolved {
+        record: approval_record(),
+    };
+    assert_valid("approvals.schema.json", &resolved.to_json());
+    let routes = ApprovalsOutput::Routes {
+        agent: "d".to_string(),
+        routes: serde_json::from_value(serde_json::json!({
+            "finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"}
+            }
+        }))
+        .expect("the route response carries its required resolution"),
+    };
+    let routes_json = routes.to_json();
+    assert_eq!(
+        routes_json["routes"]["finance"]["resolution"]["address"],
+        "C0EXAMPLE1"
+    );
+    assert_valid("approvals.schema.json", &routes_json);
+    let dry = ApprovalsOutput::DryRun(DryRunPlan {
+        lines: vec!["GET /approvals".to_string()],
+    });
+    assert_valid("approvals.schema.json", &dry.to_json());
+}
+
+#[test]
+fn skill_approvals_output_validates_both_variants() {
+    let gates = SkillApprovalsOutput::Gates {
+        gates: vec![("Bash".to_string(), "approval".to_string())],
+    };
+    assert_valid("skill-approvals.schema.json", &gates.to_json());
+    let env = SkillApprovalsOutput::Env {
+        env: "CURIE_APPROVALS=Bash".to_string(),
+        restart: "curie skill up --replace".to_string(),
+        bundle_note: "declared in .claude-plugin".to_string(),
+    };
+    assert_valid("skill-approvals.schema.json", &env.to_json());
+}
+
+#[test]
+fn comms_output_validates_both_variants() {
+    let done = CommsOutput::Done { connected: true };
+    assert_valid("comms.schema.json", &done.to_json());
+    let dry = CommsOutput::DryRun(DryRunPlan {
+        lines: vec!["helm upgrade".to_string()],
+    });
+    assert_valid("comms.schema.json", &dry.to_json());
+}
+
+#[test]
+fn local_up_output_validates_both_variants() {
+    let up = LocalUpOutput::Up {
+        endpoints: vec![("Curie API".to_string(), "http://localhost:8155".to_string())],
+        slack: false,
+    };
+    assert_valid("local-up.schema.json", &up.to_json());
+    let dry = LocalUpOutput::DryRun(DryRunPlan {
+        lines: vec!["docker compose up".to_string()],
+    });
+    assert_valid("local-up.schema.json", &dry.to_json());
+}
+
+#[test]
+fn local_rebuild_output_validates_both_variants() {
+    let rebuilt = LocalRebuildOutput::Rebuilt {
+        service: "worker".to_string(),
+        model_mode: ModelMode::LiveFromCredential,
+    };
+    assert_valid("local-rebuild.schema.json", &rebuilt.to_json());
+    let dry = LocalRebuildOutput::DryRun(DryRunPlan {
+        lines: vec!["docker compose build".to_string()],
+    });
+    assert_valid("local-rebuild.schema.json", &dry.to_json());
+}
+
+#[test]
+fn local_status_output_validates_both_variants() {
+    let services = LocalStatusOutput::Services {
+        rows: vec!["worker  Up 2 minutes".to_string()],
+    };
+    assert_valid("local-status.schema.json", &services.to_json());
+    let dry = LocalStatusOutput::DryRun(DryRunPlan {
+        lines: vec!["docker compose ps".to_string()],
+    });
+    assert_valid("local-status.schema.json", &dry.to_json());
+}
+
+#[test]
+fn local_down_output_validates_all_variants() {
+    let down = LocalDownOutput::Down {
+        volumes_wiped: true,
+        reaped: 2,
+    };
+    assert_valid("local-down.schema.json", &down.to_json());
+    assert_valid(
+        "local-down.schema.json",
+        &LocalDownOutput::Aborted.to_json(),
+    );
+    let dry = LocalDownOutput::DryRun(DryRunPlan {
+        lines: vec!["docker compose down".to_string()],
+    });
+    assert_valid("local-down.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_up_output_validates_both_variants() {
+    let up = ClusterUpOutput::Up {
+        namespace: "curie".to_string(),
+        release: "curie".to_string(),
+    };
+    assert_valid("cluster-up.schema.json", &up.to_json());
+    let dry = ClusterUpOutput::DryRun(DryRunPlan {
+        lines: vec!["helm upgrade".to_string()],
+    });
+    assert_valid("cluster-up.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_status_output_validates_both_variants() {
+    let status = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![PodRow {
+            mail_channel: None,
+            name: "curie-worker-0".to_string(),
+            ready: "1/1".to_string(),
+            status: "Running".to_string(),
+        }],
+        ready: 1,
+        total: 1,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+    };
+    let out = ClusterStatusOutput::Status(Box::new(status));
+    assert_valid("cluster-status.schema.json", &out.to_json());
+    assert!(
+        out.to_json()["pods"]["rows"][0]["mail_channel"].is_null(),
+        "an unprobed row omits mail_channel so consumers read null"
+    );
+    let with_mail = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![PodRow {
+            mail_channel: Some(curie::mail_channel::Report {
+                pod: "acme-mail-0".to_string(),
+                channel_token: Some(curie::mail_channel::Token {
+                    present: true,
+                    exp: Some(1_800_000_000),
+                    state: curie::mail_channel::TokenState::Expired,
+                }),
+                last_ingress_status: None,
+                detail: "mail channel token: expired".to_string(),
+                fix: Some("re-mint".to_string()),
+            }),
+            name: "acme-mail-0".to_string(),
+            ready: "1/1".to_string(),
+            status: "Running".to_string(),
+        }],
+        ready: 1,
+        total: 1,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+    };
+    let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
+    assert_eq!(
+        with_mail["pods"]["rows"][0]["mail_channel"]["channel_token"]["state"],
+        "expired"
+    );
+    assert_valid("cluster-status.schema.json", &with_mail);
+
+    let dry = ClusterStatusOutput::DryRun(DryRunPlan {
+        lines: vec!["helm status".to_string()],
+    });
+    assert_valid("cluster-status.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_down_output_validates_all_variants() {
+    let down = ClusterDownOutput::Down {
+        release_was_absent: false,
+    };
+    assert_valid("cluster-down.schema.json", &down.to_json());
+    assert_valid(
+        "cluster-down.schema.json",
+        &ClusterDownOutput::Aborted.to_json(),
+    );
+    let dry = ClusterDownOutput::DryRun(DryRunPlan {
+        lines: vec!["helm uninstall".to_string()],
+    });
+    assert_valid("cluster-down.schema.json", &dry.to_json());
 }
 
 #[test]

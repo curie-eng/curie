@@ -158,6 +158,14 @@ roleRef:
 {{- end -}}
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
+{{- /* An agent whose bundle layers its own runner image (ADR-0173) renders
+       that digest in every container that would run the platform runner. */}}
+{{- $runnerImageRef := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
+{{- if $agent }}
+{{- with index (.Values.agentSandbox.runnerImages | default dict) $agent }}
+{{- $runnerImageRef = . }}
+{{- end }}
+{{- end }}
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := $runner.workspace }}
 {{- $af := $runner.attachments | default dict }}
@@ -456,7 +464,7 @@ spec:
         {{- end }}
         {{- if $wf.enabled }}
         - name: workspace-init
-          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          image: {{ $runnerImageRef | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
@@ -582,7 +590,7 @@ spec:
         overwhelming majority of turns -- is a clean no-op.
         */}}
         - name: attachments-init
-          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          image: {{ $runnerImageRef | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
           # Same container-level lockdown as the runner: this fetches untrusted
@@ -685,7 +693,7 @@ spec:
       {{- end }}
       containers:
         - name: runner
-          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          image: {{ $runnerImageRef | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
@@ -837,6 +845,14 @@ spec:
 {{- range $agent := keys $connectorSecrets | sortAlpha }}
 {{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
 {{- fail (printf "agentSandbox.connectorSecrets.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- end }}
+{{- range $agent, $ref := .Values.agentSandbox.runnerImages | default dict }}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
+{{- fail (printf "agentSandbox.runnerImages.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" (toString $ref)) }}
+{{- fail (printf "agentSandbox.runnerImages.%s must be a digest reference <repository>@sha256:<64 hex> produced by curie build, got %q" $agent (toString $ref)) }}
 {{- end }}
 {{- end }}
 {{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}

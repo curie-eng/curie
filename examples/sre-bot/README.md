@@ -198,7 +198,9 @@ maps `/commonLabels/curie_workload` to the repository and deployed revision.
 signer adds to each forwarded body. Set the following inputs for your release
 and workload, then run the commands from this checkout. The default service
 address assumes the `curie` release in the `curie` namespace and the chart's
-default API port. The Slack channel is the agent's bound reply channel.
+default API port. The Slack channel is the agent's bound reply channel. If the
+agent binds that channel under a named Slack identity rather than the default
+one, set `SLACK_IDENTITY` to its name so the hook URL names that route.
 
 ```bash
 (
@@ -206,6 +208,7 @@ set -euo pipefail
 umask 077
 : "${KUBE_CONTEXT:?Set the Kubernetes context for this installation}"
 : "${SLACK_CHANNEL:?Set the bound Slack channel ID}"
+SLACK_IDENTITY=${SLACK_IDENTITY:-}
 OBS_NAMESPACE=${OBS_NAMESPACE:-observability}
 CURIE_NAMESPACE=${CURIE_NAMESPACE:-curie}
 CURIE_RELEASE=${CURIE_RELEASE:-curie}
@@ -227,9 +230,12 @@ curie cluster hooks configure "$CURIE_AGENT" --file "$private_dir/hooks.json"
 agent_id=$(curie cluster hooks show "$CURIE_AGENT" --json | jq -er '.id')
 curie cluster hooks secret "$CURIE_AGENT" --json |
   jq -ej '.secret' > "$private_dir/CURIE_HOOK_SECRET"
-printf 'http://%s-api.%s.svc.cluster.local:8000/hooks/%s/alertmanager?kind=slack&address=%s' \
-  "$CURIE_RELEASE" "$CURIE_NAMESPACE" "$agent_id" "$SLACK_CHANNEL" \
-  > "$private_dir/CURIE_HOOK_URL"
+hook_url=$(printf 'http://%s-api.%s.svc.cluster.local:8000/hooks/%s/alertmanager?kind=slack&address=%s' \
+  "$CURIE_RELEASE" "$CURIE_NAMESPACE" "$agent_id" "$SLACK_CHANNEL")
+if [ -n "$SLACK_IDENTITY" ]; then
+  hook_url="$hook_url&adapter=$SLACK_IDENTITY"
+fi
+printf '%s' "$hook_url" > "$private_dir/CURIE_HOOK_URL"
 openssl rand -hex 32 | tr -d '\n' > "$private_dir/token"
 kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create secret generic alert-signer-hook \
   --from-file="$private_dir/CURIE_HOOK_SECRET" \
