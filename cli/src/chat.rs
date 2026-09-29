@@ -21,6 +21,7 @@
 //! `chat.update` edits land at this stub instead of real Slack. No Slack token,
 //! channel, or real Slack HTTP on the CLI side.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -120,6 +121,10 @@ pub struct SlackCall {
     /// payload contains a valid id. This is independent of placeholder edit
     /// ordering, so a card that arrives before its notice can still be resumed.
     pub approval_id: Option<String>,
+    /// The ts this stub answered a `chat.postMessage` with, so a wait can follow
+    /// a reply the worker posted as a new message (ADR-0179). `None` for every
+    /// other method.
+    pub posted_ts: Option<String>,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
@@ -128,6 +133,37 @@ pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) ->
         call.text.as_deref()
     } else {
         None
+    }
+}
+
+/// Follow the message this wait reports as the reply, then observe its edits.
+///
+/// The tracked message starts as the placeholder. A resumed answer below an
+/// in-thread approval card is posted as a new message instead (ADR-0179), so a
+/// post that is not an approval card, arriving before this wait has seen any
+/// edit, becomes the tracked message and its text the first snapshot. Once the
+/// placeholder carries the reply, a later post never takes its place.
+fn observe_reply(
+    call: &SlackCall,
+    tracked_ts: &mut String,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) -> bool {
+    if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
+        if let Some(posted) = call.posted_ts.as_deref() {
+            *tracked_ts = posted.to_string();
+            if let Some(text) = call.text.as_deref() {
+                observer(text);
+                *latest = Some(text.to_string());
+            }
+            return true;
+        }
+    }
+    if placeholder_update_text(call, tracked_ts).is_some() {
+        observe_placeholder_update(call, tracked_ts, latest, observer);
+        true
+    } else {
+        false
     }
 }
 
@@ -273,6 +309,7 @@ struct StubState {
 pub struct SlackStub {
     base_api_url: String,
     calls: mpsc::UnboundedReceiver<SlackCall>,
+    deferred_calls: VecDeque<SlackCall>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -327,6 +364,7 @@ impl SlackStub {
         Ok(Self {
             base_api_url: format!("http://{advertise_host}:{}/api/", addr.port()),
             calls,
+            deferred_calls: VecDeque::new(),
             server,
         })
     }
@@ -338,7 +376,17 @@ impl SlackStub {
 
     /// Await the next captured call, or `None` if the stub has shut down.
     pub async fn recv(&mut self) -> Option<SlackCall> {
-        self.calls.recv().await
+        match self.deferred_calls.pop_front() {
+            Some(call) => Some(call),
+            None => self.calls.recv().await,
+        }
+    }
+
+    /// Put calls back ahead of the live receiver for the next logical turn.
+    fn restore_calls(&mut self, calls: Vec<SlackCall>) {
+        for call in calls.into_iter().rev() {
+            self.deferred_calls.push_front(call);
+        }
     }
 }
 
@@ -363,6 +411,7 @@ async fn handle_call(
     let ts_out = ts
         .clone()
         .unwrap_or_else(|| synthetic_thread_and_placeholder().0);
+    let posted_ts = (method == "chat.postMessage").then(|| ts_out.clone());
     let _ = state.tx.send(SlackCall {
         method,
         channel: channel.clone(),
@@ -370,6 +419,7 @@ async fn handle_call(
         text: text.clone(),
         approval_card,
         approval_id,
+        posted_ts,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
@@ -476,10 +526,17 @@ pub async fn await_reply(
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
     let mut latest: Option<String> = None;
+    // The message whose edits are the reply: the placeholder, unless the turn
+    // posts its reply as a new message (see `observe_reply`).
+    let mut tracked_ts = placeholder_ts.to_string();
     // Whether the worker posted an approval card during this turn: the turn parked
     // awaiting approval rather than finalizing normally (#529).
     let mut awaiting_approval = false;
     let mut card_approval_id: Option<String> = None;
+    // A fast approval resolution can enqueue and deliver the resume before this
+    // wait has returned from the parked turn. Keep calls that do not belong to
+    // this turn and replay them to await_resume instead of losing them here.
+    let mut deferred_calls = Vec::new();
     let mut poll = tokio::time::interval(ACK_POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -489,7 +546,10 @@ pub async fn await_reply(
                     if call.approval_id.is_some() {
                         card_approval_id = call.approval_id.clone();
                     }
-                    observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                    let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                    if awaiting_approval && !call.approval_card && !consumed {
+                        deferred_calls.push(call);
+                    }
                 }
             }
             _ = poll.tick() => {
@@ -512,16 +572,23 @@ pub async fn await_reply(
                         if call.approval_id.is_some() {
                             card_approval_id = call.approval_id.clone();
                         }
-                        observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                        let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                        if awaiting_approval && !call.approval_card && !consumed {
+                            deferred_calls.push(call);
+                        }
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
                     // text (the route-bound case, where no card reaches us).
-                    return completed_turn_outcome(
+                    let outcome = completed_turn_outcome(
                         latest,
                         awaiting_approval,
                         card_approval_id,
                     );
+                    if matches!(outcome, Outcome::AwaitingApproval { .. }) {
+                        stub.restore_calls(deferred_calls);
+                    }
+                    return outcome;
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -915,6 +982,7 @@ mod tests {
             text: Some("the answer".into()),
             approval_card: false,
             approval_id: None,
+            posted_ts: None,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).
@@ -925,6 +993,140 @@ mod tests {
             ..update.clone()
         };
         assert_eq!(placeholder_update_text(&post, "1.2"), None);
+    }
+
+    fn stub_call(method: &str, ts: Option<&str>, posted: Option<&str>, text: &str) -> SlackCall {
+        SlackCall {
+            method: method.into(),
+            channel: Some("C1".into()),
+            ts: ts.map(str::to_string),
+            text: Some(text.into()),
+            approval_card: false,
+            approval_id: None,
+            posted_ts: posted.map(str::to_string),
+        }
+    }
+
+    fn replay(calls: &[SlackCall]) -> (Option<String>, Vec<String>) {
+        let mut tracked = "ph".to_string();
+        let mut latest = None;
+        let mut seen = Vec::new();
+        for call in calls {
+            observe_reply(call, &mut tracked, &mut latest, &mut |text| {
+                seen.push(text.to_string())
+            });
+        }
+        (latest, seen)
+    }
+
+    /// ADR-0179 decision 3: a resumed answer below an in-thread card is a NEW
+    /// message, so the wait follows the post instead of the placeholder above
+    /// the card. The settled card's own edit is not the reply.
+    #[test]
+    fn a_resumed_answer_posted_below_the_card_is_the_reply() {
+        let (latest, seen) = replay(&[
+            stub_call("chat.update", Some("card-ts"), None, "Approved"),
+            stub_call("chat.postMessage", None, Some("p1"), "Starting up"),
+            stub_call("chat.update", Some("p1"), None, "Filed report-v1.md"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("Filed report-v1.md"));
+        assert_eq!(seen, vec!["Starting up", "Filed report-v1.md"]);
+    }
+
+    /// ADR-0179 decision 3: a fast resume can post before the first wait finishes
+    /// draining the approval turn. That post belongs to the NEXT wait, not the
+    /// already-populated pause notice.
+    #[test]
+    fn a_fast_resumed_post_is_preserved_for_the_resume_wait() {
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let mut first_tracked = "ph".to_string();
+        let mut pause = Some("Approval requested. See the card below.".to_string());
+        let mut seen = Vec::new();
+
+        assert!(!observe_reply(
+            &post,
+            &mut first_tracked,
+            &mut pause,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(
+            pause.as_deref(),
+            Some("Approval requested. See the card below.")
+        );
+
+        let mut resume_tracked = "ph".to_string();
+        let mut resumed = None;
+        assert!(observe_reply(
+            &post,
+            &mut resume_tracked,
+            &mut resumed,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(resumed.as_deref(), Some("Starting up"));
+    }
+
+    /// Calls drained from an approval turn are replayed in wire order when the
+    /// resume wait starts, so the new post is seen before edits to its minted ts.
+    #[tokio::test]
+    async fn deferred_calls_are_replayed_in_wire_order() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let update = stub_call("chat.update", Some("p1"), None, "Done");
+
+        stub.restore_calls(vec![post, update]);
+
+        assert_eq!(stub.recv().await.unwrap().method, "chat.postMessage");
+        assert_eq!(stub.recv().await.unwrap().method, "chat.update");
+    }
+
+    /// The negative: once the placeholder carries the reply, a later post (a
+    /// second message the turn happens to send) does not take its place.
+    #[test]
+    fn a_post_after_the_placeholder_was_edited_is_not_the_reply() {
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            stub_call("chat.postMessage", None, Some("p2"), "something else"),
+            stub_call("chat.update", Some("p2"), None, "something else, edited"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// An approval card is never the reply, even when it is the first post.
+    #[test]
+    fn an_approval_card_post_is_never_followed_as_the_reply() {
+        let mut card = stub_call("chat.postMessage", None, Some("p1"), "Approval required: x");
+        card.approval_card = true;
+        let (latest, seen) = replay(&[card, stub_call("chat.update", Some("p1"), None, "edited")]);
+
+        assert_eq!(latest, None);
+        assert!(seen.is_empty());
+    }
+
+    /// The stub reports the ts it answered a post with, which is what lets the
+    /// wait follow a reply posted as a new message.
+    #[tokio::test]
+    async fn the_stub_reports_the_ts_it_answered_a_post_with() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C1"), ("thread_ts", "1.0"), ("text", "hello")])
+            .send()
+            .await
+            .expect("the stub answers")
+            .json()
+            .await
+            .expect("the stub answers JSON");
+        let call = stub.recv().await.expect("the stub records the call");
+
+        assert_eq!(call.method, "chat.postMessage");
+        assert_eq!(call.posted_ts.as_deref(), response["ts"].as_str());
+        assert!(call.posted_ts.is_some());
     }
 
     #[test]

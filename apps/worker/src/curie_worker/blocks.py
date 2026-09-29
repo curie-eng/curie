@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from channel_protocol import ChoiceIntent, ConfirmIntent, OutboundMessage
@@ -383,7 +384,13 @@ def approval_card(
 
 
 def resolved_approval_card(
-    *, summary: str, requested_by: str, decision: str, resolver: str, note: str | None
+    *,
+    summary: str,
+    requested_by: str,
+    decision: str,
+    resolver: str,
+    note: str | None,
+    resolved_at: datetime | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """The approval card rebuilt in its RESOLVED form (#1084).
 
@@ -400,40 +407,38 @@ def resolved_approval_card(
 
     from curie_dispatcher.approval_actions import (
         settled_approval_card,
+        settled_card_header,
         settled_verdict_line,
     )
 
     return settled_approval_card(
         summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),
         requested_by=requested_by,
-        verdict=settled_verdict_line(decision=decision, resolver=resolver, note=note),
+        verdict=settled_verdict_line(
+            decision=decision, resolver=resolver, note=note, resolved_at=resolved_at
+        ),
+        header=settled_card_header(decision),
     )
 
 
-def expired_approval_card(*, summary: str) -> tuple[str, list[dict[str, Any]]]:
+def expired_approval_card(
+    *, summary: str, requested_by: str = ""
+) -> tuple[str, list[dict[str, Any]]]:
     """The approval card rebuilt in its EXPIRED, no-longer-actionable form (#419).
 
     The same summary the live card showed, with the Approve/Reject actions block
     dropped and an expiry line in its place -- so the card cannot be clicked and
-    reads as settled. This is the expiry mirror of the dispatcher's resolved-card
-    edit, rebuilt from the remembered summary because the worker does not keep the
-    original card's blocks. Returns ``(fallback_text, blocks)`` for ``chat.update``.
+    reads as settled. Rendered by the same settled-card builder as a resolved
+    card, headed ``Expired`` and naming the requester when it is known
+    (ADR-0179); an expiry has no decision time. Returns ``(fallback_text,
+    blocks)`` for ``chat.update``.
     """
 
-    clamped = _truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX)
-    fallback = _truncate(f"Approval expired: {summary}", _SLACK_TEXT_MAX)
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": _truncate("Approval expired", _HEADER_MAX),
-                "emoji": True,
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": clamped}},
-        _context_block(
-            "This request expired and can no longer be approved or rejected."
-        ),
-    ]
-    return fallback, blocks
+    from curie_dispatcher.approval_actions import settled_approval_card, settled_card_header
+
+    return settled_approval_card(
+        summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),
+        requested_by=requested_by,
+        verdict="This request expired and can no longer be approved or rejected.",
+        header=settled_card_header("expired"),
+    )

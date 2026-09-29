@@ -1363,6 +1363,11 @@ class WorkerConfig(BaseSettings):
         # key so the card store's legacy migration scan never sees these entries.
         return f"{self.key_prefix}:approval-notice-ref:{approval_id}"
 
+    def approval_reply_below_card_key(self, approval_id: str) -> str:
+        # Present when this approval's resume answers below its card (ADR-0179).
+        # Its own segment for the same reason as the notice ref's.
+        return f"{self.key_prefix}:approval-reply-below-card:{approval_id}"
+
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.
 

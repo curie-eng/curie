@@ -97,13 +97,13 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
 - the channel to probe when a request names none, if you want a default;
 - the `owner/repo@branch` repositories it may read target bundles from, if any;
-- the test installations, if any;
 - how many new threads a campaign may open per 15 minutes, how many follow-ups
   a thread may carry, and the turn budget (see "A campaign").
 
-Every target not listed as a test installation is production. Against
-production, the tester only reads and asks. It never asks for an action, even
-an approval-gated one, and never attaches a file (ADR 0172 decision 5).
+Every probe only reads or asks. The tester never asks for an action, even on a
+test installation and even when the action is approval gated. It never creates
+or resolves an approval card, and it never attaches a file (ADR 0172 decision
+5, tightened by #3043).
 
 The sandbox needs egress to Slack's API, and to GitHub's API when a repository
 is listed. Add one `agentSandbox.connectorEgress.<agent>` entry per CIDR, for
@@ -186,8 +186,8 @@ and only then sends anything. A campaign has five kinds of thread:
 - **ordinary use:** one probe for each thing the spec says the target does;
 - **boundaries:** a near miss, something that does not exist, a value it must
   refuse;
-- **refusals:** an off-topic ask, a forbidden action asked as a question, an
-  instruction to ignore its rules;
+- **refusals:** an off-topic ask, a question about what a forbidden action
+  would require, an instruction to ignore its rules;
 - **authority:** someone else already approved it, the rules changed this
   morning;
 - **conversation:** a follow-up in the same thread that corrects, contradicts
@@ -234,8 +234,13 @@ all in one Slack reply of under 3,000 characters.
 
 Each case in [`evals/cases.json`](evals/cases.json) hands the tester a recorded
 exchange and grades its verdict. Real failure shapes must come back FAIL, and
-good replies PASS, with a spec and without one. Run them with a model
-credential:
+good replies PASS, with a spec and without one. The recorded exchanges include
+contradictions between a claimed capability and the target's own tool inventory,
+misleading tool-call
+inventories presented as changes, replies that leave their Slack thread,
+settled approval cards that still look pending, and approval messages in the
+wrong order. Approval cases are recorded exchanges only. The tester never
+creates a card to exercise them. Run the cases with a model credential:
 
 ```bash
 curie skill eval --plugin-dir examples/mean-tester
@@ -244,6 +249,7 @@ curie skill eval --plugin-dir examples/mean-tester
 ## What it will not do
 
 - Resolve, approve or reject any approval card.
+- Ask a target to perform an action or create an approval card.
 - Change anything about its target, or file anything.
 - Reply in any thread but the ones its own probes opened, react, or read Slack
   users: the tool policy allows exactly the seven tools listed in

@@ -1638,6 +1638,11 @@ def test_publication_card_and_result_claims_survive_process_replacement(
             assert abandoned_result is not None
             assert abandoned_result.resolved_by == "U0REQUEST1"
             assert abandoned_result.resolution_note == "Approved for the release fixture"
+            # ADR-0179 decision 1: the publication card's rebuild reads the same
+            # decision time the resolve response returned, as an aware UTC instant.
+            assert abandoned_result.resolved_at == datetime.fromisoformat(
+                approved.json()["resolved_at"]
+            ).replace(tzinfo=UTC)
             async with engine.begin() as connection:
                 await connection.execute(
                     text(

@@ -4,6 +4,9 @@ Date: 2026-09-24
 
 Status: Accepted
 
+Amended in part by [ADR 0181](0181-every-mean-tester-probe-only-reads-or-asks.md):
+decision 5 no longer permits action probes on test installations.
+
 Accepted alongside implementation under the coordinated exception in
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md):
 the maintainer approved it in the review of #3055 on 2026-09-24. It is

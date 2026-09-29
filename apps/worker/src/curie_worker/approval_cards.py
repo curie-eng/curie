@@ -262,6 +262,26 @@ class ApprovalCardStore:
             self._config.approval_notice_ref_key(approval_id), ref, ex=self._ttl_s
         )
 
+    async def remember_reply_below_card(self, approval_id: str) -> None:
+        """Remember that this approval's resume answers below its card (ADR-0179).
+
+        Kept apart from the card ref, which settling consumes, so a redelivered
+        resume still finds it. Same TTL as the card.
+        """
+
+        if not approval_id:
+            raise ValueError("approval_id is required to remember a reply placement")
+        await self._redis.set(
+            self._config.approval_reply_below_card_key(approval_id), b"1", ex=self._ttl_s
+        )
+
+    async def replies_below_card(self, approval_id: str) -> bool:
+        """Whether this approval's resume answers below its card (ADR-0179)."""
+
+        return bool(
+            await self._redis.exists(self._config.approval_reply_below_card_key(approval_id))
+        )
+
     async def read_notice_ref(self, approval_id: str) -> str | None:
         """The remembered notice ref for an approval, if any (#2721)."""
 

@@ -96,6 +96,7 @@ from .approvals import (
     PublicationLineage,
     ReviewAuthorityUnavailable,
     VerifiedReviewFeedback,
+    decided_field,
 )
 from .attachments import (
     AttachmentCoordinator,
@@ -893,6 +894,11 @@ def _remaining_budget(lease: DeliveryLease | None) -> float | None:
 # stamped expired. The marker is a stable
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
+
+# The pause notice above a card posted in the requester's own thread (ADR-0179
+# decision 2). Worded as something that happened, so it stays true once the card
+# settles and nothing edits it again.
+_IN_THREAD_APPROVAL_NOTICE = "Approval requested. See the card below."
 
 # The only channel kind a POLICY-ROUTED approval RESOLUTION target may name
 # (#1460). The explicit kind is the future extension point, but accepting another
@@ -2415,7 +2421,7 @@ class Kernel:
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
             if self._is_approval_resume(qevent.event_id):
-                await self._adopt_remembered_notice_ref(qevent)
+                qevent = await self._place_the_resumed_reply(qevent)
                 with operation_span(
                     "curie.approval.resume",
                     kind=SpanKind.INTERNAL,
@@ -6695,8 +6701,11 @@ class Kernel:
             # A resolve states what was decided, and that comes from the durable
             # record before the card ref is touched.
             outcome: SettledOutcome | None = None
+            decided: datetime | None = None
             if not is_expiry:
-                outcome = await self._settled_from_record(approval_id)
+                read = await self._settled_from_record(approval_id)
+                if read is not None:
+                    outcome, decided = read
                 if outcome is None:
                     logger.info(
                         "no readable approval outcome for thread %s -- "
@@ -6744,7 +6753,13 @@ class Kernel:
                         conversation_id=qevent.conversation_id,
                         reply_ref=ref.ts,
                     ),
-                    message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
+                    message=OutboundMessage(
+                        version=MESSAGE_VERSION,
+                        text=ref.summary,
+                        # When it was decided, as data (ADR-0179); the adapter
+                        # chooses how to show it.
+                        fields=[decided_field(decided)] if decided is not None else [],
+                    ),
                     settled=settled,
                 ),
                 route=TargetRoute(
@@ -6767,8 +6782,10 @@ class Kernel:
                 exc,
             )
 
-    async def _settled_from_record(self, approval_id: str) -> SettledOutcome | None:
-        """The resolved outcome to stamp, read from the durable record.
+    async def _settled_from_record(
+        self, approval_id: str
+    ) -> tuple[SettledOutcome, datetime | None] | None:
+        """The resolved outcome to stamp and its decision time, from the record.
 
         Read, not parsed. The resume turn does state the decision, the resolver
         and the note, but it states them in a sentence written for a language
@@ -6785,12 +6802,44 @@ class Kernel:
         record = await self._approval_reader.get(approval_id)
         if record is None or record.status not in ("approved", "rejected"):
             return None
-        return SettledOutcome(
-            requested_by="",
-            decision=record.status,
-            resolver=record.resolved_by,
-            note=record.resolution_note,
+        return (
+            SettledOutcome(
+                requested_by="",
+                decision=record.status,
+                resolver=record.resolved_by,
+                note=record.resolution_note,
+            ),
+            record.resolved_at,
         )
+
+    async def _place_the_resumed_reply(self, qevent: QueuedTurn) -> QueuedTurn:
+        """Choose where a resumed approval turn answers (ADR-0179 decision 3).
+
+        When the pause remembered that its card sits in this thread below the
+        notice, the turn drops the placeholder the API replays, so its first
+        delivery posts a new message after the card (the ADR-0079 path) and the
+        rest of the turn edits that message. Otherwise the answer stays on the
+        pending notice, adopting its remembered ref when the row carries none.
+        The returned turn replaces the caller's for the rest of the turn; the
+        durable row and the stream entry are untouched.
+        """
+
+        approval_id = _approval_id_from_resume_event(qevent.event_id)
+        handle = qevent.reply_handle
+        if self._card_store is not None and approval_id is not None and handle is not None:
+            try:
+                below = await self._card_store.replies_below_card(approval_id)
+            except Exception as exc:  # noqa: BLE001 - never fail the resume
+                logger.warning(
+                    "reading the reply placement failed for approval %s: %s", approval_id, exc
+                )
+                below = False
+            if below:
+                return qevent.model_copy(
+                    update={"reply_handle": handle.model_copy(update={"placeholder": None})}
+                )
+        await self._adopt_remembered_notice_ref(qevent)
+        return qevent
 
     async def _adopt_remembered_notice_ref(self, qevent: QueuedTurn) -> None:
         """Adopt the pending notice's ref on a ref-less approval resume (#2721).
@@ -7186,6 +7235,50 @@ class Kernel:
                 type(suspend_error).__name__,
             )
 
+        # The card's destination -- kind AND route -- is selected from the
+        # channel it POSTS TO, never from the turn that requested it. In the
+        # requesting channel the card joins the thread and rides the trigger's
+        # own transport. A route-bound channel has no such thread and is policy,
+        # not a per-turn reply: it posts top-level over the worker's configured
+        # Slack transport, because ``ApprovalRouteBinding.resolution`` is
+        # Slack-only by construction (``schemas.py`` validates the explicit
+        # pair), and the authorizer proves membership of that channel through a
+        # verified Slack card click. Notification transport never feeds this
+        # comparison or these route fields.
+        #
+        # Keeping the requesting turn's kind and adapter here was a fail-closed
+        # bug: an email-originated approval routed to a Slack policy channel kept
+        # ``kind=email`` with an email adapter and NO endpoint, so the egress
+        # raised and the channel the policy exists to notify never saw the card.
+        #
+        # The comparison is the full PAIR, because an address is only unique
+        # within its kind: two bindings may carry the same address string under
+        # different kinds, and comparing addresses alone would hand a non-Slack
+        # turn's transport to a Slack policy card that merely shares its address.
+        in_requesting_channel = (card_kind, card_channel) == (
+            handle.kind,
+            handle.channel,
+        )
+        card_endpoint = handle.endpoint if in_requesting_channel else None
+        # A policy route names only a channel. A Slack turn lends its adapter
+        # so a named identity posts the card under that same identity. An adapter
+        # from another kind cannot carry a Slack policy card.
+        card_adapter = (
+            None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
+        )
+        # The relay (#2883) carries the card on the turn's own ref, so no card
+        # message follows the notice there, and its reader parses the approval id
+        # out of the notice text.
+        card_rides_the_turn = card_adapter == CLUSTER_MESSAGE_ADAPTER
+        # ADR-0179 decision 2: a card that lands in this thread as a message of its
+        # own gets one plain line above it. The line is chosen here, before the card
+        # is posted, and never rewritten: a buffering channel (email) replaces its
+        # reply text on each update and appends the card, so a rewrite would drop
+        # the card from that reply.
+        card_in_thread = (
+            not is_publication and in_requesting_channel and not card_rides_the_turn
+        )
+
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
         # parse_approval_id, the #766 keep-alive). A model-authored blank line or
@@ -7197,7 +7290,9 @@ class Kernel:
         # the notice and never starts with the marker, so the notice stays the
         # single marker-leading, trailing block the CLI expects.
         notice_summary = " ".join(display_summary.split())
-        if is_publication:
+        if card_in_thread:
+            notice = _IN_THREAD_APPROVAL_NOTICE
+        elif is_publication:
             notice = (
                 f"Awaiting approval ({created.id}): {notice_summary}\n"
                 "The session is paused. The platform will publish or decline the "
@@ -7244,41 +7339,6 @@ class Kernel:
             )
             return True
 
-        # The card's destination -- kind AND route -- is selected from the
-        # channel it POSTS TO, never from the turn that requested it. In the
-        # requesting channel the card joins the thread and rides the trigger's
-        # own transport. A route-bound channel has no such thread and is policy,
-        # not a per-turn reply: it posts top-level over the worker's configured
-        # Slack origin, because ``ApprovalRouteBinding.resolution`` is
-        # Slack-only by construction (``schemas.py`` validates the explicit
-        # pair), and the authorizer proves membership of that channel through a
-        # verified Slack card click. Notification transport never feeds this
-        # comparison or these route fields.
-        #
-        # Keeping the requesting turn's kind and adapter here was a fail-closed
-        # bug: an email-originated approval routed to a Slack policy channel kept
-        # ``kind=email`` with an email adapter and NO endpoint, so the egress
-        # raised and the channel the policy exists to notify never saw the card.
-        #
-        # The comparison is the full PAIR, because an address is only unique
-        # within its kind: two bindings may carry the same address string under
-        # different kinds, and comparing addresses alone would hand a non-Slack
-        # turn's transport to a Slack policy card that merely shares its address.
-        in_requesting_channel = (card_kind, card_channel) == (
-            handle.kind,
-            handle.channel,
-        )
-        card_endpoint = handle.endpoint if in_requesting_channel else None
-        # A policy-routed card (NOT in the requesting channel) carries no
-        # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
-        # names only a channel, never an adapter -- so it must borrow the
-        # TURN's, or a named identity's card posts as ``default`` in a channel
-        # where only that identity may be a member (ADR-0168 decision 5). Only
-        # a Slack turn lends it: any other kind's adapter is that kind's own
-        # egress credential, which does not belong on a Slack policy card.
-        card_adapter = (
-            None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
-        )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
@@ -7340,9 +7400,7 @@ class Kernel:
             # mint and addresses the caller's session bucket by the turn's ref,
             # exactly as the publication card outbox does (#2757).
             card_reply_ref = (
-                self._target_for(qevent).reply_ref
-                if card_adapter == CLUSTER_MESSAGE_ADAPTER
-                else None
+                self._target_for(qevent).reply_ref if card_rides_the_turn else None
             )
             card_ack = await self._sink.emit(
                 ReplyPost(
@@ -7389,6 +7447,18 @@ class Kernel:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+            # ADR-0179 decision 3: the card is now a message of its own below the
+            # notice, so the resume answers below it. Remembered apart from the
+            # card ref because settling consumes that ref, and a redelivered
+            # resume must choose the same place. A lost memory only means the
+            # answer edits the notice, as it did before.
+            if card_in_thread and card_ts and self._card_store is not None:
+                try:
+                    await self._card_store.remember_reply_below_card(str(created.id))
+                except Exception as exc:  # noqa: BLE001 - best-effort memory
+                    logger.warning(
+                        "remembering the reply placement for %s failed: %s", created.id, exc
+                    )
         # Visibility is independent of card delivery. This is a second post, not
         # a second card: there is deliberately no ConfirmIntent, action value, or
         # remembered card ref. A failed notification cannot invalidate or move

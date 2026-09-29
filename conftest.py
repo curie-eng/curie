@@ -53,6 +53,7 @@ SHARED_LIVE_STATE_FILES = frozenset(
         "apps/api/tests/test_github_review_pending_outbox.py",
         "apps/api/tests/test_github_review_sender_authority.py",
         "apps/api/tests/test_github_review_terminal.py",
+        "apps/api/tests/test_migration_0043_github_reviews.py",
         # Diffs a global relay key glob before and after each call
         "apps/api/tests/test_cluster_message_results.py",
         # The default eval stream (curie:evals): exact length reads and producers

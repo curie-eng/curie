@@ -252,6 +252,14 @@ and it is stored on the record, stamped onto the card in the approver channel, a
 carried to the requester in the resume turn below. Cancelling the dialog resolves
 nothing, so a misclick is recoverable.
 
+Once an approval ends, its card is a record of the outcome
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+The buttons are gone, the header reads `Approved`, `Rejected` or `Expired`, the summary
+and the requester stay. An approved or rejected card names who decided and when, with
+the note under it. The time is a Slack date token, so each reader sees it in their own
+time zone. An expired card states that the request expired without a decision time.
+A resolve from the CLI or the Console settles the card the same way a click does.
+
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra
 click, and it is deliberate. A reason is the half of a rejection the requester actually
@@ -324,8 +332,16 @@ recognize them will treat the resume as an unrelated user message and the verdic
 silently dropped. Give the skill a section that says what to do on each, including for
 a rejection.
 
-The reply streams back into the **same message** the "awaiting approval" notice was left
-on, because the resume turn replays the original turn's reply handle.
+Where the reply lands depends on where the card went
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+When the card was posted into the requester's own thread, the message above it reads
+only "Approval requested. See the card below.", and the resumed answer is posted as a
+new message below the card, so the thread reads request, card, answer. When the card
+went somewhere else (a route bound to another channel, or the `cluster message` relay),
+the requester's thread gets the full `Awaiting approval (<id>): ...` notice, and the
+reply streams back into that same message, because the resume turn replays the
+original turn's reply handle. The CLI reads the id from the card when its stub
+receives one and from that full notice otherwise.
 
 **A rejection is final until a person asks again.** If the resumed turn requests the same
 approval again (same agent, thread, route and gated tool, however the summary is worded),

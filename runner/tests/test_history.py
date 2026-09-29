@@ -287,6 +287,81 @@ def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_
     assert exported == HarnessReplayState(harness="claude", kind="delta", entries=(delta_entry,))
 
 
+def _prompt_snapshot(system_prompt: str) -> dict[str, object]:
+    """The entry the bundled Claude CLI mirrors for the prompt it will restore.
+
+    Shape observed from claude-agent-sdk 0.2.159 (bundled CLI 2.1.281); the
+    real-CLI half of this contract is test_resumed_turn_system_prompt.py.
+    """
+
+    return {
+        "type": "attachment",
+        "uuid": "snapshot-1",
+        "timestamp": "1970-01-01T00:00:00.000Z",
+        "attachment": {
+            "type": "prompt_snapshot",
+            "systemPrompt": [system_prompt],
+            "reminderFold": False,
+        },
+    }
+
+
+_PRIOR_TURN = (
+    ConversationMessage(role="user", content="what can you do?"),
+    ConversationMessage(role="assistant", content=[{"type": "text", "text": "four things"}]),
+)
+_PRIOR_NATIVE_USER = {
+    "type": "user",
+    "uuid": "entry-1",
+    "timestamp": "1970-01-01T00:00:00.000Z",
+    "message": {"role": "user", "content": "what can you do?"},
+}
+
+
+def test_native_checkpoint_under_another_system_prompt_replays_the_portable_prefix(
+    tmp_path,
+) -> None:
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(_PRIOR_NATIVE_USER, _prompt_snapshot("bundle prompt")),
+    )
+
+    resume = build_structured_resume(
+        _PRIOR_TURN,
+        curie_session_id="curie-thread-attachment",
+        cwd=str(tmp_path),
+        harness_replay=checkpoint,
+        system_prompt="bundle prompt\n\nThe message you are answering carried file attachments.",
+    )
+
+    assert resume.resume == resume.session_id
+    assert resume.session_store is not None
+    entries = anyio.run(resume.session_store.load, resume.session_key)
+    assert entries is not None
+    assert [entry["type"] for entry in entries] == ["user", "assistant"]
+    assert [entry["message"] for entry in entries] == [m.to_dict() for m in _PRIOR_TURN]
+
+
+def test_native_checkpoint_under_this_system_prompt_is_restored(tmp_path) -> None:
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(_PRIOR_NATIVE_USER, _prompt_snapshot("bundle prompt")),
+    )
+
+    resume = build_structured_resume(
+        _PRIOR_TURN,
+        curie_session_id="curie-thread-attachment",
+        cwd=str(tmp_path),
+        harness_replay=checkpoint,
+        system_prompt="bundle prompt",
+    )
+
+    assert resume.session_store is not None
+    assert anyio.run(resume.session_store.load, resume.session_key) == list(checkpoint.entries)
+
+
 def test_dropped_native_export_requests_a_fresh_adapter_checkpoint(tmp_path) -> None:
     resume = build_structured_resume((), curie_session_id="curie-thread-bounded", cwd=str(tmp_path))
     assert resume.session_store is not None

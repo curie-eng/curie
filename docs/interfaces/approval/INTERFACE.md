@@ -81,8 +81,9 @@ in code now:
   A further optional `Final` field, `approval_display` (#2565, Draft ADR-0151), carries the
   human sentence a bundle-authored `approvalPolicy.gates[].summary` template rendered. It is
   additive (ACI patch 0.4.5). The worker uses `approval_display or approval_summary` for the
-  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`), and the
-  resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
+  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`, which is
+  the full notice only where the card is not posted into the requester's own thread;
+  there it is one line pointing at the card, ADR-0179), and the resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
   `gate_kind IS NULL` prefix fallback and the audit record are unchanged. A gate without a
   template leaves `approval_display` unset, which is today's bytes.
 - **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
