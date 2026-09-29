@@ -824,6 +824,267 @@ tests:
         alertname: CurieConnectorNotReady
         exp_alerts: []
 
+  # A connector that is up but answers its tool calls with errors leaves every
+  # turn done: the model tells the person it could not read the system.
+  # curie_tool_result_total is the runner's count of tool results by origin and
+  # outcome. Runner series are per sandbox process (`instance`), and a runner
+  # sandbox usually lives for one turn, so its series' first sample already
+  # carries that turn's errors and the rule counts it as an increase from zero.
+  # Both counts sum without (instance, outcome), so the alert names no process
+  # and no outcome.
+  #
+  # One sandbox's first export at 10m: three errors and one success, then flat.
+  # The new-series term holds from 10m to 24m, when the offset hour first reads
+  # the 10m sample. Errors are 3 of 4 results. Pending at 10m, firing from 15m,
+  # resolved at 25m.
+  - name: connector tool errors fire on a new runner series' first sample
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 25m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two sandboxes, two errors and one success each: neither reaches three on
+  # its own. a's first export is at 10m and b's at 12m, so the sum is four
+  # errors of six results from 12m until a's new-series term ends at 24m.
+  # Pending at 12m, firing from 17m, one alert with no instance label.
+  - name: connector tool errors fire when they are spread over two runner instances
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-b"}'
+        values: '_x12 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-b"}'
+        values: '_x12 1x30'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 25m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # A sandbox that has served turns since before 0m: one error and one success
+  # already counted. Three more errors at 31m, 32m and 33m and no success, so
+  # increase() reads three (a little more, extrapolated) from 33m until 44m,
+  # when the window no longer holds the sample before the first new error.
+  # Pending at 33m, firing from 38m, resolved at 45m once the errors stop.
+  - name: connector tool errors on a long-running runner fire, then recover when the errors stop
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '1x30 2 3 4x40'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '1x72'
+    alert_rule_test:
+      - eval_time: 37m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 44m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 45m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Three errors, but among thirteen results: a connector that fails now and
+  # then while mostly answering is below the ratio.
+  - name: connector tool errors stay quiet when most connector calls succeed
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Every connector result an error, but only two of them: first exported at 1
+  # and then 2, with no success series at all. Short of three on either term.
+  - name: two connector tool errors stay quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x6 1x6 2x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two connector errors beside five failed builtin and platform calls. A
+  # builtin tool such as Read and Curie's own tools are not connectors; counted
+  # in, they would make seven and fire.
+  - name: builtin and platform tool errors do not count toward connector errors
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="builtin",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="platform",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two connector errors beside five calls the runner's approval gate held. A
+  # held call arrives as an error result but never reached the connector;
+  # counted in, it would make seven and fire.
+  - name: connector calls held for approval do not count as connector errors
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="awaiting_approval",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Nor do held calls dilute the ratio: three errors and one success among the
+  # connector's own answers, beside ten held calls. The ratio counts success
+  # and error only, so it is 3 of 4 and fires; counting the held calls would
+  # make it 3 of 14 and hide the failing connector.
+  - name: connector calls held for approval do not dilute the connector error ratio
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="awaiting_approval",instance="acme-runner-a"}'
+        values: '_x10 10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+
   # The dispatcher down is the quietest failure an installation has: every pod
   # is Running, nothing errors, and no Slack message reaches any agent.
   # CurieWorkerSupervisedRestartLoop watches the worker's own supervised-task

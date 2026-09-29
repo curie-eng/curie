@@ -1018,6 +1018,7 @@ REQUIRED_ALERTS = {
     "CurieReplyDeliveryRefused",
     "CurieChannelTokenRotationFailed",
     "CurieMailAdapterNotReady",
+    "CurieConnectorToolErrors",
     "CurieRootDiskPressure",
     "CurieRootInodesLow",
     "CurieNodeMemoryHeadroomLow",

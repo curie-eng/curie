@@ -592,6 +592,35 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     assert definition["cardinality_bound"] == 14
 
 
+def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
+    """The runner's tool result counter carries no identifier of the tool.
+
+    ``cancelled`` is a result that arrived after an operator stopped the turn,
+    kept apart from ``error`` so a stopped turn never reads as a failing
+    connector. Red until the outcome domain declares it and
+    ``schema/metrics.json`` is regenerated. Red again on any drift: a connector
+    or tool name added as an attribute (the cardinality bound would no longer
+    be twelve), an origin or outcome value dropped or renamed, or the counter
+    made non-monotonic. The alert CurieConnectorToolErrors selects on exactly
+    these values.
+    """
+
+    manifest = _read(_MANIFEST)["metrics"]
+    assert manifest.get("curie.tool.result") == {
+        "type": "counter",
+        "unit": "{call}",
+        "description": "Tool call results by origin and outcome.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-runner"],
+            "source": ["runner"],
+            "origin": ["connector", "platform", "builtin"],
+            "outcome": ["success", "error", "awaiting_approval", "cancelled"],
+        },
+        "cardinality_bound": 12,
+    }
+
+
 def test_supervised_restart_metric_rejects_undeclared_operation_by_execution(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:

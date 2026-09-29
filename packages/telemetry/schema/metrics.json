@@ -1664,6 +1664,32 @@
         ]
       },
       "cardinality_bound": 14
+    },
+    "curie.tool.result": {
+      "type": "counter",
+      "unit": "{call}",
+      "description": "Tool call results by origin and outcome.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
+        ],
+        "origin": [
+          "connector",
+          "platform",
+          "builtin"
+        ],
+        "outcome": [
+          "success",
+          "error",
+          "awaiting_approval",
+          "cancelled"
+        ]
+      },
+      "cardinality_bound": 12
     }
   }
 }

@@ -145,12 +145,12 @@ serverFiles:
     groups:
       - name: curie-reliability
         # CurieTaskFailure, CurieWorkerSupervisedRestartLoop,
-        # CurieReplyDeliveryRefused and CurieChannelTokenRotationFailed each
-        # have a second term for a new series. The SDK exports a counter only
-        # after its first measurement, so a series arrives at its first value
-        # with no zero before it, and increase() cannot see a first sample.
-        # Each process exports under its own `instance`, so a restarted
-        # process's counters are new series too.
+        # CurieReplyDeliveryRefused, CurieChannelTokenRotationFailed and
+        # CurieConnectorToolErrors each have a second term for a new series.
+        # The SDK exports a counter only after its first measurement, so a
+        # series arrives at its first value with no zero before it, and
+        # increase() cannot see a first sample. Each process exports under its
+        # own `instance`, so a restarted process's counters are new series too.
         # `X unless last_over_time(X[1h] offset O)` is a series with no sample
         # in the hour ending O ago. O is the rule's window, so a new series'
         # value counts as its increase over the same window increase() uses.
@@ -625,6 +625,154 @@ serverFiles:
                 A connector has no available replica, or has been scaled to
                 zero. Its agent still answers, and tells the person it cannot
                 reach the systems it reads from.
+          - alert: CurieConnectorToolErrors
+            # A connector that is serving but answers its tool calls with
+            # errors is invisible to CurieConnectorNotReady: every turn still
+            # ends done, and the model tells the person it could not read the
+            # system. curie_tool_result_total is the runner's count of tool
+            # results by origin and outcome. Runner series are per sandbox
+            # process (`instance`), and a sandbox usually lives for one turn,
+            # so a series' first sample already carries that turn's errors.
+            # Every count therefore uses the new-series term above, reading
+            # last_over_time(X[15m]) for X as CurieTurnAcceptedStale does, so
+            # a sandbox that exported its errors and exited still counts for
+            # the whole window. Each count sums without (instance, outcome),
+            # so errors spread over several sandboxes add up and the alert
+            # names no process. It needs both three or more errors in 15
+            # minutes and errors at least half of the connector's success and
+            # error results, so an occasional model mistake, such as a
+            # connector refusing a wrong argument, does not page. A call the
+            # runner's approval gate held (awaiting_approval) or an operator
+            # stop cut off (cancelled) counts toward neither. An error is any
+            # is_error result on a non-platform `mcp__` tool that the gate did
+            # not hold and no operator stop cut off: a connector's isError
+            # result or JSON-RPC error, a call the turn deadline cut off, and
+            # rarely a call refused before it reached the connector, as
+            # docs/interfaces/telemetry-otel/INTERFACE.md lists. A connector
+            # that reports failure inside a success-shaped payload counts as a
+            # success, and this rule cannot see it. The metric carries no
+            # connector name. The runner logs one WARNING per failed call
+            # naming the connector server and tool, and that line is how to
+            # find which connector is failing.
+            expr: |
+              sum without (instance, outcome) (
+                (
+                  increase(
+                    curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                  )
+                  unless
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                or
+                (
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                  )
+                  unless
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                    offset 15m
+                  )
+                )
+              ) >= 3
+              and
+              (
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                /
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error"
+                        }[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error"
+                        }[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[1h]
+                      offset 15m
+                    )
+                  )
+                )
+              ) >= 0.5
+            for: 5m
+            labels:
+              severity: page
+              component: curie-connector
+            annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
           - alert: CurieDispatcherRestartLoop
             # Pod restarts, not CurieWorkerSupervisedRestartLoop's in-process
             # counter: a dispatcher that crashes takes its counter with it.

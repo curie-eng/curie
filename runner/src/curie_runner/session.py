@@ -49,7 +49,7 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import ApprovalGate
+from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
@@ -137,6 +137,21 @@ FALSE_COMPLETION_CLASSIFICATION = "false-completion"
 # error+final pair, because a publication request that produced no approval
 # record must never finalize looking like a clean turn.
 PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
+# Curie's own in-process tool names, for a tool result's ``origin`` (#3486).
+# Exact membership, as ``is_platform_owned_tool`` decides it (#2286), but over
+# the maximal set: a telemetry label grants nothing, so a ``curie-state`` name
+# counts as platform whether or not this session mounted that server.
+_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True)
+
+
+def _tool_result_origin(tool_name: str) -> str:
+    """``platform``, ``connector`` or ``builtin`` for a live tool name (#3486)."""
+
+    if tool_name in _PLATFORM_TOOL_NAMES:
+        return "platform"
+    if is_mcp_tool(tool_name):
+        return "connector"
+    return "builtin"
 
 
 def _is_auth_rejection(message: object) -> bool:
@@ -1297,6 +1312,9 @@ class SessionRunner:
             # (#2294). Never a task, and nothing is awaited between observing a
             # publication call and classifying the turn that made it.
             await self._observe_publication_calls(state)
+            # The tool result counter (#3486), on the same iteration: a held
+            # call's gate record is standing when its deny result arrives.
+            self._observe_tool_results(state)
             decided_result_final: Final | None = None
             if isinstance(message, AssistantMessage):
                 if self._primary_model is None:
@@ -1544,6 +1562,63 @@ class SessionRunner:
                 logger.debug(
                     "publication already recorded this turn session=%s",
                     self._session_id,
+                )
+
+    def _observe_tool_results(self, state: TurnState) -> None:
+        """Count every tool result that closed a call this turn (#3486).
+
+        ``is_error`` is the signal; no payload is parsed. The order matches
+        ``_merge_gate_block``, where an operator interrupt outranks an approval
+        halt. A result that is not an error is ``success``. An error after an
+        operator stop is ``cancelled``: the CLI answers the call it cut off
+        itself. An error on the call the approval gate holds (it asked for a
+        halt and its pending record names this tool) is ``awaiting_approval``;
+        the record holds the first held call only, so another tool's failure in
+        the same message stays an error. Anything else is ``error``, a turn
+        deadline included on purpose: a connector that holds a call until the
+        deadline is failing.
+
+        So a connector ``error`` is any is_error result on a non-platform
+        ``mcp__`` tool that the approval gate did not hold and no operator stop
+        cut off. That rarely includes a call that never reached the connector;
+        ``docs/interfaces/telemetry-otel/INTERFACE.md`` lists those cases
+        (#3489). Each one logs one WARNING naming the server and the tool,
+        because the metric may carry no identifier; the line never carries the
+        call's arguments or its result. Like ``_observe_publication_calls`` it
+        runs on every message and acts only on results it has not counted yet.
+        """
+
+        gate = self._approval_gate
+        while state.tool_results_observed < len(state.tool_results):
+            tool_name, errored = state.tool_results[state.tool_results_observed]
+            state.tool_results_observed += 1
+            if not errored:
+                outcome = "success"
+            elif self._interrupt_requested and not self._timeout_requested:
+                outcome = "cancelled"
+            elif gate is not None and gate.pending_halt and gate.pending_granted_tool == tool_name:
+                outcome = "awaiting_approval"
+            else:
+                outcome = "error"
+            origin = _tool_result_origin(tool_name)
+            record_metric(
+                "curie.tool.result",
+                attributes={
+                    "service.name": "curie-runner",
+                    "source": "runner",
+                    "origin": origin,
+                    "outcome": outcome,
+                },
+            )
+            if origin == "connector" and outcome == "error":
+                # Split at the FIRST separator: a plugin server key is one
+                # token, and a tool name may itself contain ``__``.
+                server, _, tool = tool_name[len("mcp__") :].partition("__")
+                logger.warning(
+                    "connector tool error session=%s server=%s tool=%s",
+                    self._session_id,
+                    server,
+                    tool,
                 )
 
     def _has_unhandled_publication(self, state: TurnState) -> bool:
