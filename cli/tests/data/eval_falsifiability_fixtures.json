@@ -42,7 +42,8 @@
       "⚠️ This signed notification is still valid and warrants investigation.\nWhat I checked: the notification identity and current queue evidence.\nWhat to do: inspect the dead-letter item.\nWhat I changed: nothing."
     ],
     "sre-bot/sre-alert-2-empty-instant-series-is-not-a-fabricated-alert": [
-      "⚠️ No longer firing: history confirms this was a genuine notification, not fabricated.\nWhat I checked: the Prometheus source is healthy and range history contains the episode.\nWhat to do: watch for recurrence.\nWhat I changed: nothing."
+      "⚠️ No longer firing: history confirms this was a genuine notification, not fabricated.\nWhat I checked: the Prometheus source is healthy and range history contains the episode.\nWhat to do: watch for recurrence.\nWhat I changed: nothing.",
+      "⚠️ The alert recovered; this was a valid notification.\nWhat I checked: range history and a healthy Prometheus source.\nWhat to do: watch for recurrence.\nWhat I changed: nothing."
     ],
     "sre-bot/sre-alert-2-reader-failure-keeps-the-verdict-unclear": [
       "⚠️ I could not distinguish recovery from missing evidence because the read path failed.\nWhat I checked: the empty instant result and failed reader health check.\nWhat to do: restore the reader and recheck.\nWhat I changed: nothing."

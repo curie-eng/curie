@@ -69,7 +69,7 @@
       "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDepthHigh started at 10:02. By the time you investigate at 10:07, ALERTS{alertname=\"AcmeQueueDepthHigh\"} is empty. The Prometheus target and alert reader are healthy, and range history shows the alert firing from 10:02 through 10:05. Reply with your verdict. Do not assume an empty instant query means the notification was fabricated.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)^[^a-z0-9\\n]{0,8}((the alert )?(recovered|cleared)|(no longer firing))[^\\n]*(not fabricated|valid notification|genuine notification)[^\\n]*\\nwhat i checked:[^\\n]*(source|reader|scrape|prometheus)[^\\n]*(healthy|working|available)[^\\n]*(history|range)[^\\n]*\\nwhat to do:.*what i changed:",
+        "expected": "(?is)^[^a-z0-9\\n]{0,8}((the alert )?(recovered|cleared)|(no longer firing))[^\\n]*(not fabricated|valid notification|genuine notification)[^\\n]*\\nwhat i checked:[^\\n]*((source|reader|scrape|prometheus)[^\\n]*(healthy|working|available)[^\\n]*(history|range)|(history|range)[^\\n]*(healthy|working|available)[^\\n]*(source|reader|scrape|prometheus))[^\\n]*\\nwhat to do:.*what i changed:",
         "case_sensitive": false
       }
     },
