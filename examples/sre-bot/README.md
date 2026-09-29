@@ -4,6 +4,12 @@ This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.
 
+Installations whose alert provider delivers email into Slack can opt into the
+per-message, source-thread intake described in
+[`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). It is deliberately
+not part of the default bundle because its Slack source identity, subject
+prefixes, channel, and signed hook are installation-specific.
+
 ## Kubernetes authority
 
 The bundle's `toolPolicy` classifies the pinned server's complete 19-tool core
