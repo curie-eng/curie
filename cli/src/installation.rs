@@ -356,7 +356,8 @@ impl Installation {
             }
             if !trimmed.is_empty()
                 && !is_supported_empty_secret_clear(key, value)
-                && set_key_is_secret_bearing(key)
+                && (set_key_is_secret_bearing(key)
+                    || otel_workload_headers_are_sensitive(key, trimmed))
             {
                 bail!(
                     "set.{key} is a secret-bearing chart key and cannot carry an inline value. \
@@ -672,6 +673,30 @@ fn name_is_sensitive_header(name: &str) -> bool {
         )
     }) || words.windows(2).any(|pair| pair == ["api", "key"])
         || name == "apikey"
+}
+
+/// `otelCollector.headers` is one comma/semicolon/whitespace-delimited string,
+/// so its secret-bearing name lives in the value instead of the Helm path.
+/// Mirror the workload-header regex in the chart helper.
+fn otel_workload_headers_are_sensitive(key: &str, value: &str) -> bool {
+    key == "otelCollector.headers"
+        && value
+            .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+            .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+            .map(str::to_ascii_lowercase)
+            .any(|name| {
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "token"
+                        | "apikey"
+                        | "api-key"
+                        | "api_key"
+                        | "secret"
+                        | "password"
+                        | "credential"
+                )
+            })
 }
 
 /// This exact empty object is the chart's typed clear for the worker credential
@@ -3080,6 +3105,32 @@ mod diff_tests {
                 Installation::parse(&config).is_err(),
                 "token-shaped value must not bypass validation through example.label"
             );
+        }
+    }
+
+    #[test]
+    fn workload_header_strings_reject_sensitive_names_and_allow_benign_metadata() {
+        for value in [
+            "Authorization=Bearer opaque-placeholder",
+            "tenant=acme;token=opaque-placeholder",
+            "tenant=acme, API-Key=opaque-placeholder",
+            "tenant=acme\nAuthorization=opaque-placeholder",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  otelCollector.headers: {value:?}\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "sensitive OTLP workload header was accepted: {value}"
+            );
+        }
+
+        for value in ["tenant=acme", "x-tenant-id=acme;region=us-west"] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  otelCollector.headers: {value:?}\n"
+            );
+            Installation::parse(&config)
+                .unwrap_or_else(|error| panic!("benign workload header was rejected: {error}"));
         }
     }
 

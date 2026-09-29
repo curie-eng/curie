@@ -3351,6 +3351,10 @@ fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
             "otelCollector.extraExporters.backend.headers.X-API-Key",
             "opaque-api-key-placeholder",
         ),
+        (
+            "otelCollector.headers",
+            "Authorization=Bearer opaque-header-placeholder",
+        ),
         ("example.label", "sk-ant-placeholder"),
     ] {
         let config = format!(
@@ -3430,6 +3434,45 @@ fn documented_secret_name_references_reach_dry_run_and_apply() {
                 "{key} reference did not reach the Helm plan: {observed}"
             );
         }
+    }
+}
+
+#[test]
+fn benign_otel_workload_headers_reach_dry_run_and_apply() {
+    let key = "otelCollector.headers";
+    let value = "tenant=acme;region=us-west";
+    let config = format!(
+        "{}set:\n  {key}: {value:?}\n",
+        installation_for_the_stateful_guard()
+    );
+    for dry_run in [true, false] {
+        let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+        let output = if dry_run {
+            fixture.apply_dry_run(&[])
+        } else {
+            fixture.apply(&[], &[])
+        };
+        assert!(
+            output.status.success(),
+            "benign headers failed during {}:\n{}{}",
+            if dry_run { "dry run" } else { "apply" },
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let observed = if dry_run {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        } else {
+            fixture.calls()
+        };
+        assert!(observed.contains(key), "benign headers missing: {observed}");
+        assert!(
+            observed.contains("tenant=acme") && observed.contains("region=us-west"),
+            "benign headers changed or disappeared: {observed}"
+        );
     }
 }
 
