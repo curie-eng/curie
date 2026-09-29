@@ -6922,6 +6922,7 @@ class Kernel:
                     f"lists approvers, but its card would be shown here, on {handle.kind}, "
                     "where approvers cannot be verified yet; flagging for a human "
                     "instead of creating an approval nobody here can answer.",
+                    failure_class="approval-approvers-unverifiable",
                 )
                 return False
 
