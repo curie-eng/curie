@@ -1461,22 +1461,24 @@ class SessionRunner:
     def _observe_tool_results(self, state: TurnState) -> None:
         """Count every tool result that closed a call this turn (#3486).
 
-        ``is_error`` is the whole signal. The CLI sets it for both of an MCP
-        server's error channels (``isError`` and a JSON-RPC error), so a
-        connector that reports failure inside a success-shaped payload is not
-        counted: translate.py refuses to parse prose, and no generic payload
-        convention exists to parse.
+        ``is_error`` is the signal; no payload is parsed. The order matches
+        ``_merge_gate_block``, where an operator interrupt outranks an approval
+        halt. A result that is not an error is ``success``. An error after an
+        operator stop is ``cancelled``: the CLI answers the call it cut off
+        itself. An error on the call the approval gate holds (it asked for a
+        halt and its pending record names this tool) is ``awaiting_approval``;
+        the record holds the first held call only, so another tool's failure in
+        the same message stays an error. Anything else is ``error``, a turn
+        deadline included on purpose: a connector that holds a call until the
+        deadline is failing.
 
-        The runner's own approval gate also answers a call it held with an
-        is_error result, for a call that never reached the tool. That result is
-        ``awaiting_approval``, read from the gate's per-turn record the way
-        ``_merge_gate_block`` reads it: the gate asked for a halt and its pending
-        record names this tool. The record holds the first held call only, so
-        another tool's failure in the same message is still an error.
-
-        A failed connector call also logs one WARNING naming the server and the
-        tool, because the metric may carry no identifier. Never the call's
-        arguments and never its result. Like ``_observe_publication_calls`` it
+        So a connector ``error`` is any is_error result on a non-platform
+        ``mcp__`` tool that the approval gate did not hold and no operator stop
+        cut off. That rarely includes a call that never reached the connector;
+        ``docs/interfaces/telemetry-otel/INTERFACE.md`` lists those cases
+        (#3489). Each one logs one WARNING naming the server and the tool,
+        because the metric may carry no identifier; the line never carries the
+        call's arguments or its result. Like ``_observe_publication_calls`` it
         runs on every message and acts only on results it has not counted yet.
         """
 
@@ -1486,6 +1488,8 @@ class SessionRunner:
             state.tool_results_observed += 1
             if not errored:
                 outcome = "success"
+            elif self._interrupt_requested and not self._timeout_requested:
+                outcome = "cancelled"
             elif gate is not None and gate.pending_halt and gate.pending_granted_tool == tool_name:
                 outcome = "awaiting_approval"
             else:

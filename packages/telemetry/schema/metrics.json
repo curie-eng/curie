@@ -1579,10 +1579,11 @@
         "outcome": [
           "success",
           "error",
-          "awaiting_approval"
+          "awaiting_approval",
+          "cancelled"
         ]
       },
-      "cardinality_bound": 9
+      "cardinality_bound": 12
     }
   }
 }
