@@ -2188,6 +2188,18 @@ jobs:
           kubectl wait --for=condition=Ready node --all --timeout=300s
       - name: Install YAML parser for the installation identity proof
         run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+      # The resource override assertions render the chart, but live under
+      # ci/runtime. Run them directly through the receipt runner so a selected
+      # change cannot pass the required verdict on the quota script's indirect
+      # invocation alone (#3485).
+      - name: Runner resource overrides match the rendered quota
+        run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/runtime/runner-resources-assertions.sh
+      # Exercise the connector identity against this job's Kubernetes 1.31 API
+      # server. The script owns and cleans up its uniquely named resources.
+      - name: E2E connector identity enforces its namespace boundary
+        env:
+          CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
+        run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
       - name: Prepare the installation identity proof kubeconfig
         env:
           KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
