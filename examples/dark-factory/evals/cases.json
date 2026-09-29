@@ -65,6 +65,15 @@
       }
     },
     {
+      "id": "waits-for-background-build-in-foreground",
+      "input": "You started a cargo build with Bash run_in_background set to true, then planned to end your turn and wait for a completion notification. What happens to this factory run, and what should you do instead? Answer in one or two sentences.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)(end|stop|terminat).{0,180}(foreground)|(foreground).{0,180}(end|stop|terminat)",
+        "case_sensitive": false
+      }
+    },
+    {
       "id": "approve-with-notes-ends-the-loop",
       "input": "The plan reviewer replied 'VERDICT: APPROVE' with a NOTES list of three non-blocking refinements. Do you run another plan review round before implementing? Begin your answer with Yes or No.",
       "grader": {
