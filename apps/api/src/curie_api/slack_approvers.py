@@ -182,11 +182,8 @@ class SlackUserGroupMembers:
 def approval_token_identity(approval: Approval) -> str:
     """The Slack identity whose token resolves this approval's groups (ADR-0168 decision 5).
 
-    A Slack row with an endpoint is the pre-ADR custom-transport form, whose
-    ``reply_adapter`` is a credential slug; any other kind's card is posted by
-    ``default``. Both keep ``default``'s token. The rule itself is
-    ``aci_protocol.turn.slack_speaking_identity``, shared with the worker so
-    the two cannot disagree about a route.
+    The rule is ``aci_protocol.turn.slack_speaking_identity``, shared with the
+    worker so the two cannot disagree about a route.
     """
 
     kind = approval.reply_kind or ""

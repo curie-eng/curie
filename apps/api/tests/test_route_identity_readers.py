@@ -1,15 +1,14 @@
 """Every other API reader of a channel route resolves by its IDENTITY
 (ADR-0168 decision 3), not the raw `adapter` column.
 
-The stored form is unchanged until that decision's contract migration
-(#3100): the default Slack identity is NULL (migrations 0023/0024), and
-nothing here writes `'default'` to a row. Every reader below compares a
-route's identity through `route_identity` -- an omitted adapter, a stored NULL
-and a wire-side `'default'` all mean the same route. Each test targets exactly
-one reader, seeding the STORED form (`adapter=None`) and, where the reader
-compares against a value that arrives over the WIRE, sending `'default'` from
-that side -- the one mismatch a raw `!=` would manufacture, since a NULL never
-equals the string `'default'`.
+Migration 0070 stores the default Slack identity by name, `'default'`, but a
+value arriving over the WIRE -- from an older caller, or a handle queued
+before the upgrade -- can still name none. Every reader below compares a
+route's identity through `route_identity`: an omitted adapter, a NULL and
+`'default'` all mean the same route. Each test targets exactly one reader,
+seeding the STORED form and, where the reader compares against a wire value,
+sending None from that side -- the one mismatch a raw `!=` would manufacture,
+since a NULL never equals the string `'default'`.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import pytest
 from alembic import command
 from curie_api import crud
 from curie_api.config import get_settings
-from curie_api.migration_fence import DECLARATIONS_ENV, load_declarations
+from curie_api.migration_fence import DECLARATIONS_ENV, HONORED_ACTION, load_declarations
 from curie_api.routers import approval_recovery
 from curie_api.schemas import PublicationCreate
 from fastapi.testclient import TestClient
@@ -47,7 +46,9 @@ from apps.api.tests.test_channels import channels_client as channels_client
 from apps.api.tests.test_channels import valkey as valkey
 from apps.api.tests.test_migration_fence import (
     BELOW_0022,
+    REVISION_0022,
     _at,
+    _audit_rows,
     _declaration,
     _reply_identity,
     _seed_approval,
@@ -79,11 +80,9 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """`crud.binding_for_route(session, "slack", None, address)` -- what
-    `routers/channels.py:_resolve_binding` now delegates to for the ingress
-    (`POST /channels/turns`, whose body never carries an adapter, plan D4.1) --
-    resolves the pair's one stored row, exactly as the raw
-    `select(...).where(kind==, address==)` `_resolve_binding` ran before this
-    task.
+    `routers/channels.py:_resolve_binding` delegates to for a platform-key
+    ingress (`POST /channels/turns`, whose body never carries an adapter) --
+    resolves the default identity's row, stored as `'default'`.
     """
 
     agent_id = _bind(
@@ -93,7 +92,7 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
         channel=_channel("slack", "C0EXAMPLE1"),
     )
     stored = _binding_row(agent_id)
-    assert stored["adapter"] is None  # the default identity's stored form
+    assert stored["adapter"] == "default"  # the default identity's stored form
 
     async def resolve() -> Any:
         engine = create_async_engine(get_settings().database_url)
@@ -107,7 +106,7 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
     binding = asyncio.run(resolve())
     assert binding is not None
     assert binding.id == stored["id"]
-    assert binding.adapter is None
+    assert binding.adapter == "default"
 
 
 def test_channel_ingress_resolves_a_non_slack_binding_end_to_end(
@@ -118,13 +117,9 @@ def test_channel_ingress_resolves_a_non_slack_binding_end_to_end(
     clean_db: None,
 ) -> None:
     """Drives the REAL ingress (`POST /channels/turns`) for a non-Slack
-    binding: every other ingress test here names a Slack address, whose
-    custom-transport fallback in `crud.matching_bindings` can mask a
-    positional argument mix-up at
-    `_resolve_binding`'s call site (`_resolve_binding(session, body.kind,
-    None, body.address)`) -- swap `adapter` and `address` there and a Slack
-    test can still pass by falling back to the endpoint-carrying row, while a
-    non-Slack pair, which has no such fallback, resolves to nothing and 404s.
+    binding, whose route is resolved from its token's claim: every other
+    ingress test here names a Slack address, so this is the one that proves
+    the adapter-bearing row itself reaches the minted turn.
     """
 
     address = f"ingress-identity-{uuid.uuid4().hex[:8]}@example.test"
@@ -150,8 +145,8 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
 ) -> None:
     """`ChannelTokenRequest.adapter` (ADR-0168 decision 3): omitting it keeps
     minting for the row every caller before the ADR minted for, and naming it
-    explicitly as `'default'` -- the wire-side spelling of the identity a
-    NULL-stored row carries -- must mint for the SAME row, not 404 it. An API
+    explicitly as `'default'` -- the identity the row stores -- must mint for
+    the SAME row, not 404 it. An API
     without the field 422s the second request (`ChannelBinding.model_config`
     forbids extra fields), which is why the CLI leaves a default out.
     """
@@ -163,7 +158,7 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
         channel=_channel("slack", "C0EXAMPLE1"),
     )
     stored = _binding_row(agent_id)
-    assert stored["adapter"] is None
+    assert stored["adapter"] == "default"
 
     omitted = channels_client.post(
         "/channels/token",
@@ -193,20 +188,18 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
 # --------------------------------------------------------------------------
 
 
-def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_default(
+def test_create_publication_keeps_the_binding_when_reply_adapter_names_none(
     publication_stack: tuple[TestClient, str], auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """`binding.adapter` (stored NULL) and `data.reply_adapter` (a wire
-    `'default'`) name the SAME Slack identity, so
-    `create_publication` must adopt the binding into the new lineage rather
-    than treat the route as unbound.
+    """`binding.adapter` (stored `'default'`) and `data.reply_adapter` (None)
+    name the SAME Slack identity, so `create_publication` must adopt the
+    binding into the new lineage rather than treat the route as unbound.
 
-    `PublicationCreate`'s own validator already collapses a wire `'default'`
-    to NULL for an ordinary caller (schemas.py `_valid_reply_route`), so this
-    sets `reply_adapter` on the validated model directly (`validate_assignment`
-    is off) to hand `crud.create_publication` exactly what a caller that has
-    not gone through that collapse -- or a future phase -- would: the raw
-    wire value the reader has to resolve for itself.
+    `PublicationCreate`'s own validator already resolves an omitted adapter to
+    `'default'` (schemas.py `_valid_reply_route`), so this sets `reply_adapter`
+    on the validated model directly (`validate_assignment` is off) to hand
+    `crud.create_publication` what a caller that has not gone through that
+    resolution would: the raw value the reader has to resolve for itself.
     """
 
     client, _ = publication_stack
@@ -225,8 +218,8 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_def
     assert selected.status_code == 200, selected.text
 
     data = PublicationCreate.model_validate(payload)
-    assert data.reply_adapter is None  # the schema's own collapse, sanity-checked
-    data.reply_adapter = "default"  # simulate the wire value `crud` must resolve
+    assert data.reply_adapter == "default"  # the schema's own resolution
+    data.reply_adapter = None  # simulate the wire value `crud` must resolve
 
     async def create() -> uuid.UUID:
         engine = create_async_engine(get_settings().database_url)
@@ -257,39 +250,37 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_def
             await engine.dispose()
 
     binding_id = asyncio.run(read_binding_id())
-    assert binding_id is not None, "the wire-default reply_adapter dropped the binding"
+    assert binding_id is not None, "the omitted reply_adapter dropped the binding"
 
 
-def test_review_revision_accepts_reply_adapter_as_wire_default(
+def test_review_revision_accepts_an_omitted_reply_adapter(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
 ) -> None:
     """`create_publication`'s review-revision comparison (`crud.py`, the
     `_require_review_binding` branch) must not refuse a revision that merely
-    SPELLS the reserved binding's identity differently on the wire: the
-    original publication's Slack binding is stored with `adapter=None`
-    (the stored form) and this revision names it `reply_adapter='default'` --
-    the same identity, through `route_identity`.
+    SPELLS the reserved binding's identity differently: the original
+    publication's Slack binding is stored as `'default'` and this revision
+    names none -- the same identity, through `route_identity`.
 
     Goes around the HTTP body the same way the create_publication test does:
-    `PublicationCreate`'s own validator collapses a wire `'default'` back to
-    `None` for an ordinary Slack-no-endpoint caller, so reaching the raw value
-    `crud.create_publication` has to resolve means setting it directly on an
-    already-validated model.
+    `PublicationCreate`'s own validator resolves an omitted adapter to
+    `'default'`, so reaching the raw value `crud.create_publication` has to
+    resolve means setting it directly on an already-validated model.
     """
 
     client, truth, _ = review_lineage_app
     deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
-    reservation = _reserve_review(client, lineage, "review:wire-default")
+    reservation = _reserve_review(client, lineage, "review:no-adapter")
     assert reservation.status_code == 201, reservation.text
 
     payload = _publication_payload(
         deployment["id"], conversation_id=lineage["conversation_id"], base_sha=FIRST_REVISION_SHA
     )
-    payload.update(reply_conversation_id="review-original", review_origin_key="review:wire-default")
+    payload.update(reply_conversation_id="review-original", review_origin_key="review:no-adapter")
     data = PublicationCreate.model_validate(payload)
-    assert data.reply_adapter is None  # the schema's own collapse, sanity-checked
-    data.reply_adapter = "default"  # simulate the wire value `crud` must resolve
+    assert data.reply_adapter == "default"  # the schema's own resolution
+    data.reply_adapter = None  # simulate the wire value `crud` must resolve
 
     async def create() -> uuid.UUID:
         engine = create_async_engine(get_settings().database_url)
@@ -316,15 +307,9 @@ def test_review_revision_accepts_reply_adapter_as_wire_default(
 def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """A Slack row's `adapter` is stored as NULL (the default identity,
-    ADR-0168 decision 3; `route_identity`), so a bare Slack row must NOT read
-    as adapter-authenticated egress. The fix in `_binding_facts` is defensive
-    rather than a live-bug fix: `agent_channels_route_pair_ck` (0024) makes
-    "adapter set, no endpoint" unstorable for ANY kind, so the only Slack row
-    this installation can ever store with a truthy `adapter` is the pre-ADR
-    custom-transport form, WITH an endpoint -- and that form's adapter IS a
-    real egress credential, so it must stay in the set. Both reachable shapes
-    are tested.
+    """A Slack row's `adapter` is its identity (`'default'` here, ADR-0168
+    decision 3), never an egress credential, so a Slack binding must NOT read
+    as adapter-authenticated egress however truthy its adapter is.
     """
 
     default_identity = client.post(
@@ -337,22 +322,6 @@ def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
     )
     assert default_identity.status_code == 201, default_identity.text
     default_agent_id = default_identity.json()["id"]
-
-    custom_transport = client.post(
-        "/agents",
-        json={
-            "name": f"recovery-identity-custom-{uuid.uuid4().hex[:8]}",
-            "channel": {
-                "kind": "slack",
-                "address": "C0EXAMPLE2",
-                "endpoint": "http://127.0.0.1:1",
-                "adapter": "proof-offline",
-            },
-        },
-        headers=auth_headers,
-    )
-    assert custom_transport.status_code == 201, custom_transport.text
-    custom_agent_id = custom_transport.json()["id"]
 
     async def read_adapter_kinds(agent_id: str) -> set[str]:
         engine = create_async_engine(get_settings().database_url)
@@ -367,7 +336,6 @@ def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
             await engine.dispose()
 
     assert "slack" not in asyncio.run(read_adapter_kinds(default_agent_id))
-    assert "slack" in asyncio.run(read_adapter_kinds(custom_agent_id))
 
 
 # --------------------------------------------------------------------------
@@ -398,10 +366,30 @@ def test_fence_accepts_wire_default_on_a_slack_declaration_and_refuses_other_nam
     )
     monkeypatch.setenv(DECLARATIONS_ENV, str(accepted_path))
     accepted = load_declarations()
-    # Accepted as a NAME, but the stored form does not move: the loaded
-    # `Declaration` normalizes back to NULL, the same value every other
-    # reader's `route_identity` already treats as the default Slack identity.
-    assert accepted[str(approval_id)].reply_adapter is None
+    # Normalized to the stored form, with the operator's own spelling kept.
+    assert accepted[str(approval_id)].reply_adapter == "default"
+    assert accepted[str(approval_id)].reply_adapter_as_written == "default"
+
+    null_path = tmp_path / "null.json"
+    null_path.write_text(
+        json.dumps(
+            {
+                "declarations": [
+                    {
+                        "approval_id": str(approval_id),
+                        "reply_kind": "slack",
+                        "reply_adapter": None,
+                        "actor": "U0OPERATOR",
+                        "reason": "raised on the default Slack identity",
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv(DECLARATIONS_ENV, str(null_path))
+    from_null = load_declarations()
+    assert from_null[str(approval_id)].reply_adapter == "default"
+    assert from_null[str(approval_id)].reply_adapter_as_written is None
 
     refused_path = tmp_path / "refused.json"
     refused_path.write_text(
@@ -426,16 +414,13 @@ def test_fence_accepts_wire_default_on_a_slack_declaration_and_refuses_other_nam
     assert "'second'" in message, message
 
 
-def test_honor_declarations_stores_a_wire_default_slack_declaration_as_null(
+def test_honor_declarations_stores_a_slack_declaration_as_the_default_identity(
     isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Slack declaration may NAME the default identity as `'default'`, but
-    honoring it must not WRITE that literal into `approvals.reply_adapter` --
-    the stored form is unchanged (NULL),
-    and `crud.py`'s raw `approval.reply_adapter != data.reply_adapter`
-    replay-conflict check compares this column directly, never through
-    `route_identity`.
-    """
+    """A Slack declaration names the default identity, and honoring it writes
+    that name into `approvals.reply_adapter` at the revision that honors it --
+    the stored form 0070 backfills everywhere else. The audit keeps the
+    normalized value and the operator's own spelling."""
 
     cfg = _at(isolated_migration_db, BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
@@ -452,6 +437,32 @@ def test_honor_declarations_stores_a_wire_default_slack_declaration_as_null(
         ],
     )
 
+    command.upgrade(cfg, REVISION_0022)
+
+    assert _reply_identity(orphan) == ("slack", "default")
+    (honored,) = [r for r in _audit_rows(orphan) if r.action == HONORED_ACTION]
+    assert honored.evidence["declared_reply_adapter"] == "default"
+    assert honored.evidence["declared_reply_adapter_as_written"] == "default"
+
     command.upgrade(cfg, "head")
 
-    assert _reply_identity(orphan) == ("slack", None)
+    assert _reply_identity(orphan) == ("slack", "default")
+
+
+def test_honor_declarations_admits_a_non_slack_adapter_named_default(
+    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`default` is an ordinary adapter slug for any kind but Slack, and 0022
+    honored one before the Slack identity had a name."""
+
+    cfg = _at(isolated_migration_db, BELOW_0022)
+    orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
+    _write_declarations(
+        tmp_path,
+        monkeypatch,
+        [_declaration(orphan, reply_kind="email", reply_adapter="default")],
+    )
+
+    command.upgrade(cfg, REVISION_0022)
+
+    assert _reply_identity(orphan) == ("email", "default")

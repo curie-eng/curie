@@ -3232,12 +3232,18 @@ impl ChannelChange {
         match (add, remove) {
             (Some(spec), _) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
-                // A non-Slack kind still needs BOTH endpoint and adapter for
-                // the custom-transport form (ADR-0168 decision 3): clap only
-                // enforces `--endpoint` requires `--adapter`, not the other
-                // way, so `--adapter` alone on a non-Slack kind reaches here
-                // and must be refused before any I/O -- the API would refuse
-                // it too, but only after a round trip.
+                if kind == "slack" && endpoint.is_some() {
+                    return Err(crate::exit::usage(
+                        "--endpoint on a Slack binding: a Slack route names its identity with \
+                         --adapter and takes no endpoint (ADR-0168 decision 3)"
+                            .to_string(),
+                    ));
+                }
+                // A non-Slack reply route needs BOTH endpoint and adapter:
+                // clap only enforces `--endpoint` requires `--adapter`, not
+                // the other way, so `--adapter` alone on a non-Slack kind
+                // reaches here and must be refused before any I/O -- the API
+                // would refuse it too, but only after a round trip.
                 if kind != "slack" && adapter.is_some() && endpoint.is_none() {
                     return Err(crate::exit::usage(format!(
                         "--adapter on a non-Slack kind ({kind}) also needs --endpoint; \
@@ -3441,11 +3447,11 @@ pub async fn channel_bindings(
                 endpoint,
                 adapter,
             } => {
-                // Three reply-route shapes (ADR-0168 decision 3): the
-                // pre-ADR custom transport (endpoint + adapter together),
-                // a named Slack identity (adapter alone), or the implicit
-                // default nothing names.
-                let reply_route = if endpoint.is_some() && adapter.is_some() {
+                // Three reply-route shapes (ADR-0168 decision 3): a
+                // non-Slack route (endpoint + adapter together), a named
+                // Slack identity (adapter alone), or the implicit default
+                // nothing names.
+                let reply_route = if kind != "slack" && endpoint.is_some() && adapter.is_some() {
                     "configured".to_string()
                 } else if let Some(adapter) = adapter {
                     format!("identity {adapter}")
@@ -3927,8 +3933,8 @@ mod channels_tests {
         )
         .is_ok());
 
-        // Both endpoint and adapter together on a non-Slack kind is the
-        // pre-ADR custom-transport form and must still succeed.
+        // Both endpoint and adapter together on a non-Slack kind is that
+        // kind's reply route and must still succeed.
         assert!(ChannelChange::resolve(
             Some("discord=111111111111111111".into()),
             None,
@@ -3936,6 +3942,21 @@ mod channels_tests {
             Some("discord-main".into()),
         )
         .is_ok());
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_binding_takes_no_endpoint() {
+        let err = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("http://127.0.0.1:1".into()),
+            Some("proof-offline".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
     }
 
     #[test]
@@ -7260,14 +7281,14 @@ fn validate_notification_target(
             "route {route:?}: notification address must be non-empty and contain no whitespace"
         )));
     }
-    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
-    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
-    if !complete_transport && !empty_transport {
-        return Err(crate::exit::usage(format!(
-            "route {route:?}: notification endpoint and adapter must be supplied together"
-        )));
-    }
-    if target.kind != "slack" && !complete_transport {
+    if target.kind == "slack" {
+        if target.endpoint.is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: a Slack notification names its identity in adapter and takes \
+                 no endpoint"
+            )));
+        }
+    } else if target.endpoint.is_none() || target.adapter.is_none() {
         return Err(crate::exit::CliError::usage(format!(
             "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
             target.kind
@@ -9861,12 +9882,31 @@ mod tests {
         replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
         route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
         select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
-        validate_channel_binding, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
-        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        validate_channel_binding, validate_notification_target, ApprovalGateDecl, DeclaringVersion,
+        DeployTier, DownPlan, EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown,
+        SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_notification_names_an_identity_and_no_transport() {
+        let named = crate::api::NotificationTargetWrite {
+            kind: "slack".into(),
+            address: "C0EXAMPLE2".into(),
+            endpoint: None,
+            adapter: Some("ops-bot".into()),
+        };
+        validate_notification_target("finance", &named).expect("an identity alone is complete");
+        let transport = crate::api::NotificationTargetWrite {
+            endpoint: Some("https://adapter.example.com/replies".into()),
+            ..named
+        };
+        let err = validate_notification_target("finance", &transport).unwrap_err();
+        assert!(err.to_string().contains("no endpoint"), "{err}");
+    }
 
     #[test]
     fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {

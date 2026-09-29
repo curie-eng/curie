@@ -75,7 +75,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   on any Slack identity but `default`), `conversation_id` is the thread ts,
   `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
   Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
-  the delivery arrived on -- null for `default` until #3146 (ADR-0168 decision 2).
+  the delivery arrived on (ADR-0168 decisions 2 and 3).
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral

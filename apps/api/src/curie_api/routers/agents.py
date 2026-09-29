@@ -52,8 +52,6 @@ class HookSecretOut(BaseModel):
 # violated constraint's name) as plain attributes on the wrapped driver
 # exception -- there is no psycopg-style `.diag` namespace.
 _UNIQUE_VIOLATION = "23505"
-# Postgres SQLSTATE for a check_violation.
-_CHECK_VIOLATION = "23514"
 
 # The real unique constraints an agent write can violate -- on `agents` and on
 # its `agent_channels` binding (from the alembic migrations) -- mapped to the
@@ -77,39 +75,24 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
     # (ADR-0096 phase 2). Without this the create succeeded and the second agent
     # was silently shadowed by the resolver at runtime. Stated without the word
     # "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
-    # belong to every channel kind. The constraint is on the PAIR and fires
-    # whatever identity the write names, so the message names the pair. The
-    # contract migration for ADR-0168 decision 3 (#3100) widens it to the
-    # `(kind, adapter, address)` route and adds that constraint's entry here.
+    # belong to every channel kind. 0070 replaced this key; kept for its wording
+    # on a database that still has it.
     "agent_channels_kind_address_key": (
         "another agent is already bound to that channel kind and address; one "
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
+    # Migration 0070's key: the route is the triple (ADR-0168 decision 3).
+    "agent_channels_route_key": (
+        "another agent is already bound to that channel kind and address under that "
+        "identity; one agent per route (bind another identity, move or delete the "
+        "other agent, or pick another address)"
+    ),
     # No entry for `agent_channels_agent_id_key`: migration 0030 drops that
     # constraint (ADR-0118), so its message can never fire again, and it said
     # the opposite of what this API now does. A dead entry is worse than none --
-    # it reads as a protection. The pair constraint above is the ONLY binding
-    # conflict left.
-}
-
-
-# The CHECK constraints a caller's binding write can reach once the write
-# schema has passed it, mapped to a 422 naming why. Keyed by constraint name so
-# an entry goes quiet by itself once a migration drops or renames its
-# constraint. Any other check violation stays a server fault.
-_CHECK_CONSTRAINT_MESSAGES = {
-    # 0024's both-or-neither route check. The write schema admits a Slack
-    # binding naming a declared identity with no endpoint (ADR-0168 decision
-    # 1), and this check still refuses that row until
-    # [#3146](https://github.com/curie-eng/curie/issues/3146) widens it. The
-    # schema already refuses every other shape this check covers.
-    "agent_channels_route_pair_ck": (
-        "a Slack binding naming an identity other than 'default' cannot be "
-        "stored until the database admits it "
-        "(https://github.com/curie-eng/curie/issues/3146). The identity is "
-        "declared; bind the channel under 'default' instead"
-    ),
+    # it reads as a protection. The route keys above are the only binding
+    # conflicts left.
 }
 
 
@@ -136,20 +119,15 @@ def classify_integrity_error(exc: IntegrityError) -> tuple[int, str] | None:
     """Map a caller-caused constraint violation to a `(status, message)` pair.
 
     A genuine unique_violation (SQLSTATE 23505) is a caller conflict (409). A
-    check_violation (23514) on a constraint in `_CHECK_CONSTRAINT_MESSAGES` is
-    a request the database cannot store (422). A NOT NULL or FK violation, or
-    any other check, is a server fault and must surface as a 500, so this
-    returns `None` for those (the caller re-raises). The human message is
+    NOT NULL, FK or check violation is a server fault and must surface as a
+    500, so this returns `None` for those (the caller re-raises): the write
+    schemas refuse every shape `agent_channels_route_ck` covers before the
+    database sees it. The human message is
     chosen by the violated constraint's name from asyncpg's structured fields,
     not by substring-matching the stringified driver error.
     """
     sqlstate = _driver_diag(exc, "sqlstate")
     constraint_name = _driver_diag(exc, "constraint_name")
-    if sqlstate == _CHECK_VIOLATION:
-        check_message = _CHECK_CONSTRAINT_MESSAGES.get(constraint_name or "")
-        if check_message is None:
-            return None
-        return status.HTTP_422_UNPROCESSABLE_ENTITY, check_message
     if sqlstate != _UNIQUE_VIOLATION:
         return None
     message = "agent violates a uniqueness constraint"
@@ -168,7 +146,13 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
     # is a genuine server fault -- re-raise it so it surfaces as a 500.
     try:
+        await crud.refuse_routeless_pair_sharing(
+            session, None, data.channel.kind, data.channel.address, data.channel.adapter
+        )
         agent = await crud.create_agent(session, data)
+    except crud.RoutelessPairShared as exc:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntegrityError as exc:
         await session.rollback()
         classified = classify_integrity_error(exc)
@@ -373,13 +357,14 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
 
 # --- the channel-binding subresource (ADR-0118, #1525) ------------------------
 #
-# One agent holds one or more `(kind, address)` bindings, so add, move and
-# remove are three verbs here instead of one overloaded `AgentUpdate.channel`
-# field, each with exactly one meaning. The pair selects the binding on PATCH
-# and DELETE, passed as QUERY parameters: it is the routing key every other
-# layer already uses (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`)
-# and an `address` is opaque per kind, so a `/` in one would have to survive as
-# `%2F` in a path segment -- a proxy hazard the query string does not have.
+# One agent holds one or more `(kind, address, adapter)` bindings, so add, move
+# and remove are three verbs here instead of one overloaded
+# `AgentUpdate.channel` field, each with exactly one meaning. The route selects
+# the binding on PATCH and DELETE, passed as QUERY parameters: it is the
+# routing key every other layer already uses (`binding._RESOLVE_SQL` narrowed
+# by `matching_routes`, `agent_channels_route_key`) and an `address` is opaque
+# per kind, so a `/` in one would have to survive as `%2F` in a path segment --
+# a proxy hazard the query string does not have.
 
 
 async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
@@ -397,11 +382,9 @@ def _binding_for(
     The matching RULE lives in `crud.matching_bindings`, shared with every
     other reader of a route including `add_agent_channel`'s idempotence check
     below, so the two surfaces here agree on what counts as "the same
-    binding". Migration 0023's `agent_channels_kind_address_key` (UNIQUE
-    kind, address) holds one row per pair, so the 409 below (several
-    identities on one pair) cannot fire against real data until the contract
-    migration for ADR-0168 decision 3 (#3100) widens the constraint to the
-    triple and several identities can share one pair.
+    binding". `agent_channels_route_key` lets several routes share one pair,
+    so an omitted non-Slack adapter can select more than one row: the 409
+    below, never a pick.
 
     Selecting from the locked list rather than issuing a second, unlocked query
     is what makes the lock load-bearing. It is also the authorization boundary:
@@ -434,7 +417,6 @@ def _binding_for(
 
 def _conflict_message(
     route_owner: uuid.UUID | None,
-    pair_owner: uuid.UUID | None,
     agent_id: uuid.UUID,
     kind: str,
     adapter: str | None,
@@ -444,25 +426,12 @@ def _conflict_message(
 
     The generic map message says "another agent is already bound", which is
     false -- and actively misleading -- when the duplicate is this agent's
-    own. Two different "this agent's own" cases need two different sentences:
-
-    - `route_owner == agent_id`: the EXACT route this write asked for
-      (kind, resolved identity, address) already exists -- the ordinary
-      idempotent-recheck case.
-    - `route_owner is None` but `pair_owner == agent_id`: the database
-      constraint is still the pair alone (`agent_channels_kind_address_key`,
-      migration 0023, until the contract migration for ADR-0168 decision 3
-      (#3100) widens it), so the identity-precise lookup can answer `None` while
-      this agent still holds `(kind, address)` under a DIFFERENT route -- a
-      custom-transport binding a bare identity-form write collided with, for
-      instance. Reporting the generic "another agent" sentence here is false:
-      no other agent is involved, this agent's own other route is what is in
-      the way.
-    - Otherwise (both `None`, or naming a different agent): the generic map
-      message. Both `None` means the winning row was deleted between the
-      failed insert and this lookup -- the pair is free again -- and the
-      generic sentence is the safe answer either way, since the caller
-      retries.
+    own: `route_owner == agent_id` means the EXACT route this write asked for
+    (kind, resolved identity, address) already exists. Otherwise (None, or
+    naming a different agent) the generic map message: None means the
+    winning row was deleted between the failed insert and this lookup -- the
+    route is free again -- and the generic sentence is the safe answer
+    either way, since the caller retries.
     """
 
     if route_owner is not None and route_owner == agent_id:
@@ -472,13 +441,7 @@ def _conflict_message(
             f"this agent is already bound to {route}; the binding you "
             "asked for already exists, so nothing was changed"
         )
-    if pair_owner is not None and pair_owner == agent_id:
-        return (
-            f"this agent already holds {kind}:{address} under another route; "
-            "this installation allows only one route per (kind, address) pair "
-            "-- move or delete the other binding first"
-        )
-    return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_kind_address_key"]
+    return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_route_key"]
 
 
 # Postgres SQLSTATE for `deadlock_detected`. asyncpg surfaces it as `sqlstate`
@@ -487,7 +450,7 @@ def _conflict_message(
 _DEADLOCK_DETECTED = "40P01"
 
 # The 409 a broken deadlock earns. Deliberately the same STATUS as a taken
-# pair: from the caller's side both mean "the binding set moved under you, the
+# route: from the caller's side both mean "the binding set moved under you, the
 # write did not land, retry" -- and a deadlock victim is the one caller for
 # whom a retry is near-certain to succeed, since its opponent has by then
 # committed. Left as a 500 it reads as a server fault and an operator stops
@@ -509,12 +472,12 @@ def _is_deadlock(exc: DBAPIError) -> bool:
 async def _deadlock_as_conflict() -> AsyncIterator[None]:
     """Turn a broken lock cycle into a retryable 409 instead of a 500.
 
-    `lock_agent_bindings` locks ONE agent's rows, but a `(kind, address)` pair
-    is globally unique: two callers swapping their agents' pairs in opposite
-    directions each hold their own agent's rows and then wait on the other's
-    uncommitted index entry. That is a genuine cycle, Postgres aborts one side
-    with `40P01`, and without this the victim gets an unexplained 500 for a
-    race it can simply retry.
+    `lock_agent_bindings` locks ONE agent's rows, but a route is globally
+    unique (`agent_channels_route_key`): two callers swapping their agents'
+    routes in opposite directions each hold their own agent's rows and then
+    wait on the other's uncommitted index entry. That is a genuine cycle,
+    Postgres aborts one side with `40P01`, and without this the victim gets an
+    unexplained 500 for a race it can simply retry.
 
     Wraps the WHOLE handler body rather than the savepoint alone: the cycle can
     close on the locking read, on the flush, or on the commit, and all three are
@@ -543,34 +506,18 @@ async def _raise_binding_conflict(
     that may have moved again; no rollback would leave the session failed and
     answer 500 `PendingRollbackError` on the lookup itself.
 
-    A non-unique violation (NOT NULL, FK) is a server fault, so it is re-raised
-    rather than dressed up as a conflict; a mapped check violation is not a
-    conflict either, and goes back as its own status and message.
+    A non-unique violation (NOT NULL, FK, check) is a server fault, so it is
+    re-raised rather than dressed up as a conflict.
     """
 
-    classified = classify_integrity_error(exc)
-    if classified is None:
+    if classify_integrity_error(exc) is None:
         raise exc
-    if classified[0] != status.HTTP_409_CONFLICT:
-        raise HTTPException(*classified) from exc
     route_owner = await crud.agent_id_for_route(
         session, channel.kind, channel.adapter, channel.address
     )
-    pair_owner = route_owner
-    if route_owner is None:
-        # The database constraint is the PAIR, not the triple
-        # (`agent_channels_kind_address_key`, migration 0023, until the
-        # contract migration for ADR-0168 decision 3 (#3100)). The
-        # identity-precise lookup above can legitimately answer None while
-        # this agent still holds the pair under a DIFFERENT route, so recheck
-        # at the pair level before `_conflict_message` concludes the pair is
-        # free or belongs to someone else.
-        pair_owner = await crud.agent_id_for_channel_pair(session, channel.kind, channel.address)
     raise HTTPException(
         status.HTTP_409_CONFLICT,
-        _conflict_message(
-            route_owner, pair_owner, agent_id, channel.kind, channel.adapter, channel.address
-        ),
+        _conflict_message(route_owner, agent_id, channel.kind, channel.adapter, channel.address),
     ) from exc
 
 
@@ -586,34 +533,31 @@ async def add_agent_channel(
         # serializes this add against a concurrent move or delete of the same
         # agent's bindings, which is what keeps the last-binding guard sound.
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        # A re-POST of a pair this agent already holds is an idempotent
+        # A re-POST of a route this agent already holds is an idempotent
         # success that changes nothing. `crud.matching_bindings` is the same
-        # rule `_binding_for` selects by, so a re-POST naming no adapter finds
-        # this agent's Slack custom-transport row the way a PATCH or DELETE
-        # naming none does. The pair check behind it covers a repeat naming a
-        # different adapter: migration 0023's `agent_channels_kind_address_key`
-        # lets the pair carry one row, so that repeat cannot be a second route
-        # and would otherwise fail the insert as a conflict with itself.
-        if crud.matching_bindings(bindings, data.kind, data.address, data.adapter) or any(
-            binding.kind == data.kind and binding.address == data.address for binding in bindings
-        ):
+        # rule `_binding_for` selects by, so "the same binding" means the same
+        # thing to add, move and delete. A POST naming another identity or
+        # adapter on a pair this agent holds is a second route
+        # (`agent_channels_route_key` is the triple), and is inserted.
+        if crud.matching_bindings(bindings, data.kind, data.address, data.adapter):
             return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.add_channel_binding(session, agent_id, data)
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, data.kind, data.address, data.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
-            classified = classify_integrity_error(exc)
-            if classified is None:
+            if classify_integrity_error(exc) is None:
                 raise
-            if classified[0] != status.HTTP_409_CONFLICT:
-                raise HTTPException(*classified) from exc
-            # Two concurrent idempotent adds can both observe the pair absent;
+            # Two concurrent idempotent adds can both observe the route absent;
             # the winner inserts and the loser reaches the unique constraint.
             # Once the savepoint has rolled back, treat that winner as the same
             # successful desired state when it belongs to this agent. Asked of
-            # the PAIR, the key the violated constraint enforces, for the same
-            # reason as the check above.
-            owner = await crud.agent_id_for_channel_pair(session, data.kind, data.address)
+            # the ROUTE, the key the violated constraint enforces.
+            owner = await crud.agent_id_for_route(session, data.kind, data.adapter, data.address)
             if owner == agent_id:
                 return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
             await _raise_binding_conflict(exc, session, agent_id, data)
@@ -670,8 +614,15 @@ async def move_agent_channel(
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.update_channel_binding(session, binding, data)
+                # The moved row's route, not the request's: an omitted route
+                # keeps the stored one within a kind.
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, binding.kind, binding.address, binding.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
-            # The same recovery as the add: a move onto a pair another agent (or
+            # The same recovery as the add: a move onto a route another agent (or
             # this one) already holds raises the identical violation and needs the
             # identical owner recheck, inside the same still-live transaction.
             await _raise_binding_conflict(exc, session, agent_id, data)

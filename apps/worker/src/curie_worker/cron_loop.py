@@ -70,6 +70,7 @@ from zoneinfo import ZoneInfo
 
 from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from cronsim import CronSim
 from curie_telemetry import record_metric
@@ -740,17 +741,40 @@ class CronSchedulerLoop:
                     .mappings()
                     .all()
                 )
-            if len(bindings) != 1:
-                logger.warning(
-                    "cron hook %s for agent=%s targets %r, which matches %d bindings; "
-                    "recording failed",
-                    name,
-                    target.agent_name,
-                    address,
-                    len(bindings),
-                )
+            candidates = bindings
+            slack_identities = len(candidates) > 1 and all(
+                b["kind"] == SLACK_KIND for b in candidates
+            )
+            if slack_identities:
+                # ADR-0168 decision 3: a trigger names an address, never an
+                # identity; several of this agent's identities there mean its
+                # default Slack one.
+                candidates = [
+                    b
+                    for b in candidates
+                    if b["kind"] == SLACK_KIND
+                    and route_identity(b["kind"], b["adapter"]) == DEFAULT_IDENTITY
+                ]
+            if len(candidates) != 1:
+                if slack_identities and not candidates:
+                    logger.warning(
+                        "cron hook %s for agent=%s targets %r, which has no binding "
+                        "as 'default'; recording failed",
+                        name,
+                        target.agent_name,
+                        address,
+                    )
+                else:
+                    logger.warning(
+                        "cron hook %s for agent=%s targets %r, which matches %d bindings; "
+                        "recording failed",
+                        name,
+                        target.agent_name,
+                        address,
+                        len(bindings),
+                    )
                 raise _UnboundTarget
-            binding = bindings[0]
+            binding = candidates[0]
             handle = ReplyHandle(
                 kind=binding["kind"],
                 channel=binding["address"],

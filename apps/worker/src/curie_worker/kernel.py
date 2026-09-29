@@ -119,6 +119,7 @@ from .binding import (
     PROGRESS_URL_ENV,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
+    AmbiguousRoute,
     BindingResolver,
 )
 from .capacity_wait import (
@@ -934,24 +935,11 @@ def _parse_approval_targets(
     or duplicate targets must not produce a durable approval with ambiguous
     authority.
 
-    ADR-0168 decision 3 splits the notification target's both-or-neither rule
-    by kind. A Slack notification WITH an endpoint is the pre-ADR
-    custom-transport form and keeps both-or-neither: ``adapter`` there is a
-    credential slug, not an identity, and a stray endpoint with no adapter (or
-    the reverse) is a half-configured transport. A Slack notification with NO
-    endpoint may name an identity in ``adapter``, or none (the default) --
-    ``adapter`` alone is a complete, resolvable Slack route (D4.4), not a
-    half-configured one. Any other kind still requires both, unconditionally
-    (enforced below by ``kind != POLICY_CARD_KIND`` on its own).
-
-    Duplicate detection against the resolution target follows the same split:
-    a Slack notification with no endpoint duplicates the resolution when they
-    name the SAME IDENTITY (``route_identity``), because that is the same
-    Slack route by decision 3; a Slack notification WITH an endpoint (custom
-    transport) and any other kind duplicate the resolution on the raw
-    ``(kind, address)`` pair, as they always have -- ``adapter`` there is a
-    credential slug, not an identity, so comparing it would let two different
-    credentials on the SAME pair pass as distinct targets.
+    ADR-0168 decision 3: a Slack notification names its identity in
+    ``adapter``, or none for the default, and has no endpoint; any other kind
+    needs both. A Slack notification duplicates the resolution when it names
+    the same identity (``route_identity``) on the same channel; any other kind
+    duplicates it on the raw ``(kind, address)`` pair.
     """
 
     if not isinstance(binding, dict) or set(binding) - {
@@ -988,13 +976,7 @@ def _parse_approval_targets(
     endpoint = notification.get("endpoint")
     adapter = notification.get("adapter")
     address_shape = _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
-    # True for every shape EXCEPT a Slack notification with no endpoint: a
-    # non-Slack kind (always) or a Slack custom-transport notification (an
-    # endpoint present). That one exception is where `adapter` names an
-    # ADR-0168 decision 3 IDENTITY rather than a credential slug, so both the
-    # both-or-neither gate and the duplicate check below treat it apart from
-    # every other shape, which still goes by the raw `(kind, address)` pair.
-    not_slack_identity_form = kind != POLICY_CARD_KIND or endpoint is not None
+    not_slack = kind != POLICY_CARD_KIND
     if (
         not isinstance(kind, str)
         or _CHANNEL_SLUG.fullmatch(kind) is None
@@ -1006,12 +988,12 @@ def _parse_approval_targets(
             adapter is not None
             and (not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None)
         )
-        or (not_slack_identity_form and (endpoint is None) != (adapter is None))
+        or (endpoint is None if not_slack else endpoint is not None)
+        or (not_slack and adapter is None)
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
-        or (kind != POLICY_CARD_KIND and endpoint is None)
         or (
             (kind, address) == resolution_pair
-            if not_slack_identity_form
+            if not_slack
             else (kind, route_identity(kind, adapter), address)
             == (POLICY_CARD_KIND, DEFAULT_IDENTITY, resolution_pair[1])
         )
@@ -2545,16 +2527,26 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
-                resolved = await self._binding.resolve(handle.kind, handle.adapter, handle.channel)
+                try:
+                    resolved = await self._binding.resolve(
+                        handle.kind, handle.adapter, handle.channel
+                    )
+                except AmbiguousRoute as exc:
+                    await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                    return
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
                     # on those doubles on the established polite-drop path.
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
-                    undeployed = (
-                        await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
-                        if undeployed_lookup is not None
-                        else None
-                    )
+                    try:
+                        undeployed = (
+                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            if undeployed_lookup is not None
+                            else None
+                        )
+                    except AmbiguousRoute as exc:
+                        await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                        return
                     if undeployed is not None:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
@@ -3664,6 +3656,31 @@ class Kernel:
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
         await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
+
+    async def _drop_ambiguous_route(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        exc: AmbiguousRoute,
+        *,
+        lease: DeliveryLease | None = None,
+    ) -> None:
+        """Complete a turn whose route selects several agents' bindings.
+
+        It runs under no deployment and replies through no route: every route
+        on the pair belongs to an agent the turn may not be from, so a reply
+        through any of them is the misroute being refused (ADR-0168 decision 3).
+        """
+
+        logger.error("dropping event %s without a run or a reply: %s", qevent.event_id, exc)
+        await self._complete(
+            qevent,
+            route,
+            "dropped",
+            telemetry_outcome="interrupted",
+            lease=lease,
+            hook_outcome="failed",
+        )
 
     async def _drop_sibling_turn(
         self,
@@ -7187,17 +7204,11 @@ class Kernel:
         # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
         # names only a channel, never an adapter -- so it must borrow the
         # TURN's, or a named identity's card posts as ``default`` in a channel
-        # where only that identity may be a member (ADR-0168 decision 5). That
-        # borrow applies only to a Slack turn in IDENTITY form (no endpoint): a
-        # Slack turn carrying its own endpoint is the pre-ADR custom-transport
-        # form, whose ``adapter`` is a credential slug rather than an identity
-        # (``aci_protocol.turn.slack_speaking_identity``), and any other kind's
-        # adapter is that kind's own egress credential -- neither belongs on a
-        # Slack policy card.
+        # where only that identity may be a member (ADR-0168 decision 5). Only
+        # a Slack turn lends it: any other kind's adapter is that kind's own
+        # egress credential, which does not belong on a Slack policy card.
         card_adapter = (
-            None
-            if not in_requesting_channel and (handle.kind != SLACK_KIND or handle.endpoint)
-            else route.adapter
+            None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
         )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the

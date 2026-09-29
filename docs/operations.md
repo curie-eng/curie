@@ -475,7 +475,9 @@ revision or a pending contract/irreversible migration without
 `--forward-only` refuses before `helm upgrade`. `--forward-only` sets
 `api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
 `migrate` phase is a resumable checkpoint boundary only; it performs no
-migration of its own.
+migration of its own. Revision 0070 is such a migration; see
+[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0070)
+before an upgrade crosses it.
 
 The redacted plan names the configuration schema version the upgrade migrates
 from and to (`config schema: <from> -> <to>`). It never carries credential
@@ -1751,6 +1753,81 @@ For each mixed `memory=false` agent, choose shared or isolated policy and
 move/merge every general-state row into that one shape. Re-run the preflights,
 then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
 flags, state rows, the constraint, and the Alembic revision stay unchanged.
+
+### Slack route identity migration (Alembic revision 0070)
+
+Revision 0070 is a contract migration (ADR-0168 decision 3), and it ships in
+v0.11.0. It stores the identity on every Slack binding, `default` where none was
+named, and makes the binding key `(kind, address, adapter)`, so two identities
+can bind one channel. Before it changes anything it refuses, naming each row,
+while a Slack binding or an approval route's Slack notification still carries an
+`endpoint`, which is the retired custom-transport form, or while an approval
+raised through one is pending or owed its resume. Clear each of them first, on
+the release you are upgrading from:
+
+- Settle each approval it names: resolve it, or let it expire, and let its
+  resume turn finish. A resume replays the transport the approval was raised
+  through, so after the upgrade it would be dropped.
+- Clear the route on each Slack binding it names, or delete the binding. The
+  v0.10.x API accepts only a body that clears both route fields, and it ignores
+  an `adapter` query parameter:
+
+  ```bash
+  curl -X PATCH "$CURIE_API_URL/agents/<agent id>/channels?kind=slack&address=<address>" \
+    -H "X-API-Key: $CURIE_API_KEY" -H 'Content-Type: application/json' \
+    -d '{"kind": "slack", "address": "<address>", "endpoint": null, "adapter": null}'
+  ```
+
+  The upgrade then binds it as the `default` identity. Bind a named identity
+  once the upgrade has finished; v0.10.x cannot store one.
+- Drop `endpoint` and `adapter` from each Slack notification in the agent's
+  approval routes.
+
+Then upgrade from v0.10.x with
+`curie cluster upgrade --to 0.11.0 --forward-only`, or set
+`api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the schema
+check refuses the upgrade before any mutation. As with any contract, a rollback
+below v0.11.0 is refused once the migration has run.
+
+During the roll, v0.10.x pods keep serving against the migrated schema. Their
+schema check treats a revision they do not know as a compatible expand and runs
+only when an API pod starts, and the worker has none, so nothing stops them.
+Three things they do fail against it:
+
+- A v0.10.x API pod answers a Slack binding write with a 500: creating an agent
+  with a Slack channel, adding or changing a Slack binding (`surfaces --add`, or
+  a deploy that binds a channel), or moving a binding to Slack. It writes a
+  Slack binding with no identity, which 0070's check refuses.
+- A v0.10.x API pod compares a publication replay's reply adapter as stored, so
+  a replay of a publication raised before the migration, which now names
+  `default`, is refused as a conflict.
+- A v0.10.x API pod refuses a publication create whose Slack reply names
+  `default` with no endpoint, with a 422 the worker reports as an approval
+  backend error. Every Slack turn carries that shape after the migration.
+
+The window runs from the `-schema-migrate` Job to the last v0.10.x API pod
+stopping. The chart's worker upgrade drain (`worker.upgradeDrain.enabled`, on by
+default) runs before the migration and pauses worker claims until the
+post-upgrade hook, which `helm upgrade --wait` runs only after the Deployments
+have rolled. So it keeps the publication failure out of the window, and it is
+also what keeps v0.10.x workers, which resolve a turn by `(kind, address)`
+alone, from choosing between two identities bound on one channel. It does not
+cover the window when the drain is disabled, when the roll outlasts
+`worker.upgradeDrain.quiesceTtlSeconds`, or on a `helm upgrade` without
+`--wait`; in those cases hold publications and second-identity binds until the
+worker and API Deployments have rolled. The drain pauses worker claims, not API
+writes, so hold binding changes until the API Deployment has rolled either way,
+and retry any write that failed during it.
+
+A local stack runs the same schema check in its one-shot `curie-migrate`
+service, which takes no forward-only flag, so `curie local up` on a volume that
+predates 0070 fails at that service. Run `curie local up --dry-run`, with the
+flags you normally pass, to print the exact compose command it would run.
+Run that command with its trailing `up -d --wait` replaced by
+`run --rm -e CURIE_SCHEMA_FORWARD_ONLY=true curie-migrate`, then run
+`curie local up` again. If the local data is disposable, `curie local down
+--wipe` followed by `curie local up` starts from an empty database, which
+applies every migration without the flag.
 
 ### Before you upgrade, check what would be removed
 
