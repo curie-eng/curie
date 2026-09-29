@@ -2597,8 +2597,7 @@ class Kernel:
                             endpoint=undeployed.endpoint or handle.endpoint,
                             adapter=(
                                 handle.adapter
-                                if handle.kind == SLACK_KIND
-                                and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                                if handle.adapter == CLUSTER_MESSAGE_ADAPTER
                                 else undeployed.adapter or handle.adapter
                             ),
                         )
@@ -2637,8 +2636,7 @@ class Kernel:
                     endpoint=resolved.endpoint or handle.endpoint,
                     adapter=(
                         handle.adapter
-                        if handle.kind == SLACK_KIND
-                        and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                        if handle.adapter == CLUSTER_MESSAGE_ADAPTER
                         else resolved.adapter or handle.adapter
                     ),
                 )

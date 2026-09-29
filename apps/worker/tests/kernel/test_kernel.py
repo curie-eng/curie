@@ -4829,20 +4829,9 @@ class _TokenBinding:
         return BehaviorPacks()
 
 
-@pytest.mark.parametrize(
-    ("handle_adapter", "expected_adapter"),
-    [
-        ("curie-cluster-message", "curie-cluster-message"),
-        (None, "default"),
-    ],
-)
-def test_cluster_relay_survives_default_slack_binding(
-    make_harness,
-    handle_adapter: str | None,
-    expected_adapter: str,
+def _assert_bound_reply_route(
+    make_harness: Any, handle_adapter: str | None, expected_adapter: str
 ) -> None:
-    """The relay stays internal while an ordinary turn uses the bound identity."""
-
     async def go() -> None:
         binding = _TokenBinding("tok-route", uuid.uuid4(), adapter="default")
         async with make_harness(binding=binding) as h:
@@ -4861,6 +4850,16 @@ def test_cluster_relay_survives_default_slack_binding(
             assert set(routes) == {TargetRoute(endpoint=None, adapter=expected_adapter)}
 
     asyncio.run(go())
+
+
+def test_cluster_relay_survives_default_slack_binding(make_harness) -> None:
+    """The internal relay stays selected after the default Slack binding resolves."""
+    _assert_bound_reply_route(make_harness, "curie-cluster-message", "curie-cluster-message")
+
+
+def test_ordinary_turn_uses_default_slack_binding(make_harness) -> None:
+    """An ordinary turn still uses the binding's default Slack identity."""
+    _assert_bound_reply_route(make_harness, None, "default")
 
 
 def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
