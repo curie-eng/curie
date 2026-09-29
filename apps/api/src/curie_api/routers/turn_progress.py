@@ -26,6 +26,8 @@ from ..turn_progress import (
     append_to_inbox,
     inbox_fields,
     inbox_key,
+    inbox_pending_key,
+    progress_key,
     rate_key,
     take_rate_token,
 )
@@ -36,17 +38,11 @@ router = APIRouter(tags=["turn-progress"])
 
 
 async def require_turn_progress_token(
-    progress_id: uuid.UUID,
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> str:
-    """Accept only a ``turn.progress`` token bound to the path's chain."""
+    """Require the dedicated credential; subject verification needs the body."""
 
-    if not x_api_key or not sandbox_token.verify(
-        x_api_key,
-        get_settings().api_key,
-        agent=str(progress_id),
-        scope=TURN_PROGRESS_SCOPE,
-    ):
+    if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid turn progress token",
@@ -70,18 +66,41 @@ async def accept_turn_progress(
 
     settings = get_settings()
     valkey = request.app.state.valkey
+    subject = f"{progress_id}:{body.generation}"
+    if not sandbox_token.verify(
+        token,
+        settings.api_key,
+        agent=subject,
+        scope=TURN_PROGRESS_SCOPE,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid turn progress token",
+        )
     if not await take_rate_token(valkey, rate_key(settings.worker_key_prefix, token)):
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={"code": "rate_limited"},
             headers={"Retry-After": "1"},
         )
+    progress_id_text = str(progress_id)
     entry_id = await append_to_inbox(
         valkey,
-        inbox_key(settings.worker_key_prefix, str(progress_id)),
-        inbox_fields(body),
+        key=inbox_key(settings.worker_key_prefix, progress_id_text),
+        pending_key=inbox_pending_key(settings.worker_key_prefix),
+        record_key=progress_key(settings.worker_key_prefix, progress_id_text),
+        progress_id=progress_id_text,
+        fields=inbox_fields(body),
     )
+    if entry_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="turn progress generation is no longer active",
+        )
     logger.info(
-        "turn progress accepted for %s at epoch %d seq %d", progress_id, body.epoch, body.seq
+        "turn progress accepted for %s at generation %d seq %d",
+        progress_id,
+        body.generation,
+        body.seq,
     )
     return {"accepted": True, "id": entry_id}

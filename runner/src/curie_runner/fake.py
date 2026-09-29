@@ -214,9 +214,7 @@ def progress_demo_turn() -> list[Any]:
         tool_use_id = f"p{index}"
         script.append(_Pause())
         script.append(
-            _assistant(
-                ToolUseBlock(id=tool_use_id, name=TURN_PROGRESS_TOOL_NAME, input=arguments)
-            )
+            _assistant(ToolUseBlock(id=tool_use_id, name=TURN_PROGRESS_TOOL_NAME, input=arguments))
         )
         script.append(_ProgressCall(tool_use_id=tool_use_id, arguments=arguments))
     script.append(_Pause())
@@ -348,14 +346,9 @@ class FakeModelSession:
                 return
 
     async def _answer_progress(self, call: _ProgressCall) -> UserMessage:
-        """The progress tool's answer, from the same handler the SDK tool runs."""
+        """The offline fake acknowledges the marker without any network I/O."""
 
-        if self._turn_progress is None:
-            return _tool_result(call.tool_use_id, [{"type": "text", "text": NOT_SHOWN_TEXT}])
-        answer = await self._turn_progress.submit(call.arguments)
-        return _tool_result(
-            call.tool_use_id, answer["content"], is_error=bool(answer.get("is_error"))
-        )
+        return _tool_result(call.tool_use_id, [{"type": "text", "text": NOT_SHOWN_TEXT}])
 
     async def _apply_gate(self, message: Any) -> None:
         """Run the permission gate over each ToolUseBlock and honor its decision.

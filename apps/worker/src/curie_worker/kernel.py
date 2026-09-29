@@ -174,8 +174,9 @@ from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .turn_progress import (
     ProgressPump,
     TurnProgressPlan,
+    activate_turn_progress,
+    deactivate_turn_progress,
     link_progress_resume,
-    mint_capability,
     plan_turn_progress,
     start_progress_pump,
 )
@@ -658,9 +659,7 @@ def _max_turns_guidance(delivered_max_turns: str | None) -> str:
     )
 
 
-def _with_guidance(
-    lead: str, token: str, *, delivered_max_turns: str | None
-) -> str:
+def _with_guidance(lead: str, token: str, *, delivered_max_turns: str | None) -> str:
     if token == "max-turns":
         guidance: str | None = _max_turns_guidance(delivered_max_turns)
     else:
@@ -768,11 +767,7 @@ def _is_context_tool(name: str) -> bool:
     if name in _CONTEXT_TOOLS:
         return True
     parts = name.split("__", 2)
-    return (
-        len(parts) == 3
-        and parts[0] == "mcp"
-        and parts[2].startswith(_CONTEXT_MCP_PREFIXES)
-    )
+    return len(parts) == 3 and parts[0] == "mcp" and parts[2].startswith(_CONTEXT_MCP_PREFIXES)
 
 
 def _unpublished_cause(tools_called: frozenset[str]) -> str:
@@ -796,6 +791,7 @@ def _finish_detail(text: str) -> str | None:
     if len(detail) > _FINISH_DETAIL_MAX:
         return detail[: _FINISH_DETAIL_MAX - 3] + "..."
     return detail
+
 
 # How long the reclaim preflight waits for a previous owner's runner to go idle
 # after the interrupt, and how often it re-reads. Bounded (and further clamped to
@@ -1974,16 +1970,18 @@ class Kernel:
             self._minted_refs.pop(qevent.event_id, None)
 
     async def expire_capacity_wait(
-        self, qevent: QueuedTurn, *, lease: DeliveryLease, cause: str,
+        self,
+        qevent: QueuedTurn,
+        *,
+        lease: DeliveryLease,
+        cause: str,
         grant_epoch: str | None,
     ) -> tuple[bool, str | None]:
         lease.raise_if_lost()
         # A wait without a recorded grant never started work. A later message
         # may now own this thread, so only stop the exact epoch of this wait.
         if grant_epoch is not None:
-            await self._quiesce_capacity_epoch(
-                _thread_key_for(qevent), grant_epoch
-            )
+            await self._quiesce_capacity_epoch(_thread_key_for(qevent), grant_epoch)
         lease.raise_if_lost()
         route = _route_from_handle(qevent)
         delivered = False
@@ -2025,9 +2023,7 @@ class Kernel:
 
         return await self._quiesce_capacity_epoch(_thread_key_for(qevent), epoch)
 
-    async def notify_capacity_expired(
-        self, qevent: QueuedTurn, *, cause: str
-    ) -> ReplyAck:
+    async def notify_capacity_expired(self, qevent: QueuedTurn, *, cause: str) -> ReplyAck:
         try:
             text = (
                 _CAPACITY_FAILED_REPLY
@@ -2036,9 +2032,7 @@ class Kernel:
                 if cause == "grant_unknown"
                 else _CAPACITY_EXPIRED_REPLY
             )
-            return await self._reply_for(
-                qevent, _route_from_handle(qevent), text
-            )
+            return await self._reply_for(qevent, _route_from_handle(qevent), text)
         finally:
             self._minted_refs.pop(qevent.event_id, None)
             self._terminal_reply_attempted.discard(qevent.event_id)
@@ -2443,9 +2437,7 @@ class Kernel:
                 assert handle is not None
                 refusal = self._sink.undeliverable_reason(handle.kind, route)
                 if refusal is not None:
-                    logger.error(
-                        "dropping event %s without a reply: %s", event_id, refusal
-                    )
+                    logger.error("dropping event %s without a reply: %s", event_id, refusal)
                     await self._complete(
                         qevent,
                         route,
@@ -2844,9 +2836,7 @@ class Kernel:
                 else:
                     record = await wait_scope[0].get(wait_scope[1])
                     if record is not None and record.grant_epoch is not None:
-                        await self._quiesce_capacity_epoch(
-                            thread_key, record.grant_epoch
-                        )
+                        await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
 
             # Retry carry for the inferred repository announcement (#2659); see
             # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
@@ -2952,15 +2942,9 @@ class Kernel:
                                 exc.code,
                             )
                         return
-                    if (
-                        qevent.source is TurnSource.CRON
-                        and (
-                            isinstance(busy, HookPaused)
-                            or (
-                                not targetless
-                                and isinstance(busy, (LiveSessionBusy, CatchUpExpired))
-                            )
-                        )
+                    if qevent.source is TurnSource.CRON and (
+                        isinstance(busy, HookPaused)
+                        or (not targetless and isinstance(busy, (LiveSessionBusy, CatchUpExpired)))
                     ):
                         # ADR-0099 Concurrency and idle (#2929): the busy read ran
                         # under the per-thread lock. Record the fire deferred and
@@ -3069,9 +3053,7 @@ class Kernel:
                                 f"The run hit an error ({token}) after starting an action; "
                                 "not retrying automatically.",
                                 token,
-                                delivered_max_turns=(boot_env or {}).get(
-                                    MAX_TURNS_ENV
-                                ),
+                                delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                             ),
                             detail=outcome.error_message,
                         ),
@@ -3123,9 +3105,7 @@ class Kernel:
                             lead=_with_guidance(
                                 f"The run failed ({token}) after {attempt} attempt(s).",
                                 token,
-                                delivered_max_turns=(boot_env or {}).get(
-                                    MAX_TURNS_ENV
-                                ),
+                                delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                             ),
                             detail=outcome.error_message,
                         ),
@@ -3351,9 +3331,7 @@ class Kernel:
             "the reclaim interrupt; refusing to run a replacement beside it"
         )
 
-    async def _quiesce_capacity_epoch(
-        self, thread_key: str, epoch: str
-    ) -> str:
+    async def _quiesce_capacity_epoch(self, thread_key: str, epoch: str) -> str:
         """Stop only this epoch and return its attested admission decision."""
 
         deadline = time.monotonic() + _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S
@@ -3365,7 +3343,9 @@ class Kernel:
             remaining_s = max(0.0, deadline - time.monotonic())
             try:
                 status = await self._runner.capacity_status(
-                    handle.base_url, epoch=epoch, token=handle.token or None,
+                    handle.base_url,
+                    epoch=epoch,
+                    token=handle.token or None,
                     remaining_s=min(1.0, remaining_s),
                 )
             except Exception as exc:
@@ -3384,16 +3364,12 @@ class Kernel:
             if status["turn_epoch"] != epoch:
                 return str(status["capacity_admission_result"])
             if not timeout_sent:
-                await self._runner.timeout_turn(
-                    handle.base_url, epoch, token=handle.token or None
-                )
+                await self._runner.timeout_turn(handle.base_url, epoch, token=handle.token or None)
                 timeout_sent = True
             await asyncio.sleep(
                 min(_RECLAIM_PREFLIGHT_POLL_S, max(0.0, deadline - time.monotonic()))
             )
-        raise ReclaimPreflightUnsafe(
-            f"capacity runner turn remains live for thread {thread_key}"
-        )
+        raise ReclaimPreflightUnsafe(f"capacity runner turn remains live for thread {thread_key}")
 
     async def interrupt_thread(self, thread_key: str, reason: str) -> bool:
         """Hard-stop the thread's live turn. True if a live runner was signalled."""
@@ -3814,9 +3790,7 @@ class Kernel:
                     qevent.event_id,
                     exc_info=True,
                 )
-        await self._complete(
-            qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease
-        )
+        await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
 
     async def _reply(
         self,
@@ -4044,9 +4018,7 @@ class Kernel:
             and turn.review_origin_key == event_id
             and turn.classification == "history-persistence-error"
         )
-        marker_value: DoneMarkerValue = (
-            "history_capacity" if history_capacity_review else "1"
-        )
+        marker_value: DoneMarkerValue = "history_capacity" if history_capacity_review else "1"
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -4233,9 +4205,7 @@ class Kernel:
             return False
         except Exception as exc:  # noqa: BLE001 - the turn is already durably done
             try:
-                await self._markers.clear_completion_cause(
-                    record.event_id, generation=generation
-                )
+                await self._markers.clear_completion_cause(record.event_id, generation=generation)
             except Exception as cause_exc:  # noqa: BLE001 - retry remains owed
                 logger.warning(
                     "turn.completed failure cause could not be cleared for %s (%s)",
@@ -4815,9 +4785,7 @@ class Kernel:
             # (#2943).
             record_reclaimed_retry()
             release_order()
-            logger.warning(
-                "turn start refused for %s: %s", qevent.event_id, exc
-            )
+            logger.warning("turn start refused for %s: %s", qevent.event_id, exc)
             await self._reply_for(
                 qevent,
                 route,
@@ -5019,6 +4987,9 @@ class Kernel:
             # an unexpected failure after start_turn but before _consume enters
             # its response context.
             turn.close()
+            progress_plan = _TURN_PROGRESS.get()
+            if progress_plan is not None and self._progress is not None:
+                await deactivate_turn_progress(self._progress, progress_plan)
 
     async def _start_turn_under_hook_control(
         self,
@@ -5032,7 +5003,16 @@ class Kernel:
 
         extra: dict[str, Any] = {"capacity_admission": True} if capacity_admission else {}
         plan = _TURN_PROGRESS.get()
-        progress = mint_capability(self._config, plan.progress_id) if plan is not None else None
+        progress = (
+            await activate_turn_progress(
+                self._progress,
+                self._config,
+                plan,
+                answer_ref=None,
+            )
+            if plan is not None and self._progress is not None
+            else None
+        )
         if progress is not None:
             extra["progress"] = progress
         carry = _HOOK_RUN_CARRY.get()
@@ -5040,16 +5020,30 @@ class Kernel:
             async with carry.recorder.start_guard(carry.ref) as allowed:
                 if not allowed:
                     raise HookPaused("cron hook paused before runner start")
-                return await self._runner.start_turn(
-                    handle.base_url,
-                    event,
-                    token=handle.token or None,
-                    remaining_s=remaining_s,
-                    **extra,
-                )
-        return await self._runner.start_turn(
-            handle.base_url, event, token=handle.token or None, remaining_s=remaining_s, **extra
-        )
+                try:
+                    return await self._runner.start_turn(
+                        handle.base_url,
+                        event,
+                        token=handle.token or None,
+                        remaining_s=remaining_s,
+                        **extra,
+                    )
+                except BaseException:
+                    if plan is not None and self._progress is not None:
+                        await deactivate_turn_progress(self._progress, plan)
+                    raise
+        try:
+            return await self._runner.start_turn(
+                handle.base_url,
+                event,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+                **extra,
+            )
+        except BaseException:
+            if plan is not None and self._progress is not None:
+                await deactivate_turn_progress(self._progress, plan)
+            raise
 
     async def _route_attachment_and_start(
         self,
@@ -5518,9 +5512,7 @@ class Kernel:
                 reader = getattr(self._publication_creator, "get_publication_lineage", None)
                 if reader is not None:
                     try:
-                        lineage = await reader(
-                            workspace_deployment_id, thread_key, workspace_repo
-                        )
+                        lineage = await reader(workspace_deployment_id, thread_key, workspace_repo)
                     except (ApprovalBackendError, WorkspaceSelectionRefused):
                         if self._is_factory_work_item_turn(queued_event_id):
                             raise RunnerError("publication lineage is unavailable") from None
@@ -5729,13 +5721,17 @@ class Kernel:
             async def deny() -> None:
                 try:
                     await self._runner.admit_turn(
-                        handle.base_url, epoch, allow=False,
-                        token=handle.token or None, remaining_s=2.0,
+                        handle.base_url,
+                        epoch,
+                        allow=False,
+                        token=handle.token or None,
+                        remaining_s=2.0,
                     )
                 except Exception:
                     logger.warning(
                         "could not deny unadmitted capacity turn for event %s",
-                        wait[1], exc_info=True,
+                        wait[1],
+                        exc_info=True,
                     )
 
             observe_until = asyncio.get_running_loop().time() + _CAPACITY_ADMISSION_OBSERVE_S
@@ -5751,13 +5747,15 @@ class Kernel:
                     raise RunnerError("capacity runner admission was not observed")
                 try:
                     status = await self._runner.capacity_status(
-                        handle.base_url, token=handle.token or None,
+                        handle.base_url,
+                        token=handle.token or None,
                         remaining_s=min(1.0, budget_s or 1.0),
                     )
                 except Exception:
                     logger.warning(
                         "capacity runner status unavailable for event %s",
-                        wait[1], exc_info=True,
+                        wait[1],
+                        exc_info=True,
                     )
                 else:
                     if status.get("turn_epoch") == epoch:
@@ -5774,7 +5772,9 @@ class Kernel:
             try:
                 wait[3].raise_if_lost()
                 await self._runner.admit_turn(
-                    handle.base_url, epoch, allow=True,
+                    handle.base_url,
+                    epoch,
+                    allow=True,
                     token=handle.token or None,
                     remaining_s=min(2.0, wait[3].remaining_s()),
                 )
@@ -5786,7 +5786,9 @@ class Kernel:
                 # Query the exact epoch before deciding whether work started.
                 try:
                     status = await self._runner.capacity_status(
-                        handle.base_url, epoch=epoch, token=handle.token or None,
+                        handle.base_url,
+                        epoch=epoch,
+                        token=handle.token or None,
                         remaining_s=1.0,
                     )
                 except Exception:
@@ -5804,9 +5806,7 @@ class Kernel:
                         await wait[0].confirm_grant(wait[1], wait[2], wait[3], epoch)
                     elif result == "unknown":
                         await wait[0].mark_grant_unknown(wait[1], wait[2], epoch)
-                    raise CapacityWaitRefused(
-                        "capacity runner grant was not confirmed"
-                    ) from None
+                    raise CapacityWaitRefused("capacity runner grant was not confirmed") from None
             if not await wait[0].confirm_grant(wait[1], wait[2], wait[3], epoch):
                 await self._quiesce_capacity_epoch(thread_key, epoch)
                 raise CapacityWaitRefused("capacity runner grant lost its delivery")
@@ -5850,13 +5850,15 @@ class Kernel:
                 wait_budget_s = await check_capacity_before_request()
                 try:
                     capacity_status = await self._runner.capacity_status(
-                        handle.base_url, token=handle.token or None,
+                        handle.base_url,
+                        token=handle.token or None,
                         remaining_s=min(1.0, wait_budget_s or 1.0),
                     )
                 except Exception:
                     logger.warning(
                         "capacity runner status unavailable for event %s",
-                        wait[1], exc_info=True,
+                        wait[1],
+                        exc_info=True,
                     )
                     raise CapacityWaitRequested() from None
                 # An older runner does not implement the admission gate. Never
@@ -6110,9 +6112,7 @@ class Kernel:
             # API through its bridge network. The API signs the authority, not
             # the transport URL; deliver the same route on the runner's base.
             base = self._config.runner_facing_api_base_url.rstrip("/")
-            context = context.model_copy(
-                update={"precheck_url": f"{base}/publications/precheck"}
-            )
+            context = context.model_copy(update={"precheck_url": f"{base}/publications/precheck"})
         _PUBLICATION_CONTEXT.set(context)
         remaining_s = run.bound_remaining_s(
             None if remaining_s is None else remaining_s - (time.monotonic() - started)
@@ -7339,9 +7339,7 @@ class Kernel:
         # is posted, and never rewritten: a buffering channel (email) replaces its
         # reply text on each update and appends the card, so a rewrite would drop
         # the card from that reply.
-        card_in_thread = (
-            not is_publication and in_requesting_channel and not card_rides_the_turn
-        )
+        card_in_thread = not is_publication and in_requesting_channel and not card_rides_the_turn
 
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
@@ -7463,9 +7461,7 @@ class Kernel:
             # is the cluster-message relay (#2883): it has no card message to
             # mint and addresses the caller's session bucket by the turn's ref,
             # exactly as the publication card outbox does (#2757).
-            card_reply_ref = (
-                self._target_for(qevent).reply_ref if card_rides_the_turn else None
-            )
+            card_reply_ref = self._target_for(qevent).reply_ref if card_rides_the_turn else None
             card_ack = await self._sink.emit(
                 ReplyPost(
                     version=REPLY_WIRE_VERSION,
@@ -7621,19 +7617,13 @@ class Kernel:
         if parsed is None or parsed.kind != "execute":
             return outcome
         run = self._work_item_runs.get(parsed.request_id)
-        if (
-            run is None
-            or run.event_id != qevent.event_id
-            or not run.started
-            or run.finished
-        ):
+        if run is None or run.event_id != qevent.event_id or not run.started or run.finished:
             return outcome
         if (
             not outcome.terminal_ok
             or outcome.steered
             or outcome.continued
-            or outcome.status
-            not in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT)
+            or outcome.status not in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT)
             or PLATFORM_PUBLISH_TOOL_NAME in outcome.tools_called
         ):
             return outcome

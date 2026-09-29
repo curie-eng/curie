@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 URL_HEADER: Final = "X-Curie-Progress-Url"
 TOKEN_HEADER: Final = "X-Curie-Progress-Token"
+GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
 TOKEN_SCOPE: Final = "turn.progress"
 ROUTE: Final = "/v1/turn-progress/{progress_id}"
 
@@ -56,8 +57,8 @@ PUMP_BATCH: Final = 64
 PUMP_DRAIN_TIMEOUT_S: Final = 5.0
 
 _SLACK_KIND: Final = "slack"
-_INBOX_FIELDS: Final = frozenset({"command", "epoch", "seq"})
-# epoch and seq travel through the store's Lua, whose numbers are doubles.
+_INBOX_FIELDS: Final = frozenset({"command", "generation", "seq"})
+# generation and seq travel through the store's Lua, whose numbers are doubles.
 _MAX_POSITION: Final = 2**53 - 1
 _TRANSIENT = (ValkeyConnectionError, ValkeyTimeoutError, OSError)
 
@@ -80,7 +81,7 @@ def progress_eligible(qevent: QueuedTurn, *, factory_work_item: bool) -> bool:
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class TurnProgressPlan:
     """The chain one delivery reports progress on, named before any turn starts.
 
@@ -91,6 +92,7 @@ class TurnProgressPlan:
     progress_id: str
     thread_key: str
     root_event_id: str | None
+    generation: int | None = None
 
 
 async def plan_turn_progress(
@@ -135,7 +137,11 @@ def capability_url(config: WorkerConfig, progress_id: str) -> str:
 
 
 def mint_capability(
-    config: WorkerConfig, progress_id: str, *, now: float | None = None
+    config: WorkerConfig,
+    progress_id: str,
+    generation: int,
+    *,
+    now: float | None = None,
 ) -> dict[str, str] | None:
     """The runner control headers for one turn start, or None without an API key.
 
@@ -148,13 +154,51 @@ def mint_capability(
     issued = int(now if now is not None else time.time())
     return {
         URL_HEADER: capability_url(config, progress_id),
+        GENERATION_HEADER: str(generation),
         TOKEN_HEADER: sandbox_token.mint(
             config.api_key,
-            agent=progress_id,
+            agent=f"{progress_id}:{generation}",
             scope=TOKEN_SCOPE,
             exp=issued + SANDBOX_TOKEN_TTL_SECONDS,
         ),
     }
+
+
+async def activate_turn_progress(
+    store: ProgressStore,
+    config: WorkerConfig,
+    plan: TurnProgressPlan,
+    *,
+    answer_ref: str | None,
+) -> dict[str, str] | None:
+    """Open the chain, allocate its generation, and mint the turn capability."""
+
+    if not config.api_key:
+        return None
+    try:
+        if plan.root_event_id is not None:
+            await store.open_chain(
+                plan.thread_key,
+                plan.root_event_id,
+                answer_ref=answer_ref,
+            )
+        generation = await store.begin_turn(plan.progress_id)
+    except Exception:  # noqa: BLE001 - progress never fails a turn
+        logger.warning("progress turn %s did not activate", plan.progress_id, exc_info=True)
+        return None
+    plan.generation = generation
+    return mint_capability(config, plan.progress_id, generation)
+
+
+async def deactivate_turn_progress(store: ProgressStore, plan: TurnProgressPlan) -> None:
+    """Close this plan's generation without clearing a newer owner."""
+
+    if plan.generation is None:
+        return
+    try:
+        await store.end_turn(plan.progress_id, plan.generation)
+    except Exception:  # noqa: BLE001 - progress never fails a turn
+        logger.warning("progress turn %s did not deactivate", plan.progress_id, exc_info=True)
 
 
 def resume_event_id_for(approval_id: object) -> str:
@@ -178,7 +222,9 @@ async def link_progress_resume(
         linked = await store.link_resume(resume_event_id, plan.progress_id)
     except Exception:  # noqa: BLE001 - progress never fails a turn
         logger.warning(
-            "progress chain %s was not linked to %s", plan.progress_id, resume_event_id,
+            "progress chain %s was not linked to %s",
+            plan.progress_id,
+            resume_event_id,
             exc_info=True,
         )
         return
@@ -197,13 +243,13 @@ def parse_inbox_entry(fields: Mapping[str, str]) -> tuple[ProgressCommand, int, 
         return None
     try:
         command = ProgressCommand.model_validate_json(fields["command"])
-        epoch = int(fields["epoch"])
+        generation = int(fields["generation"])
         seq = int(fields["seq"])
     except (ValidationError, ValueError):
         return None
-    if not (1 <= epoch <= _MAX_POSITION and 1 <= seq <= _MAX_POSITION):
+    if not (1 <= generation <= _MAX_POSITION and 1 <= seq <= _MAX_POSITION):
         return None
-    return command, epoch, seq
+    return command, generation, seq
 
 
 class ProgressPump:
@@ -309,6 +355,8 @@ class ProgressPump:
                 )
             self._cursor = entry_id
             await self._store.advance_cursor(self._progress_id, entry_id)
+        if len(entries) < self._batch:
+            await self._store.release_inbox_if_drained(self._progress_id)
         return len(entries)
 
     async def _apply(self, entry_id: str, fields: Mapping[str, str]) -> None:
@@ -318,14 +366,15 @@ class ProgressPump:
                 "progress entry %s of %s is malformed; skipping it", entry_id, self._progress_id
             )
             return
-        command, epoch, seq = parsed
+        command, generation, seq = parsed
         outcome = await self._store.apply_model_command(
             self._progress_id,
             command,
-            epoch=epoch,
+            epoch=generation,
             seq=seq,
             route=self._route,
             target=self._target(),
+            enqueue_deliveries=self._render,
         )
         logger.info(
             "progress %s entry %s: %s%s",
@@ -334,8 +383,6 @@ class ProgressPump:
             outcome.status,
             f" ({outcome.reason})" if outcome.reason else "",
         )
-        if outcome.deliveries and not self._render:
-            await self._store.discard_deliveries(outcome.deliveries)
 
 
 async def start_progress_pump(
@@ -347,18 +394,9 @@ async def start_progress_pump(
     render: bool,
     interval_s: float = PUMP_INTERVAL_S,
 ) -> ProgressPump | None:
-    """Open a fresh chain's record, then start its pump; None when neither can.
-
-    A fresh chain is opened here, when a turn's stream is consumed, and not
-    when the delivery is planned, so an event that only steers a live turn
-    opens nothing. Opening is idempotent, so a retried turn reopens nothing.
-    """
+    """Start the pump for the chain activated before the runner turn began."""
 
     try:
-        if plan.root_event_id is not None:
-            await store.open_chain(
-                plan.thread_key, plan.root_event_id, answer_ref=target().reply_ref
-            )
         record = await store.read(plan.progress_id)
     except Exception:  # noqa: BLE001 - progress never fails a turn
         logger.warning("progress pump for %s did not start", plan.progress_id, exc_info=True)

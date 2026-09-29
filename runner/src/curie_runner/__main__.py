@@ -84,6 +84,7 @@ from .progress import (
     VERIFICATION_COMMAND,
     ProgressActivity,
     build_progress_tool,
+    factory_progress_requested,
     preflight_workspace_verification,
     resolve_progress,
 )
@@ -94,7 +95,12 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
-from .turn_progress import PROGRESS_PREAMBLE, TurnProgress, build_turn_progress_tool
+from .turn_progress import (
+    PROGRESS_PREAMBLE,
+    TurnProgress,
+    build_turn_progress_tool,
+    should_mount_turn_progress,
+)
 from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
@@ -130,9 +136,7 @@ def _discover_attachments(mount: Path | None) -> tuple[Path, ...]:
         return ()
     return tuple(
         sorted(
-            child
-            for child in mount.iterdir()
-            if child.is_file() and not child.name.startswith(".")
+            child for child in mount.iterdir() if child.is_file() and not child.name.startswith(".")
         )
     )
 
@@ -252,8 +256,7 @@ def format_workspace_preamble(
                 f"`{command}` could not be completed."
             )
         lines.append(
-            f"{result_text} Missing binaries: {missing_text}. "
-            f"Blocked services: {blocked_text}."
+            f"{result_text} Missing binaries: {missing_text}. Blocked services: {blocked_text}."
         )
         if verification.get("report_status") != 201:
             lines.append(
@@ -440,6 +443,7 @@ def build_runner(
     # The live status card (#3077): a factory execution carries a progress URL
     # and token, and the bundle declares its phases. A malformed phase file is
     # logged and mounts no tool; progress never stops a boot.
+    factory_requested = factory_progress_requested(os.environ)
     try:
         progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
     except ValueError as exc:
@@ -449,7 +453,14 @@ def build_runner(
     # ``progress`` tool and carries its prompt block. Its capability arrives per
     # turn on /v1/event, so a session that is never handed one gets only the
     # tool's soft "not shown" answer.
-    turn_progress = TurnProgress() if progress is None else None
+    turn_progress = (
+        TurnProgress()
+        if should_mount_turn_progress(
+            factory_progress_requested=factory_requested,
+            factory_progress_resolved=progress is not None,
+        )
+        else None
+    )
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
@@ -605,9 +616,7 @@ def build_runner(
             async def reprobe(
                 failures: tuple[ConnectorCapabilityFailure, ...],
             ) -> tuple[ConnectorCapabilityFailure, ...]:
-                return await reprobe_connector_failures(
-                    failures, reprobe_servers, reprobe_env
-                )
+                return await reprobe_connector_failures(failures, reprobe_servers, reprobe_env)
 
             connector_reprobe = reprobe
 
@@ -656,9 +665,7 @@ def build_runner(
                     else None
                 ),
                 turn_progress_tool=(
-                    build_turn_progress_tool(turn_progress)
-                    if turn_progress is not None
-                    else None
+                    build_turn_progress_tool(turn_progress) if turn_progress is not None else None
                 ),
             ),
             **(
@@ -797,11 +804,7 @@ def build_runner(
             usage_reporter=usage_reporter,
             primary_model=config.model,
             connector_failures=connector_failures
-            or (
-                capability.connector_failures
-                if capability is not None
-                else ()
-            ),
+            or (capability.connector_failures if capability is not None else ()),
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
@@ -914,8 +917,7 @@ async def _load_history(
                 )
             except HistoryCapacityError as exc:
                 logger.error(
-                    "history capacity exceeded at boot session=%s status=%d "
-                    "(refusing turns)",
+                    "history capacity exceeded at boot session=%s status=%d (refusing turns)",
                     config.session.session_id,
                     exc.status,
                 )
@@ -926,11 +928,7 @@ async def _load_history(
                 records, max_turns=max_turns, max_bytes=max_bytes
             )
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
-        status = (
-            exc.args[0]
-            if len(exc.args) == 1 and isinstance(exc.args[0], int)
-            else None
-        )
+        status = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], int) else None
         if status is None:
             logger.error(
                 "history load failed session=%s error_class=%s",
@@ -989,9 +987,7 @@ async def _load_boot_fetches(
         caller_header=config.connector_caller_token is not None,
     )
     expansion_failures = (
-        diagnose_derived_connector_headers(
-            derived, {**os.environ, **dict(sdk_env or {})}
-        )
+        diagnose_derived_connector_headers(derived, {**os.environ, **dict(sdk_env or {})})
         if fake_model
         else ()
     )
@@ -1100,6 +1096,7 @@ def _serve() -> None:
         connector_failures=fetches.connector_failures,
         history_capacity_exceeded=fetches.history_capacity_exceeded,
     )
+
     def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is
         # the repository fact. The proposal is runner-held state from the

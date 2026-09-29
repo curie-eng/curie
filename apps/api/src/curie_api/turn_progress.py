@@ -42,21 +42,20 @@ RATE_PER_S: Final = 1.0
 RATE_BURST: Final = 5
 _RATE_TTL_MS: Final = 60_000
 
-# epoch and seq travel through the worker store's Lua, whose numbers are doubles.
+# generation and seq travel through the worker store's Lua, whose numbers are doubles.
 _MAX_POSITION: Final = 2**53 - 1
 
 Position = Annotated[int, Field(strict=True, ge=1, le=_MAX_POSITION)]
 
 
 class TurnProgressBody(ProgressCommand):
-    """A ``ProgressCommand`` and the runner's position for it.
+    """A ``ProgressCommand`` and the worker/runner position for it.
 
-    Closed like the command: an unknown field is refused. ``epoch`` orders the
-    turn's commands after every earlier turn's in the chain, and ``seq`` orders
-    them within the turn; the worker store refuses a command out of order.
+    Closed like the command: an unknown field is refused. ``generation`` is
+    allocated durably by the worker and ``seq`` orders commands within it.
     """
 
-    epoch: Position
+    generation: Position
     seq: Position
 
 
@@ -64,6 +63,18 @@ def inbox_key(key_prefix: str, progress_id: str) -> str:
     """The chain's inbox stream, under the worker's key prefix."""
 
     return f"{key_prefix}:progress:inbox:{progress_id}"
+
+
+def inbox_pending_key(key_prefix: str) -> str:
+    """The durable index maintenance workers use to find non-empty inboxes."""
+
+    return f"{key_prefix}:progress:inbox:pending"
+
+
+def progress_key(key_prefix: str, progress_id: str) -> str:
+    """The worker-owned chain record whose active generation fences ingress."""
+
+    return f"{key_prefix}:progress:{progress_id}"
 
 
 def rate_key(key_prefix: str, token: str) -> str:
@@ -76,19 +87,23 @@ def rate_key(key_prefix: str, token: str) -> str:
 def inbox_fields(body: TurnProgressBody) -> dict[str, str]:
     """One inbox entry: the command as JSON, and its position."""
 
-    command = ProgressCommand.model_validate(body.model_dump(exclude={"epoch", "seq"}))
+    command = ProgressCommand.model_validate(body.model_dump(exclude={"generation", "seq"}))
     return {
         "command": command.model_dump_json(exclude_none=True),
-        "epoch": str(body.epoch),
+        "generation": str(body.generation),
         "seq": str(body.seq),
     }
 
 
-# Append and renew the expiry in one step, so an inbox is never left without one.
+# Fence, append, index and renew expiry in one step. A 202 can therefore never
+# be orphaned from the maintenance drainer by an API crash between writes.
 _APPEND_LUA = """
+if redis.call('HGET', KEYS[3], 'active_generation') ~= ARGV[4] then return false end
 local id = redis.call('XADD', KEYS[1], 'MAXLEN', ARGV[1], '*',
-  'command', ARGV[3], 'epoch', ARGV[4], 'seq', ARGV[5])
+  'command', ARGV[3], 'generation', ARGV[4], 'seq', ARGV[5])
+redis.call('SADD', KEYS[2], ARGV[6])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
+redis.call('EXPIRE', KEYS[2], ARGV[2])
 return id
 """
 
@@ -136,17 +151,30 @@ async def take_rate_token(valkey: Redis, key: str) -> bool:
     return int(allowed) == 1
 
 
-async def append_to_inbox(valkey: Redis, key: str, fields: dict[str, str]) -> str:
-    """Append one entry to a chain's inbox and return its stream id."""
+async def append_to_inbox(
+    valkey: Redis,
+    *,
+    key: str,
+    pending_key: str,
+    record_key: str,
+    progress_id: str,
+    fields: dict[str, str],
+) -> str | None:
+    """Append and index one active-generation entry; None when fenced."""
 
     entry_id: Any = await valkey.eval(
         _APPEND_LUA,
-        1,
+        3,
         key,
+        pending_key,
+        record_key,
         str(INBOX_MAXLEN),
         str(INBOX_TTL_S),
         fields["command"],
-        fields["epoch"],
+        fields["generation"],
         fields["seq"],
+        progress_id,
     )
+    if entry_id is None:
+        return None
     return entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)

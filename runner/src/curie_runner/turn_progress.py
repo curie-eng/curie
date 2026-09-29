@@ -22,8 +22,7 @@ images and share no module.
 from __future__ import annotations
 
 import logging
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -34,13 +33,14 @@ logger = logging.getLogger(__name__)
 
 PROGRESS_URL_HEADER: Final = "X-Curie-Progress-Url"
 PROGRESS_TOKEN_HEADER: Final = "X-Curie-Progress-Token"
+PROGRESS_GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
 PROGRESS_TOKEN_REQUEST_HEADER: Final = "X-API-Key"
 TURN_PROGRESS_TOOL: Final = "progress"
 PROGRESS_COMMAND_VERSION: Final = "1.0"
 _TIMEOUT_SECONDS: Final = 5.0
 
 NOT_SHOWN_TEXT: Final = "Progress is not shown for this turn."
-_RECORDED_TEXT: Final = "Progress recorded."
+_QUEUED_TEXT: Final = "Progress queued."
 _CONTINUE: Final = "Continue the work; progress never blocks it."
 
 # The committed ``ProgressCommand`` schema
@@ -136,16 +136,34 @@ class ProgressCapability:
 
     url: str
     token: str
+    generation: int
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> ProgressCapability | None:
-        """The capability the worker sent, or None unless both headers carry one."""
+        """The capability the worker sent, or None unless all headers carry one."""
 
         url = (headers.get(PROGRESS_URL_HEADER) or "").strip()
         token = (headers.get(PROGRESS_TOKEN_HEADER) or "").strip()
-        if not url or not token:
+        generation_raw = (headers.get(PROGRESS_GENERATION_HEADER) or "").strip()
+        try:
+            generation = int(generation_raw)
+        except ValueError:
             return None
-        return cls(url=url, token=token)
+        if not url or not token or generation < 1:
+            return None
+        return cls(url=url, token=token, generation=generation)
+
+
+def should_mount_turn_progress(
+    *, factory_progress_requested: bool, factory_progress_resolved: bool
+) -> bool:
+    """Whether this boot is an ordinary session rather than any factory boot.
+
+    A malformed or incomplete factory declaration must fail closed: falling
+    back to deliberate progress would expose the wrong platform tool.
+    """
+
+    return not factory_progress_requested and not factory_progress_resolved
 
 
 def _result(text: str, *, is_error: bool = False) -> dict[str, Any]:
@@ -158,17 +176,12 @@ def _result(text: str, *, is_error: bool = False) -> dict[str, Any]:
 class TurnProgress:
     """The open turn's progress capability, and the one handler every path calls.
 
-    ``epoch`` is the turn's start in Unix milliseconds, raised past the
-    previous turn's in this process so it always increases; ``seq`` counts the
-    turn's posts from 1. Together they let the worker apply a turn's commands
-    in order and refuse a finished turn's once a newer one has written.
+    The worker-issued generation identifies the active turn durably; ``seq``
+    counts that turn's posts from 1.
     """
 
-    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
-        self._clock = clock
+    def __init__(self) -> None:
         self._capability: ProgressCapability | None = None
-        self._epoch = 0
-        self._last_epoch = 0
         self._seq = 0
 
     @property
@@ -180,8 +193,6 @@ class TurnProgress:
 
         self._capability = capability
         self._seq = 0
-        self._epoch = max(int(self._clock() * 1000), self._last_epoch + 1)
-        self._last_epoch = self._epoch
 
     def close(self) -> None:
         """End the turn: a later call without a new capability shows nothing."""
@@ -204,11 +215,11 @@ class TurnProgress:
         self._seq += 1
         body: dict[str, Any] = {"version": PROGRESS_COMMAND_VERSION}
         body.update({key: value for key, value in args.items() if value is not None})
-        body["epoch"] = self._epoch
+        body["generation"] = capability.generation
         body["seq"] = self._seq
         status = await _post(capability, body)
         if status == 202:
-            return _result(_RECORDED_TEXT)
+            return _result(_QUEUED_TEXT)
         if status == 422:
             return _result(
                 "The update was refused: it is not a valid progress command. Check "
