@@ -4490,6 +4490,16 @@
         "title": "MetricsSummary",
         "type": "object"
       },
+      "MilestoneClass": {
+        "description": "Why a durable interruption is warranted (ADR-0130 section 3).\n\nA class is a reason, not a step: a chain may skip one or repeat one while\nits milestone budget lasts.",
+        "enum": [
+          "evidence",
+          "scope",
+          "verification"
+        ],
+        "title": "MilestoneClass",
+        "type": "string"
+      },
       "ModelUsageEntry": {
         "additionalProperties": false,
         "properties": {
@@ -4842,6 +4852,22 @@
         ],
         "title": "ProgressReport",
         "type": "object"
+      },
+      "ProgressState": {
+        "description": "The initial state set, in ADR-0130 section 1's order.",
+        "enum": [
+          "queued",
+          "investigating",
+          "awaiting-approval",
+          "preparing-workspace",
+          "testing",
+          "publishing",
+          "complete",
+          "failed",
+          "cancelled"
+        ],
+        "title": "ProgressState",
+        "type": "string"
       },
       "PublicationContext": {
         "description": "API issued authority and observation for one execution's publication read.\n\nThe capability authorizes only the publication precheck endpoint. It must\nstay outside model text, transcripts, workspace files and logs. The queued\nevent identifier is a correlation value, not proof of an active turn.\nObservation metadata records the API read at dispatch; consumers must make\na fresh comparison before handling an empty publication proposal.",
@@ -7006,6 +7032,66 @@
           "duplicate"
         ],
         "title": "TurnAccepted",
+        "type": "object"
+      },
+      "TurnProgressBody": {
+        "additionalProperties": false,
+        "description": "A ``ProgressCommand`` and the runner's position for it.\n\nClosed like the command: an unknown field is refused. ``epoch`` orders the\nturn's commands after every earlier turn's in the chain, and ``seq`` orders\nthem within the turn; the worker store refuses a command out of order.",
+        "properties": {
+          "epoch": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "milestone": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MilestoneClass"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requests a durable milestone reply of this class. The milestone budget is the platform's to apply, not the command's to state."
+          },
+          "seq": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Seq",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProgressState"
+          },
+          "summary": {
+            "maxLength": 200,
+            "minLength": 1,
+            "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+            "title": "Summary",
+            "type": "string"
+          },
+          "update_id": {
+            "description": "Identifies this update within its record, for idempotency.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+            "title": "Update Id",
+            "type": "string"
+          },
+          "version": {
+            "const": "1.0",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "update_id",
+          "state",
+          "summary",
+          "epoch",
+          "seq"
+        ],
+        "title": "TurnProgressBody",
         "type": "object"
       },
       "TurnSource": {
@@ -16778,6 +16864,76 @@
         "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/turn-progress/{progress_id}": {
+      "post": {
+        "description": "Append one command to the chain's inbox for the worker's pump.\n\n202 means the command is queued for the chain, not that it was applied:\nthe worker's store may still refuse it as a duplicate, out of order, past\nthe chain's update cap, or for a state only the platform sets.",
+        "operationId": "accept_turn_progress_v1_turn_progress__progress_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "progress_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Progress Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnProgressBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Accept Turn Progress V1 Turn Progress  Progress Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Turn Progress",
+        "tags": [
+          "turn-progress"
         ]
       }
     },

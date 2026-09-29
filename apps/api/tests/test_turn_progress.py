@@ -95,6 +95,7 @@ def _post(
     client: TestClient,
     progress_id: str,
     token: str | None,
+    /,
     *,
     seq: int = 1,
     epoch: int = 1_759_000_000_000,
