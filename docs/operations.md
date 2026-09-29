@@ -1451,6 +1451,47 @@ never retried automatically. It reaches the worker as `CURIE_TURN_RECEIPT`, so
 changing it rolls the workers. The chart refuses any other value at render,
 and the worker refuses one at startup.
 
+### Deliberate progress from a running turn
+
+A long task can report short progress while it runs
+([ADR-0130](adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+Nothing renders it yet: the platform records it and shows nobody, so turning
+it on later changes what people see, not what is stored.
+
+The path, and what an operator can check on each hop:
+
+1. **The capability.** For a person's Slack turn (and the approval resume of
+   one) the worker mints a sandbox token with scope `turn.progress`, bound to
+   that turn chain's `progress_id`, and sends it to the runner with the turn.
+   Jobs, cron and targetless hook turns, factory executions and
+   `curie cluster message` relay turns get none.
+2. **The ingress.** The runner's `progress` tool POSTs each update to the API
+   at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
+   The API accepts only a `turn.progress` token whose subject is the path's
+   `progress_id` and that has not expired: the platform key, another chain's
+   token and an expired token are refused 401, and a body that is not a
+   `ProgressCommand` plus the runner's `epoch` and `seq` (an unknown field
+   included) is refused 422. Each token may send one update a second, with a
+   burst of five; past that the API answers 429. An accepted update is
+   appended to the chain's inbox stream and answered 202.
+3. **The record.** While the turn runs, the worker applies each inbox entry to
+   the chain's durable record, which keeps its state, revision and milestone
+   reservations.
+
+With the default local stack, a fake-model turn shows it end to end:
+
+```bash
+curie local message "[fake:progress-demo] check the build"
+# the record the demo turn wrote (one per chain)
+valkey-cli -p 26379 -a valkeypass --scan --pattern 'curie:worker:progress:*'
+valkey-cli -p 26379 -a valkeypass HGETALL curie:worker:progress:<progress_id>
+```
+
+The record shows `state testing`, `revision 3` and `milestones_used 2`, and the
+Slack stub receives nothing from progress. The worker switch that will turn
+rendering on is `CURIE_PROGRESS_RENDER`; it is off, the chart does not expose
+it, and this release's worker refuses to start with it on.
+
 ### Connecting Slack
 
 ```bash

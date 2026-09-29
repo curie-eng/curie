@@ -623,6 +623,13 @@ as a whole; remembered only):
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
   ship in different images, so they are frozen together.
   [vector: `tests/vectors/connector-caller-refusal.json`]
+- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
+  runner control headers and `turn.progress` token scope the worker mints
+  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
+  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
+  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
+  and the worker's pump reads, cross three images, so they are frozen together.
+  [vector: `tests/vectors/turn-progress-capability.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

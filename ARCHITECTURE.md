@@ -39,6 +39,7 @@ detail, and documentation drift on one version-selectable system diagram.
 - [Handling a Slack mention (message flow)](#handling-a-slack-mention-message-flow)
   - [The four kernel invariants](#the-four-kernel-invariants)
   - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
+  - [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)
 - [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
 - [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
   - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
@@ -275,13 +276,18 @@ sequenceDiagram
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
-        W->>R: POST /v1/event {message}
+        W->>R: POST /v1/event {message} (+ progress capability headers on a person's turn)
     else turn already live for this thread
         W->>R: POST /v1/steer {text}
         Note over W,R: 409 if the turn finished first (finish race), worker opens a fresh turn on the same idle sandbox
     end
 
     R->>A: model call (streaming)
+    opt the model calls mcp__curie__progress on a turn holding a capability
+        R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token)
+        P->>V: XADD the chain's progress inbox
+        W->>V: pump: read the inbox, apply to the progress record (rendering off)
+    end
     R-->>W: NDJSON: text_delta*, tool notes*, final
     R--)O: gen_ai spans (agent.run root + generation/tool sibling intervals)
 
@@ -380,6 +386,30 @@ Three properties keep an approval from becoming a standing permission:
 - Membership for "who may approve" resolves in the API, never in the sandbox (ADR-0034).
 - The resumed sandbox boots with a scoped state token rather than the platform key (ADR-0033).
 - The post-approval allowance is one-shot and bound to the granting agent (ADR-0035), so an approval cannot be replayed into a standing permission.
+
+### Deliberate progress (ADR 0130)
+
+A long turn can report short task state while it runs
+([ADR-0130](docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+The report never rides the ACI stream: tool notes stay internal telemetry, and
+the frozen ACI is unchanged. Instead the kernel gives an eligible turn (a
+person's Slack turn, or its approval resume) a per-turn capability, a
+`turn.progress` sandbox token bound to the turn chain's `progress_id`, sent to
+the runner as two runner control headers on `POST /v1/event`
+([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
+The runner's platform `progress` tool posts each command to the API with it
+([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).
+The API verifies the token, rate limits it and appends the command to the
+chain's inbox stream in Valkey
+([`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`](apps/api/src/curie_api/routers/turn_progress.py)).
+While the kernel consumes the turn, a per-turn pump applies the inbox to the
+chain's durable record
+([`apps/worker/src/curie_worker/turn_progress.py::ProgressPump`](apps/worker/src/curie_worker/turn_progress.py),
+[`apps/worker/src/curie_worker/progress.py::ProgressStore`](apps/worker/src/curie_worker/progress.py)),
+which owns the ordering, idempotency, terminal and milestone-budget rules.
+Rendering is off: nothing reaches an adapter yet. The worker README's
+[Deliberate progress](apps/worker/README.md#deliberate-progress-adr-0130)
+section holds the rules.
 
 ## Pushing agent versions with git (deploy flow)
 

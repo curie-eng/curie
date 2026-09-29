@@ -70,6 +70,48 @@ Enforcement is only-when-configured: with the var unset the app is pass-through
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
 
+## Deliberate progress (ADR 0130)
+
+The runner mounts a `progress` tool on its platform `curie` MCP server, so the
+model sees it as `mcp__curie__progress`. It is ADR 0130's `curie_progress`
+operation. Its input schema is the committed `ProgressCommand` schema
+(`packages/channel-protocol/schema/channel-protocol.schema.json`) without
+`version`, which the runner fills in: `update_id`, `state`, `summary` and an
+optional `milestone`. A factory execution mounts `report_progress` instead and
+never both. When the tool is mounted the system prompt carries a short progress
+block beside the memory and workspace blocks: call it only on long,
+multi-step tasks, at material transitions, and never for a quick answer; a
+milestone (`evidence`, `scope` or `verification`) only when the step is
+material, at most three per task; and never reasoning, raw tool output, secrets
+or a draft answer in the summary. The tool description repeats the rules.
+
+The capability is per turn. The worker sends it on `POST /v1/event` in two
+runner control headers, `X-Curie-Progress-Url` and `X-Curie-Progress-Token`,
+next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
+fields. The runner holds them only while that turn is open, sets them when the
+turn starts and clears them when it ends, so a steer uses the turn's capability
+and a later turn without the headers has none. The names are frozen with the
+worker and the API in `tests/vectors/turn-progress-capability.json`.
+
+Each call POSTs the command to the capability URL with the token in
+`X-API-Key`, adding `epoch` and `seq`. `epoch` is the turn's start in Unix
+milliseconds, raised past the previous turn's in the same process so it always
+increases, and `seq` counts the turn's posts from 1, so the worker applies a
+turn's commands in order and never a finished turn's after a newer one. A call
+without a capability returns "Progress is not shown for this turn." and makes
+no network call. A refusal, a rate limit, a 5xx or a transport failure is a
+soft tool result that tells the model to continue; it never fails the turn. An
+input the schema refuses (an unknown field, a bad state or summary) is an error
+result the model can correct, still without failing the turn. The call is
+platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
+`side_effect_flag` and never lands on the turn's receipt.
+
+The fake model's `[fake:progress-demo]` marker calls the tool through the same
+handler: investigating, investigating with an `evidence` milestone, then
+testing with a `verification` milestone, two seconds apart so a steer can land,
+then the answer. Without a capability each call gets the soft result and no
+network call is made.
+
 ## Environment
 
 - **ACI-frozen** (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,
