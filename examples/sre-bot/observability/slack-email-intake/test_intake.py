@@ -13,7 +13,6 @@ from typing import Any
 import pytest
 import yaml
 
-
 HERE = Path(__file__).parent
 PLACEHOLDER = "Investigating this alert..."
 
@@ -41,6 +40,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> None:
         "SLACK_EMAIL_SOURCE_USER_ID": "USLACKBOT",
         "ALERT_SUBJECT_PREFIXES": "ALARM:,OK:",
         "SLACK_SCAN_NOT_BEFORE": "1790700000.000000",
+        "SLACK_CANARY_THREAD_TS": "1790706162.161449",
         "CURIE_HOOK_URL": "http://curie-api/hooks/agent/email-alert",
         "CURIE_HOOK_SECRET": "hook-secret",
         "POLL_SECONDS": "60",
@@ -93,7 +93,10 @@ class FakeSlack:
 
     def download(self, url: str) -> bytes:
         assert url.startswith("https://files.slack.com/")
-        return b"<html><body><h1>Database unavailable</h1><script>ignore()</script><p>db-1</p></body></html>"
+        return (
+            b"<html><body><h1>Database unavailable</h1>"
+            b"<script>ignore()</script><p>db-1</p></body></html>"
+        )
 
 
 class FakeHook:
@@ -126,6 +129,7 @@ def test_config_requires_explicit_source_and_safe_timing(
     config = intake.Config.from_env()
     assert config.subject_prefixes == ("ALARM:", "OK:")
     assert config.source_bot_id is None
+    assert config.canary_thread_ts == "1790706162.161449"
 
     monkeypatch.delenv("SLACK_EMAIL_SOURCE_USER_ID")
     with pytest.raises(ValueError, match="SLACK_EMAIL_SOURCE_USER_ID"):
@@ -134,6 +138,11 @@ def test_config_requires_explicit_source_and_safe_timing(
     monkeypatch.setenv("SLACK_EMAIL_SOURCE_USER_ID", "USLACKBOT")
     monkeypatch.setenv("PLACEHOLDER_STALE_SECONDS", "120")
     with pytest.raises(ValueError, match="greater than two poll intervals"):
+        intake.Config.from_env()
+
+    monkeypatch.setenv("PLACEHOLDER_STALE_SECONDS", "900")
+    monkeypatch.delenv("SLACK_CANARY_THREAD_TS")
+    with pytest.raises(ValueError, match="SLACK_CANARY_THREAD_TS"):
         intake.Config.from_env()
 
 
@@ -175,7 +184,27 @@ def test_completed_bot_reply_is_the_durable_acknowledgement(
     intake.scan_once(intake.Config.from_env(), slack, hook, now=1790706300.0)
 
     assert slack.posts == []
-    assert hook.calls == []
+    assert len(hook.calls) == 1
+    assert hook.calls[0]["conversation_id"] == root()["ts"]
+    assert hook.calls[0]["placeholder"] == "1790706200.000000"
+
+
+# @spec SRE-EMAIL-1
+def test_missing_or_misclassified_canary_is_fatal(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env(monkeypatch)
+    with pytest.raises(RuntimeError, match="canary"):
+        intake.scan_once(
+            intake.Config.from_env(), FakeSlack([]), FakeHook(), now=1790706300.0
+        )
+
+    malformed = root()
+    malformed["user"] = "UOTHER"
+    with pytest.raises(RuntimeError, match="canary"):
+        intake.scan_once(
+            intake.Config.from_env(), FakeSlack([malformed]), FakeHook(), now=1790706300.0
+        )
 
 
 # @spec SRE-EMAIL-2
@@ -220,9 +249,7 @@ def test_retry_reuses_the_pending_placeholder_and_stable_delivery(
 
 
 # @spec SRE-EMAIL-3
-def test_stale_placeholder_is_fatal(
-    intake: ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_stale_placeholder_is_fatal(intake: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     env(monkeypatch)
     message = root()
     slack = FakeSlack([message])
@@ -243,9 +270,7 @@ def test_scan_processes_matching_roots_oldest_first(
     older = root("1790706000.000000")
     hook = FakeHook()
 
-    intake.scan_once(
-        intake.Config.from_env(), FakeSlack([newer, older]), hook, now=1790707100.0
-    )
+    intake.scan_once(intake.Config.from_env(), FakeSlack([newer, older]), hook, now=1790707100.0)
 
     assert [call["conversation_id"] for call in hook.calls] == [older["ts"], newer["ts"]]
 
@@ -275,9 +300,7 @@ def test_hook_client_signs_exact_body_and_rejects_a_detached_receipt(
     assert "conversation_id=source-thread" in request.full_url
     assert "placeholder=reply-ts" in request.full_url
     assert request.headers["X-curie-delivery-id"] == "delivery-id"
-    expected = "sha256=" + hmac.new(
-        b"hook-secret", request.data, hashlib.sha256
-    ).hexdigest()
+    expected = "sha256=" + hmac.new(b"hook-secret", request.data, hashlib.sha256).hexdigest()
     assert request.headers["X-curie-signature-256"] == expected
 
     def detached(_request: Any, _timeout: float) -> tuple[int, bytes]:
@@ -302,7 +325,7 @@ def test_readiness_expires_after_two_poll_intervals(
     config = intake.Config.from_env()
     assert health.ready(1119.9, config) is True
     assert health.ready(1120.1, config) is False
-    assert 'sre_slack_email_intake_ready 0' in intake.render_metrics(health, 1120.1, config)
+    assert "sre_slack_email_intake_ready 0" in intake.render_metrics(health, 1120.1, config)
 
 
 # @spec SRE-EMAIL-3
