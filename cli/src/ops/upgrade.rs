@@ -404,7 +404,10 @@ pub struct FakeUpgradeHost {
     manifest_matches: bool,
     in_flight: Vec<String>,
     retained_values: bool,
+    runner_layer_clears: Vec<String>,
     applied: bool,
+    /// Agents whose claims Apply retired (#3422), in retirement order.
+    pub retired_claims: Vec<String>,
     pub drain_calls: u32,
     pub mutate_calls: u32,
 }
@@ -426,7 +429,9 @@ impl FakeUpgradeHost {
             manifest_matches: true,
             in_flight: Vec::new(),
             retained_values: false,
+            runner_layer_clears: Vec::new(),
             applied: false,
+            retired_claims: Vec::new(),
             drain_calls: 0,
             mutate_calls: 0,
         }
@@ -494,6 +499,12 @@ impl FakeUpgradeHost {
         self
     }
 
+    /// Agents whose layered runner the upgrade will stop matching (#3218).
+    pub fn with_runner_layer_clears(mut self, agents: &[&str]) -> Self {
+        self.runner_layer_clears = agents.iter().map(|a| a.to_string()).collect();
+        self
+    }
+
     pub fn with_retained_values(mut self) -> Self {
         self.retained_values = true;
         self
@@ -536,6 +547,9 @@ impl UpgradeDriver for FakeUpgradeHost {
     fn retained_values(&self) -> bool {
         self.retained_values
     }
+    fn runner_layer_clears(&self) -> Vec<String> {
+        self.runner_layer_clears.clone()
+    }
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
@@ -560,6 +574,11 @@ impl UpgradeDriver for FakeUpgradeHost {
         self.mutate_calls += 1;
         self.applied = true;
         self.set_current(Some(to.to_string()));
+        Ok(())
+    }
+    fn retire_runner_layer_claims(&mut self) -> Result<()> {
+        self.retired_claims
+            .extend(self.runner_layer_clears.iter().cloned());
         Ok(())
     }
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
@@ -625,6 +644,7 @@ fn plan_lines(
     secret: Option<&str>,
     schema_plan: Option<&str>,
     retained_values: bool,
+    runner_layer_clears: &[String],
     helm_timeout_seconds: u64,
 ) -> Vec<String> {
     let apply = helm_upgrade_argv(
@@ -632,6 +652,7 @@ fn plan_lines(
         &opts.to,
         from.is_none(),
         retained_values.then_some(RETAINED_VALUES_PLACEHOLDER),
+        runner_layer_clears,
         helm_timeout_seconds,
     );
     let from = from.unwrap_or("none");
@@ -647,11 +668,18 @@ fn plan_lines(
          performs schema migration during apply"
             .into(),
         apply.join(" "),
+    ];
+    lines.extend(
+        runner_layer_retirements(&opts.common.namespace, runner_layer_clears)
+            .iter()
+            .map(OpsCommand::display),
+    );
+    lines.extend([
         "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest"
             .into(),
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
-    ];
+    ]);
     // #2299: the configuration schema version the upgrade moves from and to.
     if let Some(schema_plan) = schema_plan {
         lines.push(schema_plan.to_string());
@@ -662,12 +690,83 @@ fn plan_lines(
             mask_secret(secret)
         ));
     }
+    if let Some(notice) = runner_layer_notice(runner_layer_clears) {
+        lines.push(notice);
+    }
     if let Some((source_url, cache_path)) = opts.chart.pending_release() {
         lines.push(format!(
             "phase validate pending: chart metadata, schema compatibility, and Helm timeout after release chart download from {source_url} to {cache_path}"
         ));
     }
     lines
+}
+
+/// The runner reference the upgraded release will render (#3218): the
+/// retained overlay's `agentSandbox.runner` fields over the target chart's
+/// defaults, with an empty tag meaning the target chart's appVersion, which
+/// the release train holds equal to `--to`. `None` when no image is known.
+pub(crate) fn target_runner_ref(
+    chart_default: Option<&serde_json::Value>,
+    overlay: &serde_json::Value,
+    to: &str,
+) -> Option<String> {
+    let mut runner = serde_json::Map::new();
+    for source in [chart_default, Some(overlay)].into_iter().flatten() {
+        if let Some(fields) = source
+            .pointer("/agentSandbox/runner")
+            .and_then(|r| r.as_object())
+        {
+            for (key, value) in fields {
+                if value.is_null() {
+                    runner.remove(key);
+                } else {
+                    runner.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    let values = serde_json::json!({"agentSandbox": {"runner": runner}});
+    crate::cluster_secrets::effective_runner_ref(&values, Some(to))
+}
+
+/// The pure part of [`Upgrade::compute_runner_layer_clears`] (#3218): once the
+/// current and target runner references are resolved (or known unknown), the
+/// layers an upgrade leaves stale is a function of just those two references
+/// and the layered agent list. Delegates to
+/// [`crate::cluster_secrets::layers_stopping_to_match`]; kept as a separate,
+/// directly testable seam here rather than inlined at the call site.
+/// One `kubectl delete sandboxclaim` per agent whose runner layer the upgrade
+/// clears (#3422), the same retirement `cluster deploy` runs (#3300).
+fn runner_layer_retirements(namespace: &str, agents: &[String]) -> Vec<OpsCommand> {
+    agents
+        .iter()
+        .map(|agent| crate::cluster_secrets::retire_claims_command(namespace, agent))
+        .collect()
+}
+
+fn layer_clears_from_refs(
+    layered: &[String],
+    current: Option<&str>,
+    target: Option<&str>,
+) -> Vec<String> {
+    crate::cluster_secrets::layers_stopping_to_match(layered, current, target)
+}
+
+/// The operator-facing line naming every agent whose layered runner stops
+/// matching (#3218, ADR 0173 decision 5). `None` when there are none.
+pub(crate) fn runner_layer_notice(agents: &[String]) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "runner layers: the platform runner changes, so the layered runner of agent(s) {} \
+         will stop matching. This upgrade clears agentSandbox.runnerImages for them: they run \
+         the platform runner WITHOUT their layer until their owners rebuild with `curie build \
+         --plugin-dir <dir> --registry <ref>` against the upgraded CLI and redeploy with \
+         `curie cluster deploy`. Their live sandboxes are retired after the helm upgrade, so \
+         existing threads start fresh on the platform runner at their next turn",
+        agents.join(", ")
+    ))
 }
 
 fn completed_output(
@@ -757,6 +856,19 @@ trait UpgradeDriver {
     fn retained_values(&self) -> bool {
         false
     }
+    /// The agents whose layered runner will stop matching the installation's
+    /// runner after this upgrade (#3218). Apply clears each one's
+    /// `agentSandbox.runnerImages.<agent>` in the same `helm upgrade`.
+    fn runner_layer_clears(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Retire the SandboxClaims of every agent in [`Self::runner_layer_clears`]
+    /// after Apply (#3422), so a live thread's next turn cold-starts on the
+    /// platform runner instead of keeping the old layer and old base.
+    fn retire_runner_layer_claims(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn helm_timeout_seconds(&self) -> u64 {
         HELM_TIMEOUT_DEFAULT_SECS
     }
@@ -826,12 +938,14 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         host.secret(),
         host.schema_plan().as_deref(),
         host.retained_values(),
+        &host.runner_layer_clears(),
         host.helm_timeout_seconds(),
     );
     if same_version {
         // #2861: the rerun runs no Helm upgrade, so the plan must not show one.
         plan.retain(|line| {
             !line.starts_with("helm upgrade ")
+                && !line.starts_with("kubectl ")
                 && !line.starts_with("phase drain_preflight:")
                 && !line.starts_with("phase checkpoint:")
                 && !line.starts_with("phase migrate:")
@@ -1026,6 +1140,9 @@ fn execute_phase<H: UpgradeDriver>(
         UpgradePhase::Migrate => Ok(PhaseOutcome::Continue),
         UpgradePhase::Apply => {
             host.apply_target(&opts.to)?;
+            // #3422: a cleared layer only reaches live threads once their
+            // claims are gone, as `cluster deploy` does (#3300).
+            host.retire_runner_layer_claims()?;
             Ok(PhaseOutcome::Continue)
         }
         UpgradePhase::Converge => {
@@ -1228,6 +1345,8 @@ struct LiveHost {
     schema_decision: Option<serde_json::Value>,
     /// Why the target schema was refused, if it was.
     schema_refusal: Option<String>,
+    /// Layered agents whose runner stops matching the target runner (#3218).
+    runner_layer_clears: Vec<String>,
     /// The target chart's rendered drain budget, computed with the exact
     /// retained overlay that Apply will hand to Helm.
     helm_timeout_seconds: u64,
@@ -1260,6 +1379,7 @@ fn helm_upgrade_argv(
     to: &str,
     install: bool,
     values: Option<&str>,
+    runner_layer_clears: &[String],
     timeout_seconds: u64,
 ) -> Vec<String> {
     let chart = chart_ref(opts);
@@ -1288,6 +1408,11 @@ fn helm_upgrade_argv(
     if let Some(values) = values {
         argv.push("-f".into());
         argv.push(values.to_string());
+    }
+    // After `-f`, so the clear wins over a retained layered digest (#3218).
+    for pair in crate::cluster_secrets::runner_image_clears(runner_layer_clears) {
+        argv.push("--set".into());
+        argv.push(pair);
     }
     argv
 }
@@ -1421,6 +1546,7 @@ impl LiveHost {
             schema_plan: None,
             schema_decision: None,
             schema_refusal: None,
+            runner_layer_clears: Vec::new(),
             helm_timeout_seconds: HELM_TIMEOUT_DEFAULT_SECS,
             timeout_refusal: None,
             holder: uuid::Uuid::new_v4().to_string(),
@@ -1803,6 +1929,65 @@ impl LiveHost {
                 }
             }
         }
+        self.compute_runner_layer_clears();
+    }
+
+    /// Which layered agents the upgrade leaves on a stale base (#3218).
+    ///
+    /// The deploy guard guarantees every bound layer was built on the current
+    /// installation's runner, so they all stop matching exactly when the
+    /// target runner's digest differs from the current one. A release with no
+    /// layered agent costs no extra read. Either runner being unknown counts
+    /// as a change: keeping an old layer under a new worker is the failure this
+    /// exists to prevent, and running the platform runner is always servable.
+    fn compute_runner_layer_clears(&mut self) {
+        let Some(overlay) = self
+            .overlay
+            .as_deref()
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok())
+        else {
+            return;
+        };
+        let layered = crate::cluster_secrets::layered_agents(&overlay);
+        if layered.is_empty() {
+            return;
+        }
+        let current = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(crate::cluster_secrets::installed_runner(&self.opts.common))
+        })
+        .ok()
+        .map(|(_, pinned)| pinned);
+        let chart_default = self.target_chart_runner_values();
+        let target = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to).and_then(
+            |reference| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
+                })
+                .ok()
+            },
+        );
+        self.runner_layer_clears =
+            layer_clears_from_refs(&layered, current.as_deref(), target.as_deref());
+    }
+
+    /// The target chart's own `agentSandbox.runner` defaults, when the chart
+    /// is available to read. A pending release asset is not.
+    fn target_chart_runner_values(&self) -> Option<serde_json::Value> {
+        if self.opts.chart.pending_release().is_some() {
+            return None;
+        }
+        let mut args = vec![plain("show"), plain("values"), plain(self.chart_ref())];
+        if self.opts.chart.uses_helm_version() {
+            args.push(plain("--version"));
+            args.push(plain(&self.opts.to));
+        }
+        let (ok, out, _) = self.run(&OpsCommand::new("helm", args)).ok()?;
+        if !ok {
+            return None;
+        }
+        serde_norway::from_str(&out).ok()
     }
 
     fn render_target_helm_timeout(&self) -> Result<u64> {
@@ -2186,6 +2371,7 @@ impl LiveHost {
             to,
             self.current.is_none(),
             values.as_deref(),
+            &self.runner_layer_clears,
             self.helm_timeout_seconds,
         )
         .into_iter()
@@ -2318,6 +2504,10 @@ impl UpgradeDriver for LiveHost {
     fn retained_values(&self) -> bool {
         self.overlay.is_some()
     }
+    fn runner_layer_clears(&self) -> Vec<String> {
+        self.runner_layer_clears.clone()
+    }
+
     fn helm_timeout_seconds(&self) -> u64 {
         self.helm_timeout_seconds
     }
@@ -2360,6 +2550,22 @@ impl UpgradeDriver for LiveHost {
                 bail!("helm upgrade to {to} reported success, but the release reports no version")
             }
         }
+    }
+    fn retire_runner_layer_claims(&mut self) -> Result<()> {
+        for cmd in runner_layer_retirements(&self.opts.common.namespace, &self.runner_layer_clears)
+        {
+            let (ok, _, err) = self.run(&cmd)?;
+            if !ok {
+                bail!(
+                    "helm upgrade cleared the runner layer, but retiring its sandboxes failed \
+                     ({}): {}; run `{}` so live threads leave the old layer",
+                    cmd.display(),
+                    err.trim(),
+                    cmd.display()
+                );
+            }
+        }
+        Ok(())
     }
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         self.live_convergence()
@@ -2426,6 +2632,9 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
                 .and_then(|record| record.known_good_version.clone())
                 .or_else(|| live.current.clone());
             live.compute_pre_mutation();
+            if let Some(notice) = runner_layer_notice(&live.runner_layer_clears) {
+                crate::ui::ui().warn(&notice);
+            }
             run_lifecycle_inner(opts, &mut live).await
         }
         Err(error) => Err(error),
@@ -2678,6 +2887,103 @@ mod drain_preflight_naming_tests {
             drain_preflight_observation(false, "connection refused"),
             None,
             "an unreadable API is still pending, not a terminal failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runner_layer_guard_tests {
+    use super::*;
+
+    fn runner_values(fields: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"agentSandbox": {"runner": fields}})
+    }
+
+    #[test]
+    fn target_runner_ref_layers_overlay_over_chart_default() {
+        let chart_default = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+        }));
+        // The overlay only sets a digest; the image field must still come
+        // from the chart default underneath it.
+        let overlay = runner_values(serde_json::json!({"digest": "sha256:aaaa"}));
+        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.0")
+            .expect("image known from chart default");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:aaaa");
+    }
+
+    #[test]
+    fn target_runner_ref_overlay_null_removes_chart_default_field() {
+        let chart_default = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+            "digest": "sha256:aaaa",
+        }));
+        // An explicit null in the overlay clears the chart default's digest,
+        // so the tag (falling back to `to`) takes over.
+        let overlay = runner_values(serde_json::json!({"digest": null}));
+        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.9")
+            .expect("tag known from chart default");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.0");
+    }
+
+    #[test]
+    fn target_runner_ref_empty_tag_falls_back_to_to() {
+        let overlay = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "",
+        }));
+        let reference = target_runner_ref(None, &overlay, "0.9.5").expect("to backs an empty tag");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.5");
+    }
+
+    #[test]
+    fn target_runner_ref_digest_wins_over_tag() {
+        let overlay = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+            "digest": "sha256:bbbb",
+        }));
+        let reference = target_runner_ref(None, &overlay, "0.9.0").expect("digest known");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:bbbb");
+    }
+
+    #[test]
+    fn target_runner_ref_none_when_no_image_known() {
+        let overlay = serde_json::json!({});
+        assert_eq!(target_runner_ref(None, &overlay, "0.9.0"), None);
+    }
+
+    #[test]
+    fn layer_clears_from_refs_same_digest_clears_nothing() {
+        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        assert!(layer_clears_from_refs(&layered, Some(reference), Some(reference)).is_empty());
+    }
+
+    #[test]
+    fn layer_clears_from_refs_differing_digest_clears_all_layered_agents() {
+        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let current = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        let target = "ghcr.io/curie-eng/curie-runner@sha256:bbbb";
+        assert_eq!(
+            layer_clears_from_refs(&layered, Some(current), Some(target)),
+            layered
+        );
+    }
+
+    #[test]
+    fn layer_clears_from_refs_unknown_reference_clears_all_layered_agents() {
+        let layered = vec!["agent-a".to_string()];
+        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        assert_eq!(
+            layer_clears_from_refs(&layered, None, Some(reference)),
+            layered
+        );
+        assert_eq!(
+            layer_clears_from_refs(&layered, Some(reference), None),
+            layered
         );
     }
 }

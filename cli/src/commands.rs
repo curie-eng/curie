@@ -1326,6 +1326,7 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
+        identity: None,
         api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
@@ -2405,6 +2406,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             if let Err(err) = build_connectors(ConnectorBuildOpts {
                 plugin_dir: plugin_dir.clone(),
                 registry: None,
+                runner_image: None,
                 force: false,
             })
             .await
@@ -3197,6 +3199,10 @@ pub enum ChannelChange {
     Remove {
         kind: String,
         address: String,
+        /// Which identity's binding to drop (ADR-0168 decision 3). Omitted
+        /// keeps today's selection: the default Slack identity, or the single
+        /// row on a non-Slack pair.
+        adapter: Option<String>,
     },
 }
 
@@ -3210,6 +3216,10 @@ impl ChannelChange {
     /// Args:
     ///   add: the `--add KIND=ADDRESS` value, if passed.
     ///   remove: the `--remove KIND=ADDRESS` value, if passed.
+    ///   adapter: `--adapter`, valid alongside either -- a Slack identity name
+    ///     on `--add` (with no `--endpoint`) or the identity to drop on
+    ///     `--remove` (ADR-0168 decision 3). Meaningless with neither, since
+    ///     there is no write and no removal selector for it to name.
     ///
     /// Returns:
     ///   The intent, or a usage error when the pair is malformed.
@@ -3222,6 +3232,24 @@ impl ChannelChange {
         match (add, remove) {
             (Some(spec), _) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
+                if kind == "slack" && endpoint.is_some() {
+                    return Err(crate::exit::usage(
+                        "--endpoint on a Slack binding: a Slack route names its identity with \
+                         --adapter and takes no endpoint (ADR-0168 decision 3)"
+                            .to_string(),
+                    ));
+                }
+                // A non-Slack reply route needs BOTH endpoint and adapter:
+                // clap only enforces `--endpoint` requires `--adapter`, not
+                // the other way, so `--adapter` alone on a non-Slack kind
+                // reaches here and must be refused before any I/O -- the API
+                // would refuse it too, but only after a round trip.
+                if kind != "slack" && adapter.is_some() && endpoint.is_none() {
+                    return Err(crate::exit::usage(format!(
+                        "--adapter on a non-Slack kind ({kind}) also needs --endpoint; \
+                         a Slack identity needs no endpoint, but a {kind} reply route does"
+                    )));
+                }
                 Ok(ChannelChange::Add {
                     kind,
                     address,
@@ -3231,9 +3259,20 @@ impl ChannelChange {
             }
             (None, Some(spec)) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
-                Ok(ChannelChange::Remove { kind, address })
+                Ok(ChannelChange::Remove {
+                    kind,
+                    address,
+                    adapter,
+                })
             }
-            (None, None) => Ok(ChannelChange::List),
+            (None, None) => {
+                if adapter.is_some() {
+                    return Err(crate::exit::usage(
+                        "--adapter needs --add or --remove".to_string(),
+                    ));
+                }
+                Ok(ChannelChange::List)
+            }
         }
     }
 }
@@ -3282,11 +3321,21 @@ struct ChannelBindingPresentation<'a> {
     kind: &'a str,
     address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
 }
 
 fn channel_binding_never_resolves(kind: &str, address: &str) -> bool {
     kind == "slack" && address.trim_start().starts_with('#')
+}
+
+/// The binding's identity, when it is worth printing: present and not the
+/// default Slack identity every pre-ADR install already reads as (ADR-0168
+/// decision 3). Naming that one on every row would make single-identity
+/// output noisier for no new information.
+fn channel_binding_named_identity(binding: &crate::api::ChannelBinding) -> Option<&str> {
+    binding.named_adapter()
 }
 
 fn channel_binding_presentation(
@@ -3295,6 +3344,7 @@ fn channel_binding_presentation(
     ChannelBindingPresentation {
         kind: &binding.kind,
         address: &binding.address,
+        adapter: channel_binding_named_identity(binding),
         warning: channel_binding_never_resolves(&binding.kind, &binding.address)
             .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
     }
@@ -3340,7 +3390,10 @@ impl crate::ui::CliOutput for ChannelsOutput {
                 } else {
                     channels
                         .iter()
-                        .map(|c| format!("{}:{}", c.kind, c.address))
+                        .map(|c| match channel_binding_named_identity(c) {
+                            Some(identity) => format!("{}:{} ({identity})", c.kind, c.address),
+                            None => format!("{}:{}", c.kind, c.address),
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
@@ -3383,30 +3436,50 @@ pub async fn channel_bindings(
 ) -> Result<ChannelsOutput> {
     let ui = crate::ui::ui();
     if opts.dry_run {
-        let plan =
-            match &change {
-                ChannelChange::List => format!(
-                    "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
-                    opts.api_url, opts.agent
-                ),
-                ChannelChange::Add {
-                    kind,
-                    address,
-                    endpoint,
-                    adapter,
-                } => format!(
-                "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
-                 (would resolve agent {:?} first; reply route: {})",
-                opts.api_url,
-                opts.agent,
-                if endpoint.is_some() && adapter.is_some() { "configured" } else { "implicit" }
+        let plan = match &change {
+            ChannelChange::List => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
+                opts.api_url, opts.agent
             ),
-                ChannelChange::Remove { kind, address } => format!(
-                    "DELETE {}/agents/<id>/channels?kind={kind}&address={address}  \
-                 (would resolve agent {:?} first)",
+            ChannelChange::Add {
+                kind,
+                address,
+                endpoint,
+                adapter,
+            } => {
+                // Three reply-route shapes (ADR-0168 decision 3): a
+                // non-Slack route (endpoint + adapter together), a named
+                // Slack identity (adapter alone), or the implicit default
+                // nothing names.
+                let reply_route = if kind != "slack" && endpoint.is_some() && adapter.is_some() {
+                    "configured".to_string()
+                } else if let Some(adapter) = adapter {
+                    format!("identity {adapter}")
+                } else {
+                    "implicit".to_string()
+                };
+                format!(
+                        "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
+                         (would resolve agent {:?} first; reply route: {reply_route})",
+                        opts.api_url, opts.agent,
+                    )
+            }
+            ChannelChange::Remove {
+                kind,
+                address,
+                adapter,
+            } => {
+                let selector = match adapter {
+                    Some(adapter) => format!("kind={kind}&address={address}&adapter={adapter}"),
+                    None => format!("kind={kind}&address={address}"),
+                };
+                format!(
+                    "DELETE {}/agents/<id>/channels?{selector}  \
+                         (would resolve agent {:?} first)",
                     opts.api_url, opts.agent
-                ),
-            };
+                )
+            }
+        };
         return Ok(ChannelsOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![plan],
         }));
@@ -3424,7 +3497,7 @@ pub async fn channel_bindings(
             });
         }
         ChannelChange::Add { kind, address, .. } => (kind, address, true),
-        ChannelChange::Remove { kind, address } => (kind, address, false),
+        ChannelChange::Remove { kind, address, .. } => (kind, address, false),
     };
     let cl = ui.checklist();
     let verb = if adding { "adding" } else { "removing" };
@@ -3446,7 +3519,14 @@ pub async fn channel_bindings(
         // The DELETE answers 204 with no body, so the remaining set comes from
         // a fresh read rather than from locally subtracting the pair -- the CLI
         // reports what the API holds, never what it assumes it holds.
-        match client.remove_agent_channel(&agent.id, kind, address).await {
+        let adapter = match &change {
+            ChannelChange::Remove { adapter, .. } => adapter.as_deref(),
+            _ => None,
+        };
+        match client
+            .remove_agent_channel(&agent.id, kind, address, adapter)
+            .await
+        {
             Ok(()) => client.get_agent(&agent.id).await,
             Err(err) => Err(err),
         }
@@ -3464,6 +3544,248 @@ pub async fn channel_bindings(
     Ok(ChannelsOutput::Done {
         agent: saved.name,
         channels: saved.channels,
+        changed: true,
+    })
+}
+
+/// What one `curie <tier> callers <agent> --surface KIND=ADDRESS` invocation
+/// does to that surface's caller list (ADR 0175): show it, replace it, or clear
+/// it so everyone may talk to the bot again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallersChange {
+    /// No `--set` and no `--clear`: read the list and write nothing.
+    Show,
+    /// `--set`: replace the list with exactly these ids.
+    Set(Vec<String>),
+    /// `--clear`: remove the list, so everyone may talk to the bot.
+    Clear,
+}
+
+impl CallersChange {
+    /// Resolve `--set` / `--clear` into one intent, before any I/O.
+    ///
+    /// clap already refuses the two together (`conflicts_with`). This mirrors
+    /// only the API's kind-free rules (convention: validate at the API, mirror
+    /// in the CLI): an entry must be non-empty with no whitespace. The id shape
+    /// per kind (a Slack U/W/B id, one bare email address) stays the API's
+    /// call, because only the API knows the selected binding's kind for sure.
+    ///
+    /// Args:
+    ///   set: the `--set` ids, comma separated or repeated; empty when absent.
+    ///   clear: whether `--clear` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error naming the malformed entry.
+    pub fn resolve(set: Vec<String>, clear: bool) -> Result<Self> {
+        if clear {
+            return Ok(CallersChange::Clear);
+        }
+        if set.is_empty() {
+            return Ok(CallersChange::Show);
+        }
+        for id in &set {
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return Err(crate::exit::usage(format!(
+                    "--set takes exact caller ids, comma separated, with no spaces \
+                     (e.g. --set U0123ABCD,U0456EFGH or --set person@example.com); got {id:?}"
+                )));
+            }
+        }
+        Ok(CallersChange::Set(set))
+    }
+}
+
+/// Output of `<tier> callers <agent>`: the dry-run plan, or the surface as the
+/// API holds it after this invocation. `allowed_callers` is `None` when the
+/// surface carries no list (everyone may talk to the bot), which is emitted as
+/// JSON `null` rather than omitted, so a consumer never mistakes "open" for "not
+/// reported". `changed` distinguishes a show from a write.
+#[derive(Debug)]
+pub enum CallersOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        surface: crate::api::ChannelBinding,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for CallersOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            CallersOutput::DryRun(plan) => plan.to_json(),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "kind": surface.kind,
+                "address": surface.address,
+                "adapter": surface.adapter,
+                "allowed_callers": surface.allowed_callers,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            CallersOutput::DryRun(plan) => plan.render(ui),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => {
+                let route = match channel_binding_named_identity(surface) {
+                    Some(identity) => format!("{}:{} ({identity})", surface.kind, surface.address),
+                    None => format!("{}:{}", surface.kind, surface.address),
+                };
+                let verb = if *changed { " now" } else { "" };
+                let who = match &surface.allowed_callers {
+                    None => "everyone (no caller list)".to_string(),
+                    Some(ids) => ids.join(", "),
+                };
+                ui.payload(&format!("callers for {agent} on {route}{verb}: {who}"));
+            }
+        }
+    }
+}
+
+/// The surface `(kind, address, adapter)` names among one agent's bindings.
+///
+/// Matched as the API's `_binding_for` matches: the pair always, and the
+/// identity only when `adapter` names one, compared on the identity the read
+/// side reports (a Slack binding with none reads back `default`).
+fn find_surface<'a>(
+    channels: &'a [crate::api::ChannelBinding],
+    kind: &str,
+    address: &str,
+    adapter: Option<&str>,
+) -> Option<&'a crate::api::ChannelBinding> {
+    channels.iter().find(|binding| {
+        binding.kind == kind
+            && binding.address == address
+            && adapter.is_none_or(|wanted| binding.adapter.as_deref() == Some(wanted))
+    })
+}
+
+/// `curie <tier> callers <agent> --surface KIND=ADDRESS [--set IDS | --clear]`.
+///
+/// With neither flag this SHOWS the surface's caller list, from the agent read
+/// alone. With `--set` it replaces the list, and with `--clear` it removes it,
+/// through `PUT /agents/{id}/channels/callers` (ADR 0175), and reports the
+/// surface as the API stored it. The write leaves the binding's generation
+/// alone, so an adapter's channel token keeps working.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   surface: the `--surface KIND=ADDRESS` value.
+///   adapter: `--adapter`, the identity that selects one of several routes on
+///     a pair (ADR-0168 decision 3); omitted selects as the API does.
+///   change: the intent already parsed from `--set` / `--clear`.
+///
+/// Returns:
+///   The surface and its caller list, or the dry-run plan.
+pub async fn channel_callers(
+    opts: AgentActionOpts,
+    surface: &str,
+    adapter: Option<String>,
+    change: CallersChange,
+) -> Result<CallersOutput> {
+    let (kind, address) = parse_channel_pair(surface)?;
+    if opts.dry_run {
+        let selector = match &adapter {
+            Some(adapter) => format!("kind={kind}&address={address}&adapter={adapter}"),
+            None => format!("kind={kind}&address={address}"),
+        };
+        let plan = match &change {
+            CallersChange::Show => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print the caller list \
+                 of {kind}:{address})",
+                opts.api_url, opts.agent
+            ),
+            CallersChange::Set(ids) => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {}  (would resolve agent {:?} first)",
+                opts.api_url,
+                serde_json::json!({ "allowed_callers": ids }),
+                opts.agent
+            ),
+            CallersChange::Clear => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {{\"allowed_callers\":null}}  \
+                 (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(CallersOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let not_bound = || {
+        crate::exit::CliError::usage(format!(
+            "agent {} has no {kind}:{address} surface{}",
+            agent.name,
+            adapter
+                .as_deref()
+                .map(|a| format!(" as {a:?}"))
+                .unwrap_or_default()
+        ))
+        .with_fix(format!(
+            "List the agent's surfaces with `curie <tier> surfaces {}` and pass one of them \
+             as --surface KIND=ADDRESS.",
+            agent.name
+        ))
+    };
+    let callers = match &change {
+        CallersChange::Show => {
+            let found = find_surface(&agent.channels, &kind, &address, adapter.as_deref())
+                .cloned()
+                .ok_or_else(not_bound)?;
+            return Ok(CallersOutput::Done {
+                agent: agent.name.clone(),
+                surface: found,
+                changed: false,
+            });
+        }
+        CallersChange::Set(ids) => Some(ids.as_slice()),
+        CallersChange::Clear => None,
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let verb = if callers.is_some() {
+        "setting"
+    } else {
+        "clearing"
+    };
+    let step = cl.step(&format!(
+        "{verb} the caller list of {kind}:{address} on {}",
+        agent.name
+    ));
+    let saved = match client
+        .set_channel_callers(&agent.id, &kind, &address, adapter.as_deref(), callers)
+        .await
+    {
+        Ok(saved) => {
+            step.done(if callers.is_some() { "set" } else { "cleared" });
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    let stored = find_surface(&saved.channels, &kind, &address, adapter.as_deref())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the API accepted the caller list but its answer carries no {kind}:{address} surface"
+            )
+        })?;
+    Ok(CallersOutput::Done {
+        agent: saved.name,
+        surface: stored,
         changed: true,
     })
 }
@@ -3513,6 +3835,7 @@ mod channels_tests {
             ChannelChange::Remove {
                 kind: "slack".into(),
                 address: "C0EXAMPLE2".into(),
+                adapter: None,
             }
         );
 
@@ -3521,6 +3844,119 @@ mod channels_tests {
             ChannelChange::resolve(None, None, None, None).unwrap(),
             ChannelChange::List
         );
+    }
+
+    #[test]
+    fn channel_change_resolve_carries_the_adapter_on_add_and_remove() {
+        // ADR-0168 decision 3: --adapter names the identity on --add (a Slack
+        // identity, with no --endpoint) and selects which identity's binding
+        // --remove drops.
+        let add = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            None,
+            Some("default".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            add,
+            ChannelChange::Add {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                endpoint: None,
+                adapter: Some("default".into()),
+            }
+        );
+
+        let remove = ChannelChange::resolve(
+            None,
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("default".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            remove,
+            ChannelChange::Remove {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: Some("default".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_bare_adapter_with_no_add_or_remove() {
+        // `--adapter` with neither `--add` nor `--remove` names nothing: there
+        // is no write for it to name an identity on, and no removal for it to
+        // select. It refuses before any I/O rather than reading as the
+        // read-only `List`, which would drop the flag without a word.
+        let err = ChannelChange::resolve(None, None, None, Some("default".into())).unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--adapter"), "{err}");
+        assert!(err.to_string().contains("--add"), "{err}");
+        assert!(err.to_string().contains("--remove"), "{err}");
+
+        // Plain `List` (no adapter at all) is unaffected.
+        assert_eq!(
+            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::List
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_non_slack_adapter_with_no_endpoint() {
+        // ADR-0168 decision 3: a non-Slack ingress still needs BOTH endpoint
+        // and adapter for its reply route. Clap's `--endpoint requires
+        // --adapter` only covers one direction; `--adapter` alone on a
+        // non-Slack kind must be refused here, before the round trip the API
+        // would otherwise spend refusing it.
+        let err = ChannelChange::resolve(
+            Some("discord=111111111111111111".into()),
+            None,
+            None,
+            Some("discord-main".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
+
+        // The same pairing on a Slack kind is exactly the bare-identity case
+        // and must still succeed.
+        assert!(ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            None,
+            Some("second-bot".into())
+        )
+        .is_ok());
+
+        // Both endpoint and adapter together on a non-Slack kind is that
+        // kind's reply route and must still succeed.
+        assert!(ChannelChange::resolve(
+            Some("discord=111111111111111111".into()),
+            None,
+            Some("https://discord-adapter.example.com/replies".into()),
+            Some("discord-main".into()),
+        )
+        .is_ok());
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_binding_takes_no_endpoint() {
+        let err = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("http://127.0.0.1:1".into()),
+            Some("proof-offline".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
     }
 
     #[test]
@@ -4656,6 +5092,10 @@ pub struct DeployOpts {
     pub agent: Option<String>,
     /// Resolve agent/env/channel from a `deploy.yaml` target (ADR-0089).
     pub target: Option<String>,
+    /// The identity the Slack binding this deploy writes speaks through
+    /// (ADR-0168 decision 8). `None` takes the target's, else `default`, which
+    /// is written exactly as before.
+    pub identity: Option<String>,
     pub plugin_dir: PathBuf,
     pub api_url: String,
     pub api_key: String,
@@ -4873,12 +5313,35 @@ pub struct PreparedDeploy {
     step: crate::ui::Step,
     tier: DeployTier,
     plugin_dir: PathBuf,
+    /// The resolved target's connector allowlist (ADR-0168 decision 8); `None`
+    /// when no target was resolved or it lists none, which runs every one.
+    connector_allowlist: Option<Vec<String>>,
 }
 
 fn is_documentation_placeholder_channel(channel: &str) -> bool {
     channel.strip_prefix("C0EXAMPLE").is_some_and(|suffix| {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+/// Refuse an `--identity` that is not a deploy.yaml identity name, before any
+/// request. @spec ADR-0168 d8. The rule is `plugin_format.deploy_targets`'
+/// target-name rule; which names exist is the platform's to say.
+pub fn validate_identity_name(name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    let alnum = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = matches!((bytes.first(), bytes.last()), (Some(first), Some(last)) if alnum(first) && alnum(last))
+        && bytes.len() <= 40
+        && bytes.iter().all(|byte| alnum(byte) || *byte == b'-');
+    if valid {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "--identity `{name}` is not an identity name: lowercase letters, digits and dashes, \
+         starting and ending with a letter or digit, at most 40 characters"
+    ))
+    .with_fix("pass the identity name the installation declares, for example --identity ops-bot")
+    .into())
 }
 
 fn reject_documentation_placeholder_target(
@@ -4940,6 +5403,11 @@ async fn prepare_deploy_with_commit_sha(
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
     // copy) is the path they typed.
     let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    if let Some(warning) =
+        crate::connector_build::undeclared_runner_dockerfile(&opts.plugin_dir, &connector_decl)
+    {
+        crate::ui::ui().warn(&warning);
+    }
     if opts.tier == DeployTier::Local
         && connector_decl
             .connectors
@@ -4950,7 +5418,7 @@ async fn prepare_deploy_with_commit_sha(
     }
     {
         let decl = &connector_decl;
-        if decl.connectors.values().any(|spec| spec.build.is_some()) {
+        if decl.runner.is_some() || decl.connectors.values().any(|spec| spec.build.is_some()) {
             let recomputed = recompute_source_digests(&plugin_dir, decl)?;
             let lock = crate::connector_build::load_lock(&plugin_dir)?;
             lock_preflight(
@@ -5023,6 +5491,9 @@ async fn prepare_deploy_with_commit_sha(
     let ui = crate::ui::ui();
     if let Some(channel) = opts.slack_channel.as_deref() {
         validate_channel_binding("slack", channel)?;
+    }
+    if let Some(identity) = opts.identity.as_deref() {
+        validate_identity_name(identity)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
     let packed_manifest = read_packed_bundle_manifest(&archive);
@@ -5152,8 +5623,22 @@ async fn prepare_deploy_with_commit_sha(
     // On Local the auto-bound connector Bearer names are resolved here too
     // (#2518): the record is local's only sandbox delivery path. Cluster keeps
     // `opts.secret` alone; its connector values are resolved cluster-scoped.
+    // @spec ADR-0168 d8. Only a resolved target narrows the CLI's own work; the
+    // API render and the runner narrow every deploy's pods regardless.
+    let connector_allowlist = resolved.as_ref().and_then(|r| r.connectors.clone());
+    // The explicit `--secret` names plus the Bearer names of the connectors
+    // this target keeps. Local resolves their values here; an excluded
+    // connector never reaches `bring_up_local`, so its secret is not this
+    // deploy's to require.
+    let target_secret_names = merge_secret_env(
+        opts.secret.clone(),
+        &crate::connector_build::hosted_env_secret_names(&crate::connector_build::restrict_to(
+            &connector_decl,
+            connector_allowlist.as_deref(),
+        )),
+    );
     let resolved_names: &[String] = match opts.tier {
-        DeployTier::Local => &effective_secret_names,
+        DeployTier::Local => &target_secret_names,
         DeployTier::Cluster => &opts.secret,
     };
     let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -5199,6 +5684,25 @@ async fn prepare_deploy_with_commit_sha(
         .slack_channel
         .as_deref()
         .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref()));
+    // @spec ADR-0168 d8. An explicit flag beats the target, as every field does.
+    let identity = opts
+        .identity
+        .as_deref()
+        .or_else(|| resolved.as_ref().map(|r| r.identity.as_str()))
+        .filter(|name| *name != crate::api::DEFAULT_SLACK_IDENTITY);
+    if let (Some(identity), None) = (identity, slack_channel) {
+        return Err(crate::exit::CliError::usage(format!(
+            "identity `{identity}` names the Slack binding this deploy writes, and this deploy \
+             writes none: no --slack-channel was passed and no target slack_channel applies"
+        ))
+        .with_fix("pass --slack-channel <id>, or add slack_channel to the deploy.yaml target")
+        .into());
+    }
+    let record_secret_names = if opts.tier == DeployTier::Cluster {
+        target_secret_names.clone()
+    } else {
+        opts.secret.clone()
+    };
     let record_secrets = match opts.tier {
         DeployTier::Local => secrets.clone(),
         // Names-only placeholders over the EFFECTIVE set, not just
@@ -5210,7 +5714,7 @@ async fn prepare_deploy_with_commit_sha(
         // resolved cluster-scoped later (#1913) and reaches the pod
         // through the per-agent Helm Secret, never through the record.
         DeployTier::Cluster => {
-            crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+            crate::cluster_secrets::agent_record_secret_names(&record_secret_names)
         }
     };
     let cl = ui.checklist();
@@ -5221,7 +5725,7 @@ async fn prepare_deploy_with_commit_sha(
     // error arm below.
     let prepared = async {
         let (agent, channel, repo_note) = client
-            .resolve_agent(&agent_name, slack_channel, opts.repo.as_deref())
+            .resolve_agent_as(&agent_name, slack_channel, opts.repo.as_deref(), identity)
             .await?;
         check_deploy_routes_bound(
             declared_routes.as_ref(),
@@ -5269,6 +5773,7 @@ async fn prepare_deploy_with_commit_sha(
         step,
         tier: opts.tier,
         plugin_dir,
+        connector_allowlist,
     })
 }
 
@@ -5354,6 +5859,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         step,
         tier,
         plugin_dir,
+        connector_allowlist,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -5450,6 +5956,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             crate::connector_build::ConnectorLockFileDecl {
                 version: crate::connector_build::LOCK_VERSION,
                 connectors: std::collections::BTreeMap::new(),
+                runner: None,
             }
         });
         let identity = crate::connector_build::ConnectorScope {
@@ -5458,7 +5965,11 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             namespace: "default".to_string(),
         };
         let project = crate::local::current_resources()?.project;
-        bring_up_local(&plugin_dir, &lock, &identity, &project).await?;
+        let decl = crate::connector_build::restrict_to(
+            &crate::connector_build::load(&plugin_dir)?,
+            connector_allowlist.as_deref(),
+        );
+        bring_up_local(&plugin_dir, &decl, &lock, &identity, &project).await?;
     }
 
     Ok(DeployOutput {
@@ -6665,7 +7176,8 @@ fn build_route_bindings(
                         ))
                         .with_fix(
                             "a route binding requires `resolution: {kind: \"slack\", \
-                             address: \"C...\"}` and accepts optional `notification` and \
+                             address: \"C...\"}` or `resolution: {mode: \
+                             \"requesting_surface\"}` and accepts optional `notification` and \
                              `approvers` blocks, and nothing else. The retired `channel` key \
                              is not accepted",
                         ),
@@ -6683,17 +7195,9 @@ fn build_route_bindings(
         let (name, channel) = split_route_arg("--route-resolution", raw)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| {
-                b.resolution = crate::api::ApprovalResolutionTargetWrite {
-                    kind: "slack".to_string(),
-                    address: channel.to_string(),
-                }
-            })
+            .and_modify(|b| b.resolution = crate::api::ApprovalResolutionWrite::slack(channel))
             .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
-                resolution: crate::api::ApprovalResolutionTargetWrite {
-                    kind: "slack".to_string(),
-                    address: channel.to_string(),
-                },
+                resolution: crate::api::ApprovalResolutionWrite::slack(channel),
                 notification: None,
                 approvers: None,
             });
@@ -6725,8 +7229,17 @@ fn build_route_bindings(
     for (name, binding) in &bindings {
         validate_resolution_target(name, &binding.resolution)?;
         if let Some(notification) = &binding.notification {
+            let crate::api::ApprovalResolutionWrite::Fixed(resolution) = &binding.resolution else {
+                // ADR-0177 decision 1, mirroring the API: the card already
+                // joins the conversation that asked, so there is nobody further
+                // to notify.
+                return Err(crate::exit::usage(format!(
+                    "route {name:?}: a requesting_surface resolution cannot carry a \
+                     notification; the card is already shown in the conversation that asked"
+                )));
+            };
             validate_notification_target(name, notification)?;
-            reject_identical_targets(name, &binding.resolution, notification)?;
+            reject_identical_targets(name, resolution, notification)?;
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
@@ -6736,12 +7249,26 @@ fn build_route_bindings(
     Ok(bindings)
 }
 
-/// The interactive extension point is explicit but remains Slack-only until a
-/// second channel can mint a scoped, verified resolver credential.
+/// A fixed target stays Slack-only; the only way off Slack is the
+/// `requesting_surface` mode, which shows the card in the conversation that
+/// asked (ADR-0177). Mirrors the API's `ApprovalRouteBinding.resolution`.
 fn validate_resolution_target(
     route: &str,
-    target: &crate::api::ApprovalResolutionTargetWrite,
+    resolution: &crate::api::ApprovalResolutionWrite,
 ) -> Result<()> {
+    let target = match resolution {
+        crate::api::ApprovalResolutionWrite::Fixed(target) => target,
+        crate::api::ApprovalResolutionWrite::RequestingSurface(target) => {
+            if target.mode != "requesting_surface" {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: resolution mode {:?} is unsupported; the only mode is \
+                     \"requesting_surface\"",
+                    target.mode
+                )));
+            }
+            return Ok(());
+        }
+    };
     if target.kind != "slack" {
         return Err(crate::exit::usage(format!(
             "route {route:?}: resolution kind {:?} is unsupported; only slack can carry \
@@ -6770,14 +7297,14 @@ fn validate_notification_target(
             "route {route:?}: notification address must be non-empty and contain no whitespace"
         )));
     }
-    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
-    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
-    if !complete_transport && !empty_transport {
-        return Err(crate::exit::usage(format!(
-            "route {route:?}: notification endpoint and adapter must be supplied together"
-        )));
-    }
-    if target.kind != "slack" && !complete_transport {
+    if target.kind == "slack" {
+        if target.endpoint.is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: a Slack notification names its identity in adapter and takes \
+                 no endpoint"
+            )));
+        }
+    } else if target.endpoint.is_none() || target.adapter.is_none() {
         return Err(crate::exit::CliError::usage(format!(
             "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
             target.kind
@@ -6924,6 +7451,9 @@ pub enum ApprovalsOutput {
     Pending {
         agent: String,
         records: Vec<crate::api::ApprovalRecord>,
+        /// Current route bindings fetched with the agent for this list read.
+        /// These are display context, never a snapshot of resolve authority.
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
         /// `true` when `records.len()` hit the server's page-size cap
         /// (`ApiClient::APPROVALS_LIST_LIMIT`), meaning more pending approvals
         /// may exist beyond what was fetched (#670). Always present (never
@@ -6983,6 +7513,22 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
     })
 }
 
+fn pending_approval_record_json(
+    record: &crate::api::ApprovalRecord,
+    routes: &BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
+) -> serde_json::Value {
+    let mut row = approval_record_json(record);
+    let current_route_approvers = record
+        .route
+        .as_ref()
+        .and_then(|route| routes.get(route))
+        .and_then(|binding| binding.approvers.as_ref());
+    // This reports the route configuration observed when listing. The API
+    // reads the binding again when an actor attempts to resolve the approval.
+    row["current_route_approvers"] = serde_json::json!(current_route_approvers);
+    row
+}
+
 impl crate::ui::CliOutput for ApprovalsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -6999,10 +7545,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => serde_json::json!({
                 "agent": agent,
-                "pending": records.iter().map(approval_record_json).collect::<Vec<_>>(),
+                "pending": records.iter().map(|record| pending_approval_record_json(record, routes)).collect::<Vec<_>>(),
                 "count": records.len(),
                 "truncated": truncated,
             }),
@@ -7064,6 +7611,7 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => {
                 if records.is_empty() {
@@ -7089,10 +7637,20 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                             .as_deref()
                             .filter(|c| !c.is_empty())
                             .unwrap_or("(requesting channel)");
+                        let approvers = match r.route.as_deref() {
+                            Some(route) => routes.get(route).map_or_else(
+                                || {
+                                    "route binding missing; restore it before resolution"
+                                        .to_string()
+                                },
+                                describe_approvers,
+                            ),
+                            None => format!("members of {card} (routeless default)"),
+                        };
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{} — {} [tool: {tool}, route: {route}, channel: {card}, by: {}]",
+                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
                                 r.summary, r.conversation_id, r.author
                             ),
                         );
@@ -7202,12 +7760,18 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        let resolution =
-                            format!("{}:{}", binding.resolution.kind, binding.resolution.address);
-                        ui.kv(
-                            name,
-                            &format!("resolution {resolution} (verified interactive card)"),
-                        );
+                        let resolution = match &binding.resolution {
+                            crate::api::ApprovalResolutionResponse::Fixed(target) => format!(
+                                "resolution {}:{} (verified interactive card)",
+                                target.kind, target.address
+                            ),
+                            crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
+                                "resolution requesting_surface (the card is shown in the \
+                                 conversation that asked)"
+                                    .to_string()
+                            }
+                        };
+                        ui.kv(name, &resolution);
                         let notification = binding
                             .notification
                             .as_ref()
@@ -7225,10 +7789,17 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 /// One line naming who may resolve a route's approvals, including the default.
 fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> String {
     match &binding.approvers {
-        None => format!(
-            "members of {}:{} (the default: no approvers block declared)",
-            binding.resolution.kind, binding.resolution.address
-        ),
+        None => match &binding.resolution {
+            crate::api::ApprovalResolutionResponse::Fixed(target) => format!(
+                "members of {}:{} (the default: no approvers block declared)",
+                target.kind, target.address
+            ),
+            crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
+                "the asking channel's members in Slack, or only the person who asked on any \
+                 other channel (the default: no approvers block declared)"
+                    .to_string()
+            }
+        },
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
             // `users` wins over `group`, so a binding carrying both must not read
@@ -7666,6 +8237,7 @@ pub async fn approvals(
         return Ok(ApprovalsOutput::Pending {
             agent: agent.name,
             records,
+            routes: agent.approval_routes.unwrap_or_default(),
             truncated,
         });
     }
@@ -8812,6 +9384,245 @@ pub fn skill_work_items_unavailable() -> anyhow::Error {
     crate::exit::unsupported("work-items", WORK_ITEMS_REASON, WORK_ITEMS_ALT)
 }
 
+/// Why `skill schedules` cannot be answered at this tier.
+pub const SCHEDULES_REASON: &str =
+    "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
+/// Where to read scheduled hooks instead.
+pub const SCHEDULES_ALT: &str =
+    "use `curie local schedules` or `curie cluster schedules` against a platform API";
+
+/// `skill schedules`: understood, but unavailable at this tier (ADR-0041, #2933).
+pub fn skill_schedules_unavailable() -> anyhow::Error {
+    crate::exit::unsupported("schedules", SCHEDULES_REASON, SCHEDULES_ALT)
+}
+
+/// Why `skill hook schedule` and `skill hook record` cannot be answered here.
+pub const HOOK_RECORD_REASON: &str =
+    "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
+/// Where a durable hook record lives instead.
+pub const HOOK_RECORD_ALT: &str =
+    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+
+/// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
+pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+}
+
+/// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
+pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
+    let path = plugin_dir.join(".claude-plugin/plugin.json");
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("parsing plugin.json")?;
+    let triggers = value
+        .get("triggers")
+        .and_then(|item| item.as_array())
+        .context("plugin.json has no triggers array")?;
+    for trigger in triggers {
+        if trigger.get("type").and_then(|item| item.as_str()) != Some("cron") {
+            continue;
+        }
+        if trigger.get("name").and_then(|item| item.as_str()) != Some(name) {
+            continue;
+        }
+        let prompt = trigger
+            .get("prompt")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .context("cron hook has no prompt")?;
+        return Ok(prompt.to_string());
+    }
+    bail!("no cron hook named {name}")
+}
+
+/// `skill hook fire`: run the named hook against the local runner. No run row.
+pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+    let prompt = hook_prompt(plugin_dir, name)?;
+    send(&prompt, "hook", SendType::Job.into(), url, false).await
+}
+
+/// Inputs for `<tier> hook fire`.
+pub struct HookFireOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub dry_run: bool,
+    pub wait_secs: u64,
+}
+
+/// Output of `<tier> hook fire`.
+pub enum HookFireOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Record(crate::api::HookFireRecord),
+}
+
+impl crate::ui::CliOutput for HookFireOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.to_json(),
+            HookFireOutput::Record(record) => serde_json::to_value(record).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.render(ui),
+            HookFireOutput::Record(record) => {
+                let outcome = record.outcome.as_deref().unwrap_or("-");
+                ui.payload(&format!(
+                    "{} {} {} {} {}",
+                    record.agent, record.name, record.slot_utc, outcome, record.id
+                ));
+            }
+        }
+    }
+}
+
+fn hook_fire_path(agent: &str, name: &str) -> String {
+    format!("/agents/{agent}/hooks/{name}/fire")
+}
+
+/// `<tier> hook fire`: run the hook now and print the record once it settles.
+pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
+    let path = hook_fire_path(&opts.agent, &opts.name);
+    if opts.dry_run {
+        return Ok(HookFireOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!("POST {}{path}", opts.api_url.trim_end_matches('/'))],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let mut record = client.fire_hook(&opts.agent, &opts.name).await?;
+    let deadline = Instant::now() + Duration::from_secs(opts.wait_secs);
+    while record.outcome.is_none() {
+        if Instant::now() >= deadline {
+            return Err(crate::exit::transient(format!(
+                "hook {} did not settle within {}s; run {}",
+                opts.name, opts.wait_secs, record.id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        record = client
+            .get_hook_run(&opts.agent, &opts.name, &record.id)
+            .await?;
+    }
+    Ok(HookFireOutput::Record(record))
+}
+
+/// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
+pub struct SchedulesOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: Option<String>,
+    pub pause: Option<String>,
+    pub resume: Option<String>,
+    pub dry_run: bool,
+}
+
+/// Output of `<tier> schedules`. `List` is the API body, not a reshaped copy.
+pub enum SchedulesOutput {
+    DryRun(crate::ui::DryRunPlan),
+    List(crate::api::ScheduleList),
+    Control(crate::api::ScheduleControl),
+}
+
+impl crate::ui::CliOutput for SchedulesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            SchedulesOutput::DryRun(plan) => plan.to_json(),
+            SchedulesOutput::List(list) => serde_json::to_value(list).unwrap_or_default(),
+            SchedulesOutput::Control(control) => serde_json::to_value(control).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            SchedulesOutput::DryRun(plan) => plan.render(ui),
+            SchedulesOutput::Control(control) => ui.payload(&format!(
+                "{} {} {}",
+                control.agent,
+                control.name,
+                if control.paused { "paused" } else { "resumed" }
+            )),
+            SchedulesOutput::List(list) => {
+                if list.schedules.is_empty() {
+                    ui.payload("no schedules");
+                    return;
+                }
+                for agent in &list.schedules {
+                    ui.payload(&agent.agent);
+                    if let Some(error) = &agent.bundle_error {
+                        ui.payload(error);
+                    }
+                    for hook in &agent.hooks {
+                        let fire = hook.last_fire_at.as_deref().unwrap_or("-");
+                        let outcome = hook.last_outcome.as_deref().unwrap_or("-");
+                        ui.payload(&format!(
+                            "{} {} {} {} {} {} {}",
+                            hook.name,
+                            hook.trigger,
+                            hook.schedule,
+                            hook.zone,
+                            fire,
+                            outcome,
+                            if hook.paused { "paused" } else { "active" }
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
+pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
+    let action = match (opts.pause.as_deref(), opts.resume.as_deref()) {
+        (Some(name), None) => Some((name, true)),
+        (None, Some(name)) => Some((name, false)),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(crate::exit::usage("choose pause or resume")),
+    };
+    if action.is_some() && opts.agent.is_none() {
+        return Err(crate::exit::usage("schedule control requires --agent"));
+    }
+    let agent_query = opts
+        .agent
+        .as_ref()
+        .map(|agent| format!("?agent={agent}"))
+        .unwrap_or_default();
+    if opts.dry_run {
+        let line = if let Some((name, pause)) = action {
+            format!(
+                "POST {}/schedules/{}/{}/{}",
+                opts.api_url.trim_end_matches('/'),
+                opts.agent.as_deref().unwrap_or_default(),
+                name,
+                if pause { "pause" } else { "resume" }
+            )
+        } else {
+            format!(
+                "GET {}/schedules{agent_query}",
+                opts.api_url.trim_end_matches('/')
+            )
+        };
+        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    if let Some((name, pause)) = action {
+        return Ok(SchedulesOutput::Control(
+            client
+                .control_schedule(opts.agent.as_deref().unwrap_or_default(), name, pause)
+                .await?,
+        ));
+    }
+    Ok(SchedulesOutput::List(
+        client.list_schedules(opts.agent.as_deref()).await?,
+    ))
+}
+
 /// A work item ID must be a UUID. Refused locally as a usage error (exit 2)
 /// before any request is made, through the centralized error path so `--json`
 /// still gets the structured `{error, ...}` payload.
@@ -9100,12 +9911,31 @@ mod tests {
         replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
         route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
         select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
-        validate_channel_binding, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
-        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        validate_channel_binding, validate_notification_target, ApprovalGateDecl, DeclaringVersion,
+        DeployTier, DownPlan, EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown,
+        SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_notification_names_an_identity_and_no_transport() {
+        let named = crate::api::NotificationTargetWrite {
+            kind: "slack".into(),
+            address: "C0EXAMPLE2".into(),
+            endpoint: None,
+            adapter: Some("ops-bot".into()),
+        };
+        validate_notification_target("finance", &named).expect("an identity alone is complete");
+        let transport = crate::api::NotificationTargetWrite {
+            endpoint: Some("https://adapter.example.com/replies".into()),
+            ..named
+        };
+        let err = validate_notification_target("finance", &transport).unwrap_err();
+        assert!(err.to_string().contains("no endpoint"), "{err}");
+    }
 
     #[test]
     fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {
@@ -10275,6 +11105,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -10397,6 +11228,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10440,6 +11272,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10486,6 +11319,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10524,6 +11358,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10559,6 +11394,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -10950,10 +11786,7 @@ mod tests {
                     (
                         r.to_string(),
                         crate::api::ApprovalRouteBindingWrite {
-                            resolution: crate::api::ApprovalResolutionTargetWrite {
-                                kind: "slack".to_string(),
-                                address: "C0EXAMPLE1".to_string(),
-                            },
+                            resolution: crate::api::ApprovalResolutionWrite::slack("C0EXAMPLE1"),
                             notification: None,
                             approvers: None,
                         },
@@ -12131,6 +12964,32 @@ mod tests {
             "a resolved credential must not outlive the boot that staged it"
         );
     }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn identity_names_follow_the_deploy_yaml_rule() {
+        let longest = "a".repeat(40);
+        for ok in ["default", "ops-bot", "a", "b2", longest.as_str()] {
+            assert!(
+                super::validate_identity_name(ok).is_ok(),
+                "{ok:?} is a valid name"
+            );
+        }
+        let too_long = "a".repeat(41);
+        for bad in [
+            "",
+            "Ops",
+            "ops_bot",
+            "-ops",
+            "ops-",
+            "ops bot",
+            too_long.as_str(),
+        ] {
+            let err = super::validate_identity_name(bad).unwrap_err();
+            assert_eq!(crate::exit::classify(&err).0.code(), 2, "{bad:?}");
+            assert!(err.to_string().contains("--identity"), "{err}");
+        }
+    }
 }
 
 /// Which nullable override a `<tier> overrides` invocation intends to change.
@@ -12262,6 +13121,56 @@ impl OverrideChange {
             (None, false) => Ok(OverrideChange::Unchanged),
         }
     }
+
+    /// Resolve `--runner-resources` / `--clear-runner-resources`.
+    ///
+    /// A set value is a JSON object, stored as text and emitted as that object.
+    /// Blank text and malformed JSON are usage errors and never reach the API.
+    pub fn resolve_runner_resources(value: Option<String>, clear: bool) -> Result<Self> {
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(
+                "--runner-resources and --clear-runner-resources contradict each other; \
+                 pass one. --clear-runner-resources restores the platform default"
+                    .to_string(),
+            )),
+            (Some(raw), false) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(crate::exit::usage(
+                        "--runner-resources must not be blank; use --clear-runner-resources \
+                         to restore the platform default"
+                            .to_string(),
+                    ));
+                }
+                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+                    crate::exit::usage(format!(
+                        "--runner-resources must be a JSON object of requests and limits, got {raw:?}"
+                    ))
+                })?;
+                if !parsed.is_object() {
+                    return Err(crate::exit::usage(format!(
+                        "--runner-resources must be a JSON object of requests and limits, got {raw:?}"
+                    )));
+                }
+                Ok(OverrideChange::Set(parsed.to_string()))
+            }
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
+
+    /// Same as [`patch_value`](Self::patch_value), but `Set` is a JSON value
+    /// rather than a JSON string. Used for `runner_resources`.
+    fn patch_value_as_json(&self) -> Option<serde_json::Value> {
+        match self {
+            OverrideChange::Unchanged => None,
+            OverrideChange::Clear => Some(serde_json::Value::Null),
+            OverrideChange::Set(v) => Some(
+                serde_json::from_str(v)
+                    .expect("runner resources Set must already be a JSON object"),
+            ),
+        }
+    }
 }
 
 /// The `PATCH /agents/{id}` body for a `<tier> overrides` write, or `None` when
@@ -12282,6 +13191,7 @@ pub fn overrides_patch_body(
     model: &OverrideChange,
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
+    runner_resources: &OverrideChange,
 ) -> Option<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(v) = model.patch_value() {
@@ -12292,6 +13202,9 @@ pub fn overrides_patch_body(
     }
     if let Some(v) = execution_deadline.patch_value_as_number() {
         body.insert("execution_deadline_seconds".to_string(), v);
+    }
+    if let Some(v) = runner_resources.patch_value_as_json() {
+        body.insert("runner_resources".to_string(), v);
     }
     if body.is_empty() {
         return None;
@@ -12324,17 +13237,22 @@ pub fn overrides_summary(
     model: &Option<String>,
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
+    runner_resources: &Option<serde_json::Value>,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
     let deadline = execution_deadline_seconds
         .map(|s| format!("{s} s"))
         .unwrap_or_else(|| "platform default".to_string());
+    let resources = runner_resources
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "platform default".to_string());
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}",
         show(model),
         show(thinking)
     )
@@ -12356,6 +13274,7 @@ pub enum OverridesOutput {
         model: Option<String>,
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
+        runner_resources: Option<serde_json::Value>,
         changed: bool,
     },
 }
@@ -12369,12 +13288,14 @@ impl crate::ui::CliOutput for OverridesOutput {
                 model,
                 thinking,
                 execution_deadline_seconds,
+                runner_resources,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
+                "runner_resources": runner_resources,
                 "changed": changed,
             }),
         }
@@ -12388,6 +13309,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 model,
                 thinking,
                 execution_deadline_seconds,
+                runner_resources,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -12395,6 +13317,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     model,
                     thinking,
                     execution_deadline_seconds,
+                    runner_resources,
                     *changed,
                 ));
             }
@@ -12428,9 +13351,10 @@ pub async fn overrides(
     model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
+    runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking, &execution_deadline);
+    let body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
@@ -12456,6 +13380,7 @@ pub async fn overrides(
             model: agent.model,
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
+            runner_resources: agent.runner_resources,
             changed: false,
         });
     };
@@ -12476,6 +13401,7 @@ pub async fn overrides(
         model: saved.model,
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
+        runner_resources: saved.runner_resources,
         changed: true,
     })
 }
@@ -12680,6 +13606,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .expect("a clear is a write");
         let obj = body.as_object().expect("an object");
@@ -12695,7 +13622,8 @@ mod overrides_tests {
         assert!(overrides_patch_body(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
-            &OverrideChange::Unchanged
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .is_none());
     }
@@ -12705,6 +13633,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
@@ -12742,10 +13671,11 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, false);
+        let line =
+            super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, &None, false);
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -12753,8 +13683,8 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), true),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s"
+            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), &None, true),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default"
         );
     }
 
@@ -12780,6 +13710,7 @@ mod overrides_tests {
     fn the_dry_run_body_carries_the_trimmed_value() {
         let body = overrides_patch_body(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
@@ -12816,6 +13747,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["execution_deadline_seconds"], 120);
@@ -12829,6 +13761,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
+            &OverrideChange::Unchanged,
         )
         .expect("a clear is a write");
         assert!(body["execution_deadline_seconds"].is_null());
@@ -12839,6 +13772,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
@@ -12945,6 +13879,9 @@ pub struct ConnectorBuildOpts {
     /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
     /// platform into the local Docker daemon.
     pub registry: Option<String>,
+    /// The platform runner a declared runner layer builds on; `None` is the
+    /// same default `curie skill up` runs.
+    pub runner_image: Option<String>,
     /// Replace a registry lock with a local-daemon one deliberately.
     pub force: bool,
 }
@@ -12968,10 +13905,15 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         .iter()
         .filter(|(_, spec)| spec.build.is_some())
         .collect();
-    if buildable.is_empty() {
+    if buildable.is_empty() && decl.runner.is_none() {
         return Ok(ConnectorBuildOutput {
             connectors: Vec::new(),
         });
+    }
+    // The runner Dockerfile's base rule is checked before anything is resolved
+    // or built: a literal base builds on something the lock would not record.
+    if let Some(runner) = &decl.runner {
+        cb::check_runner_source(&plugin_dir, runner)?;
     }
     if !on_path("docker") {
         bail!(
@@ -12994,6 +13936,26 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     let mut records = Vec::new();
     let mut entries = std::collections::BTreeMap::new();
     let mut failure = None;
+    let mut runner_entry = None;
+    // Resolve the platform runner to an immutable identity before any build, so
+    // a base that cannot be resolved fails before minutes of connector builds.
+    let runner_base = match &decl.runner {
+        Some(_) => {
+            let image = crate::artifacts::resolve_image(
+                opts.runner_image.as_deref(),
+                crate::artifacts::Channel::current(),
+                crate::artifacts::version(),
+            );
+            match resolve_runner_base(&image, opts.registry.is_some()).await {
+                Ok(base) => Some(base),
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&metadata_dir);
+                    return Err(err);
+                }
+            }
+        }
+        None => None,
+    };
     for (connector, spec) in buildable {
         let plan = match cb::build_plan(
             &plugin_dir,
@@ -13035,6 +13997,71 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             }
         }
     }
+    if let (None, Some(runner), Some((base_arg, base))) = (&failure, &decl.runner, &runner_base) {
+        let built = match cb::runner_build_plan(
+            &plugin_dir,
+            &bundle_name,
+            runner,
+            opts.registry.as_deref(),
+            base_arg,
+            &host,
+            &metadata_dir,
+        ) {
+            Ok(plan) => run_one_connector_build(&plan, ui)
+                .await
+                .map(|image| (plan, image)),
+            Err(err) => Err(err),
+        };
+        match built {
+            Ok((plan, image)) => {
+                // Local-daemon delivery builds on a mutable tag, not a digest
+                // pin: if `base_arg` was retagged between the pre-build
+                // inspect above and this build finishing, the layer was built
+                // on a base other than the one `base` records. Re-inspect and
+                // refuse to write a lock that would misrecord it.
+                let mut mismatch = None;
+                if plan.delivery == cb::Delivery::LocalDaemon {
+                    match crate::docker::docker(&cb::image_inspect_argv(base_arg).argv()).await {
+                        Ok(current_id) => {
+                            let current_id = current_id.trim();
+                            if current_id != base {
+                                mismatch = Some(anyhow::anyhow!(
+                                    "runner: the platform runner {base_arg} changed during the \
+                                     build (inspected {base}, now {current_id}); refusing to \
+                                     record a lock for a base the layer was not built on"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            mismatch = Some(err.context(format!(
+                                "runner: re-inspect the platform runner {base_arg} after build"
+                            )))
+                        }
+                    }
+                }
+                match mismatch {
+                    Some(err) => failure = Some(err),
+                    None => {
+                        runner_entry = Some(cb::RunnerLockEntryDecl {
+                            image: image.clone(),
+                            base: base.clone(),
+                            delivery: plan.delivery,
+                            platforms: plan.platforms.clone(),
+                            source_digest: plan.source_digest.clone(),
+                        });
+                        records.push(ConnectorBuildRecord {
+                            name: "runner".to_string(),
+                            image,
+                            delivery: plan.delivery,
+                            platforms: plan.platforms,
+                            source_digest: plan.source_digest,
+                        });
+                    }
+                }
+            }
+            Err(err) => failure = Some(err),
+        }
+    }
     let _ = std::fs::remove_dir_all(&metadata_dir);
     if let Some(err) = failure {
         // A build that could not run writes no lock: a partial lock would claim
@@ -13047,12 +14074,59 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         &cb::ConnectorLockFileDecl {
             version: cb::LOCK_VERSION,
             connectors: entries,
+            runner: runner_entry,
         },
         opts.force,
     )?;
     Ok(ConnectorBuildOutput {
         connectors: records,
     })
+}
+
+/// Pin the platform runner a runner layer builds on (ADR 0173).
+///
+/// Returns `(build_arg, recorded_base)`. Registry delivery records and builds
+/// on `<repo>@sha256:<manifest digest>`, asked of the registry unless the
+/// reference already carries one. Local-daemon delivery builds on the
+/// reference it inspected and records the daemon's image id for it.
+async fn resolve_runner_base(image: &str, registry: bool) -> Result<(String, String)> {
+    use crate::connector_build as cb;
+
+    if !registry {
+        let id = crate::docker::docker(&cb::image_inspect_argv(image).argv())
+            .await
+            .with_context(|| format!("runner: inspect the platform runner {image}"))?;
+        return Ok((image.to_string(), id.trim().to_string()));
+    }
+    if image.contains("@sha256:") {
+        return Ok((image.to_string(), image.to_string()));
+    }
+    let inspect = cb::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--format".into(),
+            "{{json .Manifest}}".into(),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
+    if !ok {
+        bail!(
+            "runner: could not resolve the platform runner {image} in its registry: {}",
+            stderr.trim()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("runner: parse the manifest of {image}"))?;
+    let digest = manifest
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("runner: the manifest of {image} names no digest"))?;
+    let base = cb::digest_pinned_ref(image, digest);
+    Ok((base.clone(), base))
 }
 
 /// Create a directory only its owner can enter, in one step.
@@ -13180,6 +14254,41 @@ pub fn lock_preflight(
                     "connectors.{connector} is locked to an image in your local Docker daemon, \
                      which no cluster node can pull. Push it to a registry first."
                 ))
+                .with_fix(rebuild_hint(plugin_dir, true)),
+            ));
+        }
+    }
+    if decl.runner.is_some() {
+        let Some(entry) = lock.and_then(|lock| lock.runner.as_ref()) else {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Build \
+                     it before deploying.",
+                    crate::connector_build::CONNECTORS_FILE,
+                    crate::connector_build::CONNECTOR_LOCK_FILE
+                ))
+                .with_fix(rebuild_hint(plugin_dir, false)),
+            ));
+        };
+        if let Some(fresh) = recomputed.get(crate::connector_build::RUNNER_DIGEST_KEY) {
+            if &entry.source_digest != fresh {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "the runner layer has changed since {} was written, so the locked \
+                         runner image no longer matches this source.",
+                        crate::connector_build::CONNECTOR_LOCK_FILE
+                    ))
+                    .with_fix(rebuild_hint(plugin_dir, false)),
+                ));
+            }
+        }
+        if tier == DeployTier::Cluster && entry.delivery == Delivery::LocalDaemon {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(
+                    "the runner layer is locked to an image in your local Docker daemon, which \
+                     no cluster node can pull. Push it to a registry first."
+                        .to_string(),
+                )
                 .with_fix(rebuild_hint(plugin_dir, true)),
             ));
         }
@@ -13379,6 +14488,14 @@ pub fn recompute_source_digests(
                 .with_context(|| format!("connectors.{connector}"))?,
         );
     }
+    if let Some(runner) = &decl.runner {
+        let context = crate::connector_build::resolve_context(plugin_dir, &runner.build.context)
+            .context("runner")?;
+        digests.insert(
+            crate::connector_build::RUNNER_DIGEST_KEY.to_string(),
+            crate::connector_build::source_digest_of(&context, &runner.build).context("runner")?,
+        );
+    }
     Ok(digests)
 }
 
@@ -13532,13 +14649,13 @@ async fn compose_connector_readiness_targets(
 /// dialed another.
 pub async fn bring_up_local(
     plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
     lock: &crate::connector_build::ConnectorLockFileDecl,
     identity: &crate::connector_build::ConnectorScope,
     project: &str,
 ) -> Result<()> {
     use crate::connector_build as cb;
 
-    let decl = cb::load(plugin_dir)?;
     let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
         .connectors
         .iter()
@@ -13557,7 +14674,7 @@ pub async fn bring_up_local(
     // connector comes up authenticating with nothing. It runs above the reap so
     // a bundle that cannot come up does not first tear down the connectors that
     // are serving.
-    refuse_missing_connector_secrets(&decl)?;
+    refuse_missing_connector_secrets(decl)?;
 
     // Reconcile before starting: compose only ADDS the services the overlay
     // names, so a connector this bundle version dropped or renamed would keep
@@ -13611,7 +14728,7 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
+    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
@@ -13772,6 +14889,7 @@ async fn start_skill_connectors(
     let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
+        runner: None,
     });
     let mut started = Vec::new();
     let mut readiness_targets = Vec::new();

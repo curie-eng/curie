@@ -1,7 +1,7 @@
 """The channel ingress API (ADR-0096 phase 2, #1459).
 
-Two endpoints, and every request/response model they use lives here rather than
-in ``schemas.py``:
+Three endpoints, and every request/response model they use lives here rather
+than in ``schemas.py``:
 
 - ``POST /channels/token`` (platform key, or an adapter principal serving the
   binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
@@ -9,7 +9,10 @@ in ``schemas.py``:
   exactly one binding instead of the platform key, and a remint revokes the
   token it replaces.
 - ``POST /channels/turns`` (platform key OR a ``chn`` token) enqueues a
-  ``QueuedTurn`` for the binding named in the BODY.
+  ``QueuedTurn`` for the binding named in the BODY, once the binding's caller
+  list (ADR 0175) admits the turn's author; a refused author is a 403.
+- ``POST /channels/admission`` (platform key only) answers the same admission
+  question for the Slack dispatcher, which has no database of its own.
 
 **Kind and address ride in the BODY, not the path.** An address is an opaque
 routing key matched on equality; it may contain ``@``, ``.``, ``/``, ``?`` or
@@ -58,9 +61,10 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
-from .. import adapter_principal, channel_token
+from .. import adapter_principal, channel_token, crud
+from ..admission import AdmissionDecision, admit
 from ..approval_auth import platform_key_or_adapter
-from ..auth import verify_platform_key
+from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
@@ -103,6 +107,28 @@ _AUTH_DETAIL = "missing or invalid credential"
 # cannot swallow each other's turns (E16).
 _CLAIM_PREFIX = "curie:channel"
 
+# The 403 a refused caller earns at the channel port (ADR 0175 decision 2). The
+# adapter has already proved it speaks for this binding, so saying "refused"
+# reveals nothing it did not know; the detail names no list entry and no
+# message content.
+#
+# The detail is a stable machine-readable CODE, not a sentence, because it is
+# the one thing an adapter settles on: a 403 carrying exactly this detail is
+# final, and any other 403 (a proxy, a firewall, a future authorization check
+# on this route) stays retryable, so infrastructure in front of the API can
+# never make an adapter drop mail for good. A body code rather than a header,
+# because the refusal and its marker then travel as one JSON document that no
+# intermediary adds on its own, and a proxy that rewrites the body fails safe
+# (the adapter retries). Frozen with the mail adapter's reader in
+# `tests/vectors/channel-port-refusal.json`.
+CALLER_NOT_ALLOWED_DETAIL = "caller_not_allowed"
+
+# The bound on how many ids one admission question may carry. The dispatcher
+# sends at most two (a sender plus the bot id that posted as it); the headroom
+# is for a future channel, and the cap keeps one request from making the check
+# walk an arbitrarily long list.
+_MAX_ADMISSION_CALLERS = 10
+
 
 # --- request/response models --------------------------------------------------
 
@@ -122,6 +148,16 @@ class ChannelTokenRequest(ChannelBinding):
     # them. Minting itself is a rotation write: it bumps generation so a remint
     # revokes the token it replaces (#2379).
     ttl_s: int = Field(default=3600, gt=0, le=604800)
+
+    # The route's IDENTITY half (ADR-0168 decision 3), optional so every
+    # caller that predates it -- CLI, UI, the e2e proof -- keeps minting
+    # exactly as before: an omission resolves through `route_identity` to the
+    # default Slack identity, or to a non-Slack pair's one route; a pair
+    # holding several answers 409 (`crud.AmbiguousRoute`). Not validated as a slug here the
+    # way `ChannelBindingWrite.adapter` is: this field NAMES a route to look
+    # up, it never gets written to one, so there is no config-map-key shape
+    # for a caller-supplied value to violate.
+    adapter: str | None = None
 
 
 class ChannelTokenOut(BaseModel):
@@ -149,6 +185,40 @@ class TurnIn(ChannelBinding):
     author: str
     text: str
     reply_ref: str
+
+
+class AdmissionIn(ChannelBinding):
+    """One admission question from the Slack dispatcher (ADR 0175 decision 2).
+
+    Subclasses `ChannelBinding` so the route pair is judged by the same
+    `_validate_channel_binding` every other binding surface runs. `adapter`
+    names the identity half of the route (ADR-0168 decision 3), resolved
+    exactly as `POST /channels/token` resolves it: omitted means the default
+    Slack identity. `callers` is every id the channel reports for the caller;
+    any one of them on the list admits.
+    """
+
+    adapter: str | None = None
+    callers: list[Annotated[str, Field(max_length=256)]] = Field(
+        default_factory=list, max_length=_MAX_ADMISSION_CALLERS
+    )
+
+
+class AdmissionOut(BaseModel):
+    """The admission answer.
+
+    `restricted` says whether the route carries a list at all, so the
+    dispatcher can cache an unrestricted route as open to every caller and ask
+    again only when that entry expires.
+    """
+
+    allowed: bool
+    restricted: bool
+    # Whether ANY binding on this install carries a list. The dispatcher
+    # remembers it for the same stale window as every other answer, so a cold
+    # miss during an outage on an install with no list anywhere is admitted:
+    # a list that does not exist cannot refuse anyone.
+    install_restricted: bool
 
 
 class TurnAccepted(BaseModel):
@@ -190,30 +260,37 @@ def _parse_turn(raw: bytes) -> TurnIn:
 
 
 async def _resolve_binding(
-    session: Any, kind: str, address: str
+    session: Any, kind: str, adapter: str | None, address: str
 ) -> AgentChannel | None:
-    """The binding row for one `(kind, address)` pair, or None.
+    """The binding row for one `(kind, adapter, address)` route, or None.
 
-    The PAIR, never the address alone: since migration 0023 one address can be
-    bound under two kinds, and resolving on the address would let one kind's
-    adapter reach the other kind's agent.
+    The kind too, never the address alone: one address can be bound under two
+    kinds, and resolving on the address would let one kind's adapter reach the
+    other kind's agent. Delegates to `crud.binding_for_route` (ADR-0168
+    decision 3), which narrows to `adapter`'s RESOLVED identity -- an omitted
+    Slack adapter still means the default app -- and answers a pair holding
+    several routes under an omitted non-Slack adapter with a 409 here.
     """
 
-    row: AgentChannel | None = await session.scalar(
-        select(AgentChannel).where(
-            AgentChannel.kind == kind, AgentChannel.address == address
-        )
-    )
-    return row
+    try:
+        return await crud.binding_for_route(session, kind, adapter, address)
+    except crud.AmbiguousRoute as exc:
+        raise _ambiguous(exc) from exc
+
+
+def _ambiguous(exc: crud.AmbiguousRoute) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
 
 
 def _route_is_configured(row: AgentChannel) -> bool:
     """Whether this binding can actually deliver a reply.
 
-    `slack` needs no per-binding route (D4.4). Every other kind needs both
-    halves, and the DB CHECK guarantees they are both-or-neither, so testing one
-    of them would be enough -- both are tested because the guarantee is the
-    database's, not this function's.
+    `slack` needs no per-binding route (D4.4): the worker's configured Slack
+    origin is what actually delivers, and a Slack row carries its identity and
+    no endpoint, so it is answered by kind and never reaches the test below.
+    Every other kind needs both halves, and the DB CHECK guarantees they are
+    both-or-neither, so testing one of them would be enough -- both are tested
+    because the guarantee is the database's, not this function's.
     """
 
     if row.kind == _IMPLICIT_ROUTE_KIND:
@@ -278,11 +355,19 @@ async def mint_channel_token(
         # never take `FOR UPDATE` on a row it does not serve, and unknown vs
         # unserved must read identically (same detail, same lack of a lock) so
         # an adapter cannot probe which pairs are bound outside its own set.
-        unlocked_row = await session.scalar(
-            select(AgentChannel).where(
-                AgentChannel.kind == data.kind, AgentChannel.address == data.address
+        # Selected by the TRIPLE (`data.adapter`, ADR-0168 decision 3), not
+        # only the pair: an omitted `data.adapter` still resolves to the
+        # default Slack identity through `route_identity`, so an unchanged
+        # caller keeps naming the same row it always did. An ambiguous pair
+        # names no single binding, and answering its 409 here would tell a
+        # principal serving neither route how many the pair holds, so it
+        # reads as unserved too.
+        try:
+            unlocked_row = await crud.binding_for_route(
+                session, data.kind, data.adapter, data.address
             )
-        )
+        except crud.AmbiguousRoute:
+            unlocked_row = None
         if unlocked_row is None or unlocked_row.id not in adapter.bindings:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
@@ -293,12 +378,12 @@ async def mint_channel_token(
     # on two tokens, and neither rotation would revoke the other. `populate_existing`
     # is the same load-bearing choice as `crud.lock_agent_bindings`. Only reached
     # for a row the adapter (or the platform key) actually serves.
-    row: AgentChannel | None = await session.scalar(
-        select(AgentChannel)
-        .where(AgentChannel.kind == data.kind, AgentChannel.address == data.address)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
+    try:
+        row = await crud.binding_for_route(
+            session, data.kind, data.adapter, data.address, for_update=True
+        )
+    except crud.AmbiguousRoute as exc:
+        raise _ambiguous(exc) from exc
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -394,6 +479,60 @@ def _authorize(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
+async def _claimed_row(
+    session: Any, claims: channel_token.ChannelClaims, kind: str, address: str
+) -> AgentChannel | None:
+    """The row a verified `chn` claim names, if it is still the body's pair.
+
+    None otherwise, which `_authorize` refuses with the identical 401: a caller
+    must not learn whether its token's row moved, was deleted, or never
+    matched the pair it posted to.
+    """
+
+    try:
+        channel_id = uuid.UUID(claims.channel_id)
+    except ValueError:
+        return None
+    row: AgentChannel | None = await session.get(AgentChannel, channel_id)
+    if row is None or row.kind != kind or row.address != address:
+        return None
+    return row
+
+
+def _record_refusal(
+    row: AgentChannel,
+    decision: AdmissionDecision,
+    *,
+    surface: str,
+    level: int = logging.INFO,
+) -> None:
+    """Log one refused caller: the binding and the reason, never the message.
+
+    The log line is what an operator greps when a listed person reports the bot
+    is silent, so it names the binding row and the stable reason token. It never
+    names the caller id or any of the message: a refused caller is by definition
+    someone the operator did not expect, and their text is not ours to keep.
+
+    Args:
+        row: the binding the caller was refused on.
+        decision: the refusal `admit` returned.
+        surface: which endpoint refused, for the log line.
+        level: the log level. The channel port logs at INFO, one line per
+            refused delivery. The admission question logs at DEBUG: in a busy
+            shared channel most callers may be unlisted, and the dispatcher's
+            `curie.turn.refused` counter already counts every refusal.
+    """
+
+    logger.log(
+        level,
+        "caller refused surface=%s binding=%s kind=%s reason=%s",
+        surface,
+        row.id,
+        row.kind,
+        decision.reason.value,
+    )
+
+
 def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     """Build the `QueuedTurn` from the BINDING ROW plus the delivery's content.
 
@@ -464,7 +603,10 @@ async def ingest_turn(
     4. the binding row, loaded only for a caller that already authenticated;
     5. the claims bound to that row, and only then does an unknown pair earn a
        404 -- a caller with no credential learns nothing about which bindings
-       exist.
+       exist;
+    6. the binding's caller list (ADR 0175), before any claim, quota slot or
+       queue write, so a refused author costs nothing but this request and
+       answers 403.
     """
 
     settings = get_settings()
@@ -475,7 +617,17 @@ async def ingest_turn(
     )
     body = _parse_turn(raw)
     claims = _verify_credential(x_api_key)
-    row = await _resolve_binding(session, body.kind, body.address)
+    # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
+    # docstring): the credential -- not the body -- names the binding. A `chn`
+    # token's claim names its ROW, so that row is loaded by id and must be the
+    # pair the body claims; the pair alone can hold several routes (ADR-0168
+    # decision 3). A platform-key turn names no row, so `None` resolves to the
+    # default Slack identity or the pair's single non-Slack route, and an
+    # ambiguous pair is a 409.
+    if claims is not None:
+        row = await _claimed_row(session, claims, body.kind, body.address)
+    else:
+        row = await _resolve_binding(session, body.kind, None, body.address)
     _authorize(claims, row)
     if row is None:
         raise HTTPException(
@@ -487,6 +639,20 @@ async def ingest_turn(
         # The mint's refusal, on the ingress. Enqueuing here would hand the
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
+
+    # ADR 0175: the one admission check, after the credential proved it speaks
+    # for this binding and before anything is claimed or queued. The adapter is
+    # trusted to send the sender it authenticated, as it always was; `author`
+    # is that sender. The platform key is not exempt: the list is about who
+    # wrote the message, not who carried it.
+    decision = admit(row, [body.author])
+    if not decision.allowed:
+        _record_refusal(row, decision, surface="channel-port")
+        record_metric(
+            "curie.turn.refused",
+            attributes={"service.name": "curie-api", "reason": decision.reason.value},
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
     # One hash of the `delivery_id`, shared by the two names derived from it.
     digest = sha16(body.delivery_id)
@@ -633,3 +799,44 @@ async def ingest_turn(
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
+
+
+# --- POST /channels/admission ---------------------------------------------------
+
+
+@router.post(
+    "/admission",
+    response_model=AdmissionOut,
+    dependencies=[Depends(require_api_key)],
+)
+async def check_admission(data: AdmissionIn, session: SessionDep) -> AdmissionOut:
+    """Answer whether a caller may start a turn on a route (platform key only).
+
+    The Slack dispatcher's half of ADR 0175 decision 2: it has no database, so
+    it asks here, after its own filters and before it claims the event or posts
+    a placeholder. The answer comes from the same `admission.admit` the channel
+    port runs, so the two channels cannot disagree about one list.
+
+    Platform key only, never a `chn` token or an adapter principal: an adapter
+    already gets its answer as the 403 on `POST /channels/turns`, and this
+    route would otherwise let a token scoped to one binding ask about every
+    other binding's list.
+
+    An unbound route answers allowed and unrestricted: the list lives on the
+    binding, and what happens to a mention of an unbound channel is routing's
+    call, unchanged by this ADR.
+    """
+
+    row = await crud.binding_for_route(session, data.kind, data.adapter, data.address)
+    decision = admit(row, data.callers)
+    if not decision.allowed and row is not None:
+        # The dispatcher counts its own refusal (`curie.turn.refused` with
+        # service curie-dispatcher); counting it here too would double every
+        # Slack refusal, so this side only logs the binding and reason.
+        _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+    install_restricted = decision.restricted or await crud.any_binding_restricted(session)
+    return AdmissionOut(
+        allowed=decision.allowed,
+        restricted=decision.restricted,
+        install_restricted=install_restricted,
+    )

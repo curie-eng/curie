@@ -20,6 +20,8 @@ from aci_protocol import (
     WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -180,6 +182,10 @@ class Settings(BaseSettings):
         le=10800,
         validation_alias="GITHUB_FACTORY_CI_WAIT_S",
     )
+    # Public model price list the factory's per-run cost estimate reads
+    # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
+    # the estimate unset and the token counts are still stored. Empty disables.
+    factory_price_source_url: str = "https://openrouter.ai/api/v1/models"
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -450,6 +456,14 @@ class Settings(BaseSettings):
     # boot gate deliberately -- Slack is optional, and that resolve-time denial
     # is the enforcement.
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1), which
+    # `identities.declared_identities` checks a binding against; see
+    # `aci_protocol.slack_identities.declared_slack_identity_names` for what
+    # an empty declaration means. Reads only the chart's reserved name, like
+    # the worker and dispatcher: no bare `slack_identities` kwarg alias, or a
+    # same-named stray env var would let this service alone admit names the
+    # other two never see.
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # How long a fetched user-group member set is reused (#420).
     # usergroups.users.list is a Slack Tier 2 method (~20 req/min), so a fetch
     # per click would let a busy approval channel hit the rate limit; 60s of
@@ -562,6 +576,84 @@ class Settings(BaseSettings):
     hook_backlog_window_s: int = 60
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = 60
+    # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
+    # the quota object renders, and leaves all four unset otherwise. A partial
+    # set is a broken install: the agent write refuses rather than skipping the
+    # check. Unset means this API has no quota to compare against.
+    sandbox_quota_requests_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_CPU", "sandbox_quota_requests_cpu"
+        ),
+    )
+    sandbox_quota_requests_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY", "sandbox_quota_requests_memory"
+        ),
+    )
+    sandbox_quota_limits_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CURIE_SANDBOX_QUOTA_LIMITS_CPU", "sandbox_quota_limits_cpu"),
+    )
+    sandbox_quota_limits_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY", "sandbox_quota_limits_memory"
+        ),
+    )
+
+    # The caller proxy every hosted connector render carries (ADR-0168
+    # decision 7): the public key the worker's signing key pairs with, the one
+    # it replaced during a rotation, and the image the proxy runs from, with
+    # the worker's pull policy and comma-separated pull secret names. An empty
+    # current key renders no proxy.
+    connector_caller_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PUBLIC_KEY", "connector_caller_public_key"
+        ),
+    )
+    connector_caller_previous_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY", "connector_caller_previous_public_key"
+        ),
+    )
+    connector_proxy_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CONNECTOR_PROXY_IMAGE", "connector_proxy_image"),
+    )
+    connector_proxy_image_pull_policy: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY", "connector_proxy_image_pull_policy"
+        ),
+    )
+    connector_proxy_image_pull_secrets: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
+        ),
+    )
+
+    def connector_proxy(self) -> ConnectorProxy | None:
+        """The proxy each hosted connector renders with, or None for none."""
+
+        current = self.connector_caller_public_key.strip()
+        if not current:
+            return None
+        previous = self.connector_caller_previous_public_key.strip()
+        return ConnectorProxy(
+            image=self.connector_proxy_image.strip(),
+            public_keys=(current, previous) if previous else (current,),
+            pull_policy=self.connector_proxy_image_pull_policy.strip() or None,
+            pull_secrets=tuple(
+                name.strip()
+                for name in self.connector_proxy_image_pull_secrets.split(",")
+                if name.strip()
+            ),
+        )
 
     def valkey_dsn(self) -> str:
         if self.valkey_url:
@@ -582,6 +674,24 @@ class Settings(BaseSettings):
         if not self.installation_id:
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
+
+    @model_validator(mode="after")
+    def _validate_connector_proxy(self) -> "Settings":
+        # At boot, not at the first render: a key the proxy cannot use would
+        # otherwise surface as a 500 on every connector deploy.
+        if (
+            self.connector_caller_previous_public_key.strip()
+            and not self.connector_caller_public_key.strip()
+        ):
+            raise ValueError(
+                "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY is set without "
+                "CURIE_CONNECTOR_CALLER_PUBLIC_KEY"
+            )
+        try:
+            self.connector_proxy()
+        except ValueError as exc:
+            raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":

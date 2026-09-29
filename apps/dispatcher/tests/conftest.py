@@ -1,13 +1,26 @@
 """Shared fixtures. Stream/dedupe tests run against the REAL Valkey from the
 compose stack (per repo test discipline: never mock Valkey). The Slack Web API
 and socket transport are faked; `_black_hole_api` is not a fake but a real
-loopback socket standing in for an endpoint that never answers."""
+loopback socket standing in for an endpoint that never answers.
 
+The platform API is another service to the dispatcher, reached over HTTP, so
+`admission_api` stands it in with a real loopback HTTP server for
+`POST /channels/admission` (ADR 0175), the same boundary the preflight suite
+uses. Its caller lists are plain sets: the dispatcher decides nothing about who
+is listed, it only relays the API's answer, so the fake need only answer
+consistently."""
+
+import json
 import logging
 import socket
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
@@ -39,6 +52,25 @@ def _authorize(**_kwargs: Any) -> AuthorizeResult:
         bot_id="B1",
         bot_user_id="U0BOT",
     )
+
+
+def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient dispatcher config and install only public test values."""
+    for name, field in DispatcherConfig.model_fields.items():
+        alias = field.validation_alias
+        monkeypatch.delenv(
+            alias if isinstance(alias, str) else name.upper(), raising=False
+        )
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
+
+
+class _TestTelemetry:
+    """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
+
+    def shutdown(self) -> None:
+        pass
 
 
 class FakeSocketClient:
@@ -103,6 +135,104 @@ def _black_hole_api() -> Iterator[str]:
         sock.close()
 
 
+@dataclass
+class FakeAdmissionApi:
+    """A loopback stand-in for the platform API's ``POST /channels/admission``.
+
+    Attributes:
+        url: the base URL to hand the dispatcher as ``api_base_url``.
+        lists: ``(address, adapter) -> caller ids`` for every route that
+            carries a list; a route absent here is open to everyone.
+        down: when True every request answers 503, the API-outage case.
+        predates: when True every request answers FastAPI's own route-miss
+            404, the platform API from before ADR 0175 had the route.
+        delay_s: how long each answer takes, for the single-flight tests.
+        requests: every request body received, in order.
+        headers: the ``X-API-Key`` each request carried, in order.
+    """
+
+    url: str
+    lists: dict[tuple[str, str | None], set[str]] = dataclass_field(default_factory=dict)
+    down: bool = False
+    predates: bool = False
+    delay_s: float = 0.0
+    requests: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    headers: list[str | None] = dataclass_field(default_factory=list)
+
+
+@contextmanager
+def fake_admission_api() -> Iterator[FakeAdmissionApi]:
+    """Serve a `FakeAdmissionApi` on a free loopback port until the block exits."""
+
+    state = FakeAdmissionApi(url="")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            state.requests.append(body)
+            state.headers.append(self.headers.get("X-API-Key"))
+            if self.path != "/channels/admission":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if state.delay_s:
+                time.sleep(state.delay_s)
+            if state.down:
+                self.send_response(503)
+                self.end_headers()
+                return
+            if state.predates:
+                # Exactly what FastAPI answers for a path it has no route for.
+                payload = b'{"detail":"Not Found"}'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            listed = state.lists.get((body.get("address"), body.get("adapter")))
+            install_restricted = bool(state.lists)
+            if listed is None:
+                answer = {
+                    "allowed": True,
+                    "restricted": False,
+                    "install_restricted": install_restricted,
+                }
+            else:
+                allowed = any(caller in listed for caller in body.get("callers", []))
+                answer = {"allowed": allowed, "restricted": True, "install_restricted": True}
+            payload = json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            """Keep the test server out of the process's terminal log."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    state.url = f"http://{host!s}:{port}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+@pytest.fixture
+def admission_api() -> Iterator[FakeAdmissionApi]:
+    """A fresh fake platform API per test; every route open unless listed."""
+
+    with fake_admission_api() as api:
+        yield api
+
+
 # Compose defaults and connection params come from the shared curie_test_support.valkey helper.
 
 
@@ -114,9 +244,12 @@ def redis_client() -> Iterator[redis.Redis]:
 
 
 @pytest.fixture
-def config(redis_client: redis.Redis) -> Iterator[DispatcherConfig]:
+def config(
+    redis_client: redis.Redis, admission_api: FakeAdmissionApi
+) -> Iterator[DispatcherConfig]:
     """A config with a per-test-unique stream and dedupe prefix so tests do not
-    collide, cleaned up afterwards."""
+    collide, cleaned up afterwards. Its platform API is the per-test
+    `admission_api`, so the caller-list check (ADR 0175) has something to ask."""
     token = uuid.uuid4().hex
     cfg = DispatcherConfig(
         slack_app_token="xapp-test",
@@ -132,9 +265,12 @@ def config(redis_client: redis.Redis) -> Iterator[DispatcherConfig]:
         # Socket Mode interactions become a chat principal only when the
         # dispatcher can sign an attestation with this dedicated credential.
         approval_chat_attester_secret="dispatcher-attester-test-secret",
+        api_base_url=admission_api.url,
+        admission_cache_prefix=f"test:curie:admission:{token}:",
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))
+    keys.extend(redis_client.scan_iter(f"test:curie:admission:{token}:*"))
     keys.append(cfg.stream)
     if keys:
         redis_client.delete(*keys)

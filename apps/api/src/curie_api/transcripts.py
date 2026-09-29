@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .models import ThreadTranscript, WorkItem
+from .threadkeys import pre_identity_thread_key_for
 
 TRANSCRIPT_NAMESPACE = "transcript"
 
@@ -88,6 +89,38 @@ def enforce_thread_cap(key: str, value: Any, *, reserve_bytes: int | None = None
         )
 
 
+async def _delete_pre_identity(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, keys: list[str]
+) -> None:
+    """Delete the pre-identity row a route in ``keys`` may still have.
+
+    Called wherever a thread's history ends (``remove``,
+    ``expire_for_work_item``, and a key ``_sweep_expired`` just swept): the
+    rule that adoption never touches the old row belongs to adoption, not to
+    the end of history, and without this the old row outlives the delete and
+    the next read on ``key`` copies it straight back.
+    SKIP LOCKED: a worker that has not rolled and is mid-write to the old key
+    is left alone, and a later end of history catches it.
+    """
+    old_keys = [
+        old_key
+        for key in keys
+        if (old_key := await pre_identity_thread_key_for(session, agent_id, key)) is not None
+    ]
+    if not old_keys:
+        return
+    locked = (
+        select(ThreadTranscript.id)
+        .where(
+            ThreadTranscript.agent_id == agent_id,
+            ThreadTranscript.binding_scope == scope,
+            ThreadTranscript.thread_key.in_(old_keys),
+        )
+        .with_for_update(skip_locked=True)
+    )
+    await session.execute(delete(ThreadTranscript).where(ThreadTranscript.id.in_(locked)))
+
+
 async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
     """Delete this agent's expired transcripts.
 
@@ -100,12 +133,65 @@ async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
         .where(ThreadTranscript.agent_id == agent_id, ThreadTranscript.expires_at <= func.now())
         .with_for_update(skip_locked=True)
     )
-    await session.execute(delete(ThreadTranscript).where(ThreadTranscript.id.in_(expired)))
+    swept = await session.execute(
+        delete(ThreadTranscript)
+        .where(ThreadTranscript.id.in_(expired))
+        .returning(ThreadTranscript.binding_scope, ThreadTranscript.thread_key)
+    )
+    by_scope: dict[str | None, list[str]] = {}
+    for scope, key in swept:
+        by_scope.setdefault(scope, []).append(key)
+    for scope, keys in by_scope.items():
+        await _delete_pre_identity(session, agent_id, scope, keys)
+
+
+async def _adopt_pre_identity(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
+) -> bool:
+    """Copy the transcript a named non-Slack route kept under its pre-identity key.
+
+    ADR-0168 decision 4 gave that route's key an identity segment. Copy when
+    this key has no row or the old row is newer. The read of the old row
+    never locks or deletes it, so a worker that has not rolled keeps writing
+    it. Does not commit. Returns whether anything was copied.
+    """
+    old_key = await pre_identity_thread_key_for(session, agent_id, key)
+    if old_key is None:
+        return False
+    old: ThreadTranscript | None = await session.scalar(
+        select(ThreadTranscript).where(*_where(agent_id, scope, old_key), _live())
+    )
+    if old is None:
+        return False
+    current: ThreadTranscript | None = await session.scalar(
+        select(ThreadTranscript).where(*_where(agent_id, scope, key)).with_for_update()
+    )
+    if current is None:
+        session.add(
+            ThreadTranscript(
+                agent_id=agent_id,
+                binding_scope=scope,
+                thread_key=key,
+                value=old.value,
+                version=old.version,
+                expires_at=_expiry(),
+            )
+        )
+    elif old.updated_at > current.updated_at:
+        current.value = old.value
+        current.version = max(current.version, old.version) + 1
+        current.expires_at = _expiry()
+    else:
+        return False
+    await session.flush()
+    return True
 
 
 async def get(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
+    if await _adopt_pre_identity(session, agent_id, scope, key):
+        await session.commit()
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key), _live())
     )
@@ -115,6 +201,7 @@ async def get(
 async def _get_locked(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
+    await _adopt_pre_identity(session, agent_id, scope, key)
     await _sweep_expired(session, agent_id)
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key)).with_for_update()
@@ -209,6 +296,7 @@ async def remove(
     if expected_version is None:
         if row is not None:
             await session.delete(row)
+        await _delete_pre_identity(session, agent_id, scope, [key])
         await session.commit()
         return
     stored = row.version if row is not None else None
@@ -219,6 +307,8 @@ async def remove(
             .where(ThreadTranscript.id == row.id, ThreadTranscript.version == expected_version)
             .returning(ThreadTranscript.id)
         )
+        if deleted is not None:
+            await _delete_pre_identity(session, agent_id, scope, [key])
         await session.commit()
     if deleted is None:
         if stored is None:
@@ -279,3 +369,4 @@ async def expire_for_work_item(session: AsyncSession, work_item: WorkItem) -> No
             ThreadTranscript.thread_key == work_item.conversation_id,
         )
     )
+    await _delete_pre_identity(session, work_item.agent_id, None, [work_item.conversation_id])

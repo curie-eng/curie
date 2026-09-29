@@ -97,7 +97,21 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   with no `--secret`, so the `unhosted_url` fallback derives the same header (#2518). A hosted
   connector with several
   secrets, any of them a plain string, and no `bearer_secret` is `connectors.bearer_secret_required`;
-  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector may
+  declare `admits`, the agent names whose sandboxes may call it (ADR-0168 decision 7): a missing
+  list admits the deploying agent alone, `[]` refuses everyone, and a list is exact, so it does
+  not add the deploying agent. An entry is either the reserved name `self`, meaning the agent the
+  bundle is deployed as, or a name shaped like `deploy.yaml`'s agent names; either way it may not
+  repeat (`connectors.bad_admits_agent`, `connectors.duplicate_admits`), and a `url` connector
+  cannot declare `admits` at all (`connectors.remote_has_admits`). `self` is itself refused as an
+  agent name (`deploy.bad_agent_name`), since a target genuinely named `self` would be
+  indistinguishable from the sentinel. On an install whose API holds a caller public key, each
+  hosted connector's caller proxy admits exactly the resolved list, `self` becoming the deploying
+  agent's stored name (`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`);
+  an install with no key renders no proxy and enforces no list. A consumer built before the
+  first release carrying #3107 refuses `admits` as `connectors.invalid`: an older API or CLI
+  refuses the bundle, and an older runner mounts none of its connectors. Declare `admits` only once
+  the API, the CLI and every runner image are on that release. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
@@ -106,7 +120,9 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
   only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
-  entry is the authored URL, so its name is not checked), and others). Authored mapping keys are checked for
+  entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
+  hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
+  would render the same Service name), and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
@@ -141,20 +157,52 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   Docker, no registry, no network -- which is what lets the API run it and stay a pure renderer
   (ADR-0087). Delivery is deliberately NOT judged here: a `local-daemon` lock is legitimate for a
   local-tier deploy, and refusing it belongs to the cluster preflight.
+- A layered runner (ADR-0173). `connectors.yaml` may carry an optional top-level `runner:` block,
+  `packages/plugin-format/src/plugin_format/connectors.py::RunnerSpec`, whose only key is a
+  `build` of the same shape and rules as a connector's (`context` inside the bundle, `dockerfile`
+  defaulting to `Dockerfile`, non-empty `platforms`). The runner Dockerfile must declare
+  `ARG CURIE_RUNNER_IMAGE` before its first `FROM`, and that first `FROM` must be
+  `${CURIE_RUNNER_IMAGE}` (optionally `AS name`); a literal base is refused as
+  `connectors.runner_base_not_arg`
+  (`packages/plugin-format/src/plugin_format/connector_lock.py::check_runner_dockerfile`).
+  `curie build --plugin-dir <dir> [--registry <ref>] [--runner-image <ref>]` pins the platform
+  runner (default: the one `curie skill up` runs) to a digest, passes it as that build argument,
+  and records a `runner:` entry in `connectors.lock.yaml`,
+  `packages/plugin-format/src/plugin_format/connector_lock.py::RunnerLockEntry`, carrying
+  `image`, `base`, `delivery`, `platforms` and `source_digest`. Both `image` and `base` obey the
+  digest rule of `delivery`. Intake reports a missing or stale runner entry as
+  `connectors.lock_missing` / `connectors.lock_stale`, and
+  `packages/plugin-format/src/plugin_format/connector_lock.py::resolve_runner_image` is the one
+  resolver a renderer uses: `None` for a bundle with no `runner:`, otherwise exactly the recorded
+  digest.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of
-  `{agent, env, slack_channel}` where `env` is `dev` or `prod`. Validated by
-  `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
+  `{agent, env, identity, slack_channel, connectors}` where `env` is `dev` or `prod`, `identity`
+  names the channel identity (the bot) the target's binding speaks through and defaults to
+  `default`, and `connectors` is an allowlist over the bundle's `connectors.yaml` connectors:
+  absent runs all of them, a list runs only those, `[]` runs none (ADR-0168 decision 8). Validated
+  by `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
   `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
   the target key), `deploy.bad_agent_name`, `deploy.ambiguous_agent_name` (the agent, not the
   connector, must not contain `-mcp-` or END in `-mcp`, since the agent sits immediately left of
   the `-mcp-` join — same collision as `connectors.ambiguous_name`, viewed from the other side of
   the join),
-  `deploy.bad_slack_channel`). Authored mapping keys are
+  `deploy.bad_slack_channel`, `deploy.bad_identity` (shape only: the installation declares its
+  identities and this validator never sees it), `deploy.bad_connector_name` (the `connectors.yaml` name
+  rule), `deploy.duplicate_connector`, `deploy.null_connectors` (an explicit null allowlist,
+  such as a bare `connectors:`, is refused rather than read as all; omit the key or write `[]`),
+  `deploy.unknown_connector` (an allowlist entry `connectors.yaml` does not declare),
+  `deploy.conflicting_connectors` (two targets that bind the same agent with different
+  `connectors`, compared as sets)). Authored
+  mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
-  silently selecting the last YAML value.
+  silently selecting the last YAML value. The allowlist is a property of the agent, not of the
+  target that states it (ADR-0168 decision 8): every target naming that agent must carry the same
+  `connectors`, since the connector objects it narrows are named per agent
+  (`<release>-<agent>-mcp-<connector>`), and it narrows both the connectors route's render and the
+  runner's mount for that agent.
 
 The overlay files are not independent of the manifest, which is the part a second consumer is
 most likely to miss: `connectors.yaml` feeds manifest validation. The set of gate names

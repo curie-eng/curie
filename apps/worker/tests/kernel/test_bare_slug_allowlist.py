@@ -31,7 +31,7 @@ _DEPLOYMENT_ID = uuid.UUID("33333333-3333-4333-8333-333333332947")
 
 
 class _Binding(GrantBinding):
-    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(

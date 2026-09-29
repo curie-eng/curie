@@ -345,6 +345,12 @@ are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
 
+The SRE bot Prometheus overlay includes alerts for dead lettered messages,
+slow sandbox claims, refused capacity reclamation, and transcript persistence
+failures. It counts a counter's first observed sample so failures are visible
+even when a process has just started. See
+[`examples/sre-bot/observability/prometheus-values.yaml`](../../examples/sre-bot/observability/prometheus-values.yaml).
+
 The chart-managed collector is a bounded gateway, not a lossless store. Every
 network exporter uses retry plus a bounded sending queue. `memory_limiter` runs
 before `batch`, and the default persistent `file_storage` queue uses a 1Gi PVC
@@ -392,6 +398,16 @@ collector stdout. `values-dev.yaml` explicitly enables it and selects an
 ephemeral queue for disposable development. Use the same explicit persistence
 override for any short-lived test installation; production installs retain the
 PVC by default.
+
+Kubernetes keeps Events for about an hour, so the Warning events behind an
+OOMKill, eviction, failed schedule or probe failure are usually gone before an
+incident review. Set `otelCollector.kubernetesEvents.enabled=true` to add a
+`k8sobjects/events` receiver that watches `events.k8s.io` Events in the release
+namespace and feeds them into the logs pipeline. The chart then runs the
+collector as its own ServiceAccount bound to a namespaced Role with only
+get/list/watch on events. The logs pipeline exports to `nop/logs` by default,
+so Helm refuses the setting unless `extraLogPipelineExporters` names a durable
+log exporter (or the development `debug` exporter is enabled).
 
 Additional trace destinations are configured through
 `otelCollector.extraExporters`, a map of exporter names to collector exporter
@@ -1305,6 +1321,51 @@ runtimeclass is absent it is marked NOT-TESTABLE (per the security-boundary test
 enforcement asserted separately by the preflight and proven live in the security-boundary test plan
 (`uname` = `4.19.0-gvisor`).
 
+## End to end connector identity on a test cluster (ADR 0176)
+
+`curie cluster up --e2e-connector-identity` (chart value
+`e2eConnectorIdentity.enabled`) installs the identity the end to end connector
+uses on a separate **test** cluster. Pass it only on that cluster's owner
+release (ADR 0129), never on the cluster that runs the factory. It needs
+Kubernetes 1.30 or newer for `admissionregistration.k8s.io/v1`.
+
+What it grants, and how the cluster enforces it:
+
+- A service account, `<fullname>-e2e-connector`, with a cluster grant of
+  exactly: read, create and delete namespaces; create RoleBindings; and `bind`
+  on one ClusterRole, `<fullname>-e2e-connector-namespace`. No namespace update
+  or patch, and no other cluster scoped write.
+- The `-namespace` ClusterRole is bound only by a RoleBinding the connector
+  creates inside a namespace it created. That RoleBinding is its only source of
+  namespaced reads and writes, so every other namespace is unreadable to it.
+- A ValidatingAdmissionPolicy, failing closed, matched to that service account
+  and to every service account inside a prefixed namespace, so a token the
+  identity mints there is held to the same rules. It admits a namespace create
+  only when the name starts with `e2eConnectorIdentity.namespacePrefix` (default
+  `curie-e2e-`), the namespace carries `e2eConnectorIdentity.ownerLabel`
+  (default `curietech.ai/e2e-owner=<release>`), and it sets
+  `pod-security.kubernetes.io/enforce` to `baseline` or `restricted`, so no pod
+  there may be privileged, share host namespaces or mount a host path. It
+  admits a namespace delete only for a prefixed, labelled namespace; admits a
+  namespaced write only inside one; denies every other cluster scoped write;
+  and refuses a RoleBinding naming anything but a service account of its own
+  namespace, so no grant reaches a user, a group or another namespace.
+
+A namespace an administrator creates with the prefix and label is inside the
+identity's scope by definition: the label is the ownership claim. Only the
+identity and cluster administrators can create such a namespace.
+
+`ci/e2e-connector-identity-assertions.sh` pins the rendered grant.
+`ci/runtime/e2e-connector-identity-runtime.sh` proves each denial against a live
+API server by impersonating the service account:
+
+```bash
+CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
+  bash charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
+```
+
+It creates only objects named from its run id and deletes them on exit.
+
 ## Uninstalling and CRD lifecycle
 
 `helm uninstall <release> -n <ns>` removes everything the chart templated, but
@@ -1750,6 +1811,142 @@ surface and its paired worker credential source. A plain `curie cluster up`
 runs a full `helm upgrade --install` with no `--reuse-values`, so the CLI
 explicitly re-supplies each recorded source that the invocation does not
 replace or clear. That preservation lives in `cli/src/ops/up.rs`.
+
+### Several Slack identities
+
+`dispatcher.slack` is the Slack identity named `default`
+([ADR-0168](../../docs/adr/0168-one-installation-hosts-several-bot-identities.md)
+decision 1). `dispatcher.slack.identities` lists more, each by
+`existingSecret` reference only; a plain token in an entry fails the render.
+Once the list is non-empty, `default` takes its secrets by reference too: a
+plain `appToken`, `botToken` or `signingSecret` in the `dispatcher.slack` block
+fails the render, so `curie cluster comms --slack`, which writes plain block
+tokens, is refused on such an install. With no entries the block keeps
+accepting plain values, as it always has.
+
+```yaml
+dispatcher:
+  slack:
+    appTokenExistingSecret: my-slack-tokens
+    botTokenExistingSecret: my-slack-tokens
+    identities:
+      - name: sales
+        appTokenExistingSecret: slack-sales      # key defaults to slackAppToken
+        botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
+```
+
+With no entries the chart renders exactly the objects it rendered before the
+key existed. With entries, the dispatcher, worker and API each receive
+`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
+its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
+token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
+gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+`default` always keeps the `SLACK_*` names. The render refuses a duplicate
+name, a name that is not lowercase letters and digits in runs joined by single
+hyphens (at most 40 characters, so every name is one a binding's `adapter` can
+carry), a name of `curie-cluster-message` (reserved for the platform's
+built-in cluster-message reply adapter), a missing token reference, `default`
+configured twice or not at all, and an `extraEnv` entry naming any of these
+variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+A plain `curie cluster up` re-supplies a recorded list along with the
+`dispatcher.slack` token fields, so an operator does not need to pass it again
+on a later `up`. The one shape `up` refuses outright is a list explicitly
+recorded as empty (`[]`, as opposed to the key being absent); leave the key out
+rather than clearing it to an empty list.
+
+The API validates a Slack binding's identity against this declared list and
+stores it on the binding, so a declared identity can be bound to any channel,
+including one another identity already answers in (ADR-0168 decision 3).
+
+Each identity's bot token is also the one its turns are answered with. The
+worker sets the assistant status, edits the reply, posts and settles approval
+cards and downloads attached files with the token of the identity a turn
+arrived on, and the API resolves an approval's Slack user-group approvers with
+it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
+A worker holding no token for the identity a turn names drops the turn before
+it runs, logs the identity, and leaves the placeholder as the dispatcher posted
+it: it never answers as another bot.
+
+A second identity also puts a rate limit on fan-out between siblings (ADR-0168
+decision 6): 5 sibling-written turns per session key, and 5 conversations
+opened per ordered identity pair, both in a 600 s window. A bot fanning work
+out to a sibling across more than 5 threads in ten minutes is cut off past the
+fifth, and the drop is visible on Slack as the placeholder edited to a notice
+that names nobody, so the exchange cannot restart itself.
+
+### The connector caller key pair
+
+The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
+with an Ed25519 key, and the API renders the public half into a caller proxy in
+front of every hosted connector. The proxy refuses a call whose token is
+missing, invalid or expired, or names an agent the connector's `admits` list
+does not, and forwards the rest to the server over loopback. The proxy runs
+from the worker image (`CURIE_CONNECTOR_PROXY_IMAGE`, from `worker.image`), so
+nothing new is pulled from a new place. It pulls with `worker.image.pullPolicy`
+and `worker.imagePullSecrets`, which the connector pod carries, so a private
+worker image needs its pull Secret in the namespace the connectors run in.
+
+A caller that is not an agent, such as a keep-alive Job, has no token. Each
+proxied connector also gets a Service named after its own with `-direct`,
+which selects the same pods on the server's own port. No rendered policy opens
+that port, so the caller also needs an ingress policy of your own naming it.
+
+`curie cluster up` generates the pair on a release that records none and
+re-supplies it on every upgrade, as it does the sealing keypair. `--dev`
+generates none, and neither does a plain `helm install` that sets no
+`connectorCaller` value: with no key the worker mints no token, the API renders
+no proxy, and each connector's NetworkPolicy is its only access check.
+
+To bring your own pair, name a Secret holding both halves as standard base64:
+the 32-byte seed under `connectorCaller.signingKeyKey` (default `signingKey`)
+and its 32-byte public key under `connectorCaller.verifyKeyKey` (default
+`verifyKey`). With PyNaCl installed:
+
+```bash
+python3 -c 'import base64, nacl.signing as s; k = s.SigningKey.generate(); print(base64.b64encode(bytes(k)).decode()); print(base64.b64encode(bytes(k.verify_key)).decode())'
+```
+
+```yaml
+connectorCaller:
+  existingSecret: my-connector-caller   # holds signingKey and verifyKey
+```
+
+Only the worker receives the signing key, and only the API the public key.
+`cluster up` carries `existingSecret` forward as well.
+
+To rotate, set `connectorCaller.previousVerifyKey` to the current public key,
+set the new pair, and `kubectl rollout restart` the api and worker Deployments:
+neither pod template carries a checksum of this Secret. Tokens live 24 hours,
+so clear `previousVerifyKey` a day later.
+
+The worker that signs the token, the runner that presents it in
+`X-Curie-Caller`, and the proxy that checks it arrive in the same release, so
+no earlier runner image carries the header and every hosted connector refuses
+one. Keep any agent-specific runner image on this release too.
+
+The first upgrade that gives the release a caller key rolls every hosted
+connector pod once, because its rendered Deployment gains the proxy. That is
+the `curie cluster up` upgrade of a release recording none. `curie cluster
+upgrade` generates no key, so it renders no proxy until a later `cluster up`
+or a key of your own. Upgrade note: a keep-alive Job that dialled the
+connector Service now dials `<name>-direct`, keeping its port, because the
+connector Service lands on the proxy, which refuses a caller without a token.
+Its peer-ingress policy keeps naming the server's port.
+
+A sandbox booted by a worker that held no signing key carries no token, and a
+proxied connector refuses every call it makes: the runner reports that
+connector as refusing this sandbox and its tools as unavailable. The next turn
+on its thread that a worker holding the key takes claims a fresh sandbox
+instead, and a turn already in progress finishes first. Every sandbox from
+before the upgrade is such a sandbox, and so is one booted during the roll by
+a worker pod the roll has not replaced yet. The pre-upgrade drain
+(`worker.upgradeDrain`) stops every worker taking new work until its
+post-upgrade release, but `cluster up` runs Helm without `--wait`, so that
+release can clear the pause while a worker pod from before the upgrade is
+still running, and that pod can take turns until it is replaced. Upgrading
+first with no key and generating one later does not remove this: the second
+upgrade rolls workers that do not yet hold the key in the same way.
 
 ### Reserved environment variables
 

@@ -20,7 +20,11 @@ knows which mistakes it can take back.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
+
+# What the receipt shows, chosen per install (ADR-0180). ``WorkerConfig`` reads
+# it from ``CURIE_TURN_RECEIPT``, and the chart schema offers the same three.
+TurnReceiptMode = Literal["all", "failures", "off"]
 
 # A connector's summary is not a size this platform controls, and a receipt is
 # read in a chat client beneath an answer someone actually asked for.
@@ -107,7 +111,9 @@ def _read_only_bash(action: dict[str, Any]) -> bool:
     return any(re.fullmatch(pattern, command.strip()) for pattern in _READ_ONLY_COMMANDS)
 
 
-def render_receipt(actions: list[dict[str, Any]]) -> str | None:
+def render_receipt(
+    actions: list[dict[str, Any]], mode: TurnReceiptMode = "all"
+) -> str | None:
     """One line per action, or None when the turn changed nothing.
 
     Most turns are reads, and a receipt on every one of them is noise. This
@@ -118,8 +124,16 @@ def render_receipt(actions: list[dict[str, Any]]) -> str | None:
     actions would hide the ones that matter most: the value of showing
     "restarting pods cannot be undone" beside "scaled 3 to 10, can be undone" is
     that an operator sees the system knows the difference.
+
+    ``mode`` is the install's choice (ADR-0180): ``failures`` renders this same
+    receipt for the failed actions alone, and ``off`` renders none. It decides
+    only what the person is shown; the caller has already recorded every action.
     """
 
+    if mode == "off":
+        return None
+    if mode == "failures":
+        actions = [action for action in actions if action.get("status") == "failed"]
     visible = [action for action in actions if not _read_only_bash(action)]
     if not visible:
         return None

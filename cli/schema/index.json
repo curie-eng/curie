@@ -19,7 +19,7 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.2"
+      "version": "2.3"
     },
     {
       "result": "BudgetOutput",
@@ -34,6 +34,12 @@
       "version": "1.0"
     },
     {
+      "result": "CallersOutput",
+      "kind": "CliOutput",
+      "schema": "callers.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ChannelTokenOutput",
       "kind": "CliOutput",
       "schema": "channel-token.schema.json",
@@ -43,7 +49,7 @@
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "ChartCheckOutput",
@@ -166,6 +172,12 @@
       "version": "1.0"
     },
     {
+      "result": "LintValuesOutput",
+      "kind": "CliOutput",
+      "schema": "lint-values.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ListAgentsOutput",
       "kind": "CliOutput",
       "schema": "list-agents.schema.json",
@@ -253,7 +265,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "PublicationPolicyOutput",
@@ -308,6 +320,18 @@
       "kind": "CliOutput",
       "schema": "status.schema.json",
       "version": "1.1"
+    },
+    {
+      "result": "SchedulesOutput",
+      "kind": "CliOutput",
+      "schema": "schedules.schema.json",
+      "version": "2.0"
+    },
+    {
+      "result": "HookFireOutput",
+      "kind": "CliOutput",
+      "schema": "hook-fire.schema.json",
+      "version": "1.0"
     },
     {
       "result": "VersionsOutput",

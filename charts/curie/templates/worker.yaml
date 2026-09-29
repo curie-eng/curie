@@ -59,6 +59,17 @@ rules:
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get"]
+  {{- if .Values.agentSandbox.deploy }}
+  # Per-agent runner resources (#3209). get reads the chart template. create
+  # and patch write only the worker-owned copy. list and delete stay absent.
+  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
+  # on the same condition and refuses any name that is not that copy, so this
+  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
+  # that template, which fails this render before the grant is installed.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "create", "patch"]
+  {{- end }}
   # A factory execution defers as capacity when its sandbox pod is
   # Unschedulable (#3169). The worker reads only the exact named pod.
   - apiGroups: [""]
@@ -299,12 +310,10 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
-            # Same shared secret reference api.yaml and dispatcher.yaml resolve
-            # (issue #1759, curie.secretRef), so the three cannot drift apart.
-            - name: SLACK_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
+            # Every Slack identity's bot token, from the one helper api.yaml and
+            # dispatcher.yaml also render (curie.env.slack), so the three cannot
+            # drift apart.
+            {{- include "curie.env.slack" (dict "root" . "workload" "worker") | trim | nindent 12 }}
             # The sealing keys (ADR-0094). The connector reconciler runs here,
             # so this is the only workload that needs to DECRYPT a sealed
             # value; nothing else in the release gets them. Both are optional:
@@ -318,6 +327,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" .Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | nindent 18 }}
+            # The connector caller signing key (ADR-0168 decision 7). Only the
+            # worker signs, so only the worker holds it. Empty mints no token.
+            - name: CURIE_CONNECTOR_CALLER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.signingKeyKey "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -365,11 +380,11 @@ spec:
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
             # Every agent agent-sandbox.yaml renders a per-agent pool for
-            # (connectorSecrets and registryEgress, #3083), or none when
-            # worker.warmPool is overridden and the names cannot match. The
-            # worker routes only to these, and refuses a connector-secret claim
-            # for any other agent instead of waiting on a pool nothing rendered
-            # (#2943).
+            # (connectorSecrets, registryEgress, #3083, and runnerImages,
+            # ADR-0173), or none when worker.warmPool is overridden and the
+            # names cannot match. The worker routes only to these, and refuses a
+            # connector-secret claim for any other agent instead of waiting on a
+            # pool nothing rendered (#2943).
             - name: CURIE_AGENT_SANDBOX_POOLS
               value: {{ ternary (include "curie.agentSandboxPoolAgents" . | fromJsonArray | join ",") "" $perAgentPools | quote }}
             # The subset whose pool template carries connector secretKeyRefs; a
@@ -435,6 +450,13 @@ spec:
               value: {{ .Values.worker.shimmer | quote }}
             - name: CURIE_STATUS_TEXT
               value: {{ .Values.worker.statusText | quote }}
+            # What the receipt beneath a turn's reply shows (ADR-0180). The
+            # schema admits all, failures and off; `required` catches the one
+            # shape it cannot see, an explicit null Helm drops before
+            # validation, which would otherwise render an empty value the
+            # worker refuses at startup.
+            - name: CURIE_TURN_RECEIPT
+              value: {{ required "worker.turnReceipt must be one of all, failures or off" .Values.worker.turnReceipt | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the
@@ -516,7 +538,7 @@ spec:
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.

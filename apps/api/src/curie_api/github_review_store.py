@@ -12,7 +12,6 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
-from channel_protocol import scoped_conversation_id
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
@@ -45,6 +44,7 @@ from .models import (
 )
 from .repo_full_name import repo_url_path
 from .schemas import BUILTIN_CLUSTER_MESSAGE_ADAPTER, ReviewRevisionReserve
+from .threadkeys import route_thread_key_matches
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
@@ -132,9 +132,13 @@ async def review_context(
         binding is None
         or binding.agent_id != lineage.agent_id
         or binding.generation != lineage.binding_generation
-        or scoped_conversation_id(
-            binding.kind, binding.address, lineage.reply_conversation_id
-        ) != lineage.conversation_id
+        or not route_thread_key_matches(
+            binding.kind,
+            binding.adapter,
+            binding.address,
+            lineage.reply_conversation_id,
+            lineage.conversation_id,
+        )
     ):
         raise FeedbackIgnored("binding_no_longer_authorized")
     origin_adapter = await session.scalar(

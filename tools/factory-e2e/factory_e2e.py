@@ -18,6 +18,11 @@ run publishes without a human. With CURIE_FACTORY_MODEL_API_KEY set the
 install runs a real model (DEFAULT_MODEL unless CURIE_FACTORY_MODEL names
 another) with the 10800 second execution bound; without it the model is fake.
 The bound is set on the factory agent as its execution deadline (#3071).
+The bundle's GitHub MCP server lives in its runner layer (#3420): with
+CURIE_FACTORY_LAYER_REGISTRY set, the driver runs `curie build` on a private
+copy of the bundle against the candidate's runner and pushes the layer there
+before the deploy. A bundle that already carries connectors.lock.yaml needs no
+registry.
 
 `curie dev factory-e2e run --scenario <name>` runs one scenario driver after
 the preflight. `issue-to-pr --issue-file <file> [--expect pr|comment|any]`
@@ -320,6 +325,9 @@ class FactoryConfig:
     model_context_tokens: int | None = DEFAULT_MODEL_CONTEXT_TOKENS
     bundle_dir: Path = DEFAULT_BUNDLE
     curie_bin: str = "curie"
+    # Where `curie build` pushes the bundle's runner layer (#3420); None when
+    # the bundle declares no layer or already carries a lock for one.
+    layer_registry: str | None = None
     # The operator's own GitHub login; None means ask gh at check time.
     operator_login: str | None = None
 
@@ -601,6 +609,19 @@ def load_config(
         missing.append(
             "CURIE_FACTORY_BUNDLE_DIR (a plugin bundle directory; default examples/dark-factory)"
         )
+    layer_registry = env.get("CURIE_FACTORY_LAYER_REGISTRY") or None
+    if (
+        bundle_dir.is_dir()
+        and bundle_declares_runner_layer(bundle_dir)
+        and not (bundle_dir / "connectors.lock.yaml").is_file()
+        and layer_registry is None
+    ):
+        # The bundle's stdio MCP servers live in its runner layer (#3420), and
+        # a cluster deploy refuses a declared layer that no lock records.
+        missing.append(
+            "CURIE_FACTORY_LAYER_REGISTRY (a registry the cluster can pull from, where "
+            "`curie build` pushes the bundle's runner layer)"
+        )
 
     model = env.get("CURIE_FACTORY_MODEL") or DEFAULT_MODEL
     # Only DEFAULT_MODEL has a known window; another model declares its own or
@@ -643,8 +664,25 @@ def load_config(
         model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
         curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
+        layer_registry=layer_registry,
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
     )
+
+
+_RUNNER_DECLARATION = re.compile(r"^runner:", re.MULTILINE)
+
+
+def bundle_declares_runner_layer(bundle: Path) -> bool:
+    """True when the bundle's connectors.yaml declares a runner layer (ADR 0173).
+
+    A top-level ``runner:`` key is the whole test: the CLI validates the
+    declaration itself, and this driver stays standard library only."""
+
+    try:
+        text = (bundle / "connectors.yaml").read_text()
+    except OSError:
+        return False
+    return bool(_RUNNER_DECLARATION.search(text))
 
 
 def parse_issue_file(path: Path) -> tuple[str, str]:
@@ -2121,12 +2159,45 @@ class Preflight:
         path.mkdir(mode=0o700, exist_ok=True)
         return path
 
+    def build_runner_layer(self, bundle: Path) -> Path:
+        """Build the bundle's declared runner layer on this candidate's runner.
+
+        Returns the directory to deploy: the bundle itself when it declares no
+        layer or no registry was named (its committed lock is used as is), else
+        a private copy whose lock `curie build` wrote, so the checkout is never
+        modified. Without the layer the agent runs the bare platform runner,
+        which carries no GitHub MCP server (#3420)."""
+
+        registry = self.config.layer_registry
+        if registry is None or not bundle_declares_runner_layer(bundle):
+            return bundle
+        copy = self.workdir / "bundle"
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.copytree(bundle, copy)
+        runner = f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+        log(f"curie build (the bundle's runner layer on {runner})")
+        argv = [
+            self.config.curie_bin,
+            "build",
+            "--plugin-dir",
+            str(copy),
+            "--registry",
+            registry,
+            "--runner-image",
+            runner,
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout).strip()[-1500:]
+            raise PreflightFailed(f"curie build --plugin-dir failed: {tail}")
+        return copy
+
     def deploy_bundle(self) -> None:
         """Deploy the default dark-factory bundle onto the bound agent and let
         the platform resolve its publication approval (policy auto)."""
 
         assert self.chart_dir is not None, "install() extracts the chart first"
-        bundle = self.config.bundle_dir
+        bundle = self.build_runner_layer(self.config.bundle_dir)
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         kubeconfig = self._write_kubeconfig()
         token = self._issue_read_token()
@@ -2168,9 +2239,9 @@ class Preflight:
             secrets,
         )
         try:
-            shown = str(bundle.resolve().relative_to(self.repo_root.resolve()))
+            shown = str(self.config.bundle_dir.resolve().relative_to(self.repo_root.resolve()))
         except ValueError:
-            shown = bundle.name
+            shown = self.config.bundle_dir.name
         self.evidence["bundle"] = {
             "name": manifest.get("name"),
             "version": manifest.get("version"),

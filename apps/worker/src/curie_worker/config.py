@@ -36,11 +36,15 @@ from aci_protocol.service_config import (
     derive_dead_letter_stream_name,
     warn_if_deprecated_api_url_env,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from pydantic import AliasChoices, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
+
+from . import caller_token
+from .receipt import TurnReceiptMode
 
 
 def _default_consumer_name() -> str:
@@ -133,10 +137,21 @@ CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_pars
 MAX_DELIVERY_BUDGET_S = 10800.0
 
 
+class CallerSigningKeyError(RuntimeError):
+    """The connector caller signing key cannot sign.
+
+    Not a ``ValueError``: pydantic wraps one of those in a ``ValidationError``
+    that prints the whole settings input, which would put the key in the boot
+    log.
+    """
+
+
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -170,6 +185,10 @@ class WorkerConfig(BaseSettings):
 
     # Slack
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot; `slack_tokens` reads each
+    # one's bot token for its replies and file downloads (decision 5).
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
     # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
     # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)
@@ -262,6 +281,14 @@ class WorkerConfig(BaseSettings):
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
 
+    # The Ed25519 seed that signs each sandbox's connector caller token
+    # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
+    # renders it only from `connectorCaller.existingSecret`, and it never
+    # enters a sandbox (`sandbox.types.HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
+    connector_caller_signing_key: str = Field(
+        default="", validation_alias="CURIE_CONNECTOR_CALLER_SIGNING_KEY", repr=False
+    )
+
     # The shimmer caption, kept SEPARATE from the dispatcher's placeholder text
     # because the two surfaces have different grammar. Slack renders an
     # assistant-thread status as "<App Name> <status>" and inserts the app name
@@ -319,6 +346,13 @@ class WorkerConfig(BaseSettings):
         default="Working on it...",
         validation_alias="CURIE_BOOTING_TEXT",
     )
+
+    # What the receipt beneath a turn's reply shows (ADR-0180): every action
+    # (``all``, the ADR-0117 receipt as built), only the failed ones, or none.
+    # Any other value refuses boot rather than falling back to a mode nobody
+    # chose. It changes only what the person is shown, never what the action
+    # ledger records or what the no-retry rule reads.
+    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
 
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
@@ -448,6 +482,24 @@ class WorkerConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
+        """Fail at construction on a signing key that cannot sign.
+
+        Otherwise every scoped boot would raise at mint time, one turn at a
+        time.
+        """
+
+        if not self.connector_caller_signing_key.strip():
+            return self
+        try:
+            caller_token.signing_key(self.connector_caller_signing_key)
+        except ValueError as exc:
+            raise CallerSigningKeyError(
+                f"CURIE_CONNECTOR_CALLER_SIGNING_KEY is unusable: {exc}"
+            ) from None
+        return self
+
+    @model_validator(mode="after")
     def _lease_spans_three_heartbeats(self) -> WorkerConfig:
         """Fail at construction if the lease cannot survive two lost heartbeats.
 
@@ -553,6 +605,30 @@ class WorkerConfig(BaseSettings):
                 "a maximum-budget turn"
             )
         return self
+
+    @model_validator(mode="after")
+    def _hook_claim_lease_covers_the_budget(self) -> WorkerConfig:
+        """Fail at construction if a cron claim's lease is shorter than a turn.
+
+        The next fire reclaims a claim past its lease (ADR-0099, #2931). A
+        lease shorter than the overall delivery budget would reclaim a turn
+        that is still running and let a second fire of the hook start beside it.
+        """
+        lease = self.hook_claim_lease_s
+        if lease is not None and lease < self.delivery_budget_s:
+            raise ValueError(
+                f"CURIE_HOOK_CLAIM_LEASE_S ({lease!r}) must be at least "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a shorter "
+                "lease reclaims a scheduled turn that is still running"
+            )
+        return self
+
+    @property
+    def effective_hook_claim_lease_s(self) -> float:
+        """The cron claim lease; the delivery budget when none is configured."""
+        if self.hook_claim_lease_s is None:
+            return self.delivery_budget_s
+        return self.hook_claim_lease_s
 
     @model_validator(mode="after")
     def _runner_request_fits_the_budget(self) -> WorkerConfig:
@@ -732,6 +808,14 @@ class WorkerConfig(BaseSettings):
         ge=60.0,
         le=MAX_DELIVERY_BUDGET_S,
         validation_alias="CURIE_DELIVERY_BUDGET_S",
+    )
+    # How long a cron hook run claim holds before the hook's next fire may
+    # reclaim it (ADR-0099, #2931). ``None`` means the delivery budget: the
+    # budget bounds the whole delivery, so a turn past it is dead by
+    # construction. Set it higher when turns wait long on the stream before a
+    # worker claims them; it can never be lower than the budget.
+    hook_claim_lease_s: float | None = Field(
+        default=None, gt=0, validation_alias="CURIE_HOOK_CLAIM_LEASE_S"
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
@@ -1236,6 +1320,24 @@ class WorkerConfig(BaseSettings):
         # loop must not scan a production Valkey, and a redelivery-only sweep
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
+
+    def progress_key(self, progress_id: str) -> str:
+        # One logical turn chain's progress record (ADR 0130); see the worker
+        # README's "Deliberate progress" section for its fields and expiry.
+        return f"{self.key_prefix}:progress:{progress_id}"
+
+    def progress_delivery_key(self, delivery_id: str) -> str:
+        # One pending progress delivery, keyed by its derived reply-wire id.
+        return f"{self.key_prefix}:progress:delivery:{delivery_id}"
+
+    def progress_pending_key(self) -> str:
+        # The progress sweep index: a SET, for the reason completions_pending_key
+        # gives.
+        return f"{self.key_prefix}:progress:pending"
+
+    def progress_chain_key(self, event_id: str) -> str:
+        # The pointer an approval resume event follows back to its chain's record.
+        return f"{self.key_prefix}:progress:chain:{event_id}"
 
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation

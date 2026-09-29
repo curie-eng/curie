@@ -490,6 +490,24 @@ export const commandManifest = {
           "name": "work-items"
         },
         {
+          "about": "Not available at this tier: the skill tier runs one bundle against a local runner and has no platform API or hook run record; use `curie local schedules` or `curie cluster schedules` against a platform API",
+          "args": [
+            {
+              "global": false,
+              "help": "Accepts any arguments so every form reaches the exit-4 capability refusal instead of a clap usage error",
+              "id": "_rest",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "schedules"
+        },
+        {
           "about": "Not available at this tier: the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API; use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API",
           "hidden": false,
           "name": "observability",
@@ -788,6 +806,56 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "eval"
+        },
+        {
+          "about": "Run a declared cron hook against the local runner, or report that a durable schedule or record is unavailable at this tier (ADR-0099)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run the named cron hook now against the local runner. No durable record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trigger name from `.claude-plugin/plugin.json`",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "help": "Plugin bundle directory",
+                  "id": "plugin_dir",
+                  "long": "plugin-dir",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Runner base URL. Default: the URL recorded by `skill up`",
+                  "id": "url",
+                  "long": "url",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            },
+            {
+              "about": "Not available at this tier: there is no scheduler",
+              "hidden": false,
+              "name": "schedule"
+            },
+            {
+              "about": "Not available at this tier: there is no hook run record",
+              "hidden": false,
+              "name": "record"
+            }
+          ]
         },
         {
           "about": "Interview to generate a starter `evals/cases.json` (guided eval generation)",
@@ -1261,6 +1329,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -1382,6 +1458,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -1585,6 +1669,14 @@ export const commandManifest = {
               "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
               "positional": false,
               "required": false
             },
@@ -2387,6 +2479,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -2589,7 +2701,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
               "positional": false,
@@ -2607,6 +2719,90 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`).\n\nWith no flags this lists. An agent holds one or more bindings (ADR-0118), so exactly one `--add` OR one `--remove` is applied per invocation: the API has no batch endpoint, and a half-applied batch would leave the operator guessing what took.",
           "name": "surfaces"
+        },
+        {
+          "about": "Show, set, or clear who may talk to the bot through one surface (`PUT /agents/{id}/channels/callers`, ADR 0175)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1)",
+              "id": "surface",
+              "long": "surface",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The Slack identity whose route to select when several share the surface (default: the one route on it)",
+              "id": "adapter",
+              "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow exactly these caller ids, comma separated: Slack user or bot ids for a Slack surface, bare email addresses for an email one. Replaces the whole list",
+              "id": "set",
+              "long": "set",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the list, so everyone may talk to the bot again",
+              "id": "clear",
+              "long": "clear",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Show, set, or clear who may talk to the bot through one surface (`PUT /agents/{id}/channels/callers`, ADR 0175).\n\nWith neither `--set` nor `--clear` this shows the list. `--set` replaces it with exactly the ids given; `--clear` removes it so everyone may talk to the bot again. Anyone not on a list gets no reply at all. Editing the list does not revoke the surface's adapter token.",
+          "name": "callers"
         },
         {
           "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
@@ -2781,7 +2977,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
+              "help": "The worker's composed key: kind[:identity]:channel:thread-ts, each part percent-encoded; identity only when the route names one other than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -2893,6 +3089,144 @@ export const commandManifest = {
           "name": "work-items"
         },
         {
+          "about": "List each cron hook on the in-force deployment (`GET /schedules`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Scope to one agent (name or id). Omit to list every deployed agent",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be requested and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
+        },
+        {
           "about": "Delete an agent via the local platform API",
           "args": [
             {
@@ -2969,6 +3303,45 @@ export const commandManifest = {
       "hidden": false,
       "name": "cluster",
       "subcommands": [
+        {
+          "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
+          "args": [
+            {
+              "global": false,
+              "help": "Pending Helm values files in application order",
+              "id": "files",
+              "long": "values",
+              "positional": false,
+              "required": true,
+              "short": "f"
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "lint-values"
+        },
         {
           "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
           "args": [
@@ -3133,6 +3506,18 @@ export const commandManifest = {
               "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
               "id": "forward_only",
               "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Install the end to end connector's identity on this release's cluster (ADR 0176 decision 4). Pass it only on the owner release of a separate TEST cluster. It renders a service account that may create and delete only namespaces carrying the connector's prefix and ownership label, may act only inside them, and holds no cluster scoped write; a ValidatingAdmissionPolicy enforces the prefix and label at the API server (Kubernetes 1.30 or newer). A later `cluster up` without this flag removes the identity",
+              "id": "e2e_connector_identity",
+              "long": "e2e-connector-identity",
               "positional": false,
               "possible_values": [
                 "true",
@@ -3944,6 +4329,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -4117,6 +4510,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -4412,6 +4813,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
               "id": "repo",
               "long": "repo",
@@ -4702,6 +5111,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -4911,7 +5340,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
               "positional": false,
@@ -4982,6 +5411,110 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`).\n\nWith no flags this lists. An agent holds one or more bindings (ADR-0118), so exactly one `--add` OR one `--remove` is applied per invocation: the API has no batch endpoint, and a half-applied batch would leave the operator guessing what took.",
           "name": "surfaces"
+        },
+        {
+          "about": "Show, set, or clear who may talk to the bot through one surface (`PUT /agents/{id}/channels/callers`, ADR 0175)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1)",
+              "id": "surface",
+              "long": "surface",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The Slack identity whose route to select when several share the surface (default: the one route on it)",
+              "id": "adapter",
+              "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow exactly these caller ids, comma separated: Slack user or bot ids for a Slack surface, bare email addresses for an email one. Replaces the whole list",
+              "id": "set",
+              "long": "set",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the list, so everyone may talk to the bot again",
+              "id": "clear",
+              "long": "clear",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Show, set, or clear who may talk to the bot through one surface (`PUT /agents/{id}/channels/callers`, ADR 0175).\n\nWith neither `--set` nor `--clear` this shows the list. `--set` replaces it with exactly the ids given; `--clear` removes it so everyone may talk to the bot again. Anyone not on a list gets no reply at all. Editing the list does not revoke the surface's adapter token.",
+          "name": "callers"
         },
         {
           "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
@@ -5177,7 +5710,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
+              "help": "The worker's composed key: kind[:identity]:channel:thread-ts, each part percent-encoded; identity only when the route names one other than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -5405,6 +5938,184 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "work-items"
+        },
+        {
+          "about": "List each cron hook on the in-force deployment (`GET /schedules`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Scope to one agent (name or id). Omit to list every deployed agent",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be requested and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "args": [
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",
@@ -6276,6 +6987,14 @@ export const commandManifest = {
           "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
           "id": "registry",
           "long": "registry",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "id": "runner_image",
+          "long": "runner-image",
           "positional": false,
           "required": false
         },

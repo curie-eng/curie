@@ -1311,7 +1311,8 @@ class TestHelmCiWorkflowTriggers:
         # aci-protocol bindings, scripts/, the compose files, the ci.yaml and
         # release.yaml image matrices). A PR touching
         # only one of them must still match this filter or the gate that
-        # exists to catch it never runs.
+        # exists to catch it never runs. The explicit files below are also
+        # executed by gates that live outside their owning trees.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/**",
@@ -1328,6 +1329,11 @@ class TestHelmCiWorkflowTriggers:
             "pyproject.toml",
             "compose.yaml",
             "compose.dev.yaml",
+            "cli/src/ops/upgrade.rs",
+            "cli/tests/data/upgrade-driver.py",
+            "packages/aci-protocol/src/aci_protocol/slack_identities.py",
+            "packages/aci-protocol/src/aci_protocol/turn.py",
+            "apps/worker/src/curie_worker/sandbox/types.py",
             "compose/**",
         ]
 

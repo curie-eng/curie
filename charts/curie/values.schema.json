@@ -116,6 +116,11 @@
           "minimum": 1,
           "description": "Turn budget for a work-item (factory) delivery (#3071), rendered as CURIE_WORK_ITEM_MAX_TURNS and written into that delivery's sandbox as CURIE_MAX_TURNS. Other deliveries keep the runner default. A run that exhausts it fails as max-turns."
         },
+        "turnReceipt": {
+          "type": "string",
+          "enum": ["all", "failures", "off"],
+          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action, the default), failures (only actions that reported failure) or off (none). The worker refuses any other value at startup, so the schema admits only these three."
+        },
         "deliveryShutdownReserveSeconds": {
           "type": "integer",
           "minimum": 0,
@@ -204,6 +209,22 @@
                 "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
               }
             }
+          }
+        }
+      }
+    },
+    "e2eConnectorIdentity": {
+      "type": "object",
+      "description": "End to end connector identity on a test cluster (ADR 0176 decision 4, issue #3243).",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "serviceAccountName": {"type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"},
+        "namespacePrefix": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$"},
+        "ownerLabel": {
+          "type": "object",
+          "properties": {
+            "key": {"type": "string", "minLength": 1},
+            "value": {"type": "string", "pattern": "^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$"}
           }
         }
       }

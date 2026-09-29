@@ -10,7 +10,9 @@ BaseSettings refactor.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import os
 import socket
 from pathlib import Path
@@ -21,6 +23,7 @@ import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
+from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 
 
@@ -296,6 +299,18 @@ _ENV_TABLE: list[_Row] = [
     # interval is shorter than the lease".
     _Row("reclaim_interval_s", "CURIE_RECLAIM_INTERVAL_S", "10", 10.0, 30.0),
     _Row("work_item_max_turns", "CURIE_WORK_ITEM_MAX_TURNS", "5", 5, 1000),
+    # The install's receipt mode (ADR-0180). The sentinel is a NON-default mode
+    # so a field that never read its alias cannot pass, and the bare decoy is a
+    # third mode so ``populate_by_name`` cannot satisfy the read either.
+    _Row(
+        "turn_receipt",
+        "CURIE_TURN_RECEIPT",
+        "failures",
+        "failures",
+        "all",
+        bare="TURN_RECEIPT",
+        bare_raw="off",
+    ),
     # --- inbound attachment lane envelope (#2567, S4) ---
     # Defaults are asserted AGAINST ``AttachmentLimits`` rather than literals:
     # two independently written copies of "32 MiB" is exactly how a chart
@@ -439,6 +454,21 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     config = WorkerConfig()
 
+    # Valkey
+    assert config.valkey_host == "localhost"
+    assert config.valkey_port == 6379
+    assert config.valkey_password == ""
+    assert config.valkey_db == 0
+    # Slack
+    assert config.slack_bot_token == ""
+    assert config.slack_api_base_url == ""
+    assert config.slack_identities == ()
+    # Postgres
+    assert (
+        config.database_url
+        == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
+    )
+    assert config.db_schema == "curie"
     # Deployment-to-runtime binding
     assert config.default_max_usd_per_day == 10.0
     assert config.default_max_output_tokens_per_run == 100000
@@ -1326,6 +1356,75 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
         WorkerConfig.model_validate(overrides)
 
 
+@pytest.mark.parametrize("mode", ["all", "failures", "off"])
+def test_each_turn_receipt_mode_is_read_from_its_env(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """ADR-0180 decision 1: the install chooses one of exactly three modes."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", mode)
+
+    assert WorkerConfig().turn_receipt == mode
+
+
+def test_the_turn_receipt_defaults_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An install that sets nothing keeps ADR-0117's receipt as built."""
+
+    _clear_all_config_env(monkeypatch)
+
+    assert WorkerConfig().turn_receipt == "all"
+
+
+@pytest.mark.parametrize("raw", ["ALL", "Off", "none", "failure", "true", " off", ""])
+def test_an_unknown_turn_receipt_mode_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Not a fallback to a mode nobody chose: the worker fails at config load.
+
+    Casing and whitespace are refused rather than normalized, because the chart
+    schema admits the three lowercase spellings only, and a worker that quietly
+    accepted "Off" would read a value the chart would never render.
+    """
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", raw)
+
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+
+    assert "CURIE_TURN_RECEIPT" in str(exc_info.value)
+
+
+def test_an_unknown_turn_receipt_mode_is_refused_by_field_name_too() -> None:
+    with pytest.raises(ValidationError):
+        WorkerConfig(turn_receipt="quiet")
+
+
+def test_the_chart_offers_exactly_the_turn_receipt_modes_the_worker_accepts() -> None:
+    """Two languages, one vocabulary: the chart value and the worker field.
+
+    A mode the schema admits and the worker refuses renders green and
+    crash-loops the worker; a mode the worker accepts and the schema refuses is
+    unreachable from Helm. The shipped default must agree on both sides too.
+    """
+
+    from typing import get_args
+
+    from curie_worker.receipt import TurnReceiptMode
+
+    repo_root = Path(__file__).resolve().parents[3]
+    chart = repo_root / "charts" / "curie"
+    values = yaml.safe_load((chart / "values.yaml").read_text())
+    schema = json.loads((chart / "values.schema.json").read_text())
+    offered = schema["properties"]["worker"]["properties"]["turnReceipt"]
+
+    assert offered["type"] == "string"
+    assert sorted(offered["enum"]) == sorted(get_args(TurnReceiptMode))
+    assert values["worker"]["turnReceipt"] == WorkerConfig.model_fields["turn_receipt"].default
+    assert values["worker"]["turnReceipt"] == "all"
+
+
 def test_the_chart_defaults_match_the_worker_defaults() -> None:
     """The cross-language seam AGENTS.md names: two languages, one envelope.
 
@@ -1363,9 +1462,151 @@ def test_the_chart_defaults_match_the_worker_defaults() -> None:
     assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default
 
 
+def test_a_malformed_slack_identity_declaration_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker parses `CURIE_SLACK_IDENTITIES` with the same shared parser
+    as the API and dispatcher (ADR-0168 decision 1), so a declaration the
+    chart would never render must refuse boot here too, not only at the API."""
+
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "second",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "PATH",
+                    "signing_secret_env": None,
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="CURIE_SLACK_IDENTITIES"):
+        WorkerConfig()
+
+
+# The connector caller signing key (ADR-0168 decision 7).
+
+
+def _caller_seed() -> str:
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def test_the_caller_signing_key_is_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unset is a stock install: no token is minted and the boot env is the one
+    # it had before the key existed.
+    _clear_all_config_env(monkeypatch)
+    assert WorkerConfig().connector_caller_signing_key == ""
+
+
+def test_a_whitespace_only_signing_key_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Secret value written with `echo` ends in a newline: an empty value
+    # arrives as all-newline. The boot check strips before judging "is
+    # anything configured at all", so this constructs cleanly rather than
+    # tripping ``CallerSigningKeyError`` -- the same ``.strip()`` gate minting
+    # uses (`BindingResolver.boot_env`), so the two agree on what "unset"
+    # means.
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", "\n")
+    assert WorkerConfig().connector_caller_signing_key == "\n"
+
+
+def test_the_caller_signing_key_reads_only_its_curie_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CONNECTOR_CALLER_SIGNING_KEY", _caller_seed())
+    assert WorkerConfig().connector_caller_signing_key == ""
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    assert WorkerConfig().connector_caller_signing_key == seed
+
+
+@pytest.mark.parametrize("raw", ["not base64!", base64.b64encode(b"short").decode()])
+def test_a_malformed_caller_signing_key_is_a_startup_error(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # Refusing at boot names the variable; minting at the first turn would fail
+    # every turn instead.
+    from curie_worker.config import CallerSigningKeyError
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", raw)
+    with pytest.raises(CallerSigningKeyError) as refused:
+        WorkerConfig()
+    assert "CURIE_CONNECTOR_CALLER_SIGNING_KEY" in str(refused.value)
+    assert raw not in str(refused.value)
+    assert refused.value.__cause__ is None and refused.value.__suppress_context__
+
+
+def test_the_caller_signing_key_stays_out_of_the_config_repr() -> None:
+    seed = _caller_seed()
+    config = WorkerConfig(connector_caller_signing_key=seed)
+    assert config.connector_caller_signing_key == seed
+    assert seed not in repr(config)
+
+
+def test_an_unrelated_validation_error_does_not_print_the_signing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A field-level failure only ever carries its OWN raw value, but a
+    # model-level ``@model_validator(mode="after")`` failure -- like the
+    # dead-letter-equals-stream guard below -- is handed pydantic's whole raw
+    # settings input as its error's context. With a valid signing key ALSO
+    # set, that context includes the key, and pydantic's default `str()`
+    # rendering prints it via `input_value=...`. `hide_input_in_errors`
+    # suppresses that clause from `str()`/`repr()` unconditionally, which is
+    # the only rendering anything in the worker actually prints today.
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    monkeypatch.setenv("CURIE_STREAM", "runs")
+    monkeypatch.setenv("CURIE_DEAD_LETTER_STREAM", "runs")
+
+    with pytest.raises(ValidationError) as refused:
+        WorkerConfig()
+
+    assert "CURIE_DEAD_LETTER_STREAM" in str(refused.value)
+    assert "input_value" not in str(refused.value)
+    assert seed not in str(refused.value)
+
+
 def test_quiesce_ttl_may_be_at_or_below_the_drain_wait() -> None:
     """#3127: the marker is a renewed lease while waiting, so the roll hold no
     longer has to outlast the drain wait; the chart caps it AT the wait."""
     for ttl in (60.0, 30.0):
         config = WorkerConfig(upgrade_drain_timeout_s=60.0, upgrade_quiesce_ttl_s=ttl)
         assert config.upgrade_quiesce_ttl_s == ttl
+
+
+def test_hook_claim_lease_defaults_to_the_delivery_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cron claim outlives its turn only while the delivery could still be
+    running; past the overall budget the turn is dead by construction (#2931)."""
+    _clear_all_config_env(monkeypatch)
+    config = _lease_config(delivery_budget_s=1800.0)
+    assert config.hook_claim_lease_s is None
+    assert config.effective_hook_claim_lease_s == 1800.0
+
+
+def test_hook_claim_lease_reads_its_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_HOOK_CLAIM_LEASE_S", "7200")
+    config = _lease_config(delivery_budget_s=600.0)
+    assert config.effective_hook_claim_lease_s == 7200.0
+
+
+def test_hook_claim_lease_shorter_than_the_budget_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease shorter than the longest turn would reclaim a live run."""
+    _clear_all_config_env(monkeypatch)
+    assert _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=600.0)
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=599.0)
+    assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)

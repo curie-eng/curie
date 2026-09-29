@@ -1,7 +1,9 @@
 """Reconnect supervision: backoff on drops, and graceful shutdown. No real socket."""
 
+import logging
 import threading
 
+import pytest
 from curie_dispatcher.supervisor import BackoffPolicy, Supervisor
 
 
@@ -112,3 +114,97 @@ def _wait_for(predicate: object, timeout: float) -> bool:
             return True
         time.sleep(0.01)
     return False
+
+
+def test_backoff_never_raises_however_many_attempts() -> None:
+    policy = BackoffPolicy(initial_seconds=1.0, max_seconds=30.0, multiplier=2.0)
+    # 2.0**1024 overflows a float; a revoked token reaches it in about 8.5 hours.
+    assert policy.delay(1024) == 30.0
+    assert policy.delay(10_000) == 30.0
+
+
+class _SignalOn(logging.Handler):
+    """Sets ``seen`` once a record containing ``needle`` is emitted."""
+
+    def __init__(self, needle: str) -> None:
+        super().__init__()
+        self.needle = needle
+        self.seen = threading.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.needle in record.getMessage():
+            self.seen.set()
+
+
+def _signalling_logger(name: str, needle: str) -> tuple[logging.Logger, _SignalOn]:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    signal = _SignalOn(needle)
+    logger.addHandler(signal)
+    return logger, signal
+
+
+def test_a_stop_during_a_long_backoff_returns_promptly() -> None:
+    def refused() -> BlockingConnection:
+        raise RuntimeError("app token revoked")
+
+    logger, backing_off = _signalling_logger("test-supervisor-backoff-stop", "reconnecting in")
+    supervisor = Supervisor(
+        refused,
+        backoff=BackoffPolicy(initial_seconds=60.0, max_seconds=60.0),
+        logger=logger,
+    )
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        thread.start()
+        assert backing_off.seen.wait(timeout=2.0)
+
+        supervisor.request_stop()
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+    finally:
+        logger.removeHandler(backing_off)
+
+
+def test_a_stop_that_arrives_while_connecting_is_not_lost() -> None:
+    conn = BlockingConnection()
+
+    def connect() -> BlockingConnection:
+        # The stop lands after the loop's check and before the connection runs.
+        supervisor.request_stop()
+        return conn
+
+    supervisor = Supervisor(connect, sleep=lambda _seconds: None)
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert not conn.ran
+    assert conn.closed
+
+
+class _CloseRaises(BlockingConnection):
+    def close(self) -> None:
+        super().close()
+        raise RuntimeError("close failed")
+
+
+def test_a_close_error_on_shutdown_names_the_identity(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("test-supervisor-close-error")
+    conn = _CloseRaises()
+    supervisor = Supervisor(
+        lambda: conn, logger=logger, label="Slack identity ops-bot", sleep=lambda _s: None
+    )
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        thread.start()
+        assert _wait_for(lambda: conn.ran, timeout=2.0)
+        supervisor.request_stop()
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    messages = [r.getMessage() for r in caplog.records if r.name == logger.name]
+    assert messages == ["Slack identity ops-bot: error closing connection during shutdown"]

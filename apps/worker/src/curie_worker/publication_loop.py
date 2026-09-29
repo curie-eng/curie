@@ -574,7 +574,10 @@ class PublicationReconciler:
             ),
             route=TargetRoute(
                 endpoint=ref.endpoint,
-                adapter=ref.adapter if ref.kind else result.route.adapter,
+                # An empty kind is a pre-identity ref. Its card was posted by
+                # the historical default transport, never by the later result
+                # route's identity.
+                adapter=ref.adapter if ref.kind else None,
             ),
             best_effort_unreachable=False,
         )

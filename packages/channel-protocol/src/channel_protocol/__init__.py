@@ -1,6 +1,11 @@
 """Rendering-neutral messages shared by Curie channel adapters."""
 
-from .identity import hook_conversation_id, scoped_conversation_id
+from .identity import (
+    ScopedConversation,
+    hook_conversation_id,
+    parse_scoped_conversation_id,
+    scoped_conversation_id,
+)
 from .models import (
     MESSAGE_VERSION,
     Action,
@@ -13,7 +18,18 @@ from .models import (
     MessageLink,
     OutboundMessage,
 )
+from .progress import (
+    MAX_PROGRESS_MILESTONES,
+    PROGRESS_COMMAND_VERSION,
+    TERMINAL_PROGRESS_STATES,
+    MilestoneClass,
+    ProgressCard,
+    ProgressCommand,
+    ProgressMilestone,
+    ProgressState,
+)
 from .reply import (
+    PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyAck,
@@ -27,8 +43,13 @@ from .reply import (
 )
 
 __all__ = [
+    "MAX_PROGRESS_MILESTONES",
     "MESSAGE_VERSION",
+    "PROGRESS_COMMAND_VERSION",
+    "PROGRESS_REPLY_WIRE_VERSION",
     "REPLY_WIRE_VERSION",
+    "TERMINAL_PROGRESS_STATES",
+    "ScopedConversation",
     "Action",
     "ChannelCapability",
     "ChannelCapabilities",
@@ -37,8 +58,13 @@ __all__ = [
     "InteractionIntent",
     "MessageField",
     "MessageLink",
+    "MilestoneClass",
     "NavAffordance",
     "OutboundMessage",
+    "ProgressCard",
+    "ProgressCommand",
+    "ProgressMilestone",
+    "ProgressState",
     "ReplyAck",
     "ReplyEvent",
     "ReplyPost",
@@ -48,5 +74,6 @@ __all__ = [
     "TurnCompleted",
     "TurnStatus",
     "hook_conversation_id",
+    "parse_scoped_conversation_id",
     "scoped_conversation_id",
 ]

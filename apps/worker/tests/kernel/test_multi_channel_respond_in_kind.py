@@ -97,7 +97,9 @@ class OneAgentTwoBindings:
             adapter=None,
         )
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
         self.resolve_calls.append((kind, address))
         if (kind, address) in (("slack", CHANNEL_A), ("slack", CHANNEL_B)):
             return self._deployment()
@@ -210,10 +212,15 @@ class RecordingSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         fresh_only: bool = False,
     ) -> Any:
         handle = self._inner.claim(
-            thread_key, env=env, agent_name=agent_name, fresh_only=fresh_only
+            thread_key,
+            env=env,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            fresh_only=fresh_only,
         )
         self.claims.append((thread_key, handle.sandbox_name))
         return handle

@@ -95,6 +95,14 @@ empty segments (a trailing comma, a doubled comma) are dropped rather than read
 as a match-anything entry, and a `From` header carrying a display name is matched
 on the bare address inside it.
 
+**The binding can carry the real list instead.** The platform checks the
+binding's own caller list (ADR 0175) after this adapter's gate, for every
+channel alike, and a list there is edited through the platform without a
+redeploy. An operator who keeps the list on the binding can set
+`CURIE_MAIL_ALLOWED_SENDERS=*` here; the provider-label check above still runs,
+and so do the provider's SPF, DKIM and DMARC checks. A binding list compares exact
+addresses only, so the DMARC caveats above apply to it unchanged.
+
 **Empty means deny everything, and it is refused at boot rather than served as
 deny-all.** With `ADAPTER_INGRESS_ENABLED=true` and no allow-list the process
 exits non-zero naming the variable. Allow-all is reachable only by writing `*`
@@ -109,6 +117,21 @@ message/thread id, or reply text. The message is left in the mailbox unmodified:
 nothing is deleted, labeled or bounced. So after widening the list, use the
 durable state and provider mailbox under the operator's PII controls, and ask the
 correspondent to resend. There is no replay or reprocess-on-widen mechanism.
+
+**Another inbox of this installation is admitted like any sender.** A second
+mail adapter is a second identity (ADR-0168), and one inbox answers another only
+if its address, or a domain entry that covers it, is on this list. The
+prerequisites above apply to its domain as to any other. The worker rate limits
+an exchange between two inboxes and drops the turn that passes the limit.
+
+**A dropped completion that recorded no text sends no mail, for any drop
+reason.** A dropped turn was never processed, so there is nothing of its own
+to reply with, and mailing the empty-reply notice would be a new message —
+from a sibling inbox, the next turn of the exchange the drop just ended. A
+dropped completion that did record text (an undeployed or paused agent's
+notice, say) still sends it, and a delivered completion with no text still
+sends the empty-reply notice as before; only a drop with nothing recorded is
+silent.
 
 ## Config surface (env vars)
 
@@ -222,6 +245,13 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   pending. A documented terminal 200, including a 200 duplicate receipt, settles
   it. Token rotation therefore restarts the single replica and resumes the
   original row rather than losing it.
+- **A caller-list refusal is final; any other 403 is not.** The channel port
+  answers 403 with `{"detail": "caller_not_allowed"}` when the binding's own
+  caller list does not admit the sender (ADR 0175). The adapter settles that
+  message without a turn, the same as one its own gate rejected, and never posts
+  it again; nothing is sent back to the sender. A 403 with any other body, such
+  as one from a proxy or firewall in front of the platform, leaves the delivery
+  pending and is retried like a 5xx.
 - **Provider failures are loud.** A TCP connection refusal while reading the
   provider thread witness or sending the reply returns 424 with
   `{"detail":"provider egress refused"}`. The worker stores that fixed cause on

@@ -1173,6 +1173,23 @@ class _OrderedTimeoutWireSession:
 
     async def receive_turn(self):
         if self.queries == 1:
+            if self.first_receive_entered.is_set() and any(
+                kind == "interrupt" for kind, _ in self.wire
+            ):
+                # The next turn's resync read of the abandoned first turn
+                # (#3425): the CLI ends a turn with its terminal result once it
+                # reads a written stop, whether or not the ack reached the runner.
+                self.wire.append(("drained", "first"))
+                yield ResultMessage(
+                    subtype="error_during_execution",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="sdk-session-PLACEHOLDER",
+                    result="",
+                )
+                return
             self.first_receive_entered.set()
             await self.end_first_receive.wait()
             return
@@ -1338,6 +1355,7 @@ def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> Non
         ("query", "first"),
         ("interrupt", 1),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
@@ -1365,6 +1383,7 @@ def test_timeout_cancelled_before_stop_write_uses_cleanup_before_next_query() ->
     assert session.wire == [
         ("query", "first"),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)

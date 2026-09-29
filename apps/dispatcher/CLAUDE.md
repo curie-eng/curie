@@ -11,6 +11,12 @@ summary.
   the worker (`apps/worker`). If you find yourself adding any
   decision about *how* a message gets answered, that decision belongs one
   layer up -- stop and move it, don't grow the dispatcher's scope.
+- **Caller admission is asked, never decided, here (ADR 0175).** Every
+  turn-starting lane asks the platform API (`admission.AdmissionGate`) after its
+  own filters and BEFORE the dedupe claim, so a refused caller gets no
+  placeholder. The dispatcher caches answers and fails closed on a cold miss
+  during an outage; it never compares caller ids itself, because the API's
+  `admission.admit` is the one decider.
 - **The queued-turn shape is the frozen `QueuedTurn` contract in `packages/`.**
   The dispatcher is the producer, but the payload it enqueues was promoted out
   of the dispatcher into the channel-neutral `aci_protocol.QueuedTurn` (issue

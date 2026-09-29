@@ -621,6 +621,9 @@ services:
       # BOTH surfaces and an operator had no shipped way to disable it.
       - CURIE_SHIMMER=${CURIE_SHIMMER:-true}
       - CURIE_STATUS_TEXT=${CURIE_STATUS_TEXT:-is working on your request...}
+      # The receipt beneath a turn's reply (ADR-0180): all, failures or off. The
+      # chart's worker.turnReceipt sets the same variable on a cluster install.
+      - CURIE_TURN_RECEIPT=${CURIE_TURN_RECEIPT:-all}
       # Fake model by default (no credential needed). `curie local up` reaches
       # skill-tier parity: when a credential (one of the bare names below) is set
       # in your SHELL it injects CURIE_FAKE_MODEL=0 automatically, so local goes

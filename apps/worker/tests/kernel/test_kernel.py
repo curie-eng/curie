@@ -94,7 +94,7 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
 
 
 class _HistoryBinding:
-    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
     def boot_env(
@@ -385,7 +385,7 @@ class _BuiltInCodingBinding:
         self.deployment_id = deployment_id
         self.workspace_enabled = workspace_enabled
 
-    async def resolve(self, _kind: str, _channel: str) -> object:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("22222222-2222-4222-8222-222222222222"),
             agent_name="test-agent",
@@ -889,8 +889,9 @@ def test_no_edit_streaming_final_carries_the_announcement(make_harness) -> None:
 def test_announcement_sits_between_answer_and_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A unit on the composition order: answer, announcement, receipt.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows: "RECEIPT")
+    # A unit on the composition order: answer, announcement, receipt. The stub
+    # takes the install's receipt mode too (ADR-0180), which the order ignores.
+    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
     announced = kernel_module._StreamAccumulator(
         text_parts=["answer"],
@@ -1094,7 +1095,9 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -1226,7 +1229,9 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -1881,7 +1886,9 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             self.workspace_enabled = True
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -1948,7 +1955,9 @@ def _workspace_binding(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -2312,14 +2321,15 @@ def test_a_job_never_steers_a_live_session(make_harness, make_hook_run) -> None:
                 hook_run=run.ref,
             )
 
-            for _ in range(5):
-                with pytest.raises(ThreadBusyError):
-                    await h.kernel.process_event(event)
+            # #2929: the fire is recorded deferred and the delivery settles;
+            # the scheduler, not stream reclaim, owns the retry.
+            await h.kernel.process_event(event)
 
             assert h.sink.text_posts == [], "a deferred job left a booting notice"
             assert h.runner.steers == [], "a job steered a live session"
             assert h.runner.opened == [], "a job opened a turn beside a live one"
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 
@@ -2365,18 +2375,18 @@ def test_an_unreadable_session_defers_the_job(make_harness, make_hook_run) -> No
             h.runner.turn_active = False
             h.runner.status_fails = True
 
-            with pytest.raises(ThreadBusyError):
-                await h.kernel.process_event(
-                    qevent(
-                        "digest",
-                        placeholder=None,
-                        source=TurnSource.CRON,
-                        hook_run=run.ref,
-                    )
+            await h.kernel.process_event(
+                qevent(
+                    "digest",
+                    placeholder=None,
+                    source=TurnSource.CRON,
+                    hook_run=run.ref,
                 )
+            )
 
             assert h.runner.opened == [], "an unreadable session let a job open a turn"
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 
@@ -2394,18 +2404,18 @@ def test_a_status_without_turn_active_defers_the_job(make_harness, make_hook_run
             h.runner.turn_active = False
             h.runner.status_malformed = True
 
-            with pytest.raises(ThreadBusyError):
-                await h.kernel.process_event(
-                    qevent(
-                        "digest",
-                        placeholder=None,
-                        source=TurnSource.CRON,
-                        hook_run=run.ref,
-                    )
+            await h.kernel.process_event(
+                qevent(
+                    "digest",
+                    placeholder=None,
+                    source=TurnSource.CRON,
+                    hook_run=run.ref,
                 )
+            )
 
             assert h.runner.opened == []
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 
@@ -3249,7 +3259,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     from curie_worker.sandbox.k8s import _claim_view
 
     class HistoryBinding:
-        async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+        async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
             return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
         def boot_env(
@@ -3406,12 +3416,13 @@ def test_quota_capacity_waits_for_external_headroom_before_retry(
                 pool: str,
                 env: dict[str, str] | None = None,
                 labels: dict[str, str] | None = None,
+                **kwargs: object,
             ) -> None:
                 capacity = h.fake_k8s.quota_claim_capacity
                 if not headroom_proved:
                     h.fake_k8s.quota_claim_capacity = None
                 try:
-                    original_create(name, pool=pool, env=env, labels=labels)
+                    original_create(name, pool=pool, env=env, labels=labels, **kwargs)
                 finally:
                     h.fake_k8s.quota_claim_capacity = capacity
 
@@ -4798,7 +4809,7 @@ class _TokenBinding:
         self._token = token
         self._agent_id = agent_id
 
-    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(self._agent_id)
 
     def boot_env(
@@ -4834,6 +4845,52 @@ def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
                 qevent(
                     "hi",
                     thread="tClusterMessageAdapter",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                )
+            )
+
+            routes = h.sink.routes_for("reply.update")
+            assert routes, "the completed turn emitted no reply update"
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+
+    asyncio.run(go())
+
+
+class _IdentityResolved(_FakeResolved):
+    """A Slack binding row as migration 0070 leaves every one: it names its
+    identity (ADR-0168 decision 5), ``default`` unless another app serves it."""
+
+    def __init__(self, agent_id: uuid.UUID) -> None:
+        super().__init__(agent_id)
+        self.adapter = "default"
+
+
+class _IdentityBinding(_TokenBinding):
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
+        return _IdentityResolved(self._agent_id)
+
+
+def test_reply_handle_relay_adapter_survives_a_binding_that_names_its_identity(
+    make_harness,
+) -> None:
+    """A ``curie cluster message`` turn replies through the relay on a 0070 row.
+
+    The turn keeps its Slack binding and selects the reserved relay adapter with
+    no endpoint. The binding row now names its Slack identity, and that identity
+    must not replace the relay: a relay turn routed to the Slack sink has no
+    endpoint, so it posts to real Slack with the install's token and the CLI
+    never hears the reply.
+    """
+
+    async def go() -> None:
+        binding = _IdentityBinding("tok-route", uuid.uuid4())
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                qevent(
+                    "hi",
+                    thread="tClusterMessageIdentity",
                     placeholder="123e4567-e89b-42d3-a456-426614174000",
                     adapter="curie-cluster-message",
                 )

@@ -11,6 +11,7 @@ import enum
 import secrets
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -24,6 +25,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -146,6 +148,10 @@ class Agent(Base):
     # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
     # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
     execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
+    # Per-agent runner cpu, memory, and ephemeral-storage (#3209). NULL means
+    # the chart agentSandbox.runner.resources block. A set value is applied on
+    # the next sandbox claim, not by resizing a sandbox that is already running.
+    runner_resources: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
@@ -240,9 +246,8 @@ class Agent(Base):
     # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
     # `created_at` to fall back on, so without an explicit order the serialized
     # list's element order is whatever Postgres happens to return, and two
-    # identical GETs could differ. `(kind, address)` is used because it is the
-    # pair every other layer already treats as the binding's identity
-    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
+    # identical GETs could differ. `(kind, address, adapter)` is used because it
+    # is the route every other layer keys by (`agent_channels_route_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
@@ -252,7 +257,7 @@ class Agent(Base):
     channels: Mapped[list[AgentChannel]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        order_by="(AgentChannel.kind, AgentChannel.address)",
+        order_by="(AgentChannel.kind, AgentChannel.address, AgentChannel.adapter)",
         lazy="selectin",
     )
 
@@ -271,7 +276,8 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running.
+    after the cutover proves no old worker is running. Migration 0070 widens the
+    key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
@@ -280,27 +286,39 @@ class AgentChannel(Base):
     PLACE, and `POST /channels/token` bumps it on every mint, so the row id is a
     stable identity and the generation is the only thing that makes a rebind or
     remint observable to a credential minted before it.
+
+    `allowed_callers` (ADR 0175, migration 0068) is who may start a turn through
+    this binding: NULL for everyone, else the exact caller ids `admission.admit`
+    matches. It is written only by its own endpoint, which leaves `generation`
+    alone, because who may use a route is a separate question from the route.
     """
 
     __tablename__ = "agent_channels"
     __table_args__ = (
-        # One agent per ROUTE, the `(kind, address)` pair (#38, widened from
-        # migration 0021's address-only `agent_channels_address_key` by 0023).
-        # The worker resolves a pair to an agent, so a second agent bound to the
-        # same pair could never respond -- it would be silently shadowed.
-        # Enforced here so it fails at create time.
-        #
-        # The pair, not the address alone, ONLY because the resolver now sees the
-        # pair too (`binding._RESOLVE_SQL`). Widening this while any address-only
-        # consumer can still run re-opens the exact ambiguity the constraint
-        # exists to close, which is why the cutover proves no old worker pod is
-        # running before migration 0023 applies.
-        UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
+        # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
+        # decision 3, migration 0070; 0023 keyed the pair, 0021 the address).
+        # A second agent bound to the same route could never respond -- it
+        # would be silently shadowed (#38). Enforced here so it fails at create
+        # time. The pair leads so `(kind, address)` lookups keep the index
+        # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
+        # colliding on the pair.
+        UniqueConstraint(
+            "kind",
+            "address",
+            "adapter",
+            name="agent_channels_route_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
+            "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
+            name="agent_channels_route_ck",
+        ),
         # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
         # hold more than one binding now. ADR-0089's "one agent still binds one
-        # channel" is amended in part -- the (kind, address) constraint above is
-        # still what stops two agents claiming the same channel; nothing stops
-        # one agent from claiming several.
+        # channel" is amended in part -- the route key above is what stops two
+        # agents claiming the same route; nothing stops one agent from claiming
+        # several.
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
@@ -316,17 +334,27 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
-    # The server-controlled reply route (migration 0024). Both NULL for `slack`,
-    # whose route is the worker's configured Slack origin; both set together for
-    # any other kind -- `agent_channels_route_pair_ck` states that invariant at
-    # the database so a half-configured route cannot be written out of band.
+    # The reply route (migration 0024) and, for `slack`, the bot identity
+    # (ADR-0168 decision 3): a Slack row names its identity in `adapter` and has
+    # no `endpoint`; any other kind sets both or neither.
+    # `agent_channels_route_ck` states it at the database so a half-configured
+    # route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
-    # Rotation counter (ADR-0096 D5, #2379). Bumped on every binding write,
-    # including one that changes nothing, and on every `POST /channels/token`
-    # mint: re-asserting a binding or reminting its credential both invalidate
-    # outstanding tokens.
+    # Rotation counter (ADR-0096 D5, #2379). Bumped on every write to the ROUTE
+    # (a move or re-assert through `update_channel_binding`, including one that
+    # changes nothing) and on every `POST /channels/token` mint: re-asserting a
+    # binding or reminting its credential both invalidate outstanding tokens.
+    # Editing `allowed_callers` below does NOT bump it (ADR 0175 decision 4).
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
+    # Who may start a turn through this binding (ADR 0175, migration 0068).
+    # NULL means everyone; a list is never empty (the API refuses it and
+    # `agent_channels_allowed_callers_ck` states it at the database).
+    # `none_as_null` is load-bearing: without it a Python None is stored as the
+    # JSON value `null`, which is not SQL NULL and fails that CHECK.
+    allowed_callers: Mapped[list[str] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="channels")
 
@@ -1075,6 +1103,59 @@ class ExecutionRequestPhaseReport(Base):
     )
 
 
+class ExecutionRequestModelUsage(Base):
+    """Token usage of one model in one turn of a request, with its estimate (#3223).
+
+    Cost, price source, and price time are all NULL or all set: an unpriced
+    model keeps its tokens with no estimate.
+    """
+
+    __tablename__ = "execution_request_model_usage"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('implementer', 'reviewer')",
+            name="execution_request_model_usage_role_ck",
+        ),
+        CheckConstraint(
+            "input_tokens >= 0 AND cached_input_tokens >= 0 "
+            "AND cache_write_tokens >= 0 AND output_tokens >= 0",
+            name="execution_request_model_usage_tokens_ck",
+        ),
+        CheckConstraint(
+            "(estimated_cost_usd IS NULL AND price_source IS NULL AND price_as_of IS NULL) "
+            "OR (estimated_cost_usd IS NOT NULL AND estimated_cost_usd >= 0 "
+            "AND price_source IS NOT NULL AND price_as_of IS NOT NULL)",
+            name="execution_request_model_usage_price_ck",
+        ),
+        UniqueConstraint(
+            "execution_request_id",
+            "turn_id",
+            "model",
+            "role",
+            name="execution_request_model_usage_turn_model_role_key",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger)
+    output_tokens: Mapped[int] = mapped_column(BigInteger)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6), default=None)
+    price_source: Mapped[str | None] = mapped_column(Text, default=None)
+    price_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
 class PublicationReviewReservation(Base):
     """One review origin's claim on the existing publication revision writer."""
 
@@ -1434,7 +1515,8 @@ class ApprovalAuditEntry(Base):
     approval_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"), index=True
     )
-    # What happened: resolved / denied / race_lost / expired.
+    # What happened: resolved / denied / race_lost / expired / reraise_refused
+    # (a re-raise of this rejected approval refused, #2885).
     action: Mapped[str]
     actor: Mapped[str]
     actor_channel: Mapped[str | None] = mapped_column(default=None)
@@ -1709,6 +1791,20 @@ class ConsoleSession(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ScheduleControl(Base):
+    """Operator pause state for one agent and named cron hook."""
+
+    __tablename__ = "schedule_controls"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resume_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 
@@ -1721,7 +1817,8 @@ class HookRun(Base):
             name="hook_runs_agent_name_slot_key",
         ),
         CheckConstraint(
-            "outcome IS NULL OR outcome IN ('ran', 'skipped', 'blocked', 'failed')",
+            "outcome IS NULL OR outcome IN "
+            "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
     )
@@ -1742,6 +1839,8 @@ class HookRun(Base):
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # When an open claim becomes reclaimable by the hook's next fire (#2931).
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Tenant(Base):
