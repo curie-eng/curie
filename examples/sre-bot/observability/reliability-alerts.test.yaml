@@ -510,9 +510,10 @@ tests:
               summary: Slack Email alert intake is not ready
               description: >-
                 The opt-in Slack Email intake has not completed a scan within
-                two poll intervals, has no ready replica, was scaled to zero,
-                or disappeared after previously being deployed. Alert emails
-                may not be starting SRE turns in their source threads.
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
 
   - name: healthy Slack Email intake stays quiet
     interval: 1m
@@ -557,9 +558,10 @@ tests:
               summary: Slack Email alert intake is not ready
               description: >-
                 The opt-in Slack Email intake has not completed a scan within
-                two poll intervals, has no ready replica, was scaled to zero,
-                or disappeared after previously being deployed. Alert emails
-                may not be starting SRE turns in their source threads.
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
 
   - name: first Slack Email intake restart sample fires
     interval: 1m

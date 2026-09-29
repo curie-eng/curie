@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -268,6 +269,7 @@ def test_scan_processes_matching_roots_oldest_first(
     env(monkeypatch)
     newer = root("1790707000.000000")
     older = root("1790706000.000000")
+    monkeypatch.setenv("SLACK_CANARY_THREAD_TS", older["ts"])
     hook = FakeHook()
 
     intake.scan_once(intake.Config.from_env(), FakeSlack([newer, older]), hook, now=1790707100.0)
@@ -359,4 +361,4 @@ def test_automated_email_alert_turns_are_standing_read_only_policy() -> None:
     section = skill.split("<!-- @spec SRE-EMAIL-2 -->", 1)[1]
     assert "automated email alert" in section.lower()
     assert "read tools only" in section.lower()
-    assert "never request approval" in section.lower()
+    assert re.search(r"never\s+request approval", section, re.IGNORECASE)
