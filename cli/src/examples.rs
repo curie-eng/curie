@@ -1588,7 +1588,7 @@ async fn run_install_command(
         .args(&args)
         .output()
         .await
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", command.program))?;
+        .map_err(|error| crate::ops::command_io_error(command.program, error))?;
     if output.status.success() {
         return Ok(());
     }

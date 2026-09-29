@@ -3696,7 +3696,7 @@ impl RunningInstall {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+            .map_err(|error| command_io_error(&cmd.program, error))?;
         let mut stdout = child
             .stdout
             .take()
@@ -3736,9 +3736,7 @@ impl RunningInstall {
                         "failed to stop Helm after status error: {cleanup_error}"
                     ));
                 }
-                return Err(error).with_context(|| {
-                    format!("failed to invoke `{}`; is it on PATH?", self.program)
-                });
+                return Err(command_io_error(&self.program, error));
             }
         };
         let stdout = self

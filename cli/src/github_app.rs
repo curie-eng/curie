@@ -1117,7 +1117,7 @@ async fn create_sandbox_inner(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("failed to invoke `kubectl`; is it on PATH?")?;
+        .map_err(|error| crate::ops::command_io_error("kubectl", error))?;
     let mut stdin = child
         .stdin
         .take()
