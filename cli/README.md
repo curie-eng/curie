@@ -114,6 +114,10 @@ state on stdout --
   ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
   approval card rather than finalizing, and `reply` is the card's placeholder
   text if seen);
+- deliberate progress (a progress card or milestone, ADR-0130) is never
+  `reply` in any of these states: the Slack stub tells it by the block ids
+  frozen in `tests/vectors/progress-blocks.json`, the cluster relay by its
+  `progress` field, and both show it as a status line at most;
 - a **timeout** emits `{"reply": null, "finalized": false,
   "timed_out": true}` before exiting 3 (transient);
 - a turn **enqueued** onto the real Valkey stream in connected transport mode

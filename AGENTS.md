@@ -557,6 +557,13 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- worker vs CLI progress block ids -- the Slack progress card and milestone
+  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
+  edit from the turn's answer, can't share code across Python/Rust, so they are
+  frozen together in `tests/vectors/progress-blocks.json`.
+  [vector: `tests/vectors/progress-blocks.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in

@@ -515,10 +515,26 @@ delivery is impossible, and nothing below claims it. An adapter may claim the
 property only when its receiving boundary applies `event_id` idempotently or the
 adapter mutates one stable target.
 
+Slack has two verbs here and only one of them takes a key. `chat.update` takes
+none, so an edit is idempotent by its stable target. `chat.postMessage` takes
+`client_msg_id`, which is how the approval card has always survived an
+ambiguous retry, and every create that carries a reply wire 1.1 `delivery_id`
+now passes it there too (ADR-0130 section 4). What Slack answers the second
+`chat.postMessage` of a `client_msg_id` it has already accepted is not measured
+yet. `apps/worker/src/curie_worker/slack_sink.py::_adopt_posted_ts` is the one
+place that answer is read: it takes the `ts` of an ok response, and an error
+still raises, so the delivery is retried with the same `delivery_id` rather
+than guessed at. `apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`
+measures it, and the rows below that depend on it say so.
+
 | Adapter / path | Receiving boundary | Idempotent apply? | Claim |
 |---|---|---|---|
-| `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes — by **stable target**, not by `event_id`; Slack exposes no idempotency key. | One user-visible terminal effect per `event_id`. |
-| `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn) | `chat.postMessage` — a **create**, not a mutation, until the minted ts is adopted as the turn's ref. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
+| `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes, by **stable target**, not by `event_id`: `chat.update` takes no idempotency key. | One user-visible terminal effect per `event_id`. |
+| `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn), 1.0 body | `chat.postMessage`, a **create**, not a mutation, until the minted ts is adopted as the turn's ref. A 1.0 body carries no `delivery_id`, so the post carries no `client_msg_id`. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
+| `SlackReplyAdapter`, placeholder-less turn, 1.1 body carrying `delivery_id` | The same `chat.postMessage`, with `client_msg_id` set to the `delivery_id`. | Slack deduplicates by `client_msg_id`; what it answers the duplicate is unmeasured (above). | One visible answer message per `delivery_id`, pending that measurement. Until then an ok answer's `ts` is taken as given and an error is raised for the retry, so nothing is inferred about what Slack did. |
+| `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | `chat.postMessage` with `client_msg_id` set to the approval's own UUID. A 1.1 body's `delivery_id` does not replace it: the approval id is already the card's durable identity, and the CLI stub reads it back from `client_msg_id` (`cli/src/chat.rs::approval_card_id`). | Slack deduplicates by `client_msg_id`, as above. | One visible card per approval id, on the same measurement. |
+| `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`, as above. | One visible card or milestone per `delivery_id`, on the same measurement. |
+| `SlackReplyAdapter`, progress edit (`reply.update` carrying `progress`) | `chat.update` on the card's own ts, the `ref` acknowledged for its first post, never the placeholder's. Never the answer path, and never the approval card's settle path. | Yes, by **stable target**. The `delivery_id` has no Slack expression on an edit. | One visible card whatever the retry count. Which revision shows last is the coordinator's order, because Slack keeps the last edit it received. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
 
@@ -703,6 +719,57 @@ delivery written after it.
   opened.
 - `inbox_cursor` is created empty for the ingress to record how far it has
   applied its commands. Nothing advances it until the ingress exists.
+
+### How the Slack adapter renders progress
+
+`SlackReplyAdapter.emit` is ADR-0130's Slack adapter path. It checks `progress`
+before anything else on both events, so a progress body never reaches the
+answer path, the placeholder, or the approval card's settle path. The Block Kit
+comes from `apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, and nothing else
+builds a progress block.
+
+- **A card's first revision** (`reply.post`, `progress.kind == "card"`) is posted
+  into the turn's thread with `client_msg_id` set to its `delivery_id`, and the
+  `ts` Slack answers is the `ref` the coordinator records as the card's ref.
+- **A later revision** (`reply.update` carrying `progress`) is a `chat.update`
+  of `target.reply_ref`, the card's ref. One without a ref raises, because there
+  is no card to edit and posting a second one would break the one-card rule.
+- **A milestone** (`reply.post`, `progress.kind == "milestone"`) is a new message
+  in the thread, posted the way a card's first revision is. It is never edited.
+
+What a reader sees:
+
+- The card states its state in plain words (`queued` reads "Queued",
+  `awaiting-approval` "Waiting for approval", `preparing-workspace` "Preparing
+  the workspace") and then the summary. An open card reads "Task status:
+  <state>". A terminal card reads "Task complete", "Task failed" or "Task
+  cancelled" and adds a closing line saying the card will not change again, so
+  a closed card is visibly closed when the final answer arrives beneath it.
+- A milestone names its class ("Evidence acquired", "Scope changed",
+  "Verification result") and then the summary.
+- Every text element either builder renders is `plain_text` with `emoji`
+  false, never `mrkdwn`. A summary is model-authored, and Slack reads mentions
+  and emoji codes out of `mrkdwn` only, so `<!channel>` or `<@U0EXAMPLE1>` in a
+  summary is shown as those characters and pings nobody. The message's `text` fallback, which
+  Slack does parse, is the channel-neutral `progress_text` with `&`, `<` and
+  `>` escaped the way Slack's formatting reference requires. Neither adds an
+  emoji.
+- A rejected Block Kit payload falls back to text only, like every other
+  Slack path here. For an edit that fallback sends an empty `blocks` list,
+  because Slack keeps a message's previous blocks when an update omits them,
+  and a stale card would otherwise stay on screen under a changed fallback.
+
+Every block either builder renders carries a stable `block_id` prefix:
+`curie-progress-card:` for a card and `curie-progress-milestone:` for a
+milestone. A card's ids also carry its revision, because Slack asks for a new
+`block_id` on each iteration of an updated message. The prefixes are frozen in
+[`tests/vectors/progress-blocks.json`](../../tests/vectors/progress-blocks.json)
+with the CLI's Slack stub (`cli/src/chat.rs`), which uses them to tell a
+progress post or edit from the turn's answer: a progress call is shown as a
+status line at most, and never becomes the reply `local message`, `cluster
+message` or local eval report. Changing a prefix means changing that file, and
+both lanes' tests fail until it is.
 
 ## The sandbox substrate (`curie_worker.sandbox`)
 
