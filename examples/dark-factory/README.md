@@ -198,6 +198,7 @@ Measure writable disk use in a runner pod after the frozen installs:
 
 ```bash
 du -sh /workspace/.venv /workspace/.cache/uv /workspace/.cargo \
+  /workspace/.cargo-target \
   /workspace/apps/ui/node_modules "$HOME/.local/share/pnpm" 2>/dev/null
 ```
 
