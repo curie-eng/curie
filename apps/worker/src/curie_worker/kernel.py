@@ -172,12 +172,14 @@ from .sibling_turns import SIBLING_LIMIT_NOTICE, SiblingLimitReason, SiblingTurn
 from .slack_tokens import token_identity
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .turn_progress import (
+    ELIGIBILITY_ENV,
     ProgressPump,
     TurnProgressPlan,
     activate_turn_progress,
     deactivate_turn_progress,
     link_progress_resume,
     plan_turn_progress,
+    progress_eligible,
     start_progress_pump,
 )
 from .workitem_dispatch import (
@@ -2820,6 +2822,19 @@ class Kernel:
             if owned_work_item_id is not None and boot_env is not None:
                 boot_env[MAX_TURNS_ENV] = str(self._config.work_item_max_turns)
 
+            # ADR 0130: the tool and its prompt are part of the sandbox's model
+            # surface, so only an eligible human Slack sandbox gets the boot
+            # marker. _boots_differently fences adoption across this boundary.
+            factory_work_item = self._is_factory_work_item_turn(event_id)
+            if (
+                self._progress is not None
+                and self._config.api_key
+                and progress_eligible(qevent, factory_work_item=factory_work_item)
+            ):
+                if boot_env is None:
+                    boot_env = {}
+                boot_env[ELIGIBILITY_ENV] = "1"
+
             # ADR-0131 reclaim preflight. A delivery that has CHANGED HANDS --
             # generation > 1, a distributed-state fact and never a sniff of the
             # message text, so kernel rule 3 stands -- may not simply route: the
@@ -2852,7 +2867,7 @@ class Kernel:
                         self._progress,
                         qevent,
                         thread_key,
-                        factory_work_item=self._is_factory_work_item_turn(event_id),
+                        factory_work_item=factory_work_item,
                         resume=self._is_approval_resume(event_id),
                     )
                 )

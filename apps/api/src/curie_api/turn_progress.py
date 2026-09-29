@@ -100,6 +100,11 @@ def inbox_fields(body: TurnProgressBody) -> dict[str, str]:
 # be orphaned from the maintenance drainer by an API crash between writes.
 _APPEND_LUA = """
 if redis.call('HGET', KEYS[3], 'active_generation') ~= ARGV[4] then return false end
+local active_until_ms = tonumber(redis.call('HGET', KEYS[3], 'active_until_ms'))
+if active_until_ms == nil then return false end
+local now_parts = redis.call('TIME')
+local now_ms = tonumber(now_parts[1]) * 1000 + math.floor(tonumber(now_parts[2]) / 1000)
+if now_ms >= active_until_ms then return false end
 local id = redis.call('XADD', KEYS[1], 'MAXLEN', ARGV[1], '*',
   'command', ARGV[3], 'generation', ARGV[4], 'seq', ARGV[5])
 redis.call('SADD', KEYS[2], ARGV[6])

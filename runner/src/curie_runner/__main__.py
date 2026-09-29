@@ -100,6 +100,7 @@ from .turn_progress import (
     TurnProgress,
     build_turn_progress_tool,
     should_mount_turn_progress,
+    turn_progress_enabled,
 )
 from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
@@ -449,13 +450,13 @@ def build_runner(
     except ValueError as exc:
         logger.warning("report_progress not mounted: %s", exc)
         progress = None
-    # Deliberate progress (ADR 0130): every other session mounts the platform
-    # ``progress`` tool and carries its prompt block. Its capability arrives per
-    # turn on /v1/event, so a session that is never handed one gets only the
-    # tool's soft "not shown" answer.
+    # Deliberate progress (ADR 0130): only a worker-selected human Slack
+    # sandbox mounts the platform tool and prompt. The boot flag is part of the
+    # sandbox identity; per-turn headers still carry the actual authority.
     turn_progress = (
         TurnProgress()
         if should_mount_turn_progress(
+            eligible=turn_progress_enabled(os.environ),
             factory_progress_requested=factory_requested,
             factory_progress_resolved=progress is not None,
         )

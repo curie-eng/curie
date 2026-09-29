@@ -83,6 +83,10 @@ PROGRESS_SWEEP_BATCH: Final = 64
 PROGRESS_SWEEP_BUDGET_S: Final = 30.0
 PROGRESS_SWEEP_GRACE_S: Final = 60.0
 PROGRESS_MAX_ATTEMPTS: Final = 5
+# A failed best-effort end-turn write must not leave the turn token useful for
+# the record's 14-day lifetime. This small grace covers response teardown after
+# the runner's own request ceiling.
+PROGRESS_ACTIVE_GRACE_S: Final = 30.0
 
 # The fencing generation field of the ADR-0131 delivery state hash, which
 # ``delivery_lease.py`` HINCRBYs on every change of authority. The fenced-write
@@ -123,7 +127,7 @@ redis.call('HSET', KEYS[1],
   'state', '', 'summary', '', 'revision', '0', 'epoch', '0', 'last_seq', '0',
   'milestones_used', '0', 'card_ref', '', 'answer_ref', ARGV[2], 'terminal', '0',
   'inbox_cursor', '', 'update_count', '0', 'turn_generation', '0',
-  'active_generation', '0')
+  'active_generation', '0', 'active_until_ms', '0')
 redis.call('EXPIRE', KEYS[1], ARGV[1])
 return 1
 """
@@ -131,14 +135,19 @@ return 1
 _BEGIN_TURN_LUA = """
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 local generation = redis.call('HINCRBY', KEYS[1], 'turn_generation', 1)
-redis.call('HSET', KEYS[1], 'active_generation', tostring(generation))
+local now_parts = redis.call('TIME')
+local now_ms = tonumber(now_parts[1]) * 1000 + math.floor(tonumber(now_parts[2]) / 1000)
+local active_until_ms = now_ms + tonumber(ARGV[2])
+redis.call('HSET', KEYS[1],
+  'active_generation', tostring(generation),
+  'active_until_ms', tostring(active_until_ms))
 redis.call('EXPIRE', KEYS[1], ARGV[1])
 return generation
 """
 
 _END_TURN_LUA = """
 if redis.call('HGET', KEYS[1], 'active_generation') ~= ARGV[1] then return 0 end
-redis.call('HSET', KEYS[1], 'active_generation', '0')
+redis.call('HSET', KEYS[1], 'active_generation', '0', 'active_until_ms', '0')
 return 1
 """
 
@@ -408,6 +417,7 @@ class ProgressRecord:
     update_count: int
     turn_generation: int
     active_generation: int
+    active_until_ms: int
 
 
 @dataclass(frozen=True)
@@ -527,6 +537,7 @@ class ProgressStore:
                 update_count=int(fields["update_count"]),
                 turn_generation=int(fields["turn_generation"]),
                 active_generation=int(fields["active_generation"]),
+                active_until_ms=int(fields["active_until_ms"]),
             )
         except (KeyError, ValueError) as exc:
             raise MalformedProgressError(f"progress record {progress_id}: {exc!r}") from exc
@@ -542,6 +553,11 @@ class ProgressStore:
                 1,
                 self._config.progress_key(progress_id),
                 str(progress_ttl_s(self._config)),
+                str(
+                    int(
+                        (self._config.runner_total_timeout_s + PROGRESS_ACTIVE_GRACE_S) * 1000
+                    )
+                ),
             )
         )
         if generation < 1:

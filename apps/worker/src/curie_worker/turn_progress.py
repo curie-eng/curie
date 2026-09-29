@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 URL_HEADER: Final = "X-Curie-Progress-Url"
 TOKEN_HEADER: Final = "X-Curie-Progress-Token"
 GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
+ELIGIBILITY_ENV: Final = "CURIE_TURN_PROGRESS_ENABLED"
 TOKEN_SCOPE: Final = "turn.progress"
 ROUTE: Final = "/v1/turn-progress/{progress_id}"
 

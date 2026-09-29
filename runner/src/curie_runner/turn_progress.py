@@ -35,6 +35,7 @@ PROGRESS_URL_HEADER: Final = "X-Curie-Progress-Url"
 PROGRESS_TOKEN_HEADER: Final = "X-Curie-Progress-Token"
 PROGRESS_GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
 PROGRESS_TOKEN_REQUEST_HEADER: Final = "X-API-Key"
+TURN_PROGRESS_ELIGIBILITY_ENV: Final = "CURIE_TURN_PROGRESS_ENABLED"
 TURN_PROGRESS_TOOL: Final = "progress"
 PROGRESS_COMMAND_VERSION: Final = "1.0"
 _TIMEOUT_SECONDS: Final = 5.0
@@ -154,16 +155,22 @@ class ProgressCapability:
         return cls(url=url, token=token, generation=generation)
 
 
+def turn_progress_enabled(env: Mapping[str, str]) -> bool:
+    """Whether this sandbox boot was explicitly selected for deliberate progress."""
+
+    return env.get(TURN_PROGRESS_ELIGIBILITY_ENV) == "1"
+
+
 def should_mount_turn_progress(
-    *, factory_progress_requested: bool, factory_progress_resolved: bool
+    *, eligible: bool, factory_progress_requested: bool, factory_progress_resolved: bool
 ) -> bool:
-    """Whether this boot is an ordinary session rather than any factory boot.
+    """Whether this eligible boot is not any kind of factory boot.
 
     A malformed or incomplete factory declaration must fail closed: falling
     back to deliberate progress would expose the wrong platform tool.
     """
 
-    return not factory_progress_requested and not factory_progress_resolved
+    return eligible and not factory_progress_requested and not factory_progress_resolved
 
 
 def _result(text: str, *, is_error: bool = False) -> dict[str, Any]:
