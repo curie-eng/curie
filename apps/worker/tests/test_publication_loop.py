@@ -9,7 +9,7 @@ import os
 import threading
 import uuid
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -160,6 +160,7 @@ class _Store:
         result = {
             "resolved_by": None,
             "resolution_note": None,
+            "resolved_at": None,
             **value,
         }
         return SimpleNamespace(
@@ -1916,15 +1917,19 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     decision: str | None,
     text_fragment: str,
 ) -> None:
+    from curie_worker.approvals import decided_at
+
     cards = _Cards()
     loop, store, _, _, _, replies = _loop(publication, cards)
     cards.ref = _card()
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
     store.pending[PUBLICATION_ID] = {
         "outcome": outcome,
         "pr_url": pr_url,
         "error": error,
         "resolved_by": RESOLVER if decision is not None else None,
         "resolution_note": RESOLUTION_NOTE if decision is not None else None,
+        "resolved_at": decided if decision is not None else None,
     }
 
     await loop.deliver_pending_result(PUBLICATION_ID)
@@ -1941,6 +1946,9 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     assert card_update.settled.note == (
         RESOLUTION_NOTE if decision is not None else None
     )
+    # ADR-0179 decision 1: the publication rebuild keeps the time the click
+    # stamped, read off the same row; an expiry has no decision time.
+    assert decided_at(card_update.message) == (decided if decision is not None else None)
     assert card_route == TargetRoute(endpoint=None, adapter=None)
     assert cards.ref is None
     assert cards.restored == []

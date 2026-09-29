@@ -49,6 +49,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
+from .approvals import decided_at
 from .behaviorpacks import NavPack
 from .blocks import approval_card, expired_approval_card, render, resolved_approval_card
 
@@ -727,9 +728,13 @@ class SlackReplyAdapter:
         # the adapter picks the Slack form. No decision means nobody made one,
         # which is the expiry form (#419); a decision means the resolved form
         # (#1084), rendered by the SAME function the dispatcher's click path is
-        # pinned against, so an API resolve and a click settle a card alike.
+        # pinned against, so an API resolve and a click settle a card alike. The
+        # decision time rides the message's ``Decided`` field (ADR-0179).
         if settled is None or settled.decision is None:
-            text, blocks = expired_approval_card(summary=message.text)
+            text, blocks = expired_approval_card(
+                summary=message.text,
+                requested_by=settled.requested_by if settled is not None else "",
+            )
         else:
             text, blocks = resolved_approval_card(
                 summary=message.text,
@@ -737,6 +742,7 @@ class SlackReplyAdapter:
                 decision=settled.decision,
                 resolver=settled.resolver or "",
                 note=settled.note,
+                resolved_at=decided_at(message),
             )
 
         # A rejected Block Kit payload falls back to text-only, mirroring

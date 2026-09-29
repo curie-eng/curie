@@ -16,6 +16,7 @@ import json
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -227,6 +228,137 @@ def test_reject_button_resolves_with_rejected_decision(
 
     assert resolver.calls[0]["decision"] == "rejected"
     assert "Rejected by <@U_MANAGER>" in web_client.chat_update.call_args.kwargs["text"]
+
+
+# The decision instant the settled-card tests pin, and the Slack date token it
+# renders as. Slack documents the token as ``<!date^unix^token_string|fallback>``,
+# rendered in the reader's own time zone and only inside ``mrkdwn`` text objects
+# ("Date formatting", https://docs.slack.dev/messaging/formatting-message-text).
+_DECIDED = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+_DECIDED_TOKEN = "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
+
+
+@pytest.mark.parametrize(
+    ("action_id", "decision", "header"),
+    [(APPROVE_ACTION_ID, "approved", "Approved"), (REJECT_ACTION_ID, "rejected", "Rejected")],
+)
+def test_a_click_heads_the_card_with_its_outcome_and_stamps_the_decision_time(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    action_id: str,
+    decision: str,
+    header: str,
+) -> None:
+    """ADR-0179 decision 1: once resolved, the card is a record, not a request.
+
+    The header states the outcome, the summary stays, and the verdict line
+    carries the time the API recorded, so a reader later can tell from the card
+    alone whether it was approved, by whom and when.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=200,
+            resolved_by="U_MANAGER",
+            decision=decision,
+            resolved_at=_DECIDED,
+        )
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _approval_click("env-t1", action_id=action_id))
+    _drain(app)
+
+    blocks = web_client.chat_update.call_args.kwargs["blocks"]
+    assert blocks[0]["type"] == "header"
+    assert blocks[0]["text"]["text"] == header
+    assert blocks[1]["text"]["text"] == "Discount for ACME", "the summary must survive"
+    assert blocks[-1] == {
+        "type": "context",
+        "elements": [
+            {"type": "mrkdwn", "text": f"{header} by <@U_MANAGER> on {_DECIDED_TOKEN}"}
+        ],
+    }
+
+
+def test_a_claim_race_refresh_keeps_the_header_it_read(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The secondary path of ADR-0179 decision 1: a 409 names who won, not how.
+
+    The refresh exists to take stale buttons down. Without the outcome in hand it
+    must not invent a header, so it leaves the one it read.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=409, detail="already resolved by U_FIRST (approved)")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(
+        FakeSocketClient(),
+        _approval_click("env-l2", action_id=APPROVE_ACTION_ID, user="U_SECOND"),
+    )
+    _drain(app)
+
+    blocks = web_client.chat_update.call_args.kwargs["blocks"]
+    assert blocks[0]["text"]["text"] == "Approval required"
+
+
+class _ResolvedAtResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+
+class _ResolvedAtClient:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def post(
+        self, url: str, *, json: dict[str, Any], headers: dict[str, str]
+    ) -> _ResolvedAtResponse:
+        return _ResolvedAtResponse(self._body)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # ``ApprovalOut.resolved_at`` is the row's naive UTC instant, which the
+        # API serializes with no offset: ``crud.py`` writes ``func.now()`` into a
+        # ``timestamp without time zone`` column, like every instant on that row.
+        ("2026-09-21T14:13:20", _DECIDED),
+        ("2026-09-21T14:13:20.250000", _DECIDED.replace(microsecond=250000)),
+        ("2026-09-21T16:13:20+02:00", _DECIDED),
+        (None, None),
+        ("not a time", None),
+    ],
+)
+def test_resolve_reads_the_decision_time_off_the_response(
+    raw: str | None, expected: datetime | None
+) -> None:
+    body: dict[str, Any] = {"status": "approved", "resolved_by": "U_MANAGER"}
+    if raw is not None:
+        body["resolved_at"] = raw
+    resolver = ApprovalResolveClient(
+        api_base_url="https://api.example.test",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        client=_ResolvedAtClient(body),  # type: ignore[arg-type]
+    )
+
+    outcome = resolver.resolve(
+        APPROVAL_ID, decision="approved", attested_user="U_MANAGER", attested_channel="C_MGRS"
+    )
+
+    assert outcome.resolved_at == expected
 
 
 def test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action(
@@ -1031,3 +1163,28 @@ def test_a_plain_note_is_unchanged() -> None:
     line = settled_verdict_line(decision="rejected", resolver="U1", note="discount exceeds policy")
 
     assert "Note: discount exceeds policy" in line
+
+
+def test_the_verdict_line_names_the_resolver_and_the_decision_time() -> None:
+    """ADR-0179 decision 1: who decided, and when, as Slack's date token."""
+    line = settled_verdict_line(
+        decision="approved", resolver="U_MANAGER", note="approved for Q3", resolved_at=_DECIDED
+    )
+
+    assert line == f"Approved by <@U_MANAGER> on {_DECIDED_TOKEN}\nNote: approved for Q3"
+
+
+def test_a_naive_decision_time_is_read_as_utc() -> None:
+    """The approval row stores naive UTC, so a naive instant must not shift."""
+    naive = settled_verdict_line(
+        decision="rejected", resolver="U1", note=None, resolved_at=_DECIDED.replace(tzinfo=None)
+    )
+
+    assert naive == f"Rejected by <@U1> on {_DECIDED_TOKEN}"
+
+
+def test_a_verdict_with_no_decision_time_keeps_the_bare_attribution() -> None:
+    """No readable time is shown as none, never as an invented one."""
+    line = settled_verdict_line(decision="approved", resolver="U1", note=None, resolved_at=None)
+
+    assert line == "Approved by <@U1>"

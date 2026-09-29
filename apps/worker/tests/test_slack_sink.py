@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 
 import aiohttp
 import pytest
@@ -818,6 +819,88 @@ def test_update_message_renders_the_resolved_card_from_the_outcome() -> None:
     assert "expired" not in str(captured["text"]).lower()
     assert "approved" in rendered.lower()
     assert "U7" in rendered
+
+
+def _settle(message: OutboundMessage, settled: SettledOutcome | None) -> dict[str, object]:
+    """Emit one settle update through the real adapter and capture its chat_update."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    captured: dict[str, object] = {}
+
+    async def _fake_update(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    sink._client_for(None).chat_update = _fake_update  # type: ignore[method-assign]
+    asyncio.run(
+        sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=_target(ts="9.9"),
+                message=message,
+                settled=settled,
+            ),
+            route=TargetRoute(),
+        )
+    )
+    return captured
+
+
+def test_a_resolved_card_shows_the_decision_time_the_kernel_carried() -> None:
+    """ADR-0179 decision 1: the kernel says when, as data; this adapter shows it.
+
+    The instant rides the settle message's ``Decided`` field, and the adapter
+    renders it as Slack's date token on the verdict line (``<!date^unix^...|...>``,
+    mrkdwn only: https://docs.slack.dev/messaging/formatting-message-text).
+    """
+
+    from curie_worker.approvals import decided_field
+
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+    captured = _settle(
+        OutboundMessage(
+            version=MESSAGE_VERSION, text="Discount ACME", fields=[decided_field(decided)]
+        ),
+        SettledOutcome(requested_by="U9", decision="rejected", resolver="U7", note=None),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Rejected"  # type: ignore[index]
+    assert blocks[1]["text"]["text"] == "Discount ACME"  # type: ignore[index]
+    assert blocks[-1]["elements"][0]["text"] == (  # type: ignore[index]
+        "Rejected by <@U7> on "
+        "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
+    )
+
+
+def test_a_settle_without_a_decision_time_keeps_the_bare_verdict() -> None:
+    """The negative: no field, no time, and nothing invented in its place."""
+
+    captured = _settle(
+        OutboundMessage(version=MESSAGE_VERSION, text="Discount ACME"),
+        SettledOutcome(requested_by="U9", decision="approved", resolver="U7", note=None),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Approved"  # type: ignore[index]
+    assert blocks[-1]["elements"][0]["text"] == "Approved by <@U7>"  # type: ignore[index]
+
+
+def test_an_expired_card_is_headed_expired_and_names_its_requester() -> None:
+    """ADR-0179 decision 1 for the expiry form, which only the worker renders."""
+
+    captured = _settle(
+        OutboundMessage(version=MESSAGE_VERSION, text="Discount ACME"),
+        SettledOutcome(requested_by="U9"),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Expired"  # type: ignore[index]
+    assert "Requested by <@U9>" in str(blocks)
+    assert all(b.get("type") != "actions" for b in blocks)  # type: ignore[union-attr]
 
 
 def test_best_effort_still_falls_back_to_default_when_present() -> None:

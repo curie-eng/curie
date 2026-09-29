@@ -20,10 +20,13 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import httpx
 from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
+from channel_protocol import MessageField, OutboundMessage
+from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
 
 from .workspace import WorkspaceSelectionRefused
@@ -235,6 +238,31 @@ class SettledApproval:
     status: str
     resolved_by: str | None
     resolution_note: str | None
+    # When the decision was recorded, aware UTC; None when the record omits it.
+    resolved_at: datetime | None = None
+
+
+# The settle message's decision time (ADR-0179). ``SettledOutcome`` is decoded
+# strictly by out-of-process adapters, so the instant rides the message's
+# existing ``fields`` list instead: this label, an RFC 3339 UTC value. The kernel
+# and the publication loop write it; the Slack adapter reads it.
+DECIDED_FIELD_LABEL = "Decided"
+
+
+def decided_field(resolved_at: datetime) -> MessageField:
+    """The settle message field carrying when an approval was decided."""
+
+    instant = resolved_at.replace(tzinfo=UTC) if resolved_at.tzinfo is None else resolved_at
+    return MessageField(label=DECIDED_FIELD_LABEL, value=instant.astimezone(UTC).isoformat())
+
+
+def decided_at(message: OutboundMessage) -> datetime | None:
+    """The decision time a settle message carries, or None when it has none."""
+
+    for item in message.fields:
+        if item.label == DECIDED_FIELD_LABEL:
+            return parse_decision_time(item.value)
+    return None
 
 
 class ApprovalCreator(Protocol):
@@ -511,6 +539,7 @@ class ApprovalClient:
                 status=str(body["status"]),
                 resolved_by=body.get("resolved_by"),
                 resolution_note=body.get("resolution_note"),
+                resolved_at=parse_decision_time(body.get("resolved_at")),
             )
         except (ValueError, KeyError) as exc:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
