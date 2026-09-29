@@ -7,6 +7,7 @@ in production the Bolt app authorizes with the real bot token; tests pass a stub
 authorize to keep the dispatch path offline.
 """
 
+import json
 import logging
 import threading
 from collections.abc import Callable, Mapping
@@ -198,30 +199,52 @@ class SocketModeConnection(Connection):
         self._slack_identity = slack_identity
         self._presence = presence
         self._closed = threading.Event()
-        # How many of this client's own sockets the next hello counts.
+        # How many of this client's own sockets the current connection counts.
         self._own_sockets = 1
-        self._count_own_sockets_at_each_connect()
+        self._hello_own_sockets: dict[int, int] = {}
+        self._hello_own_sockets_lock = threading.Lock()
+        self._track_own_sockets_for_hello()
         self._handler.client.message_listeners.append(self._on_socket_message)
 
-    def _count_own_sockets_at_each_connect(self) -> None:
-        """Before each socket the SDK opens, note whether its previous one is open.
+    def _track_own_sockets_for_hello(self) -> None:
+        """Bind each hello to the number of our sockets at queue delivery.
 
         Slack's hello counts every socket open at its handshake. When Slack asks
         for a refresh with a ``disconnect`` frame, slack_sdk opens the
         replacement and closes the previous socket only once the new one is up
         (``SocketModeClient.connect``, slack_sdk 3.44.1), so that hello counts
-        two sockets of this one client. The first connect and every reconnect go
-        through ``client.connect``, so the count is set before the hello it
-        describes.
+        two sockets of this one client. Listener work runs on a thread pool, so
+        preserve the count when the SDK dequeues each hello; a later reconnect
+        must not change the count used for an already queued message.
         """
         client = self._handler.client
         sdk_connect = client.connect
+        message_queue = getattr(client, "message_queue", None)
+        sdk_queue_get = getattr(message_queue, "get", None)
 
         def connect() -> None:
             self._own_sockets = 2 if client.is_connected() else 1
             sdk_connect()
 
+        def get_message(*args: Any, **kwargs: Any) -> Any:
+            assert sdk_queue_get is not None
+            raw_message = sdk_queue_get(*args, **kwargs)
+            try:
+                message = (
+                    json.loads(raw_message)
+                    if isinstance(raw_message, str) and raw_message.startswith("{")
+                    else None
+                )
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and message.get("type") == "hello":
+                with self._hello_own_sockets_lock:
+                    self._hello_own_sockets[id(raw_message)] = self._own_sockets
+            return raw_message
+
         client.connect = connect  # type: ignore[method-assign]
+        if sdk_queue_get is not None and message_queue is not None:
+            message_queue.get = get_message
 
     def _on_socket_message(
         self, client: Any, message: dict[str, Any], raw_message: Any
@@ -232,9 +255,13 @@ class SocketModeConnection(Connection):
         and keep the connection: this ticket detects overlap, it does not refuse
         connect or post to Slack.
         """
-        del client, raw_message
+        del client
         if message.get("type") != "hello":
             return
+        with self._hello_own_sockets_lock:
+            own_sockets = self._hello_own_sockets.pop(
+                id(raw_message), self._own_sockets
+            )
         raw = message.get("num_connections")
         if not isinstance(raw, (int, str)):
             return
@@ -242,7 +269,6 @@ class SocketModeConnection(Connection):
             num_connections = int(raw)
         except ValueError:
             return
-        own_sockets = self._own_sockets
         if num_connections <= own_sockets:
             return
         if self._slack_identity is None:
