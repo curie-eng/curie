@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 import importlib.util
 import json
@@ -292,7 +293,83 @@ def test_released_upgrade_does_not_select_unrelated_paths(
 
 def _repo_root_references(script: str) -> list[str]:
     references = re.findall(r"\$\{?REPO_ROOT\}?\"?/([\w.][\w./-]*)", script)
+    for match in re.finditer(r"\b(?:bash|sh|python3)[ \t]+(['\"]?)([\w./-]+)\1", script):
+        path = match.group(2)
+        if "/" in path and not path.startswith("/"):
+            references.append(path)
+    # Workflow steps run from the checkout root. Match tracked path tokens
+    # independently of the command that reads them, including root files and
+    # newly added top-level directories. Redirection targets are outputs.
+    code_lines = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    )
+    code_lines = re.sub(
+        r"(?<![<>])>{1,2}[ \t]*['\"]?[\w./-]+['\"]?", "", code_lines
+    )
+    tracked = _tracked_repo_paths(REPO_ROOT)
+    references.extend(
+        token
+        for token in re.findall(
+            r"(?<![\w./-])(?:[\w.-]+/)+[\w.-]+|(?<![\w./-])[\w.-]+\.[\w.-]+",
+            code_lines,
+        )
+        if token in tracked
+    )
+    references.extend(
+        re.findall(
+            r"\b(?:open|Path)\([ \t]*['\"]([\w.-]+(?:/[\w.-]+)+)['\"]",
+            script,
+        )
+    )
     return sorted({reference.rstrip("/") for reference in references})
+
+
+@functools.cache
+def _tracked_repo_paths(root: Path) -> frozenset[str]:
+    completed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths = set(completed.stdout.split("\0")) - {""}
+    return frozenset(
+        path
+        for file in paths
+        for path in (file, *(str(parent) for parent in Path(file).parents[:-1]))
+    )
+
+
+def _without_python_module_docstring(source: str) -> str:
+    module = ast.parse(source)
+    if not module.body or not isinstance(module.body[0], ast.Expr):
+        return source
+    docstring = module.body[0]
+    if not isinstance(docstring.value, ast.Constant) or not isinstance(
+        docstring.value.value, str
+    ):
+        return source
+    lines = source.splitlines(keepends=True)
+    for index in range(docstring.lineno - 1, docstring.end_lineno):
+        lines[index] = "\n"
+    return "".join(lines)
+
+
+def _unselected_helper_inputs(reference: str, seen: set[str]) -> list[str]:
+    if reference in seen:
+        return []
+    seen.add(reference)
+    helper = REPO_ROOT / reference
+    if not helper.is_file() or helper.suffix not in {".py", ".sh"}:
+        return []
+    source = helper.read_text()
+    if helper.suffix == ".py":
+        source = _without_python_module_docstring(source)
+    problems = _unselected_matrix_inputs(source)
+    for child in _repo_root_references(source):
+        problems.extend(_unselected_helper_inputs(child, seen))
+    return problems
 
 
 def _git_ignored(path: str) -> bool:
@@ -332,6 +409,23 @@ def _unselected_matrix_inputs(
 ) -> list[str]:
     """Name each repository input of the script that skips released-upgrade."""
     problems: list[str] = []
+    if re.search(r"\bcd[ \t]+['\"]?\$\{?REPO_ROOT\}?['\"]?(?=\s|$)", script):
+        problems.append("cd to REPO_ROOT: relative reads cannot be classified")
+    for match in re.finditer(
+        r"\b(bash|sh|python3)[ \t]+(?:-[A-Za-z]+[ \t]+)*['\"]?"
+        r"(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:['\"])?(?=\s|$)",
+        script,
+    ):
+        problems.append(
+            f"{match.group(1)} {match.group(2)}: helper path cannot be classified"
+        )
+    for match in re.finditer(
+        r"\b(bash|sh|python3)[ \t]+['\"]?([\w.-]+\.(?:py|sh))['\"]?(?=\s|$)",
+        script,
+    ):
+        problems.append(
+            f"{match.group(1)} {match.group(2)}: helper path cannot be classified"
+        )
     for reference in _repo_root_references(script):
         if _git_ignored(reference):
             # Build output or local scratch: never part of a diff.
@@ -373,6 +467,11 @@ def test_released_upgrade_selects_every_repo_file_the_upgrade_matrix_reads(
     assert UPGRADE_MATRIX_DIRECTORY_INPUTS["charts/curie"] == ("charts/curie/ci",)
     assert "ci/" in helmignore.splitlines()
     assert _unselected_matrix_inputs(script) == []
+    # A helper invoked by the matrix can start reading another repository
+    # file without changing the matrix script. Guard that second hop too.
+    seen: set[str] = set()
+    for reference in _repo_root_references(script):
+        assert _unselected_helper_inputs(reference, seen) == [], reference
 
 
 def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> None:
@@ -443,6 +542,151 @@ def test_matrix_input_guard_classifies_each_reference(
     problems: list[str],
 ) -> None:
     assert _unselected_matrix_inputs(script) == problems
+
+
+@pytest.mark.parametrize(
+    ("script", "problems"),
+    [
+        (
+            "python3 cli/src/main.rs\n",
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            "bash cli/scripts/e2e-ladder.sh\n",
+            ["cli/scripts/e2e-ladder.sh: does not select released-upgrade"],
+        ),
+        (
+            'cd "$REPO_ROOT"\ncat cli/src/main.rs\n',
+            [
+                "cd to REPO_ROOT: relative reads cannot be classified",
+                "cli/src/main.rs: does not select released-upgrade",
+            ],
+        ),
+        (
+            'bash "$UPGRADE_HELPER" --check\n',
+            ["bash $UPGRADE_HELPER: helper path cannot be classified"],
+        ),
+        (
+            'python3 "$UPGRADE_HELPER" --check\n',
+            ["python3 $UPGRADE_HELPER: helper path cannot be classified"],
+        ),
+        (
+            'from pathlib import Path\nPath("cli/src/main.rs").read_text()\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'open("cli/src/main.rs").read()\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            "python3 upgrade-helper.py --check\n",
+            ["python3 upgrade-helper.py: helper path cannot be classified"],
+        ),
+        (
+            "cat cli/src/main.rs\n",
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            "jq . cli/src/main.rs\n",
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            "helm install acme charts/curie -f cli/src/main.rs\n",
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            "cat .github/e2e-selection.yaml\n",
+            [".github/e2e-selection.yaml: does not select released-upgrade"],
+        ),
+        (
+            "cat release/preserve_next.py\n",
+            ["release/preserve_next.py: does not select released-upgrade"],
+        ),
+        (
+            "cat pyproject.toml\n",
+            ["pyproject.toml: does not select released-upgrade"],
+        ),
+        (
+            'python3 -u "$UPGRADE_HELPER"\n',
+            ["python3 $UPGRADE_HELPER: helper path cannot be classified"],
+        ),
+        (
+            'bash -e "$UPGRADE_HELPER"\n',
+            ["bash $UPGRADE_HELPER: helper path cannot be classified"],
+        ),
+        (
+            'sh "$UPGRADE_HELPER"\n',
+            ["sh $UPGRADE_HELPER: helper path cannot be classified"],
+        ),
+    ],
+)
+def test_upgrade_input_guard_rejects_relative_and_unclassifiable_reads(
+    script: str,
+    problems: list[str],
+) -> None:
+    assert _unselected_matrix_inputs(script) == problems
+
+
+def test_released_upgrade_jobs_select_their_inline_repo_inputs() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    problems: dict[str, list[str]] = {}
+    for job_name in (
+        "e2e-released-upgrade",
+        "e2e-released-upgrade-negative",
+        "e2e-cluster-upgrade-matrix",
+    ):
+        problems[job_name] = []
+        seen: set[str] = set()
+        for step in jobs[job_name]["steps"]:
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            problems[job_name].extend(_unselected_matrix_inputs(run))
+            for reference in _repo_root_references(run):
+                if reference == "cli/scripts/e2e-ladder.sh":
+                    continue
+                problems[job_name].extend(_unselected_helper_inputs(reference, seen))
+    # The upgraded-install smoke uses the same ladder invocation as the fresh
+    # cluster rung. Selecting this one script also boots the negative control
+    # and all matrix shards; test_e2e_ladder_script_stays_off_released_upgrade
+    # pins the two equivalent invocations and the absence of ladder reads in
+    # the other upgrade jobs.
+    assert problems == {
+        "e2e-released-upgrade": [
+            "cli/scripts/e2e-ladder.sh: does not select released-upgrade"
+        ],
+        "e2e-released-upgrade-negative": [],
+        "e2e-cluster-upgrade-matrix": [],
+    }
+
+
+def test_inline_upgrade_guard_rejects_new_unselected_helper() -> None:
+    assert _unselected_matrix_inputs("python3 cli/src/main.rs --check\n") == [
+        "cli/src/main.rs: does not select released-upgrade"
+    ]
+
+
+def test_inline_upgrade_guard_does_not_treat_redirect_output_as_input() -> None:
+    assert _unselected_matrix_inputs("cat > cli/src/main.rs <<EOF\nfixture\nEOF\n") == []
+
+
+def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    helper = tmp_path / "charts/curie/ci/live_manifest_parity.py"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        'from pathlib import Path\nPath("cli/src/main.rs").read_text()\n'
+    )
+    input_file = tmp_path / "cli/src/main.rs"
+    input_file.parent.mkdir(parents=True)
+    input_file.write_text("// fixture\n")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    assert _unselected_helper_inputs(
+        "charts/curie/ci/live_manifest_parity.py", set()
+    ) == ["cli/src/main.rs: does not select released-upgrade"]
 
 
 def test_e2e_ladder_script_stays_off_released_upgrade(tmp_path: Path) -> None:
