@@ -32,8 +32,17 @@ _ANSI_ESCAPE = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]"
 )
 
+# The job-logs API prefixes every line with a runner timestamp; exactly one
+# space follows so indentation of the logged line survives (#3365).
+_RUNNER_TIMESTAMP = re.compile(
+    r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ", re.MULTILINE
+)
+# Trace and span ids differ on every recurrence of the same failure (#3365).
+_HEX_ID = re.compile(r"\b[0-9a-f]{16,}\b", re.IGNORECASE)
+
 _ERROR_LINE = re.compile(
-    r"(?:^|\n)(?:error: |AssertionError: |cluster: |local: |skill: ).+",
+    r"(?:^|\n)(?:error: |AssertionError: |cluster: |local: |skill: "
+    r"|✗ error \[[^\]\n]+\]: ).+",
     re.IGNORECASE,
 )
 _KNOWN = (
@@ -208,6 +217,7 @@ def _log_note(job: dict[str, object]) -> str:
 
 
 def _signature_text(log: str) -> str:
+    log = _RUNNER_TIMESTAMP.sub("", log)
     for pattern in _KNOWN:
         match = pattern.search(log)
         if not match:
@@ -216,12 +226,16 @@ def _signature_text(log: str) -> str:
         if "skill up" in text.lower():
             later = list(_ERROR_LINE.finditer(log[match.end() :]))
             if later:
-                return " ".join(later[-1].group(0).split())
-        return text
+                return _normalize_ids(later[-1].group(0))
+        return _normalize_ids(text)
     matches = list(_ERROR_LINE.finditer(log))
     if matches:
-        return " ".join(matches[-1].group(0).split())
+        return _normalize_ids(matches[-1].group(0))
     return "ladder job failed with no recognized error line"
+
+
+def _normalize_ids(text: str) -> str:
+    return _HEX_ID.sub("<id>", " ".join(text.split()))
 
 
 def plan_issue_actions(
