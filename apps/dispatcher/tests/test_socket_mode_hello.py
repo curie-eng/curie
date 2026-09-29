@@ -6,7 +6,10 @@ stand-in websocket (``offline_socket_mode``), feeding Slack's frames through the
 SDK's own message queue. Nothing here sends Slack.
 """
 
+import json
 import logging
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -162,6 +165,64 @@ def test_hello_after_a_slack_refresh_does_not_count_this_clients_previous_socket
         assert previous is not None and not previous.is_active()
         assert _ONE_RELEASE_PHRASE not in _warning_text(caplog)
     finally:
+        conn.close()
+
+
+def test_queued_refresh_hello_uses_its_own_socket_count_after_a_later_reconnect(
+    offline_socket_mode: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A delayed refresh hello still describes the two sockets at its handshake."""
+
+    monkeypatch.setenv("CURIE_RELEASE_IDENTITY", _IDENTITY)
+    conn = _connected(logging.getLogger("test-socket-mode-hello-queued-refresh"))
+    client = conn._handler.client
+    original = client.current_session
+    held = threading.Event()
+    release = threading.Event()
+    delivered = threading.Event()
+    refresh_hello = {"type": "hello", "num_connections": 2}
+
+    def hold_refresh_hello(_client: Any, message: dict[str, Any], _raw: Any) -> None:
+        if message == refresh_hello:
+            held.set()
+            release.wait(5)
+
+    def mark_delivery(_client: Any, message: dict[str, Any], _raw: Any) -> None:
+        if message == refresh_hello:
+            delivered.set()
+
+    client.message_listeners.insert(0, hold_refresh_hello)
+    client.message_listeners.append(mark_delivery)
+    try:
+        with caplog.at_level(logging.WARNING):
+            client.enqueue_message(
+                json.dumps({"type": "disconnect", "reason": "refresh_requested"})
+            )
+            deadline = time.monotonic() + 5
+            while client.current_session is original and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert client.current_session is not original, "the SDK did not refresh its socket"
+            replacement = client.current_session
+            assert original is not None and not original.is_active()
+
+            client.enqueue_message(json.dumps(refresh_hello))
+            assert held.wait(5), "the queued refresh hello did not reach the listener"
+
+            assert replacement is not None
+            replacement.close()
+            client.connect_to_new_endpoint()
+            assert client.current_session is not replacement and client.is_connected()
+
+            release.set()
+            assert delivered.wait(5), "the queued refresh hello was not delivered"
+
+        assert _ONE_RELEASE_PHRASE not in _warning_text(caplog)
+    finally:
+        release.set()
+        client.message_listeners.remove(hold_refresh_hello)
+        client.message_listeners.remove(mark_delivery)
         conn.close()
 
 
