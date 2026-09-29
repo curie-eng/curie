@@ -6696,7 +6696,8 @@ class Kernel:
                         # may not share a kind or a transport with, so rebuilding
                         # either from the turn addresses the wrong place; ``kind``
                         # empty is the pre-upgrade entry, which falls back to the
-                        # turn exactly as it did before.
+                        # turn's kind but NOT its identity: the historical card
+                        # was posted by the default transport.
                         kind=ref.kind or handle.kind,
                         address=ref.channel,
                         conversation_id=qevent.conversation_id,
@@ -6707,7 +6708,7 @@ class Kernel:
                 ),
                 route=TargetRoute(
                     endpoint=ref.endpoint,
-                    adapter=ref.adapter if ref.kind else route.adapter,
+                    adapter=ref.adapter if ref.kind else None,
                 ),
             )
             consumed = await self._card_store.consume(approval_id, raw_ref)
