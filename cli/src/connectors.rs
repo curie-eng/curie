@@ -1541,7 +1541,7 @@ async fn run(argv: &[String], stdin: Option<&str>) -> Result<(bool, String, Stri
         });
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to invoke `{program}`; is it on PATH?"))?;
+        .map_err(|error| crate::ops::command_io_error(program, error))?;
     if let Some(doc) = stdin {
         let mut pipe = child.stdin.take().context("stdin pipe missing")?;
         pipe.write_all(doc.as_bytes()).await?;
