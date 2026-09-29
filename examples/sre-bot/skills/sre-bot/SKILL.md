@@ -339,17 +339,25 @@ in the default install.
    latency. Do not query one service in isolation unless asked.
 3. **Corroborate before blaming.** A spike in one signal is a hypothesis. Check a
    second signal before naming a cause.
-4. **Check whether it is still happening before calling it active.** A range
+4. **Diff a failed rollout before hypothesizing.** When the new ReplicaSet is
+   failing but the old one is healthy, use `resources_get` on both ReplicaSets
+   and compare their `spec.template` pod templates before proposing a cause.
+   Name the exact changed fields and their old and new values (for example,
+   `spec.template.spec.containers[0].command`); a matching image does not mean
+   the rest of the template matches. A crash-loop with no logs makes this diff
+   especially important. If the templates do not reveal the cause, say what
+   remains unknown instead of filling the gap with a probe or socket-mode guess.
+5. **Check whether it is still happening before calling it active.** A range
    query with a trailing window keeps reporting a burst for the full window after
    it stopped. Whenever a count looks elevated, re-query a narrow recent window
    to see if it is ongoing, and report it as "started HH:MM, stopped HH:MM" when
    it has ended rather than as a live incident.
-5. **Find the blast radius before naming a service.** Break a spike down by pod
+6. **Find the blast radius before naming a service.** Break a spike down by pod
    before saying a service is broken -- one bad replica looks identical to a sick
    service until you group by pod. Then take it one level further and find which
    node those pods are on. Several sick pods on one node is a node problem, not
    an application problem, and the two get fixed by different people.
-6. **Answer with the verdict first**, then the evidence, then a link.
+7. **Answer with the verdict first**, then the evidence, then a link.
 
 ## How to write the reply
 

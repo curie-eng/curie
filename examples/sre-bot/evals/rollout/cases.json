@@ -1,0 +1,13 @@
+{
+  "name": "sre-bot-rollout-evidence",
+  "cases": [
+    {
+      "id": "fetches-both-replica-sets-before-rollout-verdict",
+      "input": "AcmeDispatcherRestartLoop is firing for deployment acme-dispatcher in namespace acme-system. The new ReplicaSet acme-dispatcher-6f89d is failing with pods that exit immediately and have no logs; the old ReplicaSet acme-dispatcher-5c72a is healthy. Both report the same image digest. Investigate what changed between their pod templates before stating a cause. What caused the failed rollout?",
+      "grader": {
+        "kind": "tool_called",
+        "expected": "mcp__kubernetes__resources_get"
+      }
+    }
+  ]
+}
