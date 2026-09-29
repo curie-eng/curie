@@ -2024,6 +2024,160 @@ def test_maintenance_tick_samples_queue_inventory_once(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_maintenance_tick_sweeps_the_progress_outbox_after_completions(make_harness) -> None:
+    """ADR 0130: the progress outbox is swept on the maintenance cadence, right
+    after the completion outbox and ahead of the thread-reset drain."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            calls: list[str] = []
+
+            async def step(name: str) -> None:
+                calls.append(name)
+
+            async def observe() -> None:
+                calls.append("observe")
+                consumer.request_stop()
+
+            consumer._reclaim_once = lambda: step("reclaim")  # type: ignore[method-assign]
+            h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
+            h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
+            consumer._sweep_pending_progress = lambda: step("progress")  # type: ignore[method-assign]
+            consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+
+            await consumer._maintenance_loop()
+
+            assert calls == ["reclaim", "reap", "sweep", "progress", "reset", "observe"]
+
+    asyncio.run(go())
+
+
+def test_a_failing_progress_sweep_does_not_stop_the_maintenance_tick(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            calls: list[str] = []
+
+            async def step(name: str) -> None:
+                calls.append(name)
+
+            async def observe() -> None:
+                calls.append("observe")
+                consumer.request_stop()
+
+            async def broken_sweep(*_args: object, **_kwargs: object) -> None:
+                calls.append("progress")
+                raise RuntimeError("progress store unreachable")
+
+            monkeypatch.setattr(consumer_module, "sweep_pending_progress", broken_sweep)
+            consumer._reclaim_once = lambda: step("reclaim")  # type: ignore[method-assign]
+            h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
+            h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
+            consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+
+            with caplog.at_level(logging.ERROR, logger="curie_worker.consumer"):
+                await consumer._maintenance_loop()
+
+            assert calls == ["reclaim", "reap", "sweep", "progress", "reset", "observe"]
+            assert any("progress outbox sweep failed" in r.getMessage() for r in caplog.records)
+
+    asyncio.run(go())
+
+
+def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harness) -> None:
+    """The real tick against real keys: nothing delivers progress yet, so the
+    tick quarantines a malformed record and dead-letters one whose attempts are
+    spent, and leaves a deliverable one owed with no attempt charged."""
+    from channel_protocol import ProgressCommand, ProgressState
+    from channel_protocol.reply import ReplyTarget
+    from curie_worker.progress import ProgressStore, card_delivery_id
+    from curie_worker.reply_sink import TargetRoute
+
+    async def go() -> None:
+        async with make_harness() as h:
+            graveyard = h.config.dead_letter_stream_name()
+            store = ProgressStore(h.async_redis, h.config)
+            target = ReplyTarget(
+                kind="slack",
+                address="C0EXAMPLE1",
+                conversation_id="1700000000.000100",
+                reply_ref="1700000000.000200",
+            )
+            command = ProgressCommand(
+                version="1.0",
+                update_id="u1",
+                state=ProgressState.INVESTIGATING,
+                summary="Reading the ledger",
+            )
+            ids: list[str] = []
+            for root in ("Ev0EXAMPLE1", "Ev0EXAMPLE2"):
+                pid = await store.open_chain("slack:C0EXAMPLE1:1700000000.000100", root)
+                await store.apply_model_command(
+                    pid,
+                    command,
+                    epoch=1,
+                    seq=1,
+                    route=TargetRoute(adapter="acme-bot"),
+                    target=target,
+                )
+                ids.append(card_delivery_id(pid))
+            fresh, spent = ids
+            await h.async_redis.hset(h.config.progress_delivery_key(spent), "attempts", "5")
+            malformed = str(uuid.uuid4())
+            await h.async_redis.hset(
+                h.config.progress_delivery_key(malformed), mapping={"event": "{not json"}
+            )
+            await h.async_redis.sadd(h.config.progress_pending_key(), malformed)
+
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+
+            async def observe() -> None:
+                consumer.request_stop()
+
+            async def noop() -> None:
+                return None
+
+            consumer._reclaim_once = noop  # type: ignore[method-assign]
+            consumer._drain_thread_reset_requests = noop  # type: ignore[method-assign]
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+            try:
+                await consumer._maintenance_loop()
+
+                assert await h.async_redis.smembers(h.config.progress_pending_key()) == {fresh}
+                owed = await store.read_delivery(fresh)
+                assert owed is not None
+                assert owed.attempts == 0
+                assert await h.async_redis.exists(h.config.progress_delivery_key(malformed)) == 1
+                rows = [fields for _id, fields in await h.async_redis.xrange(graveyard)]
+                progress_rows = [r for r in rows if r.get("dl_source") == "progress-outbox"]
+                assert [r["delivery_id"] for r in progress_rows] == [spent]
+                assert progress_rows[0]["dl_reason"] == "max-attempts-exceeded"
+            finally:
+                await h.async_redis.delete(graveyard)
+
+    asyncio.run(go())
+
+
 def test_ensure_group_does_not_replay_preexisting_backlog(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:

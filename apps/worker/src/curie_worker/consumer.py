@@ -72,6 +72,7 @@ from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import DeliveryLease, DeliveryLeaseStore, LeaseLostError
 from .kernel import Kernel, _thread_key_for
 from .markers import Markers
+from .progress import ProgressStore, sweep_pending_progress
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .upgrade_drain import UpgradeDrainGate
 
@@ -965,6 +966,7 @@ class Consumer(StreamConsumer):
                     await self._reclaim_once()
                 await self._kernel.reap_orphans()
                 await self._kernel.sweep_pending_completions()
+                await self._sweep_pending_progress()
                 await self._drain_thread_reset_requests()
             except Exception:
                 logger.exception("maintenance tick failed")
@@ -978,6 +980,20 @@ class Consumer(StreamConsumer):
             await self._observe_completion_outbox()
             await self._observe_capacity_waits()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _sweep_pending_progress(self) -> None:
+        """Sweep the progress outbox (ADR 0130) with no deliverer.
+
+        Nothing delivers progress yet, so the pass only quarantines, drops and
+        dead-letters (worker README, "Deliberate progress"). Like the
+        completion sweep it creates no claim, so it also runs during an upgrade
+        drain. Its failure is logged here rather than raised, so a progress
+        store fault cannot starve the thread-reset drain behind it.
+        """
+        try:
+            await sweep_pending_progress(ProgressStore(self._valkey, self._config))
+        except Exception:
+            logger.exception("progress outbox sweep failed")
 
     async def _observe_capacity_waits(self) -> None:
         try:
