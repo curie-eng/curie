@@ -54,6 +54,7 @@ from .types import (
     RouteState,
     SandboxClient,
     SandboxHandle,
+    SandboxTermination,
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
@@ -103,6 +104,7 @@ logger = logging.getLogger(__name__)
 REAP_GRACE_MARGIN_SECONDS = 30.0
 _CONTROL_REQUEST_TIMEOUT_S = 5.0
 _GONE_READ_TIMEOUT_S = 1.0
+_POD_TERMINATION_TIMEOUT_S = 2.0
 
 
 def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
@@ -162,6 +164,19 @@ class SandboxSubstrate:
         self._k8s = k8s
         self._affinity = affinity
         self._config = config
+
+    def pod_termination(
+        self, handle: SandboxHandle, *, since: datetime
+    ) -> SandboxTermination | None:
+        """Read one bounded, substrate neutral diagnosis for a dropped stream."""
+
+        if handle.namespace != self._config.namespace:
+            return None
+        return self._k8s.pod_termination(
+            handle.sandbox_name,
+            since=since,
+            request_timeout_seconds=_POD_TERMINATION_TIMEOUT_S,
+        )
 
     # -- claim / lookup -------------------------------------------------------
 

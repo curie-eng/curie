@@ -191,12 +191,15 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
   a non-idempotent action. For noncron turns, flag-clean failures retry by
   classification:
-  `rate-limit`, `runner-error`, `runner-timeout` and `workspace-error` are
-  transient (bounded exponential backoff); `budget-exceeded` and everything else
-  escalate.
+  `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-terminated` and
+  `workspace-error` are transient (bounded exponential backoff);
+  `budget-exceeded` and everything else escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
-  told apart from `runner-error` -- the sandbox or the transport dying -- so an
-  operator can see which one happened.
+  told apart from `runner-error`, which is a plain transport failure without
+  confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
+  terminated during the stream, the worker classifies the failure as
+  `sandbox-terminated`; the terminal notice includes the Kubernetes termination
+  reason so an operator can diagnose it before retrying.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
