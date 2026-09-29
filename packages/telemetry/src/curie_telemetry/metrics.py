@@ -343,6 +343,15 @@ _SUPERVISED_RESTART_ATTRIBUTES = {
     ],
     "outcome": ["restart", "give_up"],
 }
+# One point per tool result the runner sees close a call (#3486). Neither the
+# connector nor the tool is an attribute: both are identifiers, so the runner's
+# WARNING line names them instead.
+_TOOL_RESULT_ATTRIBUTES = {
+    "service.name": ["curie-runner"],
+    "source": ["runner"],
+    "origin": ["connector", "platform", "builtin"],
+    "outcome": ["success", "error", "awaiting_approval"],
+}
 
 
 _METRICS: dict[str, dict[str, Any]] = {
@@ -516,6 +525,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "In-process supervised worker task restarts.",
         True,
         _SUPERVISED_RESTART_ATTRIBUTES,
+    ),
+    "curie.tool.result": _definition(
+        "counter",
+        "{call}",
+        "Tool call results by origin and outcome.",
+        True,
+        _TOOL_RESULT_ATTRIBUTES,
     ),
 }
 

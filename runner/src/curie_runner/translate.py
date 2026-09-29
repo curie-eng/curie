@@ -213,6 +213,19 @@ class TurnState:
     # field: the session turns it into a fail-closed classified failure, because
     # a publication the runner cannot record must not look like a clean turn.
     publication_unrecorded: str | None = None
+    # Call id -> live tool name for EVERY call seen this turn (#3486), read-only
+    # ones included, unlike ``pending_actions``. Popped by the result that
+    # closes the call, so a result for an id this turn never saw, or a second
+    # result for one id, finds nothing.
+    open_tool_calls: dict[str, str] = field(default_factory=dict)
+    # (live tool name, ``is_error is True``) for each result that closed a call
+    # in ``open_tool_calls``, in arrival order (#3486). Wire-level facts only,
+    # never the result's content. Captured here, counted in
+    # ``SessionRunner._observe_tool_results``: the same split as
+    # ``publication_calls``, and for the same reason.
+    tool_results: list[tuple[str, bool]] = field(default_factory=list)
+    # How many of ``tool_results`` the session has already counted.
+    tool_results_observed: int = 0
 
 
 def translate_message(
@@ -303,6 +316,7 @@ def _translate_assistant(
             # Every tool call is evidence for the false-completion check (#517),
             # including the approval-request tool below and read-only tools.
             state.tool_call_count += 1
+            state.open_tool_calls[block.id] = block.name
             if gen is not None:
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
@@ -373,6 +387,10 @@ def _translate_user(
     a repository on the wire. A side-effecting call is different -- its reply is
     the only place a connector can report what the call did to the world, which is
     what makes the action recordable at all (ADR-0117).
+
+    Every result that closes a call seen this turn is also noted on
+    ``state.tool_results`` (#3486): the tool's name and whether ``is_error`` is
+    True, which is all the session needs to count it.
     """
 
     if isinstance(message.content, str):
@@ -385,6 +403,11 @@ def _translate_user(
             continue
         if gen is not None:
             gen.tool_result(block.tool_use_id, failed=bool(block.is_error))
+        called = state.open_tool_calls.pop(block.tool_use_id, None)
+        if called is not None:
+            # Only True is an error: the CLI reports a successful MCP call as
+            # None and a failed one as True (#3486).
+            state.tool_results.append((called, block.is_error is True))
         tool = state.pending_actions.pop(block.tool_use_id, None)
         if tool is None:
             # Read-only, or a result for a call this turn never saw, or a second
