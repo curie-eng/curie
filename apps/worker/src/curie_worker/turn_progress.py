@@ -84,6 +84,49 @@ def progress_eligible(qevent: QueuedTurn, *, factory_work_item: bool) -> bool:
     )
 
 
+class ProgressLeaseKeeper:
+    """@spec ADR-0130 d1: renew authority until the stream pump takes over."""
+
+    def __init__(
+        self,
+        store: ProgressStore,
+        *,
+        progress_id: str,
+        generation: int,
+        interval_s: float = PUMP_INTERVAL_S,
+    ) -> None:
+        self._store = store
+        self._progress_id = progress_id
+        self._generation = generation
+        self._interval_s = interval_s
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                renewed = await self._store.renew_turn(self._progress_id, self._generation)
+                if not renewed:
+                    return
+            except Exception:  # noqa: BLE001 - progress never fails a turn
+                logger.warning(
+                    "progress startup lease for %s could not renew",
+                    self._progress_id,
+                    exc_info=True,
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
+
+
 @dataclass
 class TurnProgressPlan:
     """The chain one delivery reports progress on, named before any turn starts.
@@ -96,6 +139,7 @@ class TurnProgressPlan:
     thread_key: str
     root_event_id: str | None
     generation: int | None = None
+    lease_keeper: ProgressLeaseKeeper | None = None
 
 
 async def plan_turn_progress(
@@ -190,12 +234,23 @@ async def activate_turn_progress(
         logger.warning("progress turn %s did not activate", plan.progress_id, exc_info=True)
         return None
     plan.generation = generation
+    keeper = ProgressLeaseKeeper(
+        store,
+        progress_id=plan.progress_id,
+        generation=generation,
+    )
+    keeper.start()
+    plan.lease_keeper = keeper
     return mint_capability(config, plan.progress_id, generation)
 
 
 async def deactivate_turn_progress(store: ProgressStore, plan: TurnProgressPlan) -> None:
     """Close this plan's generation without clearing a newer owner."""
 
+    keeper = plan.lease_keeper
+    plan.lease_keeper = None
+    if keeper is not None:
+        await keeper.stop()
     if plan.generation is None:
         return
     try:
@@ -327,9 +382,7 @@ class ProgressPump:
         while True:
             stopping = self._stop.is_set()
             try:
-                renewed = await self._store.renew_turn(
-                    self._progress_id, self._generation
-                )
+                renewed = await self._store.renew_turn(self._progress_id, self._generation)
                 if not renewed:
                     logger.info(
                         "progress pump for %s lost generation %d",
@@ -429,4 +482,8 @@ async def start_progress_pump(
         interval_s=interval_s,
     )
     pump.start()
+    keeper = plan.lease_keeper
+    plan.lease_keeper = None
+    if keeper is not None:
+        await keeper.stop()
     return pump
