@@ -21,6 +21,7 @@ from .admission import AdmissionGate
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
 from .identities import SlackIdentityCredentials, default_identity_credentials
+from .socket_presence import SocketPresence
 from .supervisor import Connection
 
 # In Socket Mode the signing secret is never used to verify requests (they arrive
@@ -178,6 +179,9 @@ class SocketModeConnection(Connection):
     ``slack_identity`` names the identity this connection serves when several
     run in one process (ADR-0168 decision 2). Without it, its log lines are
     unchanged.
+    With a ``presence``, the connection reports its socket to the
+    ``curie.slack.socket.identities`` gauge, and ``run``'s otherwise idle wait
+    takes that gauge's samples.
     """
 
     def __init__(
@@ -187,17 +191,42 @@ class SocketModeConnection(Connection):
         *,
         logger: logging.Logger | None = None,
         slack_identity: str | None = None,
+        presence: SocketPresence | None = None,
     ) -> None:
         self._handler = SocketModeHandler(app, app_token=app_token)
         self._logger = logger or logging.getLogger(__name__)
         self._slack_identity = slack_identity
+        self._presence = presence
         self._closed = threading.Event()
+        # How many of this client's own sockets the next hello counts.
+        self._own_sockets = 1
+        self._count_own_sockets_at_each_connect()
         self._handler.client.message_listeners.append(self._on_socket_message)
+
+    def _count_own_sockets_at_each_connect(self) -> None:
+        """Before each socket the SDK opens, note whether its previous one is open.
+
+        Slack's hello counts every socket open at its handshake. When Slack asks
+        for a refresh with a ``disconnect`` frame, slack_sdk opens the
+        replacement and closes the previous socket only once the new one is up
+        (``SocketModeClient.connect``, slack_sdk 3.44.1), so that hello counts
+        two sockets of this one client. The first connect and every reconnect go
+        through ``client.connect``, so the count is set before the hello it
+        describes.
+        """
+        client = self._handler.client
+        sdk_connect = client.connect
+
+        def connect() -> None:
+            self._own_sockets = 2 if client.is_connected() else 1
+            sdk_connect()
+
+        client.connect = connect  # type: ignore[method-assign]
 
     def _on_socket_message(
         self, client: Any, message: dict[str, Any], raw_message: Any
     ) -> None:
-        """Warn when Slack reports more than one Socket Mode client on this app.
+        """Warn when Slack reports more Socket Mode connections than this client holds.
 
         Hello ``num_connections`` is the only runtime competition signal. Warn
         and keep the connection: this ticket detects overlap, it does not refuse
@@ -213,27 +242,41 @@ class SocketModeConnection(Connection):
             num_connections = int(raw)
         except ValueError:
             return
-        if num_connections <= 1:
+        own_sockets = self._own_sockets
+        if num_connections <= own_sockets:
             return
         if self._slack_identity is None:
             self._logger.warning(
                 "%s: exactly one Curie release may connect to a given Slack app; "
-                "disconnect extra clients",
+                "disconnect extra clients (Slack reports %d connections, "
+                "%d of them this client's)",
                 release_identity(),
+                num_connections,
+                own_sockets,
             )
         else:
             self._logger.warning(
                 "%s: exactly one Curie release may connect to a given Slack app; "
-                "disconnect extra clients of Slack identity %s",
+                "disconnect extra clients of Slack identity %s "
+                "(Slack reports %d connections, %d of them this client's)",
                 release_identity(),
                 self._slack_identity,
+                num_connections,
+                own_sockets,
             )
+
+    def is_connected(self) -> bool:
+        """Whether the SDK holds an open socket for this app right now."""
+        return self._handler.client.is_connected()
 
     def run(self) -> None:
         # The supervisor never reuses a connection, so a close that landed
         # before run is final: honour it rather than clearing it.
         if self._closed.is_set():
             return
+        presence = self._presence
+        if presence is not None:
+            presence.attach(self)
         try:
             self._handler.connect()  # type: ignore[no-untyped-call]
         except BaseException:
@@ -255,7 +298,12 @@ class SocketModeConnection(Connection):
                 release_identity(),
                 self._slack_identity,
             )
-        self._closed.wait()
+        if presence is None:
+            self._closed.wait()
+            return
+        presence.record()
+        while not self._closed.wait(presence.sample_interval_s):
+            presence.record()
 
     def close(self) -> None:
         self._closed.set()
@@ -267,3 +315,5 @@ class SocketModeConnection(Connection):
             _stop_session_runner(self._handler.client)
         except Exception:  # pragma: no cover - best-effort teardown
             self._logger.exception("error stopping the socket mode session runner")
+        if self._presence is not None:
+            self._presence.detach(self)

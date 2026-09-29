@@ -11,9 +11,12 @@ import time
 from collections.abc import Callable, Iterator
 
 import pytest
+import redis
 from curie_dispatcher import run
 from curie_dispatcher.app import SocketModeConnection
 from curie_dispatcher.config import DispatcherConfig
+from curie_dispatcher.identities import SlackIdentityCredentials, default_identity_credentials
+from curie_dispatcher.preflight import PreflightedIdentity
 from curie_dispatcher.socket_presence import SocketPresence
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
@@ -170,7 +173,8 @@ def test_the_supervisors_connections_report_one_configured_identity(
         approval_chat_attester_secret="dispatcher-attester-test-secret",
     )
     supervisor = run.build_supervisor(config, logger=logging.getLogger("curie_dispatcher"))
-    conn = supervisor._connect()
+    (member,) = supervisor.members.values()
+    conn = member._connect()
     assert isinstance(conn, SocketModeConnection)
     thread = _run_in_background(conn)
     try:
@@ -179,3 +183,42 @@ def test_the_supervisors_connections_report_one_configured_identity(
         conn.close()
         thread.join(timeout=15)
     assert gauge() == {"configured": 1, "connected": 0}
+
+
+def test_two_identity_connections_share_one_process_gauge(
+    offline_socket_mode: None,
+    gauge: Gauge,
+    redis_client: redis.Redis,
+) -> None:
+    """Configured and connected are process totals, never per-identity series."""
+
+    config = DispatcherConfig(
+        slack_app_token="xapp-test",
+        slack_bot_token="xoxb-test",
+        approval_chat_attester_secret="dispatcher-attester-test-secret",
+    )
+    secondary = SlackIdentityCredentials(
+        name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops"
+    )
+    connections = run.build_identity_connections(
+        config,
+        (
+            PreflightedIdentity(default_identity_credentials(config), None),
+            PreflightedIdentity(secondary, None),
+        ),
+        redis_client=redis_client,
+        logger=logging.getLogger("curie_dispatcher"),
+    )
+    sockets = [connection.connect() for connection in connections]
+    threads = [_run_in_background(conn) for conn in sockets]
+    try:
+        _wait_for(gauge, {"configured": 2, "connected": 2}, timeout=15.0)
+        sockets[0].close()
+        threads[0].join(timeout=15)
+        _wait_for(gauge, {"configured": 2, "connected": 1}, timeout=15.0)
+    finally:
+        for conn in sockets:
+            conn.close()
+        for thread in threads:
+            thread.join(timeout=15)
+    assert gauge() == {"configured": 2, "connected": 0}

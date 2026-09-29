@@ -65,7 +65,10 @@ def test_hello_with_two_connections_warns_with_release_identity(
     assert any(record.levelno == logging.WARNING for record in caplog.records), warnings
     # The full stock message, not a substring: with no ``slack_identity`` this
     # must never grow an "of Slack identity ..." suffix.
-    assert warnings == f"{_IDENTITY}: {_ONE_RELEASE_PHRASE}; disconnect extra clients"
+    assert warnings == (
+        f"{_IDENTITY}: {_ONE_RELEASE_PHRASE}; disconnect extra clients "
+        "(Slack reports 2 connections, 1 of them this client's)"
+    )
 
 
 def test_hello_with_one_connection_does_not_warn(

@@ -28,6 +28,13 @@ unacked so Slack can retry another connection; that leave-unacked path is not an
 operator retry procedure. Disconnect the extra client instead of retrying from
 the non-owning side.
 
+The dispatcher warns in its log when a Socket Mode hello reports more connections
+than this client holds. Slack refreshes each connection every few hours, and
+slack_sdk opens the replacement before it closes the old socket, so the hello on
+the replacement counts two sockets that are both this client's. That hello does
+not warn. One that counts a third connection, or a second after a reconnect with
+nothing left open, does.
+
 ## What is ingested, and what is refused
 
 Ingest admits more than it used to (#2006). A message whose body lives in Block Kit
@@ -233,6 +240,16 @@ dispatcher requests and limits are sized for one app, so measure before
 declaring many.
 A cron-hook agent's approval destinations are not preflighted under `default`,
 since a cron trigger is not carried by the projection preflight reads.
+
+Whether the sockets are up is a metric, not only a log line. The connections
+report to the `curie.slack.socket.identities` gauge
+(`curie_slack_socket_identities` in Prometheus), which has two series per
+dispatcher: `state=configured`, the Slack identities it serves, and
+`state=connected`, those holding an open socket when sampled. It is sampled
+every 10 seconds from the SDK client itself, because slack_sdk's stale ping
+check closes a dead socket without calling any listener, and the heartbeat file
+keeps its mtime fresh either way. Alert when `connected` stays below
+`configured`. The gauge carries no identity attribute.
 
 ## Config surface (env vars)
 

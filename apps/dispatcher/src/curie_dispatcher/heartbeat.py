@@ -9,8 +9,8 @@ Scope, honestly stated: this proves only that the Python interpreter is still
 scheduling threads, i.e. the process is not fully wedged (a total deadlock or a
 GIL hang would stop the touches and the probe would fire). It is a process-level
 liveness signal. It does NOT, by itself, detect a Socket Mode connection that is
-silently dead while the process otherwise runs and keeps touching the file. A
-connection-aware health signal would be a separate mechanism.
+silently dead while the process otherwise runs and keeps touching the file.
+``socket_presence.py`` is the connection-aware signal: a gauge, not a probe.
 """
 
 import logging

@@ -242,6 +242,10 @@ _COMPLETION_OUTBOX_AGE_ATTRIBUTES = {
     "operation": ["observe"],
     "outcome": ["retry"],
 }
+_SLACK_SOCKET_IDENTITY_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "state": ["configured", "connected"],
+}
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["update", "post"],
@@ -569,6 +573,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Interactive turns by persisted capacity wait state.",
         False,
         _CAPACITY_WAIT_COUNT_ATTRIBUTES,
+    ),
+    "curie.slack.socket.identities": _definition(
+        "gauge",
+        "{identity}",
+        "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+        False,
+        _SLACK_SOCKET_IDENTITY_ATTRIBUTES,
     ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES
