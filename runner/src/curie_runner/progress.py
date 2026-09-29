@@ -12,16 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import aiohttp
-import anyio
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkMcpTool, tool
 
@@ -42,35 +38,6 @@ _MAX_LABEL = 40
 _MAX_CAP = 5
 _MAX_NOTE = 280
 _TIMEOUT_SECONDS = 10.0
-VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
-_VERIFICATION_TIMEOUT_SECONDS = 600.0
-_SERVICE_FAILURE = re.compile(
-    r"(?:connection refused|could not connect|cannot connect|connection reset|"
-    r"connection error|no route to host|temporary failure in name resolution|"
-    r"service unavailable|failed to connect)",
-    re.IGNORECASE,
-)
-_KNOWN_SERVICE_MARKERS: dict[str, tuple[str, ...]] = {
-    "docker": ("docker daemon", "docker.sock", "docker service"),
-    "postgres": ("postgres", "postgresql", ":5432"),
-    "valkey": ("valkey", "redis", ":6379"),
-    "clickhouse": ("clickhouse", ":8123"),
-    "rustfs": ("rustfs", "s3 endpoint"),
-    "langfuse": ("langfuse", ":3000", ":23000"),
-}
-_MISSING_BINARY_NAMES = r"(uv|pytest|python3?|docker)"
-_MISSING_BINARY_PATTERNS = (
-    re.compile(
-        r"^(?:[^\n]{0,40}: )?(?:command not found|failed to spawn):?\s*"
-        rf"['`\"]?{_MISSING_BINARY_NAMES}\b",
-        re.IGNORECASE | re.MULTILINE,
-    ),
-    re.compile(
-        r"^(?:[^\n]{0,40}: )?"
-        rf"{_MISSING_BINARY_NAMES}:?\s*(?:command not found|not found)\b",
-        re.IGNORECASE | re.MULTILINE,
-    ),
-)
 
 _DESCRIPTION = (
     "Report the phase you are starting now. Call it at the start of every phase "
@@ -228,128 +195,6 @@ class ProgressClient:
             if status < 500:
                 return status
         return status
-
-
-def _subprocess_text(value: str | bytes | None) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value or ""
-
-
-def _verification_failures(output: str) -> tuple[list[str], list[str]]:
-    """Extract only known missing tools and named service failures from output."""
-
-    missing = sorted(
-        {
-            match.group(1).lower()
-            for pattern in _MISSING_BINARY_PATTERNS
-            for match in pattern.finditer(output)
-        }
-    )
-    blocked: set[str] = set()
-    for line in output.splitlines():
-        if not _SERVICE_FAILURE.search(line):
-            continue
-        lowered = line.casefold()
-        for service, markers in _KNOWN_SERVICE_MARKERS.items():
-            if any(marker in lowered for marker in markers):
-                blocked.add(service)
-    return missing, sorted(blocked)
-
-
-async def preflight_workspace_verification(
-    workspace: Path, url: str, token: str
-) -> dict[str, Any]:
-    """Run and report the documented focused check without installing tools.
-
-    The command is bounded and runs in the mounted checkout. ``UV_OFFLINE`` and
-    ``UV_NO_SYNC`` prevent package or interpreter downloads and environment
-    synchronization. The report describes this execution only; a successful
-    result does not certify later edits.
-    """
-
-    executable = shutil.which("uv")
-    record: dict[str, Any] = {
-        "command": VERIFICATION_COMMAND,
-        "outcome": "unavailable",
-        "exit_status": None,
-        "missing_binaries": [],
-        "blocked_services": [],
-    }
-    failure_reason: str | None = None
-    if executable is None:
-        record["missing_binaries"] = ["uv"]
-    else:
-        env = dict(os.environ)
-        env["UV_OFFLINE"] = "1"
-        env["UV_NO_SYNC"] = "1"
-        env["UV_LOCKED"] = "1"
-        try:
-            result = await anyio.to_thread.run_sync(
-                lambda: subprocess.run(
-                    ["uv", "run", "pytest", "runner/tests", "-q"],
-                    cwd=workspace,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=_VERIFICATION_TIMEOUT_SECONDS,
-                    check=False,
-                )
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = "\n".join(
-                (_subprocess_text(exc.stdout), _subprocess_text(exc.stderr))
-            )
-            missing, blocked = _verification_failures(output)
-            record["missing_binaries"] = missing
-            record["blocked_services"] = blocked
-            if not (missing or blocked):
-                record["outcome"] = "failed"
-                record["exit_status"] = 124
-                failure_reason = (
-                    f"command timed out after {_VERIFICATION_TIMEOUT_SECONDS:g} seconds"
-                )
-        except OSError as exc:
-            # ``which`` and process creation can race if the image is changing.
-            # Do not expose arbitrary exception text in the progress record.
-            missing_uv = isinstance(exc, FileNotFoundError) and Path(
-                str(exc.filename or "")
-            ).name == "uv"
-            if missing_uv:
-                record["missing_binaries"] = ["uv"]
-            else:
-                record["outcome"] = "failed"
-                record["exit_status"] = 126 if isinstance(exc, PermissionError) else 125
-                failure_reason = f"command could not start ({type(exc).__name__})"
-            logger.warning(
-                "verification command could not start error_class=%s",
-                type(exc).__name__,
-            )
-        else:
-            output = f"{result.stdout}\n{result.stderr}"
-            missing, blocked = _verification_failures(output)
-            record["missing_binaries"] = missing
-            record["blocked_services"] = blocked
-            if result.returncode == 0:
-                record["outcome"] = "passed"
-                record["exit_status"] = 0
-                record["missing_binaries"] = []
-                record["blocked_services"] = []
-            elif missing or blocked:
-                record["outcome"] = "unavailable"
-            else:
-                record["outcome"] = "failed"
-                record["exit_status"] = result.returncode
-
-    client = ProgressClient(f"{url.rstrip('/')}/verification", token)
-    status = await client.post(record.copy())
-    record["report_status"] = status
-    if failure_reason is not None:
-        record["failure_reason"] = failure_reason
-    if status != 201:
-        logger.warning("verification preflight report was not accepted status=%s", status)
-        raise RuntimeError("verification preflight report was not accepted")
-    return record
 
 
 def _error(text: str) -> dict[str, Any]:

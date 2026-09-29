@@ -118,6 +118,157 @@ def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
     assert "Do not claim that the check passed" in preamble
     assert "matching required check" in preamble
     assert "/workspace" in preamble
+    assert "Verification command:" not in preamble
+    assert "pytest" not in preamble
+
+
+# --- declared verification checks (#3521) ------------------------------------------
+
+_PYTHON_COMMAND = "uv run pytest runner/tests -q"
+_RUST_COMMAND = "cargo test --locked"
+
+
+def _check(
+    check_id: str,
+    paths: list[str],
+    command: str,
+    *,
+    outcome: str = "passed",
+) -> dict[str, object]:
+    return {
+        "id": check_id,
+        "paths": paths,
+        "command": command,
+        "installed": False,
+        "outcome": outcome,
+        "exit_status": 0 if outcome == "passed" else None,
+        "missing_binaries": [] if outcome == "passed" else ["uv"],
+        "blocked_services": [],
+        "report_status": 201,
+    }
+
+
+def _verification(
+    *checks: dict[str, object],
+    source: str | None = "bundle",
+    lockfile_installs: bool = False,
+    unreadable: str | None = None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "source": source if checks else None,
+        "lockfile_installs": lockfile_installs,
+        "unreadable": unreadable,
+        "checks": list(checks),
+    }
+    if not checks:
+        result["report_status"] = 201
+    return result
+
+
+_PYTHON = _check("python", ["**/*.py", "pyproject.toml"], _PYTHON_COMMAND)
+_RUST = _check("rust", ["**/*.rs", "Cargo.lock"], _RUST_COMMAND)
+
+
+def _preamble(verification: dict[str, object]) -> str:
+    from curie_runner.__main__ import format_workspace_preamble
+
+    preamble = format_workspace_preamble(Path("dummy-workspace"), verification)
+    assert preamble is not None
+    return preamble
+
+
+def _check_line(preamble: str, check_id: str, command: str) -> str:
+    lines = [
+        line for line in preamble.splitlines() if check_id in line and command in line
+    ]
+    assert lines, preamble
+    return "\n".join(lines)
+
+
+def test_preamble_with_no_declared_check_says_so_and_names_no_suite() -> None:
+    preamble = _preamble(_verification())
+
+    assert "No verification check was declared" in preamble
+    assert re.search(r"do\s+not\s+invent\s+a\s+check", preamble, flags=re.IGNORECASE)
+    assert "pytest" not in preamble
+    assert "Verification command:" not in preamble
+    assert "Run only the repository's documented focused check command" not in preamble
+
+
+def test_preamble_names_an_unreadable_repository_declaration() -> None:
+    preamble = _preamble(
+        _verification(unreadable=".curie/verification.json is not valid JSON")
+    )
+
+    assert "No verification check was declared" in preamble
+    assert "unreadable" in preamble.casefold()
+    assert ".curie/verification.json" in preamble
+
+
+def test_preamble_lists_each_declared_check_with_its_paths_and_command() -> None:
+    preamble = _preamble(_verification(_PYTHON, _RUST))
+
+    python_line = _check_line(preamble, "python", _PYTHON_COMMAND)
+    assert "**/*.py" in python_line
+    assert "pyproject.toml" in python_line
+    rust_line = _check_line(preamble, "rust", _RUST_COMMAND)
+    assert "**/*.rs" in rust_line
+    assert "Cargo.lock" in rust_line
+    assert "from the bundle" in preamble
+    assert re.search(
+        r"run\s+only\s+the\s+check\s+whose\s+paths\s+match",
+        preamble,
+        flags=re.IGNORECASE,
+    ), preamble
+    assert "no check was declared for that area" in preamble
+    assert "Verification command:" not in preamble
+
+
+def test_preamble_names_the_repository_as_the_declaring_source() -> None:
+    preamble = _preamble(_verification(_RUST, source="repository"))
+
+    assert "from the repository" in preamble
+    _check_line(preamble, "rust", _RUST_COMMAND)
+
+
+def test_python_only_declaration_does_not_present_python_as_the_check_for_rust() -> None:
+    preamble = _preamble(_verification(_PYTHON))
+
+    _check_line(preamble, "python", _PYTHON_COMMAND)
+    assert "no check was declared for that area" in preamble
+    assert re.search(
+        r"do\s+not\s+run\s+an\s+unrelated\s+check", preamble, flags=re.IGNORECASE
+    ), preamble
+    assert "Run only the repository's documented focused check command" not in preamble
+    assert "Verification command:" not in preamble
+
+
+def test_unavailable_check_result_is_scoped_to_that_check() -> None:
+    unavailable = _check("python", ["**/*.py"], _PYTHON_COMMAND, outcome="unavailable")
+
+    preamble = _preamble(_verification(unavailable, _RUST))
+
+    assert "Missing binaries: uv" in preamble
+    assert "in-sandbox verification is unavailable" in preamble
+    python_line = _check_line(preamble, "python", _PYTHON_COMMAND)
+    assert "unavailable" in python_line
+    assert "unavailable" not in _check_line(preamble, "rust", _RUST_COMMAND)
+
+
+def test_lockfile_installs_allow_only_the_declared_install_commands() -> None:
+    preamble = _preamble(_verification(_PYTHON, lockfile_installs=True))
+
+    assert (
+        "Only the declared lockfile-pinned install commands may contact a package registry"
+        in preamble
+    )
+
+
+def test_without_lockfile_installs_the_no_index_rule_stays() -> None:
+    preamble = _preamble(_verification(_PYTHON))
+
+    assert "--no-index" in preamble
+    assert "lockfile-pinned install commands may contact" not in preamble
 
 
 def test_compose_system_prompt_joins_workspace_between_memory_and_bundle() -> None:
@@ -132,3 +283,15 @@ def test_compose_system_prompt_joins_workspace_between_memory_and_bundle() -> No
         )
         == "MEM\n\nWS\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
     )
+
+
+def test_declared_checks_are_rendered_as_fenced_data() -> None:
+    preamble = _preamble(_verification(_PYTHON, _RUST))
+
+    fenced = re.search(r"```json\n(.*?)\n```", preamble, flags=re.DOTALL)
+    assert fenced is not None, preamble
+    block = fenced.group(1)
+    assert _PYTHON_COMMAND in block and _RUST_COMMAND in block
+    assert "**/*.rs" in block
+    before = preamble[: fenced.start()]
+    assert re.search(r"data,?\s+not\s+instructions", before, flags=re.IGNORECASE)

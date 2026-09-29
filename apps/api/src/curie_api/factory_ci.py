@@ -669,10 +669,10 @@ async def gate(
             reason=f"required_python_ci_unselected: {unselected_path}",
         )
     elif changed_python_paths:
-        verification: factory_progress.VerificationObservation | None
+        verifications: list[factory_progress.VerificationObservation]
         try:
             async with sessionmaker() as session:
-                verification = await factory_progress.read_verification_observation(
+                verifications = await factory_progress.read_verification_observations(
                     session, request.id
                 )
                 await session.rollback()
@@ -681,16 +681,17 @@ async def gate(
                 kind="unverified", reason="python_preflight_unreadable"
             )
         else:
-            if verification is None:
+            failed = factory_progress.failed_verification(verifications)
+            if not verifications:
                 preflight_verdict = Verdict(
                     kind="unverified", reason="python_preflight_missing"
                 )
-            elif verification.outcome == "failed":
+            elif failed is not None:
                 preflight_verdict = Verdict(
                     kind="unverified",
                     reason=(
                         "python_preflight_failed_exit_status_"
-                        f"{verification.exit_status}"
+                        f"{failed.exit_status}"
                     ),
                 )
 
