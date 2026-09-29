@@ -7036,12 +7036,12 @@
       },
       "TurnProgressBody": {
         "additionalProperties": false,
-        "description": "A ``ProgressCommand`` and the runner's position for it.\n\nClosed like the command: an unknown field is refused. ``epoch`` orders the\nturn's commands after every earlier turn's in the chain, and ``seq`` orders\nthem within the turn; the worker store refuses a command out of order.",
+        "description": "A ``ProgressCommand`` and the worker/runner position for it.\n\nClosed like the command: an unknown field is refused. ``generation`` is\nallocated durably by the worker and ``seq`` orders commands within it.",
         "properties": {
-          "epoch": {
+          "generation": {
             "maximum": 9007199254740991.0,
             "minimum": 1.0,
-            "title": "Epoch",
+            "title": "Generation",
             "type": "integer"
           },
           "milestone": {
@@ -7088,7 +7088,7 @@
           "update_id",
           "state",
           "summary",
-          "epoch",
+          "generation",
           "seq"
         ],
         "title": "TurnProgressBody",
