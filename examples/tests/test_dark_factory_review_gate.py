@@ -127,6 +127,40 @@ def test_infers_the_diff_reviewer_and_forces_foreground(session: Session) -> Non
     assert out["updatedInput"]["run_in_background"] is False
 
 
+def test_backgrounded_bash_build_is_denied_before_the_agent_ends_its_turn(
+    session: Session,
+) -> None:
+    out = session.pre(
+        "Bash",
+        {
+            "command": "cargo build --locked",
+            "description": "Build the project and wait for completion",
+            "run_in_background": True,
+        },
+    )
+
+    assert out["permissionDecision"] == "deny"
+    reason = out["permissionDecisionReason"].lower()
+    assert "foreground" in reason
+    assert "end your turn" in reason
+
+
+@pytest.mark.parametrize("run_in_background", [False, None])
+def test_foreground_bash_build_is_allowed(
+    session: Session, run_in_background: bool | None
+) -> None:
+    tool_input: dict[str, Any] = {
+        "command": "cargo build --locked",
+        "description": "Build the project and wait for completion",
+    }
+    if run_in_background is not None:
+        tool_input["run_in_background"] = run_in_background
+
+    out = session.pre("Bash", tool_input)
+
+    assert out["permissionDecision"] == "allow"
+
+
 def test_description_outranks_the_prompt_when_inferring(session: Session) -> None:
     # The quoted issue talks about a diff, but the call is a plan review.
     out = session.pre(
@@ -320,7 +354,7 @@ def test_hooks_json_registers_every_event() -> None:
     pre = re.compile(hooks["PreToolUse"][0]["matcher"])
     for tool in ("Agent", "Task", PUBLISH, COMMENT):
         assert pre.fullmatch(tool), tool
-    assert not pre.fullmatch("Bash")
+    assert pre.fullmatch("Bash")
     for entries in hooks.values():
         assert entries[0]["hooks"][0]["command"].endswith("hooks/review_gate.py")
 
