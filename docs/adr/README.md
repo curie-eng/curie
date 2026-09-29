@@ -198,4 +198,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
 | 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Draft |
 | 0174 | [Publication prechecks use an execution scoped capability](0174-publication-prechecks-use-an-execution-scoped-capability.md) | Accepted |
+| 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
 <!-- END GENERATED: adr-index -->
