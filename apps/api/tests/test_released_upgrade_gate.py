@@ -1738,7 +1738,7 @@ def test_seed_released_database_returns_the_exact_released_state_metadata(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era, released_state_repaired: (
+        lambda _columns, *, approval_route_era, released_state_repaired, released_route_identity: (
             ("SELECT 1",),
             metadata,
         ),
@@ -1773,7 +1773,7 @@ def test_seed_released_database_refuses_state_capable_schema_without_a_sentinel(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era, released_state_repaired: (
+        lambda _columns, *, approval_route_era, released_state_repaired, released_route_identity: (
             ("SELECT 1",),
             empty_metadata,
         ),
