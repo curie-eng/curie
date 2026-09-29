@@ -59,7 +59,8 @@
       "⚠️ startsAt identifies this episode but cannot establish whether it is active now.\nWhat I checked: the episode time and unavailable current reads.\nWhat to do: restore the read path.\nWhat I changed: nothing.",
       "⚠️ The timestamp alone cannot prove the alert is still firing, and with no current reads I cannot tell whether it recovered.\nWhat I checked: the delivery's startsAt, which identifies the episode Alertmanager first matched; it does **not** update while the alert continues.\nWhat to do: restore a read of provider state or history.\nWhat I changed: nothing.",
       "⚠️ startsAt 10:02 proves only that Alertmanager first observed the condition at 10:02. No, I cannot say the alert is still firing now.\nWhat I checked: the delivery's startsAt; provider state, source health and history were unavailable.\nWhat to do: restore one of those reads.\nWhat I changed: nothing.",
-      "⚠️ The startsAt timestamp only identifies when this episode began; I can't tell whether it is still active.\nWhat I checked: the delivery; provider state, source health and history were unavailable.\nWhat to do: treat it as unclear.\nWhat I changed: nothing."
+      "⚠️ The startsAt timestamp only identifies when this episode began; I can't tell whether it is still active.\nWhat I checked: the delivery; provider state, source health and history were unavailable.\nWhat to do: treat it as unclear.\nWhat I changed: nothing.",
+      "⚠️ The startsAt timestamp only proves when Alertmanager first observed the condition; it cannot show whether the alert is still firing now.\nWhat I checked: the delivery; no current state, source health or history was available.\nWhat to do: read the rule's current state.\nWhat I changed: nothing."
     ]
   },
   "counterexamples": {
