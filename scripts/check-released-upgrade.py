@@ -962,15 +962,27 @@ def _detect_approval_route_era(released_tree: Path) -> str:
 ROUTE_IDENTITY_REVISION_FILE = "0070_agent_channels_route_identity.py"
 
 
+def _tree_supports_route_identity(tree: Path) -> bool:
+    """Whether a worktree carries migration 0070 exactly (ADR-0168 decision 3)."""
+
+    versions = tree / "apps" / "api" / "alembic" / "versions"
+    return (versions / ROUTE_IDENTITY_REVISION_FILE).is_file()
+
+
 def _candidate_supports_route_identity(candidate_tree: Path) -> bool:
-    """Whether the candidate carries migration 0070 exactly (ADR-0168 decision 3).
+    """Whether the candidate names every Slack route identity.
 
     The same exact-file gating as the 0037 state sentinel: only a candidate
     that names every Slack binding's identity is asked to prove it did.
     """
 
-    versions = candidate_tree / "apps" / "api" / "alembic" / "versions"
-    return (versions / ROUTE_IDENTITY_REVISION_FILE).is_file()
+    return _tree_supports_route_identity(candidate_tree)
+
+
+def _released_supports_route_identity(released_tree: Path) -> bool:
+    """Whether the released schema requires a named Slack route identity."""
+
+    return _tree_supports_route_identity(released_tree)
 
 
 def _candidate_supports_legacy_state(candidate_tree: Path) -> bool:
@@ -1018,6 +1030,7 @@ def _plan_seed_statements(
     *,
     approval_route_era: str,
     released_state_repaired: bool = False,
+    released_route_identity: bool = False,
 ) -> tuple[tuple[str, ...], SeedMetadata]:
     """Render released-shaped SQL and exact metadata for optional seeded rows.
 
@@ -1035,6 +1048,10 @@ def _plan_seed_statements(
     contains it. In the latter direction the sentinel owner is seeded with
     memory enabled up front: a post-0037 released database could legitimately
     contain that shared identity, but not under a memory-disabled owner.
+
+    `released_route_identity` distinguishes a released tree at 0070 or later.
+    Its kind-aware check requires every Slack binding to name an adapter, while
+    an older released schema requires endpoint and adapter to be both NULL.
 
     Raises `GateError` rather than returning an empty plan when neither binding
     location exists. A seed that no-ops turns the read-back into a vacuous pass,
@@ -1059,6 +1076,13 @@ def _plan_seed_statements(
             "the released tree contains the 0037 state repair but the released "
             "schema has no agents.memory column; refusing to fabricate an "
             "impossible repaired-state seed"
+        )
+
+    if released_route_identity and ("agent_channels", "adapter") not in present:
+        raise GateError(
+            "the released tree contains the 0070 route-identity migration but "
+            "the released schema has no agent_channels.adapter column; refusing "
+            "to fabricate an impossible route-identity seed"
         )
 
     if ("agents", "slack_channel") in present:
@@ -1115,19 +1139,25 @@ def _plan_seed_statements(
                 insert_values += ", TRUE"
             # One statement per agent, so the binding is written in the same
             # transaction as the row it belongs to and the new id never has to be
-            # round-tripped back through psql. `endpoint` / `adapter` are left
-            # NULL, the released shape of a Slack row (0024's
-            # `agent_channels_route_pair_ck` permits it), which 0070 names
-            # `default` under `agent_channels_route_ck`.
+            # round-tripped back through psql. Before 0070, `endpoint` and
+            # `adapter` are left NULL, the posture 0024's pair check permits.
+            # At 0070, Slack instead requires a named identity and no endpoint.
+            binding_columns = "id, agent_id, kind, address"
+            binding_values = (
+                f"gen_random_uuid(), seeded.id, "
+                f"{_sql_literal(agent.kind)}, {_sql_literal(agent.address)}"
+            )
+            if released_route_identity and agent.kind == "slack":
+                binding_columns += ", adapter"
+                binding_values += ", 'default'"
             statements.append(
                 "WITH seeded AS (\n"
                 f"    INSERT INTO curie.agents ({insert_columns})\n"
                 f"    VALUES ({insert_values})\n"
                 "    RETURNING id\n"
                 ")\n"
-                "INSERT INTO curie.agent_channels (id, agent_id, kind, address)\n"
-                f"SELECT gen_random_uuid(), seeded.id, "
-                f"{_sql_literal(agent.kind)}, {_sql_literal(agent.address)}\n"
+                f"INSERT INTO curie.agent_channels ({binding_columns})\n"
+                f"SELECT {binding_values}\n"
                 "FROM seeded"
             )
     else:
@@ -1186,6 +1216,7 @@ def _seed_released_database(
     phase: str,
     approval_route_era: str,
     released_state_repaired: bool = False,
+    released_route_identity: bool = False,
 ) -> SeedMetadata:
     """Write the fixture into the released database, between the two upgrades.
 
@@ -1201,6 +1232,7 @@ def _seed_released_database(
         columns,
         approval_route_era=approval_route_era,
         released_state_repaired=released_state_repaired,
+        released_route_identity=released_route_identity,
     )
     state_capable = any(
         column.table_name == "workflow_state_entries" for column in columns
@@ -1319,6 +1351,7 @@ def _upgrade_pair(
         phase=SEED_PHASE,
         approval_route_era=_detect_approval_route_era(released_tree),
         released_state_repaired=_candidate_supports_legacy_state(released_tree),
+        released_route_identity=_released_supports_route_identity(released_tree),
     )
 
     failure = _walk(candidate_phases)
