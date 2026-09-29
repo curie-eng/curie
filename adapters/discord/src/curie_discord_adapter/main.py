@@ -154,14 +154,20 @@ class DiscordAdapter(discord.Client):
     async def _withdraw(
         self, placeholder: discord.Message | None, created_thread: discord.Thread | None
     ) -> None:
-        try:
-            if created_thread is not None:
-                # Deleting the thread takes its placeholder with it.
+        if created_thread is not None:
+            try:
+                # Deleting the thread takes its placeholder with it. It needs
+                # Manage Threads; without it, fall through and remove at least
+                # the bot's own placeholder.
                 await created_thread.delete()
-            elif placeholder is not None:
+                return
+            except Exception:
+                logger.exception("Failed to delete the thread opened for a refused Discord caller")
+        if placeholder is not None:
+            try:
                 await placeholder.delete()
-        except Exception:
-            logger.exception("Failed to withdraw the reply to a refused Discord caller")
+            except Exception:
+                logger.exception("Failed to delete the placeholder for a refused Discord caller")
 
     def _binding_for_parent(self, parent_channel_id: str) -> DiscordBinding | None:
         bindings = {

@@ -224,3 +224,19 @@ def test_api_outage_still_shows_the_error(tmp_path: Path) -> None:
     assert thread.sent[0].edits == ["Curie could not accept this message. Please try again."]
     assert state.claim_delivery("5555") is True
     state.close()
+
+
+def test_refusal_without_manage_threads_still_removes_the_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def forbidden(self) -> None:
+        raise RuntimeError("Missing Permissions")
+
+    monkeypatch.setattr(FakeThread, "delete", forbidden)
+    message, http, state = _deliver(tmp_path, _refusal_response)
+
+    assert http.calls == 1
+    [placeholder] = message.threads[0].sent
+    assert placeholder.deleted
+    assert placeholder.edits == []
+    state.close()
