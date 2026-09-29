@@ -477,7 +477,9 @@ mutation's scope.
 2. Through the installation's normal values and upgrade workflow, set only
    `api.approvalRecovery.enabled: true` and wait for the API rollout. Keep this
    window attended: every platform-key holder has the installation-wide reject
-   grant until it is disabled again.
+   grant until it is disabled again. Prepare the exact disable rollout before
+   enabling, and perform it even if principal minting or recovery fails, returns
+   a conflict, or is interrupted.
 
 3. Mint an attributed operator principal without putting its returned token in
    shell history, then recover exactly the inspected id. The disposition is
