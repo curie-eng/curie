@@ -101,8 +101,11 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 [`docs/operations.md`](../../docs/operations.md)). Then:
 
 ```bash
-# The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
-# and the worker budget to 600 s, so raise all three. The chart raises the
+# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
+# already default to 10800. The execution deadline still defaults to 1800, so
+# the required override is:
+#   curie cluster overrides dark-factory --execution-deadline 10800
+# The helm sets below pin those worker values explicitly. The chart raises the
 # worker termination grace with the budget. At this budget, the drain Job
 # publishes a minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
