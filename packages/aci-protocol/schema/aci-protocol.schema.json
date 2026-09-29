@@ -363,6 +363,22 @@
           ],
           "title": "Bundle Version"
         },
+        "channel_memory_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CHANNEL_MEMORY_REF",
+          "producer": [
+            "worker"
+          ],
+          "title": "Channel Memory Ref"
+        },
         "connector_agent": {
           "anyOf": [
             {
@@ -1734,6 +1750,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.6",
-  "title": "ACI Protocol v0.5.6"
+  "protocolVersion": "0.5.7",
+  "title": "ACI Protocol v0.5.7"
 }
