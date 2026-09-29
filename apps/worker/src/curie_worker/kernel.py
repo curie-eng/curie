@@ -1495,6 +1495,8 @@ def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None
     env = boot_env or {}
     if handle.max_turns != env.get(MAX_TURNS_ENV):
         return True
+    if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
+        return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 

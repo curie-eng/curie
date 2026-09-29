@@ -42,13 +42,14 @@ from .binding import SANDBOX_TOKEN_TTL_SECONDS
 from .config import WorkerConfig
 from .progress import ProgressStore, progress_id_for
 from .reply_sink import TargetRoute
+from .sandbox.types import TURN_PROGRESS_ELIGIBILITY_ENV
 
 logger = logging.getLogger(__name__)
 
 URL_HEADER: Final = "X-Curie-Progress-Url"
 TOKEN_HEADER: Final = "X-Curie-Progress-Token"
 GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
-ELIGIBILITY_ENV: Final = "CURIE_TURN_PROGRESS_ENABLED"
+ELIGIBILITY_ENV: Final = TURN_PROGRESS_ELIGIBILITY_ENV
 TOKEN_SCOPE: Final = "turn.progress"
 ROUTE: Final = "/v1/turn-progress/{progress_id}"
 
@@ -269,6 +270,7 @@ class ProgressPump:
         store: ProgressStore,
         *,
         progress_id: str,
+        generation: int,
         route: TargetRoute,
         target: Callable[[], ReplyTarget],
         render: bool,
@@ -278,6 +280,7 @@ class ProgressPump:
     ) -> None:
         self._store = store
         self._progress_id = progress_id
+        self._generation = generation
         self._route = route
         self._target = target
         self._render = render
@@ -324,6 +327,16 @@ class ProgressPump:
         while True:
             stopping = self._stop.is_set()
             try:
+                renewed = await self._store.renew_turn(
+                    self._progress_id, self._generation
+                )
+                if not renewed:
+                    logger.info(
+                        "progress pump for %s lost generation %d",
+                        self._progress_id,
+                        self._generation,
+                    )
+                    return
                 read = await self._pump_once()
             except Exception:  # noqa: BLE001 - progress never fails a turn
                 logger.warning(
@@ -403,9 +416,12 @@ async def start_progress_pump(
     except Exception:  # noqa: BLE001 - progress never fails a turn
         logger.warning("progress pump for %s did not start", plan.progress_id, exc_info=True)
         return None
+    if plan.generation is None:
+        return None
     pump = ProgressPump(
         store,
         progress_id=plan.progress_id,
+        generation=plan.generation,
         route=route,
         target=target,
         render=render,

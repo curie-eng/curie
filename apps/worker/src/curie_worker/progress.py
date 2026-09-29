@@ -83,10 +83,9 @@ PROGRESS_SWEEP_BATCH: Final = 64
 PROGRESS_SWEEP_BUDGET_S: Final = 30.0
 PROGRESS_SWEEP_GRACE_S: Final = 60.0
 PROGRESS_MAX_ATTEMPTS: Final = 5
-# A failed best-effort end-turn write must not leave the turn token useful for
-# the record's 14-day lifetime. This small grace covers response teardown after
-# the runner's own request ceiling.
-PROGRESS_ACTIVE_GRACE_S: Final = 30.0
+# The live pump renews this lease every half second. Five seconds tolerates
+# transient scheduling stalls while bounding a failed end-turn clear tightly.
+PROGRESS_ACTIVE_LEASE_MS: Final = 5_000
 
 # The fencing generation field of the ADR-0131 delivery state hash, which
 # ``delivery_lease.py`` HINCRBYs on every change of authority. The fenced-write
@@ -148,6 +147,17 @@ return generation
 _END_TURN_LUA = """
 if redis.call('HGET', KEYS[1], 'active_generation') ~= ARGV[1] then return 0 end
 redis.call('HSET', KEYS[1], 'active_generation', '0', 'active_until_ms', '0')
+return 1
+"""
+
+_RENEW_TURN_LUA = """
+if redis.call('HGET', KEYS[1], 'active_generation') ~= ARGV[1] then return 0 end
+local active_until_ms = tonumber(redis.call('HGET', KEYS[1], 'active_until_ms'))
+if active_until_ms == nil then return 0 end
+local now_parts = redis.call('TIME')
+local now_ms = tonumber(now_parts[1]) * 1000 + math.floor(tonumber(now_parts[2]) / 1000)
+if now_ms >= active_until_ms then return 0 end
+redis.call('HSET', KEYS[1], 'active_until_ms', tostring(now_ms + tonumber(ARGV[2])))
 return 1
 """
 
@@ -451,9 +461,18 @@ class MalformedProgressError(RuntimeError):
 class ProgressStore:
     """The durable progress record, its chain pointers, and its outbox."""
 
-    def __init__(self, redis: Redis, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        config: WorkerConfig,
+        *,
+        active_lease_ms: int = PROGRESS_ACTIVE_LEASE_MS,
+    ) -> None:
+        if active_lease_ms < 1:
+            raise ValueError("active_lease_ms must be positive")
         self._redis = redis
         self._config = config
+        self._active_lease_ms = active_lease_ms
 
     @property
     def dead_letter_stream(self) -> str:
@@ -553,11 +572,7 @@ class ProgressStore:
                 1,
                 self._config.progress_key(progress_id),
                 str(progress_ttl_s(self._config)),
-                str(
-                    int(
-                        (self._config.runner_total_timeout_s + PROGRESS_ACTIVE_GRACE_S) * 1000
-                    )
-                ),
+                str(self._active_lease_ms),
             )
         )
         if generation < 1:
@@ -574,6 +589,18 @@ class ProgressStore:
             str(generation),
         )
         return int(ended) == 1
+
+    async def renew_turn(self, progress_id: str, generation: int) -> bool:
+        """Renew this live generation, but never revive one whose lease lapsed."""
+
+        renewed = await self._redis.eval(
+            _RENEW_TURN_LUA,
+            1,
+            self._config.progress_key(progress_id),
+            str(generation),
+            str(self._active_lease_ms),
+        )
+        return int(renewed) == 1
 
     async def apply_model_command(
         self,
