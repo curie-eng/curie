@@ -135,9 +135,10 @@ next click rather than the next restart:
 
 Three independent axes, and keeping them separate is the point:
 
-- **`resolution` is WHERE the one interactive card posts.** It is required and currently
-  accepts only `{ "kind": "slack", "address": "C..." }`, because Slack's authenticated
-  interaction path supplies the verified resolver identity.
+- **`resolution` is WHERE the one interactive card posts.** It is required and takes one of
+  two forms: a fixed Slack channel, `{ "kind": "slack", "address": "C..." }`, or
+  `{ "mode": "requesting_surface" }`, which shows the card in the conversation that asked,
+  on whatever channel that is (see below).
 - **`notification` is WHERE else humans are told.** It is optional. Its text includes the
   approval ID and directs humans to the configured approval channel without naming its
   kind or address. It has no interaction, buttons, action values, or other resolving
@@ -149,9 +150,30 @@ Three independent axes, and keeping them separate is the point:
 A Slack notification can use the worker's default transport. Any other notification kind
 must store both `endpoint` and `adapter`; those transport details are write-only and are
 redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
-Resolution deliberately has a channel-neutral shape but remains Slack-only. Making another
-channel interactive requires a future adapter-scoped credential that establishes a verified
-resolver identity; this split does not add one or accept resolution through a notification.
+A fixed resolution target stays Slack-only, and a notification never resolves anything.
+
+### Answering where it was asked, including by email
+
+This is
+[ADR-0177](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md). A
+route whose `resolution` is `{ "mode": "requesting_surface" }` puts its card in the
+conversation that asked, the way an approval with no route already does. It cannot carry a
+`notification`, since the card is already in the thread that asked. Who may answer follows
+the channel the card lands on:
+
+- **In Slack**, nothing changes: the channel's members, the route's user group, or its
+  listed users, exactly as for any Slack card.
+- **Anywhere else**, such as an email thread, only the person who asked may answer, by
+  replying in that conversation through the channel's adapter. People copied on the thread
+  cannot answer, and neither can an operator token, a console session or a Slack click.
+  This is the requester confirming their own request, not a second person's sign-off. A
+  route that lists `approvers` and would land on such a conversation is escalated when the
+  approval is raised, because approver lists name Slack users that nobody there can prove
+  to be yet. A bot that needs a second person's sign-off keeps a fixed Slack route.
+
+An adapter answers only approvals whose card went to one of its own bindings. Until a
+channel's adapter renders the Approve and Reject request and reads the replies, its
+approvals still only expire.
 
 A route the bundle names but the agent never bound is **escalated to a human**, not
 posted to the requesting channel. Silently widening a request to whoever happens to be

@@ -540,6 +540,35 @@ def test_an_agent_bound_through_two_identities_gives_both_its_approval_target() 
     assert sorted(ops_client.channels) == sorted([CHANNEL_B, CHANNEL_C])
 
 
+def test_a_requesting_surface_route_adds_no_destination_and_does_not_fail_the_boot() -> None:
+    """ADR-0177: a route whose card goes where the request was asked names no
+    channel of its own. Its card lands in one of the agent's own bindings,
+    which are probed already, so it adds nothing and must not be read as a
+    malformed target that refuses the boot."""
+
+    agents = [
+        _agent(
+            channels=[{"kind": "slack", "address": CHANNEL_A, "adapter": "default"}],
+            approval_routes={
+                "confirm": {"resolution": {"mode": "requesting_surface"}},
+                "security": {"resolution": {"kind": "slack", "address": CHANNEL_C}},
+            },
+        )
+    ]
+    default_client = _IdentityClient(auth_response={"ok": True})
+
+    admitted = check_slack_channel_capabilities(
+        _config(),
+        logger=logging.getLogger("test-preflight-identities-requesting-surface"),
+        identities=(DEFAULT,),
+        web_clients={"default": default_client},
+        api_client=_client(lambda _request: httpx.Response(200, json=agents)),
+    )
+
+    assert [identity.name for identity in admitted] == ["default"]
+    assert sorted(default_client.channels) == sorted([CHANNEL_A, CHANNEL_C])
+
+
 @pytest.mark.parametrize(
     "other_ingress",
     [

@@ -61,6 +61,8 @@ from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_nam
 # also rejects bare names ("general"), pasted URLs, and lowercase IDs -- none of
 # which the worker can route on.
 _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
+# Public alias for the approval plane, which must recognize the shape too.
+SLACK_CHANNEL_ID = _SLACK_CHANNEL_ID
 # Slack user-group (subteam) IDs start with S; user IDs start with U, or W for
 # enterprise-grid users. Same allowlist discipline and same reason as channels:
 # a @handle or a bare name never resolves, and the S/C prefix is the whole
@@ -1193,15 +1195,39 @@ class ChannelBindingPatch(ChannelBindingWrite):
 
 
 class ApprovalResolutionTarget(ChannelBinding):
-    """The one target permitted to carry an approval-resolving affordance.
+    """A fixed channel for a route's approval card.
 
     ``kind`` is an explicit extension point, but it is intentionally Slack-only
     until a second adapter can present the scoped verified identity ADR-0096
     requires. Merely teaching an adapter to render buttons cannot widen this
-    authority boundary.
+    authority boundary. A card reaches any other channel only through
+    ``ApprovalRequestingSurfaceTarget``, and only in the conversation that
+    asked (ADR-0177).
     """
 
     kind: Literal["slack"]
+
+
+REQUESTING_SURFACE_MODE = "requesting_surface"
+
+
+class ApprovalRequestingSurfaceTarget(BaseModel):
+    """Show the card in the conversation that asked, on any channel (ADR-0177).
+
+    The other form of a route's ``resolution``: instead of a fixed Slack
+    channel, the card goes where the request was asked, exactly as a routeless
+    approval's card already does. Who may answer then follows the channel the
+    card lands on: Slack keeps its approver sets, and any other channel admits
+    the requester alone (``approvers.RequesterOnly``).
+
+    Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
+    ``address`` beside it is a mix of the two forms, which the ADR refuses
+    rather than guessing which half the operator meant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["requesting_surface"]
 
 
 class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
@@ -1235,7 +1261,8 @@ class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
 class ApprovalRouteBinding(_StoredWithoutNulls):
     """One strict workspace binding for a declared approval route (#1460).
 
-    ``resolution`` is the single verified-identity action surface.
+    ``resolution`` is the single verified-identity action surface: a fixed
+    Slack channel, or the conversation that asked (ADR-0177).
     ``notification`` may make the pending request visible elsewhere, but its
     message carries no interaction. ``approvers`` continues to narrow WHO may
     act through the resolution card path and is never inferred from notification
@@ -1244,12 +1271,21 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     model_config = ConfigDict(extra="forbid")
 
-    resolution: ApprovalResolutionTarget
+    resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
 
     @model_validator(mode="after")
     def _targets_must_differ(self) -> "ApprovalRouteBinding":
+        if isinstance(self.resolution, ApprovalRequestingSurfaceTarget):
+            if self.notification is not None:
+                # ADR-0177 decision 1: the card already joins the thread that
+                # asked, so there is nobody further to notify.
+                raise ValueError(
+                    "a requesting_surface resolution cannot carry a notification: "
+                    "the card is already shown in the conversation that asked"
+                )
+            return self
         if self.notification is not None and (
             self.resolution.kind,
             self.resolution.address,
@@ -1297,12 +1333,24 @@ class ApprovalApproversOut(BaseModel):
     users: list[str] | None = None
 
 
+class ApprovalRequestingSurfaceTargetOut(BaseModel):
+    """Read projection of ``ApprovalRequestingSurfaceTarget`` (ADR-0177).
+
+    Tolerant like every read shape here, so a hand-edited row still reads back
+    for repair instead of failing the whole agent response.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str
+
+
 class ApprovalRouteBindingOut(BaseModel):
     """The required resolution plus optional, redacted visibility policy."""
 
     model_config = ConfigDict(extra="ignore")
 
-    resolution: ApprovalTargetOut
+    resolution: ApprovalTargetOut | ApprovalRequestingSurfaceTargetOut
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
 

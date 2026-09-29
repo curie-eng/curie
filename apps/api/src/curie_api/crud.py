@@ -8,13 +8,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, literal, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
+from .approvers import card_on_requesting_surface
 from .config import get_settings
 from .models import (
     ActionAuditEntry,
@@ -2500,9 +2501,10 @@ async def find_rejected_reraise(session: AsyncSession, data: "ApprovalRequest") 
     return None
 
 
-# Per served agent: its approval route map, read fresh, and the (kind, address)
-# pairs of the adapter's bindings that belong to that agent.
-_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str]]]]
+# Per served agent: its approval route map, read fresh, and the adapter's
+# bindings that belong to that agent, each as its (kind, address, identity)
+# route (ADR-0168 decision 3), identity normalized by ``route_identity``.
+_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str, str | None]]]]
 
 
 async def _adapter_served_targets(
@@ -2528,38 +2530,61 @@ async def _adapter_served_targets(
             AgentChannel.agent_id,
             AgentChannel.kind,
             AgentChannel.address,
+            AgentChannel.adapter,
             Agent.approval_routes,
         )
         .join(Agent, Agent.id == AgentChannel.agent_id)
         .where(AgentChannel.id.in_(bindings))
     )
-    pairs: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    pairs: dict[uuid.UUID, set[tuple[str, str, str | None]]] = {}
     routes: dict[uuid.UUID, Any] = {}
-    for agent_id, kind, address, approval_routes in rows:
-        pairs.setdefault(agent_id, set()).add((kind, address))
+    for agent_id, kind, address, adapter, approval_routes in rows:
+        pairs.setdefault(agent_id, set()).add((kind, address, route_identity(kind, adapter)))
         routes[agent_id] = approval_routes
     return {agent_id: (routes[agent_id], frozenset(p)) for agent_id, p in pairs.items()}
 
 
 def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
-    """THE served predicate (ADR-0154), shared by the list and the resolver.
+    """THE served predicate (ADR-0154, ADR-0177), shared by the list and the resolver.
 
-    An approval is served when it names an agent and a route, and that agent's
-    route resolves to the ``(kind, address)`` of one of the adapter's bindings
-    ON THE SAME AGENT. A routeless approval, or a route whose resolution is
-    missing or malformed, is served by no adapter: fail closed.
+    An approval is served when its card went to one of the adapter's bindings
+    ON THE SAME AGENT, routed or not (ADR-0177 decision 4). Two ways a card
+    gets there:
+
+    - It was shown in the conversation that asked: a routeless approval, or a
+      route in ``requesting_surface`` mode (``approvers.card_on_requesting_surface``).
+      Then the asking route, ``(reply_kind, reply_channel, reply_adapter)``,
+      must be one of the adapter's bindings. The adapter identity is part of
+      the match: two adapters may bind one ``(kind, address)`` pair on the
+      same agent (ADR-0168 decision 3), and only the one that showed the card
+      may answer it. The record stores that route, and it is a fact about the
+      original turn that no later rebinding rewrites.
+    - Its route names a fixed target, the recorded card is at that target, and
+      the target's ``(kind, address)`` is one of the adapter's bindings.
+
+    An approval with no agent, or a route whose resolution is missing or
+    malformed, is served by no adapter: fail closed.
     """
 
-    if approval.agent_id is None or not approval.route:
+    if approval.agent_id is None:
         return False
     target = targets.get(approval.agent_id)
     if target is None:
         return False
     approval_routes, pairs = target
-    if not isinstance(approval_routes, dict):
-        return False
-    binding = approval_routes.get(approval.route)
-    if not isinstance(binding, dict):
+    binding = (
+        approval_routes.get(approval.route)
+        if approval.route and isinstance(approval_routes, dict)
+        else None
+    )
+    if card_on_requesting_surface(approval, binding):
+        asking = (
+            approval.reply_kind,
+            approval.reply_channel,
+            route_identity(approval.reply_kind, approval.reply_adapter),
+        )
+        return asking in pairs
+    if not approval.route or not isinstance(binding, dict):
         return False
     resolution = binding.get("resolution")
     if not isinstance(resolution, dict):
@@ -2567,7 +2592,13 @@ def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
     kind, address = resolution.get("kind"), resolution.get("address")
     if not isinstance(kind, str) or not isinstance(address, str):
         return False
-    return (kind, address) in pairs
+    # The card must actually be there: a route re-pointed after the ask does
+    # not hand the pending approval to whoever serves the new target.
+    if (approval.card_channel or approval.reply_channel) != address:
+        return False
+    # Fixed targets are Slack only, and no Slack approver set admits an
+    # adapter, so this match grants listing, never an answer.
+    return any((k, a) == (kind, address) for k, a, _ in pairs)
 
 
 async def approval_served_by(
@@ -2587,6 +2618,10 @@ async def existing_channel_binding_ids(
         return frozenset()
     result = await session.scalars(select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids)))
     return frozenset(result)
+
+
+# Rows read per round when an adapter's approval list is filtered in Python.
+_SERVED_LIST_BATCH = 1000
 
 
 async def list_approvals(
@@ -2615,16 +2650,35 @@ async def list_approvals(
     targets = await _adapter_served_targets(session, served_by)
     if not targets:
         return []
-    # Narrow in SQL to the served agents' routed rows, then apply the one
-    # predicate the resolver also uses; the route map is JSONB, so the
-    # resolution match itself stays in Python. The SQL side still needs its
-    # own bound: `_approval_served` can only drop rows, never keep more than
-    # it's given, so a hard cap here (well above `limit`) keeps a busy agent's
-    # adapter listing from materializing every routed approval it has.
-    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None)).limit(
-        max(limit, 1000)
-    )
-    served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
+    # Narrow in SQL to the served agents' rows, routed or not (ADR-0177). A
+    # routeless row is served only through its asking pair, so rows asked on a
+    # binding this adapter does not serve are dropped in SQL too. The rest of
+    # the match (the adapter identity, the route map's resolution) stays in
+    # Python, so read in keyset batches until the page is full: a batch of
+    # unserved rows can never shorten the page or hide an older served row.
+    asking_pairs = {(kind, address) for _, pairs in targets.values() for kind, address, _ in pairs}
+    stmt = stmt.where(
+        Approval.agent_id.in_(targets),
+        or_(
+            Approval.route.is_not(None),
+            tuple_(Approval.reply_kind, Approval.reply_channel).in_(asking_pairs),
+        ),
+    ).order_by(Approval.id.desc())
+    batch_size = max(limit, _SERVED_LIST_BATCH)
+    served: list[Approval] = []
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while len(served) < limit:
+        page = stmt
+        if cursor is not None:
+            page = page.where(
+                tuple_(Approval.created_at, Approval.id)
+                < tuple_(literal(cursor[0]), literal(cursor[1]))
+            )
+        batch = list(await session.scalars(page.limit(batch_size)))
+        served.extend(a for a in batch if _approval_served(a, targets))
+        if len(batch) < batch_size:
+            break
+        cursor = (batch[-1].created_at, batch[-1].id)
     return served[:limit]
 
 

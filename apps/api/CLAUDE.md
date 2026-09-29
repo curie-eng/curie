@@ -47,7 +47,9 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   Served is ONE predicate, `crud._approval_served`, for both. Presenting it
   with the platform key or another resolver credential is 401, never a
   precedence choice. The resolver kinds are `chat`, `console`, `operator` and
-  `adapter`; `operator` and `adapter` resolve only explicit-user routes.
+  `adapter`; `operator` resolves only explicit-user routes, and no Slack approver
+  set admits `adapter`, since only the dispatcher vouches for a Slack ID
+  (ADR-0177's separate finding).
 - **Who may start a turn is decided in ONE function (ADR 0175, #3241).**
   `admission.admit` answers for a binding's optional `allowed_callers` list, and
   both entry points call it: `POST /channels/turns` after token verification and
