@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,16 @@ OUTPUT_KEYS = {
 # Jobs behind these tiers each boot a kind cluster. Callers omit them when
 # the run should not pay for that.
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
+UPGRADE_WORKFLOW_JOBS = frozenset(
+    {
+        "e2e-released-upgrade",
+        "e2e-released-upgrade-negative",
+        "e2e-cluster-upgrade-matrix-shards",
+        "e2e-cluster-upgrade-matrix",
+    }
+)
+WORKFLOW_PATH = ".github/workflows/ci.yaml"
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 class RegistryError(ValueError):
@@ -231,6 +242,101 @@ def _changed_paths(base: str, head: str) -> list[str]:
         check=True,
     )
     return [line for line in completed.stdout.splitlines() if line]
+
+
+def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
+    try:
+        root = yaml.compose(content)
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
+    if not isinstance(root, yaml.nodes.MappingNode):
+        raise RegistryError("workflow root must be a mapping")
+
+    root_keys: set[str] = set()
+    jobs_node: yaml.nodes.MappingNode | None = None
+    for key, value in root.value:
+        if not isinstance(key, yaml.nodes.ScalarNode):
+            raise RegistryError("workflow root keys must be strings")
+        if key.value in root_keys:
+            raise RegistryError(f"duplicate workflow root key: {key.value}")
+        root_keys.add(key.value)
+        if key.value == "jobs":
+            if not isinstance(value, yaml.nodes.MappingNode):
+                raise RegistryError("workflow jobs must be a mapping")
+            jobs_node = value
+        elif isinstance(value, yaml.nodes.MappingNode):
+            if any(
+                isinstance(nested_key, yaml.nodes.ScalarNode)
+                and nested_key.value in UPGRADE_WORKFLOW_JOBS
+                for nested_key, _ in value.value
+            ):
+                raise RegistryError("upgrade job moved outside workflow jobs")
+    if jobs_node is None:
+        raise RegistryError("workflow jobs mapping is missing")
+
+    spans: dict[str, tuple[int, int]] = {}
+    seen_jobs: set[str] = set()
+    for key, value in jobs_node.value:
+        if not isinstance(key, yaml.nodes.ScalarNode):
+            raise RegistryError("workflow job keys must be strings")
+        if key.value in seen_jobs:
+            raise RegistryError(f"duplicate workflow job: {key.value}")
+        seen_jobs.add(key.value)
+        if key.value in UPGRADE_WORKFLOW_JOBS:
+            if not isinstance(value, yaml.nodes.MappingNode):
+                raise RegistryError(f"workflow job {key.value} must be a mapping")
+            spans[key.value] = (key.start_mark.line + 1, value.end_mark.line + 1)
+    return spans
+
+
+def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
+    merge_base = subprocess.run(
+        ["git", "merge-base", base, head],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    old_content = subprocess.run(
+        ["git", "show", f"{merge_base}:{WORKFLOW_PATH}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    new_content = subprocess.run(
+        ["git", "show", f"{head}:{WORKFLOW_PATH}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_spans = _workflow_job_spans(old_content)
+    new_spans = _workflow_job_spans(new_content)
+    if not (old_spans or new_spans):
+        raise RegistryError("workflow has no released-upgrade job anchors")
+
+    diff = subprocess.run(
+        ["git", "diff", "--no-renames", "--unified=0", merge_base, head, "--", WORKFLOW_PATH],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    hunk_lines = [line for line in diff.splitlines() if line.startswith("@@")]
+    if not hunk_lines:
+        raise RegistryError("changed workflow has no text hunks")
+    for line in hunk_lines:
+        match = HUNK_HEADER.match(line)
+        if match is None:
+            raise RegistryError(f"malformed workflow diff hunk: {line}")
+        old_start, old_count, new_start, new_count = match.groups()
+        for start, count, spans in (
+            (int(old_start), int(old_count or "1"), old_spans),
+            (int(new_start), int(new_count or "1"), new_spans),
+        ):
+            if count and any(
+                start < end and start + count > beginning
+                for beginning, end in spans.values()
+            ):
+                return True
+    return False
 
 
 def _render(
