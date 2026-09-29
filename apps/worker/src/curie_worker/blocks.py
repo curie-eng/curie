@@ -31,7 +31,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from channel_protocol import ChoiceIntent, ConfirmIntent, OutboundMessage
+from channel_protocol import (
+    ChoiceIntent,
+    ConfirmIntent,
+    OutboundMessage,
+    ProgressCard,
+    ProgressMilestone,
+    progress_heading,
+    progress_text,
+)
 from pydantic import ValidationError
 
 from .behaviorpacks import BehaviorPacks, NavPack, ensure_hub_button
@@ -442,3 +450,69 @@ def expired_approval_card(
         verdict="This request expired and can no longer be approved or rejected.",
         header=settled_card_header("expired"),
     )
+
+
+# --- Deliberate progress (ADR-0130) -----------------------------------------------
+
+# Every block of a card, and every block of a milestone, starts with its prefix.
+# The CLI's Slack stub tells progress from the answer by them, so they are
+# frozen with it in tests/vectors/progress-blocks.json.
+PROGRESS_CARD_BLOCK_ID_PREFIX = "curie-progress-card:"
+PROGRESS_MILESTONE_BLOCK_ID_PREFIX = "curie-progress-milestone:"
+
+_PROGRESS_CLOSED_LINE = "This task is closed. The card will not change again."
+
+
+def _plain(text: str) -> dict[str, Any]:
+    """A text object Slack shows as written: no mention, link or emoji code forms."""
+    return {"type": "plain_text", "text": text, "emoji": False}
+
+
+def _slack_escaped(text: str) -> str:
+    """``text`` for a field Slack parses, with its three control characters escaped.
+
+    ``&`` first, so the entities the other two become are not escaped again.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def progress_card(card: ProgressCard) -> tuple[str, list[dict[str, Any]]]:
+    """The progress card as ``(fallback_text, blocks)`` for a post or an edit.
+
+    @spec ADR-0130 d2, d5. The worker README section "How the Slack adapter
+    renders progress" is the contract. Block ids carry the revision because an
+    edited message should get new ones.
+    """
+
+    prefix = f"{PROGRESS_CARD_BLOCK_ID_PREFIX}r{card.revision}:"
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "block_id": f"{prefix}state", "text": _plain(progress_heading(card))},
+        {"type": "section", "block_id": f"{prefix}summary", "text": _plain(card.summary)},
+    ]
+    if card.terminal:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": f"{prefix}closed",
+                "elements": [_plain(_PROGRESS_CLOSED_LINE)],
+            }
+        )
+    return _slack_escaped(progress_text(card)), blocks
+
+
+def progress_milestone(milestone: ProgressMilestone) -> tuple[str, list[dict[str, Any]]]:
+    """One milestone reply as ``(fallback_text, blocks)`` for ``chat.postMessage``.
+
+    @spec ADR-0130 d3, d5. Never edited, so its ids carry the ordinal alone.
+    """
+
+    prefix = f"{PROGRESS_MILESTONE_BLOCK_ID_PREFIX}{milestone.ordinal}:"
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "context",
+            "block_id": f"{prefix}class",
+            "elements": [_plain(progress_heading(milestone))],
+        },
+        {"type": "section", "block_id": f"{prefix}summary", "text": _plain(milestone.summary)},
+    ]
+    return _slack_escaped(progress_text(milestone)), blocks

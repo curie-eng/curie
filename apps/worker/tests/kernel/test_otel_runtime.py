@@ -6,12 +6,14 @@ import asyncio
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from aci_protocol import (
+    Attachment,
     ErrorEvent,
     Event,
     Final,
@@ -19,6 +21,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    TurnSource,
 )
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -34,10 +37,12 @@ from curie_worker import runner_client as runner_client_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker import threadlock as threadlock_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.sandbox import substrate as substrate_module
 from opentelemetry.trace import (
     SpanKind,
@@ -351,6 +356,105 @@ def test_side_effect_failure_has_its_own_terminal_metric_and_span_class(
             assert {
                 point.attributes["outcome"] for point in _metrics(probe, "curie.turn.completed")
             } == {"side_effect_halted"}
+
+    asyncio.run(go())
+
+
+_Refusal = Callable[[Any, pytest.MonkeyPatch], tuple[QueuedTurn, str]]
+
+
+def _refuse_missing_agent_pool(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[QueuedTurn, str]:
+    error = MissingAgentPoolError("acme-bot", "curie-agent-acme-bot-runner-pool")
+
+    def refuse(thread_key: str, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(h.substrate, "claim", refuse)
+    return (
+        _qevent("hello", thread="thread-refused-pool"),
+        f"This agent cannot start: {error}. An operator has to make that change.",
+    )
+
+
+class _UnavailableAttachments:
+    """An attachment lane that refuses every download."""
+
+    def resolve(self, **_kwargs: object) -> object:
+        raise AttachmentResolutionError("fetch", "source refused the download")
+
+
+def _refuse_unavailable_attachment(
+    h: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[QueuedTurn, str]:
+    monkeypatch.setattr(h.kernel, "_attachments", _UnavailableAttachments())
+    return (
+        _qevent(
+            "read this",
+            thread="thread-refused-file",
+            attachments=[Attachment(id="F0EXAMPLE1", name="report.txt")],
+        ),
+        "I could not make that file available to the agent. "
+        "Please send the message again with the file attached.",
+    )
+
+
+def _refuse_capacity(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[QueuedTurn, str]:
+    # Only a Slack turn waits for capacity; any other source is answered at once.
+    h.fake_k8s.quota_rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1"},
+        used={"pods": "2"},
+        hard={"pods": "2"},
+    )
+    return (
+        _qevent("job output", thread="thread-refused-capacity", source=TurnSource.WEBHOOK),
+        "This agent is at capacity right now. Please try again shortly.",
+    )
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [_refuse_missing_agent_pool, _refuse_unavailable_attachment, _refuse_capacity],
+    ids=["missing-agent-pool", "unavailable-attachment", "capacity"],
+)
+def test_a_turn_the_worker_refuses_to_start_completes_as_classified_failure(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: _Refusal,
+) -> None:
+    """A refusal is a failure to alerting and the same one reply to the person.
+
+    Each path answers with the worker's own text and never opens the runner. It
+    completed exactly as a real answer does, outcome ``done``, so an alert on
+    ``classified_failure`` could not see an agent that refused every turn.
+    """
+
+    async def go() -> None:
+        probe = _install(monkeypatch)
+        async with make_harness(max_attempts=3, claim_timeout_seconds=0.05) as h:
+            event, reply = refusal(h, monkeypatch)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            texts = [text for _address, _ref, text in h.sink.updates]
+            assert texts.count(reply) == 1
+            assert texts[-1] == reply
+            assert [
+                completion.outcome
+                for completion in h.sink.completions
+                if completion.event_id == event.event_id
+            ] == ["delivered"]
+            assert {
+                point.attributes["outcome"] for point in _metrics(probe, "curie.turn.completed")
+            } == {"classified_failure"}
+            [span] = _spans(probe, "curie.turn.process")
+            assert span.attributes["outcome"] == "classified_failure"
+            assert span.status is StatusCode.ERROR
+            assert (
+                "turn.processing.completed",
+                {"outcome": "classified_failure"},
+            ) in span.events
 
     asyncio.run(go())
 

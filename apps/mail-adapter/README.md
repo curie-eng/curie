@@ -264,6 +264,13 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   ref the platform returned. Two turns in one thread cannot clear or inherit one
   another's text. A null-ref post attaches only when exactly one live ref is
   unambiguous.
+- **Deliberate progress is silent.** A `reply.update` or `reply.post` carrying
+  reply wire 1.1 `progress` (ADR-0130) is acknowledged 200 with no `ref` and
+  changes nothing: not the buffered reply text, not its ref, and no email. An
+  email turn sends one message, so a card edit has nothing to edit, and a
+  progress post appended to the buffered reply would put task-status lines
+  into the answer the correspondent reads. Silence is the conforming choice the
+  channel-adapter guide allows.
 - **Provider-visible dedupe closes the accepted-send crash window.** The local
   event receipt is the fast path. After an uncertain send, the adapter reads the
   marker carried on the provider thread before retrying: found settles without a
