@@ -81,6 +81,8 @@ _TITLE_MAX = 100
 _CHECKS_LINE_MAX = 400
 _NO_CI_NOTE = f"No CI checks appeared within {CI_GRACE_SECONDS} s."
 _REQUIRED_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+# The aggregate job above is created only after these shard jobs finish.
+_PYTHON_PYTEST_SHARD_PREFIX = "Python pytest (shard "
 # Conservative subset of the release train's MUST_RUN_PYTEST_PREFIXES and
 # nonignored fallback paths in tools/e2e-ci-selection/select_tiers.py.
 # Unknown Python paths fail closed instead of assuming the selector fallback.
@@ -328,16 +330,26 @@ def decide(
         )
 
     if requires_python_ci and not required_python_runs:
-        in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
-        if in_grace and not expired and not prior_round_had_checks:
-            return Verdict(kind="pending", reason="required_python_ci_missing")
         has_unrelated_checks = bool(check_runs or statuses)
-        reason = (
-            "required_python_ci_unrelated"
-            if has_unrelated_checks
-            else "required_python_ci_missing"
+        # Shard jobs stay in the list after they complete, and the aggregate
+        # check is created only then. Their presence means that check can
+        # still appear, so keep waiting until the CI deadline.
+        shards_expect_aggregate = any(
+            _str(run.get("name")).startswith(_PYTHON_PYTEST_SHARD_PREFIX) for run in check_runs
         )
-        return Verdict(kind="unverified", reason=reason)
+        if not expired and (pending or shards_expect_aggregate):
+            return Verdict(
+                kind="pending",
+                pending=pending,
+                reason="required_python_ci_missing",
+            )
+        in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
+        if not has_unrelated_checks and in_grace and not expired and not prior_round_had_checks:
+            return Verdict(kind="pending", reason="required_python_ci_missing")
+        reason = (
+            "required_python_ci_unrelated" if has_unrelated_checks else "required_python_ci_missing"
+        )
+        return Verdict(kind="unverified", reason=reason, pending=pending)
 
     if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
