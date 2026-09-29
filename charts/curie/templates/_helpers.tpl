@@ -2135,9 +2135,9 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173).
+every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523).
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}

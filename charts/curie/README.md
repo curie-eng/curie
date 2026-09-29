@@ -1137,6 +1137,18 @@ explicit `sizeLimit`:
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
 | `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
 | One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
+| `workspace` (the managed repository checkout at `/workspace`) | `agentSandbox.runner.workspace.sizeLimit`, or per agent `agentSandbox.workspaceSizeLimits.<agent>` | `1Gi`; per agent: none, the agent inherits the default |
+| `attachments` (one turn's inbound attachments) | `agentSandbox.runner.attachments.sizeLimit` | `512Mi` |
+
+`agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
+ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile
+in its checkout without enlarging every sandbox. Each listed agent gets its own
+SandboxTemplate and warm pool, and the worker routes that agent's claims there.
+A value must be a binary quantity (`Ki`, `Mi`, `Gi`, `Ti`); anything else fails
+render. The kubelet also counts `emptyDir` usage against the pod's
+`ephemeral-storage` limit, so that agent's runner `ephemeral-storage` limit must
+cover the workspace plus its home scratch, or the pod is evicted at the smaller
+bound. `ci/sandbox-emptydir-sizelimit-assertions.sh` pins the rendering.
 
 **This is a backstop, not an instantaneous cap.** `sizeLimit` is enforced by
 periodic kubelet measurement of the volume's usage, not a write-time quota, so a
