@@ -8,7 +8,7 @@
 //! broken for everything. Capability removal is the separate proof that a
 //! case requires its declared capability.
 //!
-//! Three controls, all offline and deterministic, all driven off the committed
+//! Four controls, all offline and deterministic, all driven off the committed
 //! suites discovered on disk (so a new suite is covered with no edit here):
 //!
 //!   A. Negative (null agent): no committed case may green against a canned
@@ -34,7 +34,12 @@
 //!      grader simply being broken. Every discovered case must have an exemplar
 //!      (completeness), so a new suite forces one to be supplied.
 //!
-//! Fixtures (exemplars + input-satisfiable baseline) live in
+//!   D. Negative (selected semantic opposites): a case may name known-bad
+//!      answers that must stay red. This catches polarity-insensitive regexes
+//!      where both the required claim and its direct negation contain the same
+//!      keywords.
+//!
+//! Fixtures (exemplars + counterexamples + input-satisfiable baseline) live in
 //! `tests/data/eval_falsifiability_fixtures.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,6 +123,7 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
 #[derive(Debug, Deserialize)]
 struct Fixtures {
     exemplars: BTreeMap<String, String>,
+    counterexamples: BTreeMap<String, Vec<String>>,
     input_satisfiable_baseline: BTreeSet<String>,
 }
 
@@ -246,5 +252,40 @@ fn every_grader_greens_on_its_known_good_exemplar() {
         "these known-good exemplars fail their grader -- the grader rejects a correct \
          answer, or the exemplar drifted:\n  {}",
         red.join("\n  ")
+    );
+}
+
+/// Control D -- selected semantic opposites stay red. These are narrower than
+/// the universal null and input-parrot controls: each answer deliberately uses
+/// the case's own vocabulary while asserting the prohibited polarity.
+#[test]
+fn selected_semantic_opposites_stay_red() {
+    let counterexamples = fixtures().counterexamples;
+    let mut case_keys: BTreeSet<String> = BTreeSet::new();
+    let mut offenders: Vec<String> = Vec::new();
+
+    for (name, suite) in discover_suites() {
+        for case in &suite.cases {
+            let key = case_key(&name, case);
+            case_keys.insert(key.clone());
+            for output in counterexamples.get(&key).into_iter().flatten() {
+                if turn_passes(case, &done_turn(output)) {
+                    offenders.push(format!("{key} greens on semantic opposite {output:?}"));
+                }
+            }
+        }
+    }
+
+    let fixture_keys: BTreeSet<String> = counterexamples.keys().cloned().collect();
+    let orphan: Vec<&String> = fixture_keys.difference(&case_keys).collect();
+    assert!(
+        orphan.is_empty(),
+        "these counterexamples reference cases that no longer exist:\n  {:?}",
+        orphan
+    );
+    assert!(
+        offenders.is_empty(),
+        "these committed eval cases accept a known semantic opposite:\n  {}",
+        offenders.join("\n  ")
     );
 }
