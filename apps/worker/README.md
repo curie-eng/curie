@@ -386,8 +386,10 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
 `1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
 one delivery lease TTL), `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
-when a delivery's handler raises) and `CURIE_TURN_RECEIPT` (what the receipt
-beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180),
+when a delivery's handler raises), `CURIE_TURN_RECEIPT` (what the receipt
+beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180) and
+`CURIE_PROGRESS_RENDER` (deliberate progress rendering, off; see
+[Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)),
 plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
 substrate. Run with `python -m curie_worker`.
 
@@ -501,10 +503,15 @@ Three verbs are **deliberately not lease-fenced**, and none is an oversight:
   entry whose turn caused it. Its guard is the record's generation, compared on
   every attempt charge, acknowledgement and dead-letter, not a lease.
 
-Applying a model's progress command (`ProgressStore.apply_model_command`) is
-not an owner verb either. The ingress that will call it serves the
-authenticated running turn, not a stream delivery, so its guard is the
-`(epoch, seq)` order and terminal monotonicity rather than a lease.
+Applying a model's progress command (`ProgressStore.apply_model_command`,
+called by the kernel's per-turn pump) is not an owner verb either. The pump
+applies what the ingress accepted from the authenticated running turn, not a
+stream delivery, so its guard is the `(epoch, seq)` order and terminal
+monotonicity rather than a lease: an owner that lost its fence can only apply
+its own turn's commands, which the record orders like anyone else's. While
+rendering is off the pump also removes the deliveries an applied command
+enqueued (`ProgressStore.discard_deliveries`); nothing a person sees depends on
+that write.
 
 ### Adapter idempotency: which channel may claim one terminal effect
 
@@ -562,11 +569,16 @@ Valkey, so they are not atomic across both systems.
 `curie_worker.progress` is the worker coordinator's durable state for
 [ADR 0130](../../docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md):
 one progress record per logical turn chain, its milestone budget, and an outbox
-of the card and milestone deliveries the record owes its channel. Nothing
-reaches it yet. No ingress accepts a `curie_progress` command, the kernel opens
-no chain, and no adapter is called; the maintenance tick runs its sweeper
-without a deliverer (below). It lives in Valkey, like the completion outbox;
-Postgres holds none of it.
+of the card and milestone deliveries the record owes its channel. It lives in
+Valkey, like the completion outbox; Postgres holds none of it.
+
+A model's command reaches it through the running turn: the kernel hands an
+eligible turn a progress capability, the runner's `progress` tool posts each
+command to the API's scoped ingress, the API appends it to the chain's inbox,
+and a per-turn pump in the kernel applies it to the record (see
+[The capability and the pump](#the-capability-and-the-pump) below). Rendering is
+off: no adapter is called for progress, and the maintenance tick runs its
+sweeper without a deliverer (below).
 
 ### Keys
 
@@ -575,12 +587,20 @@ Every key is built by a `WorkerConfig` helper under `key_prefix`
 
 | Key | Type | Holds |
 |---|---|---|
-| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
+| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `turn_generation`, `active_generation`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
 | `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` its scripts and the sweeper read. |
 | `<key_prefix>:progress:pending` | set | The index of pending delivery ids, so the sweeper never scans the keyspace. |
 | `<key_prefix>:progress:chain:{event_id}` | string | The `pid` an approval resume event continues. |
+| `<key_prefix>:progress:inbox:{pid}` | stream | The chain's inbox: one entry per command the API accepted, with the fields `command` (the `ProgressCommand` as JSON), worker-issued `generation` and runner-issued `seq`. The API writes it; the live pump or maintenance drainer reads it. |
+| `<key_prefix>:progress:inbox:pending` | set | Progress ids with inbox work not yet reflected by `inbox_cursor`. The API adds atomically with `XADD`; the worker removes only after proving no later stream id exists. |
+| `<key_prefix>:progress:rate:{token digest}` | hash | The API's per-token rate limit bucket (`tokens`, `at`). |
 
-Every key expires after `max(completion_max_retention_s, 14 days)`. Fourteen
+The inbox and the rate bucket are written by the API, which shares the
+worker's `KEY_PREFIX` (`worker_key_prefix`), and their shape is frozen in
+[`tests/vectors/turn-progress-capability.json`](../../tests/vectors/turn-progress-capability.json).
+The API caps the inbox at 128 entries and gives it a 14 day expiry on every
+append, and the bucket expires a minute after its last use. Every other key
+expires after `max(completion_max_retention_s, 14 days)`. Fourteen
 days is the approval card's own lifetime (`approval_cards.DEFAULT_CARD_TTL_S`),
 because a chain lives across the approval it suspends for. The record's expiry
 is renewed by every accepted update. A delivery keeps the expiry it was written
@@ -635,7 +655,8 @@ fails answers:
    error, and writes nothing.
 3. A terminal record (`complete`, `failed`, `cancelled`) refuses every update
    (`terminal`), so nothing reopens it.
-4. Updates are ordered by `(epoch, seq)`. A command from an older epoch is
+4. Updates are ordered by `(epoch, seq)`, where a model command's epoch is the
+   durable generation the worker allocated for its turn. A command from an older epoch is
    refused (`stale-epoch`), and within the record's epoch a `seq` at or below
    `last_seq` is refused (`stale-seq`); a newer epoch is accepted and restarts
    the sequence. A platform update names an epoch and no seq. It is refused from
@@ -716,12 +737,75 @@ Every attempt charge, acknowledgement and dead-letter compares the stored
 generation, so a pass holding a stale read can neither clear nor accuse a
 delivery written after it.
 
-### Fields nothing reads yet
+### The capability and the pump
 
-- `answer_ref` is the reply ref of the turn's answer, given when the chain is
-  opened.
-- `inbox_cursor` is created empty for the ingress to record how far it has
-  applied its commands. Nothing advances it until the ingress exists.
+`curie_worker.turn_progress` is the kernel's side of the ingress.
+
+- **Eligibility.** Only a human's Slack turn gets a capability: its source is
+  `slack`, its reply handle's kind is `slack`, it has a reply target, and it is
+  neither a factory work-item turn nor a `curie cluster message` relay turn
+  (adapter `curie-cluster-message`). An approval resume of such a turn is
+  eligible too. Before claiming its sandbox, the worker writes
+  `CURIE_TURN_PROGRESS_ENABLED=1` only for an eligible turn. That boot fact is
+  part of sandbox reuse comparison, so a sandbox with the opposite eligibility
+  is cold-recreated rather than adopted. The runner mounts the progress tool
+  and prompt only when the fact is present. A job, cron turn, targetless hook,
+  factory execution and relay turn therefore see neither the tool nor its
+  prompt, in addition to receiving no progress headers.
+- **The chain.** A fresh turn's chain is `progress_id_for(thread_key,
+  event_id)`, so a retry of the same event, in the same delivery or a
+  redelivery, names the same record. An approval resume follows only the
+  pointer its suspended turn wrote; when that pointer has expired the resume
+  gets no capability. The record is opened (idempotently) when the turn's
+  stream is consumed, never when an event only steers a live turn, so a steer
+  opens no chain. When an eligible turn pauses for approval the kernel links
+  the resume event `approval-<id>-resolved` to its chain with `link_resume`.
+- **The capability.** Each actual turn start atomically increments the record's
+  durable `turn_generation`, marks it as `active_generation`, and mints a
+  sandbox token (the byte-identical `sandbox_token` module) with scope
+  `turn.progress` and subject `progress_id:generation`. It sends the token,
+  generation, and URL to the runner on `POST /v1/event` in
+  `X-Curie-Progress-Token`, `X-Curie-Progress-Generation`, and
+  `X-Curie-Progress-Url`. They are runner control headers, like
+  `X-Curie-Turn-Epoch`, and not ACI fields. The API's append script checks the
+  signed generation is still active and its Valkey-server-time lease has not
+  passed. The lease lasts five seconds. Renewal begins as soon as activation
+  succeeds, before the worker waits for the runner's response headers, and is
+  handed to the live pump once stream consumption starts. Both renew only the
+  active, unexpired generation; a missed lease cannot be revived. The worker clears the
+  generation and deadline when the turn closes; if that best-effort clear loses
+  Valkey, expiry within one lease is the fail-closed backstop. A
+  retry or cold resume advances it first, so an old token cannot enqueue or
+  fence the current turn. Nothing opens a generation when the API key is unset.
+- **The pump.** A startup lease keeper covers runner admission and response-header
+  delay. While the kernel consumes the turn's stream, a pump takes over renewal of
+  the active lease and reads the
+  chain's inbox after the record's `inbox_cursor`, at most 64 entries every
+  half second, and applies each entry with `apply_model_command` at the
+  entry's `(epoch, seq)`, advancing `inbox_cursor` past it. The cursor only
+  moves forward and is never written to an expired record. When the stream
+  ends the pump drains what remains, bounded to 5 seconds, and stops. A
+  malformed entry is logged and skipped. The pump never fails a turn: a Valkey
+  error is logged and the turn goes on. Every accepted append also puts the
+  progress id in `progress:inbox:pending`; the maintenance loop drains that
+  index after a crash, cancellation, final-drain timeout, or transient read
+  failure. It removes membership only with a script that proves the stream has
+  no id after the durable cursor, so a concurrent append cannot be orphaned.
+  Any failure after runner start but before pump handoff stops the startup
+  keeper and closes the generation. Keeper shutdown never consumes cancellation
+  of the owning delivery: it attempts the generation close first, then
+  re-propagates cancellation.
+- **Rendering is off.** `CURIE_PROGRESS_RENDER` (default `false`) is the
+  temporary switch the rendering change will turn on; the chart does not set
+  it. With it off, the same Lua update records state, revision and milestone
+  reservations but does not enqueue a delivery at all. The no-delivery choice
+  is therefore atomic with acceptance: a crash or transient Valkey failure
+  cannot strand an outbox row for a later release to replay. This worker has no
+  progress deliverer, so it refuses to start with
+  `CURIE_PROGRESS_RENDER=true`.
+
+`answer_ref` is the reply ref of the turn's answer, given when the chain is
+opened. Nothing reads it yet.
 
 ### How the Slack adapter renders progress
 

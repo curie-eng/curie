@@ -705,6 +705,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     from curie_runner.approval import (
         APPROVAL_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        TURN_PROGRESS_TOOL_NAME,
         platform_tool_names,
     )
 
@@ -712,9 +713,13 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     published = _published(options)
     expected = platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
     # The probe boots with no potential write tool and no progress URL, so the
-    # approval and progress tools are not published; the three memory tools are.
+    # approval and either progress tool are not published; the three memory tools are.
     assert MEMORY_TOOLS <= published
-    assert published == expected - {PROGRESS_TOOL_NAME, APPROVAL_TOOL_NAME}
+    assert published == expected - {
+        PROGRESS_TOOL_NAME,
+        TURN_PROGRESS_TOOL_NAME,
+        APPROVAL_TOOL_NAME,
+    }
 
 
 # --------------------------------------------------------------------------- #

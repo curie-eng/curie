@@ -1445,6 +1445,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
     assert isinstance(session, ClaudeAgentSession)
     options = session._options
 
+    # An ineligible boot preserves the pre-progress prompt surface.
     assert options.system_prompt == "Configured model: z-ai/glm-5.2"
 
 

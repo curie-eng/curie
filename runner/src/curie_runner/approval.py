@@ -88,6 +88,7 @@ from .memory_facts import (
 )
 from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
+from .turn_progress import TURN_PROGRESS_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,9 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # The live-status-card progress tool (#3077), mounted on the same server only
 # when the worker injected a progress URL and token.
 PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
+# Deliberate progress (ADR 0130's ``curie_progress``), mounted on the same server
+# whenever ``report_progress`` is not; see ``turn_progress.py``.
+TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -271,9 +275,16 @@ PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
 # exempting its name costs nothing, and making the exemption depend on the
 # pager decision would add a second way for the two to disagree. The same
 # reasoning covers ``report_progress`` (#3077), mounted only for a factory
-# execution: it reports a phase and never acts, so it is never gated.
+# execution: it reports a phase and never acts, so it is never gated. And it
+# covers ``progress`` (ADR 0130), mounted only for eligible human turns: it
+# reports task state and never acts either.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
-    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME, PROGRESS_TOOL_NAME}
+    {
+        APPROVAL_TOOL_NAME,
+        PLATFORM_PUBLISH_TOOL_NAME,
+        PROGRESS_TOOL_NAME,
+        TURN_PROGRESS_TOOL_NAME,
+    }
 )
 
 # The memory tools (#1461, ADR-0167), on the same ``curie`` server but mounted
@@ -439,6 +450,7 @@ def build_approval_server(
     managed_workspace: bool = False,
     include_request_approval: bool = True,
     progress_tool: SdkMcpTool[Any] | None = None,
+    turn_progress_tool: SdkMcpTool[Any] | None = None,
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
@@ -463,6 +475,8 @@ def build_approval_server(
 
     ``progress_tool`` (#3077) is the ``report_progress`` tool, appended when the
     runner resolved a progress URL, token and phase declaration.
+    ``turn_progress_tool`` is the deliberate progress tool (ADR 0130), appended
+    only when ``progress_tool`` is not: a factory execution keeps its own.
 
     ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
     when the worker set a channel memory ref.
@@ -496,6 +510,8 @@ def build_approval_server(
     tools.append(publish_changes)
     if progress_tool is not None:
         tools.append(progress_tool)
+    elif turn_progress_tool is not None:
+        tools.append(turn_progress_tool)
     tools.extend(memory_tools)
 
     return create_sdk_mcp_server(

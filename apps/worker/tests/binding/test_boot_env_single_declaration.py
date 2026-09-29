@@ -127,6 +127,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # WorkerConfig and consumed where the kernel assembles the final reply.
         # It decides what the person is shown, never what a sandbox boots with.
         "CURIE_TURN_RECEIPT",
+        # The temporary deliberate progress rendering switch (ADR 0130), read
+        # from the WORKER's env by WorkerConfig and consumed by the kernel's
+        # progress pump. It decides whether progress reaches an adapter, never
+        # what a sandbox boots with.
+        "CURIE_PROGRESS_RENDER",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -329,6 +334,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
+        # sandbox boot fact is instead frozen across both declaration sites by
+        # tests/vectors/turn-progress-capability.json.
+        "CURIE_TURN_PROGRESS_ENABLED",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.

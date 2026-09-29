@@ -361,6 +361,8 @@ _HTTP_OPERATIONS = [
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
+    # Deliberate progress from a running turn (ADR 0130).
+    "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
     "/schedules",
     "/schedules/{agent}/{name}/pause",

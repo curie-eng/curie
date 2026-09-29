@@ -1451,6 +1451,66 @@ never retried automatically. It reaches the worker as `CURIE_TURN_RECEIPT`, so
 changing it rolls the workers. The chart refuses any other value at render,
 and the worker refuses one at startup.
 
+### Deliberate progress from a running turn
+
+A long task can report short progress while it runs
+([ADR-0130](adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+Nothing renders it yet: the platform records it and shows nobody, so turning
+it on later changes what people see, not what is stored.
+
+The path, and what an operator can check on each hop:
+
+1. **The capability.** For a person's Slack turn (and the approval resume of
+   one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
+   allocates a durable generation and marks it active with a five-second lease
+   on Valkey's server clock. A startup keeper renews it while the worker waits
+   for runner admission and response headers, then hands renewal to the live
+   pump when stream consumption begins. Both renew only that active, unexpired
+   generation; a missed lease cannot be revived. It mints a
+   sandbox token with scope `turn.progress`, bound to
+   `progress_id:generation`. It sends token, URL, and generation to the runner.
+   Jobs, cron and targetless hook turns, factory executions and
+   `curie cluster message` relay turns get neither the boot flag nor the
+   model-visible tool/prompt. The route record persists whether the sandbox
+   booted with the flag, and sandbox reuse compares both directions, so
+   eligibility cannot be inherited from an earlier occupant.
+   A failure between runner response headers and stream consumption stops the
+   startup keeper and closes the generation; worker cancellation still
+   propagates to the delivery owner after that close attempt finishes.
+2. **The ingress.** The runner's `progress` tool POSTs each update to the API
+   at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
+   The API accepts only a `turn.progress` token whose subject matches the path
+   and body generation, and whose generation is still active and unexpired. It rejects a
+   channel adapter's sibling `chn` token before validating the command body;
+   the platform key, another chain's token, an expired token, and a token from
+   a closed, superseded, or deadline-expired turn are also refused 401. A body
+   that is not a `ProgressCommand` plus
+   the worker-issued `generation` and runner-issued `seq` is refused 422. Each
+   token may send one update a second, with a burst of five; past that the API
+   answers 429. An accepted update is atomically appended and indexed for the
+   worker, then answered 202 (queued, not yet semantically applied).
+3. **The record.** While the turn runs, its pump applies each inbox entry to
+   the chain's durable record, which keeps its state, revision and milestone
+   reservations. A maintenance drainer owns the same durable pending-inbox
+   index, so one failed final read or a worker restart cannot orphan a 202.
+
+The fake model is network-free, including when progress headers are present.
+Use a live model or the API/worker integration fixture to exercise the ingress;
+`[fake:progress-demo]` is only a deterministic long turn for steering tests.
+
+With an integration turn, inspect the durable result with:
+
+```bash
+# the record the integration turn wrote (one per chain)
+valkey-cli -p 26379 -a valkeypass --scan --pattern 'curie:worker:progress:*'
+valkey-cli -p 26379 -a valkeypass HGETALL curie:worker:progress:<progress_id>
+```
+
+The record shows `state testing`, `revision 3` and `milestones_used 2`, and the
+Slack stub receives nothing from progress. The worker switch that will turn
+rendering on is `CURIE_PROGRESS_RENDER`; it is off, the chart does not expose
+it, and this release's worker refuses to start with it on.
+
 ### Letting the agent remember facts
 
 An agent's memory tools (`remember`, `update` and `forget`, ADR-0167) are off

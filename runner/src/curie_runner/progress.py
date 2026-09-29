@@ -79,6 +79,12 @@ _DESCRIPTION = (
 )
 
 
+def factory_progress_requested(env: Mapping[str, str]) -> bool:
+    """Whether boot carries any factory-progress signal, even an incomplete one."""
+
+    return bool(env.get(PROGRESS_URL_ENV) or env.get(PROGRESS_TOKEN_ENV))
+
+
 def _validate(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) - {"phases", "loops", "stages", "reviewer_model"}:
         raise ValueError("phases.json must be an object with phases and optional layout")
@@ -257,9 +263,7 @@ def _verification_failures(output: str) -> tuple[list[str], list[str]]:
     return missing, sorted(blocked)
 
 
-async def preflight_workspace_verification(
-    workspace: Path, url: str, token: str
-) -> dict[str, Any]:
+async def preflight_workspace_verification(workspace: Path, url: str, token: str) -> dict[str, Any]:
     """Run and report the documented focused check without installing tools.
 
     The command is bounded and runs in the mounted checkout. ``UV_OFFLINE`` and
@@ -297,9 +301,7 @@ async def preflight_workspace_verification(
                 )
             )
         except subprocess.TimeoutExpired as exc:
-            output = "\n".join(
-                (_subprocess_text(exc.stdout), _subprocess_text(exc.stderr))
-            )
+            output = "\n".join((_subprocess_text(exc.stdout), _subprocess_text(exc.stderr)))
             missing, blocked = _verification_failures(output)
             record["missing_binaries"] = missing
             record["blocked_services"] = blocked
@@ -312,9 +314,9 @@ async def preflight_workspace_verification(
         except OSError as exc:
             # ``which`` and process creation can race if the image is changing.
             # Do not expose arbitrary exception text in the progress record.
-            missing_uv = isinstance(exc, FileNotFoundError) and Path(
-                str(exc.filename or "")
-            ).name == "uv"
+            missing_uv = (
+                isinstance(exc, FileNotFoundError) and Path(str(exc.filename or "")).name == "uv"
+            )
             if missing_uv:
                 record["missing_binaries"] = ["uv"]
             else:

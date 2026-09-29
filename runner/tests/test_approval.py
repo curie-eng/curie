@@ -3232,3 +3232,69 @@ def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> N
         ) == {"publish_changes", "report_progress"}
 
     anyio.run(go)
+
+
+# --- ADR 0130: the platform progress tool --------------------------------------
+
+
+def test_the_turn_progress_tool_is_a_platform_owned_tool_name() -> None:
+    from curie_runner.approval import (
+        APPROVAL_SERVER_NAME,
+        TURN_PROGRESS_TOOL_NAME,
+        is_platform_owned_tool,
+        platform_tool_names,
+    )
+
+    assert TURN_PROGRESS_TOOL_NAME == f"mcp__{APPROVAL_SERVER_NAME}__progress"
+    for mounted in (False, True):
+        assert TURN_PROGRESS_TOOL_NAME in platform_tool_names(state_server_mounted=mounted)
+        assert is_platform_owned_tool(TURN_PROGRESS_TOOL_NAME, state_server_mounted=mounted)
+    # Exact names only (#2286): a lookalike on a curie-shaped prefix is not exempt.
+    assert not is_platform_owned_tool("mcp__curie__progress_extra", state_server_mounted=False)
+    assert not is_platform_owned_tool("mcp__curie__progressx", state_server_mounted=True)
+
+
+def test_the_turn_progress_tool_is_never_mounted_beside_report_progress() -> None:
+    from curie_runner.progress import (
+        PROGRESS_TOKEN_ENV,
+        PROGRESS_URL_ENV,
+        ProgressActivity,
+        build_progress_tool,
+        resolve_progress,
+    )
+    from curie_runner.turn_progress import TurnProgress, build_turn_progress_tool
+
+    bundle = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
+    resolved = resolve_progress(
+        {
+            PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/example",
+            PROGRESS_TOKEN_ENV: "sbx.example.token",
+        },
+        bundle,
+    )
+    assert resolved is not None
+    client, declaration = resolved
+    report = build_progress_tool(declaration, client, ProgressActivity())
+    progress = build_turn_progress_tool(TurnProgress())
+
+    async def names(server: object) -> set[str]:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    async def go() -> None:
+        assert "progress" not in await names(build_approval_server())
+        assert await names(
+            build_approval_server(include_request_approval=False, turn_progress_tool=progress)
+        ) == {"publish_changes", "progress"}
+        # A factory execution keeps its own tool, and only its own.
+        assert await names(
+            build_approval_server(
+                include_request_approval=False,
+                progress_tool=report,
+                turn_progress_tool=progress,
+            )
+        ) == {"publish_changes", "report_progress"}
+
+    anyio.run(go)

@@ -382,9 +382,7 @@ def test_capacity_wait_wakes_once_after_restart_and_rejects_stale_generation(
                 )
                 assert h.runner.opened == ["hello"]
                 assert h.runner.queried == ["hello"]
-                assert h.runner.admissions == [
-                    (h.runner.request_epochs[0][1], True)
-                ]
+                assert h.runner.admissions == [(h.runner.request_epochs[0][1], True)]
                 assert await h.async_redis.exists(h.config.done_key(event.event_id))
                 finished = await replacement._waits.get(event.event_id)
                 assert finished is not None and finished.state == "done"
@@ -480,7 +478,9 @@ def test_capacity_wake_defers_when_runner_lacks_admission(make_harness) -> None:
             replacement_task = asyncio.create_task(replacement.run())
             try:
                 deferred = await _wait_capacity_state(
-                    replacement, event.event_id, "waiting",
+                    replacement,
+                    event.event_id,
+                    "waiting",
                     generation=parked.generation + 2,
                 )
                 assert deferred.deadline_ms == parked.deadline_ms
@@ -535,7 +535,9 @@ def test_capacity_wake_defers_behind_live_turn_without_steering(make_harness) ->
             replacement_task = asyncio.create_task(replacement.run())
             try:
                 deferred = await _wait_capacity_state(
-                    replacement, event.event_id, "waiting",
+                    replacement,
+                    event.event_id,
+                    "waiting",
                     generation=parked.generation + 2,
                 )
                 assert deferred.deadline_ms == parked.deadline_ms
@@ -633,11 +635,16 @@ def test_capacity_wake_headers_before_runner_lock_do_not_start_turn(
 
 
 def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness) -> None:
+    """@spec ADR-0130 d1: pre-stream admission failure closes progress authority."""
+
+    from curie_worker.progress import ProgressStore, progress_id_for
+
     async def go() -> None:
         async with make_harness(
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
             capacity_wait_budget_s=1.0,
+            progress_factory=lambda redis, config: ProgressStore(redis, config),
         ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
@@ -686,6 +693,10 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
                 await owner._handle(wake_id, wake_fields)
             finally:
                 h.kernel._runner.admit_turn = real_admit  # type: ignore[method-assign]
+            progress_id = progress_id_for(kernel_module._thread_key_for(event), event.event_id)
+            progress = await ProgressStore(h.async_redis, h.config).read(progress_id)
+            assert progress is not None
+            assert progress.active_generation == 0
             assert failed_grants == [h.runner.request_epochs[0][1]]
             assert h.runner.opened == ["hello"]
             assert h.runner.queried == []
@@ -716,8 +727,7 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
             assert h.runner.queried == []
             assert h.runner.admissions == []
             assert h.sink.last_text == (
-                "Your request could not start before its capacity wait ended. "
-                "Please send it again."
+                "Your request could not start before its capacity wait ended. Please send it again."
             )
             await _wait_for_pending_count(
                 h.async_redis, h.config.stream, h.config.consumer_group, 0
@@ -833,17 +843,13 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
                 used={"pods": "2"},
                 hard={"pods": "2"},
             )
-            parked_event = _qevent(
-                "parked", thread="shared-thread", event_id="parked-turn"
-            )
+            parked_event = _qevent("parked", thread="shared-thread", event_id="parked-turn")
             first = _capacity_consumer(h)
             await first.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
             first_task = asyncio.create_task(first.run())
             try:
-                parked = await _wait_capacity_state(
-                    first, parked_event.event_id, "waiting"
-                )
+                parked = await _wait_capacity_state(first, parked_event.event_id, "waiting")
             finally:
                 first.request_stop()
                 await first_task
@@ -853,9 +859,7 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="later answer", status=DONE)]
-            later_event = _qevent(
-                "later", thread="shared-thread", event_id="later-turn"
-            )
+            later_event = _qevent("later", thread="shared-thread", event_id="later-turn")
             consumer = _capacity_consumer(h)
             await consumer.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(later_event))
@@ -868,9 +872,7 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
                 now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
                 await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
                 await consumer._waits.wake_due()
-                expired = await _wait_capacity_state(
-                    consumer, parked_event.event_id, "expired"
-                )
+                expired = await _wait_capacity_state(consumer, parked_event.event_id, "expired")
                 assert expired.cause == "capacity_wait_expired"
                 assert h.runner.turn_active
                 assert h.runner.interrupts == 0
@@ -908,9 +910,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 used={"pods": "2"},
                 hard={"pods": "2"},
             )
-            parked_event = _qevent(
-                "parked", thread="lease-shared", event_id="lease-parked"
-            )
+            parked_event = _qevent("parked", thread="lease-shared", event_id="lease-parked")
             first = _capacity_consumer(h)
             await first.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
@@ -926,9 +926,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="later answer", status=DONE)]
-            later_event = _qevent(
-                "later", thread="lease-shared", event_id="lease-later"
-            )
+            later_event = _qevent("later", thread="lease-shared", event_id="lease-later")
             later_task = asyncio.create_task(h.kernel.process_event(later_event))
             try:
                 await _wait_until(lambda: h.runner.queried == ["later"])
@@ -936,9 +934,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 assert later_epoch is not None
                 consumer = _capacity_consumer(h)
                 await consumer.ensure_group()
-                await h.async_redis.zadd(
-                    consumer._waits._due, {parked_event.event_id: 0}
-                )
+                await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
                 assert await consumer._waits.wake_due() == 1
                 woken = await consumer._waits.get(parked_event.event_id)
                 assert woken is not None and woken.state == "woken"
@@ -952,23 +948,26 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 )[0][1][0]
                 lease_store = DeliveryLeaseStore(h.async_redis, h.config)
                 lease = await lease_store.acquire(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     consumer=h.config.consumer_name,
                 )
                 old_epoch = uuid.uuid4().hex
                 if record_old_epoch:
                     assert old_epoch != later_epoch
-                    assert await consumer._waits.mark_active(
-                        parked_event.event_id, woken.generation, lease, old_epoch
-                    ) == "active"
+                    assert (
+                        await consumer._waits.mark_active(
+                            parked_event.event_id, woken.generation, lease, old_epoch
+                        )
+                        == "active"
+                    )
                     assert await consumer._waits.confirm_grant(
                         parked_event.event_id, woken.generation, lease, old_epoch
                     )
                     h.runner.admission_results[old_epoch] = "granted"
                 await h.async_redis.delete(
-                    h.config.delivery_lease_key(
-                        h.config.stream, h.config.consumer_group, wake_id
-                    )
+                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
                 )
 
                 await consumer._interrupt_on_lease_lost(wake_id, wake_fields)
@@ -1103,9 +1102,9 @@ def test_wake_before_deadline_expires_if_turn_cannot_start_until_after_it(
                 expired = await _wait_capacity_state(replacement, event.event_id, "expired")
                 assert expired.cause == "capacity_wait_expired"
                 assert h.runner.opened == []
-                assert len(
-                    [text for _, _, text in h.sink.updates if "could not start" in text]
-                ) == 1
+                assert (
+                    len([text for _, _, text in h.sink.updates if "could not start" in text]) == 1
+                )
                 await _wait_for_pending_count(
                     h.async_redis, h.config.stream, h.config.consumer_group, 0
                 )
@@ -1460,31 +1459,44 @@ def test_dead_lettered_wake_gets_one_terminal_reply_and_owed_completion(
                 granted_epoch = uuid.uuid4().hex
                 lease_store = DeliveryLeaseStore(h.async_redis, h.config)
                 lease = await lease_store.acquire(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     consumer=h.config.consumer_name,
                 )
-                assert await replacement._waits.mark_active(
-                    event.event_id, woken.generation, lease, granted_epoch
-                ) == "active"
+                assert (
+                    await replacement._waits.mark_active(
+                        event.event_id, woken.generation, lease, granted_epoch
+                    )
+                    == "active"
+                )
                 assert await replacement._waits.confirm_grant(
                     event.event_id, woken.generation, lease, granted_epoch
                 )
                 assert await lease_store.release(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     owner=lease.owner,
                     resume_event_id=None,
                 )
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [wake_id],
             )
             assert (await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group))[
                 wake_id
             ] == 2
             assert await replacement._dead_letter_over_cap() == {wake_id}
-            assert await _pending_owner(
-                h.async_redis, h.config.stream, h.config.consumer_group, wake_id
-            ) is None
+            assert (
+                await _pending_owner(
+                    h.async_redis, h.config.stream, h.config.consumer_group, wake_id
+                )
+                is None
+            )
             assert len(await h.async_redis.xrange(h.config.dead_letter_stream_name())) == 1
             assert h.runner.opened == []
 
@@ -1564,7 +1576,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
                 )
             )[0][1][0]
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [wake_id],
             )
             assert await replacement._dead_letter_over_cap() == {wake_id}
@@ -1588,7 +1603,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
                 )
             )[0][1][0]
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [terminal_id],
             )
             assert await replacement._dead_letter_over_cap() == {terminal_id}
@@ -1610,15 +1628,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
             assert expired.cause == "capacity_wait_expired"
             assert expired.generation == first_terminal.generation + 1
             assert h.runner.opened == []
-            assert [
-                text for _, _, text in h.sink.updates if "could not start" in text
-            ] == [
-                "Your request could not start before its capacity wait ended. "
-                "Please send it again."
+            assert [text for _, _, text in h.sink.updates if "could not start" in text] == [
+                "Your request could not start before its capacity wait ended. Please send it again."
             ]
-            assert [completion.event_id for completion in h.sink.completions] == [
-                event.event_id
-            ]
+            assert [completion.event_id for completion in h.sink.completions] == [event.event_id]
             assert await h.async_redis.xlen(h.config.stream) == 4
             assert len(await h.async_redis.xrange(h.config.dead_letter_stream_name())) == 2
             await _wait_for_pending_count(
@@ -1682,7 +1695,10 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 assert (await _wait_capacity_state(owner, event.event_id, "active")).cause == ""
                 await _wait_until(lambda: h.runner.turn_active)
                 await h.async_redis.xclaim(
-                    h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    0,
                     [wake_id],
                 )
                 server_time = await h.async_redis.time()
@@ -1691,9 +1707,7 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 assert h.runner.turn_active
                 assert not owner_task.done()
                 await h.async_redis.delete(
-                    h.config.delivery_lease_key(
-                        h.config.stream, h.config.consumer_group, wake_id
-                    )
+                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
                 )
 
                 recovery = _capacity_consumer(h)
@@ -1717,8 +1731,8 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 ) -> Any:
                     if (
                         reply.event == "reply.update"
-                        and reply.text == "Your request started but could not finish. "
-                        "Please send it again."
+                        and reply.text
+                        == "Your request started but could not finish. Please send it again."
                     ):
                         active_at_terminal_reply.append(h.runner.turn_active)
                     return await real_emit(
@@ -1730,9 +1744,9 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 await recovery._handle(terminal_id, terminal_fields)
                 expired = await _wait_capacity_state(recovery, event.event_id, "expired")
                 assert expired.cause == "delivery_exhausted"
-                assert [
-                    headers["X-Curie-Turn-Epoch"] for headers in h.runner.timeout_headers
-                ] == [h.runner.request_epochs[0][1]]
+                assert [headers["X-Curie-Turn-Epoch"] for headers in h.runner.timeout_headers] == [
+                    h.runner.request_epochs[0][1]
+                ]
                 assert h.runner.interrupts == 0
                 assert active_at_terminal_reply == [False]
                 assert not h.runner.turn_active
@@ -1828,9 +1842,7 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
             replacement = _capacity_consumer(h)
             replacement_task = asyncio.create_task(replacement.run())
             try:
-                expired = await _wait_capacity_state(
-                    replacement, event.event_id, "expired"
-                )
+                expired = await _wait_capacity_state(replacement, event.event_id, "expired")
                 await _wait_for_pending_count(
                     h.async_redis, h.config.stream, h.config.consumer_group, 0
                 )
@@ -1851,9 +1863,7 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
                 ]
                 assert len(expiry_replies) == (0 if reply_outage else 1)
                 if reply_outage:
-                    assert await h.async_redis.exists(
-                        h.config.completion_key(event.event_id)
-                    )
+                    assert await h.async_redis.exists(h.config.completion_key(event.event_id))
                 else:
                     assert [c.event_id for c in h.sink.completions] == [event.event_id]
             finally:
@@ -1864,11 +1874,10 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
                 h.sink.fail_events.clear()
                 await h.kernel.sweep_pending_completions()
                 assert [c.event_id for c in h.sink.completions] == [event.event_id]
-                assert not await h.async_redis.exists(
-                    h.config.completion_key(event.event_id)
-                )
+                assert not await h.async_redis.exists(h.config.completion_key(event.event_id))
 
     asyncio.run(go())
+
 
 def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
     async def go() -> None:
@@ -1924,9 +1933,7 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
             )
             await consumer.ensure_group()
 
-            first_id, first = await _pending_local_entry(
-                h, _qevent("a", thread="ta", event_id="a")
-            )
+            first_id, first = await _pending_local_entry(h, _qevent("a", thread="ta", event_id="a"))
             await consumer._dispatch(first_id, first)
             await _wait_until(lambda: h.runner.turn_active)  # slot taken, turn hanging
 
@@ -2049,12 +2056,21 @@ def test_maintenance_tick_sweeps_the_progress_outbox_after_completions(make_harn
             h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
             h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
             consumer._sweep_pending_progress = lambda: step("progress")  # type: ignore[method-assign]
+            consumer._drain_pending_progress_inboxes = lambda: step("inboxes")  # type: ignore[method-assign]
             consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
             consumer._observe_queue_state = observe  # type: ignore[method-assign]
 
             await consumer._maintenance_loop()
 
-            assert calls == ["reclaim", "reap", "sweep", "progress", "reset", "observe"]
+            assert calls == [
+                "reclaim",
+                "reap",
+                "sweep",
+                "progress",
+                "inboxes",
+                "reset",
+                "observe",
+            ]
 
     asyncio.run(go())
 
@@ -2870,9 +2886,7 @@ def test_slow_renewal_inside_guard_keeps_lease_alive(make_harness) -> None:
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            probe = _RenewalProbeStore(
-                ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04
-            )
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04)
             consumer._liveness_store = probe  # type: ignore[assignment]
             alive = consumer_heartbeat_key(
                 h.config.stream, h.config.consumer_group, h.config.consumer_name
@@ -3236,9 +3250,7 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            probe = _RenewalProbeStore(
-                ConsumerLivenessStore(h.async_redis), timeout_renewals=1
-            )
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), timeout_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
 
             task = asyncio.create_task(consumer.run())
@@ -3324,14 +3336,10 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
             h.runner.default_script = [Final(text="recovered", status=DONE)]
             consumer._liveness_store = ConsumerLivenessStore(h.async_redis)
             second = asyncio.create_task(consumer.run())
-            await _wait_until(
-                lambda: h.runner.opened.count("restart") == 2, timeout=3
-            )
+            await _wait_until(lambda: h.runner.opened.count("restart") == 2, timeout=3)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                summary = await h.async_redis.xpending(
-                    h.config.stream, h.config.consumer_group
-                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 if summary["pending"] == 0:
                     break
                 await asyncio.sleep(0.01)
@@ -3341,9 +3349,7 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
             await second
 
             assert h.runner.opened.count("restart") == 2
-            assert await _deliveries(
-                h.async_redis, h.config.stream, h.config.consumer_group
-            ) == {}
+            assert await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group) == {}
             assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
                 "pending"
             ] == 0
@@ -3495,9 +3501,7 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> Non
             assert h.substrate.lookup(first_thread_key) is None
             assert h.substrate.lookup(second_thread_key) is not None
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0
-            assert not await h.async_redis.sismember(
-                THREAD_RESET_INFLIGHT_SET, first_thread_key
-            )
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, first_thread_key)
 
     asyncio.run(go())
 
@@ -3524,9 +3528,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
             )
             original_delete = h.fake_k8s.delete_claim
 
-            def delete_and_free(
-                name: str, *, request_timeout_seconds: float
-            ) -> None:
+            def delete_and_free(name: str, *, request_timeout_seconds: float) -> None:
                 original_delete(
                     name,
                     request_timeout_seconds=request_timeout_seconds,
@@ -4014,8 +4016,7 @@ def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
             # the assertions below, which is the thing this test exists to
             # pin.
             await _wait_until(
-                lambda: h.sink.last_text is not None
-                and "Flagging for a human" in h.sink.last_text
+                lambda: h.sink.last_text is not None and "Flagging for a human" in h.sink.last_text
             )
             consumer.request_stop()
             await task
@@ -4140,9 +4141,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 if not started.is_set():
                     observed.append(name)
                     try:
-                        in_requests = await observer_redis.sismember(
-                            THREAD_RESET_SET, thread_key
-                        )
+                        in_requests = await observer_redis.sismember(THREAD_RESET_SET, thread_key)
                         in_flight = await observer_redis.sismember(
                             THREAD_RESET_INFLIGHT_SET, thread_key
                         )
@@ -4171,12 +4170,10 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 # as violations or as inflight_marks.
                 await original_srem(THREAD_RESET_SET, thread_key)
                 await original_srem(THREAD_RESET_INFLIGHT_SET, thread_key)
-                assert not await observer_redis.sismember(
-                    THREAD_RESET_SET, thread_key
+                assert not await observer_redis.sismember(THREAD_RESET_SET, thread_key)
+                assert not await observer_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key), (
+                    "stale in-progress residue would make arm (a) vacuous"
                 )
-                assert not await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, thread_key
-                ), "stale in-progress residue would make arm (a) vacuous"
 
                 await original_sadd(THREAD_RESET_SET, thread_key)
                 # The live request now exists; install the spy before the drain
@@ -4198,9 +4195,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
 
                 # (b) The mark landed -- the pending signal is still True while
                 # the release runs...
-                assert await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, thread_key
-                )
+                assert await observer_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
                 # ...and it came from the atomic claim, not a second round trip
                 # through the command boundary.
                 assert inflight_marks == []
@@ -4251,9 +4246,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
             # End state is clean: released, and nothing left pending.
             assert h.substrate.lookup(thread_key) is None
             assert not await h.async_redis.sismember(THREAD_RESET_SET, thread_key)
-            assert not await h.async_redis.sismember(
-                THREAD_RESET_INFLIGHT_SET, thread_key
-            )
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
 
     asyncio.run(go())
 
@@ -4267,14 +4260,10 @@ class _LockOwnerLiveness:
         self._group = group
 
     async def is_alive(self, owner: str) -> bool:
-        return await self._store.is_alive(
-            stream=self._stream, group=self._group, consumer=owner
-        )
+        return await self._store.is_alive(stream=self._stream, group=self._group, consumer=owner)
 
     async def is_capable(self, owner: str) -> bool:
-        return await self._store.is_capable(
-            stream=self._stream, group=self._group, consumer=owner
-        )
+        return await self._store.is_capable(stream=self._stream, group=self._group, consumer=owner)
 
 
 def _wire_stealable_lock(h: Any, *, owner: str, proof_s: float) -> ThreadLock:
@@ -4366,9 +4355,7 @@ def test_force_killed_worker_lock_is_stolen_and_cluster_message_reply_is_deliver
                 heartbeat_ttl_ms=1,
                 capability_ttl_ms=h.config.consumer_capability_ttl_ms,
             )
-            alive_key = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, dead_name
-            )
+            alive_key = consumer_heartbeat_key(h.config.stream, h.config.consumer_group, dead_name)
             await _wait_key(h.async_redis, alive_key, present=False)
             await _wait_consumer_idle(
                 h.async_redis,

@@ -354,6 +354,14 @@ class WorkerConfig(BaseSettings):
     # ledger records or what the no-retry rule reads.
     turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
 
+    # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
+    # exists until the rendering change lands, and the chart does not set it.
+    # Off, the kernel's progress pump records each command's state and
+    # milestone reservation and removes the deliveries it enqueued, so nothing
+    # is shown and nothing is left owed. This worker has no progress deliverer,
+    # so ``_progress_render_needs_a_deliverer`` refuses it on.
+    progress_render: Bool = Field(default=False, validation_alias="CURIE_PROGRESS_RENDER")
+
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
     # the redelivery is waited out (#2433).
@@ -428,6 +436,22 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
+        """Refuse to start with progress rendering on (ADR 0130).
+
+        Nothing in this worker delivers progress to an adapter. Accepting the
+        switch would claim a rendering that does not happen, and leaving each
+        owed delivery in the outbox for a later deliverer would replay a
+        backlog of stale cards into old threads the day one exists.
+        """
+        if self.progress_render:
+            raise ValueError(
+                "CURIE_PROGRESS_RENDER=true needs progress rendering, which this worker "
+                "does not include; leave it unset"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_self_targeting_graveyard(self) -> WorkerConfig:
@@ -861,9 +885,7 @@ class WorkerConfig(BaseSettings):
     # value is deliberate standalone and Compose compatibility: those surfaces
     # have no Helm installation boundary and keep using the legacy key. Cluster
     # workers receive a nonblank value from the chart managed Secret.
-    installation_id: str = Field(
-        default="", validation_alias="CURIE_INSTALLATION_ID"
-    )
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
     # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
     # worker processes only read marker state, so this hook-only value may be
     # absent there. An explicitly supplied revision must be positive.
@@ -900,9 +922,7 @@ class WorkerConfig(BaseSettings):
         default=600.0,
         gt=0.0,
         le=MAX_DELIVERY_BUDGET_S,
-        validation_alias=AliasChoices(
-            "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
-        ),
+        validation_alias=AliasChoices("CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"),
     )
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
@@ -964,9 +984,7 @@ class WorkerConfig(BaseSettings):
     workspace_bucket: str = Field(
         default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
     )
-    workspace_enabled: bool = Field(
-        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
-    )
+    workspace_enabled: bool = Field(default=True, validation_alias="CURIE_WORKSPACE_ENABLED")
     workspace_object_prefix: str = Field(
         default="private/workspaces",
         validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
@@ -1030,9 +1048,7 @@ class WorkerConfig(BaseSettings):
     # today: text only, files ignored, no error. Mirrored by
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
-    attachment_enabled: bool = Field(
-        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
-    )
+    attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1046,9 +1062,7 @@ class WorkerConfig(BaseSettings):
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
-    publication_enabled: bool = Field(
-        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
-    )
+    publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
     publication_namespace: str = Field(
         default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
     )
@@ -1338,6 +1352,17 @@ class WorkerConfig(BaseSettings):
     def progress_chain_key(self, event_id: str) -> str:
         # The pointer an approval resume event follows back to its chain's record.
         return f"{self.key_prefix}:progress:chain:{event_id}"
+
+    def progress_inbox_key(self, progress_id: str) -> str:
+        # The chain's inbox stream. The API appends to it under the same
+        # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
+        # tests/vectors/turn-progress-capability.json.
+        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+
+    def progress_inbox_pending_key(self) -> str:
+        # Durable discovery for commands accepted after a live pump stops or
+        # while every worker is restarting.
+        return f"{self.key_prefix}:progress:inbox:pending"
 
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation
