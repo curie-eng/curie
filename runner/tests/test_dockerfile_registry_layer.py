@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from runner_dockerfile_support import logical_instructions
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOCKERFILE = _REPO_ROOT / "runner" / "Dockerfile"
 _DOCKERIGNORE = _REPO_ROOT / "runner" / "Dockerfile.dockerignore"
 _REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
 _RUNNER_SOURCE_COPY = "COPY runner ./runner"
-_PIN_EXPORTER_COPY = (
-    "COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py"
-)
+_PIN_EXPORTER_COPY = "COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py"
 _LOCKFILE_COPY = "COPY uv.lock ./uv.lock"
 
 # Mirror apps/api/Dockerfile.dockerignore plus the trees a repo-root build
@@ -77,22 +77,6 @@ _FORBIDDEN_IGNORE_PATTERNS = (
 )
 
 
-def _logical_instructions(dockerfile_text: str) -> list[str]:
-    instructions: list[str] = []
-    pending: list[str] = []
-    for raw_line in dockerfile_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        continues = line.endswith("\\")
-        pending.append(line[:-1].rstrip() if continues else line)
-        if not continues:
-            instructions.append(" ".join(pending))
-            pending = []
-    assert not pending, "Dockerfile ends with an unfinished continuation"
-    return instructions
-
-
 def _index_of(instructions: list[str], exact: str) -> int:
     try:
         return instructions.index(exact)
@@ -121,7 +105,7 @@ def _dockerignore_patterns(text: str) -> list[str]:
 
 
 def test_registry_install_precedes_runner_source_copy() -> None:
-    instructions = _logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
+    instructions = logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
     runner_copy = _index_of(instructions, _RUNNER_SOURCE_COPY)
     registry_indexes = _registry_install_indexes(instructions)
     assert len(registry_indexes) == 1, (
@@ -134,7 +118,7 @@ def test_registry_install_precedes_runner_source_copy() -> None:
 
 
 def test_registry_layer_copies_only_lock_and_pin_exporter() -> None:
-    instructions = _logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
+    instructions = logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
     registry_indexes = _registry_install_indexes(instructions)
     assert len(registry_indexes) == 1
     registry_index = registry_indexes[0]
@@ -147,8 +131,7 @@ def test_registry_layer_copies_only_lock_and_pin_exporter() -> None:
         if instruction.startswith("COPY --from="):
             continue
         assert instruction in allowed_copies, (
-            "unexpected source transfer before registry layer: "
-            f"{instruction!r}"
+            f"unexpected source transfer before registry layer: {instruction!r}"
         )
 
     assert _index_of(instructions, _LOCKFILE_COPY) < registry_index
@@ -156,7 +139,7 @@ def test_registry_layer_copies_only_lock_and_pin_exporter() -> None:
 
 
 def test_local_package_install_follows_source_copy() -> None:
-    instructions = _logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
+    instructions = logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
     runner_copy = _index_of(instructions, _RUNNER_SOURCE_COPY)
     local_install_indexes = [
         index
@@ -183,7 +166,7 @@ RUN python3 -m venv /app/.venv \\
     && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \\
     && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
 """
-    instructions = _logical_instructions(prechange)
+    instructions = logical_instructions(prechange)
     runner_copy = _index_of(instructions, _RUNNER_SOURCE_COPY)
     registry_indexes = _registry_install_indexes(instructions)
     assert len(registry_indexes) == 1
@@ -196,21 +179,15 @@ def test_dockerignore_exists_with_required_patterns() -> None:
         "not walk .worktrees, .projects, and cli/target"
     )
     patterns = set(_dockerignore_patterns(_DOCKERIGNORE.read_text(encoding="utf-8")))
-    missing = [
-        pattern for pattern in _REQUIRED_IGNORE_PATTERNS if pattern not in patterns
-    ]
+    missing = [pattern for pattern in _REQUIRED_IGNORE_PATTERNS if pattern not in patterns]
     assert missing == []
 
 
 def test_dockerignore_does_not_exclude_dockerfile_copy_sources() -> None:
     assert _DOCKERIGNORE.is_file()
     patterns = _dockerignore_patterns(_DOCKERIGNORE.read_text(encoding="utf-8"))
-    forbidden = [
-        pattern for pattern in patterns if pattern in _FORBIDDEN_IGNORE_PATTERNS
-    ]
+    forbidden = [pattern for pattern in patterns if pattern in _FORBIDDEN_IGNORE_PATTERNS]
     assert forbidden == []
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
     for source in _COPY_SOURCES:
-        assert source in dockerfile, (
-            f"COPY source {source!r} is missing from runner/Dockerfile"
-        )
+        assert source in dockerfile, f"COPY source {source!r} is missing from runner/Dockerfile"

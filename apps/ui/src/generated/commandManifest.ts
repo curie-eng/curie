@@ -7225,11 +7225,6 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
-          "about": "Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes MCP server and a live provider (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with `curie cluster message`. Approvals resolve through `curie cluster approvals` and an operator principal. Missing the live provider skips with the reason in the run summary",
-          "hidden": false,
-          "name": "sre-demo-e2e"
-        },
-        {
           "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",
           "hidden": false,
           "name": "two-release-approval-e2e"

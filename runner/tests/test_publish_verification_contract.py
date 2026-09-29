@@ -71,11 +71,23 @@ def test_publication_description_requires_a_reported_verification_first() -> Non
     # is sentence-local so the neighbouring failure sentence cannot supply the
     # missing "do not publish".
     assert re.search(
-        r"cannot\s+identify\s+or\s+run\s+an?\s+appropriate\s+command"
+        r"cannot\s+identify\s+an?\s+appropriate\s+command"
         r"[^.]{0,80}(?:do\s+not|must\s+not|never)\s+publish",
         verification_text,
         flags=re.IGNORECASE,
-    ), "inability to identify or run a command must prevent publication"
+    ), "an unidentified command must prevent publication"
+    assert re.search(
+        r"cannot\s+run[^.]{0,180}declared\s+required\s+CI\s+route"
+        r"[^.]{0,180}changed\s+paths",
+        verification_text,
+        flags=re.IGNORECASE,
+    ), "an unavailable check needs a matching declared required CI route"
+    assert re.search(
+        r"in-sandbox\s+verification\s+was\s+unavailable"
+        r"[^.]{0,120}CI\s+is\s+pending",
+        verification_text,
+        flags=re.IGNORECASE,
+    ), "the PR must state unavailable verification and pending CI"
     # Kills: replacing the whole failure rule with a softer one ("If the command
     # fails, note it."). Sentence-local, so the cannot-identify sentence and the
     # artifacts sentence cannot stand in for it.

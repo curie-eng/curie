@@ -116,6 +116,11 @@
           "minimum": 1,
           "description": "Turn budget for a work-item (factory) delivery (#3071), rendered as CURIE_WORK_ITEM_MAX_TURNS and written into that delivery's sandbox as CURIE_MAX_TURNS. Other deliveries keep the runner default. A run that exhausts it fails as max-turns."
         },
+        "turnReceipt": {
+          "type": "string",
+          "enum": ["all", "failures", "off"],
+          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action, the default), failures (only actions that reported failure) or off (none). The worker refuses any other value at startup, so the schema admits only these three."
+        },
         "deliveryShutdownReserveSeconds": {
           "type": "integer",
           "minimum": 0,

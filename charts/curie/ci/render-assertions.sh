@@ -1218,8 +1218,9 @@ expected = {
     ("Job", f"{prefix}-netpol-probe"): "hooks",
     ("Job", f"{prefix}-security-probe"): "hooks",
     ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
-    # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
+    # The pre-upgrade drain gate, its attest hook, and its post-upgrade release (issue #2010).
     ("Job", f"{prefix}-upgrade-drain"): "hooks",
+    ("Job", f"{prefix}-upgrade-drain-attest"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     # The single schema upgrade phase (#2300).
     ("Job", f"{prefix}-schema-migrate"): "hooks",
@@ -2397,6 +2398,7 @@ expected_preupgrade = {
     **expected_preinstall,
     ("Job", "curie-schema-migrate"): {"post-install", "pre-upgrade"},
     ("Job", "curie-upgrade-drain"): {"pre-upgrade"},
+    ("Job", "curie-upgrade-drain-attest"): {"pre-upgrade"},
 }
 expected_grafana = {
     ("Job", "curie-grafana-token-updater"): {"post-install", "post-upgrade"},

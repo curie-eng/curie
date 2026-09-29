@@ -85,6 +85,8 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "runner_timeout",
         "workspace_error",
         "runner_escalated",
+        "unclassified",
+        "max_turns",
         "runner_failed",
         "approval_create_failed",
         "no_pull_request",

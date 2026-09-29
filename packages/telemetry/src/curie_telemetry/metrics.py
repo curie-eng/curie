@@ -359,6 +359,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
+    "/v1/work-item-progress/{request_id}/verification",
     "/v1/factory/cards/{token}.svg",
     "/schedules",
     "/schedules/{agent}/{name}/pause",

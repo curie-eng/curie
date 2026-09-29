@@ -122,14 +122,11 @@ class _FakeApi:
         *,
         _request_timeout: float,
     ) -> object:
-        self.request_timeouts.append(
-            (f"get:resourcequotas:{namespace}:{name}", _request_timeout)
-        )
+        self.request_timeouts.append((f"get:resourcequotas:{namespace}:{name}", _request_timeout))
         if self.quota_error is not None:
             raise self.quota_error
         assert self.quota is not None
         return self.quota
-
 
     def read_namespaced_pod(
         self,
@@ -287,9 +284,7 @@ def test_quota_headroom_reads_exact_quota_and_requires_every_resource(
     client = _client(api)
 
     assert client.quota_has_headroom(rejection, request_timeout_seconds=0.75)
-    assert api.request_timeouts == [
-        ("get:resourcequotas:test-ns:curie-sandbox-quota", 0.75)
-    ]
+    assert api.request_timeouts == [("get:resourcequotas:test-ns:curie-sandbox-quota", 0.75)]
 
 
 @pytest.mark.parametrize(
@@ -301,9 +296,7 @@ def test_quota_headroom_reads_exact_quota_and_requires_every_resource(
             used={"pods": "2"},
             hard={"pods": "2"},
         ),
-        QuotaRejection(
-            quota_name="curie-sandbox-quota", requested={}, used={}, hard={}
-        ),
+        QuotaRejection(quota_name="curie-sandbox-quota", requested={}, used={}, hard={}),
         QuotaRejection(
             quota_name="curie-sandbox-quota",
             requested={"pods": "1"},
@@ -439,9 +432,7 @@ def test_combined_quota_headroom_fails_when_one_resource_remains_full() -> None:
             status_used={"pods": "1"},
         ),
         _resource_quota(spec_hard={}, status_used={"pods": "1"}),
-        _resource_quota(
-            spec_hard={"pods": "2"}, status_hard={}, status_used={"pods": "1"}
-        ),
+        _resource_quota(spec_hard={"pods": "2"}, status_hard={}, status_used={"pods": "1"}),
         _resource_quota(spec_hard={"pods": "2"}, status_used={}),
         _resource_quota(
             spec_hard={"pods": "2"},
@@ -517,9 +508,7 @@ def test_bundle_ref_targets_init_containers_by_name() -> None:
     assert {"name": "CURIE_BUNDLE_REF", "value": "bundles/x.tar.gz"} in entries
 
     # And each bundle init container receives it by explicit containerName.
-    named = {
-        (e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e
-    }
+    named = {(e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e}
     for container in BUNDLE_INIT_CONTAINERS:
         assert named[(container, "CURIE_BUNDLE_REF")] == "bundles/x.tar.gz"
 
@@ -545,9 +534,7 @@ def test_bundle_version_reaches_the_runner_not_the_init_containers() -> None:
     entries = _env_entries(api)
 
     assert {"name": "CURIE_BUNDLE_VERSION", "value": "abc123def456"} in entries
-    named = {
-        (e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e
-    }
+    named = {(e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e}
     assert all(key[1] != "CURIE_BUNDLE_VERSION" for key in named)
 
 
@@ -754,9 +741,7 @@ def test_claim_view_classifies_live_resource_quota_condition() -> None:
         hard={"limits.cpu": "1m"},
     )
     assert view.ready_reason == "ReconcilerError"
-    assert view.ready_message == LIVE_QUOTA_REJECTED_CLAIM["status"]["conditions"][0][
-        "message"
-    ]
+    assert view.ready_message == LIVE_QUOTA_REJECTED_CLAIM["status"]["conditions"][0]["message"]
 
 
 def test_claim_view_classifies_issue_example_at_eight_of_eight() -> None:
@@ -777,28 +762,21 @@ def test_claim_view_classifies_issue_example_at_eight_of_eight() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("status", "True"), ("type", "Provisioned")],
+    [
+        pytest.param("status", "True", id="status-true"),
+        pytest.param("type", "Provisioned", id="type-provisioned"),
+        pytest.param("reason", "ProvisioningFailed", id="another-reason"),
+        pytest.param(
+            "message",
+            'Error seen: pods "curie-thread-example" is forbidden: User "system:serviceaccount:'
+            'curie1572:worker" cannot create resource "pods"',
+            id="reconciler-error-without-exceeded-quota-clause",
+        ),
+    ],
 )
 def test_quota_message_requires_failed_ready_condition(field: str, value: str) -> None:
     claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
     claim["status"]["conditions"][0][field] = value
-
-    assert _claim_view(claim).quota_rejection is None
-
-
-def test_quota_message_with_another_reason_is_not_classified() -> None:
-    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
-    claim["status"]["conditions"][0]["reason"] = "ProvisioningFailed"
-
-    assert _claim_view(claim).quota_rejection is None
-
-
-def test_reconciler_error_without_exceeded_quota_clause_is_not_classified() -> None:
-    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
-    claim["status"]["conditions"][0]["message"] = (
-        'Error seen: pods "curie-thread-example" is forbidden: User "system:serviceaccount:'
-        'curie1572:worker" cannot create resource "pods"'
-    )
 
     assert _claim_view(claim).quota_rejection is None
 

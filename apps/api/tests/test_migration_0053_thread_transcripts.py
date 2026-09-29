@@ -2,45 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
-from pathlib import Path
-from typing import Any
 
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 THREAD = "slack:C0EXAMPLE1:1700000000.000100"
 
 
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                if not result.returns_rows:
-                    return []
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
-
-
 def _state_rows(agent_id: uuid.UUID) -> list[tuple[str, str]]:
-    rows = _sql(
+    rows = sql_dicts(
         "SELECT namespace, key FROM curie.workflow_state_entries WHERE agent_id = :a "
         "ORDER BY namespace, key",
         {"a": agent_id},
@@ -49,14 +21,14 @@ def _state_rows(agent_id: uuid.UUID) -> list[tuple[str, str]]:
 
 
 def test_0053_moves_transcripts_and_downgrade_moves_them_back(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, "0052")
+    config = alembic_config()
+    isolated_migration_db.at("0052")
     agent_id = uuid.uuid4()
     transcript = [{"role": "user", "content": "fix the flaky test"}]
     try:
-        _sql(
+        sql_dicts(
             "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
             {"id": agent_id, "name": f"acme-bot-{agent_id.hex[:8]}"},
         )
@@ -65,7 +37,7 @@ def test_0053_moves_transcripts_and_downgrade_moves_them_back(
             ("memory", "facts", {"n": 1}, 1),
             ("workflow", "step", {"n": 2}, 1),
         ):
-            _sql(
+            sql_dicts(
                 "INSERT INTO curie.workflow_state_entries "
                 "(id, agent_id, namespace, key, value, version) "
                 "VALUES (:id, :a, :ns, :k, CAST(:v AS jsonb), :ver)",
@@ -80,12 +52,12 @@ def test_0053_moves_transcripts_and_downgrade_moves_them_back(
             )
 
         command.upgrade(config, "0053")
-        moved = _sql(
+        moved = sql_dicts(
             "SELECT thread_key, value, version, binding_scope FROM curie.thread_transcripts "
             "WHERE agent_id = :a",
             {"a": agent_id},
         )
-        expiry = _sql(
+        expiry = sql_dicts(
             "SELECT expires_at > now() + interval '29 days' AS idle_window "
             "FROM curie.thread_transcripts WHERE agent_id = :a",
             {"a": agent_id},
@@ -102,14 +74,15 @@ def test_0053_moves_transcripts_and_downgrade_moves_them_back(
         ]
         # The new API then adopts the thread and deletes the legacy row; a
         # downgrade writes the adopted transcript back.
-        _sql(
+        sql_dicts(
             "DELETE FROM curie.workflow_state_entries WHERE agent_id = :a "
             "AND namespace = 'transcript'",
             {"a": agent_id},
         )
 
         command.downgrade(config, "0052")
-        assert _sql("SELECT to_regclass('curie.thread_transcripts') AS name")[0]["name"] is None
+        rows = sql_dicts("SELECT to_regclass('curie.thread_transcripts') AS name")
+        assert rows[0]["name"] is None
         assert _state_rows(agent_id) == [
             ("memory", "facts"),
             ("transcript", THREAD),

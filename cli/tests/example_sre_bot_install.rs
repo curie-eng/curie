@@ -7,9 +7,11 @@
 
 mod support;
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::io::{Cursor, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -42,7 +44,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_example_stub(dir: &Path, name: &str, body: &str) {
     let reads = include_str!("data/converged-installation-read.sh");
     let body = if name == "helm" {
         // Preserve this installer's existing Grafana status/migration replies.
@@ -56,14 +58,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -115,7 +110,7 @@ impl Fixture {
         fs::create_dir(&applied_dir).expect("create applied-file capture directory");
         fs::create_dir(&helm_values_dir).expect("create helm-values capture directory");
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -277,7 +272,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh

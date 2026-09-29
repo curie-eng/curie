@@ -54,7 +54,8 @@ conversation, reconstructed through the selected harness adapter.
   none). The state API advertises its configured transcript value cap on both
   a successful GET and a missing transcript response. The runner requires that
   cap and uses it for every history bound; it does not assume a local default.
-  The API default remains 64 KiB. At boot `build_conversation_replay`
+  The API default is 16 MiB (chart value `api.transcriptMaxThreadBytes`,
+  env `TRANSCRIPT_MAX_THREAD_BYTES`), sized for a whole factory turn. At boot `build_conversation_replay`
   reconstructs the ordered portable prefix. The Claude adapter prefers an
   optional native checkpoint so its exact
   cache-breakpoint shape survives; without one it materializes deterministic
@@ -156,6 +157,8 @@ unplanned-restart case needs no special worker/kernel branch.
   the state API checks under the same row lock an append takes, so a concurrent
   append is never overwritten. The runner still refuses when publication
   markers and the summary alone leave no room for the latest bounded turn. A
+  single turn that cannot be bounded under the cap fails the run with an error
+  naming the turn's compacted size and the cap. A
   terminal capacity notice tells the operator to inspect the affected work and
   retry the run. There is no other automatic data retention or deletion policy
   for the stored source. For a value cap the runner cannot recover, quiesce

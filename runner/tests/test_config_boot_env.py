@@ -11,8 +11,8 @@ The parse tolerance is deliberately NON-uniform and each knob keeps what it has:
 garbage and on a nonpositive value. Unifying them would be a behavior change
 wearing a consistency costume, so the asymmetry is pinned on both sides.
 
-``test_config.py`` covers the pre-#488 surface; this module covers what the
-conversion must preserve and what it must remove.
+The table below also pins the deliberate production defaults and aliases that
+predate #488 (harness default, history_ref independence, token blank-is-unset).
 """
 
 from __future__ import annotations
@@ -73,16 +73,46 @@ def test_full_boot_env_parses_to_the_same_config() -> None:
     assert config.port == 9090
 
 
-def test_defaults_when_the_operator_knobs_are_absent() -> None:
-    config = RunnerConfig.from_env(dict(_BASE))
+# (env overrides on _BASE, RunnerConfig attribute, expected value). Each row is
+# a deliberate production default or alias; changing one is a behavior change.
+_KNOB_TABLE = [
+    pytest.param({}, "ceiling", 1000, id="budget-ceiling"),
+    pytest.param({}, "max_usd_per_day", 5.0, id="budget-usd-per-day"),
+    pytest.param({}, "max_turns", 20, id="max-turns-default"),
+    pytest.param({}, "port", 8080, id="port-default"),
+    pytest.param({}, "history_ref", None, id="history-ref-default"),
+    pytest.param({}, "approval_required_tools", None, id="approval-tools-default"),
+    pytest.param({}, "approval_grant_tool", None, id="approval-grant-default"),
+    pytest.param({}, "approval_resumed_kind", None, id="approval-resumed-default"),
+    # CURIE_HARNESS is a runner-local knob; unset or blank selects built-in Claude.
+    pytest.param({}, "harness", "claude", id="harness-default-claude"),
+    pytest.param({"CURIE_HARNESS": "claude-code"}, "harness", "claude-code", id="harness-read"),
+    pytest.param({"CURIE_HARNESS": "  opencode "}, "harness", "opencode", id="harness-stripped"),
+    pytest.param({"CURIE_HARNESS": "   "}, "harness", "claude", id="harness-blank-falls-back"),
+    # A memory ref is an externalized-memory pointer, not an SDK resume id, so it
+    # must not become the rehydrate ref.
+    pytest.param(
+        {"CURIE_MEMORY_REF": "s3://mem/thread"}, "history_ref", None, id="history-ref-not-memory"
+    ),
+    pytest.param(
+        {"CURIE_MEMORY_REF": "s3://mem", "CURIE_HISTORY_REF": "s3://hist"},
+        "history_ref",
+        "s3://hist",
+        id="history-ref-explicit-wins",
+    ),
+    pytest.param({"CURIE_RUNNER_TOKEN": "abc123"}, "runner_token", "abc123", id="token-read"),
+    pytest.param({}, "runner_token", None, id="token-absent"),
+    # The token is enforced only when configured (#63), so an empty value must
+    # read as unset rather than turning on enforcement with an unusable token.
+    pytest.param({"CURIE_RUNNER_TOKEN": ""}, "runner_token", None, id="token-empty-is-unset"),
+]
 
-    assert config.max_turns == 20
-    assert config.port == 8080
-    assert config.history_ref is None
-    assert config.runner_token is None
-    assert config.approval_required_tools is None
-    assert config.approval_grant_tool is None
-    assert config.approval_resumed_kind is None
+
+@pytest.mark.parametrize(("overrides", "attr", "expected"), _KNOB_TABLE)
+def test_boot_env_knob_defaults_and_aliases(
+    overrides: dict[str, str], attr: str, expected: object
+) -> None:
+    assert getattr(RunnerConfig.from_env(dict(_BASE, **overrides)), attr) == expected
 
 
 def test_approval_markers_blank_is_unset() -> None:
@@ -99,12 +129,6 @@ def test_approval_required_tools_all_blank_is_no_gates() -> None:
     config = RunnerConfig.from_env(dict(_BASE, CURIE_APPROVAL_REQUIRED_TOOLS=" , , "))
 
     assert not config.approval_required_tools
-
-
-def test_runner_token_empty_string_is_unset_not_empty() -> None:
-    # The token is enforced only when configured (#63), so an empty value must
-    # read as unset rather than turning on enforcement with an unusable token.
-    assert RunnerConfig.from_env(dict(_BASE, CURIE_RUNNER_TOKEN="")).runner_token is None
 
 
 def test_max_turns_raises_on_garbage() -> None:

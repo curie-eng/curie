@@ -880,7 +880,7 @@ def test_resolve_refuses_adapter_plus_operator_and_adapter_plus_console(
         f"/approvals/{approval['id']}/resolve",
         json={"decision": "approved"},
         headers=_adp(token, SENDER),
-        cookies={"curie_console_session": "whatever-session-token"},
+        cookies={"__Host-curie_console_session": "whatever-session-token"},
     )
     assert with_cookie.status_code == 401, with_cookie.text
     assert "ambiguous" in with_cookie.json()["detail"].lower()

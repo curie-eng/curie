@@ -155,7 +155,7 @@ def _deliver(
 def test_a_listed_mention_is_admitted_and_the_question_names_the_route(
     config: DispatcherConfig, redis_client: redis.Redis, admission_api: FakeAdmissionApi
 ) -> None:
-    admission_api.lists[(CHANNEL, None)] = {STRANGER}
+    admission_api.lists[(CHANNEL, "default")] = {STRANGER}
     harness = _deliver(
         config,
         redis_client,
@@ -168,7 +168,12 @@ def test_a_listed_mention_is_admitted_and_the_question_names_the_route(
     # The platform key rides the question; the route is (slack, default, C123)
     # and the ids are exactly the event's sender.
     assert admission_api.requests == [
-        {"kind": "slack", "address": CHANNEL, "callers": [STRANGER]}
+        {
+            "kind": "slack",
+            "address": CHANNEL,
+            "callers": [STRANGER],
+            "adapter": "default",
+        }
     ]
     assert admission_api.headers == [config.api_key]
 
@@ -179,7 +184,7 @@ def test_an_unlisted_mention_gets_no_placeholder_no_turn_and_no_claim(
     admission_api: FakeAdmissionApi,
     refused_metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
-    admission_api.lists[(CHANNEL, None)] = {LISTED}
+    admission_api.lists[(CHANNEL, "default")] = {LISTED}
     harness = _deliver(
         config,
         redis_client,
@@ -201,7 +206,7 @@ def test_an_unlisted_mention_gets_no_placeholder_no_turn_and_no_claim(
 def test_the_direct_message_lane_asks_too(
     config: DispatcherConfig, redis_client: redis.Redis, admission_api: FakeAdmissionApi
 ) -> None:
-    admission_api.lists[(DM_CHANNEL, None)] = {LISTED}
+    admission_api.lists[(DM_CHANNEL, "default")] = {LISTED}
     refused = _deliver(config, redis_client, _events_api_request("env-dm", "Ev-dm", _dm()))
     assert _stream_entries(redis_client, config) == []
     assert refused.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
@@ -217,7 +222,7 @@ def test_the_direct_message_lane_asks_too(
 def test_a_button_click_is_judged_on_the_clicking_user(
     config: DispatcherConfig, redis_client: redis.Redis, admission_api: FakeAdmissionApi
 ) -> None:
-    admission_api.lists[(CHANNEL, None)] = {LISTED}
+    admission_api.lists[(CHANNEL, "default")] = {LISTED}
     click = _block_action_body(
         actions=[{"type": "button", "action_id": "status", "value": "status", "action_ts": "1.5"}],
         trigger_id="trig-click",
@@ -261,7 +266,7 @@ def test_an_approval_click_never_starts_a_turn_and_is_not_asked(
 def test_a_bot_sender_is_asked_with_its_bot_id_and_either_id_admits(
     config: DispatcherConfig, redis_client: redis.Redis, admission_api: FakeAdmissionApi
 ) -> None:
-    admission_api.lists[(CHANNEL, None)] = {"B0EXAMPLE2"}
+    admission_api.lists[(CHANNEL, "default")] = {"B0EXAMPLE2"}
     event = _mention(text="<@U0BOT> disk alert", bot_id="B0EXAMPLE2")
     event["user"] = "U0EXAMPLEBOT"
     _deliver(config, redis_client, _events_api_request("env-bot", "Ev-bot", event))
@@ -290,7 +295,7 @@ def test_the_threaded_bot_allowlist_still_runs_first(
         json.dumps([{"channel_id": CHANNEL, "bot_id": "B2"}]),
     )
     trusted = DispatcherConfig(**config.model_dump(exclude={"slack_threaded_bot_allowlist"}))
-    admission_api.lists[(CHANNEL, None)] = {LISTED}
+    admission_api.lists[(CHANNEL, "default")] = {LISTED}
     refused = _deliver(
         trusted, redis_client, _events_api_request("env-t2", "Ev-t2", thread_event)
     )
@@ -737,7 +742,7 @@ def test_a_refused_slack_caller_is_logged_at_debug_but_still_counted(
     admission_api: FakeAdmissionApi,
     refused_metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
-    admission_api.lists[(CHANNEL, None)] = {LISTED}
+    admission_api.lists[(CHANNEL, "default")] = {LISTED}
     harness = _deliver(
         config, redis_client, _events_api_request("env-dbg", "Ev-dbg", _mention(text="hi"))
     )

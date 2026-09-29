@@ -129,14 +129,12 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   longer schema-free: there are 58 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 80 tests in `cli/tests/json_contract.rs`. Those tests
-  drive each output type's `to_json()` once per output variant rather than calling
-  the pure builder functions behind it, so a variant whose `to_json()` arm drifts
-  from the schema is caught even when the builder it delegates to still validates.
-  For the multi-variant `message` outcome the covered set is not hand-written: a
-  `syn` walk (`cli/tests/support/enum_variants.rs`) derives the variant names from
-  the enum declaration itself, so a sixth variant landing with no case turns the
-  gate red rather than passing vacuously (#955). Five of the added tests exercise
+  against real `to_json()` output across 79 tests in `cli/tests/json_contract.rs`.
+  Every `CliOutput` enum variant is also validated against its mapped schema by
+  `cli/tests/cli_output_variants.rs`. Its sample registry is checked against a
+  `syn` walk (`cli/tests/support/enum_variants.rs`) that derives enum and variant
+  names from their declarations, so an added variant without a sample turns the
+  gate red rather than passing vacuously (#965). Five tests exercise
   the walk's own rejection paths -- a source that fails to parse, a second
   declaration of the same enum, a `#[cfg]`-gated variant, and an enum inside a
   `#[cfg]`-gated module -- plus a positive control, so those rejections are now

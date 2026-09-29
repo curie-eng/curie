@@ -184,6 +184,35 @@ async def _admit(
     ):
         raise FeedbackIgnored("installation_mismatch")
     await verify_feedback_truth(feedback, bound, settings=settings, client=client)
+    # Provider verification can overlap another WorkItem or lineage writer.
+    # Keep both current rows locked through admission and reject changed proof.
+    current_item = await session.scalar(
+        select(WorkItem)
+        .where(WorkItem.id == work_item.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if current_item is None or current_item.publication_lineage_id != lineage.id:
+        raise FeedbackUnavailable("lineage_changed")
+    current_lineage = await session.scalar(
+        select(ThreadPublicationLineage)
+        .where(ThreadPublicationLineage.id == lineage.id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if current_lineage is None:
+        raise FeedbackUnavailable("lineage_changed")
+    if current_lineage.status != "open":
+        raise FeedbackIgnored("lineage_closed")
+    try:
+        current_bound = _bound(current_lineage)
+    except FeedbackIgnored:
+        raise FeedbackUnavailable("lineage_changed") from None
+    if current_bound != bound:
+        raise FeedbackUnavailable("lineage_changed")
+    if current_item.cancelled_at is not None:
+        raise FeedbackIgnored("work_item_cancelled")
+    work_item = current_item
     objective = _objective(feedback, settings, work_item.repo_full_name)
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
@@ -200,7 +229,7 @@ async def _admit(
         requester=f"github:{feedback.sender_id}:{feedback.sender_login}",
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
     )
-    result = await workitem_dispatch.admit(session, facts)
+    result = await workitem_dispatch.admit_revision(session, facts)
     return _admission_result(result, facts.request_id)
 
 

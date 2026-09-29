@@ -2358,42 +2358,41 @@ mod api_key_discovery_tests {
     }
 
     #[test]
-    fn a_failed_lookup_is_unknown_and_never_reads_as_real_slack() {
-        // The distinction that keeps #1030 from returning in another shape. A
-        // kubectl failure is not evidence that the worker talks to real Slack, and
-        // treating it as such posts a real token wherever real Slack is while the
-        // worker edits through a proxy the CLI never saw.
-        assert_eq!(parse_slack_api_base(false, ""), SlackApiBase::Unknown);
-        assert_eq!(
-            parse_slack_api_base(false, "https://proxy.example/api"),
-            SlackApiBase::Unknown
-        );
-    }
-
-    #[test]
-    fn an_empty_successful_lookup_means_real_slack() {
-        // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
-        // non-empty, so a clean empty result is the ordinary case, not a failure.
-        assert_eq!(parse_slack_api_base(true, ""), SlackApiBase::RealSlack);
-        assert_eq!(parse_slack_api_base(true, "  \n "), SlackApiBase::RealSlack);
-    }
-
-    #[test]
-    fn a_configured_base_is_returned_trimmed() {
-        assert_eq!(
-            parse_slack_api_base(true, "  https://proxy.example/api \n"),
-            SlackApiBase::Configured("https://proxy.example/api".to_string())
-        );
-    }
-
-    #[test]
-    fn two_containers_reporting_a_base_is_unknown_not_a_coin_flip() {
-        // Cannot happen in this chart today. If it ever does, picking one half is
-        // exactly the ambiguity this issue is about, so say so instead.
-        assert_eq!(
-            parse_slack_api_base(true, "https://a/api\nhttps://b/api\n"),
-            SlackApiBase::Unknown
-        );
+    fn parse_slack_api_base_cases() {
+        let cases = [
+            // The distinction that keeps #1030 from returning in another shape. A
+            // kubectl failure is not evidence that the worker talks to real Slack, and
+            // treating it as such posts a real token wherever real Slack is while the
+            // worker edits through a proxy the CLI never saw.
+            ("failed_lookup_empty", false, "", SlackApiBase::Unknown),
+            (
+                "failed_lookup_with_output",
+                false,
+                "https://proxy.example/api",
+                SlackApiBase::Unknown,
+            ),
+            // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
+            // non-empty, so a clean empty result is the ordinary case, not a failure.
+            ("empty_success", true, "", SlackApiBase::RealSlack),
+            ("whitespace_success", true, "  \n ", SlackApiBase::RealSlack),
+            (
+                "configured_base_trimmed",
+                true,
+                "  https://proxy.example/api \n",
+                SlackApiBase::Configured("https://proxy.example/api".to_string()),
+            ),
+            // Cannot happen in this chart today. If it ever does, picking one half is
+            // exactly the ambiguity this issue is about, so say so instead.
+            (
+                "two_containers_reporting_a_base",
+                true,
+                "https://a/api\nhttps://b/api\n",
+                SlackApiBase::Unknown,
+            ),
+        ];
+        for (name, ok, stdout, expected) in cases {
+            assert_eq!(parse_slack_api_base(ok, stdout), expected, "{name}");
+        }
     }
     use super::*;
 
@@ -2426,18 +2425,8 @@ mod api_key_discovery_tests {
         }
     }
 
-    fn write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write fake cluster executable");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .expect("read fake cluster executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
-    }
-
     fn install_cluster_diagnosis_tools(tools: &std::path::Path) -> EnvRestore {
-        write_executable(
+        crate::test_executable::install(
             &tools.join("kubectl"),
             r#"#!/bin/sh
 case "$*" in
@@ -2455,7 +2444,7 @@ case "$*" in
 esac
 "#,
         );
-        write_executable(
+        crate::test_executable::install(
             &tools.join("helm"),
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
@@ -3011,54 +3000,44 @@ mod release_secret_name_tests {
     /// contains the chart name. A default install renders
     /// `<release>-curie-secrets`, and every read silently found nothing.
     #[test]
-    fn a_default_install_secret_is_found() {
-        let listed = "t-curie-secrets\nsh.helm.release.v1.t.v1\n";
-        assert_eq!(
-            pick_release_secret(listed),
-            Some("t-curie-secrets".to_string())
-        );
-    }
-
-    /// The shape that hid the bug: with `nameOverride` equal to the release
-    /// name, both forms collapse to the same string.
-    #[test]
-    fn a_name_override_install_secret_is_found() {
-        assert_eq!(
-            pick_release_secret("acme-bot-secrets\n"),
-            Some("acme-bot-secrets".to_string())
-        );
-    }
-
-    /// The collision the exclusion exists for. Per-agent connector Secrets
-    /// carry the same release labels, so without it the selector could return
-    /// one -- a confidently WRONG answer, which is worse than an empty one.
-    #[test]
-    fn a_connector_secret_is_never_mistaken_for_the_chart_secret() {
-        let listed = "acme-bot-acme-bot-connector-secrets\n                      acme-bot-acme-dev-connector-secrets\n                      acme-bot-secrets\n";
-        assert_eq!(
-            pick_release_secret(listed),
-            Some("acme-bot-secrets".to_string())
-        );
-    }
-
-    /// Ordering must not decide it: the connector Secret sorting first is the
-    /// realistic case, since kubectl lists alphabetically.
-    #[test]
-    fn ordering_does_not_change_the_answer() {
-        let connector_first = "a-connector-secrets\nz-curie-secrets\n";
-        assert_eq!(
-            pick_release_secret(connector_first),
-            Some("z-curie-secrets".to_string())
-        );
-    }
-
-    /// An absent release must yield nothing, not a guess. The callers turn
-    /// `None` into an actionable error naming their escape-hatch flag.
-    #[test]
-    fn no_matching_secret_yields_none() {
-        assert_eq!(pick_release_secret(""), None);
-        assert_eq!(pick_release_secret("sh.helm.release.v1.t.v1\n"), None);
-        assert_eq!(pick_release_secret("only-connector-secrets\n"), None);
+    fn pick_release_secret_cases() {
+        let cases = [
+            (
+                "default_install",
+                "t-curie-secrets\nsh.helm.release.v1.t.v1\n",
+                Some("t-curie-secrets"),
+            ),
+            // The shape that hid the bug: with `nameOverride` equal to the release
+            // name, both forms collapse to the same string.
+            ("name_override_install", "acme-bot-secrets\n", Some("acme-bot-secrets")),
+            // The collision the exclusion exists for. Per-agent connector Secrets
+            // carry the same release labels, so without it the selector could return
+            // one -- a confidently WRONG answer, which is worse than an empty one.
+            (
+                "connector_secret_never_mistaken",
+                "acme-bot-acme-bot-connector-secrets\n                      acme-bot-acme-dev-connector-secrets\n                      acme-bot-secrets\n",
+                Some("acme-bot-secrets"),
+            ),
+            // Ordering must not decide it: the connector Secret sorting first is the
+            // realistic case, since kubectl lists alphabetically.
+            (
+                "ordering_does_not_change_the_answer",
+                "a-connector-secrets\nz-curie-secrets\n",
+                Some("z-curie-secrets"),
+            ),
+            // An absent release must yield nothing, not a guess. The callers turn
+            // `None` into an actionable error naming their escape-hatch flag.
+            ("empty_listing", "", None),
+            ("helm_release_only", "sh.helm.release.v1.t.v1\n", None),
+            ("connector_only", "only-connector-secrets\n", None),
+        ];
+        for (name, listed, expected) in cases {
+            assert_eq!(
+                pick_release_secret(listed),
+                expected.map(String::from),
+                "{name}"
+            );
+        }
     }
 }
 
@@ -3207,28 +3186,49 @@ mod chart_fullname_tests {
     /// `contains $name .Release.Name`, so a release that merely embeds the
     /// chart name anywhere takes no suffix. A "stricter" reading here would
     /// diverge from what helm actually renders.
-    #[test]
-    fn a_release_containing_curie_takes_no_suffix() {
-        assert_eq!(chart_fullname("curie").as_str(), "curie");
-        assert_eq!(chart_fullname("curieish").as_str(), "curieish");
-        assert_eq!(chart_fullname("my-curie-prod").as_str(), "my-curie-prod");
-        assert_eq!(chart_fullname("curieish").resource("api"), "curieish-api");
-    }
-
+    ///
     /// The reported bug: `helm template platform charts/curie` renders
     /// `platform-curie-api`, and the CLI used to ask for `platform-api`.
     #[test]
-    fn a_release_not_containing_curie_takes_the_chart_suffix() {
-        assert_eq!(chart_fullname("platform").as_str(), "platform-curie");
-        assert_eq!(chart_fullname("acme-prod").as_str(), "acme-prod-curie");
-        assert_eq!(
-            chart_fullname("platform").resource("api"),
-            "platform-curie-api"
-        );
-        assert_eq!(
-            chart_fullname("acme-prod").resource("worker"),
-            "acme-prod-curie-worker"
-        );
+    fn chart_fullname_suffix_cases() {
+        // (name, release, component, expected); `None` checks the bare fullname.
+        let cases = [
+            ("contains_curie_exact", "curie", None, "curie"),
+            ("contains_curie_prefix", "curieish", None, "curieish"),
+            (
+                "contains_curie_middle",
+                "my-curie-prod",
+                None,
+                "my-curie-prod",
+            ),
+            (
+                "contains_curie_resource",
+                "curieish",
+                Some("api"),
+                "curieish-api",
+            ),
+            ("no_curie_platform", "platform", None, "platform-curie"),
+            ("no_curie_acme_prod", "acme-prod", None, "acme-prod-curie"),
+            (
+                "no_curie_platform_api",
+                "platform",
+                Some("api"),
+                "platform-curie-api",
+            ),
+            (
+                "no_curie_acme_prod_worker",
+                "acme-prod",
+                Some("worker"),
+                "acme-prod-curie-worker",
+            ),
+        ];
+        for (name, release, component, expected) in cases {
+            let fullname = chart_fullname(release);
+            match component {
+                None => assert_eq!(fullname.as_str(), expected, "{name}"),
+                Some(c) => assert_eq!(fullname.resource(c), expected, "{name}"),
+            }
+        }
     }
 
     /// Helm applies `trunc 63` to the FULLNAME -- `printf "%s-%s" .Release.Name

@@ -40,13 +40,16 @@ pub(super) enum Facet {
     Rollout,
 }
 
-/// The #2010 worker drain gate, by the hook names
-/// `charts/curie/templates/worker-upgrade-drain.yaml` renders (the pre-upgrade
-/// quiesce Job and its post-upgrade release). A refusal there means accepted
-/// work had not settled when the roll began, which `cluster upgrade` reports
-/// separately from every other hook.
+/// The Drain facet is the worker drain Job, its post-upgrade release, and the
+/// attest Job (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
+/// there means accepted work had not settled, or no successful drain is
+/// recorded for this revision, which `cluster upgrade` reports separately from
+/// every other hook. Schema-migrate stays [`Facet::Hook`].
 fn hook_facet(name: &str) -> Facet {
-    if name.ends_with("-upgrade-drain") || name.ends_with("-upgrade-drain-release") {
+    if name.ends_with("-upgrade-drain")
+        || name.ends_with("-upgrade-drain-release")
+        || name.ends_with("-upgrade-drain-attest")
+    {
         Facet::Drain
     } else {
         Facet::Hook

@@ -491,7 +491,9 @@ def serve(handler: type[BaseHTTPRequestHandler], state: Any) -> ThreadingHTTPSer
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.state = state  # type: ignore[attr-defined]
     server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+    ).start()
     return server
 
 

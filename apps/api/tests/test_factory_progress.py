@@ -11,6 +11,7 @@ test_factory_terminus.py. Machine fixtures drive the events.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -79,6 +80,7 @@ ACTIVITY: dict[str, Any] = {
     "tool_calls": 37,
     "last_tool": "Bash",
 }
+VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
 
 
 def progress_token(
@@ -117,6 +119,21 @@ def report(
     body.update(extra or {})
     return client.post(
         f"/v1/work-item-progress/{path_id or request_id}",
+        headers={"X-API-Key": token if token is not None else progress_token(request_id)},
+        json=body,
+    )
+
+
+def verification(
+    client: Any,
+    request_id: uuid.UUID,
+    body: dict[str, Any],
+    *,
+    token: str | None = None,
+    path_id: uuid.UUID | None = None,
+) -> Any:
+    return client.post(
+        f"/v1/work-item-progress/{path_id or request_id}/verification",
         headers={"X-API-Key": token if token is not None else progress_token(request_id)},
         json=body,
     )
@@ -402,7 +419,305 @@ def test_a_token_whose_work_item_has_no_active_request_is_409(admitted: Any) -> 
     assert _reports(request_id) == []
 
 
-# --- 5 and 6: declaration pinning and the report limit -----------------------------------
+# --- 5: runner verification preflight -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "unavailable",
+            "exit_status": None,
+            "missing_binaries": ["uv"],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "failed",
+            "exit_status": 1,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    ],
+)
+def test_runner_verification_is_stored_as_structured_evidence_before_model_progress(
+    admitted: Any, observation: dict[str, Any]  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9711
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, observation)
+
+    assert response.status_code == 201, response.text
+    assert response.json() == {"recorded": True, "request_id": str(request_id)}
+    expected_note = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+    assert len(expected_note.encode("utf-8")) <= 280
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": expected_note,
+            "loop_round": None,
+        }
+    ]
+
+    progress_response = report(client, request_id, "implement")
+    assert progress_response.status_code == 201, progress_response.text
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": expected_note,
+            "loop_round": None,
+        },
+        {"phase": "implement", "note": None, "loop_round": None},
+    ]
+
+
+def test_verification_token_is_bound_to_the_path_request(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    first_number = 9712
+    second_number = 9713
+    _label(client, github, first_number)
+    first = _request(first_number)["id"]
+    _label(client, github, second_number)
+    second = _request(second_number)["id"]
+    observation = {
+        "command": VERIFICATION_COMMAND,
+        "outcome": "passed",
+        "exit_status": 0,
+        "missing_binaries": [],
+        "blocked_services": [],
+    }
+
+    response = verification(
+        client, first, observation, token=progress_token(first), path_id=second
+    )
+
+    assert response.status_code == 401, response.text
+    assert _reports(first) == []
+    assert _reports(second) == []
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": "   ",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": "uv run pytest -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "unknown",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 1,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": ["uv"],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "unavailable",
+            "exit_status": 127,
+            "missing_binaries": ["uv"],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "failed",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "failed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "unavailable",
+            "exit_status": None,
+            "missing_binaries": ["uv", "uv"],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "unavailable",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": ["postgres", "postgres"],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+            "model_result": "pretend success",
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "blocked_services": [],
+        },
+        {
+            "command": VERIFICATION_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+        },
+    ],
+)
+def test_malformed_verification_is_rejected_without_persisting_evidence(
+    admitted: Any, observation: dict[str, Any]  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9714
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, observation)
+
+    assert response.status_code == 422, response.text
+    assert _reports(request_id) == []
+
+
+def test_duplicate_verification_does_not_replace_the_first_observation(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9715
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    first_observation = {
+        "command": VERIFICATION_COMMAND,
+        "outcome": "unavailable",
+        "exit_status": None,
+        "missing_binaries": ["uv"],
+        "blocked_services": [],
+    }
+    second_observation = {
+        "command": VERIFICATION_COMMAND,
+        "outcome": "passed",
+        "exit_status": 0,
+        "missing_binaries": [],
+        "blocked_services": [],
+    }
+
+    first = verification(client, request_id, first_observation)
+    duplicate = verification(client, request_id, second_observation)
+
+    assert first.status_code == 201, first.text
+    assert duplicate.status_code == 409, duplicate.text
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": json.dumps(first_observation, sort_keys=True, separators=(",", ":")),
+            "loop_round": None,
+        }
+    ]
+
+
+def test_a_stale_request_cannot_record_verification_for_its_replacement(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9716
+    _label(client, github, number)
+    first = _request(number)["id"]
+    _fail(client, first)
+    github.labels = [LABEL]
+    again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert again.json()["status"] == "factory_admitted", again.text
+    rows = _all_requests(number)
+    assert [row["status"] for row in rows] == ["failed", "waiting"]
+    second = rows[1]["id"]
+    observation = {
+        "command": VERIFICATION_COMMAND,
+        "outcome": "unavailable",
+        "exit_status": None,
+        "missing_binaries": ["uv"],
+        "blocked_services": [],
+    }
+
+    response = verification(client, first, observation)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "no_active_request"
+    assert _reports(first) == []
+    assert _reports(second) == []
+
+
+def test_model_progress_cannot_spoof_the_reserved_verification_phase(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9717
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    declaration = {
+        "phases": [{"id": "verification_preflight", "label": "Verification"}],
+        "loops": [],
+    }
+
+    response = report(
+        client,
+        request_id,
+        "verification_preflight",
+        declaration=declaration,
+    )
+
+    assert response.status_code == 422, response.text
+    assert _reports(request_id) == []
+
+
+# --- 6 and 7: declaration pinning and the report limit -----------------------------------
 
 
 def test_a_changed_declaration_is_409(admitted: Any) -> None:  # noqa: F811
@@ -453,7 +768,7 @@ def test_the_report_after_two_hundred_is_429(admitted: Any) -> None:  # noqa: F8
     assert len(_reports(request_id)) == 200
 
 
-# --- 7: the phase view (pure) -----------------------------------------------------------
+# --- 8: the phase view (pure) -----------------------------------------------------------
 
 
 def _reports_of(*entries: tuple[str, int | None]) -> list[ExecutionRequestPhaseReport]:
@@ -795,6 +1110,7 @@ def _constraint_statuses() -> list[str]:
 
 
 PILLS = {
+    "queued": ("QUEUED", "#9a6700", False),
     "waiting": ("QUEUED", "#9a6700", False),
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),

@@ -189,7 +189,7 @@ def test_two_identities_feed_one_stream_each_stamping_its_own_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"Ev0EXAMPLE1", "Ev0EXAMPLE2:ops-bot"}
-    assert payloads["Ev0EXAMPLE1"]["reply_handle"]["adapter"] is None
+    assert payloads["Ev0EXAMPLE1"]["reply_handle"]["adapter"] == "default"
     assert payloads["Ev0EXAMPLE2:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
     # Each placeholder is posted by, and recorded from, the app it arrived on.
     assert payloads["Ev0EXAMPLE1"]["reply_handle"]["placeholder"] == "100.0001"
@@ -253,7 +253,7 @@ def test_the_delivery_cannot_choose_the_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"Ev0EXAMPLE3", "Ev0EXAMPLE4:ops-bot"}
-    assert payloads["Ev0EXAMPLE3"]["reply_handle"]["adapter"] is None
+    assert payloads["Ev0EXAMPLE3"]["reply_handle"]["adapter"] == "default"
     assert payloads["Ev0EXAMPLE4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
 
 
@@ -274,7 +274,7 @@ def test_a_button_click_cannot_choose_the_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"action-trig-env-f3", "action-trig-env-f4:ops-bot"}
-    assert payloads["action-trig-env-f3"]["reply_handle"]["adapter"] is None
+    assert payloads["action-trig-env-f3"]["reply_handle"]["adapter"] == "default"
     assert payloads["action-trig-env-f4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
 
 
@@ -345,15 +345,10 @@ def test_a_lane_must_be_told_which_identity_it_serves(lane: Any) -> None:
     assert parameter.default is inspect.Parameter.empty
 
 
-def test_the_default_identity_mints_exactly_the_handle_it_always_did(
+def test_the_default_identity_mints_its_name(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """Both lanes, with `default` named explicitly.
-
-    `adapter` stays null on the wire until #3146 stores the name, so every
-    phase-1 reader resolves it as `default` and a worker from before the route
-    triple still resolves every default turn.
-    """
+    """Both lanes, with `default` named explicitly."""
 
     default = _default(config, redis_client)
 
@@ -369,7 +364,7 @@ def test_the_default_identity_mints_exactly_the_handle_it_always_did(
             "channel": CHANNEL,
             "placeholder": "100.0001",
             "endpoint": None,
-            "adapter": None,
+            "adapter": "default",
         }
 
 

@@ -16,9 +16,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import importlib
+import inspect
 import io
 import json
 import os
+import re
 import stat
 import tarfile
 import threading
@@ -445,16 +447,20 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
 def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
     workspace: Any,
 ) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Please update <https://github.com/acme-corp/acme-bot.git> and add a test."
-    ) == "acme-corp/acme-bot"
-    assert workspace.parse_github_repo_fact(
-        "Keep working in this thread; the repository is already selected."
-    ) is None
+    assert (
+        workspace.parse_github_repo_fact(
+            "Please update <https://github.com/acme-corp/acme-bot.git> and add a test."
+        )
+        == "acme-corp/acme-bot"
+    )
+    assert (
+        workspace.parse_github_repo_fact(
+            "Keep working in this thread; the repository is already selected."
+        )
+        is None
+    )
 
-    with pytest.raises(
-        workspace.WorkspaceSelectionRefused, match="only one"
-    ) as excinfo:
+    with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one") as excinfo:
         workspace.parse_github_repo_fact(
             "Compare https://github.com/acme-corp/acme-bot with "
             "https://github.com/acme-corp/acme-api before changing anything."
@@ -477,29 +483,20 @@ def test_webhook_payload_urls_are_not_repository_facts(workspace: Any) -> None:
         "</untrusted-hook-payload>"
     )
     assert workspace.trusted_repository_fact(payload, ignore_message=True) is None
-    assert workspace.trusted_repository_fact(
-        "Please update https://github.com/acme-corp/acme-bot",
-        ignore_message=False,
-    ) == "acme-corp/acme-bot"
+    assert (
+        workspace.trusted_repository_fact(
+            "Please update https://github.com/acme-corp/acme-bot",
+            ignore_message=False,
+        )
+        == "acme-corp/acme-bot"
+    )
     assert workspace.webhook_job_refuses_workspace(payload) is True
-    assert workspace.webhook_job_refuses_workspace(
-        "This delivery has an authorized source mapping: repository acme-corp/acme-bot"
-    ) is False
-
-
-def test_runtime_repo_parser_deduplicates_repeated_repository_facts(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Update https://github.com/acme-corp/acme-bot and keep the notes at "
-        "https://github.com/acme-corp/acme-bot.git current."
-    ) == "acme-corp/acme-bot"
-
-
-def test_runtime_repo_parser_strips_sentence_punctuation(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Please update https://github.com/acme-corp/acme-bot."
-    ) == "acme-corp/acme-bot"
+    assert (
+        workspace.webhook_job_refuses_workspace(
+            "This delivery has an authorized source mapping: repository acme-corp/acme-bot"
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -520,20 +517,6 @@ def test_runtime_repo_parser_rejects_non_root_or_credentialed_urls(
     assert workspace.parse_github_repo_fact(message) is None
 
 
-def test_runtime_repo_parser_accepts_a_bare_owner_repo(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Please update acme-corp/acme-bot and add a test."
-    ) == "acme-corp/acme-bot"
-
-
-def test_runtime_repo_parser_deduplicates_bare_and_url_for_the_same_repo(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Update acme-corp/acme-bot and keep https://github.com/acme-corp/acme-bot current."
-    ) == "acme-corp/acme-bot"
-
-
 def test_runtime_repo_parser_reads_two_bare_names_as_prose(workspace: Any) -> None:
     """REVERSES the refusal this test asserted, for #2767.
 
@@ -542,9 +525,12 @@ def test_runtime_repo_parser_reads_two_bare_names_as_prose(workspace: Any) -> No
     the same shape. One guess reaches the allowlist and is refused there; two
     never got that far, because the count raised in the parser first.
     """
-    assert workspace.parse_github_repo_fact(
-        "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
-    ) is None
+    assert (
+        workspace.parse_github_repo_fact(
+            "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
+        )
+        is None
+    )
 
 
 def test_runtime_repo_parser_still_rejects_two_different_urls(workspace: Any) -> None:
@@ -553,9 +539,7 @@ def test_runtime_repo_parser_still_rejects_two_different_urls(workspace: Any) ->
     A github.com URL is unambiguous by construction, so two of them are two
     repositories and nothing else. #2767 reverses the bare case only.
     """
-    with pytest.raises(
-        workspace.WorkspaceSelectionRefused, match="only one"
-    ) as excinfo:
+    with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one") as excinfo:
         workspace.parse_github_repo_fact(
             "Compare https://github.com/acme-corp/acme-bot with "
             "https://github.com/acme-corp/acme-api before changing anything."
@@ -579,74 +563,81 @@ def test_two_slashed_english_pairs_name_no_repository(workspace: Any) -> None:
         assert workspace.parse_github_repo_fact(text) is None, text
 
 
-def test_a_url_is_not_refused_by_prose_beside_it(workspace: Any) -> None:
-    """A bare token next to a URL is noise beside a plain statement. #2767."""
-    assert workspace.parse_github_repo_fact(
-        "Update https://github.com/acme-corp/acme-bot -- see the P/L statement for why."
-    ) == "acme-corp/acme-bot"
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param(
+            "Update https://github.com/acme-corp/acme-bot and keep the notes at "
+            "https://github.com/acme-corp/acme-bot.git current.",
+            "acme-corp/acme-bot",
+            id="dedupes-repeated-url",
+        ),
+        pytest.param(
+            "Please update https://github.com/acme-corp/acme-bot.",
+            "acme-corp/acme-bot",
+            id="strips-sentence-punctuation",
+        ),
+        pytest.param(
+            "Please update acme-corp/acme-bot and add a test.",
+            "acme-corp/acme-bot",
+            id="bare-owner-repo",
+        ),
+        pytest.param(
+            "Update acme-corp/acme-bot and keep https://github.com/acme-corp/acme-bot current.",
+            "acme-corp/acme-bot",
+            id="dedupes-bare-and-url",
+        ),
+        # A bare token next to a URL is noise beside a plain statement. #2767.
+        pytest.param(
+            "Update https://github.com/acme-corp/acme-bot -- see the P/L statement for why.",
+            "acme-corp/acme-bot",
+            id="url-not-refused-by-prose-beside-it",
+        ),
+        pytest.param(
+            "Update acme-corp/acme-bot in src/main.py",
+            "acme-corp/acme-bot",
+            id="bare-repo-beside-two-segment-file-path",
+        ),
+        pytest.param("Update acme-corp/acme.bot", "acme-corp/acme.bot", id="dotted-repo-name"),
+        pytest.param(
+            "Update acme-corp/acme-bot in docs/README",
+            "acme-corp/acme-bot",
+            id="bare-repo-beside-extensionless-file-path",
+        ),
+        pytest.param(
+            "Please update https://github.com/acme-corp/acme-bot in src/main.py",
+            "acme-corp/acme-bot",
+            id="url-beside-two-segment-file-path",
+        ),
+    ],
+)
+def test_runtime_repo_parser_accepts(workspace: Any, message: str, expected: str) -> None:
+    assert workspace.parse_github_repo_fact(message) == expected
 
 
-def test_runtime_repo_parser_still_rejects_a_pull_request_url(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "https://github.com/acme-corp/acme-bot/pull/1"
-    ) is None
-
-
-def test_runtime_repo_parser_ignores_nested_source_paths(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Look at apps/worker/src/curie_worker/workspace.py"
-    ) is None
-
-
-def test_runtime_repo_parser_ignores_english_slash_pairs(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Use retries and/or a fallback when the clone fails."
-    ) is None
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("Look at apps/worker/src/curie_worker/workspace.py", id="nested-source-path"),
+        pytest.param(
+            "Use retries and/or a fallback when the clone fails.", id="english-slash-pair"
+        ),
+        pytest.param("Read docs/agents.md", id="two-segment-markdown-path"),
+    ],
+)
+def test_runtime_repo_parser_ignores_non_repository_paths(workspace: Any, message: str) -> None:
+    assert workspace.parse_github_repo_fact(message) is None
 
 
 def test_runtime_repo_parser_accepts_wrapped_bare_owner_repo(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Please update <acme-corp/acme-bot> and add a test."
-    ) == "acme-corp/acme-bot"
-    assert workspace.parse_github_repo_fact(
-        "Please update `acme-corp/acme-bot` and add a test."
-    ) == "acme-corp/acme-bot"
-
-
-def test_runtime_repo_parser_keeps_a_bare_repo_when_a_two_segment_file_path_is_also_present(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Update acme-corp/acme-bot in src/main.py"
-    ) == "acme-corp/acme-bot"
-
-
-def test_runtime_repo_parser_accepts_a_dotted_repository_name(workspace: Any) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Update acme-corp/acme.bot"
-    ) == "acme-corp/acme.bot"
-
-
-def test_runtime_repo_parser_keeps_a_bare_repo_when_an_extensionless_file_path_is_also_present(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Update acme-corp/acme-bot in docs/README"
-    ) == "acme-corp/acme-bot"
-
-
-def test_runtime_repo_parser_ignores_a_two_segment_markdown_path(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact("Read docs/agents.md") is None
-
-
-def test_runtime_repo_parser_keeps_a_url_when_a_two_segment_file_path_is_also_present(
-    workspace: Any,
-) -> None:
-    assert workspace.parse_github_repo_fact(
-        "Please update https://github.com/acme-corp/acme-bot in src/main.py"
-    ) == "acme-corp/acme-bot"
+    assert (
+        workspace.parse_github_repo_fact("Please update <acme-corp/acme-bot> and add a test.")
+        == "acme-corp/acme-bot"
+    )
+    assert (
+        workspace.parse_github_repo_fact("Please update `acme-corp/acme-bot` and add a test.")
+        == "acme-corp/acme-bot"
+    )
 
 
 def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
@@ -698,9 +689,7 @@ def test_unallowlisted_selection_names_the_chart_allowlist(
     )
 
     with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
-        client.select(
-            DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "attacker/other-bot"
-        )
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "attacker/other-bot")
 
     assert excinfo.value.public_detail == (
         "That repository is not in api.githubRepoAllowlist for this installation; "
@@ -765,14 +754,6 @@ def test_workspace_coordinator_propagates_absent_repository_selection(
     ("code", "expected_detail"),
     [
         (
-            "workspace.deployment_disabled",
-            "This deployment does not enable repository workspaces.",
-        ),
-        (
-            "workspace.repository_required",
-            "Start the thread by naming one allowed root GitHub repository URL.",
-        ),
-        (
             "workspace.selection_conflict",
             "This thread is already bound to a different repository.",
         ),
@@ -807,6 +788,66 @@ def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
         client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", None)
 
     assert excinfo.value.public_detail == expected_detail
+
+
+def test_selection_refusal_codes_match_the_apis_emissions(workspace: Any) -> None:
+    """#2684: the worker must map exactly the codes the API emits.
+
+    The two sides cannot share a constant: the worker does not import the API
+    package at runtime, so this seam is pinned here instead. A code in the
+    worker map that the API never emits is unreachable dead prose, and a code
+    the API emits that the worker does not map degrades into an
+    ``invalid selection refusal response`` preparation fault instead of a
+    refusal the user can read, so the two sets must stay equal.
+    """
+
+    router = importlib.import_module("curie_api.routers.workspaces")
+    quoted_codes = re.findall(r'(["\'])(workspace\.[a-z_]+)\1', inspect.getsource(router))
+    emitted = {code for _quote, code in quoted_codes}
+    understood = set(workspace._SELECTION_REFUSAL_MESSAGES)
+
+    assert emitted == understood, (
+        "worker workspace-refusal codes and the codes the API selection "
+        "router emits have drifted; update both sides of the seam together"
+    )
+
+
+def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
+    workspace: Any,
+) -> None:
+    """A code the worker does not map is a protocol fault, not refusal prose.
+
+    ``workspace.repository_required`` was one of the unreachable mappings
+    removed in #2684; reusing it here pins that the removed code now fails
+    closed through the invalid-response branch instead of silently rendering
+    prose the API never chose.
+    """
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=409,
+            headers={},
+            body=json.dumps(
+                {
+                    "detail": {
+                        "code": "workspace.repository_required",
+                        "message": "wording intentionally shares no legacy match text",
+                    }
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError) as excinfo:
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", None)
+
+    assert "invalid selection refusal response" in str(excinfo.value)
+    assert not isinstance(excinfo.value, workspace.WorkspaceSelectionRefused)
 
 
 def test_workspace_preparer_does_not_chmod_preexisting_mount_root(
@@ -1031,15 +1072,11 @@ class _RecordingSubstrate:
         self.calls: list[tuple[str, str, dict[str, str]]] = []
         self.handoff_calls: list[dict[str, Any]] = []
 
-    def claim(
-        self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> object:
+    def claim(self, thread_key: str, *, env: dict[str, str] | None = None, **_: object) -> object:
         self.calls.append(("claim", thread_key, dict(env or {})))
         return object()
 
-    def resume(
-        self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> object:
+    def resume(self, thread_key: str, *, env: dict[str, str] | None = None, **_: object) -> object:
         self.calls.append(("resume", thread_key, dict(env or {})))
         return object()
 
@@ -1371,8 +1408,7 @@ def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
     archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
     assert archive_keys == [previous.object_key]
     assert any(
-        key != previous.object_key and not key.startswith("_ownership/")
-        for key in objects.deleted
+        key != previous.object_key and not key.startswith("_ownership/") for key in objects.deleted
     )
 
 
@@ -1448,8 +1484,7 @@ def test_late_handoff_candidate_refusal_restores_prior_durable_ownership(
     archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
     assert archive_keys == [previous.object_key]
     assert any(
-        key != previous.object_key and not key.startswith("_ownership/")
-        for key in objects.deleted
+        key != previous.object_key and not key.startswith("_ownership/") for key in objects.deleted
     )
 
 
@@ -1541,9 +1576,7 @@ def test_late_handoff_fence_loss_restores_prior_durable_ownership(
     )
     assert restarted.current(thread_key) == previous
     assert previous.object_key in objects.objects
-    deleted_workspace_keys = [
-        key for key in objects.deleted if not key.startswith("_ownership/")
-    ]
+    deleted_workspace_keys = [key for key in objects.deleted if not key.startswith("_ownership/")]
     assert previous.object_key not in deleted_workspace_keys
 
 
@@ -1552,6 +1585,7 @@ def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_ob
 ) -> None:
     preparer, _, objects = _preparer(workspace, tmp_path)
     substrate = _RecordingSubstrate()
+
     class Suspended(Exception):
         pass
 
@@ -1827,12 +1861,8 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     assert WORKER_AUTH not in env.values()
     assert GIT_CREDENTIAL not in env.values()
     assert env["CURIE_SESSION_ID"] == "logical-session"
-    assert env["CURIE_HISTORY_REF"] == (
-        "https://api.example.com/state/transcript/thread-1"
-    )
-    assert env["CURIE_WORKSPACE_REF"] == result.prepared.claim_env()[
-        "CURIE_WORKSPACE_REF"
-    ]
+    assert env["CURIE_HISTORY_REF"] == ("https://api.example.com/state/transcript/thread-1")
+    assert env["CURIE_WORKSPACE_REF"] == result.prepared.claim_env()["CURIE_WORKSPACE_REF"]
     assert env["CURIE_WORKSPACE_SHA256"] == result.prepared.sha256
 
 

@@ -27,12 +27,14 @@ from .. import sandbox_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text
+from ..factory_notices import cause_text, needs_human
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
+    VerificationObservation,
     phase_view,
     record_report,
+    record_verification,
 )
 from ..factory_usage import PriceBook, UsageReport, get_price_book, record_usage
 from ..models import (
@@ -59,6 +61,7 @@ _STATUS_CODES = {
     "no_active_request": status.HTTP_409_CONFLICT,
     "declaration_changed": status.HTTP_409_CONFLICT,
     "report_limit": status.HTTP_429_TOO_MANY_REQUESTS,
+    "verification_exists": status.HTTP_409_CONFLICT,
 }
 
 
@@ -117,6 +120,22 @@ async def report_work_item_usage(
             status_code=status.HTTP_404_NOT_FOUND, content={"code": "request_not_found"}
         )
     return {"recorded": True, "request_id": str(request_id)}
+
+
+@router.post(
+    "/v1/work-item-progress/{request_id}/verification",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_progress_token)],
+)
+async def report_work_item_verification(
+    request_id: uuid.UUID, body: VerificationObservation, session: SessionDep
+) -> Any:
+    result = await record_verification(session, token_request_id=request_id, body=body)
+    if result.outcome != "recorded":
+        return JSONResponse(
+            status_code=_STATUS_CODES[result.outcome], content={"code": result.outcome}
+        )
+    return {"recorded": True, "request_id": str(result.request_id)}
 
 
 @router.get(
@@ -183,8 +202,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             cause_text=(
                 cause_text(terminal) if terminal and terminal != "completed" else None
             ),
-            needs_human=request.status == "failed"
-            and terminal in {"runner_escalated", "ci_failed"},
+            needs_human=needs_human(request.status, terminal),
         )
     )
     return Response(

@@ -2974,15 +2974,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_routes_do_not_restore_the_regular_terminal_mid_session() {
-        let source = include_str!("interactive.rs");
-        let old_suspend_path = ["suspend", "_terminal"].concat();
-        let old_line_prompt = ["prompt", "_field"].concat();
-        assert!(!source.contains(&old_suspend_path));
-        assert!(!source.contains(&old_line_prompt));
-    }
-
-    #[test]
     fn find_repo_root_detects_stable_sentinel_and_fails_when_absent() {
         use std::fs;
         let root = tempfile::tempdir().unwrap();

@@ -83,11 +83,37 @@ def test_mint_then_exchange_sets_an_httponly_cookie_and_returns_no_token(
     assert body["subject"] == SUBJECT
 
     # ... and the cookie must be HttpOnly, so page script cannot read it.
+    # Host-only: the __Host- prefix plus no Domain attribute, so a sibling
+    # host cannot be fixed as the cookie's scope.
     set_cookie = exchanged.headers.get("set-cookie", "")
+    assert SESSION_COOKIE == "__Host-curie_console_session"
     assert SESSION_COOKIE in set_cookie, set_cookie
+    assert "domain=" not in set_cookie.lower(), set_cookie
     assert "httponly" in set_cookie.lower(), set_cookie
     assert "samesite=strict" in set_cookie.lower().replace(" ", ""), set_cookie
     assert "secure" in set_cookie.lower(), set_cookie
+    assert "path=/" in set_cookie.lower().replace(" ", ""), set_cookie
+
+
+def test_the_legacy_cookie_name_is_not_a_console_session(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Readers accept only the host-only name, even for a live token."""
+
+    code = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    ).json()["code"]
+    exchanged = client.post("/console/session", json={"code": code})
+    assert exchanged.status_code == 200, exchanged.text
+    token = client.cookies.get(SESSION_COOKIE)
+    assert token
+    client.cookies.clear()
+
+    legacy = client.get(
+        "/console/session",
+        headers={"Cookie": f"curie_console_session={token}"},
+    )
+    assert legacy.status_code == 401, legacy.text
 
 
 def test_a_login_code_works_exactly_once(

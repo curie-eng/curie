@@ -821,14 +821,89 @@ def test_non_gated_tool_does_not_consume_the_grant() -> None:
     anyio.run(go)
 
 
-def test_consume_grant_only_matches_the_named_tool() -> None:
-    # A direct unit check on consume_grant: True + clears iff the name matches.
+def test_consume_grant_refuses_same_tool_with_different_arguments() -> None:
+    # #3174: the grant admits the approved call, not every call to that tool.
+    approved = {"asset": "a-1", "share_with": ["ops"]}
+    gate = ApprovalGate(
+        required=frozenset({"share_asset"}),
+        grant_tool="share_asset",
+        grant_arguments=approved,
+    )
+    assert gate.consume_grant("share_asset", {"asset": "a-2", "share_with": ["ops"]}) is False
+    assert gate.consume_grant("share_asset") is False
+    assert gate.grant_tool == "share_asset"  # a mismatch does not spend the grant
+    # Key order is not significant; the canonical form is equal.
+    assert gate.consume_grant("share_asset", {"share_with": ["ops"], "asset": "a-1"}) is True
+    assert gate.grant_tool is None
+    assert gate.consume_grant("share_asset", approved) is False  # single use
+
+
+def test_granted_tool_with_different_arguments_is_refused_with_a_reason() -> None:
+    async def go() -> None:
+        gate = ApprovalGate(
+            required=frozenset({"share_asset"}),
+            grant_tool="share_asset",
+            grant_arguments={"asset": "a-1"},
+        )
+        callback = build_can_use_tool(gate)
+
+        other = await callback("share_asset", {"asset": "a-2"}, ToolPermissionContext())
+        assert isinstance(other, PermissionResultDeny)
+        assert "exact arguments" in other.message
+        assert other.interrupt is False
+        # A refused mismatch mints no new approval and leaves the grant unspent.
+        assert gate.pending_summary is None
+        assert gate.grant_tool == "share_asset"
+
+        approved = await callback("share_asset", {"asset": "a-1"}, ToolPermissionContext())
+        assert isinstance(approved, PermissionResultAllow)
+        assert gate.grant_tool is None
+
+    anyio.run(go)
+
+
+def test_permission_grant_without_arguments_is_dropped() -> None:
+    # #3174: a permission grant that lost its approved arguments cannot prove
+    # what the approver saw, so it grants nothing.
+    gate = build_approval_gate(operator_tools=["Bash"], policy_routes={}, grant_tool="Bash")
+    assert gate is not None
+    assert gate.grant_tool is None
+    assert gate.consume_grant("Bash", {"command": "x"}) is False
+
+
+def test_policy_grant_without_arguments_keeps_the_name_match() -> None:
+    gate = build_approval_gate(
+        operator_tools=None,
+        policy_routes={"close_issue": "ops"},
+        grant_tool="close_issue",
+        resumed_kind="policy",
+        grantable_by_route={"ops": "close_issue"},
+    )
+    assert gate is not None
+    assert gate.consume_grant("close_issue", {"id": 1}) is True
+    assert gate.consume_grant("close_issue", {"id": 1}) is False
+
+
+def test_permission_resume_on_a_policy_grantable_tool_still_needs_arguments() -> None:
+    # The overlap: a tool both permission-gated and grantableViaPolicy. A
+    # permission resume that lost its arguments must not pass as a policy grant.
+    gate = build_approval_gate(
+        operator_tools=["close_issue"],
+        policy_routes={"close_issue": "ops"},
+        grant_tool="close_issue",
+        resumed_kind=None,
+        grantable_by_route={"ops": "close_issue"},
+    )
+    assert gate is not None
+    assert gate.grant_tool is None
+
+
+def test_grant_without_arguments_keeps_the_name_match() -> None:
+    # A policy grant carries no call arguments; it stays tool-name-scoped.
     gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
-    assert gate.consume_grant("Read") is False
-    assert gate.grant_tool == "Bash"  # a non-match does not clear the grant
-    assert gate.consume_grant("Bash") is True
-    assert gate.grant_tool is None  # a match clears it (single use)
-    assert gate.consume_grant("Bash") is False  # already spent
+    assert gate.consume_grant("Read", {}) is False
+    assert gate.consume_grant("Bash", {"command": "x"}) is True
+    assert gate.consume_grant("Bash", {"command": "x"}) is False
 
 
 def test_runner_config_parses_approval_grant_tool() -> None:
@@ -1324,9 +1399,11 @@ def test_build_approval_gate_carries_the_grant_tool() -> None:
         operator_tools=["Bash"],
         policy_routes={},
         grant_tool="Bash",
+        grant_arguments={"command": "x"},
     )
     assert gate is not None
     assert gate.grant_tool == "Bash"
+    assert gate.grant_arguments == {"command": "x"}
 
 
 def test_gate_block_records_the_declared_route() -> None:

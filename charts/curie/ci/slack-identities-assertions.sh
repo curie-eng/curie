@@ -30,6 +30,7 @@ INDEXED = ("CURIE_SLACK_APP_TOKEN__", "CURIE_SLACK_BOT_TOKEN__", "CURIE_SLACK_SI
 RANDOM_DOCS = {
     ("Secret", SECRET),
     ("Job", "acme-curie-upgrade-drain"),
+    ("Job", "acme-curie-upgrade-drain-attest"),
     ("Job", "acme-curie-upgrade-drain-release"),
 }
 PLAIN = {"dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}}}

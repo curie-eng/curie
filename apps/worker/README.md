@@ -322,7 +322,7 @@ tool can inspect exactly what inbound entry died and why:
 |---|---|
 | `dl_original_id` | the entry's id on the source stream |
 | `dl_delivery_count` | deliveries made before it was given up on |
-| `dl_reason` | `max-delivery-exceeded`, or `unparseable` |
+| `dl_reason` | `max-delivery-exceeded`, `unparseable`, or `broker-entry-vanished` |
 | `dl_dead_lettered_at` | UTC ISO-8601 timestamp |
 
 Completion-outbox rows are written by `Markers.dead_letter_completion` only for
@@ -377,9 +377,11 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_MAX_ATTEMPTS`, `CURIE_MAX_DELIVERY` / `CURIE_DEAD_LETTER_STREAM` /
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
 `1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
-one delivery lease TTL) and `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
-when a delivery's handler raises), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
-the substrate. Run with `python -m curie_worker`.
+one delivery lease TTL), `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
+when a delivery's handler raises) and `CURIE_TURN_RECEIPT` (what the receipt
+beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180),
+plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
+substrate. Run with `python -m curie_worker`.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
@@ -459,7 +461,7 @@ user-visible effect.
 | Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
-| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. |
+| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
 | Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
 | Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |

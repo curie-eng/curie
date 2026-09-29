@@ -8,19 +8,18 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.deps import get_session
 from curie_api.main import create_app
 from curie_api.models import Publication, ThreadPublicationLineage
 from fastapi.testclient import TestClient
-from sqlalchemy import CheckConstraint, text
+from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -29,33 +28,11 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0040"
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 REPO = "acme-corp/acme-bot"
 REPLY_KIND = "slack"
 REPLY_CHANNEL = "C0EXAMPLE1"
-
-
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                if not result.returns_rows:
-                    return []
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
 
 
 def _scoped_thread(conversation_id: str) -> str:
@@ -90,17 +67,17 @@ def _seed_deployment() -> tuple[uuid.UUID, uuid.UUID]:
     agent_id = uuid.uuid4()
     version_id = uuid.uuid4()
     deployment_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"lineage-migration-{agent_id.hex[:8]}"},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agent_versions "
         "(id, agent_id, version_label, bundle_ref, created_by) "
         "VALUES (:id, :agent_id, 'v1', NULL, 'migration-test')",
         {"id": version_id, "agent_id": agent_id},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.deployments "
         "(id, agent_id, version_id, environment, status) "
         "VALUES (:id, :agent_id, :version_id, "
@@ -117,13 +94,13 @@ def _seed_deployment() -> tuple[uuid.UUID, uuid.UUID]:
 def _seed_redeployment(agent_id: uuid.UUID) -> uuid.UUID:
     version_id = uuid.uuid4()
     deployment_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agent_versions "
         "(id, agent_id, version_label, bundle_ref, created_by) "
         "VALUES (:id, :agent_id, 'v2', NULL, 'migration-test')",
         {"id": version_id, "agent_id": agent_id},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.deployments "
         "(id, agent_id, version_id, environment, status) "
         "VALUES (:id, :agent_id, :version_id, "
@@ -149,7 +126,7 @@ def _seed_publication(
 ) -> tuple[uuid.UUID, uuid.UUID]:
     approval_id = uuid.uuid4()
     publication_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.approvals "
         "(id, agent_id, conversation_id, author, summary, reply_kind, "
         "reply_channel, dedupe_key, status, purpose) VALUES "
@@ -164,7 +141,7 @@ def _seed_publication(
             "approval_status": "approved" if status != "pending" else "pending",
         },
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.publications "
         "(id, approval_id, deployment_id, workspace_conversation_id, "
         "repo_full_name, status, base_sha, "
@@ -207,7 +184,7 @@ def _seed_thread_workspace(
     deployment_id: uuid.UUID,
     conversation_id: str,
 ) -> None:
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.thread_workspaces "
         "(id, agent_id, selected_by_deployment_id, conversation_id, "
         "repo_full_name, selected_by) VALUES "
@@ -261,10 +238,10 @@ def test_publication_orm_metadata_requires_lineage_for_active_statuses() -> None
 
 
 def test_0041_contract_rejects_n_minus_one_active_write_but_keeps_terminal_history(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id, deployment_id = _seed_deployment()
     _, terminal_id = _seed_publication(
         agent_id=agent_id,
@@ -275,7 +252,7 @@ def test_0041_contract_rejects_n_minus_one_active_write_but_keeps_terminal_histo
 
     command.upgrade(config, "head")
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT status, lineage_id FROM curie.publications WHERE id = :id",
         {"id": terminal_id},
     ) == [{"status": "failed", "lineage_id": None}]
@@ -290,7 +267,7 @@ def test_0041_contract_rejects_n_minus_one_active_write_but_keeps_terminal_histo
             status="pending",
         )
     assert "publications_active_lineage_ck" in str(excinfo.value)
-    assert _sql(
+    assert sql_dicts(
         "SELECT p.id FROM curie.publications p JOIN curie.approvals a "
         "ON a.id = p.approval_id WHERE a.conversation_id = :conversation_id",
         {"conversation_id": "thread-post-contract-n-minus-one"},
@@ -298,10 +275,10 @@ def test_0041_contract_rejects_n_minus_one_active_write_but_keeps_terminal_histo
 
 
 def test_0041_collapses_duplicate_preupgrade_thread_publications(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id, deployment_id = _seed_deployment()
     redeployment_id = _seed_redeployment(agent_id)
 
@@ -349,7 +326,7 @@ def test_0041_collapses_duplicate_preupgrade_thread_publications(
 
     command.upgrade(config, "head")
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT p.id::text, p.lineage_id::text, p.revision_number, l.pr_number "
         "FROM curie.publications p LEFT JOIN curie.thread_publication_lineages l "
         "ON l.id = p.lineage_id WHERE p.id IN (:older, :newer) ORDER BY p.created_at",
@@ -369,7 +346,7 @@ def test_0041_collapses_duplicate_preupgrade_thread_publications(
         },
     ]
 
-    active_rows = _sql(
+    active_rows = sql_dicts(
         "SELECT p.id::text, p.status, p.lineage_id::text, p.revision_number, p.error, "
         "p.patch_bytes IS NULL AS patch_cleared, "
         "p.terminal_at IS NOT NULL AS terminal, a.status AS approval_status "
@@ -413,13 +390,13 @@ def test_0041_collapses_duplicate_preupgrade_thread_publications(
             "approval_status": "approved",
         },
     ]
-    assert _sql(
+    assert sql_dicts(
         "SELECT resolved_at IS NOT NULL AS resolved, resumed_at IS NOT NULL AS resumed "
         "FROM curie.approvals WHERE id = :id",
         {"id": older_active_approval_id},
     ) == [{"resolved": True, "resumed": True}]
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT conversation_id FROM curie.thread_publication_lineages "
         "ORDER BY conversation_id"
     ) == [
@@ -429,10 +406,10 @@ def test_0041_collapses_duplicate_preupgrade_thread_publications(
 
 
 def test_0041_never_infers_opaque_legacy_reply_id_is_already_scoped(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id, deployment_id = _seed_deployment()
     native_reply_id = "thread-x"
     scoped_lookalike_reply_id = _scoped_thread(native_reply_id)
@@ -463,7 +440,7 @@ def test_0041_never_infers_opaque_legacy_reply_id_is_already_scoped(
             _scoped_thread(scoped_lookalike_reply_id),
         ),
     }
-    rows = _sql(
+    rows = sql_dicts(
         "SELECT p.id::text, p.lineage_id::text, p.workspace_conversation_id, "
         "a.conversation_id AS reply_conversation_id, l.conversation_id "
         "FROM curie.publications p "
@@ -486,7 +463,7 @@ def test_0041_never_infers_opaque_legacy_reply_id_is_already_scoped(
             "conversation_id": canonical_id,
         }
 
-    _sql(
+    sql_dicts(
         "UPDATE curie.publications SET "
         "approval_card_delivery_dead_lettered_at = now(), "
         "resource_cleanup_completed_at = now() "
@@ -518,11 +495,11 @@ def test_0041_never_infers_opaque_legacy_reply_id_is_already_scoped(
 
 
 def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id, deployment_id = _seed_deployment()
     reply_thread = "1700000000.000100"
     scoped_thread = _scoped_thread(reply_thread)
@@ -541,7 +518,7 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
 
     command.upgrade(config, "head")
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT l.id::text AS lineage_id, l.conversation_id, "
         "p.workspace_conversation_id, "
         "a.conversation_id AS reply_conversation_id "
@@ -567,12 +544,12 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
     worker_headers = {
         "X-Curie-Worker-Token": get_settings().internal_worker_token,
     }
-    _sql(
+    sql_dicts(
         "UPDATE curie.approvals SET status = 'approved', resolved_at = now() "
         "WHERE id = :id",
         {"id": approval_id},
     )
-    _sql(
+    sql_dicts(
         "UPDATE curie.publications SET status = 'approved' WHERE id = :id",
         {"id": publication_id},
     )
@@ -586,13 +563,13 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
     # Settle the migrated revision without changing either identity. The result
     # outbox must append to canonical transcript history while still addressing
     # the adapter reply with its bare Slack thread timestamp.
-    _sql(
+    sql_dicts(
         "UPDATE curie.publications SET status = 'denied', patch_bytes = NULL, "
         "approval_card_delivery_dead_lettered_at = now(), terminal_at = now() "
         "WHERE id = :id",
         {"id": publication_id},
     )
-    _sql(
+    sql_dicts(
         "UPDATE curie.approvals SET status = 'denied', resolved_at = now() WHERE id = :id",
         {"id": approval_id},
     )
@@ -613,7 +590,7 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
     assert result is not None
     assert result.workspace_conversation_id == scoped_thread
     assert result.target.conversation_id == reply_thread
-    _sql(
+    sql_dicts(
         "UPDATE curie.publications SET outcome_history_ready_at = now(), "
         "lease_owner = NULL, lease_expires_at = NULL WHERE id = :id",
         {"id": publication_id},
@@ -652,7 +629,7 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
         )
         assert revision.status_code == 201, revision.text
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT p.lineage_id::text, p.revision_number, "
         "a.conversation_id AS reply_conversation_id "
         "FROM curie.publications p "
@@ -666,7 +643,7 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
             "reply_conversation_id": reply_thread,
         }
     ]
-    assert _sql(
+    assert sql_dicts(
         "SELECT count(*) AS count FROM curie.thread_publication_lineages "
         "WHERE agent_id = :agent_id AND repo_full_name = :repo",
         {"agent_id": agent_id, "repo": REPO},
@@ -674,10 +651,10 @@ def test_0041_scopes_migrated_lineage_but_keeps_reply_identity_bare(
 
 
 def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id, deployment_id = _seed_deployment()
     _, active_id = _seed_publication(
         agent_id=agent_id,
@@ -703,7 +680,7 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
     # This round trip owns 0041; later revisions have independent downgrade guards.
     command.upgrade(config, "0041")
 
-    active = _sql(
+    active = sql_dicts(
         "SELECT p.lineage_id::text, p.revision_number, p.expected_prior_head, "
         "l.agent_id::text, l.conversation_id, l.repo_full_name, l.base_sha, "
         "l.branch, l.pr_number, l.pr_url, l.head_sha, l.status, l.version, "
@@ -730,7 +707,7 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
         "latest_revision": 1,
     }
     uuid.UUID(active[0]["lineage_id"])
-    terminal = _sql(
+    terminal = sql_dicts(
         "SELECT p.lineage_id::text, p.revision_number, p.expected_prior_head, "
         "p.workspace_conversation_id, a.conversation_id AS reply_conversation_id, "
         "l.conversation_id, l.branch, l.pr_number, l.pr_url, l.head_sha, l.status "
@@ -756,7 +733,7 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
             "status": "open",
         }
     ]
-    assert _sql(
+    assert sql_dicts(
         "SELECT lineage_id, revision_number, expected_prior_head "
         "FROM curie.publications WHERE id = :id",
         {"id": unsafe_terminal_id},
@@ -767,12 +744,12 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
             "expected_prior_head": None,
         }
     ]
-    assert _sql("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
+    assert sql_dicts("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
         {"count": 2}
     ]
 
     with pytest.raises(IntegrityError):
-        _sql(
+        sql_dicts(
             "INSERT INTO curie.thread_publication_lineages "
             "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch, "
             "status, version, latest_revision) VALUES "
@@ -789,18 +766,18 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
         )
 
     command.downgrade(config, BELOW)
-    assert _sql(
+    assert sql_dicts(
         "SELECT table_name FROM information_schema.tables WHERE "
         "table_schema = 'curie' AND table_name = 'thread_publication_lineages'"
     ) == []
-    assert _sql(
+    assert sql_dicts(
         "SELECT column_name FROM information_schema.columns WHERE "
         "table_schema = 'curie' AND table_name = 'publications' AND "
         "column_name IN ('lineage_id', 'revision_number', 'expected_prior_head')"
     ) == []
 
     command.upgrade(config, "0041")
-    assert _sql(
+    assert sql_dicts(
         "SELECT l.branch, p.revision_number FROM curie.publications p JOIN "
         "curie.thread_publication_lineages l ON l.id = p.lineage_id "
         "WHERE p.id = :id",

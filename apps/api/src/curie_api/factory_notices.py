@@ -101,6 +101,14 @@ _CAUSE_TEXT = {
         "Inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
+    "unclassified": (
+        "the run failed and Curie could not name a more specific cause. "
+        "Read the worker log for the provider message, then retry or hand it to a person."
+    ),
+    "max_turns": (
+        "the run used its whole turn budget. Raise worker.workItemMaxTurns "
+        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns, then retry."
+    ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
         "the requested approval could not be created. Check the publication "
@@ -139,6 +147,34 @@ _CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
+# Wire classification a text-only consumer reads off the status comment (#3401).
+# Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
+# no entry stay unlabeled rather than inventing a class.
+# Failed runs that still need a person, including the classes that used to
+# collapse into runner_escalated (#3401). The status card reads this set.
+NEEDS_HUMAN_CAUSES = frozenset(
+    {"runner_escalated", "unclassified", "max_turns", "ci_failed"}
+)
+
+
+def needs_human(status: str, terminal: str | None) -> bool:
+    """Whether a failed run should show the needs-human card state."""
+
+    return status == "failed" and terminal in NEEDS_HUMAN_CAUSES
+
+
+_FAILURE_CLASS_BY_CAUSE = {
+    "unclassified": "unclassified",
+    "max_turns": "max-turns",
+    "history_capacity": "history-persistence-error",
+    "model_credit_exhausted": "model-credit-exhausted",
+    "model_credential_rejected": "model-credential-rejected",
+    "model_rate_limited": "rate-limit",
+    "model_error": "server-error",
+    "budget_exceeded": "budget-exceeded",
+    "runner_timeout": "runner-timeout",
+    "workspace_error": "workspace-error",
+}
 _BACKTICK_RUN = re.compile(r"`+")
 
 
@@ -165,6 +201,7 @@ STATE_LABELS = (
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
+    "queued": "curie-factory:queued",
     "waiting": "curie-factory:queued",
     "running": "curie-factory:running",
     "cancellation_requested": "curie-factory:running",
@@ -223,6 +260,12 @@ def result_section(
             # tools/factory-e2e reads the cause from this line.
             f"Cause: {cause}\n"
         )
+    elif cause == "lineage_closed":
+        text = (
+            "Could not start this revision because its pull request closed "
+            "while the earlier run was finishing.\n"
+            f"Cause: {cause}\n"
+        )
     else:
         text = f"Could not complete: {cause_text(cause)}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
@@ -231,6 +274,9 @@ def result_section(
             label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
+        failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
+        if failure_class is not None:
+            text += f"Failure class: {failure_class}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return text
@@ -280,6 +326,7 @@ def status_body(
     phase_view: PhaseView | None,
     result: str | None,
     paused_for_upgrade: bool = False,
+    waiting_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -299,6 +346,8 @@ def status_body(
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)
     parts.append(f"Status: {pill_label}")
+    if waiting_line is not None:
+        parts.append(waiting_line)
     if paused_for_upgrade and pill_label == "QUEUED":
         parts.append(_PAUSED_FOR_UPGRADE_LINE)
     if result is not None:
@@ -337,9 +386,18 @@ async def sync_status_comments(
     """
 
     later = aliased(ExecutionRequest)
-    is_latest = ~exists().where(
-        later.work_item_id == ExecutionRequest.work_item_id,
-        later.sequence > ExecutionRequest.sequence,
+    is_latest = and_(
+        ExecutionRequest.status != "queued",
+        or_(
+            ExecutionRequest.status != "cancelled",
+            ExecutionRequest.wait_deadline.is_not(None),
+        ),
+        ~exists().where(
+            later.work_item_id == ExecutionRequest.work_item_id,
+            later.sequence > ExecutionRequest.sequence,
+            later.status != "queued",
+            or_(later.status != "cancelled", later.wait_deadline.is_not(None)),
+        ),
     )
     label_due = and_(
         is_latest,
@@ -587,6 +645,21 @@ async def _render(
         )
         view = phase_view(row.declaration, reports, request.status, cause)
     pill_label, _color, _live = pill_for(request.status, publishing)
+    pending_count = await session.scalar(
+        select(func.count(ExecutionRequest.id)).where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status == "queued",
+        )
+    )
+    waiting_line: str | None = None
+    if request.status == "queued":
+        waiting_line = (
+            "This revision is waiting on the current run. "
+            "It will start when that run finishes."
+        )
+    elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
+        word = "revision" if pending_count == 1 else "revisions"
+        waiting_line = f"{pending_count} {word} waiting on this run."
     base = settings.github_factory_card_base_url
     return status_body(
         request_id=row.execution_request_id,
@@ -595,6 +668,7 @@ async def _render(
         phase_view=view,
         result=result,
         paused_for_upgrade=paused_for_upgrade,
+        waiting_line=waiting_line,
     )
 
 

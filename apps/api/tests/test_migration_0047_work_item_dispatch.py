@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0046"
 REVISION = "0047"
 REPO = "acme-corp/acme-bot"
@@ -53,28 +47,9 @@ DISPATCH_COLUMNS = {
 }
 
 
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                return [dict(row) for row in result.mappings().all()] if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
-
-
 def _rejects(statement: str, params: dict[str, Any]) -> None:
     with pytest.raises(DBAPIError) as excinfo:
-        _sql(statement, params)
+        sql_dicts(statement, params)
     assert getattr(excinfo.value.orig, "sqlstate", None) in {
         "23502",
         "23503",
@@ -86,7 +61,7 @@ def _rejects(statement: str, params: dict[str, Any]) -> None:
 
 def _seed_agent() -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"work-item-dispatch-{agent_id.hex[:8]}"},
     )
@@ -110,7 +85,7 @@ def _insert_work_item(agent_id: uuid.UUID, **overrides: Any) -> uuid.UUID:
         "updated_at": STAMP,
     }
     values.update(overrides)
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.work_items "
         "(id, github_repository_id, github_issue_number, github_installation_id, "
         "agent_id, repo_full_name, conversation_id, publication_lineage_id, "
@@ -174,7 +149,7 @@ _INSERT_REQUEST_SQL = (
 
 def _insert_request(work_item_id: uuid.UUID, **overrides: Any) -> uuid.UUID:
     values = _request_values(work_item_id, **overrides)
-    _sql(_INSERT_REQUEST_SQL, values)
+    sql_dicts(_INSERT_REQUEST_SQL, values)
     return values["id"]
 
 
@@ -194,7 +169,7 @@ def _snapshot() -> dict[str, str]:
 
 
 def _constraint_rows(table_name: str) -> list[dict[str, Any]]:
-    return _sql(
+    return sql_dicts(
         "SELECT c.conname AS name, pg_get_constraintdef(c.oid) AS definition "
         "FROM pg_constraint c "
         "JOIN pg_class r ON r.oid = c.conrelid "
@@ -206,7 +181,7 @@ def _constraint_rows(table_name: str) -> list[dict[str, Any]]:
 
 
 def _function_body() -> str:
-    rows = _sql(
+    rows = sql_dicts(
         "SELECT p.prosrc AS function_body "
         "FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -218,13 +193,13 @@ def _function_body() -> str:
 
 
 def test_0047_adds_dispatch_columns_checks_indexes_and_trigger_rules(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
     before = {
         row["column_name"]
-        for row in _sql(
+        for row in sql_dicts(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = 'curie' AND table_name = 'execution_requests'"
         )
@@ -235,7 +210,7 @@ def test_0047_adds_dispatch_columns_checks_indexes_and_trigger_rules(
 
     columns = {
         row["column_name"]
-        for row in _sql(
+        for row in sql_dicts(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = 'curie' AND table_name = 'execution_requests'"
         )
@@ -270,7 +245,7 @@ def test_0047_adds_dispatch_columns_checks_indexes_and_trigger_rules(
 
     indexes = [
         row["indexdef"].lower()
-        for row in _sql(
+        for row in sql_dicts(
             "SELECT indexdef FROM pg_indexes WHERE schemaname = 'curie' "
             "AND tablename = 'execution_requests'"
         )
@@ -310,9 +285,9 @@ def test_0047_adds_dispatch_columns_checks_indexes_and_trigger_rules(
 
 
 def test_0047_rejects_invalid_attempts_generations_snapshots_and_causes(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     work_item_id = _insert_work_item(_seed_agent())
 
     _reject_request(work_item_id, execution_attempts=1, started_at=None)
@@ -366,7 +341,7 @@ def test_0047_rejects_invalid_attempts_generations_snapshots_and_causes(
         "UPDATE curie.execution_requests SET objective = :objective WHERE id = :id",
         {"id": waiting_id, "objective": "rewritten objective"},
     )
-    _sql(
+    sql_dicts(
         "UPDATE curie.execution_requests SET dispatch_generation = 2 WHERE id = :id",
         {"id": waiting_id},
     )
@@ -374,7 +349,7 @@ def test_0047_rejects_invalid_attempts_generations_snapshots_and_causes(
         "UPDATE curie.execution_requests SET dispatch_generation = 1 WHERE id = :id",
         {"id": waiting_id},
     )
-    _sql(
+    sql_dicts(
         "UPDATE curie.execution_requests SET dispatch_epoch = 3, runtime_epoch = 2 "
         "WHERE id = :id",
         {"id": waiting_id},
@@ -411,10 +386,10 @@ def test_0047_rejects_invalid_attempts_generations_snapshots_and_causes(
 
 
 def test_0047_downgrade_refuses_owner_lost_and_round_trips_when_clean(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, REVISION)
+    config = alembic_config()
+    isolated_migration_db.at(REVISION)
     work_item_id = _insert_work_item(_seed_agent())
     _insert_request(
         work_item_id,
@@ -431,28 +406,28 @@ def test_0047_downgrade_refuses_owner_lost_and_round_trips_when_clean(
         command.downgrade(config, BELOW)
     assert "owner_lost" in str(excinfo.value)
 
-    _sql("DELETE FROM curie.execution_requests")
+    sql_dicts("DELETE FROM curie.execution_requests")
     waiting_id = _insert_request(work_item_id)
     command.downgrade(config, BELOW)
-    assert _sql(
+    assert sql_dicts(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'execution_requests' "
         "AND column_name = 'dispatch_generation'"
     ) == []
-    assert _sql(
+    assert sql_dicts(
         "SELECT id::text FROM curie.execution_requests WHERE id = :id",
         {"id": waiting_id},
     ) == [{"id": str(waiting_id)}]
 
     command.upgrade(config, REVISION)
-    assert _sql(
+    assert sql_dicts(
         "SELECT dispatch_generation, execution_attempts "
         "FROM curie.execution_requests WHERE id = :id",
         {"id": waiting_id},
     ) == [{"dispatch_generation": 1, "execution_attempts": 0}]
     indexes = [
         row["indexname"]
-        for row in _sql(
+        for row in sql_dicts(
             "SELECT indexname FROM pg_indexes WHERE schemaname = 'curie' "
             "AND tablename = 'execution_requests'"
         )

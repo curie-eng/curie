@@ -7,45 +7,23 @@ The cron proof does not set ``slack_no_edit_streaming``; that flag stays false.
 from __future__ import annotations
 
 import asyncio
-import uuid
+import sys
+from pathlib import Path
 
 from aci_protocol import (
     ErrorEvent,
     Final,
-    HookRunRef,
-    QueuedTurn,
-    ReplyHandle,
     SessionStatus,
     TextDelta,
     TurnSource,
 )
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+
 DONE = SessionStatus.DONE
-
-
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-1",
-    event_id: str | None = None,
-    placeholder: str | None = "p-1",
-    source: TurnSource = TurnSource.SLACK,
-    hook_run: HookRunRef | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind="slack",
-            channel="C1",
-            placeholder=placeholder,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=source,
-        hook_run=hook_run,
-    )
 
 
 def test_targeted_cron_turn_posts_the_final_reply_once(

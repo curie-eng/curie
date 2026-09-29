@@ -7,14 +7,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 import time
 import uuid
-from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 import redis.exceptions
-from aci_protocol import Event, Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta, TurnSource
+from aci_protocol import Event, Final, QueuedTurn, SessionStatus, TextDelta, TurnSource
 from curie_dispatcher.queue import to_stream_fields
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
@@ -38,6 +39,12 @@ from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
 from redis.asyncio import Redis as AsyncRedis
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 DONE = SessionStatus.DONE
 
@@ -183,35 +190,8 @@ class _RenewalProbeStore:
         await self._delegate.release_reclaim(**kwargs)
 
 
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-1",
-    event_id: str | None = None,
-    source: TurnSource = TurnSource.SLACK,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=source,
-    )
-
-
 def _thread_key(thread: str) -> str:
     return f"slack:C1:{thread}"
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 async def _wait_until_turn_active_or_consumer_failed(
@@ -1318,8 +1298,22 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(make_harnes
                 [wake_id],
             )
             assert reclaimed == [(wake_id, wake_fields)]
+            # The cancelled owner can still look busy to the runner status
+            # read. That must not park the admitted turn again and edit the
+            # thread back to the queued notice.
+            h.runner.turn_active = True
             await recovery._sem.acquire()
             await recovery._handle(wake_id, wake_fields)
+            assert h.sink.last_text == "recovered answer"
+            assert [text for _, _, text in h.sink.updates].count(
+                "The agent is busy. Your request is queued and will start when space opens."
+            ) == 1
+            # A queued edit that loses the race with this answer must not
+            # replace it. The notice path is the same one the first consumer
+            # used; after the answer it has to no-op.
+            before = list(h.sink.updates)
+            await h.kernel.notify_capacity_queued(event)
+            assert h.sink.updates == before
             assert h.sink.last_text == "recovered answer"
             done = await _wait_capacity_state(recovery, event.event_id, "done")
             assert done.cause == ""

@@ -405,8 +405,13 @@ the timeout branch instead of staying pending.
 - **Roll the API before the dispatcher.** The identity contract intentionally has no
   assertion-compatible dual mode. During an upgrade, bring up the verifier first, then
   the attester; the reverse order is rejected rather than reopening asserted identity.
-- **Console resolution requires HTTPS.** Its session cookie is `Secure`, `HttpOnly`, and
-  same-site. A browser on a plain-HTTP endpoint will not retain the credential.
+- **Console resolution requires HTTPS.** Its session cookie is `__Host-curie_console_session`:
+  `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, and no `Domain`. A browser on a plain-HTTP
+  endpoint will not retain the credential. `SameSite` does not stop another origin on the same
+  site, so a cookie-authenticated resolve or recover also requires a matching `Origin` (or
+  `Referer` when `Origin` is absent). The host must match; the scheme may differ because the
+  UI proxy speaks HTTP to the API. Sessions minted under the old name `curie_console_session`
+  stop working on upgrade. The TTL is 12 hours; exchange a new login code.
 
 ## Common failures
 
@@ -415,7 +420,8 @@ the timeout branch instead of staying pending.
 | `401 missing or invalid approval principal` | A platform API key alone cannot resolve. For an explicit-user route, mint an operator principal, export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and retry; otherwise use the authenticated Slack card or a live Console session. |
 | `403 operator approval principals can resolve only routes bound to an explicit user list` | Terminal credentials carry no Slack membership evidence. Add the subject to an explicit `approvers.users` binding, or resolve through the authenticated card. |
 | `403 console approval principals can resolve only routes bound to an explicit user list or verifiable user group` | The Console session carries no channel evidence. Use an explicit `approvers.users` binding, a group the API can verify, or the authenticated card. |
-| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. |
+| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. After an upgrade that renames the cookie to `__Host-curie_console_session`, an older session also returns 401 until the operator exchanges a new login code. |
+| `403 console session origin rejected` | The console cookie was the only principal on an unsafe call, and `Origin` (or `Referer` if `Origin` was absent) was missing or named a different host. Retry from the console page itself. Header principals are not checked. |
 | `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
@@ -467,6 +473,77 @@ for attribution. The key is recorded in the recovery's audit row. Replaying the
 same key returns the outcome that already happened and changes nothing; a key
 already recorded for another approval, or a record settled some other way, is a
 `409`. Cancelling an owed resume is not part of this path yet (#2829).
+
+### Bounded operator procedure
+
+Use recovery for one identified approval, not as a standing alternative to the
+ordinary approver path. The positional agent below may be any existing agent:
+the report and recovery are installation-wide, and the approval id is the
+mutation's scope.
+
+1. While recovery is still disabled, record the pending row with the read-only
+   report and verify its id, route, and reply/card facts:
+
+   ```sh
+   AGENT=acme-bot
+   APPROVAL_ID=00000000-0000-4000-8000-000000000001
+   RECOVERY_KEY="rk-$(uuidgen)"
+
+   curie --json cluster approvals "$AGENT" --report-identity \
+     > approval-recovery-report.json
+   jq -e --arg id "$APPROVAL_ID" \
+     '.identity_report.approvals[] | select(.id == $id)' \
+     approval-recovery-report.json
+   ```
+
+2. Through the installation's normal values and upgrade workflow, set only
+   `api.approvalRecovery.enabled: true` and wait for the API rollout. Keep this
+   window attended: every platform-key holder has the installation-wide reject
+   grant until it is disabled again. Prepare the exact disable rollout before
+   enabling, and perform it even if principal minting or recovery fails, returns
+   a conflict, or is interrupted.
+
+3. Mint an attributed operator principal without putting its returned token in
+   shell history, then recover exactly the inspected id. The disposition is
+   always `rejected`; this command cannot approve on anyone's behalf.
+
+   ```sh
+   export CURIE_APPROVAL_PRINCIPAL_TOKEN="$(
+     curie cluster approvals "$AGENT" \
+       --mint-operator-principal operator@example.com
+   )"
+
+   curie cluster approvals "$AGENT" \
+     --recover "$APPROVAL_ID" \
+     --reason "Retire a stale approval after verified operator review" \
+     --recovery-key "$RECOVERY_KEY"
+   ```
+
+   If the client loses the response, retry the exact command with the same
+   `RECOVERY_KEY`. Never invent a new key for that retry: the original key is
+   what turns it into a read of the already-recorded outcome rather than a new
+   administrative act.
+
+4. Immediately set `api.approvalRecovery.enabled: false` through the same
+   deployment workflow, wait for the API rollout, and remove the principal from
+   the shell:
+
+   ```sh
+   unset CURIE_APPROVAL_PRINCIPAL_TOKEN
+   ```
+
+5. Read `GET /approvals/$APPROVAL_ID/audit` through the normal authenticated
+   operator API path and retain the result with the incident. Confirm one row
+   with `action=administratively_recovered`,
+   `authorizer=approval_recovery`, the operator subject, the reason, and the
+   exact recovery key.
+
+Recovery wakes the suspended session through the ordinary runs stream, whose
+worker also attempts to replace a remembered Slack card with its buttonless
+rejected form. The API row is the authority: if that best-effort Slack edit
+cannot find or update an old card, its buttons can no longer resolve the
+already-rejected approval. Manually delete or annotate the stale Slack message
+so it does not mislead people.
 
 A report entry stating `reply_identity_unreconstructable` means neither the row
 nor any binding says how that reply would be authenticated. The report does not

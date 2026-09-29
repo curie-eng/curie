@@ -123,6 +123,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # exactly like CURIE_BOOTING_TEXT above. Read from the worker's env by
         # WorkerConfig; never a sandbox boot key.
         "CURIE_TURN_NOT_STARTED_TEXT",
+        # The install's receipt mode (ADR-0180), read from the WORKER's env by
+        # WorkerConfig and consumed where the kernel assembles the final reply.
+        # It decides what the person is shown, never what a sandbox boots with.
+        "CURIE_TURN_RECEIPT",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -219,6 +223,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # IS a declared boot key. The key itself never enters a sandbox: holding
         # it, agent-authored code could mint a token naming any agent.
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
+        # The connector caller proxy's own config (ADR-0168 decision 7), read
+        # by curie_connector_proxy.server from env the connector render writes
+        # into the proxy container. It runs in a connector pod, never in a
+        # sandbox, and nothing here reaches a boot env.
+        "CURIE_CALLER_PROXY_PORT",
+        "CURIE_CALLER_PROXY_UPSTREAM_PORT",
+        "CURIE_CALLER_PROXY_PUBLIC_KEYS",
+        "CURIE_CALLER_PROXY_ADMITS",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",

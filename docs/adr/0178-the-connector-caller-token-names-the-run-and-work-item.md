@@ -15,13 +15,13 @@ decisions 3 and 4.
 
 ## Context
 
-ADR-0168 decision 7 gave every hosted connector an admission list. The first
-release (#3273) has the worker sign a caller token per sandbox boot in
+ADR-0168 decision 7 gave every hosted connector an admission list. #3273 has
+the worker sign a caller token per sandbox boot in
 `apps/worker/src/curie_worker/caller_token.py`, frozen in
 `tests/vectors/connector-caller-token.json`. The token is
 `cct.<payload>.<signature>`, an Ed25519 signature over the compact JSON
-`{agent, exp}`. The runner presents it in `X-Curie-Caller`. The second release
-(#3308, open) puts a caller proxy in front of each hosted connector. The proxy
+`{agent, exp}`. The runner presents it in `X-Curie-Caller`. #3308 (open), in
+the same release, puts a caller proxy in front of each hosted connector. The proxy
 checks the signature, the expiry and the agent claim against the rendered
 `admits:` list, strips `X-Curie-Caller`, and forwards the request unchanged.
 
@@ -116,8 +116,11 @@ still a valid token with the same meaning.
   before any worker mints it.
 
 Order of rollout: the proxy that understands the new claims ships in a tagged
-release before any worker mints them, the same order #3308 uses for the token
-itself. A worker rolled back past the minting change mints tokens without the
+release before any worker mints them, because a proxy from before it refuses a
+token carrying a key it does not know. The token itself did not need that
+order: #3273 and #3308 ship in one release, and a runner booted without a token
+is refused only until its thread's next turn replaces it. A worker rolled back
+past the minting change mints tokens without the
 claims, and run scoped tools refuse them by decision 2 rather than acting on
 the wrong run.
 

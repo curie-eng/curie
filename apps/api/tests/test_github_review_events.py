@@ -1011,7 +1011,7 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
         "SELECT c.address, c.endpoint, c.adapter, l.binding_generation = c.generation AS current "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id"
-    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": None, "current": True}]
+    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": "default", "current": True}]
     response = post_review(client, truth)
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "feedback_queued"

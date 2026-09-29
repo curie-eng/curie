@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,9 +26,6 @@ from aci_protocol import (
     Attachment,
     ErrorEvent,
     Final,
-    HookRunRef,
-    QueuedTurn,
-    ReplyHandle,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -55,6 +54,9 @@ from curie_worker.workspace import (
     WorkspaceSelectionRefused,
 )
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from queue_fixtures import qevent, wait_until  # noqa: E402
+
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
 FAIL = SessionStatus.CLASSIFIED_FAILURE
@@ -72,37 +74,6 @@ _WORKSPACES_OFF_REFUSAL = (
     "agentSandbox.runner.workspace.enabled in the chart values "
     "(CURIE_WORKSPACE_ENABLED on the worker)."
 )
-
-
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-1",
-    event_id: str | None = None,
-    placeholder: str | None = "p-1",
-    endpoint: str | None = None,
-    adapter: str | None = None,
-    source: TurnSource = TurnSource.SLACK,
-    attachments: Sequence[Attachment] = (),
-    hook_run: HookRunRef | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind="slack",
-            channel="C1",
-            placeholder=placeholder,
-            endpoint=endpoint,
-            adapter=adapter,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=source,
-        attachments=list(attachments),
-        hook_run=hook_run,
-    )
 
 
 def _thread_key(thread: str) -> str:
@@ -159,9 +130,7 @@ async def _safe_pressure_candidate(h: Any, thread: str) -> SandboxHandle:
         h.substrate.claim,
         thread_key,
         env={
-            "CURIE_HISTORY_REF": (
-                f"https://api.example.com/state/transcript/{thread_key}"
-            ),
+            "CURIE_HISTORY_REF": (f"https://api.example.com/state/transcript/{thread_key}"),
             "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
         },
     )
@@ -218,15 +187,6 @@ def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return outcomes
 
 
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
-
-
 def _spy_next_turn_release(kernel: Any) -> dict[str, int]:
     calls = {"n": 0}
     real_start_turn = kernel._runner.start_turn
@@ -254,7 +214,7 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
                 TextDelta(text="world"),
                 Final(text="Hello world", status=DONE),
             ]
-            ev = _qevent("hi")
+            ev = qevent("hi")
             await h.kernel.process_event(ev)
 
             assert h.runner.opened == ["hi"]
@@ -270,7 +230,7 @@ def test_post_final_stall_does_not_reclassify_or_retry_success(make_harness) -> 
             hold = asyncio.Event()
             h.runner.default_script = [Final(text="answer", status=DONE)]
             h.runner.hold = hold
-            event = _qevent("hi")
+            event = qevent("hi")
             try:
                 await asyncio.wait_for(h.kernel.process_event(event), timeout=2.0)
                 assert h.runner.opened == ["hi"]
@@ -306,7 +266,7 @@ def test_cancellation_while_route_lock_exits_releases_open_runner_response(
             lock = BlockingExitLock(h.kernel._lock)
             h.kernel._lock = lock  # type: ignore[assignment]
             release_calls = _spy_next_turn_release(h.kernel)
-            task = asyncio.create_task(h.kernel.process_event(_qevent("hi", thread="tCancel")))
+            task = asyncio.create_task(h.kernel.process_event(qevent("hi", thread="tCancel")))
             try:
                 await asyncio.wait_for(lock.exit_started.wait(), timeout=1.0)
                 task.cancel()
@@ -318,7 +278,7 @@ def test_cancellation_while_route_lock_exits_releases_open_runner_response(
                 runner_hold.set()
                 if not task.done():
                     task.cancel()
-                await _wait_until(lambda: not h.runner.turn_active)
+                await wait_until(lambda: not h.runner.turn_active)
 
     asyncio.run(go())
 
@@ -350,7 +310,7 @@ def test_cancellation_during_registered_kill_recheck_releases_runner_response(
             killswitch = BlockingSecondKillCheck()
             h.kernel.attach_killswitch(killswitch)  # type: ignore[arg-type]
             release_calls = _spy_next_turn_release(h.kernel)
-            task = asyncio.create_task(h.kernel.process_event(_qevent("hi", thread="tRegistered")))
+            task = asyncio.create_task(h.kernel.process_event(qevent("hi", thread="tRegistered")))
             try:
                 await asyncio.wait_for(killswitch.entered.wait(), timeout=1.0)
                 task.cancel()
@@ -362,7 +322,7 @@ def test_cancellation_during_registered_kill_recheck_releases_runner_response(
                 runner_hold.set()
                 if not task.done():
                     task.cancel()
-                await _wait_until(lambda: not h.runner.turn_active)
+                await wait_until(lambda: not h.runner.turn_active)
 
     asyncio.run(go())
 
@@ -389,7 +349,7 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
             release_calls = _spy_next_turn_release(h.kernel)
             task = asyncio.create_task(
                 h.kernel.process_event(
-                    _qevent(
+                    qevent(
                         "digest",
                         thread="tDeferred",
                         placeholder=None,
@@ -408,7 +368,7 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
                 runner_hold.set()
                 if not task.done():
                     task.cancel()
-                await _wait_until(lambda: not h.runner.turn_active)
+                await wait_until(lambda: not h.runner.turn_active)
 
     asyncio.run(go())
 
@@ -460,6 +420,7 @@ def test_disabled_deployment_flag_still_claims_selected_workspace(
             workspace_enabled=False,
         )
         async with make_harness(binding=binding) as h:
+
             class WorkspaceProbe:
                 selections: list[dict[str, object]] = []
                 claims: list[dict[str, object]] = []
@@ -488,7 +449,7 @@ def test_disabled_deployment_flag_still_claims_selected_workspace(
             h.runner.default_script = [Final(text="changed", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Change https://github.com/acme-corp/acme-bot",
                     thread="tBuiltInWorkspace",
                 )
@@ -505,9 +466,7 @@ def test_disabled_deployment_flag_still_claims_selected_workspace(
             assert len(probe.claims) == 1
             assert probe.claims[0]["deployment_id"] == deployment_id
             assert probe.claims[0]["thread_key"] == _thread_key("tBuiltInWorkspace")
-            assert h.runner.opened == [
-                "Change https://github.com/acme-corp/acme-bot"
-            ]
+            assert h.runner.opened == ["Change https://github.com/acme-corp/acme-bot"]
 
     asyncio.run(go())
 
@@ -521,6 +480,7 @@ def test_no_repository_selection_runs_on_a_generic_claim(make_harness) -> None:
             workspace_enabled=False,
         )
         async with make_harness(binding=binding) as h:
+
             class WorkspaceProbe:
                 selections: list[dict[str, object]] = []
 
@@ -529,17 +489,13 @@ def test_no_repository_selection_runs_on_a_generic_claim(make_harness) -> None:
                     return None
 
                 def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
-                    raise AssertionError(
-                        "null selection must not prepare or claim a workspace"
-                    )
+                    raise AssertionError("null selection must not prepare or claim a workspace")
 
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
             h.runner.default_script = [Final(text="triaged", status=DONE)]
 
-            await h.kernel.process_event(
-                _qevent("Triage this alert", thread="tGenericCoding")
-            )
+            await h.kernel.process_event(qevent("Triage this alert", thread="tGenericCoding"))
 
             assert probe.selections == [
                 {
@@ -614,13 +570,11 @@ def test_repository_url_turn_announces_the_inferred_repository(make_harness) -> 
             h.kernel._workspace = probe  # type: ignore[assignment]
             h.runner.default_script = [Final(text="changed", status=DONE)]
 
-            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tAnnounce"))
+            await h.kernel.process_event(qevent(_REPO_MESSAGE, thread="tAnnounce"))
 
             # The model input is the message verbatim; the line is platform text.
             assert h.runner.opened == [_REPO_MESSAGE]
-            assert [s["repo_full_name"] for s in probe.selections] == [
-                "acme-corp/acme-bot"
-            ]
+            assert [s["repo_full_name"] for s in probe.selections] == ["acme-corp/acme-bot"]
             assert len(probe.claims) == 1
             assert h.sink.last_text == f"changed\n\n{_ANNOUNCEMENT}"
 
@@ -637,12 +591,10 @@ def test_repository_slug_turn_announces_the_inferred_repository(make_harness) ->
             h.kernel._workspace = probe  # type: ignore[assignment]
             h.runner.default_script = [Final(text="changed", status=DONE)]
 
-            await h.kernel.process_event(_qevent(_BARE_REPO_MESSAGE, thread="tAnnounceBare"))
+            await h.kernel.process_event(qevent(_BARE_REPO_MESSAGE, thread="tAnnounceBare"))
 
             assert h.runner.opened == [_BARE_REPO_MESSAGE]
-            assert [s["repo_full_name"] for s in probe.selections] == [
-                "acme-corp/acme-bot"
-            ]
+            assert [s["repo_full_name"] for s in probe.selections] == ["acme-corp/acme-bot"]
             assert len(probe.claims) == 1
             assert h.sink.last_text == f"changed\n\n{_ANNOUNCEMENT}"
 
@@ -662,10 +614,10 @@ def test_same_url_on_a_route_that_carries_the_workspace_is_not_announced(
             h.runner.default_script = [Final(text="changed", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-first")
+                qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-first")
             )
             await h.kernel.process_event(
-                _qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-second")
+                qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-second")
             )
 
             assert h.runner.opened == [_REPO_MESSAGE, _REPO_MESSAGE]
@@ -690,17 +642,17 @@ def test_turns_without_a_repository_fact_are_not_announced(make_harness) -> None
 
             # (a) A sticky thread's follow-up names no repository.
             await h.kernel.process_event(
-                _qevent(_REPO_MESSAGE, thread="tSticky", placeholder="p-attach")
+                qevent(_REPO_MESSAGE, thread="tSticky", placeholder="p-attach")
             )
             await h.kernel.process_event(
-                _qevent("continue", thread="tSticky", placeholder="p-continue")
+                qevent("continue", thread="tSticky", placeholder="p-continue")
             )
             assert _updates_on(h, "p-continue")[-1] == "changed"
 
             # (b) A fresh generic thread with no selection.
             h.runner.default_script = [Final(text="triaged", status=DONE)]
             await h.kernel.process_event(
-                _qevent("Triage this alert", thread="tGeneric", placeholder="p-generic")
+                qevent("Triage this alert", thread="tGeneric", placeholder="p-generic")
             )
             assert _updates_on(h, "p-generic")[-1] == "triaged"
 
@@ -709,12 +661,10 @@ def test_turns_without_a_repository_fact_are_not_announced(make_harness) -> None
             h.runner.default_script = [Final(text="looked", status=DONE)]
             deep_link = "Look at https://github.com/acme-corp/acme-bot/pull/7"
             await h.kernel.process_event(
-                _qevent(deep_link, thread="tDeepLink", placeholder="p-deep")
+                qevent(deep_link, thread="tDeepLink", placeholder="p-deep")
             )
             deep_selections = [
-                s
-                for s in probe.selections
-                if s["thread_key"] == _thread_key("tDeepLink")
+                s for s in probe.selections if s["thread_key"] == _thread_key("tDeepLink")
             ]
             assert [s["repo_full_name"] for s in deep_selections] == [None]
             assert _updates_on(h, "p-deep")[-1] == "looked"
@@ -739,6 +689,7 @@ def test_late_workspace_handoff_announces_once(make_harness) -> None:
                 },
             )
         ) as h:
+
             class WorkspaceProbe:
                 selected: str | None = None
                 handoffs = 0
@@ -775,17 +726,17 @@ def test_late_workspace_handoff_announces_once(make_harness) -> None:
             h.runner.default_script = [Final(text="answered", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent("hello", thread="tLateAnnounce", placeholder="p-hello")
+                qevent("hello", thread="tLateAnnounce", placeholder="p-hello")
             )
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Use https://github.com/acme-corp/acme-bot",
                     thread="tLateAnnounce",
                     placeholder="p-url",
                 )
             )
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "continue in the repository",
                     thread="tLateAnnounce",
                     placeholder="p-continue",
@@ -822,7 +773,7 @@ def test_announcement_survives_a_retry_after_attach(make_harness) -> None:
                 [Final(text="done", status=DONE)],
             ]
 
-            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tRetryAttach"))
+            await h.kernel.process_event(qevent(_REPO_MESSAGE, thread="tRetryAttach"))
 
             assert h.runner.opened == [_REPO_MESSAGE, _REPO_MESSAGE]
             assert h.sink.last_text == f"done\n\n{_ANNOUNCEMENT}"
@@ -860,7 +811,7 @@ def test_announcement_survives_a_startup_failure_after_attach(
 
                 h.kernel._runner.steer = flaky_steer  # type: ignore[method-assign]
 
-            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tStartRetry"))
+            await h.kernel.process_event(qevent(_REPO_MESSAGE, thread="tStartRetry"))
 
             # Each attempt selects; only the first claims, and the retry adopts
             # the route that claim attached.
@@ -870,9 +821,7 @@ def test_announcement_survives_a_startup_failure_after_attach(
             ]
             assert len(probe.claims) == 1
             expected_opened = (
-                [_REPO_MESSAGE, _REPO_MESSAGE]
-                if failing_call == "start_turn"
-                else [_REPO_MESSAGE]
+                [_REPO_MESSAGE, _REPO_MESSAGE] if failing_call == "start_turn" else [_REPO_MESSAGE]
             )
             # The model input is the message verbatim on every opened turn.
             assert h.runner.opened == expected_opened
@@ -906,12 +855,10 @@ def test_canned_greeting_with_a_url_is_not_announced(make_harness) -> None:
             h.kernel._workspace = probe  # type: ignore[assignment]
 
             await h.kernel.process_event(
-                _qevent("hi https://github.com/acme-corp/acme-bot", thread="tGreetUrl")
+                qevent("hi https://github.com/acme-corp/acme-bot", thread="tGreetUrl")
             )
 
-            assert [s["repo_full_name"] for s in probe.selections] == [
-                "acme-corp/acme-bot"
-            ]
+            assert [s["repo_full_name"] for s in probe.selections] == ["acme-corp/acme-bot"]
             assert h.sink.last_text == "Hello from the greeting pack."
             assert h.runner.opened == []
 
@@ -932,11 +879,9 @@ def test_no_edit_streaming_final_carries_the_announcement(make_harness) -> None:
                 Final(text="changed", status=DONE),
             ]
 
-            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tNoEditAnnounce"))
+            await h.kernel.process_event(qevent(_REPO_MESSAGE, thread="tNoEditAnnounce"))
 
-            assert [text for _a, _r, text in h.sink.updates] == [
-                f"changed\n\n{_ANNOUNCEMENT}"
-            ]
+            assert [text for _a, _r, text in h.sink.updates] == [f"changed\n\n{_ANNOUNCEMENT}"]
 
     asyncio.run(go())
 
@@ -944,8 +889,9 @@ def test_no_edit_streaming_final_carries_the_announcement(make_harness) -> None:
 def test_announcement_sits_between_answer_and_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A unit on the composition order: answer, announcement, receipt.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows: "RECEIPT")
+    # A unit on the composition order: answer, announcement, receipt. The stub
+    # takes the install's receipt mode too (ADR-0180), which the order ignores.
+    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
     announced = kernel_module._StreamAccumulator(
         text_parts=["answer"],
@@ -982,7 +928,7 @@ def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
         async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
             h.runner.default_script = [Final(text="changed", status=DONE)]
-            ev = _qevent(message, thread=thread)
+            ev = qevent(message, thread=thread)
 
             await h.kernel.process_event(ev)
 
@@ -1005,8 +951,8 @@ def test_retained_generic_route_with_workspaces_off_runs_each_turn_once(
         async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
             h.runner.default_script = [Final(text="triaged", status=DONE)]
-            first = _qevent("Triage this alert", thread="tRetainedGeneric")
-            follow_up = _qevent("Summarize the alert", thread="tRetainedGeneric")
+            first = qevent("Triage this alert", thread="tRetainedGeneric")
+            follow_up = qevent("Summarize the alert", thread="tRetainedGeneric")
 
             await h.kernel.process_event(first)
             await h.kernel.process_event(follow_up)
@@ -1056,7 +1002,7 @@ def test_retained_workspace_route_with_workspaces_off_refuses_without_adopting(
                     history_ref="history-suspended-workspace",
                 )
                 assert h.substrate.lookup(thread_key) is None
-            event = _qevent("Continue the task", thread=thread, event_id=event_id)
+            event = qevent("Continue the task", thread=thread, event_id=event_id)
 
             await h.kernel.process_event(event)
 
@@ -1083,7 +1029,7 @@ def test_no_repository_with_workspaces_off_runs_a_generic_turn(
         async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
             h.runner.default_script = [Final(text="triaged", status=DONE)]
-            event = _qevent("Triage this alert", thread="tWorkspacesOffGeneric")
+            event = qevent("Triage this alert", thread="tWorkspacesOffGeneric")
             await h.kernel.process_event(event)
 
             assert h.runner.opened == ["Triage this alert"]
@@ -1118,15 +1064,13 @@ def test_steered_follow_up_with_the_url_is_not_announced(make_harness) -> None:
             h.runner.tail = [Final(text="done", status=DONE)]
 
             t1 = asyncio.create_task(
-                h.kernel.process_event(
-                    _qevent("first", thread="tSteerUrl", placeholder="p-live")
-                )
+                h.kernel.process_event(qevent("first", thread="tSteerUrl", placeholder="p-live"))
             )
             try:
-                await _wait_until(lambda: h.runner.turn_active)
+                await wait_until(lambda: h.runner.turn_active)
 
                 await h.kernel.process_event(
-                    _qevent(_REPO_MESSAGE, thread="tSteerUrl", placeholder="p-steer")
+                    qevent(_REPO_MESSAGE, thread="tSteerUrl", placeholder="p-steer")
                 )
                 assert h.runner.steers == [_REPO_MESSAGE]
                 assert h.runner.opened == ["first"]
@@ -1171,6 +1115,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
 
     async def go() -> None:
         async with make_harness(binding=WorkspaceBinding()) as h:
+
             class WorkspaceProbe:
                 selected: str | None = None
                 claims = 0
@@ -1196,9 +1141,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
 
                 def claim_or_resume_with_handle(self, **kwargs: object) -> object:
                     self.claims += 1
-                    return SimpleNamespace(
-                        handle=h.substrate.claim("tRepo", env={}), prepared=None
-                    )
+                    return SimpleNamespace(handle=h.substrate.claim("tRepo", env={}), prepared=None)
 
                 def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
                     return True
@@ -1206,31 +1149,35 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Change https://github.com/acme-corp/acme-bot",
                     thread="tRepo",
                 )
             )
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Switch to https://github.com/acme-corp/acme-api",
                     thread="tRepo",
                 )
             )
 
             assert probe.claims == 1
-            assert h.runner.opened == [
-                "Change https://github.com/acme-corp/acme-bot"
-            ]
-            assert h.sink.last_text == (
-                "This thread is already bound to a different repository."
-            )
+            assert h.runner.opened == ["Change https://github.com/acme-corp/acme-bot"]
+            assert h.sink.last_text == ("This thread is already bound to a different repository.")
 
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("Change https://github.com/attacker/other-bot", id="url"),
+        pytest.param("Change attacker/other-bot", id="bare-owner-repo"),
+    ],
+)
 def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
     make_harness,
+    text: str,
 ) -> None:
     deployment_id = uuid.UUID("55555555-5555-4555-8555-555555555555")
 
@@ -1240,6 +1187,7 @@ def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
             workspace_enabled=False,
         )
         async with make_harness(binding=binding) as h:
+
             class WorkspaceProbe:
                 selection_calls = 0
 
@@ -1258,59 +1206,7 @@ def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
 
-            await h.kernel.process_event(
-                _qevent(
-                    "Change https://github.com/attacker/other-bot",
-                    thread="tUnallowlistedRepo",
-                )
-            )
-
-            assert probe.selection_calls == 1
-            assert h.runner.opened == []
-            assert h.fake_k8s.claim_envs == []
-            assert h.sink.last_text == (
-                "That repository is not in api.githubRepoAllowlist for this installation; "
-                "allow `owner/repo` or `owner/*` in the chart values."
-            )
-
-    asyncio.run(go())
-
-
-def test_unallowlisted_bare_runtime_repo_is_terminal_before_claim_or_model(
-    make_harness,
-) -> None:
-    deployment_id = uuid.UUID("55555555-5555-4555-8555-555555555556")
-
-    async def go() -> None:
-        binding = _BuiltInCodingBinding(
-            deployment_id,
-            workspace_enabled=False,
-        )
-        async with make_harness(binding=binding) as h:
-            class WorkspaceProbe:
-                selection_calls = 0
-
-                def select_repository(self, **kwargs: object) -> str:
-                    self.selection_calls += 1
-                    assert kwargs["deployment_id"] == deployment_id
-                    assert kwargs["repo_full_name"] == "attacker/other-bot"
-                    raise WorkspaceSelectionRefused(
-                        "That repository is not in api.githubRepoAllowlist for this installation; "
-                        "allow `owner/repo` or `owner/*` in the chart values."
-                    )
-
-                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
-                    raise AssertionError("a refused repository must not reach credential or claim")
-
-            probe = WorkspaceProbe()
-            h.kernel._workspace = probe  # type: ignore[assignment]
-
-            await h.kernel.process_event(
-                _qevent(
-                    "Change attacker/other-bot",
-                    thread="tUnallowlistedBareRepo",
-                )
-            )
+            await h.kernel.process_event(qevent(text, thread="tUnallowlistedRepo"))
 
             assert probe.selection_calls == 1
             assert h.runner.opened == []
@@ -1361,6 +1257,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
 
     async def go() -> None:
         async with make_harness(binding=WorkspaceBinding()) as h:
+
             class WorkspaceProbe:
                 calls = 0
 
@@ -1371,7 +1268,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
 
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
-            await h.kernel.process_event(_qevent("hi", thread="tGreetingRepo"))
+            await h.kernel.process_event(qevent("hi", thread="tGreetingRepo"))
 
             assert probe.calls == 1
             assert h.sink.last_text == "Hello from the greeting pack."
@@ -1399,6 +1296,7 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
                 },
             )
         ) as h:
+
             class WorkspaceProbe:
                 selected: str | None = None
                 handoffs = 0
@@ -1435,7 +1333,7 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
 
-            await h.kernel.process_event(_qevent("hello", thread="tLateWorkspace"))
+            await h.kernel.process_event(qevent("hello", thread="tLateWorkspace"))
             generic = h.substrate.lookup(_thread_key("tLateWorkspace"))
             assert generic is not None and generic.workspace_repo is None
             # The durable pointer and logical session on the route must match
@@ -1444,7 +1342,7 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             assert generic.history_ref == history_ref
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Use https://github.com/acme-corp/acme-bot",
                     thread="tLateWorkspace",
                 )
@@ -1458,7 +1356,7 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             assert workspace.generation == generic.generation + 1
 
             await h.kernel.process_event(
-                _qevent("continue in the repository", thread="tLateWorkspace")
+                qevent("continue in the repository", thread="tLateWorkspace")
             )
             assert probe.handoffs == 1
             assert probe.touches == 1
@@ -1522,11 +1420,7 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
         async with make_harness(binding=_workspace_binding(deployment_id)) as h:
             old = h.substrate.claim(
                 _thread_key("tUnsafeHandoff"),
-                env=(
-                    {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
-                    if authenticated
-                    else {}
-                ),
+                env=({"CURIE_RUNNER_TOKEN": "workspace-test-token"} if authenticated else {}),
             )
             h.runner.turn_active = turn_active
             h.runner.history_durable = history_durable
@@ -1547,7 +1441,7 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
 
             with pytest.raises(ThreadBusyError):
                 await h.kernel.process_event(
-                    _qevent(
+                    qevent(
                         "Use https://github.com/acme-corp/acme-bot",
                         thread="tUnsafeHandoff",
                     )
@@ -1713,16 +1607,14 @@ def test_late_workspace_handoff_revalidates_boundary_before_route_replacement(
                     )
                     revalidate()
                     ordering.append("handoff")
-                    raise AssertionError(
-                        "a refused revalidation must prevent route replacement"
-                    )
+                    raise AssertionError("a refused revalidation must prevent route replacement")
 
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
 
             with pytest.raises(ThreadBusyError):
                 await h.kernel.process_event(
-                    _qevent(
+                    qevent(
                         "Use https://github.com/acme-corp/acme-bot",
                         thread="tBoundaryChangedDuringPreparation",
                     )
@@ -1934,9 +1826,7 @@ def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
     deployment_id = uuid.uuid4()
 
     async def go() -> None:
-        async with make_harness(
-            binding=_workspace_binding(deployment_id), max_attempts=1
-        ) as h:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=1) as h:
             existing = h.substrate.claim(
                 _thread_key("tMismatchedWorkspace"),
                 env={},
@@ -1956,7 +1846,7 @@ def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "continue",
                     thread="tMismatchedWorkspace",
                 )
@@ -1971,9 +1861,7 @@ def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
     asyncio.run(go())
 
 
-def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
-    make_harness, caplog
-) -> None:
+def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, caplog) -> None:
     """The refusal ends the turn; without a log line it ends it invisibly (#2004).
 
     `WorkspaceSelectionRefused` subclasses `WorkspacePreparationError`, so its
@@ -2018,16 +1906,14 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
 
     async def go() -> None:
         async with make_harness(binding=WorkspaceBinding()) as h:
+
             class WorkspaceProbe:
                 def select_repository(self, **kwargs: object) -> str:
-                    raise WorkspaceSelectionRefused(
-                        "Start the thread by naming one allowed root GitHub "
-                        "repository URL."
-                    )
+                    raise WorkspaceSelectionRefused("Repository selection refused for this thread.")
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
             with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
-                await h.kernel.process_event(_qevent("hi", thread="tRefusalLog"))
+                await h.kernel.process_event(qevent("hi", thread="tRefusalLog"))
 
             assert h.runner.opened == []
             logged = "\n".join(record.getMessage() for record in caplog.records)
@@ -2035,7 +1921,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
                 "the refusal log must name the agent; an operator searching for "
                 f"a silent bot has only that to search on. Got: {logged!r}"
             )
-            assert "naming one allowed root GitHub repository" in logged, (
+            assert "Repository selection refused" in logged, (
                 f"the refusal log must carry the reason. Got: {logged!r}"
             )
 
@@ -2082,10 +1968,7 @@ def _workspace_binding(
             kind: str | None = None,
             address: str | None = None,
         ) -> dict[str, str]:
-            return dict(
-                boot_env_override
-                or {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
-            )
+            return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
             return BehaviorPacks()
@@ -2122,6 +2005,7 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
 
     async def go() -> None:
         async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+
             class WorkspaceProbe:
                 def select_repository(
                     self,
@@ -2144,7 +2028,7 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
             await h.kernel.process_event(
-                _qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceClone")
+                qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceClone")
             )
 
             # The turn was never accepted: nothing was claimed and no turn opened.
@@ -2174,23 +2058,18 @@ def test_binding_without_deployment_id_runs_the_generic_path(make_harness) -> No
 
     async def go() -> None:
         async with make_harness(binding=_workspace_binding(None)) as h:
+
             class WorkspaceProbe:
                 def select_repository(self, **_kwargs: object) -> str | None:
-                    raise AssertionError(
-                        "a missing deployment id cannot select a repository"
-                    )
+                    raise AssertionError("a missing deployment id cannot select a repository")
 
                 def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
-                    raise AssertionError(
-                        "a missing deployment id cannot claim a workspace"
-                    )
+                    raise AssertionError("a missing deployment id cannot claim a workspace")
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
             h.runner.default_script = [Final(text="generic", status=DONE)]
 
-            await h.kernel.process_event(
-                _qevent("do the thing", thread="tNoDeploymentId")
-            )
+            await h.kernel.process_event(qevent("do the thing", thread="tNoDeploymentId"))
 
             assert h.runner.opened == ["do the thing"]
             assert len(h.fake_k8s.claim_envs) == 1
@@ -2210,18 +2089,17 @@ def test_ambiguous_repo_is_terminal_before_selection_claim_or_model(
             workspace_enabled=False,
         )
         async with make_harness(binding=binding) as h:
+
             class WorkspaceProbe:
                 def select_repository(self, **_kwargs: object) -> str | None:
                     raise AssertionError("ambiguity must fail before API selection")
 
                 def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
-                    raise AssertionError(
-                        "ambiguity must fail before credential or claim"
-                    )
+                    raise AssertionError("ambiguity must fail before credential or claim")
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "Port https://github.com/acme-corp/acme-bot to "
                     "https://github.com/acme-corp/acme-api",
                     thread="tAmbiguousRepo",
@@ -2247,7 +2125,7 @@ def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
                 ToolNote(text="opening result", tool="WebSearch"),
                 Final(text="Final answer", status=DONE),
             ]
-            event = _qevent("research this")
+            event = qevent("research this")
 
             await h.kernel.process_event(event)
 
@@ -2274,7 +2152,7 @@ def test_tool_notes_with_empty_or_absent_names_remain_internal(
                 Final(text="Final answer", status=DONE),
             ]
 
-            await h.kernel.process_event(_qevent("research this"))
+            await h.kernel.process_event(qevent("research this"))
 
             texts = [text for _, _, text in h.sink.updates]
             assert "Answer so far" in texts
@@ -2316,7 +2194,7 @@ def test_tool_notes_never_attempt_a_user_facing_sink_delivery(make_harness) -> N
                 )
 
             h.sink.emit = reject_tool_note_emit  # type: ignore[method-assign]
-            event = _qevent("run it")
+            event = qevent("run it")
 
             await h.kernel.process_event(event)
 
@@ -2338,7 +2216,7 @@ def test_final_response_is_not_filtered_when_it_matches_tool_note_formatting(
                 ToolNote(text="running command", tool="Bash"),
                 Final(text=final_text, status=DONE),
             ]
-            event = _qevent("run it")
+            event = qevent("run it")
 
             await h.kernel.process_event(event)
 
@@ -2358,7 +2236,7 @@ def test_placeholderless_turn_does_not_create_a_message_from_a_tool_note(
                 ToolNote(text="running command", tool="Bash"),
                 Final(text="Completed answer", status=DONE),
             ]
-            event = _qevent("run it", placeholder=None)
+            event = qevent("run it", placeholder=None)
 
             await h.kernel.process_event(event)
 
@@ -2383,7 +2261,7 @@ def test_null_placeholder_turn_runs_and_posts_its_own_reply(make_harness) -> Non
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="digest ready", status=DONE)]
-            event = _qevent("run the digest", placeholder=None)
+            event = qevent("run the digest", placeholder=None)
 
             await h.kernel.process_event(event)
 
@@ -2412,7 +2290,7 @@ def test_placeholder_less_turn_posts_once_then_edits_that_message(make_harness) 
                 Final(text="one two three", status=DONE),
             ]
 
-            await h.kernel.process_event(_qevent("go", placeholder=None))
+            await h.kernel.process_event(qevent("go", placeholder=None))
 
             # Exactly one message was created for the whole turn...
             assert len(h.sink.text_posts) == 1, h.sink.text_posts
@@ -2434,11 +2312,9 @@ def test_a_job_never_steers_a_live_session(make_harness, make_hook_run) -> None:
     """
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
             h.runner.turn_active = True
-            event = _qevent(
+            event = qevent(
                 "nightly digest",
                 placeholder=None,
                 source=TurnSource.CRON,
@@ -2462,14 +2338,12 @@ def test_a_job_runs_normally_when_the_thread_is_idle(make_harness, make_hook_run
     """The deferral is conditional. An idle thread runs the job immediately."""
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
             h.runner.turn_active = False
             h.runner.default_script = [Final(text="digest", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "nightly digest",
                     placeholder=None,
                     source=TurnSource.CRON,
@@ -2497,14 +2371,12 @@ def test_an_unreadable_session_defers_the_job(make_harness, make_hook_run) -> No
     """
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
             h.runner.turn_active = False
             h.runner.status_fails = True
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "digest",
                     placeholder=None,
                     source=TurnSource.CRON,
@@ -2528,14 +2400,12 @@ def test_a_status_without_turn_active_defers_the_job(make_harness, make_hook_run
     """
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
             h.runner.turn_active = False
             h.runner.status_malformed = True
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "digest",
                     placeholder=None,
                     source=TurnSource.CRON,
@@ -2588,7 +2458,7 @@ def test_a_person_still_steers_a_live_session(make_harness) -> None:
         async with make_harness() as h:
             h.runner.turn_active = True
 
-            await h.kernel.process_event(_qevent("actually, make it shorter"))
+            await h.kernel.process_event(qevent("actually, make it shorter"))
 
             assert h.runner.steers == ["actually, make it shorter"]
 
@@ -2601,7 +2471,7 @@ def test_shimmer_clears_status_when_the_turn_ends(make_harness) -> None:
     async def go() -> None:
         async with make_harness(shimmer=True) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tS"))
+            await h.kernel.process_event(qevent("hi", thread="tS"))
             assert ("C1", "tS") in h.sink.status_clears
 
     asyncio.run(go())
@@ -2614,7 +2484,7 @@ def test_no_status_clear_when_shimmer_is_off(make_harness) -> None:
     async def go() -> None:
         async with make_harness(shimmer=False) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
-            await h.kernel.process_event(_qevent("hi"))
+            await h.kernel.process_event(qevent("hi"))
             assert h.sink.status_clears == []
 
     asyncio.run(go())
@@ -2628,7 +2498,7 @@ def test_status_is_cleared_by_default(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
-            await h.kernel.process_event(_qevent("hi"))
+            await h.kernel.process_event(qevent("hi"))
             assert h.sink.status_clears, "the shipped default must clear the caption"
 
     asyncio.run(go())
@@ -2642,12 +2512,12 @@ def test_followup_steers_the_live_turn(make_harness) -> None:
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="done", status=DONE)]
 
-            e1 = _qevent("first", thread="tA")
+            e1 = qevent("first", thread="tA")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             # A follow-up on the same thread steers the live turn, not a new one.
-            await h.kernel.process_event(_qevent("second", thread="tA"))
+            await h.kernel.process_event(qevent("second", thread="tA"))
             assert h.runner.steers == ["second"]
             assert h.runner.opened == ["first"]
 
@@ -2692,10 +2562,10 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="done", status=DONE)]
             first = asyncio.create_task(
-                h.kernel.process_event(_qevent("first", thread="tActiveFile"))
+                h.kernel.process_event(qevent("first", thread="tActiveFile"))
             )
             try:
-                await _wait_until(lambda: h.runner.turn_active)
+                await wait_until(lambda: h.runner.turn_active)
                 thread_key = "slack:C1:tActiveFile"
                 route = h.substrate._affinity.get(thread_key)  # noqa: SLF001
                 assert route is not None
@@ -2707,7 +2577,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                     ),
                     ttl_seconds=60,
                 )
-                file_event = _qevent(
+                file_event = qevent(
                     "read this too",
                     thread="tActiveFile",
                     event_id="active-file-with-lease",
@@ -2736,9 +2606,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                     "Please send the whole message again after that reply finishes. "
                     "The text of this message was not processed."
                 )
-                file_updates = [
-                    text for _channel, ref, text in h.sink.updates if ref == "p-file"
-                ]
+                file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
                 assert file_updates[-1] == expected
                 assert lane.resolve_calls == 0
                 assert h.runner.steers == []
@@ -2776,12 +2644,12 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
         async with make_harness() as h:
             # First turn completes; the sandbox stays live but idle (no turn).
             h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(_qevent("first", thread="tB"))
+            await h.kernel.process_event(qevent("first", thread="tB"))
 
             # Follow-up: the steer hits 409 (no active turn) and the kernel opens
             # a fresh turn on the same idle sandbox.
             h.runner.default_script = [Final(text="two", status=DONE)]
-            await h.kernel.process_event(_qevent("second", thread="tB"))
+            await h.kernel.process_event(qevent("second", thread="tB"))
 
             assert h.runner.steers == []  # steer returned 409, not delivered
             assert h.runner.opened == ["first", "second"]
@@ -2790,20 +2658,160 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_drop_mid_run_retries_then_succeeds(make_harness) -> None:
+# Error-classification table, transient half: the first attempt fails in a
+# retryable way and the second attempt's reply is what the user sees.
+@pytest.mark.parametrize(
+    ("first_attempt", "second_attempt", "expected_reply"),
+    [
+        pytest.param(
+            [ErrorEvent(message="rl", classification="rate-limit")],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # Hyphenated platform rate-limit, sibling of the SDK's underscore
+            # rate_limit row below: allowlist-constrain must not fold it, or
+            # retry dies.
+            id="platform-rate-limit",
+        ),
+        pytest.param(
+            [
+                ErrorEvent(message="rl", classification="rate-limit"),
+                ErrorEvent(message="empty-class", classification=""),
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # A later ErrorEvent with classification="" must not fold to
+            # unclassified and wipe a prior rate-limit, or the retry dies.
+            id="empty-after-rate-limit-keeps-rate-limit",
+        ),
+        pytest.param(
+            [ErrorEvent(message="blank-class", classification="")],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # Old fold treated "" as falsy so _finish defaulted to runner-error
+            # (retryable). Do not escalate on the first attempt.
+            id="empty-alone-is-retryable-runner-error",
+        ),
+        pytest.param(
+            # Mid-run drop: a delta streams, then the stream ends with no final.
+            [TextDelta(text="partial")],
+            [TextDelta(text="full"), Final(text="full done", status=DONE)],
+            "full done",
+            id="drop-mid-run",
+        ),
+    ],
+)
+def test_transient_failure_retries_then_succeeds(
+    make_harness,
+    first_attempt: list[Any],
+    second_attempt: list[Any],
+    expected_reply: str,
+) -> None:
     async def go() -> None:
         async with make_harness() as h:
-            # Attempt 1 streams a delta then the stream ends with no final (a
-            # mid-run drop). Attempt 2 completes.
-            h.runner.turn_scripts = [
-                [TextDelta(text="partial")],
-                [TextDelta(text="full"), Final(text="full done", status=DONE)],
-            ]
-            ev = _qevent("go")
-            await h.kernel.process_event(ev)
+            first = list(first_attempt)
+            if not isinstance(first[0], TextDelta):
+                first.append(Final(text="f", status=FAIL))
+            h.runner.turn_scripts = [first, list(second_attempt)]
+            await h.kernel.process_event(qevent("go"))
 
-            assert h.runner.opened == ["go", "go"]  # retried
-            assert h.sink.last_text == "full done"
+            assert h.runner.opened == ["go", "go"]  # retried once
+            assert h.sink.last_text == expected_reply
+
+    asyncio.run(go())
+
+
+# Error-classification table, escalation half: the run escalates after a single
+# attempt and the reply names the classification, the detail, and the event_id.
+@pytest.mark.parametrize(
+    ("classification", "message", "event_id", "max_attempts", "expected_reply", "absent"),
+    [
+        pytest.param(
+            "unknown",
+            "model-said-unknown",
+            "evt-unknown-cause",
+            3,
+            "curie-turn-failure: unclassified\n\n"
+            "The run failed (unclassified) after 1 attempt(s). "
+            "model-said-unknown event_id=evt-unknown-cause. "
+            "Flagging for a human.",
+            ("(unknown)",),
+            id="unknown-is-unclassified",
+        ),
+        pytest.param(
+            # A worker-local timeout token arriving on an ErrorEvent is not
+            # platform vocabulary, so it must not be echoed as a class.
+            "runner-timeout-unconfirmed",
+            "injected-local-token",
+            "evt-local-timeout-token",
+            3,
+            "curie-turn-failure: unclassified\n\n"
+            "The run failed (unclassified) after 1 attempt(s). "
+            "injected-local-token event_id=evt-local-timeout-token. "
+            "Flagging for a human.",
+            ("(runner-timeout-unconfirmed)",),
+            id="worker-local-timeout-token-is-unclassified",
+        ),
+        pytest.param(
+            # SDK underscore spelling is not the platform's retryable rate-limit.
+            "rate_limit",
+            "sdk-rate-limit-underscore",
+            "evt-rate-limit-underscore",
+            3,
+            "curie-turn-failure: unclassified\n\n"
+            "The run failed (unclassified) after 1 attempt(s). "
+            "sdk-rate-limit-underscore event_id=evt-rate-limit-underscore. "
+            "Flagging for a human.",
+            ("(rate_limit)", "(rate-limit)"),
+            id="sdk-rate-limit-underscore-does-not-retry",
+        ),
+        pytest.param(
+            "runner-error",
+            "sandbox died",
+            "evt-runner-error-cause",
+            1,
+            "curie-turn-failure: runner-error\n\n"
+            "The run failed (runner-error) after 1 attempt(s). "
+            "sandbox died event_id=evt-runner-error-cause. "
+            "Flagging for a human.",
+            (),
+            id="allowlisted-runner-error-at-attempt-cap",
+        ),
+        pytest.param(
+            "budget-exceeded",
+            "over budget",
+            "evt-budget-exceeded",
+            3,
+            "curie-turn-failure: budget-exceeded\n\n"
+            "The run failed (budget-exceeded) after 1 attempt(s). "
+            "over budget event_id=evt-budget-exceeded. "
+            "Flagging for a human.",
+            (),
+            id="budget-exceeded-is-not-retryable",
+        ),
+    ],
+)
+def test_error_classification_escalates_after_one_attempt(
+    make_harness,
+    classification: str,
+    message: str,
+    event_id: str,
+    max_attempts: int,
+    expected_reply: str,
+    absent: tuple[str, ...],
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=max_attempts) as h:
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification=classification),
+                Final(text="failed", status=FAIL),
+            ]
+            await h.kernel.process_event(qevent("go", event_id=event_id))
+
+            assert h.runner.opened == ["go"]
+            reply = h.sink.last_text
+            assert reply == expected_reply
+            for fragment in absent:
+                assert fragment not in reply
 
     asyncio.run(go())
 
@@ -2818,81 +2826,13 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
                 ErrorEvent(message="boom", classification="runner-error"),
                 Final(text="failed", status=FAIL),
             ]
-            ev = _qevent("do it")
+            ev = qevent("do it")
             await h.kernel.process_event(ev)
 
             assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
-
-    asyncio.run(go())
-
-
-def test_rate_limit_retries_then_succeeds(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness() as h:
-            h.runner.turn_scripts = [
-                [
-                    ErrorEvent(message="rl", classification="rate-limit"),
-                    Final(text="f", status=FAIL),
-                ],
-                [Final(text="recovered", status=DONE)],
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go", "go"]
-            assert h.sink.last_text == "recovered"
-
-    asyncio.run(go())
-
-
-def test_unknown_classification_escalates_as_unclassified_with_event_id(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(max_attempts=3) as h:
-            h.runner.default_script = [
-                ErrorEvent(message="model-said-unknown", classification="unknown"),
-                Final(text="failed", status=FAIL),
-            ]
-            ev = _qevent("go", event_id="evt-unknown-cause")
-            await h.kernel.process_event(ev)
-
-            assert h.runner.opened == ["go"]
-            reply = h.sink.last_text
-            assert reply == (
-                "The run failed (unclassified) after 1 attempt(s). "
-                "model-said-unknown event_id=evt-unknown-cause. "
-                "Flagging for a human."
-            )
-            assert "(unclassified)" in reply
-            assert "model-said-unknown" in reply
-            assert "event_id=evt-unknown-cause" in reply
-            assert "(unknown)" not in reply
-            assert reply.startswith("The run failed (")
-
-    asyncio.run(go())
-
-
-def test_worker_local_timeout_token_from_error_event_remains_unclassified(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(max_attempts=3) as h:
-            h.runner.default_script = [
-                ErrorEvent(
-                    message="injected-local-token",
-                    classification="runner-timeout-unconfirmed",
-                ),
-                Final(text="failed", status=FAIL),
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go"]
-            assert h.sink.last_text is not None
-            assert "(unclassified)" in h.sink.last_text
-            assert "(runner-timeout-unconfirmed)" not in h.sink.last_text
 
     asyncio.run(go())
 
@@ -2907,13 +2847,14 @@ def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
                 ErrorEvent(message="boom-detail", classification="unknown"),
                 Final(text="failed", status=FAIL),
             ]
-            ev = _qevent("do it", event_id="evt-unknown-side-effect")
+            ev = qevent("do it", event_id="evt-unknown-side-effect")
             await h.kernel.process_event(ev)
 
             assert h.runner.opened == ["do it"]
             reply = h.sink.last_text
             assert reply is not None
             assert reply == (
+                "curie-turn-failure: unclassified\n\n"
                 "The run hit an error (unclassified) after starting an action; "
                 "not retrying automatically. boom-detail "
                 "event_id=evt-unknown-side-effect. Flagging for a human."
@@ -2922,123 +2863,8 @@ def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
             assert "boom-detail" in reply
             assert "event_id=evt-unknown-side-effect" in reply
             assert "human" in reply.lower()
-            assert reply.startswith("The run hit an error (")
+            assert reply.startswith("curie-turn-failure: unclassified\n")
             assert "(unknown)" not in reply
-
-    asyncio.run(go())
-
-
-def test_sdk_rate_limit_underscore_does_not_retry(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(max_attempts=3) as h:
-            h.runner.default_script = [
-                ErrorEvent(
-                    message="sdk-rate-limit-underscore",
-                    classification="rate_limit",
-                ),
-                Final(text="f", status=FAIL),
-            ]
-            ev = _qevent("go", event_id="evt-rate-limit-underscore")
-            await h.kernel.process_event(ev)
-
-            assert h.runner.opened == ["go"]
-            reply = h.sink.last_text
-            assert reply == (
-                "The run failed (unclassified) after 1 attempt(s). "
-                "sdk-rate-limit-underscore event_id=evt-rate-limit-underscore. "
-                "Flagging for a human."
-            )
-            assert "(unclassified)" in reply
-            assert "(rate_limit)" not in reply
-            assert "(rate-limit)" not in reply
-
-    asyncio.run(go())
-
-
-def test_platform_rate_limit_still_retries_then_succeeds(make_harness) -> None:
-    # Hyphenated sibling of test_sdk_rate_limit_underscore_does_not_retry:
-    # allowlist-constrain must not fold platform rate-limit, or retry dies.
-    async def go() -> None:
-        async with make_harness() as h:
-            h.runner.turn_scripts = [
-                [
-                    ErrorEvent(message="rl", classification="rate-limit"),
-                    Final(text="f", status=FAIL),
-                ],
-                [Final(text="recovered", status=DONE)],
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go", "go"]
-            assert h.sink.last_text == "recovered"
-
-    asyncio.run(go())
-
-
-def test_empty_classification_does_not_overwrite_prior_rate_limit(make_harness) -> None:
-    # A later ErrorEvent with classification="" must not fold to unclassified
-    # and wipe a prior rate-limit, or the retry dies.
-    async def go() -> None:
-        async with make_harness() as h:
-            h.runner.turn_scripts = [
-                [
-                    ErrorEvent(message="rl", classification="rate-limit"),
-                    ErrorEvent(message="empty-class", classification=""),
-                    Final(text="f", status=FAIL),
-                ],
-                [Final(text="recovered", status=DONE)],
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go", "go"]
-            assert h.sink.last_text == "recovered"
-
-    asyncio.run(go())
-
-
-def test_empty_classification_alone_defaults_to_retryable_runner_error(
-    make_harness,
-) -> None:
-    # Old fold treated "" as falsy so _finish defaulted to runner-error
-    # (retryable). Do not escalate on the first attempt.
-    async def go() -> None:
-        async with make_harness() as h:
-            h.runner.turn_scripts = [
-                [
-                    ErrorEvent(message="blank-class", classification=""),
-                    Final(text="f", status=FAIL),
-                ],
-                [Final(text="recovered", status=DONE)],
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go", "go"]
-            assert h.sink.last_text == "recovered"
-
-    asyncio.run(go())
-
-
-def test_allowlisted_runner_error_escalates_with_event_id(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(max_attempts=1) as h:
-            h.runner.default_script = [
-                ErrorEvent(message="sandbox died", classification="runner-error"),
-                Final(text="failed", status=FAIL),
-            ]
-            ev = _qevent("go", event_id="evt-runner-error-cause")
-            await h.kernel.process_event(ev)
-
-            assert h.runner.opened == ["go"]
-            reply = h.sink.last_text
-            assert reply == (
-                "The run failed (runner-error) after 1 attempt(s). "
-                "sandbox died event_id=evt-runner-error-cause. "
-                "Flagging for a human."
-            )
-            assert "(runner-error)" in reply
-            assert "sandbox died" in reply
-            assert "event_id=evt-runner-error-cause" in reply
-            assert reply.startswith("The run failed (")
 
     asyncio.run(go())
 
@@ -3047,9 +2873,7 @@ def test_allowlisted_runner_error_escalates_with_event_id(make_harness) -> None:
 _FAKE_ESCALATION_API_KEY = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 
 
-def test_escalation_detail_redacts_token_from_reply_and_log(
-    make_harness, caplog
-) -> None:
+def test_escalation_detail_redacts_token_from_reply_and_log(make_harness, caplog) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=1) as h:
             h.runner.default_script = [
@@ -3059,7 +2883,7 @@ def test_escalation_detail_redacts_token_from_reply_and_log(
                 ),
                 Final(text="failed", status=FAIL),
             ]
-            ev = _qevent("go", event_id="evt-escalation-secret")
+            ev = qevent("go", event_id="evt-escalation-secret")
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 await h.kernel.process_event(ev)
 
@@ -3074,9 +2898,7 @@ def test_escalation_detail_redacts_token_from_reply_and_log(
             logged = "\n".join(record.getMessage() for record in caplog.records)
             assert _FAKE_ESCALATION_API_KEY not in logged
             assert "[REDACTED:api_key]" in logged
-            assert any(
-                "escalating event" in record.getMessage() for record in caplog.records
-            )
+            assert any("escalating event" in record.getMessage() for record in caplog.records)
 
     asyncio.run(go())
 
@@ -3090,25 +2912,10 @@ def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
             h.runner.event_fail_times = 1
             h.runner.default_script = [Final(text="recovered", status=DONE)]
 
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert h.runner.opened == ["go", "go"]  # failed start, then retried
             assert h.sink.last_text == "recovered"
-
-    asyncio.run(go())
-
-
-def test_budget_exceeded_escalates_without_retry(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness() as h:
-            h.runner.default_script = [
-                ErrorEvent(message="over budget", classification="budget-exceeded"),
-                Final(text="f", status=FAIL),
-            ]
-            await h.kernel.process_event(_qevent("go"))
-
-            assert h.runner.opened == ["go"]  # budget-exceeded is not retryable
-            assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
 
     asyncio.run(go())
 
@@ -3137,7 +2944,7 @@ def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> N
                 ErrorEvent(message="reached max turns", classification="max-turns"),
                 Final(text="f", status=FAIL),
             ]
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert h.runner.opened == ["go"]  # max-turns is not retryable
             text = h.sink.last_text
@@ -3146,9 +2953,63 @@ def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> N
             assert "(unclassified)" not in text
             assert "max-turns" in text
             assert "turn budget" in text.lower()
+            # #3403: a chat turn ran under the runner's own cap.
+            assert "CURIE_MAX_TURNS" in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
+            assert text.startswith("curie-turn-failure: max-turns\n")
+            assert kernel_module.failure_class_from_reply(text) == "max-turns"
+
+    asyncio.run(go())
+
+
+def test_failed_turn_reply_replaces_success_looking_model_text(make_harness) -> None:
+    """#3401: a consumer that sees only the delivered reply must not score a
+    failed turn as a successful task reply."""
+
+    model_text = "Task complete. All checks passed."
+
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.runner.default_script = [
+                TextDelta(text=model_text),
+                ErrorEvent(message="turn budget exhausted", classification="max-turns"),
+                Final(text=model_text, status=FAIL),
+            ]
+            await h.kernel.process_event(qevent("go"))
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_module.failure_class_from_reply(reply) == "max-turns"
+            assert model_text not in reply
+            assert h.sink.completions[-1].outcome == "escalated"
+
+    asyncio.run(go())
+
+
+def test_successful_reply_is_not_a_failure_marker(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [
+                TextDelta(text="the answer is PONG"),
+                Final(text="the answer is PONG", status=DONE),
+            ]
+            await h.kernel.process_event(qevent("go"))
+
+            reply = h.sink.last_text
+            assert reply == "the answer is PONG"
+            assert kernel_module.failure_class_from_reply(reply or "") is None
             assert (
-                "CURIE_WORK_ITEM_MAX_TURNS" in text or "worker.workItemMaxTurns" in text
-            ), text
+                kernel_module.failure_class_from_reply(
+                    "the answer is PONG\n\ncurie-turn-failure: max-turns"
+                )
+                is None
+            )
+            assert (
+                kernel_module.failure_class_from_reply(
+                    "curie-turn-failure: max-turns and more words"
+                )
+                is None
+            )
 
     asyncio.run(go())
 
@@ -3167,12 +3028,10 @@ def test_connector_capability_failed_done_posts_diagnosis_not_escalate(
                 "credential GITHUB_TOKEN expanded empty. Connector tools are unavailable."
             )
             h.runner.default_script = [
-                ErrorEvent(
-                    message=diagnosis, classification="connector-capability-failed"
-                ),
+                ErrorEvent(message=diagnosis, classification="connector-capability-failed"),
                 Final(text=diagnosis, status=DONE),
             ]
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert h.runner.opened == ["go"]
             assert h.sink.last_text == diagnosis
@@ -3190,7 +3049,7 @@ def test_retries_are_bounded_then_escalate(make_harness) -> None:
                 ErrorEvent(message="rl", classification="rate-limit"),
                 Final(text="f", status=FAIL),
             ]
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert len(h.runner.opened) == 3
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
@@ -3215,7 +3074,7 @@ def test_quota_capacity_requests_wait_without_retry_or_runner_turn(
                 hard={"limits.cpu": "8"},
             )
             endpoint = "http://127.0.0.1:43199"
-            ev = _qevent("go", endpoint=endpoint)
+            ev = qevent("go", endpoint=endpoint)
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(ev)
@@ -3289,6 +3148,7 @@ def test_valid_quota_evidence_reaches_budget_gate_before_inventory(
             binding=_HistoryBinding(),
             claim_timeout_seconds=0.05,
         ) as h:
+
             def scan_must_not_run(**_kwargs: object) -> object:
                 raise AssertionError("missing budget reached pressure inventory")
 
@@ -3300,7 +3160,7 @@ def test_valid_quota_evidence_reaches_budget_gate_before_inventory(
             h.fake_k8s.quota_rejection = rejection
 
             with pytest.raises(CapacityWaitRequested):
-                await h.kernel.process_event(_qevent("start", thread="tValidQuota"))
+                await h.kernel.process_event(qevent("start", thread="tValidQuota"))
 
             assert outcomes == ["refused-no-budget"]
             assert h.runner.opened == []
@@ -3379,7 +3239,7 @@ def test_invalid_quota_evidence_refuses_before_inventory_or_deletion(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tInvalidQuotaTrigger", event_id=event_id),
+                    qevent("start", thread="tInvalidQuotaTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -3504,7 +3364,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             monkeypatch.setattr(kernel_module, "record_metric", record)
 
             await h.kernel.process_event(
-                _qevent("start a new turn", thread=trigger_thread, event_id=event_id),
+                qevent("start a new turn", thread=trigger_thread, event_id=event_id),
                 lease=lease,
             )
 
@@ -3517,7 +3377,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
 
             await asyncio.to_thread(h.substrate.release, _thread_key(trigger_thread))
             await h.kernel.process_event(
-                _qevent("resume the reclaimed thread", thread=oldest_thread)
+                qevent("resume the reclaimed thread", thread=oldest_thread)
             )
 
             resumed = h.substrate.lookup(_thread_key(oldest_thread))
@@ -3596,7 +3456,7 @@ def test_quota_capacity_waits_for_external_headroom_before_retry(
             h.runner.default_script = [Final(text="started after quota release", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "start after quota release",
                     thread="tQuotaLagTrigger",
                     event_id=event_id,
@@ -3694,7 +3554,7 @@ def test_quota_pressure_preserves_routes_with_unsafe_persisted_state(
             h.runner.default_script = [Final(text="started safely", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent("start", thread="tUnsafeTrigger", event_id=event_id),
+                qevent("start", thread="tUnsafeTrigger", event_id=event_id),
                 lease=lease,
             )
 
@@ -3772,7 +3632,7 @@ def test_unknown_detach_stops_after_real_eval_without_later_probe_or_retry(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tUnknownDetachTrigger", event_id=event_id),
+                    qevent("start", thread="tUnknownDetachTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -3830,10 +3690,7 @@ def test_pressure_inventory_hard_stops_at_two_seconds(
             h.substrate._affinity._pressure_redis = (  # type: ignore[assignment]  # noqa: SLF001
                 delayed
             )
-            padding = {
-                f"{prefix}:unrelated:{number}": "padding"
-                for number in range(18_000)
-            }
+            padding = {f"{prefix}:unrelated:{number}": "padding" for number in range(18_000)}
             await asyncio.to_thread(sync_client.mset, padding)
             try:
                 started = time.monotonic()
@@ -3949,7 +3806,7 @@ def test_quota_pressure_preserves_routes_without_safe_idle_history_status(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tStatusTrigger", event_id=event_id),
+                    qevent("start", thread="tStatusTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -3999,7 +3856,7 @@ def test_unreadable_oldest_runner_does_not_block_later_safe_reclamation(
             h.runner.default_script = [Final(text="started after fallback", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent("start", thread="tUnreadableTrigger", event_id=event_id),
+                qevent("start", thread="tUnreadableTrigger", event_id=event_id),
                 lease=lease,
             )
 
@@ -4070,7 +3927,7 @@ def test_quota_pressure_loses_races_without_deleting_the_candidate(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tRaceTrigger", event_id=event_id),
+                    qevent("start", thread="tRaceTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -4112,7 +3969,7 @@ def test_contended_pressure_lock_is_skipped_within_its_short_bound(
             started = time.monotonic()
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tContentionTrigger", event_id=event_id),
+                    qevent("start", thread="tContentionTrigger", event_id=event_id),
                     lease=lease,
                 )
             elapsed = time.monotonic() - started
@@ -4165,22 +4022,20 @@ def test_same_thread_followup_cannot_overtake_pressure_retry(make_harness) -> No
 
             first = asyncio.create_task(
                 h.kernel.process_event(
-                    _qevent("first", thread="tFifoTrigger", event_id=event_id),
+                    qevent("first", thread="tFifoTrigger", event_id=event_id),
                     lease=lease,
                 )
             )
             await asyncio.wait_for(status_entered.wait(), timeout=2.0)
             second = asyncio.create_task(
-                h.kernel.process_event(
-                    _qevent("followup", thread="tFifoTrigger")
-                )
+                h.kernel.process_event(qevent("followup", thread="tFifoTrigger"))
             )
             await asyncio.sleep(0.05)
             assert h.runner.opened == []
             assert h.runner.steers == []
 
             allow_status.set()
-            await _wait_until(lambda: h.runner.opened == ["first"])
+            await wait_until(lambda: h.runner.opened == ["first"])
             await second
             assert h.runner.opened == ["first"]
             assert h.runner.steers == ["followup"]
@@ -4203,9 +4058,7 @@ def test_capacity_wait_request_releases_fifo_for_followup(
         ) as h:
             h.fake_k8s.quota_rejection = _quota_rejection()
             with pytest.raises(CapacityWaitRequested):
-                await h.kernel.process_event(
-                    _qevent("first", thread="tRefusalOrder")
-                )
+                await h.kernel.process_event(qevent("first", thread="tRefusalOrder"))
             assert h.kernel._order_locks == {}
             h.fake_k8s.quota_rejection = None
 
@@ -4214,11 +4067,9 @@ def test_capacity_wait_request_releases_fifo_for_followup(
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="done", status=DONE)]
             second = asyncio.create_task(
-                h.kernel.process_event(
-                    _qevent("followup", thread="tRefusalOrder")
-                )
+                h.kernel.process_event(qevent("followup", thread="tRefusalOrder"))
             )
-            await _wait_until(lambda: h.runner.opened == ["followup"])
+            await wait_until(lambda: h.runner.opened == ["followup"])
 
             hold.set()
             await second
@@ -4247,7 +4098,7 @@ def test_second_quota_rejection_refuses_after_exactly_one_pressure_retry(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tRetryTrigger", event_id=event_id),
+                    qevent("start", thread="tRetryTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -4281,7 +4132,7 @@ def test_pressure_retry_restarts_attachment_resolution_from_the_top(
             h.runner.default_script = [Final(text="attachment started", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "read this",
                     thread="tAttachmentTrigger",
                     event_id=event_id,
@@ -4332,7 +4183,7 @@ def test_route_created_between_attachment_retry_locks_keeps_changed_route_outcom
             lease = await _pressure_lease(h, event_id)
 
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "read this",
                     thread=trigger_thread,
                     event_id=event_id,
@@ -4382,7 +4233,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
 
             victim_task = asyncio.create_task(
                 h.kernel.process_event(
-                    _qevent(
+                    qevent(
                         "read victim attachment",
                         thread=victim_thread,
                         attachments=[Attachment(id="F3", name="victim.txt")],
@@ -4394,7 +4245,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
             event_id = "pressure-between-victim-attachment-locks"
             lease = await _pressure_lease(h, event_id)
             await h.kernel.process_event(
-                _qevent("start", thread="tAttachmentPressureTrigger", event_id=event_id),
+                qevent("start", thread="tAttachmentPressureTrigger", event_id=event_id),
                 lease=lease,
             )
 
@@ -4409,8 +4260,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
             assert lane.resolve_calls == 1
             assert lane.discard_calls == 1
             assert any(
-                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY
-                for update in h.sink.updates
+                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
             )
 
     asyncio.run(go())
@@ -4441,9 +4291,7 @@ def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
             h.fake_k8s.quota_rejection = _quota_rejection()
 
             with pytest.raises(CapacityWaitRequested):
-                await h.kernel.process_event(
-                    _qevent("start", thread="tNoBudgetTrigger")
-                )
+                await h.kernel.process_event(qevent("start", thread="tNoBudgetTrigger"))
 
             assert h.substrate.lookup(_thread_key("tNoBudgetCandidate")) == candidate
             assert candidate.claim_name not in h.fake_k8s.deleted_claims
@@ -4455,8 +4303,7 @@ def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
 
 def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
     cold_redis_operation = (
-        kernel_module._PRESSURE_REDIS_CONNECT_S
-        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        kernel_module._PRESSURE_REDIS_CONNECT_S + 3 * kernel_module._PRESSURE_REDIS_READ_S
     )
     inventory = kernel_module._PRESSURE_SCAN_DEADLINE_S
     candidate = (
@@ -4464,10 +4311,7 @@ def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
         + kernel_module._PRESSURE_RUNNER_STATUS_S
         + 3 * kernel_module._PRESSURE_REDIS_READ_S
     )
-    cleanup = (
-        kernel_module._PRESSURE_DELETE_S
-        + kernel_module._PRESSURE_GONE_WAIT_S
-    )
+    cleanup = kernel_module._PRESSURE_DELETE_S + kernel_module._PRESSURE_GONE_WAIT_S
 
     assert kernel_module._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
     assert kernel_module._PRESSURE_INVENTORY_CEILING_S == inventory
@@ -4510,7 +4354,7 @@ def test_pressure_entry_refuses_when_current_budget_is_below_derived_floor(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tLowBudgetTrigger", event_id=event_id),
+                    qevent("start", thread="tLowBudgetTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -4541,7 +4385,7 @@ def test_scan_cap_emits_one_incomplete_pressure_outcome(
 
             with pytest.raises(CapacityWaitRequested):
                 await h.kernel.process_event(
-                    _qevent("start", thread="tScanCapTrigger", event_id=event_id),
+                    qevent("start", thread="tScanCapTrigger", event_id=event_id),
                     lease=lease,
                 )
 
@@ -4593,7 +4437,7 @@ def test_capacity_queued_notice_keeps_operator_accounting_out_of_the_reply(
             )
             h.fake_k8s.quota_rejection = rejection
 
-            event = _qevent("go")
+            event = qevent("go")
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 with pytest.raises(CapacityWaitRequested):
                     await h.kernel.process_event(event)
@@ -4616,8 +4460,7 @@ def test_capacity_queued_notice_keeps_operator_accounting_out_of_the_reply(
                     f"data and this text is read by a customer. Got: {reply!r}"
                 )
             assert "quota" not in reply.lower(), (
-                f"the capacity refusal must not name the quota mechanism at all. "
-                f"Got: {reply!r}"
+                f"the capacity refusal must not name the quota mechanism at all. Got: {reply!r}"
             )
 
             logged = "\n".join(record.getMessage() for record in caplog.records)
@@ -4667,7 +4510,7 @@ def test_approval_resume_capacity_retries_then_escalates(
                 hard={"limits.cpu": "8"},
             )
             endpoint = "http://127.0.0.1:43199"
-            ev = _qevent(
+            ev = qevent(
                 "approved continuation",
                 thread=thread,
                 event_id="approval-example-resolved",
@@ -4682,6 +4525,7 @@ def test_approval_resume_capacity_retries_then_escalates(
                 (
                     "C1",
                     "p-1",
+                    "curie-turn-failure: runner-error\n\n"
                     "The run failed (runner-error) after 3 attempt(s). "
                     "event_id=approval-example-resolved. Flagging for a human.",
                 )
@@ -4702,7 +4546,7 @@ def test_claim_timeout_without_quota_retries_then_escalates(make_harness) -> Non
             claim_timeout_seconds=0.02,
         ) as h:
             h.fake_k8s.bind_ready = False
-            ev = _qevent("go", event_id="evt-claim-timeout")
+            ev = qevent("go", event_id="evt-claim-timeout")
 
             await h.kernel.process_event(ev)
 
@@ -4712,6 +4556,7 @@ def test_claim_timeout_without_quota_retries_then_escalates(make_harness) -> Non
                 (
                     "C1",
                     "p-1",
+                    "curie-turn-failure: runner-error\n\n"
                     "The run failed (runner-error) after 3 attempt(s). "
                     "event_id=evt-claim-timeout. Flagging for a human.",
                 )
@@ -4730,9 +4575,9 @@ def test_interrupt_hard_stops_the_live_turn(make_harness) -> None:
             h.runner.default_script = [TextDelta(text="thinking")]
             h.runner.tail = [Final(text="stopped", status=IDLE)]
 
-            e1 = _qevent("start", thread="tI")
+            e1 = qevent("start", thread="tI")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             signalled = await h.kernel.interrupt_thread(_thread_key("tI"), "user stop")
             assert signalled is True
@@ -4766,7 +4611,7 @@ def test_interrupt_agent_signals_other_threads_past_a_wedged_runner(
             h.runner.default_script = [Final(text="hi", status=DONE)]
             threads = ("tKillA", "tKillB", "tKillC")
             for thread in threads:
-                await h.kernel.process_event(_qevent("hi", thread=thread))
+                await h.kernel.process_event(qevent("hi", thread=thread))
             h.kernel._active_by_agent[agent_id] = {_thread_key(t) for t in threads}
 
             monkeypatch.setattr(kernel_module, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
@@ -4796,7 +4641,7 @@ def test_duplicate_event_is_idempotent(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="one", status=DONE)]
-            ev = _qevent("hi", event_id="dup-1")
+            ev = qevent("hi", event_id="dup-1")
             await h.kernel.process_event(ev)
             await h.kernel.process_event(ev)  # same event id
 
@@ -4818,11 +4663,11 @@ def test_ordering_preserved_under_concurrent_sends(make_harness) -> None:
             # event open the turn and the second steer into it. Without that lock
             # the order (and whether a second turn is forked) would be a race, so
             # this asserts the ordering guarantee, not just that steering works.
-            e1 = _qevent("first", thread="tO", event_id="o1")
-            e2 = _qevent("second", thread="tO", event_id="o2")
+            e1 = qevent("first", thread="tO", event_id="o1")
+            e2 = qevent("second", thread="tO", event_id="o2")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
             t2 = asyncio.create_task(h.kernel.process_event(e2))
-            await _wait_until(lambda: h.runner.turn_active and bool(h.runner.steers))
+            await wait_until(lambda: h.runner.turn_active and bool(h.runner.steers))
 
             assert h.runner.opened == ["first"]  # exactly one turn, the first event
             assert h.runner.steers == ["second"]  # the second folded in as a steer
@@ -4836,7 +4681,7 @@ def test_ordering_preserved_under_concurrent_sends(make_harness) -> None:
 def test_prior_side_effect_marker_escalates_without_running(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
-            ev = _qevent("retry me", event_id="se-1")
+            ev = qevent("retry me", event_id="se-1")
             # A prior attempt executed a side effect then the worker crashed: the
             # marker is set but the event never reached done. It must escalate,
             # never re-run the non-idempotent action.
@@ -4855,7 +4700,7 @@ def test_suspended_thread_is_resumed_not_forked(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(_qevent("first", thread="tR"))
+            await h.kernel.process_event(qevent("first", thread="tR"))
 
             # Suspend the thread (records a rehydrate ref on the route).
             await asyncio.to_thread(h.substrate.suspend, _thread_key("tR"), history_ref="hist-1")
@@ -4863,7 +4708,7 @@ def test_suspended_thread_is_resumed_not_forked(make_harness) -> None:
             # A new event on a suspended thread must resume (carry the history)
             # rather than silently fork a fresh, history-less session.
             h.runner.default_script = [Final(text="resumed", status=DONE)]
-            await h.kernel.process_event(_qevent("second", thread="tR"))
+            await h.kernel.process_event(qevent("second", thread="tR"))
 
             assert h.runner.opened == ["first", "second"]
             assert h.sink.last_text == "resumed"
@@ -4882,7 +4727,7 @@ def test_live_route_reuse_refreshes_ttl(make_harness) -> None:
         async with make_harness() as h:
             # First event creates a live route with the substrate's route TTL.
             h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(_qevent("first", thread="tTTL"))
+            await h.kernel.process_event(qevent("first", thread="tTTL"))
 
             route_key = await _route_key(h.async_redis, _thread_key("tTTL"))
             # Simulate time passing by dropping the TTL low.
@@ -4893,7 +4738,7 @@ def test_live_route_reuse_refreshes_ttl(make_harness) -> None:
             # refresh the TTL (a regression to lookup() would leave it at ~5 and
             # let the reaper delete a busy thread's sandbox).
             h.runner.default_script = [Final(text="two", status=DONE)]
-            await h.kernel.process_event(_qevent("second", thread="tTTL"))
+            await h.kernel.process_event(qevent("second", thread="tTTL"))
             assert await h.async_redis.ttl(route_key) > 5
 
     asyncio.run(go())
@@ -4907,13 +4752,13 @@ def test_steered_followup_placeholder_is_retired(make_harness) -> None:
             h.runner.default_script = [TextDelta(text="w")]
             h.runner.tail = [Final(text="done", status=DONE)]
 
-            e1 = _qevent("first", thread="tPH", placeholder="ph-1")
+            e1 = qevent("first", thread="tPH", placeholder="ph-1")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             # The follow-up carries its own placeholder; once steered, that
             # placeholder must be retired (not left stuck on "working").
-            e2 = _qevent("second", thread="tPH", placeholder="ph-2")
+            e2 = qevent("second", thread="tPH", placeholder="ph-2")
             await h.kernel.process_event(e2)
 
             folded = [u for u in h.sink.updates if u[1] == "ph-2"]
@@ -4930,7 +4775,7 @@ def test_order_lock_map_evicts_after_processing(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="ok", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tEV"))
+            await h.kernel.process_event(qevent("hi", thread="tEV"))
             # Ref-counted eviction: no per-thread lock entry lingers once the last
             # holder releases (a regression would leak one entry per thread seen).
             assert h.kernel._order_locks == {}
@@ -4997,7 +4842,7 @@ def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "hi",
                     thread="tClusterMessageAdapter",
                     placeholder="123e4567-e89b-42d3-a456-426614174000",
@@ -5007,9 +4852,7 @@ def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
 
             routes = h.sink.routes_for("reply.update")
             assert routes, "the completed turn emitted no reply update"
-            assert set(routes) == {
-                TargetRoute(endpoint=None, adapter="curie-cluster-message")
-            }
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
 
     asyncio.run(go())
 
@@ -5023,16 +4866,16 @@ def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
             h.runner.default_script = [TextDelta(text="w")]
             h.runner.tail = [Final(text="done", status=DONE)]
 
-            e1 = _qevent("first", thread="tTok")
+            e1 = qevent("first", thread="tTok")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             # Event path: the opening /v1/event carried the claim-minted token.
             assert h.runner.event_headers
             assert h.runner.event_headers[-1].get("Authorization") == "Bearer tok-24"
 
             # Steer path: a follow-up folded into the live turn carries it too.
-            await h.kernel.process_event(_qevent("second", thread="tTok"))
+            await h.kernel.process_event(qevent("second", thread="tTok"))
             assert h.runner.steer_headers
             assert h.runner.steer_headers[-1].get("Authorization") == "Bearer tok-24"
 
@@ -5063,7 +4906,7 @@ def test_no_edit_streaming_edits_placeholder_once(make_harness) -> None:
         async with make_harness(slack_no_edit_streaming=True) as h:
             # Text and tool frames arrive, but no edit mode updates only the final.
             h.runner.default_script = list(_MULTI_DELTA)
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert len(h.sink.updates) == 1
             assert h.sink.last_text == "abc final"
@@ -5082,7 +4925,7 @@ def test_no_edit_streaming_suppresses_tool_context_and_finalizes_once(
                 Final(text="final answer", status=DONE),
             ]
 
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert h.sink.updates == [("C1", "p-1", "final answer")]
 
@@ -5096,7 +4939,7 @@ def test_default_streaming_edits_more_than_once(make_harness) -> None:
         # more than one edit, proving the flag actually changes behavior.
         async with make_harness() as h:
             h.runner.default_script = list(_MULTI_DELTA)
-            await h.kernel.process_event(_qevent("go"))
+            await h.kernel.process_event(qevent("go"))
 
             assert len(h.sink.updates) > 1
             assert h.sink.last_text == "abc final"
@@ -5115,7 +4958,7 @@ def test_booting_state_edits_placeholder_before_answer(make_harness) -> None:
                 TextDelta(text="world"),
                 Final(text="Hello world", status=DONE),
             ]
-            ev = _qevent("hi", thread="tBOOT", placeholder="ph-boot")
+            ev = qevent("hi", thread="tBOOT", placeholder="ph-boot")
             await h.kernel.process_event(ev)
 
             booting = h.config.booting_text
@@ -5146,7 +4989,7 @@ def test_reply_endpoint_is_threaded_to_the_sink(make_harness) -> None:
                 Final(text="done", status=DONE),
             ]
             await h.kernel.process_event(
-                _qevent("hi", thread="tEP", endpoint="http://stub:8155/api/")
+                qevent("hi", thread="tEP", endpoint="http://stub:8155/api/")
             )
 
             assert h.sink.last_text == "done"
@@ -5163,7 +5006,7 @@ def test_reply_endpoint_defaults_to_none_for_the_worker_default(make_harness) ->
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="ok", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tEPNONE"))
+            await h.kernel.process_event(qevent("hi", thread="tEPNONE"))
             assert set(h.sink.update_endpoints) == {None}
 
     asyncio.run(go())
@@ -5200,7 +5043,7 @@ def test_booting_update_failure_never_fails_the_turn(make_harness) -> None:
 
             h.sink.emit = flaky_emit  # type: ignore[method-assign]
 
-            ev = _qevent("hi", thread="tBOOTFAIL", placeholder="ph-boot-fail")
+            ev = qevent("hi", thread="tBOOTFAIL", placeholder="ph-boot-fail")
             await h.kernel.process_event(ev)
 
             assert fired["n"] > 0, "the booting update was never attempted"
@@ -5220,7 +5063,7 @@ def test_release_thread_force_releases_a_live_route(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tRelease"))
+            await h.kernel.process_event(qevent("hi", thread="tRelease"))
             assert h.substrate.lookup(_thread_key("tRelease")) is not None  # the route is live
 
             released = await h.kernel.release_thread(_thread_key("tRelease"))
@@ -5258,7 +5101,7 @@ def test_workspace_reaper_holds_the_route_lock_during_exact_ledger_recheck(
 
             h.kernel._workspace = GatedWorkspace()  # type: ignore[assignment]
             reaping = asyncio.create_task(h.kernel.reap_orphans())
-            await _wait_until(entered.is_set)
+            await wait_until(entered.is_set)
 
             contender = asyncio.create_task(h.kernel._lock.acquire(h.config.lock_key(thread)))
             try:
@@ -5286,9 +5129,9 @@ def test_release_thread_interrupts_a_live_turn_first(make_harness) -> None:
             h.runner.default_script = [TextDelta(text="thinking")]
             h.runner.tail = [Final(text="stopped", status=IDLE)]
 
-            e1 = _qevent("start", thread="tReleaseMidTurn")
+            e1 = qevent("start", thread="tReleaseMidTurn")
             t1 = asyncio.create_task(h.kernel.process_event(e1))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             released = await h.kernel.release_thread(_thread_key("tReleaseMidTurn"))
             assert released is True
@@ -5319,7 +5162,7 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tWedged"))
+            await h.kernel.process_event(qevent("hi", thread="tWedged"))
             assert h.substrate.lookup(_thread_key("tWedged")) is not None  # the route is live
 
             monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
@@ -5351,7 +5194,7 @@ def test_release_thread_releases_when_the_interrupt_raises(make_harness, monkeyp
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
-            await h.kernel.process_event(_qevent("hi", thread="tInterruptBoom"))
+            await h.kernel.process_event(qevent("hi", thread="tInterruptBoom"))
             assert h.substrate.lookup(_thread_key("tInterruptBoom")) is not None
 
             async def boom(base_url: str, reason: str, token: str | None = None) -> None:
@@ -5397,7 +5240,7 @@ def test_release_serializes_against_a_concurrent_turn_start(make_harness) -> Non
             h.runner.default_script = [Final(text="ok", status=DONE)]
 
             # Establish a live route with a concrete, idle sandbox.
-            await h.kernel.process_event(_qevent("first", thread="tRace"))
+            await h.kernel.process_event(qevent("first", thread="tRace"))
             old = h.substrate.lookup(_thread_key("tRace"))
             assert old is not None
             old_claim = old.claim_name
@@ -5416,11 +5259,11 @@ def test_release_serializes_against_a_concurrent_turn_start(make_harness) -> Non
             h.substrate.release = gated_release  # type: ignore[method-assign]
 
             reset = asyncio.create_task(h.kernel.release_thread(_thread_key("tRace")))
-            await _wait_until(release_entered.is_set)  # release now holds the lock
+            await wait_until(release_entered.is_set)  # release now holds the lock
 
             # A new message for the same thread races the reset. It must block on
             # the route lock the release holds, not adopt the doomed sandbox.
-            turn = asyncio.create_task(h.kernel.process_event(_qevent("second", thread="tRace")))
+            turn = asyncio.create_task(h.kernel.process_event(qevent("second", thread="tRace")))
             await asyncio.sleep(0.2)
             assert h.runner.opened == ["first"], "turn started while the reset held the lock"
 
@@ -5451,7 +5294,7 @@ def test_claim_latency_is_logged(make_harness, caplog) -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
-                await h.kernel.process_event(_qevent("hi", thread="tLatency"))
+                await h.kernel.process_event(qevent("hi", thread="tLatency"))
 
             matches = [
                 r.getMessage()
@@ -5489,9 +5332,11 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
             def release_order() -> None:
                 released.append(True)
 
-            qe = _qevent("go", thread=thread)
+            qe = qevent("go", thread=thread)
             outcome = await h.kernel._attempt(
-                qe, TargetRoute(), release_order,
+                qe,
+                TargetRoute(),
+                release_order,
                 pressure_retried=False,
                 workspace_inference=kernel_module._WorkspaceInferenceCarry(),
             )
@@ -5525,11 +5370,11 @@ def test_lock_acquire_timeout_retries_in_process(make_harness) -> None:
             async def unsquat() -> None:
                 # Each attempt opens with a "booting" edit before it touches the
                 # lock, so a second one means attempt 1 already gave up.
-                await _wait_until(lambda: len(h.sink.updates) >= 2)
+                await wait_until(lambda: len(h.sink.updates) >= 2)
                 await h.async_redis.delete(lock_key)
 
             freeing = asyncio.create_task(unsquat())
-            ev = _qevent("go", thread=thread)
+            ev = qevent("go", thread=thread)
             await h.kernel.process_event(ev)
             await freeing
 
@@ -5574,7 +5419,7 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     from curie_dispatcher.queue import to_stream_fields
 
     await h.async_redis.xadd(
-        h.config.stream, to_stream_fields(_qevent("reclaimed", event_id=event_id))
+        h.config.stream, to_stream_fields(qevent("reclaimed", event_id=event_id))
     )
     rows = await h.async_redis.xreadgroup(
         h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
@@ -5584,7 +5429,10 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     for _ in range(generation):
         if lease is not None:
             await store.release(
-                h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                owner=lease.owner,
                 resume_event_id=None,
             )
         lease = await store.acquire(
@@ -5630,9 +5478,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -5642,7 +5488,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(_qevent("first", thread="steer-1", event_id="steer-1")),
+                to_stream_fields(qevent("first", thread="steer-1", event_id="steer-1")),
             )
             rows = await h.async_redis.xreadgroup(
                 h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
@@ -5658,10 +5504,10 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
                 )
             )[0]["times_delivered"]
             await consumer._dispatch(entry_id, dict(fields))
-            await _wait_until(lambda: h.runner.turn_active)
+            await wait_until(lambda: h.runner.turn_active)
 
             # Early in the turn: a same-thread follow-up steers.
-            await h.kernel.process_event(_qevent("second", thread="steer-1"))
+            await h.kernel.process_event(qevent("second", thread="steer-1"))
             assert h.runner.steers == ["second"]
             assert h.runner.opened == ["first"]
 
@@ -5669,7 +5515,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
             # lease that is still live and has burned no deliveries.
             await asyncio.sleep(3 * _LEASE_TTL_S)
             assert await store.is_live(h.config.stream, h.config.consumer_group, entry_id)
-            await h.kernel.process_event(_qevent("third", thread="steer-1"))
+            await h.kernel.process_event(qevent("third", thread="steer-1"))
             assert h.runner.steers == ["second", "third"]
             assert h.runner.opened == ["first"], "a steer opened a second turn"
             after = (
@@ -5691,7 +5537,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
             # than retrying the steer (kernel rule 2).
             h.runner.hold = None
             h.runner.default_script = [Final(text="fresh", status=DONE)]
-            await h.kernel.process_event(_qevent("fourth", thread="steer-1"))
+            await h.kernel.process_event(qevent("fourth", thread="steer-1"))
             assert h.runner.steers == ["second", "third"], "the 409 steer was retried"
             assert h.runner.opened == ["first", "fourth"]
             assert h.sink.last_text == "fresh"
@@ -5732,7 +5578,7 @@ def test_a_reclaimed_delivery_with_a_side_effect_marker_never_runs_the_runner_ag
             h.runner.default_script = [Final(text="ok", status=DONE)]
 
             lease = await _leased_entry(h, store, event_id="pre-se", generation=2)
-            ev = _qevent("retry me", thread="pre-se", event_id="pre-se")
+            ev = qevent("retry me", thread="pre-se", event_id="pre-se")
             await h.async_redis.set(h.config.side_effect_key(ev.event_id), "1")
 
             await h.kernel.process_event(ev, lease=lease)
@@ -5744,7 +5590,7 @@ def test_a_reclaimed_delivery_with_a_side_effect_marker_never_runs_the_runner_ag
 
             # NEGATIVE CONTROL: same generation, no marker -> the turn runs.
             clean_lease = await _leased_entry(h, store, event_id="pre-clean", generation=2)
-            clean = _qevent("run me", thread="pre-clean", event_id="pre-clean")
+            clean = qevent("run me", thread="pre-clean", event_id="pre-clean")
             await h.kernel.process_event(clean, lease=clean_lease)
             assert h.runner.opened == ["run me"]
 
@@ -5785,21 +5631,21 @@ def test_a_reclaimed_delivery_interrupts_a_still_active_retained_runner(
 
             # A first, ordinary turn so the thread has a retained sandbox.
             h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(_qevent("first", thread="pre-live"))
+            await h.kernel.process_event(qevent("first", thread="pre-live"))
             assert h.runner.opened == ["first"]
 
             # The retained runner reports a live turn (the previous owner's).
             h.runner.turn_active = True
 
             async def idle_on_interrupt() -> None:
-                await _wait_until(lambda: h.runner.interrupts >= 1, timeout=10.0)
+                await wait_until(lambda: h.runner.interrupts >= 1, timeout=10.0)
                 h.runner.turn_active = False
 
             watcher = asyncio.create_task(idle_on_interrupt())
             lease = await _leased_entry(h, store, event_id="pre-live-2", generation=2)
             h.runner.default_script = [Final(text="two", status=DONE)]
             await h.kernel.process_event(
-                _qevent("second", thread="pre-live", event_id="pre-live-2"), lease=lease
+                qevent("second", thread="pre-live", event_id="pre-live-2"), lease=lease
             )
             await watcher
 
@@ -5813,7 +5659,7 @@ def test_a_reclaimed_delivery_interrupts_a_still_active_retained_runner(
             idle_lease = await _leased_entry(h, store, event_id="pre-idle", generation=2)
             h.runner.default_script = [Final(text="three", status=DONE)]
             await h.kernel.process_event(
-                _qevent("third", thread="pre-live", event_id="pre-idle"), lease=idle_lease
+                qevent("third", thread="pre-live", event_id="pre-idle"), lease=idle_lease
             )
             assert h.runner.interrupts == interrupts_before, (
                 "an idle runner was interrupted: the preflight is unconditional"
@@ -5852,20 +5698,16 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             # A first turn so the thread retains a sandbox to be read.
             h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(_qevent("first", thread="pre-blind"))
+            await h.kernel.process_event(qevent("first", thread="pre-blind"))
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("second", thread="pre-blind", event_id="pre-blind-2")
-                ),
+                to_stream_fields(qevent("second", thread="pre-blind", event_id="pre-blind-2")),
             )
             rows = await h.async_redis.xreadgroup(
                 h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
@@ -5880,7 +5722,10 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
                 consumer=h.config.consumer_name,
             )
             await store.release(
-                h.config.stream, h.config.consumer_group, entry_id, owner=first.owner,
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                owner=first.owner,
                 resume_event_id=None,
             )
 
@@ -5939,7 +5784,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
             def release_order() -> None:
                 released.append(True)
 
-            qe = _qevent("go", thread="tStreamTimeout")
+            qe = qevent("go", thread="tStreamTimeout")
             try:
                 with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                     outcome = await h.kernel._attempt(
@@ -5958,9 +5803,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
             assert released, "the order lock was not released on the timed-out turn"
 
             dropped = [
-                r.getMessage()
-                for r in caplog.records
-                if "turn stream dropped" in r.getMessage()
+                r.getMessage() for r in caplog.records if "turn stream dropped" in r.getMessage()
             ]
             assert dropped, caplog.text
             message = dropped[-1]
@@ -5987,7 +5830,7 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
-            ev = _qevent("do it", thread="tTimeoutSideEffect")
+            ev = qevent("do it", thread="tTimeoutSideEffect")
             try:
                 await h.kernel.process_event(ev)
             finally:
@@ -6027,13 +5870,11 @@ def test_unconfirmed_stream_timeout_never_retries_and_settles_once(
             h.runner.timeout_delay_seconds = timeout_delay_seconds
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="partial")]
-            event = _qevent("go", thread="tTimeoutUnconfirmed")
+            event = qevent("go", thread="tTimeoutUnconfirmed")
             processing = asyncio.create_task(h.kernel.process_event(event))
             try:
                 if timeout_delay_seconds:
-                    await asyncio.wait_for(
-                        h.runner.timeout_handler_entered.wait(), timeout=1.0
-                    )
+                    await asyncio.wait_for(h.runner.timeout_handler_entered.wait(), timeout=1.0)
                     assert not processing.done()
                 await processing
             finally:
@@ -6063,7 +5904,7 @@ def test_unconfirmed_stream_timeout_after_side_effect_displays_its_local_cause(
             h.runner.timeout_status = 409
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
-            event = _qevent("go", thread="tTimeoutUnconfirmedSideEffect")
+            event = qevent("go", thread="tTimeoutUnconfirmedSideEffect")
             try:
                 await h.kernel.process_event(event)
             finally:
@@ -6088,12 +5929,10 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
             hold = asyncio.Event()
             h.runner.timeout_status = 409
             h.runner.hold = hold
-            h.runner.default_script = [
-                ErrorEvent(message="limited", classification="rate-limit")
-            ]
+            h.runner.default_script = [ErrorEvent(message="limited", classification="rate-limit")]
             try:
                 outcome = await h.kernel._attempt(
-                    _qevent("go", thread="tTimeoutEarlierError"),
+                    qevent("go", thread="tTimeoutEarlierError"),
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
@@ -6116,6 +5955,18 @@ def test_history_persistence_error_has_dedicated_factory_cause() -> None:
     )
 
     assert kernel_module._escalation_cause(failure) == "history_capacity"
+
+
+def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
+    max_turns = kernel_module.TurnOutcome(
+        terminal_ok=False, classification="max-turns"
+    )
+    unclassified = kernel_module.TurnOutcome(
+        terminal_ok=False, classification="unclassified"
+    )
+
+    assert kernel_module._escalation_cause(max_turns) == "max_turns"
+    assert kernel_module._escalation_cause(unclassified) == "unclassified"
 
 
 @pytest.mark.parametrize(
@@ -6143,7 +5994,7 @@ def test_history_persistence_error_never_retries_and_settles_once(
                 ),
                 Final(text="failed", status=FAIL),
             ]
-            event = _qevent("go", event_id=event_id)
+            event = qevent("go", event_id=event_id)
             await h.kernel.process_event(event)
 
             assert h.runner.opened == ["go"]
@@ -6174,9 +6025,7 @@ def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadlin
             accepted.set()
             try:
                 await release.wait()
-                return web.json_response(
-                    {"id": "action-example", "status": "pending"}, status=201
-                )
+                return web.json_response({"id": "action-example", "status": "pending"}, status=201)
             finally:
                 handler_done.set()
 
@@ -6203,7 +6052,7 @@ def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadlin
                     ),
                     Final(text="done", status=DONE),
                 ]
-                event = _qevent("do it", thread="tBufferedActionTimeout")
+                event = qevent("do it", thread="tBufferedActionTimeout")
                 started = asyncio.get_running_loop().time()
                 await asyncio.wait_for(h.kernel.process_event(event), timeout=3.0)
                 elapsed = asyncio.get_running_loop().time() - started
@@ -6217,9 +6066,7 @@ def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadlin
                 assert "human" in h.sink.last_text.lower()
                 assert "runner-timeout" in h.sink.last_text
                 assert len(h.sink.completions) == 1
-                assert await h.async_redis.exists(
-                    h.config.side_effect_key(event.event_id)
-                )
+                assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
                 assert await h.async_redis.exists(h.config.done_key(event.event_id))
         finally:
             release.set()
@@ -6280,12 +6127,12 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
                 # cancelled by the disconnect unwinds inside that window; either
                 # way the probe finds an idle session (409 on the steer) and a
                 # NEW turn is opened.
-                await _wait_until(lambda: len(h.runner.opened) >= 1)
+                await wait_until(lambda: len(h.runner.opened) >= 1)
                 await asyncio.sleep(0.6)
                 hold.set()
 
             releasing = asyncio.create_task(release_after_the_budget_expires())
-            ev = _qevent("go", thread="tTimeoutRetry")
+            ev = qevent("go", thread="tTimeoutRetry")
             try:
                 await h.kernel.process_event(ev)
             finally:
@@ -6330,10 +6177,12 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
 
             monkeypatch.setattr(h.kernel, "_apply_frame", stalled_delivery)
 
-            qe = _qevent("go", thread="tReplyTimeout")
+            qe = qevent("go", thread="tReplyTimeout")
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 outcome = await h.kernel._attempt(
-                    qe, TargetRoute(), lambda: None,
+                    qe,
+                    TargetRoute(),
+                    lambda: None,
                     pressure_retried=False,
                     workspace_inference=kernel_module._WorkspaceInferenceCarry(),
                 )
@@ -6342,9 +6191,7 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
             assert outcome.classification == "runner-error"
 
             dropped = [
-                r.getMessage()
-                for r in caplog.records
-                if "turn stream dropped" in r.getMessage()
+                r.getMessage() for r in caplog.records if "turn stream dropped" in r.getMessage()
             ]
             assert dropped, caplog.text
             message = dropped[-1]
@@ -6352,7 +6199,6 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
             assert reason, f"the drop reason is empty: {message!r}"
 
     asyncio.run(go())
-
 
 
 @pytest.mark.parametrize("keepalive", [True, False], ids=["refreshed", "control"])
@@ -6387,14 +6233,12 @@ def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
                 await asyncio.sleep(2.5)
                 # Age every claim past the bind grace so only the route can
                 # spare it: grace = claim_timeout_seconds + 30 s margin.
-                h.substrate._config = replace(
-                    h.substrate._config, claim_timeout_seconds=-60.0
-                )
+                h.substrate._config = replace(h.substrate._config, claim_timeout_seconds=-60.0)
                 reaped.extend(await asyncio.to_thread(h.substrate.reap_orphans))
                 hold.set()
 
             reaper = asyncio.create_task(reap_mid_turn())
-            await asyncio.wait_for(h.kernel.process_event(_qevent("long turn")), timeout=10.0)
+            await asyncio.wait_for(h.kernel.process_event(qevent("long turn")), timeout=10.0)
             await reaper
             assert calls, "the route was never refreshed while the turn streamed"
             if keepalive:
@@ -6427,13 +6271,11 @@ def test_missing_agent_pool_is_terminal_and_names_the_fix(
 
             def refuse(thread_key: str, **_kwargs: object) -> SandboxHandle:
                 attempts.append(thread_key)
-                raise MissingAgentPoolError(
-                    "cli-bot", "curie-agent-cli-bot-runner-pool"
-                )
+                raise MissingAgentPoolError("cli-bot", "curie-agent-cli-bot-runner-pool")
 
             monkeypatch.setattr(h.substrate, "claim", refuse)
             with caplog.at_level(logging.WARNING):
-                await h.kernel.process_event(_qevent("hello", thread="tNoPool"))
+                await h.kernel.process_event(qevent("hello", thread="tNoPool"))
 
             assert len(attempts) == 1
             assert h.runner.opened == []

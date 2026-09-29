@@ -247,6 +247,22 @@ class _UnknownExpiryPressureRedis:
         return pipeline
 
 
+async def _warm(pressure_client: AsyncRedis) -> None:
+    """Open the pressure connection before the behavior under test runs.
+
+    The client keeps production's 1s fail-fast budget so the inventory calls are
+    held to it. Only this setup connect may retry: a loaded CI Valkey can stall
+    a first connect past 1s, and that stall is not what these tests pin.
+    """
+    for _ in range(4):
+        try:
+            await pressure_client.ping()
+            return
+        except (TimeoutError, redis.exceptions.TimeoutError):
+            continue
+    await pressure_client.ping()
+
+
 @asynccontextmanager
 async def _pressure_store(
     redis_client: redis.Redis,
@@ -256,7 +272,7 @@ async def _pressure_store(
     record: bool = False,
 ) -> AsyncIterator[tuple[AffinityStore, _RecordingPressureRedis | None]]:
     pressure_client = pressure_redis_factory()
-    await pressure_client.ping()
+    await _warm(pressure_client)
     recording = _RecordingPressureRedis(pressure_client) if record else None
     store = AffinityStore(
         redis_client,

@@ -375,7 +375,7 @@ def test_button_click_enqueues_a_turn(
     assert queued.event_id == "action-trig-env-1"
 
 
-def test_both_mint_sites_stamp_kind_slack_and_no_adapter(
+def test_both_mint_sites_stamp_kind_slack_and_the_default_identity(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
     """T-A17 / AC1 (plan EB-A19, round-5 item 2). The Slack mint, BOTH lanes.
@@ -388,10 +388,9 @@ def test_both_mint_sites_stamp_kind_slack_and_no_adapter(
 
     `kind` is the literal `"slack"`, not config-derived: a Socket Mode dispatcher
     that could claim another kind is itself a misrouting vector. `adapter` is
-    None because Slack's egress route is the worker's configured origin (D4.4),
-    and it is asserted rather than left unmentioned so a later change cannot
-    quietly start stamping a slug the worker would then look a credential up
-    under.
+    the identity whose app the delivery arrived on, `default` here, stamped by
+    name (ADR-0168 decision 3), and it is asserted rather than left unmentioned
+    so neither lane can drift back to minting none.
     """
 
     app, _ = _build(config, redis_client)
@@ -410,7 +409,7 @@ def test_both_mint_sites_stamp_kind_slack_and_no_adapter(
 
     for event_id, turn in by_event.items():
         assert turn.reply_handle.kind == "slack", event_id
-        assert turn.reply_handle.adapter is None, event_id
+        assert turn.reply_handle.adapter == "default", event_id
 
 
 CHANNEL_A = "C0EXAMPLE1"

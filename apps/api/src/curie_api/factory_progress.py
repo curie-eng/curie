@@ -8,6 +8,7 @@ the pure phase view the status comment and the SVG card render from.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from .workitems import _lock_active_request
 PROGRESS_SCOPE = "work_item.progress"
 REPORT_LIMIT = 200
 PHASE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+VERIFICATION_PREFLIGHT_PHASE = "verification_preflight"
+VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
 
 
 class _Strict(BaseModel):
@@ -64,6 +67,8 @@ class Declaration(_Strict):
         ids = [phase.id for phase in self.phases]
         if len(set(ids)) != len(ids):
             raise ValueError("declaration phase ids must be unique")
+        if VERIFICATION_PREFLIGHT_PHASE in ids:
+            raise ValueError("verification_preflight is a reserved phase")
         for loop in self.loops:
             if loop.start not in ids or loop.review not in ids:
                 raise ValueError("a loop names an undeclared phase")
@@ -118,6 +123,8 @@ class ProgressReport(_Strict):
 
     @model_validator(mode="after")
     def _against_declaration(self) -> ProgressReport:
+        if self.phase == VERIFICATION_PREFLIGHT_PHASE:
+            raise ValueError("verification_preflight is a reserved phase")
         if self.phase not in {phase.id for phase in self.declaration.phases}:
             raise ValueError("phase is not declared")
         if self.round is not None:
@@ -129,10 +136,73 @@ class ProgressReport(_Strict):
         return self
 
 
+class VerificationObservation(_Strict):
+    """Exact sandbox command result recorded before the model starts."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command: str = Field(min_length=1, max_length=180)
+    outcome: Literal["passed", "unavailable", "failed"]
+    exit_status: int | None = Field(ge=-255, le=255)
+    missing_binaries: list[str] = Field(max_length=8)
+    blocked_services: list[str] = Field(max_length=8)
+
+    @field_validator("command")
+    @classmethod
+    def _command_not_blank(cls, value: str) -> str:
+        if value != VERIFICATION_COMMAND:
+            raise ValueError("command must be the documented factory verification check")
+        return value
+
+    @field_validator("missing_binaries", "blocked_services")
+    @classmethod
+    def _unique_nonblank_names(
+        cls, values: list[str], info: ValidationInfo
+    ) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            name = value.strip()
+            if not name or len(name) > 64:
+                raise ValueError(
+                    f"{info.field_name} entries must be 1 to 64 characters"
+                )
+            normalized.append(name)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"{info.field_name} entries must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def _consistent_result(self) -> VerificationObservation:
+        has_blocker = bool(self.missing_binaries or self.blocked_services)
+        if self.outcome == "unavailable":
+            if self.exit_status is not None or not has_blocker:
+                raise ValueError("unavailable requires blockers and a null exit_status")
+        elif self.outcome == "passed":
+            if self.exit_status != 0 or has_blocker:
+                raise ValueError("passed requires exit_status 0 and no blockers")
+        elif self.exit_status in (None, 0):
+            raise ValueError("failed requires a nonzero exit_status")
+        note = json.dumps(self.model_dump(), sort_keys=True, separators=(",", ":"))
+        if len(note.encode("utf-8")) > 280:
+            raise ValueError("verification observation exceeds the 280-byte storage limit")
+        return self
+
+
+def verification_observation_note(observation: VerificationObservation) -> str:
+    """Serialize a validated observation into its compact, deterministic note."""
+
+    return json.dumps(observation.model_dump(), sort_keys=True, separators=(",", ":"))
+
+
 @dataclass(frozen=True)
 class RecordResult:
     outcome: Literal[
-        "recorded", "request_not_found", "no_active_request", "declaration_changed", "report_limit"
+        "recorded",
+        "request_not_found",
+        "no_active_request",
+        "declaration_changed",
+        "report_limit",
+        "verification_exists",
     ]
     request_id: uuid.UUID | None = None
 
@@ -204,6 +274,95 @@ async def record_report(
         row.activity = body.activity.model_dump(exclude_none=True)
     await session.commit()
     return RecordResult("recorded", active.id)
+
+
+async def record_verification(
+    session: AsyncSession,
+    *,
+    token_request_id: uuid.UUID,
+    body: VerificationObservation,
+) -> RecordResult:
+    """Store the one immutable preflight observation on the token's active request."""
+
+    token_request: ExecutionRequest | None = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == token_request_id).with_for_update()
+    )
+    if token_request is None:
+        await session.rollback()
+        return RecordResult("request_not_found")
+    active = await _lock_active_request(session, token_request.work_item_id)
+    if active is None or active.id != token_request.id:
+        await session.rollback()
+        return RecordResult("no_active_request")
+    active_id = active.id
+
+    existing_id = await session.scalar(
+        select(ExecutionRequestPhaseReport.id)
+        .where(
+            ExecutionRequestPhaseReport.execution_request_id == active_id,
+            ExecutionRequestPhaseReport.phase == VERIFICATION_PREFLIGHT_PHASE,
+        )
+        .limit(1)
+    )
+    if existing_id is not None:
+        await session.rollback()
+        return RecordResult("verification_exists", active_id)
+
+    count = await session.scalar(
+        select(func.count())
+        .select_from(ExecutionRequestPhaseReport)
+        .where(ExecutionRequestPhaseReport.execution_request_id == active_id)
+    )
+    if (count or 0) >= REPORT_LIMIT:
+        await session.rollback()
+        return RecordResult("report_limit", active_id)
+
+    session.add(
+        ExecutionRequestPhaseReport(
+            execution_request_id=active_id,
+            phase=VERIFICATION_PREFLIGHT_PHASE,
+            note=verification_observation_note(body),
+        )
+    )
+    await session.commit()
+    return RecordResult("recorded", active_id)
+
+
+async def read_verification_observation(
+    session: AsyncSession, request_id: uuid.UUID
+) -> VerificationObservation | None:
+    """Read and validate the stored preflight observation, if one exists.
+
+    A missing row is distinct from an unreadable row. Malformed persisted data
+    raises ``ValueError`` so callers can fail closed instead of treating it as
+    a successful sandbox verification.
+    """
+
+    notes = list(
+        await session.scalars(
+            select(ExecutionRequestPhaseReport.note)
+            .where(
+                ExecutionRequestPhaseReport.execution_request_id == request_id,
+                ExecutionRequestPhaseReport.phase == VERIFICATION_PREFLIGHT_PHASE,
+            )
+            .limit(2)
+        )
+    )
+    if not notes:
+        return None
+    if len(notes) != 1:
+        raise ValueError("multiple stored verification observations are unreadable")
+    note = notes[0]
+    if not isinstance(note, str):
+        raise ValueError("stored verification observation is unreadable")
+    try:
+        raw = json.loads(note)
+        observation = VerificationObservation.model_validate(raw)
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("stored verification observation is unreadable") from exc
+    if verification_observation_note(observation) != note:
+        raise ValueError("stored verification observation is not canonical")
+    return observation
 
 
 WAIT_CI_PHASE = "wait_ci"
@@ -457,6 +616,7 @@ def phase_view(
 
 
 _PILLS: dict[str, tuple[str, str, bool]] = {
+    "queued": ("QUEUED", "#9a6700", False),
     "waiting": ("QUEUED", "#9a6700", False),
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),

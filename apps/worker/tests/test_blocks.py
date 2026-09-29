@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from channel_protocol import Action, ChoiceIntent, ConfirmIntent, OutboundMessage
 from curie_worker.behaviorpacks import NavPack
 from curie_worker.blocks import Reply, _reply_from_message, chunk, parse_reply, render, to_blocks
@@ -13,21 +14,12 @@ _NAV = NavPack(enabled=True, hub_label="Help", hub_command="help")
 
 
 def _action_ids(blocks: list[dict]) -> list[str]:
-    return [
-        e["action_id"]
-        for b in blocks
-        if b["type"] == "actions"
-        for e in b["elements"]
-    ]
+    return [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
 
 
 def _action_labels(blocks: list[dict]) -> list[str]:
-    return [
-        e["text"]["text"]
-        for b in blocks
-        if b["type"] == "actions"
-        for e in b["elements"]
-    ]
+    return [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+
 
 _BLOCK = """Here you go:
 
@@ -166,21 +158,19 @@ def test_parse_reply_maps_versioned_confirmation_to_two_actions() -> None:
     assert reply.buttons == [("Deploy", "deploy"), ("Cancel", "cancel")]
 
 
-def test_versioned_reply_rejects_unknown_channel_native_fields() -> None:
-    assert (
-        parse_reply(
-            '```curie-reply\n{"version":"1.0","text":"x","blocks":[]}\n```'
-        )
-        is None
-    )
-
-
-def test_parse_reply_none_without_a_block() -> None:
-    assert parse_reply("just a normal answer") is None
-
-
-def test_parse_reply_defensive_on_bad_json() -> None:
-    assert parse_reply("```curie-reply\n{not json}\n```") is None
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            '```curie-reply\n{"version":"1.0","text":"x","blocks":[]}\n```',
+            id="versioned-reply-with-channel-native-fields",
+        ),
+        pytest.param("just a normal answer", id="no-block"),
+        pytest.param("```curie-reply\n{not json}\n```", id="bad-json"),
+    ],
+)
+def test_parse_reply_returns_none(raw: str) -> None:
+    assert parse_reply(raw) is None
 
 
 def test_render_complete_block_returns_blocks() -> None:
@@ -192,7 +182,7 @@ def test_render_complete_block_returns_blocks() -> None:
 
 def test_render_hides_half_streamed_block() -> None:
     # Fence opened mid-stream, not yet closed: never show the raw JSON.
-    partial = "Working...\n```curie-reply\n{\"header\": \"T"
+    partial = 'Working...\n```curie-reply\n{"header": "T'
     text, blocks = render(partial)
     assert blocks is None
     assert "curie-reply" not in text
@@ -322,9 +312,9 @@ def test_parse_reply_extracts_links() -> None:
 
 def test_parse_reply_drops_malformed_links() -> None:
     reply = parse_reply(
-        '```curie-reply\n'
+        "```curie-reply\n"
         '{"links": [["only-one"], ["a", "b", "c"], ["Docs", "https://x/y"]], "text": "b"}\n'
-        '```'
+        "```"
     )
     assert reply is not None
     assert reply.links == [("Docs", "https://x/y")]  # 1-elem and 3-elem entries dropped
@@ -398,9 +388,7 @@ def test_action_id_clamped_to_255() -> None:
 
 def test_section_fields_capped_at_10() -> None:
     reply = Reply(text="body", fields=[(f"k{i}", f"v{i}") for i in range(15)])
-    section = next(
-        b for b in to_blocks(reply) if b["type"] == "section" and "fields" in b
-    )
+    section = next(b for b in to_blocks(reply) if b["type"] == "section" and "fields" in b)
     assert len(section["fields"]) == 10
 
 
@@ -583,9 +571,7 @@ def test_approval_card_keeps_interpolated_markdown_literal() -> None:
         {"title": "[Review](https://evil.example.com)"},
     )
     assert rendered is not None
-    _fallback, live = approval_card(
-        approval_id="appr-1", summary=rendered, requested_by="U_AE"
-    )
+    _fallback, live = approval_card(approval_id="appr-1", summary=rendered, requested_by="U_AE")
     section = live[1]["text"]["text"]
     assert "<https://evil.example.com|" not in section
     assert "evil.example.com|Review" not in section
@@ -631,9 +617,7 @@ def test_resolved_card_with_a_human_sentence_puts_the_verdict_first() -> None:
 def test_approval_card_clamps_oversized_summary() -> None:
     from curie_worker.blocks import approval_card
 
-    fallback, card = approval_card(
-        approval_id="appr-2", summary="x" * 10000, requested_by="U1"
-    )
+    fallback, card = approval_card(approval_id="appr-2", summary="x" * 10000, requested_by="U1")
     # Section mrkdwn stays under Slack's 3000-char cap; fallback under 40k.
     assert len(card[1]["text"]["text"]) <= 2900
     assert len(fallback) <= 39000
