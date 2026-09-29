@@ -1469,9 +1469,10 @@ The path, and what an operator can check on each hop:
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
    The API accepts only a `turn.progress` token whose subject matches the path
-   and body generation, and whose generation is still active: the platform
-   key, another chain's token, an expired token, and a token from a closed or
-   superseded turn are refused 401. A body that is not a `ProgressCommand` plus
+   and body generation, and whose generation is still active. It rejects a
+   channel adapter's sibling `chn` token before validating the command body;
+   the platform key, another chain's token, an expired token, and a token from
+   a closed or superseded turn are also refused 401. A body that is not a `ProgressCommand` plus
    the worker-issued `generation` and runner-issued `seq` is refused 422. Each
    token may send one update a second, with a burst of five; past that the API
    answers 429. An accepted update is atomically appended and indexed for the
