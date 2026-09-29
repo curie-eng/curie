@@ -442,6 +442,21 @@ def _check_targetless_shape(qevent: QueuedTurn) -> None:
 _NO_EGRESS_ROUTE = TargetRoute()
 
 
+def _bound_egress_adapter(bound: str | None, handle_adapter: str | None) -> str | None:
+    """The adapter a resolved turn replies through (#3475).
+
+    The binding row's adapter wins, except over the reserved relay adapter a
+    ``curie cluster message`` turn selects on its handle: since migration 0070
+    every Slack row names its identity, and letting that identity replace the
+    relay sends the reply to the Slack sink with no endpoint, which is real
+    Slack, instead of to the relay the CLI is polling.
+    """
+
+    if handle_adapter == CLUSTER_MESSAGE_ADAPTER:
+        return handle_adapter
+    return bound or handle_adapter
+
+
 def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
     """The agent's hub button as the wire carries it, or nothing at all.
 
@@ -2595,7 +2610,7 @@ class Kernel:
                         _TURN_AGENT.set(undeployed.agent_name)
                         route = TargetRoute(
                             endpoint=undeployed.endpoint or handle.endpoint,
-                            adapter=undeployed.adapter or handle.adapter,
+                            adapter=_bound_egress_adapter(undeployed.adapter, handle.adapter),
                         )
                         logger.warning(
                             "undeployed agent turn dropped for agent=%s route=%s:%s",
@@ -2630,7 +2645,7 @@ class Kernel:
                 # dispatcher and CLI bind no endpoint of their own.
                 route = TargetRoute(
                     endpoint=resolved.endpoint or handle.endpoint,
-                    adapter=resolved.adapter or handle.adapter,
+                    adapter=_bound_egress_adapter(resolved.adapter, handle.adapter),
                 )
                 _TURN_AGENT.set(getattr(resolved, "agent_name", None))
                 hook_carry = _HOOK_RUN_CARRY.get()
