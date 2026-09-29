@@ -402,7 +402,8 @@ server-time lease, then sends a `turn.progress` sandbox token bound to
 generation, and the URL as runner control headers on `POST /v1/event`. A
 startup keeper renews the active generation while the worker waits for the
 runner's response headers; the stream pump takes over renewal before the
-startup keeper stops
+startup keeper stops. Every exit before that handoff stops the keeper and
+closes the generation, without swallowing owner cancellation
 ([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
 The runner's platform `progress` tool posts each command to the API with it
 ([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).

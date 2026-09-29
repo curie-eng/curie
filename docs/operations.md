@@ -1474,6 +1474,9 @@ The path, and what an operator can check on each hop:
    model-visible tool/prompt. The route record persists whether the sandbox
    booted with the flag, and sandbox reuse compares both directions, so
    eligibility cannot be inherited from an earlier occupant.
+   A failure between runner response headers and stream consumption stops the
+   startup keeper and closes the generation; worker cancellation still
+   propagates to the delivery owner.
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
    The API accepts only a `turn.progress` token whose subject matches the path

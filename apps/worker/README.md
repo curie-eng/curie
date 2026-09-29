@@ -791,6 +791,9 @@ delivery written after it.
   index after a crash, cancellation, final-drain timeout, or transient read
   failure. It removes membership only with a script that proves the stream has
   no id after the durable cursor, so a concurrent append cannot be orphaned.
+  Any failure after runner start but before pump handoff stops the startup
+  keeper and closes the generation. Keeper shutdown never consumes cancellation
+  of the owning delivery.
 - **Rendering is off.** `CURIE_PROGRESS_RENDER` (default `false`) is the
   temporary switch the rendering change will turn on; the chart does not set
   it. With it off, the same Lua update records state, revision and milestone
