@@ -523,7 +523,7 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- $eventsEnabled := (get (.Values.otelCollector.kubernetesEvents | default dict) "enabled") -}}
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
