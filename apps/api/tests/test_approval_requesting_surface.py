@@ -646,7 +646,9 @@ def test_no_operator_console_or_slack_principal_can_answer_for_the_requester(
     for kind, headers in (
         ("operator", {PRINCIPAL_HEADER: operator}),
         ("chat", {PRINCIPAL_HEADER: chat}),
-        ("console", {"Cookie": f"{SESSION_COOKIE}={console}"}),
+        # Same-origin, so the console session itself is accepted and the
+        # refusal comes from the approver set, not the origin check.
+        ("console", {"Cookie": f"{SESSION_COOKIE}={console}", "Origin": "http://testserver"}),
     ):
         denied = _resolve(surface_client, approval["id"], headers)
         assert denied.status_code == 403, (kind, denied.text)
@@ -753,3 +755,171 @@ def test_a_moded_route_asked_in_slack_keeps_slack_channel_membership(
     assert member.status_code == 200, member.text
     audit = _audit(surface_client, auth_headers, approval["id"])
     assert audit[-1]["authorizer"] == "ChannelMembershipAuthorizer"
+
+
+def _binding_id_for(agent_id: str, address: str, adapter: str) -> str:
+    async def run() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    sql_text(
+                        "SELECT id FROM curie.agent_channels "
+                        "WHERE agent_id = :aid AND address = :address AND adapter = :adapter"
+                    ),
+                    {"aid": agent_id, "address": address, "adapter": adapter},
+                )
+                return str(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+def test_two_adapters_on_one_address_serve_only_their_own_card(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """One agent may bind the same (kind, address) under two adapters
+    (ADR-0168 decision 3). The asking route includes the adapter, so the other
+    adapter's credential can neither list nor answer the card, even naming the
+    requester."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    other_adapter = "agentmail-other"
+    added = surface_client.post(
+        f"/agents/{agent['agent_id']}/channels",
+        json={
+            "kind": "email",
+            "address": agent["inbox"],
+            "endpoint": EMAIL_ENDPOINT,
+            "adapter": other_adapter,
+        },
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    asking = _binding_id_for(agent["agent_id"], agent["inbox"], EMAIL_ADAPTER)
+    other = _binding_id_for(agent["agent_id"], agent["inbox"], other_adapter)
+    assert asking != other
+    approval = _email_approval(surface_client, auth_headers, agent)
+
+    other_token = _adapter_token([other])
+    assert _listed(surface_client, other_token) == set()
+    refused = _resolve(surface_client, approval["id"], _adp(other_token, REQUESTER))
+    assert refused.status_code == 404, refused.text
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+
+    asking_token = _adapter_token([asking])
+    assert _listed(surface_client, asking_token) == {approval["id"]}
+    accepted = _resolve(surface_client, approval["id"], _adp(asking_token, REQUESTER))
+    assert accepted.status_code == 200, accepted.text
+
+
+def _clone_approval(approval_id: str, copies: int) -> None:
+    """Insert ``copies`` newer pending rows shaped exactly like ``approval_id``."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                columns = [
+                    row.column_name
+                    for row in await conn.execute(
+                        sql_text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema = 'curie' AND table_name = 'approvals' "
+                            "ORDER BY ordinal_position"
+                        )
+                    )
+                ]
+                overrides = {
+                    "id": "gen_random_uuid()",
+                    "dedupe_key": "md5(random()::text || n::text)",
+                    "created_at": "created_at + make_interval(secs => n)",
+                }
+                select_list = ", ".join(overrides.get(c, c) for c in columns)
+                await conn.execute(
+                    sql_text(
+                        f"INSERT INTO curie.approvals ({', '.join(columns)}) "
+                        f"SELECT {select_list} FROM curie.approvals, "
+                        "generate_series(1, :copies) AS n WHERE id = :aid"
+                    ),
+                    {"aid": approval_id, "copies": copies},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_unserved_routeless_rows_do_not_crowd_a_served_card_off_the_list(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Routeless rows asked on a binding the adapter does not serve are
+    dropped before the listing's SQL cap, so a busy sibling inbox cannot hide
+    this adapter's older card."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    inbox_b = f"busy-{_uid()}@example.com"
+    added = surface_client.post(
+        f"/agents/{agent['agent_id']}/channels",
+        json={
+            "kind": "email",
+            "address": inbox_b,
+            "endpoint": EMAIL_ENDPOINT,
+            "adapter": EMAIL_ADAPTER,
+        },
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    served = _email_approval(surface_client, auth_headers, agent)
+    busy = _email_approval(surface_client, auth_headers, {**agent, "inbox": inbox_b})
+    _clone_approval(busy["id"], 1100)
+
+    assert _listed(surface_client, _adapter_token([agent["binding_id"]])) == {served["id"]}
+
+
+def test_same_address_rows_under_another_adapter_do_not_crowd_the_list(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Rows asked on the same (kind, address) under another adapter pass the
+    SQL pair filter and are dropped only by the served predicate. More of them
+    than one read batch must still leave this adapter's older card listed."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    other_adapter = "agentmail-other"
+    added = surface_client.post(
+        f"/agents/{agent['agent_id']}/channels",
+        json={
+            "kind": "email",
+            "address": agent["inbox"],
+            "endpoint": EMAIL_ENDPOINT,
+            "adapter": other_adapter,
+        },
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    served = _email_approval(surface_client, auth_headers, agent)
+    crowd = surface_client.post(
+        "/approvals",
+        json={
+            "conversation_id": f"thread-{_uid()}",
+            "author": REQUESTER,
+            "summary": "Confirm the requested action",
+            "reply_kind": "email",
+            "reply_channel": agent["inbox"],
+            "reply_placeholder": None,
+            "reply_endpoint": EMAIL_ENDPOINT,
+            "reply_adapter": other_adapter,
+            "dedupe_key": uuid.uuid4().hex,
+            "agent_id": agent["agent_id"],
+            "route": None,
+            "card_channel": agent["inbox"],
+            "gate_kind": "policy",
+        },
+        headers=auth_headers,
+    )
+    assert crowd.status_code == 201, crowd.text
+    _clone_approval(crowd.json()["id"], 1100)
+
+    token = _adapter_token([_binding_id_for(agent["agent_id"], agent["inbox"], EMAIL_ADAPTER)])
+    assert _listed(surface_client, token) == {served["id"]}
