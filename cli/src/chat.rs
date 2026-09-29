@@ -1133,13 +1133,13 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_id_requires_equal_structured_uuid_copies() {
-        let id = "00000000-0000-4000-8000-000000000220";
+    fn approval_card_id_reads_the_structured_action_value() {
+        let approval_id = "00000000-0000-4000-8000-000000000220";
         let body = format!(
-            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{id}"}}]}}]}}"#
+            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{approval_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
         );
         let captured = approval_card_id("application/json", &body);
-        assert_eq!(captured.as_deref(), Some(id));
+        assert_eq!(captured.as_deref(), Some(approval_id));
 
         // The card can win the Slack-call race while the latest placeholder is
         // still ordinary text. Preserve that text for output, but carry the
@@ -1147,7 +1147,10 @@ mod tests {
         match completed_turn_outcome(Some("working".into()), true, captured) {
             Outcome::AwaitingApproval { reply, approval_id } => {
                 assert_eq!(reply.as_deref(), Some("working"));
-                assert_eq!(approval_id.as_deref(), Some(id));
+                assert_eq!(
+                    approval_id.as_deref(),
+                    Some("00000000-0000-4000-8000-000000000220")
+                );
             }
             outcome => panic!("approval card was not classified as awaiting: {outcome:?}"),
         }
@@ -1175,26 +1178,55 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_id_rejects_mismatched_or_missing_uuid_copies() {
-        let client_id = "00000000-0000-4000-8000-000000000220";
-        let action_id = "00000000-0000-4000-8000-000000000221";
+    fn approval_card_id_uses_the_action_value_with_a_distinct_or_missing_delivery_key() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
+        let approval_id = "00000000-0000-4000-8000-000000000221";
         let mismatched = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+            r#"{{"client_msg_id":"{delivery_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
         );
         let missing_client = format!(
-            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
         );
+        let blocks = format!(
+            r#"[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]"#
+        );
+        let form = serde_urlencoded::to_string([
+            ("client_msg_id", delivery_id),
+            ("blocks", blocks.as_str()),
+        ])
+        .expect("encode approval card form");
+
+        for (content_type, body) in [
+            ("application/json", mismatched.as_str()),
+            ("application/json", missing_client.as_str()),
+            ("application/x-www-form-urlencoded", form.as_str()),
+        ] {
+            assert_eq!(
+                approval_card_id(content_type, body).as_deref(),
+                Some(approval_id)
+            );
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_a_missing_action_value() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
         let missing_action_value = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
+            r#"{{"client_msg_id":"{delivery_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
         );
 
-        for body in [&mismatched, &missing_client, &missing_action_value] {
-            assert!(body.contains(APPROVE_ACTION_ID_PREFIX));
-            assert_eq!(approval_card_id("application/json", body), None);
-            match completed_turn_outcome(None, true, approval_card_id("application/json", body)) {
-                Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
-                outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
-            }
+        assert!(missing_action_value.contains(APPROVE_ACTION_ID_PREFIX));
+        assert_eq!(
+            approval_card_id("application/json", &missing_action_value),
+            None
+        );
+        match completed_turn_outcome(
+            None,
+            true,
+            approval_card_id("application/json", &missing_action_value),
+        ) {
+            Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+            outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
         }
     }
 

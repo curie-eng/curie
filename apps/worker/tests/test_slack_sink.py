@@ -1432,14 +1432,15 @@ def test_a_plain_platform_post_passes_its_delivery_id() -> None:
     )
 
 
-def test_an_approval_card_keeps_its_approval_id_as_its_key() -> None:
-    """The card's durable identity is its approval id, and the CLI stub reads it back.
+def test_a_reply_wire_1_1_approval_uses_its_delivery_id_as_slack_key() -> None:
+    """@spec ADR-0130 d4: the wire operation identity keys every 1.1 create.
 
-    ``cli/src/chat.rs::approval_card_id`` requires ``client_msg_id`` to equal the
-    Approve button's value, so a delivery_id on the same post does not replace it.
+    The approval id remains in the structured button value for resolution; it
+    does not replace the post's distinct delivery identity.
     """
 
     approval_id = "00000000-0000-4000-8000-00000000a001"
+    delivery_id = "00000000-0000-4000-8000-000000000008"
     sink = SlackReplyAdapter("xoxb-test")
     slack = _SlackRecorder(sink)
 
@@ -1451,10 +1452,10 @@ def test_an_approval_card_keeps_its_approval_id_as_its_key() -> None:
                 target=_target(ts=None, thread=_THREAD),
                 message=_approval_message(approval_id, "Deploy acme-bot to production?"),
                 requested_by="U0EXAMPLE1",
-                delivery_id="00000000-0000-4000-8000-000000000008",
+                delivery_id=delivery_id,
             ),
             route=TargetRoute(),
         )
     )
 
-    assert slack.only("chat.postMessage")["client_msg_id"] == approval_id
+    assert slack.only("chat.postMessage")["client_msg_id"] == delivery_id
