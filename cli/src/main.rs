@@ -4192,6 +4192,42 @@ fn emit_boxed(out: Box<dyn curie::ui::CliOutput>) -> Result<()> {
     Ok(())
 }
 
+/// Select the runner image declared by a bundle.
+fn skill_runner_image(plugin_dir: &std::path::Path, image: Option<&str>) -> Result<String> {
+    if let Some(image) = image {
+        return Ok(image.to_string());
+    }
+
+    let declaration = curie::connector_build::load(plugin_dir)
+        .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+    if declaration.runner.is_some() {
+        let lock = curie::connector_build::load_lock(plugin_dir)
+            .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+        return lock
+            .and_then(|lock| lock.runner)
+            .map(|runner| runner.image)
+            .ok_or_else(|| {
+                curie::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Run `curie build --plugin-dir {}` first.",
+                    curie::connector_build::CONNECTORS_FILE,
+                    curie::connector_build::CONNECTOR_LOCK_FILE,
+                    plugin_dir.display(),
+                ))
+                .with_fix(format!(
+                    "Run `curie build --plugin-dir {}` first.",
+                    plugin_dir.display(),
+                ))
+                .into()
+            });
+    }
+
+    Ok(artifacts::resolve_image(
+        None,
+        artifacts::Channel::current(),
+        artifacts::version(),
+    ))
+}
+
 /// Dispatch one parsed command. No subcommand opens the interactive terminal,
 /// matching `curie interactive` / `curie ui`. Returns the command's
 /// `Result`; `main`
@@ -4509,11 +4545,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 replace,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::start(StartOpts {
                     plugin_dir,
                     image,
@@ -4537,11 +4569,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 timeout,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::check(plugin_dir, image, timeout).await
             }
             SkillAction::Approvals {
@@ -4642,11 +4670,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 sampling,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = if model.is_empty() {
+                    artifacts::resolve_image(
+                        image.as_deref(),
+                        artifacts::Channel::current(),
+                        artifacts::version(),
+                    )
+                } else {
+                    let saved = curie::state::load(std::path::Path::new("."))?;
+                    let bundle_dir = saved
+                        .as_ref()
+                        .and_then(|state| state.bundle_snapshot_dir.as_deref())
+                        .or_else(|| saved.as_ref().map(|state| state.plugin_dir.as_str()))
+                        .unwrap_or(".");
+                    skill_runner_image(std::path::Path::new(bundle_dir), image.as_deref())?
+                };
                 commands::eval(
                     cases,
                     case_id,

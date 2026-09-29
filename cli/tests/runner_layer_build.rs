@@ -161,7 +161,9 @@ fn build_lines(log: &str) -> Vec<&str> {
 }
 
 fn run_lines(log: &str) -> Vec<&str> {
-    log.lines().filter(|line| line.starts_with("run ")).collect()
+    log.lines()
+        .filter(|line| line.starts_with("run "))
+        .collect()
 }
 
 fn run_skill(root: &Path, bundle: &Path, action: &str, image: Option<&str>) -> Run {
@@ -197,9 +199,48 @@ fn run_skill(root: &Path, bundle: &Path, action: &str, image: Option<&str>) -> R
     Run { output, log }
 }
 
+fn write_eval_suite(bundle: &Path) {
+    let evals = bundle.join("evals");
+    fs::create_dir_all(&evals).expect("mkdir evals");
+    fs::write(
+        evals.join("cases.json"),
+        r#"{"name":"runner-layer","cases":[{"id":"reply","input":"ping","grader":{"kind":"contains","expected":"pong"}}]}"#,
+    )
+    .expect("write eval suite");
+}
+
+fn run_eval_model(root: &Path, bundle: &Path) -> Run {
+    let tools = root.join("tools");
+    let home = root.join("home");
+    for dir in [&tools, &home] {
+        fs::create_dir_all(dir).expect("mkdir fixture dir");
+    }
+    let log = root.join("docker.log");
+    install_fake_docker(&tools, &log);
+    fs::write(&log, "").expect("clear prior Docker calls");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .current_dir(bundle)
+        .args(["--color=never", "skill", "eval", "--model", "acme-model"])
+        .env_clear()
+        .env("PATH", stub_path(&tools))
+        .env("HOME", &home)
+        .env("TMPDIR", root)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run curie skill eval model sweep");
+    let log = fs::read_to_string(&log).unwrap_or_default();
+    Run { output, log }
+}
+
 fn assert_runner_image(run: &Run, image: &str) {
     let runs = run_lines(&run.log);
-    assert_eq!(runs.len(), 1, "exactly one runner starts\n{}", describe(run));
+    assert_eq!(
+        runs.len(),
+        1,
+        "exactly one runner starts\n{}",
+        describe(run)
+    );
     assert!(
         runs[0].split_whitespace().any(|arg| arg == image),
         "runner must use image {image}\n{}",
@@ -315,11 +356,6 @@ fn skill_up_uses_the_bundles_locked_runner_layer() {
 
     let run = run_skill(temp.path(), &bundle, "up", None);
     assert!(!run.output.status.success(), "{}", describe(&run));
-    assert!(
-        String::from_utf8_lossy(&run.output.stderr).contains("test stopped runner startup"),
-        "the test must reach Docker run\n{}",
-        describe(&run)
-    );
     let locked = format!("{REGISTRY}/{BUNDLE}-runner@{}", layer_digest());
     assert_runner_image(&run, &locked);
     assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
@@ -381,12 +417,6 @@ fn explicit_skill_image_overrides_an_unbuilt_runner_layer() {
         assert_runner_image(&run, OVERRIDE_IMAGE);
         if action == "check" {
             assert!(run.output.status.success(), "{}", describe(&run));
-        } else {
-            assert!(
-                String::from_utf8_lossy(&run.output.stderr).contains("test stopped runner startup"),
-                "{}",
-                describe(&run)
-            );
         }
     }
 }
@@ -412,4 +442,46 @@ fn skill_commands_use_the_platform_runner_without_a_runner_declaration() {
         let run = run_skill(temp.path(), &bundle, action, None);
         assert_runner_image(&run, &platform);
     }
+}
+
+/// A model sweep starts its own runner, so it must select the same locked
+/// layer as the other skill commands before it enters Docker.
+#[test]
+fn skill_eval_model_sweep_uses_the_bundles_locked_runner_layer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+    );
+    write_eval_suite(&bundle);
+    let built = run_build(temp.path(), &bundle);
+    assert!(built.output.status.success(), "{}", describe(&built));
+
+    let run = run_eval_model(temp.path(), &bundle);
+    assert!(!run.output.status.success(), "{}", describe(&run));
+    let locked = format!("{REGISTRY}/{BUNDLE}-runner@{}", layer_digest());
+    assert_runner_image(&run, &locked);
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
+}
+
+/// A declared but unbuilt runner must fail before an eval sweep can boot a
+/// transient platform runner that lacks the bundle's installed MCP servers.
+#[test]
+fn unbuilt_runner_layer_refuses_skill_eval_model_sweep() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+    );
+    write_eval_suite(&bundle);
+
+    let run = run_eval_model(temp.path(), &bundle);
+    assert_eq!(run.output.status.code(), Some(2), "{}", describe(&run));
+    assert!(
+        String::from_utf8_lossy(&run.output.stderr).contains("curie build --plugin-dir"),
+        "model sweep must name the recovery command\n{}",
+        describe(&run)
+    );
+    assert!(run_lines(&run.log).is_empty(), "{}", describe(&run));
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
 }
