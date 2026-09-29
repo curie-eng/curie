@@ -1,14 +1,16 @@
 {
-  "comment": "The per-turn deliberate progress capability (ADR-0130), frozen across the three services it crosses, which ship in different images and share no module. The worker (apps/worker/src/curie_worker/turn_progress.py) mints a sandbox token with `token_scope` whose subject is the chain's progress_id and sends it, with the capability URL (`route` under the API base), to the runner on POST /v1/event in the two runner control headers `url_header` and `token_header`. The runner (runner/src/curie_runner/turn_progress.py) reads those headers, holds them for the open turn only, and POSTs each progress command to the URL with the token in `token_request_header`. The API (apps/api/src/curie_api/turn_progress.py) verifies the token against the path's progress_id and scope and appends the command to the chain's inbox stream at `inbox_key` (the worker's key prefix, then the progress id), one entry per command with exactly the fields of `inbox_entry_example`; the worker's pump reads that stream. Read by apps/worker/tests/test_turn_progress_vector.py, runner/tests/test_turn_progress_vector.py and apps/api/tests/test_turn_progress_vector.py, each of which rejects an unknown key so a key added for one reader cannot pass vacuously.",
+  "comment": "The per-turn deliberate progress capability (ADR-0130), frozen across the three services it crosses, which ship in different images and share no module. The worker (apps/worker/src/curie_worker/turn_progress.py) durably allocates a monotonically increasing generation for the chain, marks that generation active, and mints a sandbox token with `token_scope` whose subject is `progress_id:generation`. It sends the capability URL (`route` under the API base), token, and generation to the runner on POST /v1/event in `url_header`, `token_header`, and `generation_header`. The runner (runner/src/curie_runner/turn_progress.py) reads those headers, holds them for the open turn only, and POSTs each progress command to the URL with the token in `token_request_header`; it adds the worker-issued generation and its own per-turn sequence. The API (apps/api/src/curie_api/turn_progress.py) verifies the token against that subject and scope, atomically refuses a generation that is no longer active, appends the command to the chain's inbox stream at `inbox_key`, and indexes the chain in `inbox_pending_key`. One entry per command has exactly the fields of `inbox_entry_example`; the live pump or maintenance drainer reads it. Read by apps/worker/tests/test_turn_progress_vector.py, runner/tests/test_turn_progress_vector.py and apps/api/tests/test_turn_progress_vector.py, each of which rejects an unknown key so a key added for one reader cannot pass vacuously.",
   "url_header": "X-Curie-Progress-Url",
   "token_header": "X-Curie-Progress-Token",
+  "generation_header": "X-Curie-Progress-Generation",
   "token_request_header": "X-API-Key",
   "token_scope": "turn.progress",
   "route": "/v1/turn-progress/{progress_id}",
   "inbox_key": "{key_prefix}:progress:inbox:{progress_id}",
+  "inbox_pending_key": "{key_prefix}:progress:inbox:pending",
   "inbox_entry_example": {
     "command": "{\"version\":\"1.0\",\"update_id\":\"demo-1\",\"state\":\"investigating\",\"summary\":\"Reading the failing test\",\"milestone\":\"evidence\"}",
-    "epoch": "1759000000000",
+    "generation": "7",
     "seq": "1"
   }
 }

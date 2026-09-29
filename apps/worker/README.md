@@ -587,11 +587,12 @@ Every key is built by a `WorkerConfig` helper under `key_prefix`
 
 | Key | Type | Holds |
 |---|---|---|
-| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
+| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `turn_generation`, `active_generation`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
 | `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` its scripts and the sweeper read. |
 | `<key_prefix>:progress:pending` | set | The index of pending delivery ids, so the sweeper never scans the keyspace. |
 | `<key_prefix>:progress:chain:{event_id}` | string | The `pid` an approval resume event continues. |
-| `<key_prefix>:progress:inbox:{pid}` | stream | The chain's inbox: one entry per command the API accepted, with the fields `command` (the `ProgressCommand` as JSON), `epoch` and `seq`. The API writes it; the pump reads it. |
+| `<key_prefix>:progress:inbox:{pid}` | stream | The chain's inbox: one entry per command the API accepted, with the fields `command` (the `ProgressCommand` as JSON), worker-issued `generation` and runner-issued `seq`. The API writes it; the live pump or maintenance drainer reads it. |
+| `<key_prefix>:progress:inbox:pending` | set | Progress ids with inbox work not yet reflected by `inbox_cursor`. The API adds atomically with `XADD`; the worker removes only after proving no later stream id exists. |
 | `<key_prefix>:progress:rate:{token digest}` | hash | The API's per-token rate limit bucket (`tokens`, `at`). |
 
 The inbox and the rate bucket are written by the API, which shares the
@@ -654,7 +655,8 @@ fails answers:
    error, and writes nothing.
 3. A terminal record (`complete`, `failed`, `cancelled`) refuses every update
    (`terminal`), so nothing reopens it.
-4. Updates are ordered by `(epoch, seq)`. A command from an older epoch is
+4. Updates are ordered by `(epoch, seq)`, where a model command's epoch is the
+   durable generation the worker allocated for its turn. A command from an older epoch is
    refused (`stale-epoch`), and within the record's epoch a `seq` at or below
    `last_seq` is refused (`stale-seq`); a newer epoch is accepted and restarts
    the sequence. A platform update names an epoch and no seq. It is refused from
@@ -753,13 +755,17 @@ delivery written after it.
   stream is consumed, never when an event only steers a live turn, so a steer
   opens no chain. When an eligible turn pauses for approval the kernel links
   the resume event `approval-<id>-resolved` to its chain with `link_resume`.
-- **The capability.** Each turn start mints a sandbox token (the byte-identical
-  `sandbox_token` module) with scope `turn.progress` and subject `progress_id`,
-  valid for 24 hours, and sends it to the runner on `POST /v1/event` in
-  `X-Curie-Progress-Token`, beside `X-Curie-Progress-Url`, the API's
-  `/v1/turn-progress/{progress_id}` under `runner_facing_api_base_url`. They
-  are runner control headers, like `X-Curie-Turn-Epoch`, and not ACI fields.
-  Nothing mints a capability when the API key is unset.
+- **The capability.** Each actual turn start atomically increments the record's
+  durable `turn_generation`, marks it as `active_generation`, and mints a
+  sandbox token (the byte-identical `sandbox_token` module) with scope
+  `turn.progress` and subject `progress_id:generation`. It sends the token,
+  generation, and URL to the runner on `POST /v1/event` in
+  `X-Curie-Progress-Token`, `X-Curie-Progress-Generation`, and
+  `X-Curie-Progress-Url`. They are runner control headers, like
+  `X-Curie-Turn-Epoch`, and not ACI fields. The API's append script checks the
+  signed generation is still active. The worker clears it when the turn closes;
+  a retry or cold resume advances it first, so an old token cannot enqueue or
+  fence the current turn. Nothing opens a generation when the API key is unset.
 - **The pump.** While the kernel consumes the turn's stream, a pump reads the
   chain's inbox after the record's `inbox_cursor`, at most 64 entries every
   half second, and applies each entry with `apply_model_command` at the
@@ -767,14 +773,19 @@ delivery written after it.
   moves forward and is never written to an expired record. When the stream
   ends the pump drains what remains, bounded to 5 seconds, and stops. A
   malformed entry is logged and skipped. The pump never fails a turn: a Valkey
-  error is logged and the turn goes on.
+  error is logged and the turn goes on. Every accepted append also puts the
+  progress id in `progress:inbox:pending`; the maintenance loop drains that
+  index after a crash, cancellation, final-drain timeout, or transient read
+  failure. It removes membership only with a script that proves the stream has
+  no id after the durable cursor, so a concurrent append cannot be orphaned.
 - **Rendering is off.** `CURIE_PROGRESS_RENDER` (default `false`) is the
   temporary switch the rendering change will turn on; the chart does not set
-  it. With it off, the pump records the state, the revision and the milestone
-  reservations, and removes from the outbox each delivery an applied command
-  enqueued, so no progress reaches an adapter and nothing is left for a later
-  deliverer to replay. This worker has no progress deliverer, so it refuses to
-  start with `CURIE_PROGRESS_RENDER=true`.
+  it. With it off, the same Lua update records state, revision and milestone
+  reservations but does not enqueue a delivery at all. The no-delivery choice
+  is therefore atomic with acceptance: a crash or transient Valkey failure
+  cannot strand an outbox row for a later release to replay. This worker has no
+  progress deliverer, so it refuses to start with
+  `CURIE_PROGRESS_RENDER=true`.
 
 `answer_ref` is the reply ref of the turn's answer, given when the chain is
 opened. Nothing reads it yet.

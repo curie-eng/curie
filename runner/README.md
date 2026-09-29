@@ -85,19 +85,24 @@ milestone (`evidence`, `scope` or `verification`) only when the step is
 material, at most three per task; and never reasoning, raw tool output, secrets
 or a draft answer in the summary. The tool description repeats the rules.
 
-The capability is per turn. The worker sends it on `POST /v1/event` in two
-runner control headers, `X-Curie-Progress-Url` and `X-Curie-Progress-Token`,
+The capability is per turn. The worker first allocates a durable, monotonically
+increasing generation on the chain and marks it active. It sends the capability
+on `POST /v1/event` in three runner control headers, `X-Curie-Progress-Url`,
+`X-Curie-Progress-Token`, and `X-Curie-Progress-Generation`,
 next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
-fields. The runner holds them only while that turn is open, sets them when the
-turn starts and clears them when it ends, so a steer uses the turn's capability
-and a later turn without the headers has none. The names are frozen with the
-worker and the API in `tests/vectors/turn-progress-capability.json`.
+fields. The token is signed for `progress_id:generation`, and the API also
+checks that the same generation is still active before it appends anything.
+The runner holds the three values only while that turn is open, sets them when
+the turn starts and clears them when it ends, so a steer uses the turn's
+capability and a closed or superseded turn cannot enqueue. The names are frozen
+with the worker and the API in `tests/vectors/turn-progress-capability.json`.
 
 Each call POSTs the command to the capability URL with the token in
-`X-API-Key`, adding `epoch` and `seq`. `epoch` is the turn's start in Unix
-milliseconds, raised past the previous turn's in the same process so it always
-increases, and `seq` counts the turn's posts from 1, so the worker applies a
-turn's commands in order and never a finished turn's after a newer one. A call
+`X-API-Key`, adding the worker-issued `generation` and a `seq` that counts this
+turn's posts from 1. The generation remains monotonic across runner restarts,
+clock skew, retries, and cold approval resumes; the worker applies a turn's
+commands in order and refuses an older generation after a newer one. HTTP 202
+means `Progress queued.`, because durable application can still refuse it. A call
 without a capability returns "Progress is not shown for this turn." and makes
 no network call. A refusal, a rate limit, a 5xx or a transport failure is a
 soft tool result that tells the model to continue; it never fails the turn. An
@@ -106,11 +111,10 @@ result the model can correct, still without failing the turn. The call is
 platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
 `side_effect_flag` and never lands on the turn's receipt.
 
-The fake model's `[fake:progress-demo]` marker calls the tool through the same
-handler: investigating, investigating with an `evidence` milestone, then
-testing with a `verification` milestone, two seconds apart so a steer can land,
-then the answer. Without a capability each call gets the soft result and no
-network call is made.
+The fake model is unconditionally network-free, including when progress headers
+are present. `[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. API/worker integration
+tests and live-provider tests exercise the real progress handler instead.
 
 ## Environment
 

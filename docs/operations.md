@@ -1461,28 +1461,34 @@ it on later changes what people see, not what is stored.
 The path, and what an operator can check on each hop:
 
 1. **The capability.** For a person's Slack turn (and the approval resume of
-   one) the worker mints a sandbox token with scope `turn.progress`, bound to
-   that turn chain's `progress_id`, and sends it to the runner with the turn.
+   one) the worker allocates a durable generation, marks it active, and mints a
+   sandbox token with scope `turn.progress`, bound to
+   `progress_id:generation`. It sends token, URL, and generation to the runner.
    Jobs, cron and targetless hook turns, factory executions and
    `curie cluster message` relay turns get none.
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
-   The API accepts only a `turn.progress` token whose subject is the path's
-   `progress_id` and that has not expired: the platform key, another chain's
-   token and an expired token are refused 401, and a body that is not a
-   `ProgressCommand` plus the runner's `epoch` and `seq` (an unknown field
-   included) is refused 422. Each token may send one update a second, with a
-   burst of five; past that the API answers 429. An accepted update is
-   appended to the chain's inbox stream and answered 202.
-3. **The record.** While the turn runs, the worker applies each inbox entry to
+   The API accepts only a `turn.progress` token whose subject matches the path
+   and body generation, and whose generation is still active: the platform
+   key, another chain's token, an expired token, and a token from a closed or
+   superseded turn are refused 401. A body that is not a `ProgressCommand` plus
+   the worker-issued `generation` and runner-issued `seq` is refused 422. Each
+   token may send one update a second, with a burst of five; past that the API
+   answers 429. An accepted update is atomically appended and indexed for the
+   worker, then answered 202 (queued, not yet semantically applied).
+3. **The record.** While the turn runs, its pump applies each inbox entry to
    the chain's durable record, which keeps its state, revision and milestone
-   reservations.
+   reservations. A maintenance drainer owns the same durable pending-inbox
+   index, so one failed final read or a worker restart cannot orphan a 202.
 
-With the default local stack, a fake-model turn shows it end to end:
+The fake model is network-free, including when progress headers are present.
+Use a live model or the API/worker integration fixture to exercise the ingress;
+`[fake:progress-demo]` is only a deterministic long turn for steering tests.
+
+With an integration turn, inspect the durable result with:
 
 ```bash
-curie local message "[fake:progress-demo] check the build"
-# the record the demo turn wrote (one per chain)
+# the record the integration turn wrote (one per chain)
 valkey-cli -p 26379 -a valkeypass --scan --pattern 'curie:worker:progress:*'
 valkey-cli -p 26379 -a valkeypass HGETALL curie:worker:progress:<progress_id>
 ```

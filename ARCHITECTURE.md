@@ -276,7 +276,8 @@ sequenceDiagram
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
-        W->>R: POST /v1/event {message} (+ progress capability headers on a person's turn)
+        W->>V: allocate and activate durable progress generation
+        W->>R: POST /v1/event {message} (+ progress URL, token, generation headers on a person's turn)
     else turn already live for this thread
         W->>R: POST /v1/steer {text}
         Note over W,R: 409 if the turn finished first (finish race), worker opens a fresh turn on the same idle sandbox
@@ -284,9 +285,9 @@ sequenceDiagram
 
     R->>A: model call (streaming)
     opt the model calls mcp__curie__progress on a turn holding a capability
-        R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token)
-        P->>V: XADD the chain's progress inbox
-        W->>V: pump: read the inbox, apply to the progress record (rendering off)
+        R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token + generation)
+        P->>V: validate active generation; XADD inbox + SADD pending index atomically
+        W->>V: live pump or maintenance drainer applies inbox (rendering off, no outbox enqueue)
     end
     R-->>W: NDJSON: text_delta*, tool notes*, final
     R--)O: gen_ai spans (agent.run root + generation/tool sibling intervals)
@@ -393,17 +394,19 @@ A long turn can report short task state while it runs
 ([ADR-0130](docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
 The report never rides the ACI stream: tool notes stay internal telemetry, and
 the frozen ACI is unchanged. Instead the kernel gives an eligible turn (a
-person's Slack turn, or its approval resume) a per-turn capability, a
-`turn.progress` sandbox token bound to the turn chain's `progress_id`, sent to
-the runner as two runner control headers on `POST /v1/event`
+person's Slack turn, or its approval resume) a per-turn capability. It durably
+allocates and activates a monotonically increasing chain generation, then sends
+a `turn.progress` sandbox token bound to `progress_id:generation`, the
+generation, and the URL as runner control headers on `POST /v1/event`
 ([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
 The runner's platform `progress` tool posts each command to the API with it
 ([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).
-The API verifies the token, rate limits it and appends the command to the
-chain's inbox stream in Valkey
+The API verifies the token and active generation, rate limits it, and atomically
+appends the command to the chain's inbox stream and durable pending-inbox index
 ([`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`](apps/api/src/curie_api/routers/turn_progress.py)).
 While the kernel consumes the turn, a per-turn pump applies the inbox to the
-chain's durable record
+chain's durable record. The maintenance loop drains the same pending-inbox
+index after a crash, cancellation, timeout, or transient final read
 ([`apps/worker/src/curie_worker/turn_progress.py::ProgressPump`](apps/worker/src/curie_worker/turn_progress.py),
 [`apps/worker/src/curie_worker/progress.py::ProgressStore`](apps/worker/src/curie_worker/progress.py)),
 which owns the ordering, idempotency, terminal and milestone-budget rules.
