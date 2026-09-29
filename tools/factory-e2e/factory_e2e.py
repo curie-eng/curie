@@ -170,9 +170,11 @@ CODING_SANDBOX_POD_QUOTA = 50
 START_ATTEMPTS = 3
 START_WAIT_SECONDS = 150
 # The Claude SDK can reject the configured model while titling the session and
-# surface that as `model error: unknown`, which the worker records as
-# runner_escalated in about a second. A real refusal takes longer.
+# surface that as `model error: unknown`. The worker records that as
+# unclassified (#3401); older runs recorded runner_escalated. A real refusal
+# takes longer.
 FAST_ESCALATION_SECONDS = 45
+FAST_ESCALATION_CAUSES = frozenset({"runner_escalated", "unclassified"})
 # The judged bound: the execution deadline plus terminal settlement slack.
 ELAPSED_LIMIT_SECONDS = EXECUTION_BOUND_SECONDS + 300
 # A dead tunnel is judged over several probes, not one: a single failed health
@@ -192,6 +194,8 @@ TERMINUS_CAUSES = (
     "issue_cancelled",
     "owner_lost",
     "runner_escalated",
+    "unclassified",
+    "max_turns",
     "runner_failed",
     "no_pull_request",
     "early_stop",
@@ -4057,7 +4061,7 @@ def _capture(p: Preflight, fn: Callable[[], dict[str, Any]]) -> tuple[dict[str, 
 def should_retry_fast_escalation(cause: object, elapsed: object) -> bool:
     """Whether a finished run is the short model crash, not a real ending."""
 
-    if cause != "runner_escalated":
+    if cause not in FAST_ESCALATION_CAUSES:
         return False
     if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
         return False
@@ -4554,9 +4558,10 @@ def judge_quiesce(obs: Mapping[str, Any]) -> list[str]:
         failures.append(f"path B: marker cleared after {clear_b!r}s, bound {immediate}s")
     if obs.get("path_b_terminated_logged") is not True:
         failures.append("path B: drain pod log lacks the terminated line")
-    # Helm treats a deleted hook Job as finished and goes on to roll, so path B's
-    # helm exit is recorded (path_b_helm_exit_code) but is not the proof; the
-    # terminated log line and the clear time are.
+    # Helm treats a deleted hook Job as finished. The chart's attest hook then
+    # refuses the upgrade unless this revision recorded a successful drain.
+    # Path B still records path_b_helm_exit_code without judging it: this
+    # scenario proves the marker clear, not that helm exit.
     if obs.get("final_state") != "claims_enabled":
         failures.append(f"final claim state was {obs.get('final_state')!r}")
     return failures

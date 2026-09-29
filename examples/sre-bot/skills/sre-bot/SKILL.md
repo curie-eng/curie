@@ -455,6 +455,12 @@ What I changed: nothing.
   zero-argument connector actions; having a Kubernetes mutation tells you
   nothing about either upgrade action.
 
+  `resources_scale` is gated as a whole, including its read mode. Called
+  without `scale` it only reads the current replica count, yet it still raises
+  an approval card, and approving that card changes nothing. Read replicas with
+  `resources_get`, then call `resources_scale` once with `scale` set to the
+  target count. That single call is the approval request.
+
   **Anything not on the list, you have no tool for.** An action outside the
   RBAC ceiling is also impossible even when a matching tool is present and a
   human approves it. So:

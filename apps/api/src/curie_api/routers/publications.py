@@ -14,17 +14,23 @@ from typing import Any, Literal, cast
 import httpx
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud
+from .. import crud, factory_ci, factory_progress
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import ExecutionRequest, PublicationReviewReservation, ThreadPublicationLineage
+from ..models import (
+    ExecutionRequest,
+    Publication,
+    PublicationReviewReservation,
+    ThreadPublicationLineage,
+)
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
@@ -377,6 +383,67 @@ async def create_publication(
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
+
+    if data.work_item_request_id is not None:
+        prior_paths = (
+            await session.scalars(
+                select(Publication.changed_paths).where(
+                    Publication.execution_request_id == data.work_item_request_id,
+                    Publication.status == "succeeded",
+                )
+            )
+        ).all()
+        changed_paths = [
+            path for paths in prior_paths for path in paths
+        ] + data.changed_paths
+        unselected = factory_ci._unselected_python_path(changed_paths)
+        if unselected is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "publication.required_python_ci_unselected",
+                    "message": f"required Python CI does not select {unselected}",
+                },
+            )
+        if factory_ci._python_paths(changed_paths):
+            try:
+                observation = await factory_progress.read_verification_observation(
+                    session, data.work_item_request_id
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_unreadable",
+                        "message": "stored verification preflight is unreadable",
+                    },
+                ) from exc
+            if observation is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_missing",
+                        "message": "verification preflight observation is missing",
+                    },
+                )
+            if observation.outcome == "failed":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_failed",
+                        "message": "verification preflight failed; rerun after fixing the failure",
+                    },
+                )
+            if observation.outcome == "unavailable":
+                body = data.body or ""
+                statements = (
+                    "In-sandbox verification was unavailable.",
+                    "Python (ruff + mypy + pytest) is pending proof.",
+                )
+                missing = [statement for statement in statements if statement not in body]
+                if missing:
+                    body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                    data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:

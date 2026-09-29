@@ -2086,6 +2086,7 @@ class PublicationOut(BaseModel):
 
 
 WorkItemOutcomeState = Literal[
+    "queued",
     "waiting",
     "running",
     "cancellation_requested",
@@ -2107,7 +2108,7 @@ class WorkItemRequestOut(BaseModel):
     sequence: int
     status: str
     created_at: datetime
-    wait_deadline: datetime
+    wait_deadline: datetime | None
     started_at: datetime | None
     execution_deadline: datetime | None
     terminal_at: datetime | None

@@ -132,13 +132,14 @@ WORKSPACES_DISABLED_REFUSAL = (
     "agentSandbox.runner.workspace.enabled in the chart values "
     "(CURIE_WORKSPACE_ENABLED on the worker)."
 )
+# The worker maps the API's machine-readable 409 `detail.code` values from
+# `apps/api/src/curie_api/routers/workspaces.py` to its own user-facing prose;
+# it never echoes the API's mutable message text. A code the API does not emit
+# is unreachable here (#2684), and an emitted code missing from this mapping is
+# treated as an invalid refusal response, so the two sets must stay equal.
+# Pinned by `test_selection_refusal_codes_match_the_apis_emissions` in
+# `apps/worker/tests/test_workspace.py`.
 _SELECTION_REFUSAL_MESSAGES = {
-    "workspace.deployment_disabled": (
-        "This deployment does not enable repository workspaces."
-    ),
-    "workspace.repository_required": (
-        "Start the thread by naming one allowed root GitHub repository URL."
-    ),
     "workspace.selection_conflict": (
         "This thread is already bound to a different repository."
     ),

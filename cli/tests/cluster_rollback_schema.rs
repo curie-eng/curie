@@ -5,8 +5,10 @@
 //! 0.8.4's migrate init container does not know. This file pins the additional
 //! pre-mutation gate. Status filtering stays in `cluster_rollback.rs`.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Output;
 
@@ -27,96 +29,104 @@ fn catalog_marks_artifact_identity_ambiguous(version: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Release v0.8.7 carries the same Alembic head as v0.8.6. Pin both the
-/// accepted live head and the fail-closed boundary for an unknown successor.
+/// Keep each release's catalog window and accepted boundaries in one table.
 #[test]
-fn v087_accepts_0039_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.8.7").expect("0.8.7 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0039");
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0040", &window));
-}
-
-/// Published v0.8.8 carries Alembic head 0039. Historical next candidates used
-/// the same application version, so the catalog must require artifact identity.
-#[test]
-fn v088_published_window_ends_at_0039_and_requires_artifact_identity() {
-    let window = window_for("0.8.8").expect("0.8.8 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0039");
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0044", &window));
-    assert!(catalog_marks_artifact_identity_ambiguous("0.8.8"));
-}
-
-/// Published v0.8.9 also stops at 0039. A historical candidate can extend that
-/// window only when its retained manifest establishes the different artifact.
-#[test]
-fn v089_published_window_ends_at_0039_and_requires_artifact_identity() {
-    let window = window_for("0.8.9").expect("0.8.9 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0039");
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0044", &window));
-    assert!(catalog_marks_artifact_identity_ambiguous("0.8.9"));
-}
-
-/// The released 0.9.0 and 0.9.1 artifacts stop at Alembic head 0044. Pin the
-/// accepted live head and the boundary before the later 0.9.2 migration.
-#[test]
-fn v090_and_v091_accept_0044_and_refuse_0045() {
-    for version in ["0.9.0", "0.9.1"] {
-        let window = window_for(version).unwrap_or_else(|| panic!("{version} is catalogued"));
-        assert_eq!(window.schema_min, "0001", "{version}");
-        assert_eq!(window.schema_head, "0044", "{version}");
-        assert!(live_in_window("0044", &window), "{version}");
-        assert!(live_in_window("0039", &window), "{version}");
-        assert!(!live_in_window("0045", &window), "{version}");
-        assert!(
-            !catalog_marks_artifact_identity_ambiguous(version),
-            "{version} has one unambiguous released artifact identity"
-        );
-    }
-}
-
-/// Released v0.9.2 is a single revision window at 0045. The feature train
-/// chart continues past that window, so this pin is the catalog, not the
-/// packaged 0.10.0 graph.
-#[test]
-fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
-    let window = window_for("0.9.2").expect("0.9.2 is catalogued");
-    assert_eq!(window.schema_min, "0045");
-    assert_eq!(window.schema_head, "0045");
-    assert!(!live_in_window("0044", &window));
-    assert!(live_in_window("0045", &window));
-    assert!(!live_in_window("0046", &window));
-    assert!(
-        !catalog_marks_artifact_identity_ambiguous("0.9.2"),
-        "0.9.2 has one unambiguous released artifact identity"
-    );
-}
-
-#[test]
-fn v0100_release_candidates_have_exact_catalog_windows() {
+fn release_catalog_windows_match_their_revision_boundaries() {
     let catalog: serde_json::Value =
         serde_json::from_str(include_str!("../src/application_schema_windows.json"))
             .expect("application schema catalog parses");
-    for version in ["0.10.0-rc.1", "0.10.0-rc.2"] {
-        assert!(catalog["windows"].get(version).is_some());
-        let window = window_for(version).expect("release candidate is catalogued");
-        assert_eq!(window.schema_min, "0045");
-        assert_eq!(window.schema_head, "0057");
-        assert!(live_in_window("0045", &window));
-        assert!(live_in_window("0056", &window));
-        assert!(live_in_window("0057", &window));
-        assert!(!live_in_window("0044", &window));
+
+    type ReleaseCase<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        bool,
+        bool,
+    );
+    let cases: &[ReleaseCase<'_>] = &[
+        ("0.8.7", "0001", "0039", &["0039"], &["0040"], false, false),
+        ("0.8.8", "0001", "0039", &["0039"], &["0044"], true, false),
+        ("0.8.9", "0001", "0039", &["0039"], &["0044"], true, false),
+        (
+            "0.9.0",
+            "0001",
+            "0044",
+            &["0039", "0044"],
+            &["0045"],
+            false,
+            false,
+        ),
+        (
+            "0.9.1",
+            "0001",
+            "0044",
+            &["0039", "0044"],
+            &["0045"],
+            false,
+            false,
+        ),
+        (
+            "0.9.2",
+            "0045",
+            "0045",
+            &["0045"],
+            &["0044", "0046"],
+            false,
+            false,
+        ),
+        (
+            "0.10.0-rc.1",
+            "0045",
+            "0057",
+            &["0045", "0056", "0057"],
+            &["0044"],
+            false,
+            true,
+        ),
+        (
+            "0.10.0-rc.2",
+            "0045",
+            "0057",
+            &["0045", "0056", "0057"],
+            &["0044"],
+            false,
+            true,
+        ),
+    ];
+
+    for (version, schema_min, schema_head, accepted, refused, ambiguous, prefixed_alias) in cases {
+        let window = window_for(version).unwrap_or_else(|| panic!("{version} is catalogued"));
+        assert_eq!(window.schema_min, *schema_min, "{version}");
+        assert_eq!(window.schema_head, *schema_head, "{version}");
+        for revision in *accepted {
+            assert!(
+                live_in_window(revision, &window),
+                "{version} accepts {revision}"
+            );
+        }
+        for revision in *refused {
+            assert!(
+                !live_in_window(revision, &window),
+                "{version} refuses {revision}"
+            );
+        }
         assert_eq!(
-            window_for(&format!("v{version}"))
-                .expect("prefixed release candidate is catalogued")
-                .schema_head,
-            window.schema_head
+            catalog_marks_artifact_identity_ambiguous(version),
+            *ambiguous,
+            "{version} artifact identity ambiguity"
         );
+        if *prefixed_alias {
+            assert!(catalog["windows"].get(*version).is_some());
+            assert_eq!(
+                window_for(&format!("v{version}"))
+                    .expect("prefixed release candidate is catalogued")
+                    .schema_head,
+                window.schema_head,
+                "{version} prefixed alias"
+            );
+        }
     }
 }
 
@@ -137,8 +147,8 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 }
 
 /// Released 0.9.1 reports catalog head 0044. The packaged chart applies
-/// expansions through 0059, requires forward only for contract 0060, then
-/// applies expansions 0061 through 0068.
+/// expansions through 0059, requires forward for contracts 0060 and 0063,
+/// and applies the intervening and feature-train expansions through 0069.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -147,8 +157,8 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "0060");
-    assert_eq!(target.schema_head, "0068");
+    assert_eq!(target.schema_min, "0063");
+    assert_eq!(target.schema_head, "0069");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -158,7 +168,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         [
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
             "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
-            "0067", "0068"
+            "0067", "0068", "0069"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -166,10 +176,10 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .filter(|step| step.kind == "contract")
         .map(|step| step.revision.as_str())
         .collect();
-    assert_eq!(contracts, ["0060"]);
-    assert!(pending
-        .iter()
-        .all(|step| step.kind == "expand" || step.revision == "0060"));
+    assert_eq!(contracts, ["0060", "0063"]);
+    assert!(pending.iter().all(|step| {
+        step.kind == "expand" || step.revision == "0060" || step.revision == "0063"
+    }));
 
     let refused = plan_upgrade(
         Some("0044"),
@@ -189,7 +199,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     );
     assert_eq!(decision.action, "apply");
     assert_eq!(decision.source_head.as_deref(), Some("0044"));
-    assert_eq!(decision.target_min, "0060");
+    assert_eq!(decision.target_min, "0063");
 }
 
 #[test]
@@ -200,13 +210,13 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0068");
+    assert_eq!(target.schema_head, "0069");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
-        ["0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068"]
+        ["0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069"]
     );
 
     // Contract 0060 shipped in 0.10.2, so 0.10.1 still needs the forward flag.
@@ -228,9 +238,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
     assert_eq!(decision.action, "apply");
 }
 
-/// Released 0.10.2 stamps 0062. The feature train's revisions follow it as
-/// 0063 through 0068, all expansions, so the upgrade applies without the
-/// forward flag and never reads a released revision id as another migration.
+/// Released 0.10.2 stamps 0062. Stable 0.10.3 follows with contract 0063,
+/// then the feature train continues with expansions through 0069.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let source = window_for("0.10.2").expect("released 0.10.2 is catalogued");
@@ -242,14 +251,26 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
-    assert_eq!(revisions, ["0063", "0064", "0065", "0066", "0067", "0068"]);
-    assert!(pending.iter().all(|step| step.kind == "expand"));
+    assert_eq!(
+        revisions,
+        ["0063", "0064", "0065", "0066", "0067", "0068", "0069"]
+    );
+    assert_eq!(pending[0].kind, "contract");
+    assert!(pending[1..].iter().all(|step| step.kind == "expand"));
 
-    let decision = plan_upgrade(
+    let refused = plan_upgrade(
         Some(&source.schema_head),
         &target,
         &pending,
         false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(refused.action, "refuse");
+    let decision = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        true,
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
@@ -280,14 +301,6 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
-}
-
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut perms = fs::metadata(&path).expect("stat fake").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod fake executable");
 }
 
 fn rollback_opts() -> RollbackOpts {
@@ -353,7 +366,7 @@ impl RollbackFixture {
                 format!("cat '{}' >&2; exit 1", manifest_error_path.display())
             }
         };
-        write_exec(
+        test_executable::install_in(
             dir.path(),
             "helm",
             &format!(
@@ -369,7 +382,7 @@ impl RollbackFixture {
                 history = history_path.display(),
             ),
         );
-        write_exec(
+        test_executable::install_in(
             dir.path(),
             "kubectl",
             &format!(
@@ -504,7 +517,7 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
     std::env::set_var("FAKE_HELM_ROLLBACK_LOG", &rollback_log);
     std::env::set_var("FAKE_KUBECTL_LOG", &kubectl_log);
 
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         "#!/bin/sh\n\
@@ -518,7 +531,7 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
     );
     // Probe stdout is only the alembic current line. Stderr plants a DSN so a
     // leak in the refusal would fail the redaction assertion below.
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "kubectl",
         "#!/bin/sh\n\
@@ -809,7 +822,7 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let history = dir.path().join("history.json");
     fs::write(&history, issue_2296_history_json()).expect("write history");
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         &format!(
@@ -824,7 +837,7 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
             history = history.display(),
         ),
     );
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "kubectl",
         "#!/bin/sh\necho 'postgresql://curie:secret-password@postgres:5432/curie' >&2\necho '0039 (head)'\n",

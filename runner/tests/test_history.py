@@ -31,82 +31,10 @@ from curie_runner.history import (
     build_conversation_replay,
     resolve_history,
 )
+from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
 _TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": str(_STATE_VALUE_MAX_BYTES)}
-
-
-def _fake_state_app() -> tuple[web.Application, list]:
-    """A minimal fake of the state key at /agents/A/state/transcript/t1."""
-    log: list = []
-    app = web.Application()
-    key = "/agents/A/state/transcript/t1"
-
-    async def get_key(request: web.Request) -> web.Response:
-        if not log:
-            return web.json_response(
-                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
-            )
-        return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)},
-            headers=_TRANSCRIPT_CAP_HEADERS,
-        )
-
-    async def append_key(request: web.Request) -> web.Response:
-        body = await request.json()
-        log.append(body["item"])
-        return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)}
-        )
-
-    app.router.add_get(key, get_key)
-    app.router.add_post(f"{key}/append", append_key)
-    return app, log
-
-
-def _capped_state_app() -> tuple[web.Application, list, list[int]]:
-    """A state-key fake that enforces the API's whole-value JSON byte cap."""
-
-    log: list = []
-    rejected_sizes: list[int] = []
-    app = web.Application()
-    key = "/agents/A/state/transcript/t1"
-
-    async def get_key(_request: web.Request) -> web.Response:
-        if not log:
-            return web.json_response(
-                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
-            )
-        return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1},
-            headers=_TRANSCRIPT_CAP_HEADERS,
-        )
-
-    async def append_key(request: web.Request) -> web.Response:
-        body = await request.json()
-        candidate = [*log, body["item"]]
-        encoded_size = len(
-            json.dumps(candidate, separators=(",", ":")).encode("utf-8")
-        )
-        if encoded_size > _STATE_VALUE_MAX_BYTES:
-            rejected_sizes.append(encoded_size)
-            return web.json_response(
-                {
-                    "detail": (
-                        f"value is {encoded_size} bytes, over the "
-                        f"{_STATE_VALUE_MAX_BYTES}-byte per-value cap"
-                    )
-                },
-                status=413,
-            )
-        log.append(body["item"])
-        return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1}
-        )
-
-    app.router.add_get(key, get_key)
-    app.router.add_post(f"{key}/append", append_key)
-    return app, log, rejected_sizes
 
 
 def _assert_digest_marker(value: object, original: str) -> None:
@@ -184,9 +112,7 @@ def test_legacy_turn_becomes_structured_user_assistant_messages() -> None:
 
     assert record.messages == (
         ConversationMessage(role="user", content="old question"),
-        ConversationMessage(
-            role="assistant", content=[{"type": "text", "text": "old answer"}]
-        ),
+        ConversationMessage(role="assistant", content=[{"type": "text", "text": "old answer"}]),
     )
 
 
@@ -200,10 +126,10 @@ def test_malformed_structured_turn_is_rejected_instead_of_falling_back_to_legacy
             }
         )
 
+
 def test_long_history_compacts_once_then_keeps_prefix_stable_until_next_boundary() -> None:
     records = [
-        TurnRecord(user=f"u{i}", assistant=f"a{i}", ts=f"2026-08-30T00:00:0{i}Z")
-        for i in range(6)
+        TurnRecord(user=f"u{i}", assistant=f"a{i}", ts=f"2026-08-30T00:00:0{i}Z") for i in range(6)
     ]
 
     replay, summary = build_conversation_replay(records, max_turns=4, max_bytes=None)
@@ -290,17 +216,11 @@ def test_structured_resume_materializes_ordered_sdk_entries_without_rendering_te
                 }
             ],
         ),
-        ConversationMessage(
-            role="assistant", content=[{"type": "text", "text": "done"}]
-        ),
+        ConversationMessage(role="assistant", content=[{"type": "text", "text": "done"}]),
     )
 
-    first = build_structured_resume(
-        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
-    )
-    second = build_structured_resume(
-        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
-    )
+    first = build_structured_resume(messages, curie_session_id="curie-thread-1", cwd=str(tmp_path))
+    second = build_structured_resume(messages, curie_session_id="curie-thread-1", cwd=str(tmp_path))
 
     assert first.resume == first.session_id
     assert first.session_id == second.session_id
@@ -346,9 +266,7 @@ def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_
         harness_replay=checkpoint,
     )
     assert resume.session_store is not None
-    assert anyio.run(resume.session_store.load, resume.session_key) == list(
-        checkpoint.entries
-    )
+    assert anyio.run(resume.session_store.load, resume.session_key) == list(checkpoint.entries)
 
     options = build_options(
         plugins=[],
@@ -366,19 +284,20 @@ def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_
 
     exported = anyio.run(session.export_replay_state)
 
-    assert exported == HarnessReplayState(
-        harness="claude", kind="delta", entries=(delta_entry,)
-    )
+    assert exported == HarnessReplayState(harness="claude", kind="delta", entries=(delta_entry,))
 
 
 def test_dropped_native_export_requests_a_fresh_adapter_checkpoint(tmp_path) -> None:
-    resume = build_structured_resume(
-        (), curie_session_id="curie-thread-bounded", cwd=str(tmp_path)
-    )
+    resume = build_structured_resume((), curie_session_id="curie-thread-bounded", cwd=str(tmp_path))
     assert resume.session_store is not None
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=2,
-        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=2,
+        max_budget_usd=1.0,
+        resume=resume.resume,
+        session_id=resume.session_id,
         session_store=resume.session_store,
     )
     session = ClaudeAgentSession(options)
@@ -387,7 +306,8 @@ def test_dropped_native_export_requests_a_fresh_adapter_checkpoint(tmp_path) -> 
     first_export = anyio.run(session.export_replay_state)
     assert first_export is not None and first_export.kind == "checkpoint"
     record = TurnRecord(
-        user="q", assistant="answer",
+        user="q",
+        assistant="answer",
         messages=(
             ConversationMessage(role="user", content="q"),
             ConversationMessage(role="assistant", content=[{"type": "text", "text": "answer"}]),
@@ -417,8 +337,13 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
     )
     assert resume.session_store is not None
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=2,
-        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=2,
+        max_budget_usd=1.0,
+        resume=resume.resume,
+        session_id=resume.session_id,
         session_store=resume.session_store,
     )
     adapter = ClaudeAgentSession(options)
@@ -432,7 +357,8 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
 
     first_entry = {"type": "assistant", "uuid": "entry-1", "payload": "n" * 60_000}
     second_entry = {"type": "assistant", "uuid": "entry-2"}
-    app, log, rejected_sizes = _capped_state_app()
+    state = CappedCasState()
+    app = state.app()
 
     async def go() -> None:
         await resume.session_store.append(resume.session_key, [first_entry])
@@ -442,13 +368,17 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
             )
             runner = SessionRunner(
                 session_factory=lambda: AdapterBackedFake(default_turn),
-                ceiling=0, tracer=RunTracer(None), classifier=SideEffectClassifier(),
-                trace_name="bounded-native-reset", session_id="session-native-reset",
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="bounded-native-reset",
+                session_id="session-native-reset",
                 history_store=history,
             )
             await runner.start()
             lines = [
-                line async for line in runner.run_inbound(
+                line
+                async for line in runner.run_inbound(
                     Event(type="message", text="q", user="U", ts="1")
                 )
             ]
@@ -456,8 +386,8 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
             assert isinstance(final, Final)
             assert final.status is SessionStatus.DONE
             assert runner.history_durable is True
-            assert len(log) == 1 and log[0]["harness_replay"] is None
-            assert rejected_sizes == []
+            assert len(state.value or []) == 1 and state.value[0]["harness_replay"] is None
+            assert state.rejections() == []
             await resume.session_store.append(resume.session_key, [second_entry])
             next_export = await adapter.export_replay_state()
             assert next_export == HarnessReplayState(
@@ -547,9 +477,7 @@ def test_bounded_middle_turn_breaks_native_checkpoint_delta_chain() -> None:
     middle = bound_turn_record(
         _over_bound_turn(
             "middle",
-            HarnessReplayState(
-                harness="claude", kind="delta", entries=({"uuid": "M2"},)
-            ),
+            HarnessReplayState(harness="claude", kind="delta", entries=({"uuid": "M2"},)),
         ),
         max_value_bytes=8_000,
     )
@@ -616,9 +544,7 @@ def test_prior_summary_plus_one_over_bound_turn_makes_no_new_summary() -> None:
     )
     turn = _over_bound_turn("after-summary")
 
-    replay, summary = build_conversation_replay(
-        [prior, turn], max_turns=40, max_bytes=16_000
-    )
+    replay, summary = build_conversation_replay([prior, turn], max_turns=40, max_bytes=16_000)
 
     assert summary is None
     assert replay.messages == prior.messages + turn.messages
@@ -663,7 +589,7 @@ def test_resolve_unsupported_scheme_raises() -> None:
 
 
 def test_state_store_load_empty_is_empty() -> None:
-    app, _ = _fake_state_app()
+    app = CappedCasState().app()
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -675,7 +601,8 @@ def test_state_store_load_empty_is_empty() -> None:
 
 
 def test_state_store_append_then_load_round_trip() -> None:
-    app, log = _fake_state_app()
+    state = CappedCasState()
+    app = state.app()
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -691,7 +618,7 @@ def test_state_store_append_then_load_round_trip() -> None:
                 TurnRecord(user="q1", assistant="a1", ts="2026-07-14T00:00:00+00:00"),
                 TurnRecord(user="q2", assistant="a2"),
             ]
-            assert len(log) == 2
+            assert len(state.value or []) == 2
 
     anyio.run(go)
 
@@ -824,9 +751,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
         ),
         harness_replay=harness_replay,
     )
-    raw_value_size = len(
-        json.dumps([raw_record.to_dict()], separators=(",", ":")).encode("utf-8")
-    )
+    raw_value_size = len(json.dumps([raw_record.to_dict()], separators=(",", ":")).encode("utf-8"))
     raw_without_native = TurnRecord(
         user=raw_record.user,
         assistant=raw_record.assistant,
@@ -834,11 +759,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
     )
     assert raw_value_size > 84 * 1024
     assert (
-        len(
-            json.dumps(
-                [raw_without_native.to_dict()], separators=(",", ":")
-            ).encode("utf-8")
-        )
+        len(json.dumps([raw_without_native.to_dict()], separators=(",", ":")).encode("utf-8"))
         > _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
     )
 
@@ -869,9 +790,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
                 )
             ]
         ),
-        AssistantMessage(
-            content=[TextBlock(text=assistant_payload)], model="fake-model"
-        ),
+        AssistantMessage(content=[TextBlock(text=assistant_payload)], model="fake-model"),
         ResultMessage(
             subtype="success",
             duration_ms=1,
@@ -883,7 +802,8 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             usage={"input_tokens": 1, "output_tokens": 1},
         ),
     ]
-    app, log, rejected_sizes = _capped_state_app()
+    state = CappedCasState()
+    app = state.app()
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -918,10 +838,10 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             assert runner.history_durable is True
 
             # Bounding is pre-append: the API must never reject a raw attempt.
-            assert rejected_sizes == []
-            assert len(log) == 1
+            assert state.rejections() == []
+            assert len(state.value or []) == 1
             assert (
-                len(json.dumps(log, separators=(",", ":")).encode("utf-8"))
+                len(json.dumps(state.value, separators=(",", ":")).encode("utf-8"))
                 <= _STATE_VALUE_MAX_BYTES
             )
 
@@ -995,9 +915,7 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
 
     store = _BoundedRecordingStore()
     runner = _recording_runner(store, script=script)
-    final = _run_recording_turn(
-        runner, Event(type="message", text="q", user="U", ts="1")
-    )
+    final = _run_recording_turn(runner, Event(type="message", text="q", user="U", ts="1"))
 
     assert final.status is SessionStatus.CLASSIFIED_FAILURE
     assert runner.history_durable is False
@@ -1036,9 +954,7 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
                 ),
             ],
             [
-                AssistantMessage(
-                    content=[TextBlock(text="small answer")], model="fake-model"
-                ),
+                AssistantMessage(content=[TextBlock(text="small answer")], model="fake-model"),
                 ResultMessage(
                     subtype="success",
                     duration_ms=1,
@@ -1255,9 +1171,7 @@ def test_accepted_steer_is_persisted_in_ordered_structured_history() -> None:
 
     async def go() -> None:
         await runner.start()
-        stream = runner.run_turn(
-            Event(type="message", text="first request", user="U", ts="1")
-        )
+        stream = runner.run_turn(Event(type="message", text="first request", user="U", ts="1"))
         await stream.__anext__()
         assert await runner.steer("authorized steering state") is True
         async for _ in stream:
@@ -1316,6 +1230,7 @@ def test_classified_failure_turn_is_not_appended_to_the_transcript() -> None:
                 usage=None,
             )
         ]
+
     store = _RecordingStore()
     final = _run_recording_turn(
         _recording_runner(store, script=script),
@@ -1446,9 +1361,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
             "CURIE_PLUGIN_DIR": str(tmp_path),
             "CURIE_SESSION_ID": "s-model",
             "CURIE_SANDBOX_ID": "b-model",
-            "CURIE_BUDGET": (
-                '{"max_output_tokens_per_run": 1000, "max_usd_per_day": 1.0}'
-            ),
+            "CURIE_BUDGET": ('{"max_output_tokens_per_run": 1000, "max_usd_per_day": 1.0}'),
             "CURIE_MODEL": "z-ai/glm-5.2",
         }
     )

@@ -88,6 +88,7 @@ def _detail(
 def _decide(detail: CiDetail, seconds: float, **kwargs: Any) -> Any:
     kwargs.setdefault("execution_deadline", DEADLINE)
     kwargs.setdefault("ci_wait_seconds", 1200)
+    kwargs.setdefault("changed_paths", [])
     return factory_ci.decide(
         detail,
         now=PUBLISHED + timedelta(seconds=seconds),
@@ -106,6 +107,21 @@ def _names(items: Any) -> set[str]:
         else:
             names.add(str(getattr(item, "name", None) or getattr(item, "context", None)))
     return names
+
+
+def test_later_non_python_fix_cannot_drop_prior_python_ci_requirement() -> None:
+    publications = [
+        SimpleNamespace(changed_paths=["apps/api/src/example.py"]),
+        SimpleNamespace(changed_paths=["README.md"]),
+    ]
+    changed_paths = factory_ci._publication_changed_paths(publications)
+    skipped = _run("Python (ruff + mypy + pytest)", conclusion="skipped")
+    skipped["app"] = {"slug": "github-actions"}
+
+    verdict = _decide(_detail(skipped), 130, changed_paths=changed_paths)
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_skipped"
 
 
 # --- constants and contracts ---------------------------------------------------

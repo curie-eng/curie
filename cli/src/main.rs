@@ -1139,13 +1139,6 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
-    /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
-    /// MCP server and a live provider
-    /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
-    /// `curie cluster message`. Approvals resolve through
-    /// `curie cluster approvals` and an operator principal. Missing the live
-    /// provider skips with the reason in the run summary.
-    SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
     /// Drive the dark factory against a disposable install on a named kube
@@ -4332,7 +4325,6 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
-            DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
             }
@@ -7733,14 +7725,6 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::E2eLadder
-            })
-        ));
-        let cli = try_parse_from(["curie", "dev", "sre-demo-e2e"])
-            .expect("dev sre-demo-e2e should parse");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Dev {
-                action: DevAction::SreDemoE2e
             })
         ));
         let cli = try_parse_from(["curie", "dev", "two-release-approval-e2e"])

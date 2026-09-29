@@ -71,7 +71,10 @@ server {
         # is unchanged from before this commit.
         gzip off;
         proxy_pass ${CURIE_API_TARGET}/;
-        proxy_set_header Host $host;
+        # $host drops the port. The console origin check compares host and
+        # port, so a console on :28080 would reject its own cookie. $http_host
+        # is the browser Host header, port included.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

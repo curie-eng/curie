@@ -300,6 +300,8 @@ def _admission_result(
     if isinstance(result, WorkItemOutcome):
         if result.replayed:
             return WebhookResult(status="factory_duplicate")
+        if result.request is not None and result.request.status == "queued":
+            return WebhookResult(status="factory_queued")
         if result.request is not None and result.request.id != request_id:
             return WebhookResult(status="factory_readmit_pending")
         return WebhookResult(status="factory_admitted")
@@ -321,7 +323,7 @@ async def admit_notice(
             raise FactoryRefused("not_admitted")
     facts = _facts(notice, binding, settings)
     if notice.disposition == "mention":
-        result = await workitem_dispatch.admit(session, facts)
+        result = await workitem_dispatch.admit_revision(session, facts)
     else:
         result = await workitem_dispatch.readmit(session, facts)
     return _admission_result(result, facts.request_id)

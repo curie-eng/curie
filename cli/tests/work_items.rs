@@ -134,6 +134,17 @@ fn detail_item() -> Value {
     value
 }
 
+fn queued_item() -> Value {
+    let mut value = item("queued");
+    value["actionable_cause"] = json!("revision waiting for the current run");
+    value["publication"] = Value::Null;
+    value["requests"][0]["status"] = json!("queued");
+    value["requests"][0]["wait_deadline"] = Value::Null;
+    value["requests"][0]["terminal_at"] = Value::Null;
+    value["requests"][0]["terminal_cause"] = Value::Null;
+    value
+}
+
 fn list_body(items: Vec<Value>, limit: u64, truncated: bool) -> String {
     json!({"items": items, "limit": limit, "truncated": truncated}).to_string()
 }
@@ -205,6 +216,61 @@ fn list_json_is_the_stable_envelope_and_validates_against_the_schema() {
         .expect("GET /work-items was called");
     assert_eq!(request.method, "GET");
     assert_eq!(request.header("x-api-key"), Some(TEST_API_KEY));
+}
+
+#[test]
+fn queued_revision_with_no_wait_deadline_survives_list_and_detail() {
+    let queued = queued_item();
+    let list = list_body(vec![queued.clone()], 200, false);
+    let detail = queued.to_string();
+    let server = serve(move |req| match route(&req.path) {
+        "/work-items" => Response::json(200, &list),
+        p if p == format!("/work-items/{ITEM_ID}") => Response::json(200, &detail),
+        _ => Response::json(500, "{}"),
+    });
+
+    let list_output = local(&[], &server.base_url, true);
+    assert_eq!(
+        list_output.status.code(),
+        Some(0),
+        "{}",
+        describe(&list_output)
+    );
+    let list_value = one_object(&list_output);
+    assert_eq!(list_value["items"][0]["state"], "queued");
+    assert_eq!(
+        list_value["items"][0]["requests"][0]["wait_deadline"],
+        Value::Null
+    );
+    assert_schema(&list_value);
+
+    let detail_output = local(&[ITEM_ID], &server.base_url, false);
+    assert_eq!(
+        detail_output.status.code(),
+        Some(0),
+        "{}",
+        describe(&detail_output)
+    );
+    let detail_text = stdout(&detail_output);
+    assert!(detail_text.contains("state        queued"), "{detail_text}");
+    assert!(
+        detail_text.contains("request      #1 queued"),
+        "{detail_text}"
+    );
+
+    let detail_json_output = local(&[ITEM_ID], &server.base_url, true);
+    assert_eq!(
+        detail_json_output.status.code(),
+        Some(0),
+        "{}",
+        describe(&detail_json_output)
+    );
+    let detail_value = one_object(&detail_json_output);
+    assert_eq!(
+        detail_value["item"]["requests"][0]["wait_deadline"],
+        Value::Null
+    );
+    assert_schema(&detail_value);
 }
 
 #[test]

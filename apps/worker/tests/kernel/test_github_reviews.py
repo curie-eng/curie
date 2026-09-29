@@ -10,8 +10,11 @@ kernel's ordering around the real Valkey lock and real RunnerClient.
 from __future__ import annotations
 
 import asyncio
+import functools
+import sys
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +40,13 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workspace import WorkspaceSelectionRefused
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until  # noqa: E402
+
+_wait_until = functools.partial(wait_until, timeout=3.0)
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -277,12 +287,6 @@ def _claim_matching_route(h: Any, turn: QueuedTurn) -> None:
         workspace_materialized_head=HEAD,
         publication_visible_outcome_revision=1,
     )
-
-
-async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            await asyncio.sleep(0.01)
 
 
 def test_prefix_only_impostor_is_refused_before_steer_or_model(make_harness) -> None:

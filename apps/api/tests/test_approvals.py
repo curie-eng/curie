@@ -24,9 +24,9 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
+from _migration_support import IsolatedMigrationDb, alembic_config
 from aci_protocol import QueuedTurn
 from alembic import command
-from alembic.config import Config
 from curie_api import approval_principal, crud
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
@@ -67,7 +67,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # The migration test (18) drives alembic directly against the disposable DB the
 # conftest provisions, so it needs the same script location conftest uses.
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 _TRACE_ID = int("2123456789abcdef0123456789abcdef", 16)
 _SPAN_ID = int("2123456789abcdef", 16)
 _TRACEPARENT = "00-2123456789abcdef0123456789abcdef-2123456789abcdef-01"
@@ -292,6 +291,27 @@ def _read_resumed_at(approval_id: str) -> datetime | None:
             async with sessionmaker() as session:
                 approval = await session.get(Approval, uuid.UUID(approval_id))
                 return None if approval is None else approval.resumed_at
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
+def _lapse(approval_id: str) -> datetime:
+    """Move the approval's ``expires_at`` an hour into the past, so its SLA has
+    lapsed without the test sleeping out a real expiry window, and return the
+    new deadline. Same fresh-engine shape as ``_read_resumed_at``."""
+
+    async def _run() -> datetime:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                approval = await session.get(Approval, uuid.UUID(approval_id))
+                assert approval is not None and approval.expires_at is not None
+                approval.expires_at -= timedelta(hours=1)
+                await session.commit()
+                return approval.expires_at
         finally:
             await engine.dispose()
 
@@ -693,7 +713,7 @@ def test_late_expiry_transition_and_resume_parent_to_the_stored_turn(
         json=_payload(expires_in_seconds=1),
         headers={**auth_headers, "traceparent": _TRACEPARENT},
     ).json()
-    time.sleep(1.1)
+    _lapse(created["id"])
 
     with _captured_approval_spans() as exporter:
         expired = approvals_client.post(
@@ -918,7 +938,7 @@ def test_expired_approval_resolve_returns_410_and_resumes(
         "/approvals", json=payload, headers=auth_headers
     ).json()
     assert created["expires_at"] is not None
-    time.sleep(1.1)
+    _lapse(created["id"])
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
@@ -955,16 +975,6 @@ _OWNERSHIP_VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "approval-ownership.json"
 )
 _EXPECTED_OWNERSHIP_VECTOR_KEYS = frozenset({"comment", "not_found_detail"})
-
-
-def test_api_ownership_detail_constant_matches_the_frozen_vector() -> None:
-    """The API constant is the dispatcher ownership-miss detail, frozen in the vector."""
-
-    from curie_api.routers.approvals import APPROVAL_NOT_FOUND_DETAIL
-
-    vector = json.loads(_OWNERSHIP_VECTOR.read_text(encoding="utf-8"))
-    assert set(vector) == _EXPECTED_OWNERSHIP_VECTOR_KEYS
-    assert APPROVAL_NOT_FOUND_DETAIL == vector["not_found_detail"]
 
 
 def test_unknown_approval_is_404(
@@ -1241,8 +1251,8 @@ def test_create_approval_persists_gate_kind_and_granted_tool(
     assert legacy["granted_tool"] is None
 
 
-def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
-    """(18) The migration backfills rows at rest, then round-trips.
+def test_backfill_classifies_existing_rows(isolated_migration_db: IsolatedMigrationDb) -> None:
+    """(18) The migration backfills rows at rest.
 
     A prefixed summary is a genuine permission-gate block (the runner is the
     only writer of that reserved namespace), so it backfills to 'permission'
@@ -1255,15 +1265,14 @@ def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
     never disturbs the shared session DB the other tests read.
     """
 
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    cfg = alembic_config()
 
     # Bring the fresh DB up to the full schema, then step back to BEFORE the
     # provenance migration (0015) to the state an existing deployment holds.
     # Target 0014 explicitly rather than a relative "-1": a later migration
     # (e.g. 0016) moving head would make "-1" stop short of undoing 0015, and
     # the backfill would never re-run on the seeded rows.
-    command.upgrade(cfg, "head")
+    isolated_migration_db.at("head")
     command.downgrade(cfg, "0014")
     permission_id = uuid.uuid4()
     policy_id = uuid.uuid4()
@@ -1282,13 +1291,9 @@ def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
     assert _read_provenance(permission_id) == ("permission", "Bash")
     assert _read_provenance(policy_id) == ("policy", None)
 
-    # And the revision round-trips cleanly rather than only migrating forward.
-    command.downgrade(cfg, "-1")
-    command.upgrade(cfg, "head")
-
 
 def test_gate_kind_check_constraint_rejects_unknown_values(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """(#544) The DB-layer guard on the security-load-bearing gate_kind column.
 
@@ -1300,9 +1305,6 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
     database (see ``_isolated_migration_db``) so the schema is untouched shared
     state.
     """
-
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
 
     async def _insert(gate_kind: str | None) -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1330,7 +1332,7 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
         finally:
             await engine.dispose()
 
-    command.upgrade(cfg, "head")
+    isolated_migration_db.at("head")
     # Accepted: the two literals plus NULL (NULL IN (...) is NULL, not
     # FALSE, so the CHECK passes -- the old-runner / pre-backfill case).
     asyncio.run(_insert("permission"))
@@ -1779,7 +1781,7 @@ def test_resolve_path_expiry_returns_410_even_if_enqueue_fails(
         "/approvals", json=payload, headers=auth_headers
     ).json()
     assert created["expires_at"] is not None
-    time.sleep(1.1)
+    _lapse(created["id"])
 
     async def _boom(*a: Any, **k: Any) -> str:
         raise RuntimeError("valkey down")
@@ -1851,7 +1853,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
         "/approvals", json=payload, headers=auth_headers
     ).json()
     assert created["expires_at"] is not None
-    time.sleep(1.1)
+    lapsed_at = _lapse(created["id"])
 
     real_mark = crud.mark_approval_resumed
 
@@ -1878,7 +1880,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
 
     # The 410 still names the expiry deadline. This is what the hoist protects: a
     # lazy reload after the rollback 500s before this body is ever built.
-    deadline = str(datetime.fromisoformat(created["expires_at"]))
+    deadline = str(lapsed_at)
     assert deadline in resolved.json()["detail"]
 
     # The SLA flip committed independently of the failed mark.

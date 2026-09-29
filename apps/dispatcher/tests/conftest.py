@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 import redis
+from curie_dispatcher.approval_actions import ResolveOutcome
 from curie_dispatcher.config import DispatcherConfig
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
@@ -95,26 +96,6 @@ class FakeSocketClient:
         return self.ack_payloads.get(envelope_id)
 
 
-def deliver_until_acked(
-    connections: list[tuple[Any, FakeSocketClient, Any]],
-    request: Any,
-) -> FakeSocketClient | None:
-    """Deliver one Socket Mode envelope to each connection until one acks.
-
-    Slack retries an unacked envelope on another connection of the same app
-    (https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
-    This is the fake-app stand-in for that retry: the same envelope_id, in
-    order, stopping at the first ack.
-    """
-
-    for handler, sock, app in connections:
-        handler.handle(sock, request)
-        app.listener_runner.listener_executor.shutdown(wait=True)
-        if request.envelope_id in sock.acked_envelope_ids:
-            return sock
-    return None
-
-
 def deliver_once(
     handler: Any,
     sock: FakeSocketClient,
@@ -123,8 +104,8 @@ def deliver_once(
 ) -> None:
     """Handle exactly one Socket Mode envelope and return.
 
-    Unlike ``deliver_until_acked``, this does not walk other connections and
-    does not stop at the first ack. Owner-only proof is one delivery to the
+    It does not walk other connections and does not stop at the first ack.
+    Owner-only proof is one delivery to the
     non-owner (no ack, no mutate) then one delivery to the owner, not a loop
     until someone acks (#2307).
     """
@@ -293,3 +274,44 @@ def config(
     keys.append(cfg.stream)
     if keys:
         redis_client.delete(*keys)
+
+
+class ScriptedResolver:
+    """Stands in for the platform API: returns a scripted outcome per call."""
+
+    def __init__(self, outcome: ResolveOutcome) -> None:
+        self.outcome = outcome
+        self.calls: list[dict[str, str]] = []
+
+    def resolve(
+        self,
+        approval_id: str,
+        *,
+        decision: str,
+        attested_user: str,
+        attested_channel: str,
+        note: str | None = None,
+    ) -> ResolveOutcome:
+        # `note` is recorded, not ignored: the dialog path's whole point is that
+        # the approver's reason reaches the record, and a stand-in that dropped
+        # it would let that regress silently (#1053).
+        self.calls.append(
+            {
+                "approval_id": approval_id,
+                "decision": decision,
+                "attested_user": attested_user,
+                "attested_channel": attested_channel,
+                "note": note,
+            }
+        )
+        return self.outcome
+
+    def exists(self, approval_id: str) -> bool | None:
+        # Mirror the production ownership probe: only the exact API row-miss
+        # is "not this release". Any other outcome means this release has a
+        # row (or the probe failed open).
+        del approval_id
+        return not (
+            self.outcome.status_code == 404
+            and self.outcome.detail.strip().casefold() == "approval not found"
+        )

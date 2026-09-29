@@ -28,20 +28,13 @@ itself via `isolated_migration_db`, real Postgres, no mocking.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, constraint_exists, sql_rows
 from alembic import command
 from alembic.config import Config
-from curie_api.config import get_settings
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Targeted explicitly, never as a relative "-1": a later migration moving head
 # would make "-1" stop short of undoing 0023 and the test would go green while
@@ -55,50 +48,13 @@ NEW_CONSTRAINT = "agent_channels_kind_address_key"
 AGENT_CONSTRAINT = "agent_channels_agent_id_key"
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
-def _constraint_named(name: str) -> bool:
-    """Look the constraint up BY NAME in the catalog.
-
-    Deliberately not a shape check: a unique constraint created under a generated
-    name has the right shape and the wrong identity, which is the failure the
-    API's 409 map trips over.
-    """
-
-    rows = _sql(
-        "SELECT 1 FROM pg_constraint c "
-        "JOIN pg_class t ON t.oid = c.conrelid "
-        "JOIN pg_namespace n ON n.oid = t.relnamespace "
-        "WHERE n.nspname = 'curie' AND c.conname = :name",
-        {"name": name},
-    )
-    return bool(rows)
-
-
 def _seed_binding(name: str, kind: str, address: str) -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": name},
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, :kind, :addr)",
         {"id": uuid.uuid4(), "agent": agent_id, "kind": kind, "addr": address},
@@ -106,14 +62,13 @@ def _seed_binding(name: str, kind: str, address: str) -> uuid.UUID:
     return agent_id
 
 
-def _at_below() -> Config:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
-    return cfg
+def _at_below(db: IsolatedMigrationDb) -> Config:
+    db.at(BELOW)
+    return alembic_config()
 
 
 def test_the_upgrade_lets_two_kinds_share_one_address(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A6 at the database / AC5. The widening asserted as BEHAVIOR: the insert
     that the old constraint refused now succeeds, and the pair itself is still
@@ -125,13 +80,13 @@ def test_the_upgrade_lets_two_kinds_share_one_address(
     refuses.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_binding("slack-agent", "slack", "shared@example.test")
 
     command.upgrade(cfg, REVISION)
 
     _seed_binding("mail-agent", "email", "shared@example.test")
-    rows = _sql(
+    rows = sql_rows(
         "SELECT kind FROM curie.agent_channels WHERE address = 'shared@example.test' "
         "ORDER BY kind"
     )
@@ -143,14 +98,14 @@ def test_the_upgrade_lets_two_kinds_share_one_address(
     assert NEW_CONSTRAINT in str(caught.value), caught.value
 
     # And the named contract moved, in both directions.
-    assert _constraint_named(NEW_CONSTRAINT)
-    assert not _constraint_named(OLD_CONSTRAINT)
+    assert constraint_exists(NEW_CONSTRAINT)
+    assert not constraint_exists(OLD_CONSTRAINT)
     # One agent still binds one channel; this migration must not touch it.
-    assert _constraint_named(AGENT_CONSTRAINT)
+    assert constraint_exists(AGENT_CONSTRAINT)
 
 
 def test_the_downgrade_refuses_and_names_both_rows_sharing_an_address(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A9 / AC5. Two kinds at one address have no representation under an
     address-only constraint, so the only honest downgrade is a refusal that names
@@ -158,7 +113,7 @@ def test_the_downgrade_refuses_and_names_both_rows_sharing_an_address(
     constraint` that names one and leaves the operator to find the other.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
     _seed_binding("slack-agent", "slack", "shared@example.test")
     _seed_binding("mail-agent", "email", "shared@example.test")
@@ -171,11 +126,11 @@ def test_the_downgrade_refuses_and_names_both_rows_sharing_an_address(
     assert "slack" in message, message
     assert "email" in message, message
     # The refusal was total: both bindings survive.
-    assert len(_sql("SELECT 1 FROM curie.agent_channels")) == 2
+    assert len(sql_rows("SELECT 1 FROM curie.agent_channels")) == 2
 
 
 def test_the_downgrade_round_trips_when_no_address_is_shared(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A9's positive control, and the round trip 0021's test established as the
     discipline here: a downgrade that refused unconditionally would satisfy the
@@ -183,16 +138,16 @@ def test_the_downgrade_round_trips_when_no_address_is_shared(
     old constraint under a generated name would break the API's 409 map.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
     _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     _seed_binding("mail-agent", "email", "ops@example.test")
 
     command.downgrade(cfg, BELOW)
 
-    assert _constraint_named(OLD_CONSTRAINT)
-    assert not _constraint_named(NEW_CONSTRAINT)
-    assert len(_sql("SELECT 1 FROM curie.agent_channels")) == 2
+    assert constraint_exists(OLD_CONSTRAINT)
+    assert not constraint_exists(NEW_CONSTRAINT)
+    assert len(sql_rows("SELECT 1 FROM curie.agent_channels")) == 2
 
     command.upgrade(cfg, REVISION)
-    assert _constraint_named(NEW_CONSTRAINT)
+    assert constraint_exists(NEW_CONSTRAINT)

@@ -374,10 +374,29 @@ async fn handle_call(
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
 
+/// First line of a failed turn's delivered reply (#3401). Frozen with the
+/// worker writer in `tests/vectors/turn-failure-reply.json`.
+pub const TURN_FAILURE_REPLY_PREFIX: &str = "curie-turn-failure:";
+
+/// The failure class on a delivered reply, or `None` when the text is not a
+/// failed turn. Only a first line of `curie-turn-failure: <token>` counts. A
+/// later mention, or a token that contains whitespace, is model text.
+pub fn failure_class_from_reply(text: &str) -> Option<&str> {
+    let line = text.trim_start_matches('\n').lines().next()?.trim();
+    let rest = line.strip_prefix(TURN_FAILURE_REPLY_PREFIX)?.trim();
+    if rest.is_empty() || rest.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    Some(rest)
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     /// The worker finished the turn; the final placeholder text.
     Replied(String),
+    /// The worker delivered a reply for a failed runner turn. `class` is the
+    /// platform failure token. This is not a successful task reply (#3401).
+    Failed { reply: String, class: String },
     /// The worker finished the turn but never edited the placeholder.
     CompletedNoEdit,
     /// The turn parked awaiting human approval: the worker posted an approval
@@ -411,8 +430,17 @@ fn completed_turn_outcome(
             reply: latest,
             approval_id,
         }
+    } else if let Some(text) = latest.as_deref() {
+        if let Some(class) = failure_class_from_reply(text) {
+            Outcome::Failed {
+                reply: text.to_string(),
+                class: class.to_string(),
+            }
+        } else {
+            Outcome::Replied(text.to_string())
+        }
     } else {
-        latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied)
+        Outcome::CompletedNoEdit
     }
 }
 
@@ -795,6 +823,21 @@ mod tests {
         assert_eq!(channel.as_deref(), Some("C2"));
         assert_eq!(ts.as_deref(), Some("3.4"));
         assert_eq!(text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn a_failure_marked_placeholder_is_not_a_successful_reply() {
+        let reply = "curie-turn-failure: history-persistence-error\n\nrun failed";
+        match completed_turn_outcome(Some(reply.into()), false, None) {
+            Outcome::Failed { class, .. } => {
+                assert_eq!(class, "history-persistence-error");
+            }
+            outcome => panic!("expected Failed, got {outcome:?}"),
+        }
+        match completed_turn_outcome(Some("the answer is PONG".into()), false, None) {
+            Outcome::Replied(text) => assert_eq!(text, "the answer is PONG"),
+            outcome => panic!("expected Replied, got {outcome:?}"),
+        }
     }
 
     #[test]

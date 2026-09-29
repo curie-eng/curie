@@ -2219,9 +2219,9 @@ fn failed_hook_fails_convergence() {
 // (`charts/curie/templates/worker-upgrade-drain.yaml`) that fires during Apply,
 // which is why the Drain phase cannot see its verdict and Converge can.
 //
-// `queues_drained` binds to that one hook by name; `hooks_healthy` covers every
-// other hook. Both branches are reachable, so this test is a fixture and its
-// own mutation control.
+// `queues_drained` binds to the drain Job and the attest Job by name;
+// `hooks_healthy` covers every other hook. Both branches are reachable, so
+// this test is a fixture and its own mutation control.
 #[test]
 fn failed_drain_hook_is_the_only_source_of_queues_drained() {
     // The gate refused: accepted work was still in flight when the roll began.
@@ -2245,6 +2245,20 @@ fn failed_drain_hook_is_the_only_source_of_queues_drained() {
     );
     assert_eq!(control["convergence"]["exact"], true, "{control}");
     assert_eq!(control["status"], "succeeded", "{control}");
+}
+
+// The attest Job is the other Drain facet. A failed attest hook must refuse
+// `queues_drained` the same way the drain Job does, without flipping
+// `hooks_healthy`.
+#[test]
+fn failed_attest_hook_refuses_queues_drained() {
+    let gate = Fixture::new(None);
+    let output = gate.local("failed-attest-hook");
+    let refused = json(&output);
+    observed_for_real(&gate);
+    only_false(&refused, &["queues_drained"]);
+    assert_eq!(refused["status"], "failed", "{refused}");
+    assert_eq!(refused["phase"], "converge", "{refused}");
 }
 
 // T6 (cont.) -- the two paths that reach Converge with the Drain PHASE

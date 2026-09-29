@@ -14,11 +14,13 @@ seeded here is created with fresh uuids and deleted by the test that made it.
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from aci_protocol import (
@@ -44,6 +46,11 @@ from curie_worker.sandbox import QuotaRejection
 from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemRun
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 PROMPT = "run the nightly report"
 
@@ -674,14 +681,6 @@ def test_targetless_run_under_a_valid_lease_settles_done_without_outbox(
             assert outcome == "ran"
 
     asyncio.run(go())
-
-
-async def _wait_until(predicate, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("condition not met in time")
-        await asyncio.sleep(0.01)
 
 
 @pytest.mark.parametrize("fence", ["token", "generation"])

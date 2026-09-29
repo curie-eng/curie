@@ -699,13 +699,13 @@ explicit `scheme: https` plus both ports.
 A BYO Valkey that only accepts TLS -- in-transit-encrypted ElastiCache, Azure
 Cache for Redis, Redis Cloud, Upstash -- also needs `valkey.tls: true` alongside
 `valkey.deploy: false` and `valkey.host`. It reaches every consumer of that
-store at once: the api, worker and dispatcher, both `worker-upgrade-drain` hook
-Jobs, and both Langfuse Deployments. It requires `valkey.deploy: false` --
-`valkey.tls: true` against the in-chart Valkey fails the render, because that
-StatefulSet serves no TLS listener. Verification uses the system CA bundle, so a
-store fronted by a private CA (or one requiring mutual TLS) is not supported by
-this knob; that needs CA material distributed to all seven containers, which is
-a separate decision.
+store at once: the api, worker and dispatcher, the drain, attest, and release
+`worker-upgrade-drain` hook Jobs, and both Langfuse Deployments. It requires
+`valkey.deploy: false` -- `valkey.tls: true` against the in-chart Valkey fails
+the render, because that StatefulSet serves no TLS listener. Verification uses
+the system CA bundle, so a store fronted by a private CA (or one requiring
+mutual TLS) is not supported by this knob; that needs CA material distributed
+to all eight containers, which is a separate decision.
 
 BYO Langfuse requires a bare external hostname in `langfuse.host`. Consumers
 compose its URL as

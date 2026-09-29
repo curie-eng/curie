@@ -331,6 +331,7 @@ class DeliveryLease:
         self.budget = budget
         self.resume_event_id: str | None = None
         self.lost = asyncio.Event()
+        self.entry_vanished = asyncio.Event()
         self.settlement_lock = asyncio.Lock()
         self.acknowledged = asyncio.Event()
 
@@ -532,6 +533,44 @@ class DeliveryLeaseStore:
             anchor_server_ms=int(raw[1]),
             anchor_monotonic=anchor_monotonic,
         )
+
+    async def entry_vanished(
+        self,
+        stream: str,
+        group: str,
+        entry_id: str,
+        *,
+        owner: str,
+    ) -> bool | None:
+        """Whether this exact delivery is gone and no other owner holds it.
+
+        True only when ``XRANGE`` of ``entry_id`` is empty, ``XPENDING`` of
+        that same id is empty, and the lease key is missing or still ``owner``.
+        False when the entry exists, the PEL row exists, or the lease token is
+        some other owner. None when any of those reads raises.
+        """
+        try:
+            rows = await self._redis.xrange(stream, min=entry_id, max=entry_id, count=1)
+            if rows:
+                return False
+            pending = await self._redis.xpending_range(
+                stream,
+                group,
+                min=entry_id,
+                max=entry_id,
+                count=1,
+            )
+            if pending:
+                return False
+            lease_key, _state_key = self._keys(stream, group, entry_id)
+            token = await self._redis.get(lease_key)
+            if token is None:
+                return True
+            if isinstance(token, bytes):
+                token = token.decode()
+            return token == owner
+        except Exception:  # noqa: BLE001 - an unreadable probe is not a vanished entry
+            return None
 
     async def release(
         self,

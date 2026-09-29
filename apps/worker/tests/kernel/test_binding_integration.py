@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import sys
 import uuid
-from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, SessionStatus, TextDelta
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -25,6 +25,12 @@ from curie_worker.binding import (
 from curie_worker.config import WorkerConfig
 from curie_worker.killswitch import kill_key
 from curie_worker.reply_sink import TargetRoute
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -120,36 +126,6 @@ def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> R
         max_usd_per_day=None,
         max_output_tokens_per_run=None,
     )
-
-
-def _qevent(
-    text: str,
-    *,
-    channel: str,
-    thread: str = "th-1",
-    placeholder: str = "p-1",
-    kind: str = "slack",
-    adapter: str | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind=kind, channel=channel, placeholder=placeholder, adapter=adapter
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 def test_unmapped_channel_is_a_polite_drop(make_harness) -> None:

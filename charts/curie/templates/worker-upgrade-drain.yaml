@@ -203,4 +203,84 @@ spec:
               value: {{ $upgradeLegacyQuiesce | quote }}
           resources:
             {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
+---
+{{/*
+Attest hook (#3360). This hook is the refusal carrier when the drain Job
+object is deleted: Helm treats that deletion as the drain hook finishing, so
+this later hook fails closed unless the success record exists. A finalizer
+does not close that gap: the SIGTERM handler must clear the quiesce marker and
+exit, and dropping the finalizer there lets the object disappear. Leaving the
+finalizer wedges the next before-hook-creation delete.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-upgrade-drain-attest
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: upgrade-drain-attest
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  # The clock starts at Job creation, so it has to cover scheduling and the
+  # worker image pull, not only the Valkey read. The release hook uses the
+  # same ceiling. A tighter deadline can fail attest after a clean drain and
+  # leave the roll hold set until it expires.
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "upgrade-drain-attest") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      restartPolicy: Never
+      {{- if or (not .Values.priorityClasses.platform.create) (not .Release.IsUpgrade) }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: upgrade-drain-attest
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- with .Values.worker.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "attest", "--installation-id-observed={{ $installationIdObserved }}"]
+          env:
+            {{- include "curie.env.valkey" . | nindent 12 }}
+            - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
+              value: {{ $drainTimeout | quote }}
+            - name: CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S
+              value: {{ .Values.worker.upgradeDrain.pollIntervalSeconds | quote }}
+            - name: CURIE_UPGRADE_QUIESCE_TTL_S
+              value: {{ $quiesceTtl | quote }}
+            - name: CURIE_INSTALLATION_ID
+              value: {{ $installationId | quote }}
+            - name: CURIE_UPGRADE_REVISION
+              value: {{ $upgradeRevision | quote }}
+            - name: CURIE_UPGRADE_LEGACY_QUIESCE
+              value: {{ $upgradeLegacyQuiesce | quote }}
+          resources:
+            {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
 {{- end }}

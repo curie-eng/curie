@@ -319,6 +319,9 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
+            # Per-thread conversation transcript cap in bytes (#3301).
+            - name: TRANSCRIPT_MAX_THREAD_BYTES
+              value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
             {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
           ports:
             - name: http

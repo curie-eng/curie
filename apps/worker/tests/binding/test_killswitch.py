@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+import sys
 import uuid
-from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 import redis.asyncio as aredis
@@ -28,20 +28,16 @@ from curie_test_support.valkey import (
 from curie_worker import killswitch as killswitch_module
 from curie_worker.killswitch import KILL_CHANNEL, KillSwitch, kill_key
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
+
 
 def _client() -> aredis.Redis:
     return aredis.Redis(
         host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None, decode_responses=True
     )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 def test_is_killed_reflects_the_flag_key() -> None:

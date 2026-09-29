@@ -10,7 +10,10 @@ const apiTarget = process.env.CURIE_API_TARGET ?? "http://localhost:8000";
 const proxy = {
   "/api": {
     target: apiTarget,
-    changeOrigin: true,
+    // Keep the browser's Host. The API compares that host to Origin on
+    // cookie-authenticated writes, and rewriting it to the API target would
+    // reject a legitimate console approval.
+    changeOrigin: false,
     rewrite: (p: string) => p.replace(/^\/api/, ""),
   },
 };

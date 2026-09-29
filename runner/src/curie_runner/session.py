@@ -225,13 +225,20 @@ _HISTORY_CAPACITY_FINAL = Final(
 )
 
 
-def _history_capacity_lines() -> tuple[str, str]:
-    """The one non-retryable capacity refusal, shared by append and boot (#2820)."""
+def _history_capacity_lines(detail: str | None = None) -> tuple[str, str]:
+    """The one non-retryable capacity refusal, shared by append and boot (#2820).
 
+    ``detail`` carries the cap and the turn's size when a turn could not be
+    bounded (#3301).
+    """
+
+    message = "conversation history capacity exceeded"
+    if detail:
+        message = f"{message}: {detail}"
     return (
         to_ndjson_line(
             ErrorEvent(
-                message="conversation history capacity exceeded",
+                message=message,
                 classification="history-persistence-error",
             )
         ),
@@ -381,6 +388,8 @@ class SessionRunner:
         # missing prefix, so the loss remains sticky for this runner's lifetime.
         self._history_durable = True
         self._history_loss_observed = False
+        # The cap and turn size of the last unboundable turn (#3301).
+        self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
         self._turn_ready = False
 
@@ -583,7 +592,8 @@ class SessionRunner:
             try:
                 with anyio.fail_after(_HISTORY_PERSISTENCE_BUDGET_SECONDS):
                     await self._record_turn(event, state)
-            except HistoryCapacityError:
+            except HistoryCapacityError as exc:
+                self._capacity_detail = exc.detail
                 state.final_text = None
                 state.approval_summary = None
                 state.approval_route = None
@@ -892,7 +902,7 @@ class SessionRunner:
                                 interrupt_requested=False,
                                 classified_failure=True,
                             )
-                            for line in _history_capacity_lines():
+                            for line in _history_capacity_lines(self._capacity_detail):
                                 if isinstance(parse_ndjson_line(line), Final):
                                     terminal_for_log = True
                                 yield line
@@ -1386,7 +1396,7 @@ class SessionRunner:
                         is SessionStatus.AWAITING_APPROVAL,
                     )
                     if capacity_failure:
-                        for line in _history_capacity_lines():
+                        for line in _history_capacity_lines(self._capacity_detail):
                             yield line
                     else:
                         yield to_ndjson_line(self._with_connector_notice(final))
@@ -1452,7 +1462,7 @@ class SessionRunner:
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
         if capacity_failure:
-            for line in _history_capacity_lines():
+            for line in _history_capacity_lines(self._capacity_detail):
                 yield line
         else:
             yield to_ndjson_line(self._with_connector_notice(final))

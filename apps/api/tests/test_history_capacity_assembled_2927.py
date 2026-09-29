@@ -44,6 +44,9 @@ def served_api(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    # Compaction is the behavior under test, so pin the tight cap rather than
+    # the (larger, #3301) default.
+    monkeypatch.setenv("TRANSCRIPT_MAX_THREAD_BYTES", str(_CAP))
     get_settings.cache_clear()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

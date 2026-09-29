@@ -11,26 +11,20 @@ ledger is about the signal the ledger must not disturb.
 from __future__ import annotations
 
 import asyncio
-import uuid
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, SideEffectFlag, TurnSource
+from aci_protocol import Final, SessionStatus, SideEffectFlag
 from curie_worker.actions import ActionBackendError, RecordedAction
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+
 DONE = SessionStatus.DONE
-
-
-def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=TurnSource.SLACK,
-    )
 
 
 @dataclass

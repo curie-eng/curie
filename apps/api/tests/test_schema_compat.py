@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import ALEMBIC_DIR, IsolatedMigrationDb, alembic_config, sql_rows
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -39,40 +40,18 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0060"
+REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
 
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
 def _migration_head() -> str:
-    heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
+    heads = ScriptDirectory.from_config(alembic_config()).get_heads()
     assert len(heads) == 1, f"expected one migration head, found {heads}"
     return heads[0]
 
 
 HEAD = _migration_head()
-
-
-def _sql(sql: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def run() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as conn:
-                result = await conn.execute(text(sql), params or {})
-                return list(result.fetchall())
-        finally:
-            await engine.dispose()
-
-    import asyncio
-
-    return asyncio.run(run())
 
 
 def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
@@ -175,11 +154,11 @@ def test_already_at_head_is_noop() -> None:
     assert decision.action == "noop"
 
 
-def test_assert_servable_refuses_below_min(isolated_migration_db: None) -> None:
+def test_assert_servable_refuses_below_min(isolated_migration_db: IsolatedMigrationDb) -> None:
     import asyncio
 
-    cfg = _alembic_config()
-    command.upgrade(cfg, PREV)
+    cfg = alembic_config()
+    isolated_migration_db.at(PREV)
     with pytest.raises(RuntimeError, match="below application min"):
         asyncio.run(assert_servable())
     command.upgrade(cfg, HEAD)
@@ -199,11 +178,11 @@ def _prepare_schema_startup(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("revision", ("0041", "0042", "0044"))
 def test_api_lifespan_refuses_schema_missing_required_consumers(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
     monkeypatch: pytest.MonkeyPatch,
     revision: str,
 ) -> None:
-    command.upgrade(_alembic_config(), revision)
+    isolated_migration_db.at(revision)
     _prepare_schema_startup(monkeypatch)
     try:
         with pytest.raises(RuntimeError, match="below application min"):
@@ -214,10 +193,10 @@ def test_api_lifespan_refuses_schema_missing_required_consumers(
 
 
 def test_api_lifespan_serves_current_schema_head(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    command.upgrade(_alembic_config(), HEAD)
+    isolated_migration_db.at(HEAD)
     _prepare_schema_startup(monkeypatch)
     try:
         with TestClient(create_app()) as client:
@@ -229,11 +208,11 @@ def test_api_lifespan_serves_current_schema_head(
 
 
 def test_adapter_0045_upgrade_preserves_principal_subject_through_work_items_and_dispatch(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The stable adapter schema upgrades into the candidate WorkItems train."""
-    cfg = _alembic_config()
-    command.upgrade(cfg, "0045")
+    cfg = alembic_config()
+    isolated_migration_db.at("0045")
     assert current_revision() == "0045"
 
     approval_id = uuid.uuid4()
@@ -271,16 +250,16 @@ def test_adapter_0045_upgrade_preserves_principal_subject_through_work_items_and
     # Head moves as expand-only revisions land. The assertions below are what
     # must survive that move: the adapter audit row and the work-item columns.
     assert current_revision() == HEAD
-    assert _sql(
+    assert sql_rows(
         "SELECT principal_kind, principal_subject "
         "FROM curie.approval_audit_entries WHERE id = :id",
         {"id": audit_id},
     ) == [("adapter", "mail-adapter")]
-    assert _sql(
+    assert sql_rows(
         "SELECT to_regclass('curie.work_items')::text, "
         "to_regclass('curie.execution_requests')::text"
     ) == [("curie.work_items", "curie.execution_requests")]
-    assert _sql(
+    assert sql_rows(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'execution_requests' "
         "AND column_name IN ('dispatch_generation', 'dispatch_owner') "
@@ -330,11 +309,11 @@ def test_decision_json_is_redacted() -> None:
 
 
 def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """0041 cannot run while N-1 remains eligible to serve the database."""
-    cfg = _alembic_config()
-    command.upgrade(cfg, PREV)
+    cfg = alembic_config()
+    isolated_migration_db.at(PREV)
     assert current_revision() == PREV
 
     approval_id = uuid.uuid4()
@@ -369,16 +348,16 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
     assert outcome.forward_only is True
     assert current_revision() == HEAD
 
-    rows = _sql(
+    rows = sql_rows(
         "SELECT summary FROM curie.approvals WHERE id = :id",
         {"id": approval_id},
     )
     assert rows == [("seeded before contract",)]
 
     # The contract migration preserves rows, but its new schema is N-only.
-    col = _sql("SELECT outcome_history_ready_at FROM curie.publications LIMIT 0")
+    col = sql_rows("SELECT outcome_history_ready_at FROM curie.publications LIMIT 0")
     assert col == []
-    pubs = _sql(
+    pubs = sql_rows(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'publications' "
         "AND column_name = 'outcome_history_ready_at'"
@@ -393,7 +372,7 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
 
 
 def test_crash_retry_does_not_double_apply(
-    isolated_migration_db: None, tmp_path: Path
+    isolated_migration_db: IsolatedMigrationDb, tmp_path: Path
 ) -> None:
     """Two pending expands: first lands, second raises, retry resumes.
 
@@ -401,8 +380,7 @@ def test_crash_retry_does_not_double_apply(
     revision must not run again; the unique insert in the second must
     land once.
     """
-    cfg = _alembic_config()
-    command.upgrade(cfg, HEAD)
+    isolated_migration_db.at(HEAD)
     _exec(
         "CREATE TABLE curie.compat_probe ("
         "rev text primary key, "
@@ -468,7 +446,7 @@ def downgrade():
         os.environ.pop("CURIE_COMPAT_PROBE_CRASH", None)
 
     assert current_revision() == "compat_probe_first"
-    rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
+    rows = sql_rows("SELECT rev FROM curie.compat_probe ORDER BY rev")
     assert [r[0] for r in rows] == ["compat_probe_first"]
 
     outcome = apply_upgrade(
@@ -483,7 +461,7 @@ def downgrade():
     )
     assert outcome.outcome == "applied"
     assert current_revision() == "compat_probe_second"
-    rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
+    rows = sql_rows("SELECT rev FROM curie.compat_probe ORDER BY rev")
     assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
 
     again = apply_upgrade(
@@ -497,5 +475,5 @@ def downgrade():
         },
     )
     assert again.action == "noop"
-    rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
+    rows = sql_rows("SELECT rev FROM curie.compat_probe ORDER BY rev")
     assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]

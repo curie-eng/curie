@@ -1392,7 +1392,9 @@ def test_real_model_install_declares_the_gateway_context_window(tmp_path: Path) 
 
 def test_fast_model_crash_is_retried_and_a_real_ending_is_not() -> None:
     assert fe.should_retry_fast_escalation("runner_escalated", 2.6) is True
+    assert fe.should_retry_fast_escalation("unclassified", 2.6) is True
     assert fe.should_retry_fast_escalation("runner_escalated", 44.9) is True
+    assert fe.should_retry_fast_escalation("max_turns", 2.6) is False
     assert fe.should_retry_fast_escalation("runner_escalated", 45) is False
     assert fe.should_retry_fast_escalation("no_pull_request", 2.0) is False
     assert fe.should_retry_fast_escalation("execution_deadline", 1800) is False

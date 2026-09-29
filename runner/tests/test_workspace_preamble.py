@@ -114,9 +114,9 @@ def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
         flags=re.IGNORECASE,
     ), preamble
     assert "--no-index" in preamble
-    assert "in-sandbox verification is unavailable" in preamble
-    assert "Do not request publication." in preamble
-    assert "only after a person publishes" in preamble
+    assert "No factory verification preflight result is available" in preamble
+    assert "Do not claim that the check passed" in preamble
+    assert "matching required check" in preamble
     assert "/workspace" in preamble
 
 

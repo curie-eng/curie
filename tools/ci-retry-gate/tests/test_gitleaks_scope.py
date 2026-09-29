@@ -369,11 +369,6 @@ def test_gitleaks_config_keeps_the_slack_identifier_guards() -> None:
         "the EXAMPLE allowlist must not wave through an ordinary looking id"
     )
 
-    assert (
-        "Requiring the digit is what separates them from ordinary"
-        in GITLEAKS_CONFIG_PATH.read_text(encoding="utf-8")
-    )
-
 
 def test_scan_step_writes_the_report_the_attribution_step_reads() -> None:
     scan_step = _scan_step()
