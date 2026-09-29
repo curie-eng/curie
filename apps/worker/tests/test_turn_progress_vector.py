@@ -24,6 +24,7 @@ _EXPECTED_KEYS = {
     "url_header",
     "token_header",
     "generation_header",
+    "eligibility_env",
     "token_request_header",
     "token_scope",
     "route",
@@ -49,6 +50,7 @@ def test_the_worker_sends_the_frozen_headers_scope_and_route() -> None:
     assert turn_progress.URL_HEADER == vector["url_header"]
     assert turn_progress.TOKEN_HEADER == vector["token_header"]
     assert turn_progress.GENERATION_HEADER == vector["generation_header"]
+    assert turn_progress.ELIGIBILITY_ENV == vector["eligibility_env"]
     assert turn_progress.TOKEN_SCOPE == vector["token_scope"]
     assert turn_progress.ROUTE == vector["route"]
 

@@ -76,6 +76,7 @@ from curie_worker.progress import (
     sweep_pending_progress_inboxes,
 )
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.turn_progress import TurnProgressPlan, deactivate_turn_progress
 from pydantic import TypeAdapter
 from redis.asyncio import Redis as AsyncRedis
 
@@ -286,6 +287,11 @@ def test_turn_generation_is_durable_monotonic_and_fenced(names) -> None:  # noqa
             record = await first.read(pid)
             assert record is not None
             assert (record.turn_generation, record.active_generation) == (1, 1)
+            now_ms = int(time.time() * 1000)
+            assert now_ms < record.active_until_ms
+            assert record.active_until_ms <= now_ms + int(
+                (config.runner_total_timeout_s + 31) * 1000
+            )
 
             # A new store models a worker restart. The next generation comes
             # from Valkey, not a process clock or process-local counter.
@@ -296,6 +302,37 @@ def test_turn_generation_is_durable_monotonic_and_fenced(names) -> None:  # noqa
             closed = await restarted.read(pid)
             assert closed is not None
             assert (closed.turn_generation, closed.active_generation) == (2, 0)
+            assert closed.active_until_ms == 0
+
+    asyncio.run(go())
+
+
+def test_failed_deactivation_leaves_only_a_bounded_active_generation(names) -> None:  # noqa: ANN001
+    """@spec ADR-0130 d1: end-turn failure cannot leave day-long authority."""
+
+    class _FailedEndStore:
+        async def end_turn(self, progress_id: str, generation: int) -> bool:
+            del progress_id, generation
+            raise ConnectionError("Valkey unavailable at turn close")
+
+    async def go() -> None:
+        async with _store(names) as (store, config, _client):
+            pid = await store.open_chain(_THREAD, _ROOT)
+            generation = await store.begin_turn(pid)
+            plan = TurnProgressPlan(
+                progress_id=pid,
+                thread_key=_THREAD,
+                root_event_id=_ROOT,
+                generation=generation,
+            )
+
+            await deactivate_turn_progress(_FailedEndStore(), plan)  # type: ignore[arg-type]
+
+            record = await store.read(pid)
+            assert record is not None
+            assert record.active_generation == generation
+            remaining_ms = record.active_until_ms - int(time.time() * 1000)
+            assert 0 < remaining_ms <= int((config.runner_total_timeout_s + 30) * 1000)
 
     asyncio.run(go())
 

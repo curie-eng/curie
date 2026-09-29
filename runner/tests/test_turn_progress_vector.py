@@ -21,6 +21,7 @@ _EXPECTED_KEYS = {
     "url_header",
     "token_header",
     "generation_header",
+    "eligibility_env",
     "token_request_header",
     "token_scope",
     "route",
@@ -42,4 +43,5 @@ def test_the_runner_reads_and_presents_the_frozen_headers() -> None:
     assert turn_progress.PROGRESS_URL_HEADER == vector["url_header"]
     assert turn_progress.PROGRESS_TOKEN_HEADER == vector["token_header"]
     assert turn_progress.PROGRESS_GENERATION_HEADER == vector["generation_header"]
+    assert turn_progress.TURN_PROGRESS_ELIGIBILITY_ENV == vector["eligibility_env"]
     assert turn_progress.PROGRESS_TOKEN_REQUEST_HEADER == vector["token_request_header"]

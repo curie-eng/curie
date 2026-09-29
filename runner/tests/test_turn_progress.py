@@ -35,6 +35,7 @@ from curie_runner.turn_progress import (
     PROGRESS_PREAMBLE,
     PROGRESS_TOKEN_HEADER,
     PROGRESS_URL_HEADER,
+    TURN_PROGRESS_ELIGIBILITY_ENV,
     ProgressCapability,
     TurnProgress,
     should_mount_turn_progress,
@@ -144,23 +145,33 @@ def test_no_capability_is_a_soft_result_and_makes_no_network_call(
 
 
 @pytest.mark.parametrize(
-    ("factory_requested", "factory_resolved", "expected"),
+    ("eligible", "factory_requested", "factory_resolved", "expected"),
     [
-        (False, False, True),
-        (True, True, False),
-        (True, False, False),
+        (True, False, False, True),
+        (False, False, False, False),
+        (True, True, True, False),
+        (True, True, False, False),
     ],
 )
 def test_factory_boot_matrix_never_falls_back_to_deliberate_progress(
-    factory_requested: bool, factory_resolved: bool, expected: bool
+    eligible: bool, factory_requested: bool, factory_resolved: bool, expected: bool
 ) -> None:
     assert (
         should_mount_turn_progress(
+            eligible=eligible,
             factory_progress_requested=factory_requested,
             factory_progress_resolved=factory_resolved,
         )
         is expected
     )
+
+
+def test_the_eligibility_flag_is_exact_and_closed() -> None:
+    from curie_runner.turn_progress import turn_progress_enabled
+
+    assert turn_progress_enabled({TURN_PROGRESS_ELIGIBILITY_ENV: "1"})
+    for value in ("", "0", "true", "yes", " 1 "):
+        assert not turn_progress_enabled({TURN_PROGRESS_ELIGIBILITY_ENV: value})
 
 
 def test_capability_headers_need_both_values() -> None:

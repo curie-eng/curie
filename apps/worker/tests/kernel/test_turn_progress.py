@@ -44,6 +44,7 @@ URL_HEADER = _VECTOR["url_header"]
 TOKEN_HEADER = _VECTOR["token_header"]
 GENERATION_HEADER = _VECTOR["generation_header"]
 SCOPE = _VECTOR["token_scope"]
+ELIGIBILITY_ENV = _VECTOR["eligibility_env"]
 DONE = SessionStatus.DONE
 
 
@@ -141,6 +142,10 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
             assert record is not None
             assert record.update_count == 0
             assert (record.turn_generation, record.active_generation) == (1, 0)
+            assert any(
+                env is not None and env.get(ELIGIBILITY_ENV) == "1"
+                for env in h.fake_k8s.claim_envs
+            )
 
     asyncio.run(go())
 
@@ -164,6 +169,9 @@ def test_an_ineligible_turn_carries_no_capability(make_harness, overrides: dict[
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
                 assert _header(headers, GENERATION_HEADER) is None
+            assert all(
+                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
+            )
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
             assert await ProgressStore(h.async_redis, h.config).read(progress_id) is None
 
@@ -200,6 +208,9 @@ def test_a_factory_execution_carries_no_turn_progress_capability(make_harness) -
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
                 assert _header(headers, GENERATION_HEADER) is None
+            assert all(
+                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
+            )
 
     asyncio.run(go())
 
@@ -211,6 +222,9 @@ def test_a_kernel_without_a_progress_store_sends_no_capability(make_harness) -> 
 
             assert h.runner.event_headers
             assert _capability(h) == (None, None, None)
+            assert all(
+                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
+            )
 
     asyncio.run(go())
 

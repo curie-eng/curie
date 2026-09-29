@@ -117,7 +117,13 @@ def _inbox(valkey: redis.Redis, prefix: str, progress_id: str) -> list[tuple[str
 
 
 def _activate(valkey: redis.Redis, prefix: str, progress_id: str, generation: int = 1) -> None:
-    valkey.hset(f"{prefix}:progress:{progress_id}", mapping={"active_generation": generation})
+    valkey.hset(
+        f"{prefix}:progress:{progress_id}",
+        mapping={
+            "active_generation": generation,
+            "active_until_ms": int(time.time() * 1000) + 60_000,
+        },
+    )
 
 
 def test_an_update_is_appended_to_its_chains_inbox(
@@ -191,6 +197,21 @@ def test_an_expired_token_is_refused(api: TestClient, valkey: redis.Redis, prefi
     response = _post(api, progress_id, _token(progress_id, exp=int(time.time()) - 1))
 
     assert response.status_code == 401
+    assert _inbox(valkey, prefix, progress_id) == []
+
+
+def test_an_expired_active_generation_is_refused(
+    api: TestClient, valkey: redis.Redis, prefix: str
+) -> None:
+    """@spec ADR-0130 d1: a leaked turn token fails closed at its durable deadline."""
+
+    progress_id = str(uuid.uuid4())
+    _activate(valkey, prefix, progress_id)
+    valkey.hset(f"{prefix}:progress:{progress_id}", "active_until_ms", "1")
+
+    response = _post(api, progress_id, _token(progress_id))
+
+    assert response.status_code == 401, response.text
     assert _inbox(valkey, prefix, progress_id) == []
 
 

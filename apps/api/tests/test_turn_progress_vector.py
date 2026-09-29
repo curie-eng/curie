@@ -24,6 +24,7 @@ _EXPECTED_KEYS = {
     "url_header",
     "token_header",
     "generation_header",
+    "eligibility_env",
     "token_request_header",
     "token_scope",
     "route",
