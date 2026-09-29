@@ -1463,7 +1463,9 @@ The path, and what an operator can check on each hop:
 1. **The capability.** For a person's Slack turn (and the approval resume of
    one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
    allocates a durable generation and marks it active with a five-second lease
-   on Valkey's server clock. The live pump renews only that active, unexpired
+   on Valkey's server clock. A startup keeper renews it while the worker waits
+   for runner admission and response headers, then hands renewal to the live
+   pump when stream consumption begins. Both renew only that active, unexpired
    generation; a missed lease cannot be revived. It mints a
    sandbox token with scope `turn.progress`, bound to
    `progress_id:generation`. It sends token, URL, and generation to the runner.

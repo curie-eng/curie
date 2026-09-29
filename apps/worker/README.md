@@ -769,13 +769,16 @@ delivery written after it.
   `X-Curie-Progress-Url`. They are runner control headers, like
   `X-Curie-Turn-Epoch`, and not ACI fields. The API's append script checks the
   signed generation is still active and its Valkey-server-time lease has not
-  passed. The lease lasts five seconds and the live pump renews only its active,
-  unexpired generation; a missed lease cannot be revived. The worker clears the
+  passed. The lease lasts five seconds. Renewal begins as soon as activation
+  succeeds, before the worker waits for the runner's response headers, and is
+  handed to the live pump once stream consumption starts. Both renew only the
+  active, unexpired generation; a missed lease cannot be revived. The worker clears the
   generation and deadline when the turn closes; if that best-effort clear loses
   Valkey, expiry within one lease is the fail-closed backstop. A
   retry or cold resume advances it first, so an old token cannot enqueue or
   fence the current turn. Nothing opens a generation when the API key is unset.
-- **The pump.** While the kernel consumes the turn's stream, a pump renews the
+- **The pump.** A startup lease keeper covers runner admission and response-header
+  delay. While the kernel consumes the turn's stream, a pump takes over renewal and
   active lease and reads the
   chain's inbox after the record's `inbox_cursor`, at most 64 entries every
   half second, and applies each entry with `apply_model_command` at the
