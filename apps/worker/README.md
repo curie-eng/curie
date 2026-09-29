@@ -314,7 +314,7 @@ not inbound stream entries, and must not be replayed onto the main stream.
   system's poison rate, saturating rather than growing once the bound is
   hit.
 
-The graveyard has two row families. Stream-consumer rows carry the original
+The graveyard has three row families. Stream-consumer rows carry the original
 entry's fields verbatim plus namespaced failure metadata, so a human or replay
 tool can inspect exactly what inbound entry died and why:
 
@@ -333,6 +333,14 @@ serialized `completion`, `dl_reason="thread deleted at provider"`,
 `dl_dead_lettered_at`; they have no `dl_original_id` and are not replayable as
 inbound stream entries. Every other completion delivery failure leaves the
 completion owed in the outbox for re-emission.
+
+Progress-outbox rows are written by `ProgressStore.dead_letter` for a progress
+delivery whose attempt budget is spent. They carry `delivery_id`,
+`progress_id`, the stored `event`, `dl_reason="max-attempts-exceeded"`,
+`dl_delivery_count` (the attempts made), `dl_source="progress-outbox"`, and
+`dl_dead_lettered_at`. Like completion-outbox rows they have no
+`dl_original_id` and are not replayable as inbound stream entries; see
+[Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130).
 
 The `dl_` prefix keeps the stream-consumer metadata namespaced, but the
 unparseable path stores
@@ -464,13 +472,14 @@ user-visible effect.
 | Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
 | Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
 | Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
+| Write platform progress, terminal states included | `progress.py` `ProgressStore.apply_platform_update` (no caller yet; ADR 0130) | One Lua script checks the lease token and the fencing generation, the same two checks `settle_fenced` makes, before it writes anything. A loser writes no state and enqueues no delivery, and is refused `lease-lost`. |
 | Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
 
 Stated plainly, as ADR-0131 requires: **a fenced-out owner is refused ACK,
 dead-letter, outbox clearing, and terminal emit** — and is refused starting a
 new attempt.
 
-Two verbs are **deliberately not lease-fenced**, and neither is an oversight:
+Three verbs are **deliberately not lease-fenced**, and none is an oversight:
 
 - **The side-effect marker** (`markers.mark_side_effect`, written from
   `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
@@ -484,6 +493,16 @@ Two verbs are **deliberately not lease-fenced**, and neither is an oversight:
   acked off the group, where no lease exists or ever will. Its guard is the
   record's done flag plus the compare-and-checked `clear_completion`, not a
   lease. Do not "complete the fence" by adding one here.
+- **The progress-outbox sweeper** (`progress.py` `sweep_pending_progress`,
+  called from the maintenance tick next to the completion sweeper). It is not an
+  owner for the same reason: a pending progress delivery outlives the stream
+  entry whose turn caused it. Its guard is the record's generation, compared on
+  every attempt charge, acknowledgement and dead-letter, not a lease.
+
+Applying a model's progress command (`ProgressStore.apply_model_command`) is
+not an owner verb either. The ingress that will call it serves the
+authenticated running turn, not a stream delivery, so its guard is the
+`(epoch, seq)` order and terminal monotonicity rather than a lease.
 
 ### Adapter idempotency: which channel may claim one terminal effect
 
@@ -516,6 +535,172 @@ Slack and webhook turns perform no hook run writes.
 If persistence fails before durable closure, the delivery stays pending and
 may run again on redelivery. The close and the done marker use PostgreSQL and
 Valkey, so they are not atomic across both systems.
+
+## Deliberate progress (ADR 0130)
+
+`curie_worker.progress` is the worker coordinator's durable state for
+[ADR 0130](../../docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md):
+one progress record per logical turn chain, its milestone budget, and an outbox
+of the card and milestone deliveries the record owes its channel. Nothing
+reaches it yet. No ingress accepts a `curie_progress` command, the kernel opens
+no chain, and no adapter is called; the maintenance tick runs its sweeper
+without a deliverer (below). It lives in Valkey, like the completion outbox;
+Postgres holds none of it.
+
+### Keys
+
+Every key is built by a `WorkerConfig` helper under `key_prefix`
+(`curie:worker` by default), like every other worker key.
+
+| Key | Type | Holds |
+|---|---|---|
+| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
+| `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` the sweeper reads. |
+| `<key_prefix>:progress:pending` | set | The index of pending delivery ids, so the sweeper never scans the keyspace. |
+| `<key_prefix>:progress:chain:{event_id}` | string | The `pid` an approval resume event continues. |
+
+Every key expires after `max(completion_max_retention_s, 14 days)`. Fourteen
+days is the approval card's own lifetime (`approval_cards.DEFAULT_CARD_TTL_S`),
+because a chain lives across the approval it suspends for. The record's expiry
+is renewed by every accepted update. A delivery keeps the expiry it was written
+with, and the pending set's expiry is renewed by every enqueue, so the set
+outlives every member it indexes; the sweeper drops a member whose delivery has
+expired.
+
+### Identity
+
+- `progress_id_for(thread_key, root_event_id)` is
+  `uuid5(PROGRESS_ID_NAMESPACE, thread_key + "\0" + root_event_id)` with a fixed
+  namespace constant, so a redelivered root event reopens the same record
+  rather than minting a second one.
+- `ProgressStore.chain_for_turn` is how a turn finds its record. A fresh turn
+  opens, idempotently, the record its own event id derives. An approval resume
+  only follows `chain:{resume_event_id}`, the pointer `link_resume` writes when
+  the chain suspends, so it continues the same record with the same milestone
+  budget. When that pointer has expired the resume gets no record at all: the
+  helper returns `None` and the caller renders nothing. A resume never derives a
+  record from its own event id, so an expired pointer cannot become a fresh
+  budget.
+- Delivery ids are derived, never minted, so a retry cannot change identity.
+  The card's first post is `uuid5(pid, "card")`, the card edit at revision r is
+  `uuid5(pid, "card:r")`, and milestone n is `uuid5(pid, "milestone:n")`, each in
+  the canonical lowercase form reply wire 1.1's `DeliveryId` requires.
+
+### Who writes which state
+
+- `apply_model_command` takes a validated `ProgressCommand` and accepts only
+  `investigating`, `preparing-workspace`, `testing` and `publishing`. A command
+  naming `queued`, `awaiting-approval`, `complete`, `failed` or `cancelled` is
+  refused (`platform-only-state`) before Valkey is touched.
+- `apply_platform_update` is the platform's separate entry point and may write
+  any state, the terminal ones included. It takes the caller's ADR-0131 lease
+  (owner token and fencing generation, with the delivery triple that names its
+  keys). Its script first checks that the lease key still holds the token and
+  that the delivery state's generation is still the caller's, the two checks
+  `markers.py` `settle_fenced` makes, and writes nothing when either has moved
+  (`lease-lost`). The leaseless sentinel, `unfenced_lease()`, holds no token and
+  is refused the same way.
+- Model and platform update ids are recorded in separate namespaces (`m:` and
+  `p:` fields), so a model cannot pre-empt a platform write by reusing its id.
+
+### Update rules
+
+Each update is one Lua script. Its checks run in this order, and the first that
+fails answers:
+
+1. The record must exist (`no-chain`). Only opening a chain creates one; no
+   update does.
+2. An update id already accepted is a no-op reported as `duplicate`, not an
+   error, and writes nothing.
+3. A terminal record (`complete`, `failed`, `cancelled`) refuses every update
+   (`terminal`), so nothing reopens it.
+4. Updates are ordered by `(epoch, seq)`. A command from an older epoch is
+   refused (`stale-epoch`), and within the record's epoch a `seq` at or below
+   `last_seq` is refused (`stale-seq`); a newer epoch is accepted and restarts
+   the sequence. A platform update names an epoch and no seq. It is refused from
+   an older epoch, and at a newer one it moves the record to that epoch, which
+   refuses every later command of the older one: an `awaiting-approval` written
+   for the resume's epoch fences out a late command from the suspended session.
+5. A chain accepts at most 50 updates (`MAX_PROGRESS_UPDATES`), and the 51st
+   non-terminal update is refused (`update-cap`). The terminal write is exempt,
+   so a chain that spent its updates can still close its card. Terminal is
+   monotonic, so the exemption adds at most one.
+
+An accepted update increments `update_count`, records its id, and advances
+`epoch` and `last_seq`. It increments `revision` by exactly one when it changes
+the state or the summary, and only then; an update that changes neither leaves
+the revision, and the card, as they were.
+
+The card payload and every delivery id depend on the revision and the
+milestone count, and only Python derives them. So the script also compares the
+two counts it is about to advance against the ones the store read before
+building them, and when another update moved either in between it writes
+nothing and the store reads again and retries. Each retry means another change
+was accepted, and a chain has a bounded number of revisions and reservations,
+so the retry loop is bounded too.
+
+### Milestones
+
+A model command carrying `milestone` reserves the next ordinal in the same
+script that accepts the update, while `milestones_used` is below 3. The fourth
+request is refused, reported as `milestone_refused`, and the update itself
+still applies: its state and summary still move the card, it still counts
+toward the 50, and its id is still recorded, so a retry of it is a duplicate
+rather than a second try for a slot. An update that is refused reserves
+nothing. Reservations are fields of the record, so a restarted worker and an
+approval resume (the same pid) read the same count. Approval cards and the
+canonical final answer use no slot, and the platform entry point cannot
+request one.
+
+### The outbox
+
+The script that accepts a change also enqueues the delivery it owes, in the
+same atomic step: the delivery record and its `progress:pending` membership.
+Revision 1 owes the card's first post (`reply.post`), each later revision one
+card edit (`reply.update`), and each reservation one milestone post. The stored
+event is the semantic payload (`ProgressCard` or `ProgressMilestone`), its
+operation and its reply target. An edit is addressed to the record's
+`card_ref`, which only exists once the first post is acknowledged, so it is
+read at delivery time rather than stored in the edit.
+
+- `ack(delivery_id, generation, card_ref=...)` clears a delivery only when its
+  stored generation is the caller's, so a late acknowledgement cannot clear a
+  record written after it. For the card's first post it also records the
+  adapter's ref as `card_ref` in the same script, so a crash cannot separate
+  the two.
+- `sweep_pending_progress` is bounded: it samples at most 64 members, stops
+  after 30 seconds, and bounds each delivery by the time left. For each member:
+  - a malformed record is quarantined: its index membership is removed, the
+    payload is left for inspection until it expires, and an ERROR is logged, so
+    one bad record cannot crash-loop the tick;
+  - a member whose delivery has expired or been cleared is dropped from the
+    index;
+  - a delivery that has used its 5 attempts (`PROGRESS_MAX_ATTEMPTS`) is
+    dead-lettered to the graveyard (`dl_source=progress-outbox`, described
+    [above](#the-dead-letter-graveyard));
+  - otherwise, given a deliverer and once the delivery is older than a 60
+    second grace that keeps the sweeper out of the live path's window, it
+    charges one attempt, calls the deliverer with the stored record, whose
+    `delivery_id` never changes, and acknowledges on success. A failure leaves
+    the delivery for a later pass, and the attempt that reaches the cap
+    dead-letters it at once.
+- The maintenance tick calls the sweep right after `sweep_pending_completions`,
+  with no deliverer, because nothing delivers progress yet. That sweeper
+  quarantines, drops and dead-letters, and never charges an attempt it cannot
+  make, so a replica that can deliver never finds its deliveries' budget spent
+  by an older one during a rolling upgrade. A failed pass is logged and does
+  not stop the rest of the tick.
+
+Every attempt charge, acknowledgement and dead-letter compares the stored
+generation, so a pass holding a stale read can neither clear nor accuse a
+delivery written after it.
+
+### Fields nothing reads yet
+
+- `answer_ref` is the reply ref of the turn's answer, given when the chain is
+  opened.
+- `inbox_cursor` is created empty for the ingress to record how far it has
+  applied its commands. Nothing advances it until the ingress exists.
 
 ## The sandbox substrate (`curie_worker.sandbox`)
 
