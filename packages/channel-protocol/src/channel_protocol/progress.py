@@ -22,6 +22,7 @@ from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic_core import PydanticCustomError
 
 ProgressCommandVersion = Literal["1.0"]
 PROGRESS_COMMAND_VERSION: ProgressCommandVersion = "1.0"
@@ -127,9 +128,11 @@ class ProgressCard(BaseModel):
     @model_validator(mode="after")
     def _terminal_matches_state(self) -> Self:
         if self.terminal != (self.state in TERMINAL_PROGRESS_STATES):
-            raise ValueError(
+            raise PydanticCustomError(
+                "progress_terminal",
                 "terminal must be true exactly when state is complete, failed or "
-                f"cancelled; got state {self.state.value!r} with terminal {self.terminal}"
+                "cancelled; got state {state} with terminal {terminal}",
+                {"state": self.state.value, "terminal": self.terminal},
             )
         return self
 

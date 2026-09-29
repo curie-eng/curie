@@ -79,6 +79,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from .models import OutboundMessage
 from .progress import ProgressCard, ProgressMilestone
@@ -175,14 +176,18 @@ class _DeliveredEvent(_ReplyEventBase):
         delivery_id, progress = self._progress_wire()
         if self.version == REPLY_WIRE_VERSION:
             if delivery_id is not None or progress is not None:
-                raise ValueError(
-                    "delivery_id and progress need reply wire 1.1; a 1.0 body carries neither"
+                raise PydanticCustomError(
+                    "reply_wire_version",
+                    "delivery_id and progress need reply wire 1.1; a 1.0 body carries neither",
                 )
         elif delivery_id is None:
             if progress is not None:
-                raise ValueError("progress needs a delivery_id")
-            raise ValueError(
-                "a reply wire 1.1 body carries a delivery_id; send a body without one as 1.0"
+                raise PydanticCustomError(
+                    "progress_delivery_id", "progress needs a delivery_id"
+                )
+            raise PydanticCustomError(
+                "reply_wire_version",
+                "a reply wire 1.1 body carries a delivery_id; send a body without one as 1.0",
             )
         return self
 
@@ -237,9 +242,10 @@ class ReplyUpdate(_DeliveredEvent):
         if self.progress is not None and any(
             value is not None for value in (self.text, self.message, self.settled, self.nav)
         ):
-            raise ValueError(
+            raise PydanticCustomError(
+                "progress_not_an_answer",
                 "a progress update carries no text, message, settled or nav: a card "
-                "edit is never answer text or an approval settlement"
+                "edit is never answer text or an approval settlement",
             )
         return self
 
@@ -271,9 +277,10 @@ class ReplyPost(_DeliveredEvent):
     @model_validator(mode="after")
     def _progress_is_not_actionable(self) -> Self:
         if self.progress is not None and self.message.interaction is not None:
-            raise ValueError(
+            raise PydanticCustomError(
+                "progress_not_actionable",
                 "a progress post's message carries no interaction: the approval "
-                "card stays the only actionable platform message"
+                "card stays the only actionable platform message",
             )
         return self
 
