@@ -1036,6 +1036,22 @@
       },
       "cardinality_bound": 3
     },
+    "curie.slack.socket.identities": {
+      "type": "gauge",
+      "unit": "{identity}",
+      "description": "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "state": [
+          "configured",
+          "connected"
+        ]
+      },
+      "cardinality_bound": 2
+    },
     "curie.reply.delivery": {
       "type": "counter",
       "unit": "{reply}",

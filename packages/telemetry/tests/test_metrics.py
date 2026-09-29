@@ -264,6 +264,21 @@ def test_completion_outbox_inventory_is_bounded_and_has_no_identity_labels() -> 
             assert key not in {"event_id", "session", "run", "thread", "conversation_id"}
 
 
+def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label() -> None:
+    """Two series per dispatcher, so ``connected < configured`` is one comparison.
+
+    Which identity is down stays in the dispatcher's own log; a Slack identity
+    name is an identifier and never a metric attribute.
+    """
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.identities"]
+    assert definition["type"] == "gauge"
+    assert definition["attributes"] == {
+        "service.name": ["curie-dispatcher"],
+        "state": ["configured", "connected"],
+    }
+    assert definition["cardinality_bound"] == 2
+
+
 def test_last_success_age_has_one_series_across_failure_and_recovery(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
