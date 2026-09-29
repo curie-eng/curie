@@ -183,18 +183,42 @@ def test_a_redelivered_placeholderless_answer_edits_its_first_message(tmp_path: 
     assert port.edits == [("222", "posted-1", "The answer is 42.")]
 
 
-def test_the_reply_endpoint_accepts_a_progress_body(tmp_path: Path) -> None:
-    """The HTTP layer decodes 1.1 and acks the ref the post created."""
+class _ServiceInAppThread:
+    """Opens the SQLite state on the thread that serves requests.
 
-    port, _state, service = _service(tmp_path)
-    client = TestClient(create_reply_app(service, "reply-secret"))
+    Production opens it inside the event loop that also serves the reply app
+    (``main.run``); the test client serves from its own portal thread, and
+    sqlite3 refuses a connection used across threads.
+    """
 
-    answer = client.post(
-        "/replies",
-        json=_corpus_body("reply-post-progress-card-first-revision"),
-        headers={"X-Curie-Adapter-Secret": "reply-secret"},
-    )
+    def __init__(self, port: FakeDiscord, path: Path) -> None:
+        self._port = port
+        self._path = path
+        self.state: DiscordState | None = None
+        self._service: DiscordReplyService | None = None
 
-    assert answer.status_code == 200, answer.text
-    assert answer.json() == {"ref": "posted-1"}
+    async def deliver(self, event: ReplyEvent) -> Any:
+        if self._service is None:
+            self.state = DiscordState(self._path)
+            self._service = DiscordReplyService(self._port, self.state)
+        return await self._service.deliver(event)
+
+
+def test_the_reply_endpoint_accepts_a_progress_body_and_its_redelivery(tmp_path: Path) -> None:
+    """The HTTP layer decodes 1.1 and acks the ref the post created, twice."""
+
+    port = FakeDiscord()
+    service = _ServiceInAppThread(port, tmp_path / "state.sqlite3")
+    body = _corpus_body("reply-post-progress-card-first-revision")
+
+    with TestClient(create_reply_app(service, "reply-secret")) as client:
+        answers = [
+            client.post(
+                "/replies", json=body, headers={"X-Curie-Adapter-Secret": "reply-secret"}
+            )
+            for _ in range(2)
+        ]
+
+    assert [answer.status_code for answer in answers] == [200, 200], answers[0].text
+    assert [answer.json() for answer in answers] == [{"ref": "posted-1"}] * 2
     assert len(port.posts) == 1

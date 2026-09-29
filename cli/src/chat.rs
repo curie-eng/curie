@@ -107,6 +107,21 @@ pub(crate) fn capped(budget: Duration, deadline: Instant) -> Duration {
 /// therefore red rather than a silently blind detection (#1079).
 pub const APPROVE_ACTION_ID_PREFIX: &str = "curie-approval-approve";
 
+/// The `block_id` prefix on every block of the worker's Slack progress card
+/// (`apps/worker/src/curie_worker/blocks.py::progress_card`, ADR-0130).
+///
+/// A progress card is posted and edited like any message, and it can be the
+/// first post of a turn, which is exactly what [`observe_reply`] follows as a
+/// resumed answer. These prefixes are how the stub tells it apart, so they are
+/// frozen with the worker in `tests/vectors/progress-blocks.json` and checked
+/// in `tests::progress_block_ids_match_the_frozen_vector` below.
+pub const PROGRESS_CARD_BLOCK_ID_PREFIX: &str = "curie-progress-card:";
+
+/// The `block_id` prefix on every block of a progress milestone
+/// (`apps/worker/src/curie_worker/blocks.py::progress_milestone`); see
+/// [`PROGRESS_CARD_BLOCK_ID_PREFIX`].
+pub const PROGRESS_MILESTONE_BLOCK_ID_PREFIX: &str = "curie-progress-milestone:";
+
 /// One captured Slack Web API call at the stub.
 #[derive(Debug, Clone)]
 pub struct SlackCall {
@@ -125,11 +140,19 @@ pub struct SlackCall {
     /// a reply the worker posted as a new message (ADR-0179). `None` for every
     /// other method.
     pub posted_ts: Option<String>,
+    /// True when a block of the call carries a progress `block_id` prefix: the
+    /// worker posted or edited a progress card or milestone (ADR-0130). Such a
+    /// call is a status line at most and never the turn's reply.
+    pub progress: bool,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
+///
+/// A progress edit is never that text, even of the placeholder's own ts: a
+/// progress body is not an answer (ADR-0130 decision 5).
 pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) -> Option<&'a str> {
-    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) {
+    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) && !call.progress
+    {
         call.text.as_deref()
     } else {
         None
@@ -149,6 +172,14 @@ fn observe_reply(
     latest: &mut Option<String>,
     observer: &mut impl FnMut(&str),
 ) -> bool {
+    if call.progress {
+        // A status line at most (ADR-0130). Not consumed, so a call the
+        // approval wait defers still reaches the resume wait in order.
+        if let Some(text) = call.text.as_deref() {
+            observer(text);
+        }
+        return false;
+    }
     if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
         if let Some(posted) = call.posted_ts.as_deref() {
             *tracked_ts = posted.to_string();
@@ -211,6 +242,39 @@ pub fn extract_fields(
             .map(|(_, v)| v.clone())
     };
     (find("channel"), find("ts"), find("text"))
+}
+
+/// Whether a Slack call body carries a worker progress block (ADR-0130).
+///
+/// Structured, never a raw-body substring: the prefix must be the start of a
+/// block's `block_id`, so answer text that mentions it is not progress. The
+/// blocks ride the JSON body, or a JSON string in the `blocks` form field.
+pub fn is_progress_call(content_type: &str, body: &str) -> bool {
+    fn is_progress_block(block: &serde_json::Value) -> bool {
+        block
+            .get("block_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| {
+                id.starts_with(PROGRESS_CARD_BLOCK_ID_PREFIX)
+                    || id.starts_with(PROGRESS_MILESTONE_BLOCK_ID_PREFIX)
+            })
+    }
+
+    let blocks = if content_type.contains("application/json") {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|root| root.get("blocks").cloned())
+    } else {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
+        pairs
+            .iter()
+            .find(|(key, _)| key == "blocks")
+            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+    };
+    blocks
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| blocks.iter().any(is_progress_block))
 }
 
 /// Extract a validated durable approval id from a structured approval card.
@@ -406,6 +470,7 @@ async fn handle_call(
     // awaiting-approval turn is detectable regardless of encoding (#529).
     let approval_card = body.contains(APPROVE_ACTION_ID_PREFIX);
     let approval_id = approval_card_id(content_type, &body);
+    let progress = is_progress_call(content_type, &body);
     // chat.update echoes the existing ts; a hypothetical new-message call has no
     // ts, so synthesize one so the response still looks like Slack.
     let ts_out = ts
@@ -420,6 +485,7 @@ async fn handle_call(
         approval_card,
         approval_id,
         posted_ts,
+        progress,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
@@ -962,10 +1028,20 @@ mod tests {
     #[test]
     fn a_progress_post_and_its_edits_are_never_the_reply() {
         let (latest, seen) = replay(&[
-            progress_call("chat.postMessage", None, Some("card"), "Task status: Queued. x"),
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("card"),
+                "Task status: Queued. x",
+            ),
             progress_call("chat.update", Some("card"), None, "Task status: Testing. y"),
             stub_call("chat.update", Some("ph"), None, "the answer"),
-            progress_call("chat.postMessage", None, Some("m1"), "Milestone: Scope changed. z"),
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("m1"),
+                "Milestone: Scope changed. z",
+            ),
         ]);
 
         assert_eq!(latest.as_deref(), Some("the answer"));
@@ -1158,7 +1234,12 @@ mod tests {
         }
     }
 
-    fn progress_call(method: &str, ts: Option<&str>, posted: Option<&str>, text: &str) -> SlackCall {
+    fn progress_call(
+        method: &str,
+        ts: Option<&str>,
+        posted: Option<&str>,
+        text: &str,
+    ) -> SlackCall {
         SlackCall {
             progress: true,
             ..stub_call(method, ts, posted, text)

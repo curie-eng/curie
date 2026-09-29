@@ -26,7 +26,7 @@ use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::api::{Agent, ApiClient, ClusterMessageReplyEvent};
+use crate::api::{Agent, ApiClient, ClusterMessageProgress, ClusterMessageReplyEvent};
 use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
     failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
@@ -650,6 +650,19 @@ fn reply_or_failed(latest: Option<String>, escalated: bool) -> Outcome {
     }
 }
 
+/// The status line a relayed progress card or milestone shows while the CLI
+/// waits (ADR-0130). The wire's own words, since the CLI keeps no copy of the
+/// worker's labels.
+fn progress_status_line(progress: &ClusterMessageProgress) -> String {
+    if progress.kind == "milestone" {
+        let milestone = progress.milestone.as_deref().unwrap_or("progress");
+        format!("Milestone ({milestone}): {}", progress.summary)
+    } else {
+        let state = progress.state.as_deref().unwrap_or("unknown");
+        format!("Progress ({state}): {}", progress.summary)
+    }
+}
+
 /// Classify one relay page into a resume wait outcome. Pure so the #2757 hang
 /// (publication result delivered, waiter still looping) is unit-testable
 /// without a cluster.
@@ -667,6 +680,14 @@ fn cluster_relay_page_outcome(
     let mut completed = false;
     let mut publication_result = false;
     for event in events {
+        if let Some(progress) = event.progress.as_ref() {
+            // A progress post or card edit (ADR-0130): a status line at most,
+            // never the reply and never a completion, even when it closes.
+            if matches!(event.kind.as_str(), "reply.update" | "reply.post") {
+                observer(&progress_status_line(progress));
+                continue;
+            }
+        }
         match event.kind.as_str() {
             "turn.status" => {
                 if let Some(status) = event.status.as_deref() {
@@ -8568,7 +8589,10 @@ mod tests {
             other => panic!("expected Replied, got {other:?}"),
         }
         assert_eq!(observed.len(), 3, "{observed:?}");
-        assert!(observed[0].starts_with("Progress") && observed[0].contains("Running the integration suite"));
+        assert!(
+            observed[0].starts_with("Progress")
+                && observed[0].contains("Running the integration suite")
+        );
         assert_eq!(observed[1], "the answer");
         assert!(observed[2].starts_with("Progress") && observed[2].contains("Fix verified"));
     }
@@ -8579,7 +8603,10 @@ mod tests {
     fn a_terminal_card_without_a_completion_keeps_waiting() {
         let mut latest = None;
         let outcome = cluster_relay_page_outcome(
-            &[relay_progress("reply.update", relay_card("complete", "Fix verified", true))],
+            &[relay_progress(
+                "reply.update",
+                relay_card("complete", "Fix verified", true),
+            )],
             false,
             &mut latest,
             &mut |_| {},
@@ -8618,7 +8645,10 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::CompletedNoEdit), "{outcome:?}");
         assert_eq!(observed.len(), 1, "{observed:?}");
-        assert!(observed[0].starts_with("Milestone") && observed[0].contains("Found the failing migration"));
+        assert!(
+            observed[0].starts_with("Milestone")
+                && observed[0].contains("Found the failing migration")
+        );
     }
 
     #[test]

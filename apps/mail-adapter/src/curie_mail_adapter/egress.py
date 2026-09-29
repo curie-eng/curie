@@ -220,6 +220,11 @@ class EgressHandler(BaseHTTPRequestHandler):
     def dispatch(self, event: ReplyEvent) -> int:
         """Apply one validated neutral reply event."""
         conversation_id = event.target.conversation_id or ""
+        if isinstance(event, ReplyUpdate | ReplyPost) and event.progress is not None:
+            # Deliberate progress (ADR-0130) is silent on email: one message per
+            # turn has no card to edit, and appending a status line would put it
+            # into the answer. Checked first, so it never reaches record_text.
+            return 200
         if isinstance(event, ReplyUpdate):
             text = event.text or (event.message.text if event.message else None)
             return self.adapter.record_text(
