@@ -279,11 +279,11 @@ pub fn is_progress_call(content_type: &str, body: &str) -> bool {
 
 /// Extract a validated durable approval id from a structured approval card.
 ///
-/// The worker puts the same UUID in the card's `client_msg_id` and approval
-/// action `value`. Neither copy is authoritative alone: both must be valid UUIDs
-/// and equal, and the action id must start with [`APPROVE_ACTION_ID_PREFIX`].
-/// This keeps incomplete, inconsistent, or ordinary Slack posts from being
-/// mistaken for approval control data.
+/// The approval action `value` is authoritative: reply-wire 1.1 uses its
+/// distinct `delivery_id` as `client_msg_id`, while 1.0 historically reuses the
+/// approval UUID there. The action must be structured, carry an action id that
+/// starts with [`APPROVE_ACTION_ID_PREFIX`], and hold a valid UUID value. This
+/// keeps malformed or ordinary Slack posts from becoming approval control data.
 pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     fn valid_uuid(value: &str) -> Option<String> {
         uuid::Uuid::parse_str(value).ok().map(|_| value.to_string())
@@ -328,35 +328,23 @@ pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
         }
     }
 
-    let (card_seen, action_id, client_msg_id) = if content_type.contains("application/json") {
+    let (card_seen, action_id) = if content_type.contains("application/json") {
         let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
-        let (seen, action_id) = approval_action(&root);
-        let client_msg_id = root
-            .get("client_msg_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(valid_uuid);
-        (seen, action_id, client_msg_id)
+        approval_action(&root)
     } else {
         let pairs: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
         let blocks = pairs
             .iter()
             .find(|(key, _)| key == "blocks")
             .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok());
-        let (seen, action_id) = blocks
+        blocks
             .as_ref()
             .map(approval_action)
-            .unwrap_or((false, None));
-        let client_msg_id = pairs
-            .iter()
-            .find(|(key, _)| key == "client_msg_id")
-            .and_then(|(_, value)| valid_uuid(value));
-        (seen, action_id, client_msg_id)
+            .unwrap_or((false, None))
     };
 
-    match (card_seen, action_id, client_msg_id) {
-        (true, Some(action_id), Some(client_msg_id)) if action_id == client_msg_id => {
-            Some(action_id)
-        }
+    match (card_seen, action_id) {
+        (true, Some(action_id)) => Some(action_id),
         _ => None,
     }
 }

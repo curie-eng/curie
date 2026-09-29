@@ -806,13 +806,11 @@ class SlackReplyAdapter:
         # A reply wire 1.1 delivery_id keys any other create (ADR-0130 d4).
         client_msg_id: str | None = delivery_id
         if isinstance(intent, ConfirmIntent):
-            # Platform approvals carry UUID ids. Reusing that durable identity
-            # lets Slack adopt an ambiguous crash-after-post retry instead of
-            # rendering a second externally visible approval card. It stays the
-            # key when the body also carries a delivery_id: the CLI stub reads the
-            # approval id back from client_msg_id (cli/src/chat.rs
-            # approval_card_id), and either id is equally stable across a retry.
-            client_msg_id = intent.id
+            # A 1.0 approval has no delivery_id, so it keeps its historical
+            # approval UUID key. On 1.1, ADR-0130 d4 makes delivery_id the
+            # externally visible operation's key; the approval UUID remains in
+            # the structured action value where the CLI stub reads it.
+            client_msg_id = delivery_id or intent.id
             text, blocks = approval_card(
                 approval_id=intent.id,
                 summary=message.text,
