@@ -30,6 +30,35 @@ MAX_EMAIL_TEXT = 100_000
 SLACK_API = "https://slack.com/api"
 
 
+def _is_slack_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (hostname == "slack.com" or hostname.endswith(".slack.com"))
+
+
+class SlackRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep a Slack bearer token inside Slack's HTTPS origin family."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if not _is_slack_url(newurl):
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                "Slack redirect is outside slack.com",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Config:
     """Validated runtime configuration for one Slack Email source."""
 
@@ -208,6 +237,7 @@ class SlackClient:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.opener = urllib.request.build_opener(SlackRedirectHandler())
 
     def _api(self, method: str, fields: dict[str, str]) -> dict[str, Any]:
         body = urllib.parse.urlencode(fields).encode()
@@ -220,7 +250,7 @@ class SlackClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.config.http_timeout_seconds) as response:
+        with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
             payload = json.loads(response.read())
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             error = (
@@ -279,16 +309,12 @@ class SlackClient:
         return ts
 
     def download(self, url: str) -> bytes:
-        parsed = urllib.parse.urlsplit(url)
-        hostname = (parsed.hostname or "").lower()
-        if parsed.scheme != "https" or not (
-            hostname == "slack.com" or hostname.endswith(".slack.com")
-        ):
+        if not _is_slack_url(url):
             raise RuntimeError("Slack file URL is outside slack.com")
         request = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {self.config.slack_token}"}
         )
-        with urllib.request.urlopen(request, timeout=self.config.http_timeout_seconds) as response:
+        with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
             raw = bytes(response.read(MAX_FILE_BYTES + 1))
         if len(raw) > MAX_FILE_BYTES:
             raise RuntimeError("Slack Email HTML file exceeds the intake byte limit")

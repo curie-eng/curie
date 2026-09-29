@@ -198,9 +198,7 @@ def test_missing_or_misclassified_canary_is_fatal(
 ) -> None:
     env(monkeypatch)
     with pytest.raises(RuntimeError, match="canary"):
-        intake.scan_once(
-            intake.Config.from_env(), FakeSlack([]), FakeHook(), now=1790706300.0
-        )
+        intake.scan_once(intake.Config.from_env(), FakeSlack([]), FakeHook(), now=1790706300.0)
 
     malformed = root()
     malformed["user"] = "UOTHER"
