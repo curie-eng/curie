@@ -1209,3 +1209,39 @@ def test_the_sweeper_without_a_deliverer_charges_nothing(names) -> None:  # noqa
             assert rows[0]["dl_delivery_count"] == "5"
 
     asyncio.run(go())
+
+
+# --- the inbox (the ingress's side of the record) ------------------------------
+
+
+def test_the_inbox_cursor_only_moves_forward_and_never_onto_an_expired_record(
+    names,  # noqa: ANN001
+) -> None:
+    async def go() -> None:
+        async with _store(names) as (store, config, client):
+            pid = await store.open_chain(_THREAD, _ROOT)
+            key = config.progress_inbox_key(pid)
+            entry = {"command": "{}", "epoch": "1", "seq": "1"}
+            first = await client.xadd(key, entry)
+            second = await client.xadd(key, entry)
+
+            assert [e for e, _ in await store.read_inbox(pid, after="", count=10)] == [
+                first,
+                second,
+            ]
+            assert [e for e, _ in await store.read_inbox(pid, after=first, count=10)] == [second]
+
+            assert await store.advance_cursor(pid, second)
+            # Back, level, or not a stream id: the cursor stays where it is.
+            assert not await store.advance_cursor(pid, first)
+            assert not await store.advance_cursor(pid, second)
+            assert not await store.advance_cursor(pid, "not-a-stream-id")
+            record = await store.read(pid)
+            assert record is not None and record.inbox_cursor == second
+
+            # A record that is gone is not recreated by its cursor.
+            gone = progress_id_for(_THREAD, "Ev0EXAMPLE-gone")
+            assert not await store.advance_cursor(gone, second)
+            assert await client.exists(config.progress_key(gone)) == 0
+
+    asyncio.run(go())
