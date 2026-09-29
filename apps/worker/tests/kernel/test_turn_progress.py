@@ -154,6 +154,33 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
     asyncio.run(go())
 
 
+def test_runner_start_delay_does_not_expire_the_turn_capability(make_harness) -> None:
+    """@spec ADR-0130 d1: renewal covers runner response-header delay."""
+
+    async def go() -> None:
+        async with make_harness(progress_factory=_progress) as h:
+            h.runner.accept = asyncio.Event()
+            ev = qevent("check the build", thread="t-delayed-start")
+            turn = asyncio.create_task(h.kernel.process_event(ev))
+            try:
+                await wait_until(lambda: h.runner.opened == ["check the build"])
+                progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
+
+                # RunnerClient permits ten seconds for response headers. A valid
+                # response after the five-second lease must still have authority.
+                await asyncio.sleep(5.25)
+                record = await ProgressStore(h.async_redis, h.config).read(progress_id)
+                assert record is not None
+                assert record.active_generation == 1
+                assert record.active_until_ms > 0
+                assert await ProgressStore(h.async_redis, h.config).renew_turn(progress_id, 1)
+            finally:
+                h.runner.accept.set()
+                await turn
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
