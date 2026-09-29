@@ -234,6 +234,10 @@ class Agent(Base):
     # across every binding. Existing single-binding agents are unaffected
     # either way, since there is nothing else to share with.
     memory: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the runner mounts its remember/update/forget memory tools for this
+    # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
+    # worker hands the runner the binding-scoped channel memory URL.
+    memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(

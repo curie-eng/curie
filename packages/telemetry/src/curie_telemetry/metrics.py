@@ -270,6 +270,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hook-secret",
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
+    "/agents/{agent_id}/memory/guidance",
     "/agents/{agent_id}/memory/{index}",
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",

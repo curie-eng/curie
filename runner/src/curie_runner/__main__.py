@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from .approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
+    build_memory_tools,
     include_generic_policy_pager,
     policy_disallowed_tools,
     resolve_approval_policy,
@@ -75,7 +76,15 @@ from .mcp_tool_capability import (
     probe_mcp_tool_capability,
     reprobe_connector_failures,
 )
-from .memory import MemoryStore, format_memory_preamble, resolve_memory
+from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resolve_memory
+from .memory_facts import (
+    DEFAULT_GUIDANCE,
+    MAX_FACTS_PER_MEMORY,
+    Fact,
+    MemoryTurn,
+    format_facts_preamble,
+    resolve_facts_store,
+)
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .progress import (
@@ -305,8 +314,14 @@ def _compose_system_prompt(
     workspace_preamble: str | None = None,
     attachment_preamble: str | None = None,
     progress_preamble: str | None = None,
+    facts_preamble: str | None = None,
+    guidance_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
+
+    Memory leads (#1461, ADR-0167): the legacy ``log`` records, then the
+    remembered agent and channel facts, then the memory guidance, all above the
+    bundle prompt so the bundle's own instructions have the last word.
 
     Conversation history is deliberately absent: ADR-0119 requires it to cross
     the harness boundary as ordered messages, never rendered system text.
@@ -325,6 +340,8 @@ def _compose_system_prompt(
         p
         for p in (
             memory_preamble,
+            facts_preamble,
+            guidance_preamble,
             workspace_preamble,
             progress_preamble,
             base,
@@ -380,6 +397,8 @@ def build_runner(
     attachments_path: Path | None = None,
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
     history_capacity_exceeded: bool = False,
+    memory_facts_preamble: str | None = None,
+    memory_guidance: str | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -391,6 +410,10 @@ def build_runner(
     ``harness`` is the resolved contribution manifest (ADR-0060) whose fields
     drive the read-only tool set and bundle compile; it defaults to the built-in
     Claude harness so existing callers are unaffected.
+
+    ``memory_facts_preamble`` is the rendered remembered-facts block and
+    ``memory_guidance`` the operator's stored guidance text (None falls back to
+    ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -462,6 +485,23 @@ def build_runner(
         )
         else None
     )
+    # The memory tools (#1461, ADR-0167) mount iff the worker set a channel
+    # memory ref (the operator's memory-writes switch as the sandbox sees it)
+    # AND a memory token to write with, and only on the real-model path, which
+    # is the only path that mounts platform MCP servers at all. The toolPolicy
+    # exemption below reads this same flag, so the claim matches the mount.
+    # The guidance block rides with the tools and only with them; the facts
+    # block does not, because reading memory needs no switch.
+    memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
+    if config.channel_memory_ref and channel_facts_store is None:
+        logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
+    if config.channel_memory_ref and memory_token is None:
+        logger.warning("memory tools not mounted: no memory token")
+    memory_tools_mounted = (
+        channel_facts_store is not None and memory_token is not None and not fake_model
+    )
+    memory_turn = MemoryTurn() if memory_tools_mounted else None
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
@@ -469,6 +509,8 @@ def build_runner(
         workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
         progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+        facts_preamble=memory_facts_preamble,
+        guidance_preamble=(memory_guidance or DEFAULT_GUIDANCE) if memory_tools_mounted else None,
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -566,6 +608,7 @@ def build_runner(
             or os.environ.get(BootEnv.env_key("progress_url")),
             network_enabled=not fake_model,
         )
+        approval_gate.memory_tools_mounted = memory_tools_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -667,6 +710,20 @@ def build_runner(
                 ),
                 turn_progress_tool=(
                     build_turn_progress_tool(turn_progress) if turn_progress is not None else None
+                ),
+                memory_tools=(
+                    build_memory_tools(
+                        agent_store=resolve_facts_store(
+                            config.session.memory_ref, os.environ.get(MEMORY_TOKEN_ENV)
+                        ),
+                        channel_store=channel_facts_store,
+                        turn=memory_turn,
+                        session_id=config.session.session_id,
+                    )
+                    if memory_tools_mounted
+                    and channel_facts_store is not None
+                    and memory_turn is not None
+                    else ()
                 ),
             ),
             **(
@@ -809,6 +866,7 @@ def build_runner(
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
+            memory_turn=memory_turn,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -838,6 +896,71 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
         return store, None
     logger.info("memory loaded session=%s records=%d", config.session.session_id, len(records))
     return store, format_memory_preamble(records)
+
+
+async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
+    """Load agent and channel facts and the operator guidance at boot (#1461).
+
+    Returns the rendered facts block and the operator's guidance text. Each read
+    degrades on its own to nothing, like ``_load_memory``: an unreachable store
+    boots the agent without that part of its memory, never not at all.
+    """
+
+    token = os.environ.get(MEMORY_TOKEN_ENV)
+    agent_store = resolve_facts_store(config.session.memory_ref, token)
+    channel_store = resolve_facts_store(config.channel_memory_ref, token)
+    agent_facts: list[Fact] = []
+    channel_facts: list[Fact] = []
+    guidance: str | None = None
+
+    async def read(label: str, call: Callable[[], Awaitable[Any]]) -> Any:
+        try:
+            return await call()
+        except Exception as exc:  # noqa: BLE001 - degrade to nothing, never fail boot
+            logger.warning(
+                "memory %s load failed session=%s error_class=%s: %s",
+                label,
+                config.session.session_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    async def load_agent() -> None:
+        nonlocal agent_facts
+        if agent_store is not None:
+            agent_facts = await read("agent facts", agent_store.list) or []
+
+    async def load_channel() -> None:
+        nonlocal channel_facts
+        if channel_store is not None:
+            channel_facts = await read("channel facts", channel_store.list) or []
+
+    async def load_guidance() -> None:
+        nonlocal guidance
+        if agent_store is not None and channel_store is not None:
+            guidance = await read("guidance", agent_store.guidance)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_agent)
+        tg.start_soon(load_channel)
+        tg.start_soon(load_guidance)
+    # Counts and the guidance source only: never statements, authors or the
+    # guidance text. Counts are what the prompt shows, after the per-memory cap.
+    # "none" mirrors build_runner's mount rule as far as boot can see it (a
+    # channel store and a memory token).
+    if channel_store is None or not token:
+        guidance_source = "none"
+    else:
+        guidance_source = "operator" if guidance is not None else "default"
+    logger.info(
+        "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
+        config.session.session_id,
+        min(len(agent_facts), MAX_FACTS_PER_MEMORY),
+        min(len(channel_facts), MAX_FACTS_PER_MEMORY),
+        guidance_source,
+    )
+    return format_facts_preamble(agent_facts, channel_facts), guidance
 
 
 # Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
@@ -965,6 +1088,10 @@ class _BootFetches:
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
     history_capacity_exceeded: bool = False
+    # Remembered facts and operator guidance (#1461); field names match the
+    # build_runner parameters they feed.
+    memory_facts_preamble: str | None = None
+    memory_guidance: str | None = None
 
 
 async def _load_boot_fetches(
@@ -979,6 +1106,7 @@ async def _load_boot_fetches(
 
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
+    facts: tuple[str | None, str | None] = (None, None)
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1001,6 +1129,10 @@ async def _load_boot_fetches(
         nonlocal history
         history = await _load_history(config)
 
+    async def load_facts() -> None:
+        nonlocal facts
+        facts = await _load_memory_facts(config)
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -1012,6 +1144,7 @@ async def _load_boot_fetches(
     async with anyio.create_task_group() as tg:
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
+        tg.start_soon(load_facts)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -1028,6 +1161,8 @@ async def _load_boot_fetches(
         mcp_capability=capability,
         connector_failures=connector_failures,
         history_capacity_exceeded=history[2],
+        memory_facts_preamble=facts[0],
+        memory_guidance=facts[1],
     )
 
 
@@ -1096,6 +1231,8 @@ def _serve() -> None:
         attachments_path=attachments_path,
         connector_failures=fetches.connector_failures,
         history_capacity_exceeded=fetches.history_capacity_exceeded,
+        memory_facts_preamble=fetches.memory_facts_preamble,
+        memory_guidance=fetches.memory_guidance,
     )
 
     def capture_mounted_workspace() -> WorkspaceSnapshot:

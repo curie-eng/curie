@@ -1947,7 +1947,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -1995,6 +1995,38 @@ export const commandManifest = {
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -2495,6 +2527,18 @@ export const commandManifest = {
               "possible_values": [
                 "true",
                 "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
               ],
               "required": false
             },
@@ -5131,6 +5175,18 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -6396,7 +6452,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -6463,6 +6519,38 @@ export const commandManifest = {
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],

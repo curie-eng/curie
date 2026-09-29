@@ -494,6 +494,119 @@ tests:
         alertname: CurieMailAdapterNotReady
         exp_alerts: []
 
+  - name: stale Slack Email intake scan fires
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '0x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: healthy Slack Email intake stays quiet
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '1x6'
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '0x6'
+      - series: 'kube_deployment_spec_replicas{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '1x6'
+      - series: 'kube_pod_container_status_restarts_total{container="intake",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '0x6'
+      - series: 'up{job="kubernetes-pods",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeRestarted
+        exp_alerts: []
+
+  - name: missing Slack Email intake scrape fires while deployment exists
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '1x6'
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '0x6'
+      - series: 'kube_deployment_spec_replicas{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              deployment: sre-slack-email-intake
+              namespace: observability
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: Slack Email intake marker keeps a deleted deployment alarming
+    interval: 1m
+    input_series:
+      - series: 'kube_configmap_info{configmap="sre-slack-email-intake-code",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              configmap: sre-slack-email-intake-code
+              namespace: observability
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: first Slack Email intake restart sample fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{container="intake",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeRestarted
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              container: intake
+              namespace: observability
+              pod: sre-slack-email-intake-example
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake restarted
+              description: >-
+                The intake process restarted after a configuration, Slack,
+                file-download, hook, routing, or stale-placeholder failure.
+
   - name: sustained low memory headroom fires
     interval: 5m
     input_series:

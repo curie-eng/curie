@@ -4,6 +4,12 @@ This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.
 
+Installations whose alert provider delivers email into Slack can opt into the
+per-message, source-thread intake described in
+[`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). It is deliberately
+not part of the default bundle because its Slack source identity, subject
+prefixes, channel, and signed hook are installation-specific.
+
 ## Kubernetes authority
 
 The bundle's `toolPolicy` classifies the pinned server's complete 19-tool core
@@ -279,6 +285,83 @@ changes. A changed `server.py` ConfigMap also needs a signer restart.
 A genuine signed alert creates one partitioned investigation. Missing,
 ambiguous, or unauthorized mappings visibly stop coding. Invalid signatures
 and replayed delivery ids do not multiply work.
+
+### Slack Email alert source (opt-in)
+
+When the alert provider delivers email into Slack instead of calling
+Alertmanager directly, install the per-message intake from
+[`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). Choose one real,
+matching email root at or after the scan floor as `SLACK_CANARY_THREAD_TS`.
+The first scan processes it normally; later scans replay its stable delivery
+only to validate the complete intake path without starting another turn.
+
+Use the Slack token for the same bot identity as the selected Curie adapter.
+The setup below keeps both credentials out of command arguments and checked-in
+files. Prefixes are installation data; for example, an operator can include
+both firing and resolved subject prefixes without adding them to this public
+repository.
+The bot token must have Slack's `files:read` scope to download the email's
+`url_private` HTML file. If the app lacks it, add the scope and reinstall the
+app before applying the intake; successful channel history and thread reads do
+not prove file access.
+
+```bash
+(
+set -euo pipefail
+umask 077
+: "${KUBE_CONTEXT:?Set the Kubernetes context for this installation}"
+: "${SLACK_CHANNEL:?Set the Slack Email channel ID}"
+: "${SLACK_EMAIL_SOURCE_USER_ID:?Set the exact Slack Email source user ID}"
+: "${ALERT_SUBJECT_PREFIXES:?Set comma-separated accepted subject prefixes}"
+: "${SLACK_SCAN_NOT_BEFORE:?Set the oldest Slack timestamp to scan}"
+: "${SLACK_CANARY_THREAD_TS:?Set one matching root timestamp at or after the floor}"
+read -rsp 'Slack bot token: ' SLACK_BOT_TOKEN
+printf '\n'
+OBS_NAMESPACE=${OBS_NAMESPACE:-observability}
+CURIE_NAMESPACE=${CURIE_NAMESPACE:-curie}
+CURIE_RELEASE=${CURIE_RELEASE:-curie}
+CURIE_AGENT=${CURIE_AGENT:-sre-bot}
+CURIE_SLACK_ADAPTER=${CURIE_SLACK_ADAPTER:-}
+private_dir=$(mktemp -d)
+trap 'rm -rf "$private_dir"' EXIT
+agent_id=$(curie cluster hooks show "$CURIE_AGENT" --json | jq -er '.id')
+curie cluster hooks secret "$CURIE_AGENT" --json |
+  jq -ej '.secret' > "$private_dir/CURIE_HOOK_SECRET"
+printf 'http://%s-api.%s.svc.cluster.local:8000/hooks/%s/email-alert' \
+  "$CURIE_RELEASE" "$CURIE_NAMESPACE" "$agent_id" \
+  > "$private_dir/CURIE_HOOK_URL"
+for name in SLACK_BOT_TOKEN SLACK_CHANNEL SLACK_EMAIL_SOURCE_USER_ID \
+  ALERT_SUBJECT_PREFIXES SLACK_SCAN_NOT_BEFORE SLACK_CANARY_THREAD_TS; do
+  value=${!name}
+  file_name=$name
+  [ "$name" != SLACK_CHANNEL ] || file_name=SLACK_CHANNEL_ID
+  printf '%s' "$value" > "$private_dir/$file_name"
+done
+if [ -n "$CURIE_SLACK_ADAPTER" ]; then
+  printf '%s' "$CURIE_SLACK_ADAPTER" > "$private_dir/CURIE_SLACK_ADAPTER"
+fi
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create secret generic \
+  sre-slack-email-intake --from-file="$private_dir" --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply --server-side -f -
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create configmap \
+  sre-slack-email-intake-code \
+  --from-file=server.py=examples/sre-bot/observability/slack-email-intake/server.py \
+  --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply -f -
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply \
+  -f examples/sre-bot/observability/slack-email-intake.yaml
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" rollout status \
+  deployment/sre-slack-email-intake
+)
+```
+
+Reapply the current `prometheus-values.yaml` through the same Helm command and
+all the same later overlays used by that installation. It adds
+`SreSlackEmailIntakeNotReady` and `SreSlackEmailIntakeRestarted`; omitting that
+step gives a ready probe but no page. Confirm the canary's source thread is
+completed, both alerts are inactive, the intake target is up, and the external
+Alertmanager heartbeat is arriving. A changed code ConfigMap or Secret requires
+`kubectl rollout restart deployment/sre-slack-email-intake`.
 
 ### Alert investigation contract
 

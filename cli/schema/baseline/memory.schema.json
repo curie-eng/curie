@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/memory/v2.json",
+  "$id": "https://schemas.curietech.ai/cli/memory/v2.1.json",
   "title": "curie <tier> memory --json",
-  "description": "The agent-facing payload of `curie <tier> memory <agent>` and `curie <tier> memory <agent> --add <content>`: the dry-run plan, the learned-memory entries (an empty array when none exist), or the operator-seeded add result.",
+  "description": "The agent-facing payload of `curie <tier> memory <agent>`, `curie <tier> memory <agent> --add <content>` and the guidance flags (`--guidance`, `--guidance-from <file>`, `--reset-guidance`): the dry-run plan, the learned-memory entries (an empty array when none exist), the operator-seeded add result, or the agent's effective memory guidance with its source (`default` or `operator`) and whether this invocation wrote it.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -90,6 +90,33 @@
         "source",
         "fresh_session_required",
         "next_command"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "default",
+            "operator"
+          ]
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "text",
+        "source",
+        "changed"
       ]
     }
   ]
