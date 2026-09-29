@@ -95,6 +95,10 @@ _CAUSE_TEXT = {
         "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
     ),
     "runner_timeout": "the run took longer than its time limit.",
+    "sandbox_terminated": (
+        "the sandbox terminated before the run finished. Check the Kubernetes "
+        "reason below, then retry after addressing the sandbox failure."
+    ),
     "workspace_error": "the repository workspace could not be prepared for the run.",
     "history_capacity": (
         "conversation history capacity exceeded. Work may have happened. "
@@ -142,8 +146,8 @@ _CAUSE_TEXT = {
     ),
 }
 
-# The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
-_CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+# Infrastructure and CI causes carry details, not a provider message.
+_DETAIL_CAUSES = frozenset({"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified"})
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
@@ -153,7 +157,7 @@ _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
 # Failed runs that still need a person, including the classes that used to
 # collapse into runner_escalated (#3401). The status card reads this set.
 NEEDS_HUMAN_CAUSES = frozenset(
-    {"runner_escalated", "unclassified", "max_turns", "ci_failed"}
+    {"runner_escalated", "sandbox_terminated", "unclassified", "max_turns", "ci_failed"}
 )
 
 
@@ -173,6 +177,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "model_error": "server-error",
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
+    "sandbox_terminated": "sandbox-terminated",
     "workspace_error": "workspace-error",
 }
 _BACKTICK_RUN = re.compile(r"`+")
@@ -271,7 +276,7 @@ def result_section(
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
         elif cause != "history_capacity" and detail is not None and detail.strip():
-            label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
+            label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
         failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)

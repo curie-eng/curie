@@ -61,7 +61,7 @@ from curie_worker.sandbox import (
     SandboxSubstrate,
     SubstrateConfig,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimView, SandboxTermination, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -447,6 +447,8 @@ class FakeK8s:
     ready_reason: str | None = None
     ready_message: str | None = None
     unschedulable_message: str | None = None
+    termination: SandboxTermination | None = None
+    termination_queries: list[str] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -590,6 +592,14 @@ class FakeK8s:
         assert request_timeout_seconds > 0
         return self.unschedulable_message
 
+    def pod_termination(
+        self, name: str, *, request_timeout_seconds: float, since: datetime
+    ) -> SandboxTermination | None:
+        assert request_timeout_seconds > 0
+        assert since.tzinfo is not None
+        self.termination_queries.append(name)
+        return self.termination
+
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
 
@@ -644,6 +654,7 @@ class FakeRunner:
         self.status_delay_seconds = 0.0
         self.turn_scripts: list[list[OutboundEvent]] = []
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
+        self.abort_after_frames = False
         self.opened: list[str] = []
         self.request_epochs: list[tuple[str, str]] = []
         self.queried: list[str] = []
@@ -743,6 +754,11 @@ class FakeRunner:
                 self.queried.append(body["text"])
                 for frame in script:
                     await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+                if self.abort_after_frames:
+                    transport = request.transport
+                    assert transport is not None
+                    transport.close()
+                    return resp
                 if self.hold is not None:
                     await self.hold.wait()  # type: ignore[attr-defined]
                     for frame in self.tail:

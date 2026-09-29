@@ -309,7 +309,10 @@ def test_last_success_age_has_one_series_across_failure_and_recovery(
     assert "outcome" not in matching[0].attributes
 
 
-def test_retry_metrics_separate_bounded_retry_causes() -> None:
+def test_retry_metrics_separate_bounded_retry_causes(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
     manifest = _read(_MANIFEST)["metrics"]
     queue = manifest["curie.queue.retry"]
     assert queue["attributes"] == {
@@ -321,9 +324,18 @@ def test_retry_metrics_separate_bounded_retry_causes() -> None:
             "runner-error",
             "runner-timeout",
             "workspace-error",
+            "sandbox-terminated",
         ],
     }
-    assert queue["cardinality_bound"] == 10
+    assert queue["cardinality_bound"] == 12
+    record_metric(
+        "curie.queue.retry",
+        attributes={
+            "service.name": "curie-worker",
+            "source": "worker",
+            "retry_class": "sandbox-terminated",
+        },
+    )
     reply = manifest["curie.reply.retry"]
     assert reply["attributes"] == {
         "service.name": ["curie-worker"],
