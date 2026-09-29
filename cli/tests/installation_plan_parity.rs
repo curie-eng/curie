@@ -3355,6 +3355,18 @@ fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
             "otelCollector.headers",
             "Authorization=Bearer opaque-header-placeholder",
         ),
+        (
+            "otelCollector.headers",
+            "X-API-Key=opaque-header-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "Proxy-Authorization=opaque-header-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "X-Auth-Token=opaque-header-placeholder",
+        ),
         ("example.label", "sk-ant-placeholder"),
     ] {
         let config = format!(

@@ -684,19 +684,7 @@ fn otel_workload_headers_are_sensitive(key: &str, value: &str) -> bool {
             .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
             .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
             .map(str::to_ascii_lowercase)
-            .any(|name| {
-                matches!(
-                    name.as_str(),
-                    "authorization"
-                        | "token"
-                        | "apikey"
-                        | "api-key"
-                        | "api_key"
-                        | "secret"
-                        | "password"
-                        | "credential"
-                )
-            })
+            .any(|name| name_is_sensitive_header(&name))
 }
 
 /// This exact empty object is the chart's typed clear for the worker credential
@@ -3114,6 +3102,13 @@ mod diff_tests {
             "Authorization=Bearer opaque-placeholder",
             "tenant=acme;token=opaque-placeholder",
             "tenant=acme, API-Key=opaque-placeholder",
+            "tenant=acme,X-API-Key=opaque-placeholder",
+            "tenant=acme,X_API_KEY=opaque-placeholder",
+            "tenant=acme;Proxy-Authorization=opaque-placeholder",
+            "tenant=acme X-Auth-Token=opaque-placeholder",
+            "tenant=acme;client-secret=opaque-placeholder",
+            "tenant=acme password=opaque-placeholder",
+            "tenant=acme,backend_credential=opaque-placeholder",
             "tenant=acme\nAuthorization=opaque-placeholder",
         ] {
             let config = format!(
@@ -3125,7 +3120,11 @@ mod diff_tests {
             );
         }
 
-        for value in ["tenant=acme", "x-tenant-id=acme;region=us-west"] {
+        for value in [
+            "tenant=acme",
+            "x-tenant-id=acme;region=us-west",
+            "X-Request-ID=placeholder traceparent=placeholder tokenizer=plain",
+        ] {
             let config = format!(
                 "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  otelCollector.headers: {value:?}\n"
             );
