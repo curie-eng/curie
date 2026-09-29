@@ -2392,6 +2392,19 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
+  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
+  # (default 1Gi) for that agent only. Each listed agent gets its own
+  # SandboxTemplate and warm pool; every other agent keeps the runner default.
+  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
+  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
+  # pod was evicted. emptyDir usage also counts against the pod's
+  # ephemeral-storage limit, so raise that agent's runner resources
+  # `ephemeral-storage` limit (runner.resources, or the agent's runner
+  # resources) to at least this value plus the home scratch.
+  #   workspaceSizeLimits:
+  #     dark-factory: 24Gi
+  workspaceSizeLimits: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
