@@ -216,9 +216,17 @@ The split is the point: Block Kit lives only in the two Slack-side modules named
 above (`blocks.py` and `approval_actions.py`), the numbered selector only in
 `channel.rs`, and the agent authors none of them.
 
-Neither renderer consumes progress yet. The progress models, their JSON Schema
-and the reply-wire corpus exist, and no code produces or renders a
-`ProgressCard` or `ProgressMilestone`.
+The Slack renderer consumes progress; the terminal one does not. A card and a
+milestone become Block Kit in
+`apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, every text element
+`plain_text` so a model-authored summary cannot mention anyone, and
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` routes a
+progress body to them before any answer or approval path. The channel-neutral
+text for a channel with nothing richer is
+`packages/channel-protocol/src/channel_protocol/progress.py::progress_text`.
+Nothing produces a progress body yet: the worker's coordinator stores what it
+owes, and no deliverer calls an adapter with it.
 
 ## Known leakage
 

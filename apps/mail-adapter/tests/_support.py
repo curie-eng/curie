@@ -588,6 +588,60 @@ def reply_post(text: str, conversation_id: str = "thr-1") -> dict[str, Any]:
     }
 
 
+def progress_post(
+    summary: str,
+    conversation_id: str = "thr-1",
+    reply_ref: str | None = None,
+    *,
+    delivery_id: str = "00000000-0000-4000-8000-000000000001",
+    kind: str = "card",
+) -> dict[str, Any]:
+    """A reply wire 1.1 progress post (ADR-0130): a card's first revision or a milestone.
+
+    Its ``message.text`` is the plain-text fallback the platform always sends;
+    the mail adapter must not append it to the reply it is buffering.
+    """
+    progress: dict[str, Any] = (
+        {"kind": "card", "state": "investigating", "summary": summary, "revision": 1,
+         "terminal": False}
+        if kind == "card"
+        else {"kind": "milestone", "milestone": "evidence", "summary": summary, "ordinal": 1}
+    )
+    return {
+        "version": "1.1",
+        "event": "reply.post",
+        "target": target(conversation_id, reply_ref=reply_ref),
+        "message": {"version": "1.0", "text": summary},
+        "requested_by": "U9",
+        "delivery_id": delivery_id,
+        "progress": progress,
+    }
+
+
+def progress_update(
+    summary: str,
+    conversation_id: str = "thr-1",
+    reply_ref: str | None = "msg-1",
+    *,
+    state: str = "testing",
+    revision: int = 2,
+) -> dict[str, Any]:
+    """A reply wire 1.1 card edit: no text, message, settled or nav."""
+    return {
+        "version": "1.1",
+        "event": "reply.update",
+        "target": target(conversation_id, reply_ref),
+        "delivery_id": "00000000-0000-4000-8000-000000000002",
+        "progress": {
+            "kind": "card",
+            "state": state,
+            "summary": summary,
+            "revision": revision,
+            "terminal": state in {"complete", "failed", "cancelled"},
+        },
+    }
+
+
 def turn_status(conversation_id: str = "thr-1", status: str = "thinking") -> dict[str, Any]:
     return {
         "version": "1.0",

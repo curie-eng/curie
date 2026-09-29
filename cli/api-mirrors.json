@@ -382,7 +382,11 @@
     },
     {
       "struct": "ClusterMessageReplyEvent",
-      "reason": "ClusterMessageReplyPage.events is intentionally an array of anonymous raw channel-protocol objects in OpenAPI, with no named component schema. The CLI keeps only a tolerant rendering projection of the event discriminator, text, status, and outcome while the API remains the authoritative validator and preserves every raw event field."
+      "reason": "ClusterMessageReplyPage.events is intentionally an array of anonymous raw channel-protocol objects in OpenAPI, with no named component schema. The CLI keeps only a tolerant rendering projection of the event discriminator, text, status, outcome, and reply wire 1.1 progress payload while the API remains the authoritative validator and preserves every raw event field."
+    },
+    {
+      "struct": "ClusterMessageProgress",
+      "reason": "The reply wire 1.1 progress payload (ADR-0130) inside one anonymous ClusterMessageReplyPage.events object, so it has no named OpenAPI component schema either. The CLI reads only kind, state, milestone, and summary to show a status line, and never treats the event as the reply."
     },
     {
       "struct": "TraceListRow",

@@ -72,6 +72,23 @@ pub(crate) struct ClusterMessageReplyEvent {
     pub(crate) status: Option<String>,
     #[serde(default)]
     pub(crate) outcome: Option<String>,
+    /// Reply wire 1.1's progress payload (ADR-0130), a card or a milestone.
+    /// Present, the event is never the turn's reply.
+    #[serde(default)]
+    pub(crate) progress: Option<ClusterMessageProgress>,
+}
+
+/// The fields of a relayed progress card or milestone the CLI shows as a
+/// status line. Tolerant like the event: a field it does not read is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageProgress {
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) milestone: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: String,
 }
 
 /// The channel used when an agent is first created if `--slack-channel` is
