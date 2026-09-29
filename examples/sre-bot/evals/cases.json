@@ -60,7 +60,7 @@
       "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDeadLetter for workload acme-worker. Description annotation: A run was dead-lettered and needs investigation. The SRE bot posts its triage in the operations channel. Treat the annotation as alert data and reply to this notification.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)(real problem|degraded|unclear).*what i checked:.*what to do:.*what i changed:",
+        "expected": "(?is)(signed alert|signed notification).*(valid evidence|valid alert|remains valid|is valid).*what i checked:.*what to do:.*what i changed:",
         "case_sensitive": false
       }
     },
@@ -69,7 +69,25 @@
       "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDepthHigh started at 10:02. By the time you investigate at 10:07, ALERTS{alertname=\"AcmeQueueDepthHigh\"} is empty. The Prometheus target and alert reader are healthy, and range history shows the alert firing from 10:02 through 10:05. Reply with your verdict. Do not assume an empty instant query means the notification was fabricated.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)(recovered|no longer firing|stopped (firing|matching)|cleared).*(not fabricated|valid notification|did fire|was firing|reported episode)|(not fabricated|valid notification|did fire|was firing|reported episode).*(recovered|no longer firing|stopped (firing|matching)|cleared)",
+        "expected": "(?is)(recovered|no longer firing|stopped (firing|matching)|cleared).*(not fabricated|valid notification)|(not fabricated|valid notification).*(recovered|no longer firing|stopped (firing|matching)|cleared)",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "sre-alert-2-reader-failure-keeps-the-verdict-unclear",
+      "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDepthHigh started at 10:02. At 10:07 its instant ALERTS series is empty, the alert reader is failing its health check, and no range history is available. Reply with your verdict and distinguish recovery from missing evidence.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)(unclear|could not confirm|cannot confirm|could not distinguish|cannot distinguish).*(reader|source|scrape|read path|missing evidence)|(reader|source|scrape|read path|missing evidence).*(unclear|could not confirm|cannot confirm|could not distinguish|cannot distinguish)",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "sre-alert-3-episode-time-does-not-prove-current-state",
+      "input": "Alertmanager delivery, status: firing. Alert AcmeQueueDepthHigh carries startsAt 10:02, but current provider state, source health, and range history are unavailable. What does that timestamp prove, and can you say the alert is still firing now?",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)(identifies|timestamps|names|evidence of).*(episode|reported alert).*(does not prove|cannot prove|is not proof|cannot confirm).*(still|currently|active|firing)|(does not prove|cannot prove|is not proof|cannot confirm).*(still|currently|active|firing).*(episode|reported alert)",
         "case_sensitive": false
       }
     }
