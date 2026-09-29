@@ -89,7 +89,11 @@ def test_claude_runner_materializes_history_without_system_prompt_preamble(tmp_p
     runner = build_runner(config, conversation_replay=replay)
     options = runner._factory()._options
 
-    assert options.system_prompt is None
+    # No history in the system text: the only block is the platform's progress
+    # rules (ADR 0130), which ride every non-factory session.
+    from curie_runner.turn_progress import PROGRESS_PREAMBLE
+
+    assert options.system_prompt == PROGRESS_PREAMBLE
     assert options.resume is not None
     assert options.session_store is not None
     assert runner._history_resumed is True

@@ -94,6 +94,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .turn_progress import PROGRESS_PREAMBLE, TurnProgress, build_turn_progress_tool
 from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
@@ -299,6 +300,7 @@ def _compose_system_prompt(
     model: str | None,
     workspace_preamble: str | None = None,
     attachment_preamble: str | None = None,
+    progress_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
 
@@ -308,6 +310,10 @@ def _compose_system_prompt(
     This turn's inbound attachments (#2567) come last, closest to the query they
     belong to. Absent -- the overwhelming majority of turns -- the composed
     prompt is byte-identical to what it was before the lane existed.
+
+    The deliberate progress block (ADR 0130) is a platform block like the
+    workspace one, present whenever the ``progress`` tool is mounted, and sits
+    ahead of the bundle's own instructions.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -316,6 +322,7 @@ def _compose_system_prompt(
         for p in (
             memory_preamble,
             workspace_preamble,
+            progress_preamble,
             base,
             model_preamble,
             attachment_preamble,
@@ -430,12 +437,26 @@ def build_runner(
     # indistinguishable from one that never arrived, and the agent answers "I
     # don't see an attachment" about a message that visibly carries one.
     attachment_paths = _discover_attachments(attachments_path)
+    # The live status card (#3077): a factory execution carries a progress URL
+    # and token, and the bundle declares its phases. A malformed phase file is
+    # logged and mounts no tool; progress never stops a boot.
+    try:
+        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
+    except ValueError as exc:
+        logger.warning("report_progress not mounted: %s", exc)
+        progress = None
+    # Deliberate progress (ADR 0130): every other session mounts the platform
+    # ``progress`` tool and carries its prompt block. Its capability arrives per
+    # turn on /v1/event, so a session that is never handed one gets only the
+    # tool's soft "not shown" answer.
+    turn_progress = TurnProgress() if progress is None else None
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
         model=config.model,
         workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
+        progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -500,14 +521,6 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
-    # The live status card (#3077): a factory execution carries a progress URL
-    # and token, and the bundle declares its phases. A malformed phase file is
-    # logged and mounts no tool; progress never stops a boot.
-    try:
-        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
-    except ValueError as exc:
-        logger.warning("report_progress not mounted: %s", exc)
-        progress = None
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
     # Per-model token usage for the run's cost line (#3223): reported whenever
@@ -642,6 +655,11 @@ def build_runner(
                     if progress is not None
                     else None
                 ),
+                turn_progress_tool=(
+                    build_turn_progress_tool(turn_progress)
+                    if turn_progress is not None
+                    else None
+                ),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -713,6 +731,9 @@ def build_runner(
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
                 disallowed_tools=config.disallowed_tools,
+                # The same holder the SDK tool closes over, so the scripted
+                # progress demo runs the real handler (ADR 0130).
+                turn_progress=turn_progress,
             )
         assert real_options is not None
         nonlocal sdk_generation
@@ -772,6 +793,7 @@ def build_runner(
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
             progress_activity=progress_activity if progress is not None else None,
+            turn_progress=turn_progress,
             usage_reporter=usage_reporter,
             primary_model=config.model,
             connector_failures=connector_failures

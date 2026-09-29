@@ -75,6 +75,7 @@ from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 from .translate import TurnState, translate_message
+from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,7 @@ class SessionRunner:
         progress_activity: ProgressActivity | None = None,
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
+        turn_progress: TurnProgress | None = None,
     ) -> None:
         self._factory = session_factory
         # Per-model token usage reported at the ResultMessage boundary (#3223);
@@ -282,6 +284,10 @@ class SessionRunner:
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
+        # The deliberate progress tool's holder (ADR 0130), shared with the
+        # tool: opened with each turn's capability, closed when the turn ends.
+        # None when the tool is not mounted (a factory execution).
+        self._turn_progress = turn_progress
         self._ceiling = ceiling
         self._tracer = tracer
         self._classifier = classifier
@@ -784,12 +790,16 @@ class SessionRunner:
         parent: Context | None = None,
         turn_epoch: str | None = None,
         admission_required: bool = False,
+        progress: ProgressCapability | None = None,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
         Returns an async *generator* (not just an iterator): the server wraps it
         in ``contextlib.aclosing`` so a client disconnect finalizes it on the
         driving task, and ``aclosing`` requires the ``aclose`` a generator has.
+
+        ``progress`` is this turn's deliberate progress capability (ADR 0130),
+        held only while the turn is open.
         """
 
         if self._session is None:
@@ -810,6 +820,8 @@ class SessionRunner:
             self._persistence_owned = False
             self._turn_open = True
             self._history_durable = False
+            if self._turn_progress is not None:
+                self._turn_progress.open(progress)
             # Not ready until turn-start connector recovery completes (#2634):
             # the turn is accepted and owns its epoch, but no query has been
             # sent, so steer is refused and a stop is recorded without an SDK
@@ -1120,6 +1132,8 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._turn_progress is not None:
+                    self._turn_progress.close()
                 if self._approval_gate is not None:
                     self._approval_gate.clear_publication_context()
                 try:

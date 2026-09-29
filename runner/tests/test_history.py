@@ -1445,7 +1445,10 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
     assert isinstance(session, ClaudeAgentSession)
     options = session._options
 
-    assert options.system_prompt == "Configured model: z-ai/glm-5.2"
+    # The platform's progress block (ADR 0130) leads; the model identity follows.
+    from curie_runner.turn_progress import PROGRESS_PREAMBLE
+
+    assert options.system_prompt == f"{PROGRESS_PREAMBLE}\n\nConfigured model: z-ai/glm-5.2"
 
 
 def test_record_turn_swallows_store_failure() -> None:

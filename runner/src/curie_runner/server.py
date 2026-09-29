@@ -41,6 +41,7 @@ from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 
 from .session import SessionRunner
+from .turn_progress import ProgressCapability
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
@@ -266,10 +267,14 @@ async def _event(request: web.Request) -> web.StreamResponse:
     if traceparent is not None:
         carrier[TRACEPARENT_STREAM_FIELD] = traceparent
     parent = extract_trace_context(carrier)
+    # The turn's deliberate progress capability (ADR 0130): two runner control
+    # headers, like the admission one above, and never ACI fields.
+    progress = ProgressCapability.from_headers(request.headers)
     async with contextlib.aclosing(
         runner.run_turn(
             frame, parent=parent, turn_epoch=turn_epoch,
             admission_required=admission_header == "wait",
+            progress=progress,
         )
     ) as stream:
         async for line in stream:

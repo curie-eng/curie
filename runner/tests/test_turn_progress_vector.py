@@ -13,7 +13,9 @@ from pathlib import Path
 
 from curie_runner import turn_progress
 
-_VECTOR = Path(__file__).resolve().parents[2] / "tests" / "vectors" / "turn-progress-capability.json"
+_VECTOR = (
+    Path(__file__).resolve().parents[2] / "tests" / "vectors" / "turn-progress-capability.json"
+)
 _EXPECTED_KEYS = {
     "comment",
     "url_header",
