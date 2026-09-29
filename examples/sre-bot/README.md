@@ -300,6 +300,10 @@ The setup below keeps both credentials out of command arguments and checked-in
 files. Prefixes are installation data; for example, an operator can include
 both firing and resolved subject prefixes without adding them to this public
 repository.
+The bot token must have Slack's `files:read` scope to download the email's
+`url_private` HTML file. If the app lacks it, add the scope and reinstall the
+app before applying the intake; successful channel history and thread reads do
+not prove file access.
 
 ```bash
 (
