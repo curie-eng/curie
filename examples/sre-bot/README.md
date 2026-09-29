@@ -81,6 +81,51 @@ If the selected release already records a model credential and
 mutation because its declarative platform step would clear the credential and
 restore the fake model default.
 
+### Add the bot to an existing Curie release
+
+Keep the existing release's credentials, agents, and operator-owned values file.
+The following commands split the example into independent pieces; neither
+command upgrades the Curie release:
+
+```bash
+curie example sre-bot install --observability-only --dry-run
+curie example sre-bot install --observability-only
+curie example sre-bot render --out ./sre-bot-runtime
+```
+
+`--observability-only` installs Grafana, Loki, Alloy, Prometheus, and Tempo in
+the selected observability namespace. It does not run the Curie integration
+Helm upgrade, install the bot's Kubernetes identity, bind approvals, or deploy
+the bot. `render` resolves the Tempo connector to an immutable image digest and
+writes the same runtime bundle transforms as the full installer. It neither
+calls Helm/Kubernetes nor overwrites an existing output directory. Pass
+`--observability-namespace` on both commands when using a non-default stack
+namespace. Pass `--namespace` and `--release` to `render` for a non-default
+Curie installation; `render --platform-upgrade` includes the privileged
+upgrade connector and rendered manifests but does not apply their grants.
+
+Merge the values in
+[`observability/curie-values.yaml`](observability/curie-values.yaml) into your
+own Curie release overlay, review the resulting diff, and upgrade that release
+through your normal `curie cluster upgrade`/Helm process. Do not pass the
+example file as a later `-f` overlay and assume it preserves every existing
+setting: `otelCollector.extraExporters`,
+`otelCollector.extraMetricPipelineExporters`,
+`otelCollector.extraPipelineExporters`, and
+`security.otelCollectorNetworkPolicy.metricsIngress` need their existing
+entries carried forward. The first key is a named mapping; the other three
+are lists whose later values replace the earlier lists. Keep any existing
+exporters, pipeline members, and ingress rules alongside the SRE bot entries.
+The `grafanaConnector` values make the Curie release mint the Grafana token
+Secret; installing the stack alone does not.
+
+Then apply the appropriate Kubernetes access manifest, create the connector
+Secret `K8S_KUBECONFIG`, bind `sre-approvals` with explicit user approvers,
+and deploy `curie cluster deploy --plugin-dir ./sre-bot-runtime`. The manual
+identity and approval steps are described below. Do not deploy the source
+`examples/sre-bot` directory directly: its build-only connectors are not a
+deployable cluster bundle.
+
 The installer binds the `sre-approvals` route that gates the six Kubernetes
 mutations and platform publication before it deploys. Terminal resolution
 requires an explicit users list. Supply it with the required `--approvers` flag
@@ -110,18 +155,19 @@ purpose-built upgrade path with much wider authority. It arms only
 
 For a manual install, apply `manifests/kubernetes-access.yaml`, assemble a
 kubeconfig for `sre-bot-kubernetes`, store it as the connector secret
-`K8S_KUBECONFIG`, then deploy the unchanged bundle. The bundle declares the
+`K8S_KUBECONFIG`, then render and deploy the runtime bundle. The bundle declares the
 `sre-approvals` route, and the agent cannot bind a route before it exists. On a
 fresh install the first deploy creates the `sre-bot` agent and stops with exit
 2, before any version is uploaded, printing the binding command. Bind the
 route, then deploy again:
 
 ```bash
-curie cluster deploy --plugin-dir examples/sre-bot   # first run: creates the agent, refuses locally
+curie example sre-bot render --out ./sre-bot-runtime
+curie cluster deploy --plugin-dir ./sre-bot-runtime   # first run: creates the agent, refuses locally
 curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
   --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
-curie cluster deploy --plugin-dir examples/sre-bot
+curie cluster deploy --plugin-dir ./sre-bot-runtime
 ```
 
 On an existing agent that already binds the route, the first deploy succeeds and

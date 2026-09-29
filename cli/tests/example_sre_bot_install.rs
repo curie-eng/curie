@@ -44,6 +44,228 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn observability_only_plan_never_touches_the_curie_release_or_bot() {
+    let output = Command::new(bin())
+        .args([
+            "--json",
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run observability-only plan");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON plan");
+    let lines = value["plan"].as_array().expect("plan lines");
+    let plan = lines
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("grafana-community/grafana"));
+    assert!(plan.contains("tempo.yaml"));
+    for forbidden in [
+        "curie-values.yaml",
+        "cluster deploy",
+        "upgrade curie",
+        "kubernetes-access.yaml",
+    ] {
+        assert!(
+            !plan.contains(forbidden),
+            "unexpected platform step {forbidden}: {plan}"
+        );
+    }
+    let conflicting = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+            "--approvers",
+            DEFAULT_APPROVER,
+        ])
+        .output()
+        .expect("reject bot-only options on stack-only install");
+    assert!(!conflicting.status.success());
+}
+
+#[test]
+fn observability_only_installs_the_stack_without_curie_upgrade_or_api_calls() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &[
+            "--json",
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+        ],
+        &repo_root(),
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let helm = fixture.helm_calls().join("\n");
+    assert!(helm.contains("upgrade --install grafana"));
+    assert!(helm.contains("upgrade --install prometheus"));
+    assert!(
+        !helm.contains("upgrade curie"),
+        "Curie release changed: {helm}"
+    );
+    let kubectl = fixture.kubectl_calls().join("\n");
+    assert!(kubectl.contains("tempo.yaml"));
+    assert!(!kubectl.contains("kubernetes-access.yaml"));
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "the bot must not be deployed"
+    );
+}
+
+#[test]
+fn render_writes_a_deployable_runtime_bundle_without_cluster_mutation() {
+    let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
+    let out = fixture._temp.path().join("nested/rendered-bot");
+    let output = Command::new(bin())
+        .args([
+            "--json",
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("render example bundle");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("JSON render receipt");
+    assert_eq!(receipt["bundle_dir"], out.to_str().unwrap());
+    assert_eq!(receipt["rendered"], true);
+    let connectors: Value =
+        serde_norway::from_slice(&fs::read(out.join("connectors.yaml")).unwrap()).unwrap();
+    assert!(connectors["connectors"].get("self-upgrade").is_none());
+    assert!(connectors["connectors"]["tempo"]["image"]
+        .as_str()
+        .unwrap()
+        .contains("@sha256:"));
+    assert!(connectors["connectors"]["tempo"].get("build").is_none());
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+    assert!(!manifest["toolPolicy"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.as_str().unwrap_or("").starts_with("self-upgrade/")));
+    assert!(fixture.helm_calls().is_empty() && fixture.kubectl_calls().is_empty());
+    let previous_connectors = fs::read(out.join("connectors.yaml")).unwrap();
+    let second = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("repeat render");
+    assert!(
+        !second.status.success(),
+        "render must not overwrite operator edits"
+    );
+    assert_eq!(
+        fs::read(out.join("connectors.yaml")).unwrap(),
+        previous_connectors
+    );
+}
+
+#[test]
+fn render_platform_upgrade_keeps_only_the_gated_upgrade_path_and_custom_namespaces() {
+    let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
+    let out = fixture._temp.path().join("rendered-upgrade-bot");
+    let output = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+            "--platform-upgrade",
+            "--namespace",
+            "soak",
+            "--release",
+            "soak-rel",
+            "--observability-namespace",
+            "signals",
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("render upgrade example bundle");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let connectors: Value =
+        serde_norway::from_slice(&fs::read(out.join("connectors.yaml")).unwrap()).unwrap();
+    assert!(connectors["connectors"]["self-upgrade"]["image"]
+        .as_str()
+        .unwrap()
+        .contains("@sha256:"));
+    assert_eq!(
+        connectors["connectors"]["self-upgrade"]["env"]["PLATFORM_UPGRADE_CRONJOB"],
+        "platform-upgrade"
+    );
+    assert_eq!(
+        connectors["connectors"]["self-upgrade"]["env"]["SELF_UPGRADE_CRONJOB"],
+        ""
+    );
+    assert!(fs::read_to_string(out.join("connectors.yaml"))
+        .unwrap()
+        .contains(".signals.svc.cluster.local"));
+    assert!(
+        fs::read_to_string(out.join("manifests/platform-upgrade-role.yaml"))
+            .unwrap()
+            .contains("namespace: soak")
+    );
+    assert!(
+        fs::read_to_string(out.join("manifests/platform-upgrade-cronjob.yaml"))
+            .unwrap()
+            .contains("soak-rel")
+    );
+    assert!(!out.join("manifests/self-upgrade-cronjob.yaml").exists());
+    assert!(fixture.helm_calls().is_empty() && fixture.kubectl_calls().is_empty());
+}
+
 fn install_example_stub(dir: &Path, name: &str, body: &str) {
     let reads = include_str!("data/converged-installation-read.sh");
     let body = if name == "helm" {
@@ -591,12 +813,6 @@ exit 64
         current_dir: &Path,
         release_cache: Option<&Path>,
     ) -> Output {
-        let mut paths = vec![self.bin_dir.clone()];
-        if let Some(current) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&current));
-        }
-        let path = std::env::join_paths(paths).expect("join PATH");
-
         let mut args = vec![
             "--color",
             "never",
@@ -606,6 +822,20 @@ exit 64
             "--observability",
         ];
         args.extend_from_slice(extra);
+        self.run_command_args(&args, current_dir, release_cache)
+    }
+
+    fn run_command_args(
+        &self,
+        args: &[&str],
+        current_dir: &Path,
+        release_cache: Option<&Path>,
+    ) -> Output {
+        let mut paths = vec![self.bin_dir.clone()];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        let path = std::env::join_paths(paths).expect("join PATH");
 
         let mut command = Command::new(bin());
         command
@@ -920,7 +1150,7 @@ fn assert_refused_before_helm(fixture: &Fixture, output: &Output) -> String {
 }
 
 #[test]
-fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credential_flags() {
+fn clap_routes_install_and_exposes_no_operator_configuration_or_credential_flags() {
     let output = Command::new(bin())
         .args(["example", "sre-bot", "install", "--help"])
         .output()
@@ -929,7 +1159,11 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
     assert!(output.status.success(), "new command must parse: {text}");
     assert!(
         text.contains("--observability"),
-        "the install surface must expose the one observability flag: {text}"
+        "the install surface must expose the full observability flag: {text}"
+    );
+    assert!(
+        text.contains("--observability-only"),
+        "the install surface must expose the stack-only flag: {text}"
     );
     assert!(
         text.contains("--slack-channel"),
@@ -949,11 +1183,8 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
         text.contains("--approvers"),
         "the install surface must expose --approvers as its single approval input: {text}"
     );
-    let usage = text.split("Options:").next().unwrap_or(&text);
-    assert!(
-        usage.contains("--approvers <USER_IDS>"),
-        "the usage line must mark --approvers as required: {text}"
-    );
+    // `--approvers` is required for the full install, but deliberately absent
+    // from the stack-only form. The missing-approvers test drives that refusal.
     for forbidden in [
         "--route-approvers",
         "--routes-from",

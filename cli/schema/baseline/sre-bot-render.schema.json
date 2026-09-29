@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/sre-bot-render/v1.json",
+  "title": "curie example sre-bot render --json",
+  "description": "Receipt for a rendered SRE bot runtime bundle written to a new directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "bundle_dir": {"type": "string"},
+    "rendered": {"const": true}
+  },
+  "required": ["bundle_dir", "rendered"]
+}
