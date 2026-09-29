@@ -87,7 +87,7 @@ upgrade. The pre-upgrade drain Job publishes the required minimum in the
 `curie.ai/minimum-helm-timeout-seconds` annotation. For customized worker or
 drain budgets, use the annotation rendered from the same chart and values as
 the upgrade, and pass that value with an `s` suffix to `helm upgrade --timeout`.
-The default minimum is 2940 seconds. The chart derives it from the effective
+The default minimum is 21900 seconds. The chart derives it from the effective
 drain wait, 120 seconds for the Job, the effective worker termination grace,
 and 60 seconds for scheduling and Helm operations. Raising
 `worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
