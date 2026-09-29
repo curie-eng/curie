@@ -1117,6 +1117,12 @@ class TurnOutcome:
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False
+    # The worker could not start this turn and answered with its own text: no
+    # pool for the agent (#2943), an attachment it could not fetch, or no
+    # capacity on a source that cannot wait for it. The reply is delivered as
+    # is, but the turn did no work, so its telemetry outcome is
+    # classified_failure rather than done.
+    start_failed: bool = False
     # The approval summary and route off an awaiting-approval final (ADR-0010,
     # #247), persisted onto the durable record by the pause path. None on
     # every other status; route also None when the request named none.
@@ -3009,7 +3015,9 @@ class Kernel:
                         route,
                         "delivered",
                         telemetry_outcome=(
-                            "idle"
+                            "classified_failure"
+                            if outcome.start_failed
+                            else "idle"
                             if outcome.status is SessionStatus.IDLE_AWAITING_INPUT
                             else "done"
                         ),
@@ -4542,7 +4550,7 @@ class Kernel:
             if qevent.source is TurnSource.SLACK and handle is not None:
                 raise CapacityWaitRequested()
             await self._reply_for(qevent, route, _CAPACITY_REPLY)
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
 
         try:
             try:
@@ -4767,7 +4775,7 @@ class Kernel:
                 reason,
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
         except MissingAgentPoolError as exc:
             # Before the SandboxError clause below, which would retry it. The
             # pool appears only after an operator changes the release values,
@@ -4783,7 +4791,7 @@ class Kernel:
                 route,
                 f"This agent cannot start: {exc}. An operator has to make that change.",
             )
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
         except (
             RunnerError,
             aiohttp.ClientError,
