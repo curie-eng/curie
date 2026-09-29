@@ -20,10 +20,12 @@ _EXPECTED_KEYS = {
     "comment",
     "url_header",
     "token_header",
+    "generation_header",
     "token_request_header",
     "token_scope",
     "route",
     "inbox_key",
+    "inbox_pending_key",
     "inbox_entry_example",
 }
 
@@ -39,4 +41,5 @@ def test_the_runner_reads_and_presents_the_frozen_headers() -> None:
     assert set(vector) == _EXPECTED_KEYS
     assert turn_progress.PROGRESS_URL_HEADER == vector["url_header"]
     assert turn_progress.PROGRESS_TOKEN_HEADER == vector["token_header"]
+    assert turn_progress.PROGRESS_GENERATION_HEADER == vector["generation_header"]
     assert turn_progress.PROGRESS_TOKEN_REQUEST_HEADER == vector["token_request_header"]

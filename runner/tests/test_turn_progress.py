@@ -30,12 +30,14 @@ from curie_runner.__main__ import _compose_system_prompt, build_runner
 from curie_runner.config import RunnerConfig
 from curie_runner.turn_progress import (
     NOT_SHOWN_TEXT,
+    PROGRESS_GENERATION_HEADER,
     PROGRESS_INPUT_SCHEMA,
     PROGRESS_PREAMBLE,
     PROGRESS_TOKEN_HEADER,
     PROGRESS_URL_HEADER,
     ProgressCapability,
     TurnProgress,
+    should_mount_turn_progress,
 )
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -124,7 +126,13 @@ def test_no_capability_is_a_soft_result_and_makes_no_network_call(
         progress.open(None)
         results.append(await progress.submit(_VALID))
         progress.close()
-        progress.open(ProgressCapability(url="http://127.0.0.1:9/v1/turn-progress/x", token=_TOKEN))
+        progress.open(
+            ProgressCapability(
+                url="http://127.0.0.1:9/v1/turn-progress/x",
+                token=_TOKEN,
+                generation=7,
+            )
+        )
         progress.close()
         results.append(await progress.submit(_VALID))
         for result in results:
@@ -135,30 +143,69 @@ def test_no_capability_is_a_soft_result_and_makes_no_network_call(
     assert attempts == []
 
 
+@pytest.mark.parametrize(
+    ("factory_requested", "factory_resolved", "expected"),
+    [
+        (False, False, True),
+        (True, True, False),
+        (True, False, False),
+    ],
+)
+def test_factory_boot_matrix_never_falls_back_to_deliberate_progress(
+    factory_requested: bool, factory_resolved: bool, expected: bool
+) -> None:
+    assert (
+        should_mount_turn_progress(
+            factory_progress_requested=factory_requested,
+            factory_progress_resolved=factory_resolved,
+        )
+        is expected
+    )
+
+
 def test_capability_headers_need_both_values() -> None:
     url = "http://api:8000/v1/turn-progress/abc"
     assert ProgressCapability.from_headers(
-        {PROGRESS_URL_HEADER: url, PROGRESS_TOKEN_HEADER: _TOKEN}
-    ) == ProgressCapability(url=url, token=_TOKEN)
+        {
+            PROGRESS_URL_HEADER: url,
+            PROGRESS_TOKEN_HEADER: _TOKEN,
+            PROGRESS_GENERATION_HEADER: "7",
+        }
+    ) == ProgressCapability(url=url, token=_TOKEN, generation=7)
     assert ProgressCapability.from_headers({PROGRESS_URL_HEADER: url}) is None
     assert ProgressCapability.from_headers({PROGRESS_TOKEN_HEADER: _TOKEN}) is None
-    assert ProgressCapability.from_headers(
-        {PROGRESS_URL_HEADER: " ", PROGRESS_TOKEN_HEADER: _TOKEN}
-    ) is None
+    assert (
+        ProgressCapability.from_headers({PROGRESS_URL_HEADER: url, PROGRESS_TOKEN_HEADER: _TOKEN})
+        is None
+    )
+    assert (
+        ProgressCapability.from_headers(
+            {
+                PROGRESS_URL_HEADER: url,
+                PROGRESS_TOKEN_HEADER: _TOKEN,
+                PROGRESS_GENERATION_HEADER: "not-an-int",
+            }
+        )
+        is None
+    )
+    assert (
+        ProgressCapability.from_headers({PROGRESS_URL_HEADER: " ", PROGRESS_TOKEN_HEADER: _TOKEN})
+        is None
+    )
     assert ProgressCapability.from_headers({}) is None
 
 
-# --- epoch and seq ---------------------------------------------------------
+# --- generation and seq ----------------------------------------------------
 
 
-def test_each_post_carries_the_turns_epoch_and_a_monotonic_seq() -> None:
+def test_each_post_carries_the_worker_generation_and_a_monotonic_seq() -> None:
     ingress = _Ingress()
-    progress = TurnProgress(clock=lambda: 1_759_000_000.0)
+    progress = TurnProgress()
 
     async def go() -> None:
         async with TestServer(ingress.app) as server:
             url = str(server.make_url("/v1/turn-progress/chain-1"))
-            capability = ProgressCapability(url=url, token=_TOKEN)
+            capability = ProgressCapability(url=url, token=_TOKEN, generation=7)
 
             progress.open(capability)
             first = await progress.submit(_VALID)
@@ -166,8 +213,7 @@ def test_each_post_carries_the_turns_epoch_and_a_monotonic_seq() -> None:
                 {**_VALID, "update_id": "u2", "summary": "Found it", "milestone": "evidence"}
             )
             progress.close()
-            # A later turn in the SAME millisecond still orders after this one.
-            progress.open(capability)
+            progress.open(ProgressCapability(url=url, token=_TOKEN, generation=8))
             third = await progress.submit({**_VALID, "update_id": "u3"})
             progress.close()
 
@@ -179,18 +225,36 @@ def test_each_post_carries_the_turns_epoch_and_a_monotonic_seq() -> None:
     bodies = [body for _headers, body in ingress.posts]
     for headers, _body in ingress.posts:
         assert {k.lower(): v for k, v in headers.items()}["x-api-key"] == _TOKEN
-    assert bodies[0] == {"version": "1.0", **_VALID, "epoch": 1_759_000_000_000, "seq": 1}
+    assert bodies[0] == {"version": "1.0", **_VALID, "generation": 7, "seq": 1}
     assert bodies[1] == {
         "version": "1.0",
         **_VALID,
         "update_id": "u2",
         "summary": "Found it",
         "milestone": "evidence",
-        "epoch": 1_759_000_000_000,
+        "generation": 7,
         "seq": 2,
     }
-    assert bodies[2]["epoch"] == 1_759_000_000_001
+    assert bodies[2]["generation"] == 8
     assert bodies[2]["seq"] == 1
+
+
+def test_202_means_queued_not_recorded() -> None:
+    ingress = _Ingress()
+    progress = TurnProgress()
+
+    async def go() -> dict[str, Any]:
+        async with TestServer(ingress.app) as server:
+            progress.open(
+                ProgressCapability(
+                    url=str(server.make_url("/v1/turn-progress/chain-1")),
+                    token=_TOKEN,
+                    generation=1,
+                )
+            )
+            return await progress.submit(_VALID)
+
+    assert _text(anyio.run(go)) == "Progress queued."
 
 
 # --- failures are soft -----------------------------------------------------
@@ -205,7 +269,9 @@ def test_a_refusal_or_server_error_is_a_soft_result(status: int) -> None:
         async with TestServer(ingress.app) as server:
             progress.open(
                 ProgressCapability(
-                    url=str(server.make_url("/v1/turn-progress/chain-1")), token=_TOKEN
+                    url=str(server.make_url("/v1/turn-progress/chain-1")),
+                    token=_TOKEN,
+                    generation=7,
                 )
             )
             return await progress.submit(_VALID)
@@ -220,7 +286,9 @@ def test_a_transport_failure_is_a_soft_result() -> None:
     progress = TurnProgress()
     progress.open(
         ProgressCapability(
-            url=f"http://127.0.0.1:{_closed_port()}/v1/turn-progress/chain-1", token=_TOKEN
+            url=f"http://127.0.0.1:{_closed_port()}/v1/turn-progress/chain-1",
+            token=_TOKEN,
+            generation=7,
         )
     )
 
@@ -237,7 +305,9 @@ def test_a_command_the_ingress_refuses_is_an_error_the_model_can_fix() -> None:
         async with TestServer(ingress.app) as server:
             progress.open(
                 ProgressCapability(
-                    url=str(server.make_url("/v1/turn-progress/chain-1")), token=_TOKEN
+                    url=str(server.make_url("/v1/turn-progress/chain-1")),
+                    token=_TOKEN,
+                    generation=7,
                 )
             )
             return await progress.submit({**_VALID, "state": "done-ish"})
@@ -251,7 +321,9 @@ def test_an_unknown_field_is_refused_before_any_network_call(
 ) -> None:
     attempts = _forbid_network(monkeypatch)
     progress = TurnProgress()
-    progress.open(ProgressCapability(url="http://127.0.0.1:9/v1/turn-progress/x", token=_TOKEN))
+    progress.open(
+        ProgressCapability(url="http://127.0.0.1:9/v1/turn-progress/x", token=_TOKEN, generation=7)
+    )
 
     for extra in ({"channel": "C0EXAMPLE1"}, {"version": "1.0"}, {"delivery_id": "d"}):
         result = anyio.run(progress.submit, {**_VALID, **extra})
@@ -309,39 +381,36 @@ _DEMO = {
 }
 
 
-def test_the_fake_demo_posts_through_the_turns_capability(
+def test_the_fake_demo_is_network_free_even_with_a_capability(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("curie_runner.fake.PROGRESS_DEMO_PAUSE_S", 0.0)
     runner = _boot(tmp_path)
-    ingress = _Ingress()
+    attempts = _forbid_network(monkeypatch)
 
     async def go() -> tuple[list[Any], list[Any]]:
         await runner.start()
-        async with TestServer(ingress.app) as capability_server:
-            url = str(capability_server.make_url("/v1/turn-progress/chain-1"))
-            async with TestClient(TestServer(create_app(runner))) as client:
-                first = await client.post(
-                    "/v1/event",
-                    json=_DEMO,
-                    headers={PROGRESS_URL_HEADER: url, PROGRESS_TOKEN_HEADER: _TOKEN},
-                )
-                assert first.status == 200
-                first_events = parse_ndjson(await first.text())
-                # The next turn carries no capability, and the last one's is gone.
-                second = await client.post("/v1/event", json=_DEMO)
-                assert second.status == 200
-                second_events = parse_ndjson(await second.text())
+        async with TestClient(TestServer(create_app(runner))) as client:
+            first = await client.post(
+                "/v1/event",
+                json=_DEMO,
+                headers={
+                    PROGRESS_URL_HEADER: "http://127.0.0.1:9/v1/turn-progress/chain-1",
+                    PROGRESS_TOKEN_HEADER: _TOKEN,
+                    PROGRESS_GENERATION_HEADER: "7",
+                },
+            )
+            assert first.status == 200
+            first_events = parse_ndjson(await first.text())
+            second = await client.post("/v1/event", json=_DEMO)
+            assert second.status == 200
+            second_events = parse_ndjson(await second.text())
         return first_events, second_events
 
     first_events, second_events = anyio.run(go)
     assert first_events[-1].status == SessionStatus.DONE
     assert second_events[-1].status == SessionStatus.DONE
-    bodies = [body for _headers, body in ingress.posts]
-    assert [body["state"] for body in bodies] == ["investigating", "investigating", "testing"]
-    assert [body.get("milestone") for body in bodies] == [None, "evidence", "verification"]
-    assert [body["seq"] for body in bodies] == [1, 2, 3]
-    assert len({body["epoch"] for body in bodies}) == 1
+    assert attempts == []
     # The progress calls are platform bookkeeping: never a side effect.
     assert not any(event.type == "side_effect_flag" for event in first_events)
 
@@ -377,7 +446,11 @@ def test_a_capability_that_cannot_be_reached_never_fails_the_turn(
             response = await client.post(
                 "/v1/event",
                 json=_DEMO,
-                headers={PROGRESS_URL_HEADER: url, PROGRESS_TOKEN_HEADER: _TOKEN},
+                headers={
+                    PROGRESS_URL_HEADER: url,
+                    PROGRESS_TOKEN_HEADER: _TOKEN,
+                    PROGRESS_GENERATION_HEADER: "7",
+                },
             )
             return parse_ndjson(await response.text())
 

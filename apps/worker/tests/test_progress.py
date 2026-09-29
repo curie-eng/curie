@@ -73,6 +73,7 @@ from curie_worker.progress import (
     progress_id_for,
     progress_ttl_s,
     sweep_pending_progress,
+    sweep_pending_progress_inboxes,
 )
 from curie_worker.reply_sink import TargetRoute
 from pydantic import TypeAdapter
@@ -273,6 +274,51 @@ def test_every_key_lives_at_least_as_long_as_an_approval_card(names) -> None:  #
             for key in keys:
                 ttl = await client.ttl(key)
                 assert fourteen_days - 60 <= ttl <= fourteen_days, (key, ttl)
+
+    asyncio.run(go())
+
+
+def test_turn_generation_is_durable_monotonic_and_fenced(names) -> None:  # noqa: ANN001
+    async def go() -> None:
+        async with _store(names) as (first, config, client):
+            pid = await first.open_chain(_THREAD, _ROOT)
+            assert await first.begin_turn(pid) == 1
+            record = await first.read(pid)
+            assert record is not None
+            assert (record.turn_generation, record.active_generation) == (1, 1)
+
+            # A new store models a worker restart. The next generation comes
+            # from Valkey, not a process clock or process-local counter.
+            restarted = ProgressStore(client, config)
+            assert await restarted.begin_turn(pid) == 2
+            assert not await restarted.end_turn(pid, 1)
+            assert await restarted.end_turn(pid, 2)
+            closed = await restarted.read(pid)
+            assert closed is not None
+            assert (closed.turn_generation, closed.active_generation) == (2, 0)
+
+    asyncio.run(go())
+
+
+def test_render_off_apply_never_creates_an_outbox_delivery(names) -> None:  # noqa: ANN001
+    async def go() -> None:
+        async with _store(names) as (store, config, client):
+            pid = await store.open_chain(_THREAD, _ROOT)
+            outcome = await store.apply_model_command(
+                pid,
+                _command("u1", milestone=MilestoneClass.EVIDENCE),
+                epoch=1,
+                seq=1,
+                route=_ROUTE,
+                target=_TARGET,
+                enqueue_deliveries=False,
+            )
+            assert outcome.status == "applied"
+            assert outcome.deliveries == ()
+            assert await client.smembers(config.progress_pending_key()) == set()
+            assert [
+                key async for key in client.scan_iter(match=config.progress_delivery_key("*"))
+            ] == []
 
     asyncio.run(go())
 
@@ -614,9 +660,7 @@ def test_concurrent_milestone_requests_reserve_exactly_three(names) -> None:  # 
                     )
                     wave_accepted = [o for o in outcomes if o.status == "applied"]
                     assert wave_accepted, f"wave {wave} accepted nothing"
-                    assert all(
-                        o.reason == "stale-seq" for o in outcomes if o.status != "applied"
-                    )
+                    assert all(o.reason == "stale-seq" for o in outcomes if o.status != "applied")
                     accepted += wave_accepted
                     if len(accepted) > 3:
                         break
@@ -633,9 +677,10 @@ def test_concurrent_milestone_requests_reserve_exactly_three(names) -> None:  # 
             assert record.milestones_used == 3
             milestones = {milestone_delivery_id(pid, n) for n in (1, 2, 3)}
             assert milestones <= await _pending(client, config)
-            assert await client.exists(
-                config.progress_delivery_key(milestone_delivery_id(pid, 4))
-            ) == 0
+            assert (
+                await client.exists(config.progress_delivery_key(milestone_delivery_id(pid, 4)))
+                == 0
+            )
             for n in (1, 2, 3):
                 stored = await store.read_delivery(milestone_delivery_id(pid, n))
                 assert stored is not None
@@ -681,9 +726,10 @@ def test_a_fourth_milestone_is_refused_while_its_update_still_applies(
                 "Running the suite",
                 3,
             )
-            assert await client.exists(
-                config.progress_delivery_key(milestone_delivery_id(pid, 4))
-            ) == 0
+            assert (
+                await client.exists(config.progress_delivery_key(milestone_delivery_id(pid, 4)))
+                == 0
+            )
             # Its id is recorded, so a retry is a duplicate, not a second try.
             retry = await _model(
                 store,
@@ -944,9 +990,7 @@ def test_a_platform_write_with_a_lost_lease_writes_nothing(names) -> None:  # no
             await client.delete(
                 config.delivery_lease_key(lease_a.stream, lease_a.group, lease_a.entry_id)
             )
-            await client.xclaim(
-                lease_a.stream, lease_a.group, "worker-b", 0, [lease_a.entry_id]
-            )
+            await client.xclaim(lease_a.stream, lease_a.group, "worker-b", 0, [lease_a.entry_id])
             lease_b = await leases.acquire(
                 lease_a.stream, lease_a.group, lease_a.entry_id, consumer="worker-b"
             )
@@ -1091,8 +1135,7 @@ def test_the_sweeper_quarantines_a_malformed_record(
             # The payload stays for inspection; only the index membership goes.
             assert await client.exists(bad_key) == 1
             assert any(
-                "quarantined" in r.getMessage() and bad_id in r.getMessage()
-                for r in caplog.records
+                "quarantined" in r.getMessage() and bad_id in r.getMessage() for r in caplog.records
             )
             second = await sweep_pending_progress(store, deliver=ok, grace_s=0.0)
             assert second.quarantined == 0
@@ -1243,5 +1286,40 @@ def test_the_inbox_cursor_only_moves_forward_and_never_onto_an_expired_record(
             gone = progress_id_for(_THREAD, "Ev0EXAMPLE-gone")
             assert not await store.advance_cursor(gone, second)
             assert await client.exists(config.progress_key(gone)) == 0
+
+    asyncio.run(go())
+
+
+def test_pending_inbox_survives_a_worker_restart_and_transient_failure(names) -> None:  # noqa: ANN001
+    async def go() -> None:
+        async with _store(names) as (store, config, client):
+            pid = await store.open_chain(_THREAD, _ROOT)
+            generation = await store.begin_turn(pid)
+            inbox = config.progress_inbox_key(pid)
+            await client.xadd(
+                inbox,
+                {
+                    "command": _command("u1").model_dump_json(exclude_none=True),
+                    "generation": str(generation),
+                    "seq": "1",
+                },
+            )
+            await client.sadd(config.progress_inbox_pending_key(), pid)
+
+            # A failed pass retains the durable index and cursor for another process.
+            async def fail(*_args: object, **_kwargs: object) -> object:
+                raise ConnectionError("transient")
+
+            with pytest.raises(ConnectionError):
+                await sweep_pending_progress_inboxes(store, apply=fail)
+            assert await client.sismember(config.progress_inbox_pending_key(), pid)
+            assert (await store.read(pid)).inbox_cursor == ""  # type: ignore[union-attr]
+
+            restarted = ProgressStore(client, config)
+            swept = await sweep_pending_progress_inboxes(restarted)
+            assert swept.applied == 1
+            record = await restarted.read(pid)
+            assert record is not None and record.update_count == 1
+            assert not await client.sismember(config.progress_inbox_pending_key(), pid)
 
     asyncio.run(go())

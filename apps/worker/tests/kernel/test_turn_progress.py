@@ -42,6 +42,7 @@ _VECTOR = json.loads(
 )
 URL_HEADER = _VECTOR["url_header"]
 TOKEN_HEADER = _VECTOR["token_header"]
+GENERATION_HEADER = _VECTOR["generation_header"]
 SCOPE = _VECTOR["token_scope"]
 DONE = SessionStatus.DONE
 
@@ -66,9 +67,13 @@ def _header(headers: dict[str, str], name: str) -> str | None:
     return lowered.get(name.lower())
 
 
-def _capability(h: Any, index: int = -1) -> tuple[str | None, str | None]:
+def _capability(h: Any, index: int = -1) -> tuple[str | None, str | None, str | None]:
     headers = h.runner.event_headers[index]
-    return _header(headers, URL_HEADER), _header(headers, TOKEN_HEADER)
+    return (
+        _header(headers, URL_HEADER),
+        _header(headers, TOKEN_HEADER),
+        _header(headers, GENERATION_HEADER),
+    )
 
 
 def _route_for(h: Any, progress_id: str) -> str:
@@ -81,7 +86,7 @@ def _entry(
     state: str,
     summary: str,
     *,
-    epoch: int,
+    generation: int,
     seq: int,
     milestone: str | None = None,
 ) -> dict[str, str]:
@@ -93,7 +98,11 @@ def _entry(
     }
     if milestone is not None:
         command["milestone"] = milestone
-    fields = {"command": json.dumps(command), "epoch": str(epoch), "seq": str(seq)}
+    fields = {
+        "command": json.dumps(command),
+        "generation": str(generation),
+        "seq": str(seq),
+    }
     assert set(fields) == set(_VECTOR["inbox_entry_example"])
     return fields
 
@@ -111,26 +120,27 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
             await h.kernel.process_event(ev)
 
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
-            url, token = _capability(h)
+            url, token, generation = _capability(h)
             assert url == _route_for(h, progress_id)
-            assert token is not None
+            assert token is not None and generation == "1"
             assert sandbox_token.verify(
-                token, h.config.api_key, agent=progress_id, scope=SCOPE
+                token, h.config.api_key, agent=f"{progress_id}:1", scope=SCOPE
             )
             # Bound to this chain and this scope only.
             assert not sandbox_token.verify(
-                token, h.config.api_key, agent=str(uuid.uuid4()), scope=SCOPE
+                token, h.config.api_key, agent=f"{uuid.uuid4()}:1", scope=SCOPE
             )
             assert not sandbox_token.verify(
-                token, h.config.api_key, agent=progress_id, scope="work_item.progress"
+                token, h.config.api_key, agent=f"{progress_id}:1", scope="work_item.progress"
             )
             assert not sandbox_token.verify(
-                token, h.config.api_key, agent=progress_id, scope="state"
+                token, h.config.api_key, agent=f"{progress_id}:1", scope="state"
             )
             # The chain was opened while the turn ran.
             record = await ProgressStore(h.async_redis, h.config).read(progress_id)
             assert record is not None
             assert record.update_count == 0
+            assert (record.turn_generation, record.active_generation) == (1, 0)
 
     asyncio.run(go())
 
@@ -143,9 +153,7 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
         pytest.param({"adapter": "curie-cluster-message"}, id="cluster-message-relay"),
     ],
 )
-def test_an_ineligible_turn_carries_no_capability(
-    make_harness, overrides: dict[str, Any]
-) -> None:
+def test_an_ineligible_turn_carries_no_capability(make_harness, overrides: dict[str, Any]) -> None:
     async def go() -> None:
         async with make_harness(progress_factory=_progress) as h:
             ev = qevent("hello", thread=f"t-inel-{uuid.uuid4().hex[:6]}", **overrides)
@@ -155,6 +163,7 @@ def test_an_ineligible_turn_carries_no_capability(
             for headers in h.runner.event_headers:
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
+                assert _header(headers, GENERATION_HEADER) is None
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
             assert await ProgressStore(h.async_redis, h.config).read(progress_id) is None
 
@@ -190,6 +199,7 @@ def test_a_factory_execution_carries_no_turn_progress_capability(make_harness) -
             for headers in h.runner.event_headers:
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
+                assert _header(headers, GENERATION_HEADER) is None
 
     asyncio.run(go())
 
@@ -200,7 +210,7 @@ def test_a_kernel_without_a_progress_store_sends_no_capability(make_harness) -> 
             await h.kernel.process_event(qevent("hello", thread="t-unwired"))
 
             assert h.runner.event_headers
-            assert _capability(h) == (None, None)
+            assert _capability(h) == (None, None, None)
 
     asyncio.run(go())
 
@@ -217,11 +227,14 @@ def test_a_retry_of_the_same_event_names_the_same_chain(make_harness) -> None:
             assert len(h.runner.event_headers) == 2
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
             for index in (0, 1):
-                url, token = _capability(h, index)
+                url, token, generation = _capability(h, index)
                 assert url == _route_for(h, progress_id)
-                assert token is not None
+                assert token is not None and generation == str(index + 1)
                 assert sandbox_token.verify(
-                    token, h.config.api_key, agent=progress_id, scope=SCOPE
+                    token,
+                    h.config.api_key,
+                    agent=f"{progress_id}:{index + 1}",
+                    scope=SCOPE,
                 )
 
     asyncio.run(go())
@@ -274,7 +287,7 @@ def test_the_pump_applies_the_turns_commands_while_it_runs(make_harness) -> None
             await _append(
                 h,
                 progress_id,
-                _entry("u1", "investigating", "Reading the failing test", epoch=5, seq=1),
+                _entry("u1", "investigating", "Reading the failing test", generation=1, seq=1),
             )
             await _append(
                 h,
@@ -283,7 +296,7 @@ def test_the_pump_applies_the_turns_commands_while_it_runs(make_harness) -> None
                     "u2",
                     "investigating",
                     "Found the regression",
-                    epoch=5,
+                    generation=1,
                     seq=2,
                     milestone="evidence",
                 ),
@@ -303,11 +316,15 @@ def test_the_pump_applies_the_turns_commands_while_it_runs(make_harness) -> None
 
             # A malformed entry is skipped; an older epoch's command is refused
             # by the record's order; the last one lands.
-            await _append(h, progress_id, {"command": "not json", "epoch": "5", "seq": "3"})
             await _append(
                 h,
                 progress_id,
-                _entry("stale", "publishing", "From an older turn", epoch=4, seq=9),
+                {"command": "not json", "generation": "1", "seq": "3"},
+            )
+            await _append(
+                h,
+                progress_id,
+                _entry("stale", "publishing", "From an older turn", generation=0, seq=9),
             )
             last = await _append(
                 h,
@@ -316,7 +333,7 @@ def test_the_pump_applies_the_turns_commands_while_it_runs(make_harness) -> None
                     "u3",
                     "testing",
                     "Verified the fix",
-                    epoch=5,
+                    generation=1,
                     seq=4,
                     milestone="verification",
                 ),
@@ -331,7 +348,7 @@ def test_the_pump_applies_the_turns_commands_while_it_runs(make_harness) -> None
             assert record.revision == 3
             assert record.milestones_used == 2
             assert record.update_count == 3
-            assert (record.epoch, record.last_seq) == (5, 4)
+            assert (record.epoch, record.last_seq) == (1, 4)
             # The cursor stands past the last entry, so a resume of this chain
             # starts after it.
             assert record.inbox_cursor == last
@@ -360,7 +377,7 @@ def test_rendering_off_records_progress_and_emits_nothing(make_harness) -> None:
                     "u1",
                     "investigating",
                     "Reading the logs",
-                    epoch=7,
+                    generation=1,
                     seq=1,
                     milestone="evidence",
                 ),
@@ -378,9 +395,7 @@ def test_rendering_off_records_progress_and_emits_nothing(make_harness) -> None:
             assert await h.async_redis.smembers(h.config.progress_pending_key()) == set()
             leftovers = [
                 key
-                async for key in h.async_redis.scan_iter(
-                    match=h.config.progress_delivery_key("*")
-                )
+                async for key in h.async_redis.scan_iter(match=h.config.progress_delivery_key("*"))
             ]
             assert leftovers == []
             delivered: list[object] = []
@@ -443,11 +458,11 @@ def test_an_approval_resume_continues_its_chain(make_harness) -> None:
             )
             await h.kernel.process_event(resume)
 
-            url, token = _capability(h)
+            url, token, generation = _capability(h)
             assert url == _route_for(h, progress_id)
-            assert token is not None
+            assert token is not None and generation == "1"
             assert sandbox_token.verify(
-                token, h.config.api_key, agent=progress_id, scope=SCOPE
+                token, h.config.api_key, agent=f"{progress_id}:1", scope=SCOPE
             )
             # The resume never derives a chain of its own.
             own = progress_id_for(_thread_key_for(resume), resume_event_id)
@@ -466,7 +481,7 @@ def test_a_resume_whose_pointer_expired_gets_no_capability(make_harness) -> None
             await h.kernel.process_event(resume)
 
             assert h.runner.event_headers
-            assert _capability(h) == (None, None)
+            assert _capability(h) == (None, None, None)
             store = ProgressStore(h.async_redis, h.config)
             own = progress_id_for(_thread_key_for(resume), resume_event_id)
             assert await store.read(own) is None
@@ -482,9 +497,7 @@ def test_eligibility_is_a_persons_slack_turn_only() -> None:
     assert progress_eligible(person, factory_work_item=False)
     assert not progress_eligible(person, factory_work_item=True)
     assert not progress_eligible(qevent("hi", source=TurnSource.CRON), factory_work_item=False)
-    assert not progress_eligible(
-        qevent("hi", source=TurnSource.WEBHOOK), factory_work_item=False
-    )
+    assert not progress_eligible(qevent("hi", source=TurnSource.WEBHOOK), factory_work_item=False)
     assert not progress_eligible(qevent("hi", kind="email"), factory_work_item=False)
     assert not progress_eligible(
         qevent("hi", adapter="curie-cluster-message"), factory_work_item=False

@@ -23,10 +23,12 @@ _EXPECTED_KEYS = {
     "comment",
     "url_header",
     "token_header",
+    "generation_header",
     "token_request_header",
     "token_scope",
     "route",
     "inbox_key",
+    "inbox_pending_key",
     "inbox_entry_example",
 }
 
@@ -58,14 +60,20 @@ def test_the_api_writes_the_frozen_inbox_key_and_entry() -> None:
     assert turn_progress.inbox_key("acme:worker", progress_id) == vector["inbox_key"].format(
         key_prefix="acme:worker", progress_id=progress_id
     )
+    assert turn_progress.inbox_pending_key("acme:worker") == vector["inbox_pending_key"].format(
+        key_prefix="acme:worker"
+    )
     example = vector["inbox_entry_example"]
     command = ProgressCommand.model_validate_json(example["command"])
     body = turn_progress.TurnProgressBody(
         **command.model_dump(exclude_none=True),
-        epoch=int(example["epoch"]),
+        generation=int(example["generation"]),
         seq=int(example["seq"]),
     )
     fields = turn_progress.inbox_fields(body)
     assert set(fields) == set(example)
     assert ProgressCommand.model_validate_json(fields["command"]) == command
-    assert (fields["epoch"], fields["seq"]) == (example["epoch"], example["seq"])
+    assert (fields["generation"], fields["seq"]) == (
+        example["generation"],
+        example["seq"],
+    )

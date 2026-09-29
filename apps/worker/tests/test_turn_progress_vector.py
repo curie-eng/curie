@@ -23,10 +23,12 @@ _EXPECTED_KEYS = {
     "comment",
     "url_header",
     "token_header",
+    "generation_header",
     "token_request_header",
     "token_scope",
     "route",
     "inbox_key",
+    "inbox_pending_key",
     "inbox_entry_example",
 }
 
@@ -46,6 +48,7 @@ def test_the_worker_sends_the_frozen_headers_scope_and_route() -> None:
     vector = _vector()
     assert turn_progress.URL_HEADER == vector["url_header"]
     assert turn_progress.TOKEN_HEADER == vector["token_header"]
+    assert turn_progress.GENERATION_HEADER == vector["generation_header"]
     assert turn_progress.TOKEN_SCOPE == vector["token_scope"]
     assert turn_progress.ROUTE == vector["route"]
 
@@ -57,15 +60,18 @@ def test_the_worker_reads_the_frozen_inbox_key() -> None:
     assert config.progress_inbox_key(progress_id) == vector["inbox_key"].format(
         key_prefix="acme:worker", progress_id=progress_id
     )
+    assert config.progress_inbox_pending_key() == vector["inbox_pending_key"].format(
+        key_prefix="acme:worker"
+    )
 
 
 def test_the_pump_parses_the_frozen_inbox_entry() -> None:
     example = _vector()["inbox_entry_example"]
     parsed = turn_progress.parse_inbox_entry(example)
     assert parsed is not None
-    command, epoch, seq = parsed
+    command, generation, seq = parsed
     assert command == ProgressCommand.model_validate_json(example["command"])
-    assert (epoch, seq) == (int(example["epoch"]), int(example["seq"]))
+    assert (generation, seq) == (int(example["generation"]), int(example["seq"]))
     # Any other field set is not the API's entry and is refused, not guessed at.
     assert turn_progress.parse_inbox_entry({**example, "channel": "C0EXAMPLE1"}) is None
     assert turn_progress.parse_inbox_entry({"command": example["command"]}) is None
