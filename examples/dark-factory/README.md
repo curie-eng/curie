@@ -149,8 +149,13 @@ and redirects recorded in their lockfiles. Restrict its upstream hosts to
 `pypi.org`, `files.pythonhosted.org`, `index.crates.io`, `static.crates.io`,
 `registry.npmjs.org` and any reviewed redirect destinations. Permit only the
 read methods `GET` and `HEAD`; reject uploads and arbitrary `CONNECT` tunnels,
-which cannot enforce HTTP methods inside TLS. Allow the sandbox to reach only
-the proxy CIDR on TCP port 443:
+which cannot enforce HTTP methods inside TLS. Allow only exact reviewed package
+metadata and artifact paths needed by the committed lockfiles. Permit only
+reviewed query keys and values; reject unknown paths and queries. Never forward
+client supplied authentication headers, including `Authorization`,
+`Proxy-Authorization` and `Cookie`. The proxy must supply its own upstream
+authentication if needed. Allow the sandbox to reach only the proxy CIDR on
+TCP port 443:
 
 ```yaml
 agentSandbox:
