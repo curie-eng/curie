@@ -136,12 +136,37 @@ class StructuredResume:
     session_key: SessionKey
 
 
+def _checkpoint_keeps_system_prompt(
+    entries: Iterable[dict[str, Any]], system_prompt: str | None
+) -> bool:
+    """Whether resuming ``entries`` leaves this boot's system prompt in force.
+
+    The CLI records the prompt it ran under as a ``prompt_snapshot`` attachment
+    entry and resends that prompt on resume instead of the one it is given
+    (claude-agent-sdk 0.2.159, CLI 2.1.281). A checkpoint recorded under any
+    other prompt would hide what this boot added to it, such as this turn's
+    attachments. With no prompt of its own, there is nothing a restored one
+    could hide.
+    """
+
+    if system_prompt is None:
+        return True
+    return all(
+        attachment.get("systemPrompt") == [system_prompt]
+        for entry in entries
+        if entry.get("type") == "attachment"
+        and isinstance(attachment := entry.get("attachment"), dict)
+        and attachment.get("type") == "prompt_snapshot"
+    )
+
+
 def build_structured_resume(
     messages: tuple[ConversationMessage, ...],
     *,
     curie_session_id: str,
     cwd: str | None,
     harness_replay: HarnessReplayState | None = None,
+    system_prompt: str | None = None,
 ) -> StructuredResume:
     """Materialize portable messages into the SDK's ephemeral resume envelope.
 
@@ -149,7 +174,8 @@ def build_structured_resume(
     an opaque native checkpoint, it is preferred to retain the SDK's exact
     cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
     deterministic adapter details reconstructed on this runner. Native entries
-    are an optional optimization, never Curie's portable persistence contract.
+    are an optional optimization, never Curie's portable persistence contract,
+    so a checkpoint that would override ``system_prompt`` is set aside.
     """
 
     session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
@@ -157,15 +183,24 @@ def build_structured_resume(
         "project_key": project_key_for_directory(cwd),
         "session_id": session_id,
     }
-    if (
-        harness_replay is not None
+    checkpoint: tuple[dict[str, Any], ...] = (
+        harness_replay.entries
+        if harness_replay is not None
         and harness_replay.harness == "claude"
         and harness_replay.kind == "checkpoint"
-        and harness_replay.entries
-    ):
+        else ()
+    )
+    if checkpoint and not _checkpoint_keeps_system_prompt(checkpoint, system_prompt):
+        logger.info(
+            "native checkpoint recorded another system prompt; replaying the portable"
+            " prefix session_id=%s",
+            session_id,
+        )
+        checkpoint = ()
+    if checkpoint:
         native_entries = cast(
             "list[SessionStoreEntry]",
-            json.loads(json.dumps(harness_replay.entries)),
+            json.loads(json.dumps(checkpoint)),
         )
         store = _SeededSessionStore(
             key,
