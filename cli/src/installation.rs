@@ -354,7 +354,10 @@ impl Installation {
                      credential."
                 );
             }
-            if !trimmed.is_empty() && set_key_is_secret_bearing(key) {
+            if !trimmed.is_empty()
+                && !is_supported_empty_secret_clear(key, value)
+                && set_key_is_secret_bearing(key)
+            {
                 bail!(
                     "set.{key} is a secret-bearing chart key and cannot carry an inline value. \
                      This file is committed -- use a modeled credential field that names an \
@@ -505,7 +508,12 @@ impl Installation {
         self.set
             .iter()
             .map(|(key, value)| {
-                format!("{key}={}", crate::ops::escape_helm_set_string_value(value))
+                let value = if is_supported_empty_secret_clear(key, value) {
+                    value.clone()
+                } else {
+                    crate::ops::escape_helm_set_string_value(value)
+                };
+                format!("{key}={value}")
             })
             .collect()
     }
@@ -618,6 +626,13 @@ fn set_key_is_secret_bearing(key: &str) -> bool {
             || name.ends_with("authheader")
             || name == "salt"
     })
+}
+
+/// This exact empty object is the chart's typed clear for the worker credential
+/// map. It carries no credential material, while admitting any other object on
+/// the same path would reopen the committed-inline-secret lane.
+fn is_supported_empty_secret_clear(key: &str, value: &str) -> bool {
+    key == "worker.adapterCredentials" && value == "{}"
 }
 
 fn is_inline_extra_env_value_key(key: &str) -> bool {
@@ -2967,6 +2982,33 @@ mod diff_tests {
             assert!(
                 Installation::parse(&config).is_err(),
                 "{key} must not accept an inline credential in set"
+            );
+        }
+    }
+
+    #[test]
+    fn the_empty_worker_credential_map_remains_a_clear_not_an_inline_secret() {
+        let config = concat!(
+            "version: 1\n",
+            "install:\n  namespace: acme\n  release: acme\n",
+            "set:\n  worker.adapterCredentials: '{}'\n",
+        );
+        let cfg = Installation::parse(config)
+            .expect("the chart's typed empty worker credential map remains supported");
+        assert_eq!(cfg.helm_set_strings(), ["worker.adapterCredentials={}"]);
+
+        for value in [
+            "{\"mail-adapter\":\"opaque-placeholder\"}",
+            "{ }",
+            " {} ",
+            "[]",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  worker.adapterCredentials: {value:?}\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "only the exact empty-object clear may use the inline credential-map path: {value}"
             );
         }
     }

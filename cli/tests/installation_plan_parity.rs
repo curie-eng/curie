@@ -1820,6 +1820,21 @@ fn changing_mail_egress_source_requires_an_explicit_worker_pair_decision() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if key == "mailAdapter.egressSecret" && surface != "up" {
+                assert!(
+                    visible.contains("secret-bearing chart key"),
+                    "{surface}: committed inline secret must hit the file boundary: {visible}"
+                );
+                assert!(
+                    !visible.contains(value),
+                    "{surface}: committed inline secret leaked: {visible}"
+                );
+                assert!(
+                    fixture.calls().is_empty(),
+                    "{surface}: file validation must precede cluster reads"
+                );
+                continue;
+            }
             assert!(
                 visible.contains("paired worker"),
                 "actionable paired-source refusal: {visible}"
@@ -2366,65 +2381,73 @@ fn clearing_an_active_sealing_byo_without_an_inline_replacement_refuses_before_m
 }
 
 #[test]
-fn explicit_inline_sealing_replacement_allows_an_active_byo_clear_without_generation() {
+fn operator_inline_sealing_replacement_remains_compatible_but_the_file_refuses_it() {
     let existing = json!({
         "sealing": {
             "privateKeyExistingSecret": "acme-active-sealing-source",
             "privateKeyExistingSecretKey": "active-sealing-selector"
         }
     });
-    for surface in ["cluster up", "apply"] {
-        let config = if surface == "apply" {
-            format!(
-                "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n  \
-                 sealing.privateKey: {PRESERVED_SEALING_KEY:?}\n",
-                installation_for_the_stateful_guard()
-            )
-        } else {
-            installation_for_the_stateful_guard().to_string()
-        };
-        let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
-        let replacement = format!("sealing.privateKey={PRESERVED_SEALING_KEY}");
-        let output = if surface == "cluster up" {
-            fixture.cluster_up_with(
-                &[
-                    "--set",
-                    "sealing.privateKeyExistingSecret=",
-                    "--set",
-                    replacement.as_str(),
-                ],
-                &[],
-            )
-        } else {
-            fixture.apply(&[], &[])
-        };
-        let visible = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        json_output(
-            output,
-            &format!("{surface} with explicit sealing replacement"),
-        );
-        assert!(
-            !visible.contains("generated a sealing private key"),
-            "the supplied replacement must prevent a second generated key: {visible}"
-        );
-        assert!(
-            !visible.contains(PRESERVED_SEALING_KEY),
-            "the replacement private key leaked into CLI output: {visible}"
-        );
-        let calls = fixture.calls();
-        assert!(
-            calls.contains("sealing.privateKeyExistingSecret="),
-            "{surface} must clear the active external source: {calls}"
-        );
-        assert!(
-            calls.contains(&replacement),
-            "{surface} must consume the exact replacement private key: {calls}"
-        );
-    }
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(existing.clone()),
+    );
+    let replacement = format!("sealing.privateKey={PRESERVED_SEALING_KEY}");
+    let output = fixture.cluster_up_with(
+        &[
+            "--set",
+            "sealing.privateKeyExistingSecret=",
+            "--set",
+            replacement.as_str(),
+        ],
+        &[],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with explicit sealing replacement");
+    assert!(
+        !visible.contains("generated a sealing private key"),
+        "the supplied replacement must prevent a second generated key: {visible}"
+    );
+    assert!(
+        !visible.contains(PRESERVED_SEALING_KEY),
+        "the replacement private key leaked into CLI output: {visible}"
+    );
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("sealing.privateKeyExistingSecret="),
+        "cluster up must clear the active external source: {calls}"
+    );
+    assert!(
+        calls.contains(&replacement),
+        "cluster up must consume the exact replacement private key: {calls}"
+    );
+
+    let config = format!(
+        "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n  \
+         sealing.privateKey: {PRESERVED_SEALING_KEY:?}\n",
+        installation_for_the_stateful_guard()
+    );
+    let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing));
+    let output = fixture.apply(&[], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "curie.yaml must refuse an inline key"
+    );
+    assert!(visible.contains("secret-bearing chart key"), "{visible}");
+    assert!(!visible.contains(PRESERVED_SEALING_KEY), "{visible}");
+    assert!(
+        fixture.calls().is_empty(),
+        "refusal must precede cluster reads"
+    );
 }
 
 #[test]
