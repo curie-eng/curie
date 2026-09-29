@@ -1,7 +1,8 @@
 """The deliberate progress ingress: the chain inbox and the per-token limit (ADR 0130).
 
 The runner's ``progress`` tool posts one ``ProgressCommand`` per call, with the
-runner's ``epoch`` and ``seq``, to ``POST /v1/turn-progress/{progress_id}``
+worker-issued ``generation`` and runner ``seq``, to
+``POST /v1/turn-progress/{progress_id}``
 (``routers/turn_progress.py``). This module is what that route does once the
 token is verified: refuse a token past its rate, and append the command to the
 chain's inbox stream in Valkey, where the worker's per-turn pump reads it. The

@@ -6,12 +6,12 @@ the input schema is the committed ``ProgressCommand`` schema without
 ``version``, which the runner fills in. A factory execution mounts
 ``report_progress`` (``progress.py``) instead, never both.
 
-The capability is per turn. The worker sends it on ``POST /v1/event`` in two
+The capability is per turn. The worker sends it on ``POST /v1/event`` in three
 runner control headers; ``SessionRunner.run_turn`` opens this holder with it
 when the turn starts and closes it when the turn ends, so a steer uses the
 turn's capability and a later turn without the headers has none. Each call
-POSTs the command to the capability URL with the turn's ``epoch`` and a
-monotonic ``seq``. Without a capability a call makes no network call, and no
+POSTs the command to the capability URL with the worker's durable generation
+and a monotonic ``seq``. Without a capability a call makes no network call, and no
 answer the post gets (or fails to get) fails the turn.
 
 The header names are frozen with the worker and the API in

@@ -2,8 +2,9 @@
 
 A person's Slack turn gets a per-turn capability to report progress: a
 ``turn.progress`` sandbox token whose subject is the turn chain's
-``progress_id``, and the API route it is good for. The kernel sends both to the
-runner as two runner control headers on ``POST /v1/event``; they are not ACI
+``progress_id:generation``, and the API route it is good for. The kernel sends
+the URL, token and generation to the runner as three control headers on
+``POST /v1/event``; they are not ACI
 fields, and ADR 0130 leaves the frozen ACI unchanged. The runner's ``progress``
 tool posts each command to the API, which appends it to the chain's inbox
 stream, and while the kernel consumes the turn a ``ProgressPump`` applies the
@@ -256,7 +257,7 @@ class ProgressPump:
     """Applies one chain's inbox to its record while one turn is consumed.
 
     It reads after the record's ``inbox_cursor``, applies each entry at the
-    entry's ``(epoch, seq)`` and moves the cursor past it, so a later turn of
+    entry's ``(generation, seq)`` and moves the cursor past it, so a later turn of
     the chain (an approval resume) starts where this one stopped. The record's
     rules decide what an entry does: a duplicate, an out-of-order command and
     a platform-only state are refused there, not here.
