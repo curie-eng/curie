@@ -101,8 +101,11 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 [`docs/operations.md`](../../docs/operations.md)). Then:
 
 ```bash
-# The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
-# and the worker budget to 600 s, so raise all three. The chart raises the
+# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
+# already default to 10800. The execution deadline still defaults to 1800, so
+# the required override is:
+#   curie cluster overrides dark-factory --execution-deadline 10800
+# The helm sets below pin those worker values explicitly. The chart raises the
 # worker termination grace with the budget. At this budget, the drain Job
 # publishes a minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
@@ -212,36 +215,41 @@ Cargo cache used 585 MiB, and UI modules used 223 MiB. After
 `cargo test --no-run` completed successfully, the Cargo target directory used
 8.7 GiB.
 These are measured values for this checkout; other repositories and build
-profiles can need different amounts. The chart's
-default 1 GiB workspace, 512 MiB home scratch, and 4 GiB runner ephemeral
-storage limit cannot hold this workload. For a dedicated factory deployment,
-merge these values into the same Helm values file as the registry routes:
+profiles can need different amounts. The chart's default 1 GiB workspace,
+512 MiB home scratch, and 4 GiB runner ephemeral storage limit cannot hold this
+workload. Give the factory agent its own workspace ceiling with
+`agentSandbox.workspaceSizeLimits`, which applies to that agent's sandboxes
+only. Merge these values into the same Helm values file as the registry routes:
 
 ```yaml
 agentSandbox:
+  workspaceSizeLimits:
+    dark-factory: 24Gi
   runner:
-    workspace:
-      sizeLimit: 16Gi
     hardening:
       writablePathSizeLimit: 2Gi
-    resources:
-      requests:
-        cpu: 500m
-        memory: 1Gi
-        ephemeral-storage: 16Gi
-      limits:
-        cpu: "2"
-        memory: 2Gi
-        ephemeral-storage: 24Gi
 ```
 
-`agentSandbox.runner` applies to every sandbox runner in this Helm release,
-including its init containers for resource requests and limits. Use a dedicated
-release if other agents should keep smaller settings. The larger home scratch
-holds the default uv, Cargo and pnpm caches; a run can instead put them under
-`/workspace`. Repeat the frozen installs and Rust build in a pod with these
-values, measure peak disk and memory use, and raise the limits if the completed
-build needs more room.
+The kubelet counts the workspace against the pod's `ephemeral-storage` limit
+too, so raise the factory agent's runner resources to match. This override
+applies to the `dark-factory` agent only:
+
+```bash
+curie cluster overrides dark-factory --runner-resources \
+  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"16Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"28Gi"}}'
+```
+
+With these settings, a sandbox running this layer built every `cli/` test
+target (`cargo test --locked --manifest-path cli/Cargo.toml --no-run`) in about
+three minutes. The workspace peaked at 8.8 GiB and the build used the full 6 GiB
+of memory. With a 2 GiB memory limit, the same build was OOMKilled while
+linking.
+
+`writablePathSizeLimit` still applies to every sandbox runner in this Helm
+release. The larger home scratch holds the default uv, Cargo and pnpm caches;
+a run can instead put them under `/workspace`. Repeat the frozen installs and
+Rust build in a pod with these values, measure peak disk and memory use, and
+raise the limits if the completed build needs more room.
 
 The $100 cap is an example for this three hour recipe. Tune it to the model
 and expected workload. The SDK applies it to each session; it does not meter

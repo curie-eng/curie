@@ -157,12 +157,15 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # "workspace-error" (#2004): a managed-workspace preparation failure before
     # the turn was ever accepted, named apart from "runner-error" for the same
     # reason -- and, being retryable, subject to the same crash-on-omission.
+    # "sandbox-terminated": a retryable sandbox termination is a distinct
+    # cause; omitting it makes the retry metric reject the classification.
     "retry_class": [
         "redelivery",
         "rate-limit",
         "runner-error",
         "runner-timeout",
         "workspace-error",
+        "sandbox-terminated",
     ],
 }
 _THREAD_ATTRIBUTES = {

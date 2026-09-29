@@ -3,8 +3,8 @@
 # Render assertions for the API resume reconciler grace relationship:
 #
 #   (a) the default grace derives from the default delivery budget plus reserve;
-#   (b) raising the delivery budget raises the derived grace without an API
-#       override;
+#   (b) an explicit 1800 second delivery budget derives grace from that budget
+#       plus reserve, without an API override;
 #   (c) an explicit grace at the raised floor renders and reaches the API; and
 #   (d) an explicit YAML null selects the derived default; and
 #   (e) an explicit grace below that floor is refused during rendering.
@@ -65,17 +65,19 @@ PY
   fi
 }
 
-# (a) Default delivery budget 600 plus reserve 60 yields the derived grace 660.
-assert_api_grace a 660
+# (a) Default delivery budget 10800 plus reserve 60 yields the derived grace 10860.
+assert_api_grace a 10860
 
-# (b) With no API override, a higher delivery budget raises the derived grace.
+# (b) With no API override, grace follows this delivery budget plus reserve.
 assert_api_grace b 1860 \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1860
 
 # (c) An explicit value exactly at the raised floor is accepted and reaches the API.
 assert_api_grace c 1860 \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.deliveryShutdownReserveSeconds=60 \
   --set worker.terminationGracePeriodSeconds=1860 \
   --set api.resumeReconciler.graceSeconds=1860
@@ -83,6 +85,7 @@ assert_api_grace c 1860 \
 # (d) An explicit YAML null selects the derived default.
 assert_api_grace d 1860 \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1860 \
   --set-json api.resumeReconciler.graceSeconds=null
 
@@ -90,6 +93,7 @@ assert_api_grace d 1860 \
 invalid_output=""
 if invalid_output="$(helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1860 \
   --set api.resumeReconciler.graceSeconds=1800 2>&1)"; then
   fail e "helm accepted api.resumeReconciler.graceSeconds=1800 below the required delivery floor of 1860"

@@ -70,11 +70,14 @@ rules:
     resources: ["sandboxtemplates", "sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
   {{- end }}
-  # A factory execution defers as capacity when its sandbox pod is
-  # Unschedulable (#3169). The worker reads only the exact named pod.
+  # The worker reads the exact sandbox pod for capacity and stream failure
+  # diagnosis. It lists only events for that named pod after a stream drop.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects
@@ -332,7 +335,7 @@ spec:
             - name: CURIE_CONNECTOR_CALLER_SIGNING_KEY
               valueFrom:
                 secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.signingKeyKey "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -451,12 +454,11 @@ spec:
             - name: CURIE_STATUS_TEXT
               value: {{ .Values.worker.statusText | quote }}
             # What the receipt beneath a turn's reply shows (ADR-0180). The
-            # schema admits all, failures and off; `required` catches the one
-            # shape it cannot see, an explicit null Helm drops before
-            # validation, which would otherwise render an empty value the
-            # worker refuses at startup.
+            # schema admits all, failures and off. A prior chart's retained
+            # values omit this key, so an absent or coalesced null value uses
+            # the same default as a fresh install.
             - name: CURIE_TURN_RECEIPT
-              value: {{ required "worker.turnReceipt must be one of all, failures or off" .Values.worker.turnReceipt | quote }}
+              value: {{ (.Values.worker.turnReceipt | default "all") | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the

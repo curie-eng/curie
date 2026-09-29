@@ -76,6 +76,8 @@ class _FakeApi:
         self.quota_error: BaseException | None = None
         self.pod: object | None = None
         self.pod_error: BaseException | None = None
+        self.events: list[object] = []
+        self.event_reads: list[tuple[str, str | None, int, float]] = []
 
     def create_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, body: dict[str, Any]
@@ -139,6 +141,17 @@ class _FakeApi:
         if self.pod_error is not None:
             raise self.pod_error
         return self.pod
+
+    def list_namespaced_event(
+        self,
+        namespace: str,
+        *,
+        field_selector: str | None = None,
+        limit: int,
+        _request_timeout: float,
+    ) -> SimpleNamespace:
+        self.event_reads.append((namespace, field_selector, limit, _request_timeout))
+        return SimpleNamespace(items=self.events)
 
 
 def _client(api: _FakeApi) -> KubernetesSandboxClient:
@@ -947,3 +960,307 @@ def test_an_unreadable_pod_is_not_unschedulable(error: BaseException) -> None:
     api.pod_error = error
 
     assert _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5) is None
+
+
+def test_evicted_pod_reports_its_status_reason_and_message() -> None:
+    api = _FakeApi()
+    message = (
+        'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
+        "token=exampleSecretValue123456 " + "x" * 400
+    )
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Failed",
+            reason="Evicted",
+            message=message,
+            container_statuses=[],
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is not None
+    assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in termination.detail
+    assert "exampleSecretValue123456" not in termination.detail
+    assert "token=" not in termination.detail
+    assert len(termination.detail) <= 256
+    assert len(api.request_timeouts) == 1
+    assert api.request_timeouts[0][0] == "get:pods:test-ns:sbx-1"
+    assert 0 < api.request_timeouts[0][1] <= 0.5
+
+
+def test_evicted_pod_does_not_publish_unstructured_status_message() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Failed",
+            reason="Evicted",
+            message="The key is exampleSecretValue123456; token = anotherSecretValue123456",
+            container_statuses=[],
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is None
+
+
+def test_failed_pod_reports_other_termination_reason() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Failed", reason="NodeLost", message=None, container_statuses=[]
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+    )
+
+    assert termination is not None
+    assert termination.reason == "NodeLost"
+
+
+def test_oom_killed_runner_reports_container_termination() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Running",
+            reason=None,
+            message=None,
+            container_statuses=[
+                SimpleNamespace(
+                    name="runner",
+                    state=SimpleNamespace(
+                        terminated=SimpleNamespace(
+                            reason="OOMKilled", message="Memory limit exceeded", exit_code=137
+                        )
+                    ),
+                    last_state=None,
+                )
+            ],
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+    )
+
+    assert termination is not None
+    assert termination.reason == "OOMKilled"
+    assert termination.detail is not None
+    assert termination.detail == "exit code 137"
+    assert len(api.request_timeouts) == 1
+    assert api.request_timeouts[0][0] == "get:pods:test-ns:sbx-1"
+    assert 0 < api.request_timeouts[0][1] <= 0.5
+
+
+def test_pod_event_fallback_uses_only_the_current_pod_uid() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Failed", reason=None, message=None, container_statuses=[]
+        ),
+    )
+    api.events = [
+        SimpleNamespace(
+            type="Warning",
+            reason="Evicted",
+            message="An older pod was evicted.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-previous"),
+            last_timestamp=datetime.now(UTC),
+        ),
+        SimpleNamespace(
+            type="Warning",
+            reason="OOMKilling",
+            message="The current pod was killed for memory pressure.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        ),
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "OOMKilling"
+    assert termination.detail is None
+    assert len(api.event_reads) == 1
+    assert api.event_reads[0][0] == "test-ns"
+    assert api.event_reads[0][1] == "involvedObject.kind=Pod,involvedObject.name=sbx-1"
+    assert api.event_reads[0][2] == 20
+    assert 0 < api.event_reads[0][3] <= 0.5
+
+
+def test_stale_pod_event_cannot_supply_a_failed_pods_cause() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Failed", reason=None, message=None, container_statuses=[]
+        ),
+    )
+    api.events = [
+        SimpleNamespace(
+            type="Warning",
+            reason="Evicted",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-previous"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Failed"
+
+
+def test_running_pod_without_termination_or_matching_event_has_no_cause() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Running", reason=None, message=None, container_statuses=[]
+        ),
+    )
+    api.events = [
+        SimpleNamespace(
+            type="Warning",
+            reason="Evicted",
+            message="A stale eviction event must not override a running pod.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=since - timedelta(seconds=1),
+        )
+    ]
+
+    assert (
+        _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=since
+        )
+        is None
+    )
+
+
+def test_recent_eviction_event_explains_a_still_running_pod() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+    assert termination is not None
+    assert termination.reason == "Evicted"
+
+
+def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="OOMKilling",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    assert _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    ) is None
+
+
+def test_terminated_sidecar_does_not_hide_runner_state() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Running",
+            reason=None,
+            container_statuses=[
+                SimpleNamespace(
+                    name="helper",
+                    state=SimpleNamespace(terminated=SimpleNamespace(reason="Error", exit_code=1)),
+                    last_state=None,
+                ),
+                SimpleNamespace(
+                    name="runner",
+                    state=SimpleNamespace(
+                        terminated=SimpleNamespace(reason="OOMKilled", exit_code=137)
+                    ),
+                    last_state=None,
+                ),
+            ],
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+    )
+    assert termination is not None
+    assert termination.reason == "OOMKilled"
+
+
+@pytest.mark.parametrize("recent", [True, False])
+def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    finished_at = since + timedelta(seconds=1 if recent else -1)
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(
+            phase="Running",
+            reason=None,
+            message=None,
+            container_statuses=[
+                SimpleNamespace(
+                    name="runner",
+                    state=SimpleNamespace(terminated=None),
+                    last_state=SimpleNamespace(
+                        terminated=SimpleNamespace(
+                            reason="OOMKilled", exit_code=137, finished_at=finished_at
+                        )
+                    ),
+                )
+            ],
+        ),
+    )
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=since
+    )
+
+    if recent:
+        assert termination is not None
+        assert termination.reason == "OOMKilled"
+        assert termination.detail == "exit code 137"
+    else:
+        assert termination is None

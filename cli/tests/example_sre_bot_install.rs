@@ -585,6 +585,9 @@ exit 64
                     Some(agent) => Response::json(200, &json!([agent]).to_string()),
                     None => Response::json(200, "[]"),
                 },
+                ("GET", path) if path == format!("/deployments?agent_id={AGENT_ID}") => {
+                    Response::json(200, "[]")
+                }
                 ("POST", "/agents") => {
                     let agent = json!({
                         "id": AGENT_ID,

@@ -34,6 +34,12 @@ stating no reason. Say what you are doing in a message that also makes the
 next tool call. Your only text-only endings are that `Could not complete:`
 stop and the publication-pending note after `publish_changes`.
 
+Keep every Bash command in the foreground. Do not set `run_in_background` to
+`true`; the hook refuses background Bash calls. Wait for each command to finish
+and inspect its result before continuing or ending your turn. This applies to
+builds, tests, checks and other long commands. Agent calls are also run
+in the foreground. Set `run_in_background` to `false` on every reviewer call.
+
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
 foreground, refuses a review out of order, and refuses publication until the
@@ -169,10 +175,11 @@ Call the `Agent` tool (also called Task) with exactly these arguments:
 - `description`: `"Plan review round <n>"`
 - `prompt`: the issue link and text, your numbered acceptance criteria, the
   full plan, and, from round 2 on, the previous round's findings.
+- `run_in_background`: `false` (required; never omit it)
 
-Do not pass `isolation`, `run_in_background` or `model`. The call runs in the
-foreground; wait for its reply before any other tool call. A real review reply
-starts with the line `REVIEWER: plan-reviewer`.
+Do not pass `isolation` or `model`. Wait for the foreground call to return
+before any other tool call. A real review reply starts with the line
+`REVIEWER: plan-reviewer`.
 
 Read the `VERDICT:` line that follows:
 
@@ -243,8 +250,9 @@ Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
 numbered acceptance criteria, each check you ran with its exit status, and,
 from round 2 on, the previous round's findings.
-The reviewer reads the diff in `/workspace` itself. Do not pass `isolation`,
-`run_in_background` or `model`.
+The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
+`model`. Set `run_in_background` to `false`; wait for the foreground call to
+return before any other tool call.
 
 A real review reply starts with `REVIEWER: diff-reviewer`.
 

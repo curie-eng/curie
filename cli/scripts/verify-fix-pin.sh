@@ -553,19 +553,31 @@ except (ET.ParseError, OSError):
     raise SystemExit(1)
 
 testcases = root.findall(".//testcase")
+
+
+def matches(testcase):
+    if testcase.get("classname") != expected_classname:
+        return False
+    name = testcase.get("name") or ""
+    return name == expected_name or (
+        "[" not in expected_name and name.startswith(expected_name + "[")
+    )
+
+
 selected = [
     testcase
     for testcase in testcases
-    if testcase.get("classname") == expected_classname
-    and testcase.get("name") == expected_name
+    if matches(testcase)
 ]
 failures = root.findall(".//failure")
 errors = root.findall(".//error")
 if (
-    len(selected) != 1
-    or len(failures) != 1
+    not selected
+    or len(selected) != len(testcases)
+    or len({testcase.get("name") for testcase in selected}) != len(selected)
+    or len(failures) != len(selected)
     or errors
-    or selected[0].find("failure") is None
+    or any(len(testcase.findall("failure")) != 1 for testcase in selected)
 ):
     raise SystemExit(1)
 PY

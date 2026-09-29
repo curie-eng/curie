@@ -928,12 +928,13 @@ limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue
 and `github/add_issue_comment`, and the bundle's review gate hook allows that
 comment only once, to post unresolved findings after a failed or capped review,
 so the runner denies every other GitHub write tool. Open runner egress to the GitHub API
-CIDRs (`agentSandbox.connectorEgress.<agent>`), and raise
-`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to at
-least the agent's execution deadline so the deadline, not the 600 s default,
-bounds a run. For a run of up to three hours, set the agent's deadline with
-`curie cluster overrides <agent> --execution-deadline 10800` and both worker
-values to 10800; the chart raises the worker termination grace to match. Whether a run
+CIDRs (`agentSandbox.connectorEgress.<agent>`). The chart now ships
+`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` at 10800,
+matching the factory maximum execution deadline, so a stock install does not
+cut a factory run at 600 seconds. The agent execution deadline still defaults
+to 1800, so a three hour run still needs
+`curie cluster overrides <agent> --execution-deadline 10800`. The chart raises
+termination grace with the budget (10860 seconds at the default). Whether a run
 executes the repository's tests is the bundle's instruction. The platform does
 not check it. To let the agent install dependencies (`npm ci`, `pip install`)
 and run those checks, declare its package registry CIDRs under
@@ -1011,10 +1012,11 @@ until chart-owned values land):
 
 There are two time bounds after start: the ExecutionRequest deadline (the
 agent's `execution_deadline_seconds`, 60 to 10800, default 1800) and the worker
-delivery budget (`worker.deliveryBudgetSeconds`, default 600, maximum 10800).
-The runner request is bounded by the smaller of the two remaining times. A
-default install therefore fails a work item at 600 s (`deadline_halted`) unless
-operators raise the delivery budget for factory agents.
+delivery budget. The chart default delivery budget and runner ceiling are 10800.
+The runner request is still bounded by the smaller of the remaining execution
+deadline and the delivery budget. An agent left at the 1800 second platform
+default is still bounded by 1800. An agent set to 10800 is no longer cut by
+the worker ceiling.
 
 A work item run boots its runner with a turn budget of `worker.workItemMaxTurns`
 (default 1000), so the deadline rather than the runner's default of 20 turns
@@ -1051,7 +1053,9 @@ A last `Cause:` line names the platform cause code
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
 `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
-`workspace_error`, or `history_capacity`). When the cause has a runner failure
+`sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
+termination includes the Kubernetes reason and, for an EmptyDir eviction, the
+volume limit in a `Details:` line. When the cause has a runner failure
 class, the next line is `Failure class:` and that token. The same token is the
 first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
@@ -1059,7 +1063,7 @@ Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
 `approval-approvers-unverifiable`, `approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
-`unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+`sandbox_terminated`, `unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
@@ -1942,7 +1946,7 @@ Set `<minimum>` from the `curie.ai/minimum-helm-timeout-seconds` annotation on
 the chart's rendered pre-upgrade drain Job, using the same chart, values file,
 and overrides as the upgrade. That annotation accounts for the effective drain
 wait, the Job's 120 second allowance, the effective worker termination grace,
-and 60 seconds for scheduling and Helm operations. The default is 2940 seconds.
+and 60 seconds for scheduling and Helm operations. The default is 21900 seconds.
 Raising `worker.deliveryBudgetSeconds` raises the effective drain wait and
 termination grace automatically, so read the annotation for the customized
 values instead of reusing the default timeout.

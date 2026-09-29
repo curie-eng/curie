@@ -27,7 +27,7 @@ spec:
     requests:
       storage: {{ .Values.otelCollector.persistence.size }}
 {{- end }}
-{{- if .Values.otelCollector.kubernetesEvents.enabled }}
+{{- if (get (.Values.otelCollector.kubernetesEvents | default dict) "enabled") }}
 ---
 # Identity for the k8sobjects/events receiver (#2954): read-only access to
 # Events in this release's namespace and nothing else.
@@ -124,7 +124,7 @@ spec:
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
-      {{- if .Values.otelCollector.kubernetesEvents.enabled }}
+      {{- if (get (.Values.otelCollector.kubernetesEvents | default dict) "enabled") }}
       serviceAccountName: {{ include "curie.fullname" . }}-otel-collector
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.otelCollector.terminationGracePeriodSeconds }}

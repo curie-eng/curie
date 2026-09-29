@@ -2038,13 +2038,20 @@ worker:
   # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 10800
   # (three hours, #3071); values.schema.json enforces this at install/template
   # time and the worker's own validator enforces it again at boot.
-  deliveryBudgetSeconds: 600
+  #
+  # The shipped default is the factory maximum execution deadline (10800
+  # seconds, #3129) so a stock install does not cut a factory run at 600
+  # seconds. The agent execution deadline still defaults to 1800 and still
+  # bounds an unconfigured agent. Raising these defaults raises rendered
+  # termination grace to budget + reserve (10860) for every install.
+  deliveryBudgetSeconds: 10800
   # Positive per-request ceiling for runner work within the overall delivery
   # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
   # enforces the scalar bounds and the worker template enforces the relationship
-  # at render time.
-  runnerTotalTimeoutSeconds: 600
+  # at render time. The shipped default is the same factory maximum execution
+  # deadline (10800 seconds, #3129) as deliveryBudgetSeconds.
+  runnerTotalTimeoutSeconds: 10800
   # How long the renewable ownership lease lives before it is considered
   # expired and transferable. Must span at least 3 heartbeat periods
   # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a
@@ -2100,7 +2107,8 @@ worker:
     # second drain Job allowance, the effective worker termination grace, and
     # 60 seconds for scheduling and Helm operations. The pre upgrade drain Job
     # publishes this minimum in curie.ai/minimum-helm-timeout-seconds. With the
-    # default values it is 900 + 120 + 1860 + 60 = 2940 seconds.
+    # default values it is effective wait 10860 + job allowance 120 + grace
+    # 10860 + 60 = 21900 seconds.
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
@@ -2397,6 +2405,19 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
+  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
+  # (default 1Gi) for that agent only. Each listed agent gets its own
+  # SandboxTemplate and warm pool; every other agent keeps the runner default.
+  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
+  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
+  # pod was evicted. emptyDir usage also counts against the pod's
+  # ephemeral-storage limit, so raise that agent's runner resources
+  # `ephemeral-storage` limit (runner.resources, or the agent's runner
+  # resources) to at least this value plus the home scratch.
+  #   workspaceSizeLimits:
+  #     dark-factory: 24Gi
+  workspaceSizeLimits: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
