@@ -2,6 +2,15 @@
   "name": "sre-bot",
   "cases": [
     {
+      "id": "failed-rollout-names-the-template-command-change",
+      "input": "AcmeDispatcherRestartLoop is firing for deployment acme-dispatcher in namespace acme-system. The new ReplicaSet's pod exits immediately with no log output; the old ReplicaSet is healthy and still serving. Both use the same image digest. What caused the failed rollout? The two resources_get replies are: old ReplicaSet spec.template.spec.containers=[{\"name\":\"dispatcher\",\"image\":\"acme/dispatcher@sha256:111111\",\"command\":[\"python\",\"-m\",\"dispatcher\"]}]; new ReplicaSet spec.template.spec.containers=[{\"name\":\"dispatcher\",\"image\":\"acme/dispatcher@sha256:111111\",\"command\":[\"sh\",\"-c\",\"exit 1\"]}]. Answer with exactly one sentence on one line, beginning Cause:, naming the changed command and how it failed; do not include another suspected cause.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Cause: (?:the )?(?:new ReplicaSet'?s? )?(?:spec\\.template\\.spec\\.containers\\[0\\]\\.)?command changed from python -m dispatcher to sh -c exit 1; (?:the |this )?(?:override|command) exits immediately, (?:causing|explaining) (?:the )?(?:failed rollout|crash loop)\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
       "id": "uses-the-api-for-what-metrics-cannot-answer",
       "input": "Are any pods unable to start in this cluster right now? If so, what reason is being reported for it?",
       "grader": {
