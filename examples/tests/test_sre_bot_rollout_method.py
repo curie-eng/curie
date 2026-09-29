@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-EXAMPLE = Path(__file__).parents[1]
+EXAMPLE = Path(__file__).parents[1] / "sre-bot"
 SKILL = EXAMPLE / "skills" / "sre-bot" / "SKILL.md"
 OLD_RS = "acme-dispatcher-5c72a"
 NEW_RS = "acme-dispatcher-6f89d"
