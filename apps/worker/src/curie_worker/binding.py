@@ -381,6 +381,13 @@ class ResolvedDeployment(BaseModel):
     # takes effect on the very next turn -- there is no cached copy anywhere
     # to go stale.
     memory: bool = False
+    # Whether the operator turned memory writes on for this agent (#1461,
+    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
+    # mounts the remember/update/forget tools; off (the default), neither.
+    # Not selected by the resolver statements: the column arrives in migration
+    # 0068 and resolution runs against older schemas, so the kernel reads it
+    # with ``memory_writes_for`` and copies it on, as with runner_resources.
+    memory_writes: bool = False
 
 
 class AmbiguousRoute(RuntimeError):
@@ -846,6 +853,20 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def memory_writes_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned memory writes on for the agent (#1461).
+
+        A separate read from deployment resolution, like
+        ``runner_resources_for``: resolution runs in migration tests against
+        schemas that predate the column (migration 0068). A missing agent row or
+        a null value reads as off.
+        """
+        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
     async def model_settings_for(
         self, agent_id: uuid.UUID
     ) -> tuple[str | None, str | None, dict[str, Any] | None]:
@@ -953,12 +974,31 @@ class BindingResolver:
         # WHICH agent, and a partition key within that agent's own,
         # already-fully-accessible store has no privilege to carry, so the API
         # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). memory and history stay agent-wide either way.
+        # an opaque claim). Agent memory and history stay agent-wide either
+        # way; channel memory (below) is binding-scoped by design (ADR-0167,
+        # #1461) and is decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
                 f"{base}/agents/{resolved.agent_id}/state/bindings/"
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
+            )
+        # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
+        # to this turn's binding, on the same store and read/written with the
+        # same broad memory token. Its presence is the runner's signal to mount
+        # the memory tools, so it is set only when the operator turned memory
+        # writes on and the turn names a binding. An eval-isolated turn carries
+        # no memory at all, so it gets none either.
+        channel_memory_ref: str | None = None
+        if (
+            resolved.memory_writes
+            and kind is not None
+            and address is not None
+            and not (isolate_memory or is_eval_isolate_thread(thread_key))
+        ):
+            channel_memory_ref = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
             )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
@@ -1046,6 +1086,7 @@ class BindingResolver:
             model_env_key=self._config.model_env_key or None,
             history_token=state_token,
             memory_token=state_token,
+            channel_memory_ref=channel_memory_ref,
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted
