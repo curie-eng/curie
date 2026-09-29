@@ -328,3 +328,12 @@ def test_manifest_and_rules_make_the_intake_fail_closed() -> None:
     assert "SreSlackEmailIntakeRestarted" in alerts
     assert "max_over_time" in alerts["SreSlackEmailIntakeNotReady"]["expr"]
     assert "last_over_time" in alerts["SreSlackEmailIntakeRestarted"]["expr"]
+
+
+# @spec SRE-EMAIL-2
+def test_automated_email_alert_turns_are_standing_read_only_policy() -> None:
+    skill = (HERE.parents[1] / "skills" / "sre-bot" / "SKILL.md").read_text()
+    section = skill.split("<!-- @spec SRE-EMAIL-2 -->", 1)[1]
+    assert "automated email alert" in section.lower()
+    assert "read tools only" in section.lower()
+    assert "never request approval" in section.lower()
