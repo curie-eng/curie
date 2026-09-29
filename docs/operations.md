@@ -1510,6 +1510,7 @@ The record shows `state testing`, `revision 3` and `milestones_used 2`, and the
 Slack stub receives nothing from progress. The worker switch that will turn
 rendering on is `CURIE_PROGRESS_RENDER`; it is off, the chart does not expose
 it, and this release's worker refuses to start with it on.
+
 ### Letting the agent remember facts
 
 An agent's memory tools (`remember`, `update` and `forget`, ADR-0167) are off
