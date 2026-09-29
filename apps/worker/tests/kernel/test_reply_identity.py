@@ -35,12 +35,20 @@ _OPS_TOKEN = "xoxb-ops-bot-sentinel"
 class _Capture:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str | None]] = []
+        self.calls: list[tuple[str, str | None, dict[str, str]]] = []
         self.app = web.Application()
         self.app.add_routes([web.post("/slack/api/{method}", self._slack)])
 
     async def _slack(self, request: web.Request) -> web.Response:
-        self.requests.append(
-            (request.match_info["method"], request.headers.get("Authorization"))
+        method = request.match_info["method"]
+        authorization = request.headers.get("Authorization")
+        self.requests.append((method, authorization))
+        if request.content_type == "application/json":
+            raw_payload = await request.json()
+        else:
+            raw_payload = await request.post()
+        self.calls.append(
+            (method, authorization, {str(key): str(value) for key, value in raw_payload.items()})
         )
         return web.json_response({"ok": True, "ts": "1720000000.000200"})
 
@@ -49,6 +57,13 @@ class _Capture:
 
     def tokens(self) -> set[str | None]:
         return {auth for _method, auth in self.requests}
+
+    def update_tokens_for(self, channel: str) -> list[str | None]:
+        return [
+            auth
+            for method, auth, payload in self.calls
+            if method == "chat.update" and payload.get("channel") == channel
+        ]
 
 
 class _TripleBinding:
@@ -386,6 +401,89 @@ def test_a_stub_turns_policy_routed_card_posts_as_its_identity(
                 assert len(approvals.requests) == 1
             assert "chat.postMessage" in capture.methods()
             assert capture.tokens() == {f"Bearer {_OPS_TOKEN}"}
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    (
+        "stored_kind",
+        "stored_adapter",
+        "resume_adapter",
+        "expected_card_token",
+        "expected_reply_token",
+    ),
+    [
+        ("", None, "ops-bot", _DEFAULT_TOKEN, _OPS_TOKEN),
+        ("slack", "ops-bot", None, _OPS_TOKEN, _DEFAULT_TOKEN),
+    ],
+)
+def test_a_settled_card_uses_the_identity_that_posted_it(
+    make_harness,
+    stored_kind: str,
+    stored_adapter: str | None,
+    resume_adapter: str | None,
+    expected_card_token: str,
+    expected_reply_token: str,
+) -> None:
+    """A card edit authenticates as the bot that posted the card.
+
+    Current refs remember that identity explicitly. An empty-kind ref predates
+    identity-aware routes, so its card was posted by the historical default bot
+    even when the later resume turn arrives through a named identity.
+    """
+
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            resume_identity = route_identity("slack", resume_adapter)
+            binding = _TripleBinding(
+                {("slack", resume_identity, _CHANNEL): _resolved(resume_identity)}
+            )
+            async with make_harness(binding=binding, sink=_sink(port)) as h:
+                await h.card_store.remember(
+                    "appr-legacy",
+                    channel=_POLICY_CHANNEL,
+                    ts="1720000000.000050",
+                    summary="Needs sign-off",
+                    endpoint=None,
+                    requested_by="U1",
+                    kind=stored_kind,
+                    adapter=stored_adapter,
+                )
+                h.runner.default_script = [Final(text="Approval expired.", status=DONE)]
+                await h.kernel.process_event(
+                    QueuedTurn(
+                        event_id="approval-appr-legacy-resolved",
+                        conversation_id="t-settle-identity",
+                        author="system",
+                        text="[approval expired] not approved in time",
+                        reply_handle=ReplyHandle(
+                            kind="slack",
+                            channel=_CHANNEL,
+                            placeholder="1720000000.000100",
+                            adapter=resume_adapter,
+                        ),
+                        received_at="2026-07-05T00:00:00+00:00",
+                    )
+                )
+
+                assert not await h.async_redis.exists(
+                    h.config.approval_card_key("appr-legacy")
+                )
+
+            assert capture.update_tokens_for(_POLICY_CHANNEL) == [
+                f"Bearer {expected_card_token}"
+            ]
+            assert set(capture.update_tokens_for(_CHANNEL)) == {
+                f"Bearer {expected_reply_token}"
+            }
         finally:
             await server.close()
 

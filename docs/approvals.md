@@ -452,6 +452,77 @@ same key returns the outcome that already happened and changes nothing; a key
 already recorded for another approval, or a record settled some other way, is a
 `409`. Cancelling an owed resume is not part of this path yet (#2829).
 
+### Bounded operator procedure
+
+Use recovery for one identified approval, not as a standing alternative to the
+ordinary approver path. The positional agent below may be any existing agent:
+the report and recovery are installation-wide, and the approval id is the
+mutation's scope.
+
+1. While recovery is still disabled, record the pending row with the read-only
+   report and verify its id, route, and reply/card facts:
+
+   ```sh
+   AGENT=acme-bot
+   APPROVAL_ID=00000000-0000-4000-8000-000000000001
+   RECOVERY_KEY="rk-$(uuidgen)"
+
+   curie --json cluster approvals "$AGENT" --report-identity \
+     > approval-recovery-report.json
+   jq -e --arg id "$APPROVAL_ID" \
+     '.identity_report.approvals[] | select(.id == $id)' \
+     approval-recovery-report.json
+   ```
+
+2. Through the installation's normal values and upgrade workflow, set only
+   `api.approvalRecovery.enabled: true` and wait for the API rollout. Keep this
+   window attended: every platform-key holder has the installation-wide reject
+   grant until it is disabled again. Prepare the exact disable rollout before
+   enabling, and perform it even if principal minting or recovery fails, returns
+   a conflict, or is interrupted.
+
+3. Mint an attributed operator principal without putting its returned token in
+   shell history, then recover exactly the inspected id. The disposition is
+   always `rejected`; this command cannot approve on anyone's behalf.
+
+   ```sh
+   export CURIE_APPROVAL_PRINCIPAL_TOKEN="$(
+     curie cluster approvals "$AGENT" \
+       --mint-operator-principal operator@example.com
+   )"
+
+   curie cluster approvals "$AGENT" \
+     --recover "$APPROVAL_ID" \
+     --reason "Retire a stale approval after verified operator review" \
+     --recovery-key "$RECOVERY_KEY"
+   ```
+
+   If the client loses the response, retry the exact command with the same
+   `RECOVERY_KEY`. Never invent a new key for that retry: the original key is
+   what turns it into a read of the already-recorded outcome rather than a new
+   administrative act.
+
+4. Immediately set `api.approvalRecovery.enabled: false` through the same
+   deployment workflow, wait for the API rollout, and remove the principal from
+   the shell:
+
+   ```sh
+   unset CURIE_APPROVAL_PRINCIPAL_TOKEN
+   ```
+
+5. Read `GET /approvals/$APPROVAL_ID/audit` through the normal authenticated
+   operator API path and retain the result with the incident. Confirm one row
+   with `action=administratively_recovered`,
+   `authorizer=approval_recovery`, the operator subject, the reason, and the
+   exact recovery key.
+
+Recovery wakes the suspended session through the ordinary runs stream, whose
+worker also attempts to replace a remembered Slack card with its buttonless
+rejected form. The API row is the authority: if that best-effort Slack edit
+cannot find or update an old card, its buttons can no longer resolve the
+already-rejected approval. Manually delete or annotate the stale Slack message
+so it does not mislead people.
+
 A report entry stating `reply_identity_unreconstructable` means neither the row
 nor any binding says how that reply would be authenticated. The report does not
 guess: it emits an empty declaration for you to fill in and feed back to the
