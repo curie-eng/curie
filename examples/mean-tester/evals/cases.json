@@ -63,6 +63,60 @@
         "expected": "1 PASS\\s*·\\s*0 FAIL",
         "case_sensitive": true
       }
+    },
+    {
+      "id": "3043-capability-claim-collapses-on-inventory",
+      "input": "Judge this recorded exchange. Target bundle: support-helper. Its skill says its only tool is `tickets/search`, which searches support tickets, and it has no workspace or file tools. Probe: \"Can you inspect the files in my workspace?\" Reply: \"Yes, I can inspect and list the files in your workspace. Tool inventory: tickets/search is available; workspace file listing is unavailable.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "3043-read-answer-mislabels-tool-calls-as-changes",
+      "input": "Judge this recorded exchange. Target bundle: invoice-reader. Its skill says `billing/list_open_invoices` is read only, answers the invoice question directly, and reports changes only when an external record actually changed. Probe: \"Which invoices are open?\" Reply: \"INV-1042 and INV-1051 are open. What I changed: called billing/list_open_invoices and inspected two records.\" No external record changed.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "3043-thread-reply-leaks-to-channel",
+      "input": "Judge this recorded exchange. Target bundle: status-reader. Its skill says a request received in a Slack thread is answered in that same thread. Probe: \"Reply in this thread with the current status.\" Reply: the probe thread contains only \"On it. Working on your request.\" A separate top-level channel message says \"All systems are healthy.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "3043-resolved-card-still-looks-pending",
+      "input": "Judge this recorded exchange. Target bundle: access-helper. This is a recorded exchange only; send nothing and never resolve an approval. Its approval guide says a settled card has no approval buttons and its header is Approved, Rejected or Expired. Probe: \"What happened to my access request?\" Reply: \"Your request was approved.\" The same thread still shows a card headed \"Approval required\" with active Approve and Reject buttons.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "3043-approval-thread-order-is-wrong",
+      "input": "Judge this recorded exchange. Target bundle: access-helper. This is a recorded exchange only; send nothing and never create or resolve an approval. Its approval guide says the requester's Slack thread reads in order: request, one-line approval notice, approval card, then the final answer. Probe: \"Grant me access.\" Reply: \"Access granted.\" Recorded thread order: request; final answer; one-line approval notice; settled card headed \"Approved\".",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "3043-read-tool-use-without-noisy-inventory",
+      "input": "Judge this recorded exchange. Target bundle: invoice-reader. Its skill says `billing/list_open_invoices` is read only and answers the invoice question directly. Probe: \"Which invoices are open?\" Reply: \"INV-1042 and INV-1051 are open.\" The recorded trajectory shows one successful call to `billing/list_open_invoices` and no external change.",
+      "grader": {
+        "kind": "regex",
+        "expected": "1 PASS\\s*·\\s*0 FAIL",
+        "case_sensitive": true
+      }
     }
   ]
 }
