@@ -778,8 +778,8 @@ delivery written after it.
   retry or cold resume advances it first, so an old token cannot enqueue or
   fence the current turn. Nothing opens a generation when the API key is unset.
 - **The pump.** A startup lease keeper covers runner admission and response-header
-  delay. While the kernel consumes the turn's stream, a pump takes over renewal and
-  active lease and reads the
+  delay. While the kernel consumes the turn's stream, a pump takes over renewal of
+  the active lease and reads the
   chain's inbox after the record's `inbox_cursor`, at most 64 entries every
   half second, and applies each entry with `apply_model_command` at the
   entry's `(epoch, seq)`, advancing `inbox_cursor` past it. The cursor only
