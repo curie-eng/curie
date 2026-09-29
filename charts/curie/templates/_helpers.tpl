@@ -534,6 +534,9 @@ http
 {{- if not (hasKey $.Values.otelCollector.extraExporters $name) -}}
 {{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] names no configured exporter. Remove it, or add the exporter under otelCollector.extraExporters." $name) -}}
 {{- end -}}
+{{- if ne (first (splitList "/" $name)) "awsemf" -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] is invalid: only awsemf exporters may bypass exporterhelper durability validation on Collector 0.119.0." $name) -}}
+{{- end -}}
 {{- if not (and (kindIs "string" $reason) (trim $reason)) -}}
 {{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] must give a reason, naming the exporter and the Collector version its schema was checked against." $name) -}}
 {{- end -}}
