@@ -33,12 +33,12 @@ two off-the-shelf stdio MCP servers that the runner image preinstalls:
 
 Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
 - the channel ids it may probe in;
-- the `owner/repo@branch` repositories it reads target bundles from;
-- the test installations, if any.
+- the `owner/repo@branch` repositories it reads target bundles from.
 
-Every target not listed as a test installation is production. Against
-production, the tester only reads and asks. It never asks for an action, even
-an approval-gated one, and never attaches a file (ADR 0172 decision 5).
+Every probe only reads or asks. The tester never asks for an action, even on a
+test installation and even when the action is approval gated. It never creates
+or resolves an approval card, and it never attaches a file (ADR 0172 decision
+5, tightened by #3043).
 
 The sandbox needs egress to Slack's API and GitHub's API. Add one
 `agentSandbox.connectorEgress.<agent>` entry per CIDR, for TCP 443:
@@ -91,7 +91,12 @@ the next round. For each FAIL, the report carries an eval case for the target's
 
 Each case in [`evals/cases.json`](evals/cases.json) hands the tester a recorded
 exchange and grades its verdict. Real failure shapes must come back FAIL, and
-good replies PASS. Run them with a model credential:
+good replies PASS. The recorded exchanges include contradictions between a
+claimed capability and the target's own tool inventory, misleading tool-call
+inventories presented as changes, replies that leave their Slack thread,
+settled approval cards that still look pending, and approval messages in the
+wrong order. Approval cases are recorded exchanges only. The tester never
+creates a card to exercise them. Run the cases with a model credential:
 
 ```bash
 curie skill eval --plugin-dir examples/mean-tester
@@ -100,6 +105,7 @@ curie skill eval --plugin-dir examples/mean-tester
 ## What it will not do
 
 - Resolve, approve or reject any approval card.
+- Ask a target to perform an action or create an approval card.
 - Change anything about its target, or file anything.
 - Reply inside a target's thread, react, or read Slack users: the tool policy
   allows exactly the six tools listed in

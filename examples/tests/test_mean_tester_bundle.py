@@ -146,14 +146,19 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
         assert text in joined, f"{text!r} no longer appears in the platform; update SKILL.md"
 
 
-def test_production_is_off_limits_unless_listed_as_a_test_installation():
+def test_every_installation_is_read_or_ask_only():
+    # @spec #3043
     skill = _skill()
-    where = re.search(r"^## Where you work\n(.*?)(?=^## )", skill, re.M | re.S)
-    assert where and re.search(r"^- Test installations: ", where.group(1), re.M)
-    rule = re.search(r"^## Production is off limits\n(.*?)(?=^## )", skill, re.M | re.S)
-    assert rule, "SKILL.md must keep a '## Production is off limits' section"
-    for phrase in ("approval card", "attach", "Next (test installation):"):
-        assert phrase in rule.group(1), phrase
+    rule = re.search(r"^## Every probe only reads or asks\n(.*?)(?=^## )", skill, re.M | re.S)
+    assert rule, "SKILL.md must keep an '## Every probe only reads or asks' section"
+    text = " ".join(rule.group(1).split())
+    for phrase in (
+        "same for production and test installations",
+        "Send only probes that read or ask",
+        "even on a test installation",
+        "Never attach a file, create an approval card, or resolve one",
+    ):
+        assert phrase in text, phrase
 
 
 def test_a_round_waits_by_the_clock_and_posts_only_probes():

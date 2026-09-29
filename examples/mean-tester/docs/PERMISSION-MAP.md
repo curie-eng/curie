@@ -21,7 +21,7 @@ credentials. Their own scope is the real bound.
 
 | Tool | What it writes | Bound |
 |---|---|---|
-| `slack/slack_post_message` | One new root message per probe, `[mean test] <@target> <probe>` | The channels the app is invited to. The mark, the four-per-round cap and the one-round-per-turn rule are the skill's, not code. |
+| `slack/slack_post_message` | One new root message per read or ask probe, `[mean test] <@target> <probe>` | The channels the app is invited to. The read-or-ask rule, the mark, the four-per-round cap and the one-round-per-turn rule are the skill's, not code. |
 
 The tester's report is the turn's own reply, posted by the platform in the
 thread it was asked in.
@@ -44,3 +44,7 @@ Every other tool of both servers, among them:
 - GitHub: every write (`create_issue`, `add_issue_comment`,
   `create_or_update_file`, `push_files`, `create_pull_request`, …) and every
   other read.
+
+The allowed Slack post cannot make an action probe safe by itself. The skill
+permits only questions and reads, so it never asks a target to create an
+approval card or to change an external system.
