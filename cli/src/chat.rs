@@ -873,6 +873,155 @@ mod tests {
         );
     }
 
+    /// The frozen progress block-id vector, parsed strictly for the same reason
+    /// as [`ActionIdVector`]. The Python lane rejects unknown keys via
+    /// `_EXPECTED_PROGRESS_VECTOR_KEYS` in `apps/worker/tests/test_blocks_progress.py`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProgressBlockVector {
+        #[serde(rename = "comment")]
+        _comment: String,
+        card_block_id_prefix: String,
+        milestone_block_id_prefix: String,
+    }
+
+    /// The Rust half of the worker vs CLI progress-block gate (ADR-0130). The
+    /// worker's constants and builders are checked against the same file by
+    /// `test_progress_block_ids_match_the_frozen_vector` in
+    /// `apps/worker/tests/test_blocks_progress.py`. The rule lives in the file.
+    #[test]
+    fn progress_block_ids_match_the_frozen_vector() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/progress-blocks.json"
+        ))
+        .expect("read tests/vectors/progress-blocks.json");
+        let parsed: ProgressBlockVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/progress-blocks.json: {err}\n\
+                 An unknown field is rejected on purpose. Teach a new key to \
+                 ProgressBlockVector here, to _EXPECTED_PROGRESS_VECTOR_KEYS in \
+                 apps/worker/tests/test_blocks_progress.py, and to both lanes' assertions."
+            )
+        });
+
+        assert_eq!(
+            parsed.card_block_id_prefix, PROGRESS_CARD_BLOCK_ID_PREFIX,
+            "the stub would read a progress card as the turn's answer"
+        );
+        assert_eq!(
+            parsed.milestone_block_id_prefix, PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
+            "the stub would read a milestone as the turn's answer"
+        );
+    }
+
+    fn card_blocks(block_id: &str) -> String {
+        format!(
+            r#"[{{"type":"section","block_id":"{block_id}","text":{{"type":"plain_text","text":"Task status: Testing","emoji":false}}}}]"#
+        )
+    }
+
+    /// ADR-0130: a progress call is told apart by the block ids the worker
+    /// stamps, in either encoding slack_sdk may send, and by nothing else.
+    #[test]
+    fn progress_blocks_are_detected_by_block_id_in_either_encoding() {
+        let card = format!(
+            r#"{{"channel":"C0EXAMPLE1","text":"Task status: Testing. x","blocks":{}}}"#,
+            card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state"))
+        );
+        assert!(is_progress_call("application/json; charset=utf-8", &card));
+
+        let milestone_blocks = card_blocks(&format!("{PROGRESS_MILESTONE_BLOCK_ID_PREFIX}1:class"));
+        let form = serde_urlencoded::to_string([
+            ("channel", "C0EXAMPLE1"),
+            ("text", "Milestone: Scope changed. y"),
+            ("blocks", milestone_blocks.as_str()),
+        ])
+        .expect("encode a form body");
+        assert!(is_progress_call("application/x-www-form-urlencoded", &form));
+
+        // The negatives: the prefix in answer text, an ordinary structured
+        // reply, an approval card, and a body that is not JSON at all.
+        let in_text = format!(
+            r#"{{"text":"see {PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state","blocks":{}}}"#,
+            card_blocks("reply-1")
+        );
+        assert!(!is_progress_call("application/json", &in_text));
+        let answer = r#"{"text":"the answer","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"the answer"}}]}"#;
+        assert!(!is_progress_call("application/json", answer));
+        let approval = format!(
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"x"}}]}}]}}"#
+        );
+        assert!(!is_progress_call("application/json", &approval));
+        assert!(!is_progress_call("application/json", "not json"));
+    }
+
+    /// A progress card posted before the placeholder is edited is not the reply
+    /// the way a resumed answer post is: it is a status line, and its later
+    /// edits are status lines too.
+    #[test]
+    fn a_progress_post_and_its_edits_are_never_the_reply() {
+        let (latest, seen) = replay(&[
+            progress_call("chat.postMessage", None, Some("card"), "Task status: Queued. x"),
+            progress_call("chat.update", Some("card"), None, "Task status: Testing. y"),
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            progress_call("chat.postMessage", None, Some("m1"), "Milestone: Scope changed. z"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+        assert_eq!(
+            seen,
+            vec![
+                "Task status: Queued. x",
+                "Task status: Testing. y",
+                "the answer",
+                "Milestone: Scope changed. z",
+            ]
+        );
+    }
+
+    /// The negative for the tracked message itself: a progress edit of the ts
+    /// the wait follows still does not replace the answer.
+    #[test]
+    fn a_progress_edit_of_the_tracked_message_is_not_the_answer() {
+        let edit = progress_call("chat.update", Some("ph"), None, "Task complete. done");
+        assert_eq!(placeholder_update_text(&edit, "ph"), None);
+
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            edit,
+        ]);
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// The stub marks what it captured, so the wait never has to re-parse.
+    #[tokio::test]
+    async fn the_stub_marks_a_captured_progress_call() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"channel":"C0EXAMPLE1","text":"Task status: Queued. x","blocks":{}}}"#,
+                card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r1:state"))
+            ))
+            .send()
+            .await
+            .expect("the stub answers");
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C0EXAMPLE1"), ("text", "the answer")])
+            .send()
+            .await
+            .expect("the stub answers");
+
+        assert!(stub.recv().await.expect("the progress post").progress);
+        assert!(!stub.recv().await.expect("the answer post").progress);
+    }
+
     #[test]
     fn extract_fields_reads_form_and_json_bodies() {
         let (channel, ts, text) = extract_fields(
@@ -983,6 +1132,7 @@ mod tests {
             approval_card: false,
             approval_id: None,
             posted_ts: None,
+            progress: false,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).
@@ -1004,6 +1154,14 @@ mod tests {
             approval_card: false,
             approval_id: None,
             posted_ts: posted.map(str::to_string),
+            progress: false,
+        }
+    }
+
+    fn progress_call(method: &str, ts: Option<&str>, posted: Option<&str>, text: &str) -> SlackCall {
+        SlackCall {
+            progress: true,
+            ..stub_call(method, ts, posted, text)
         }
     }
 

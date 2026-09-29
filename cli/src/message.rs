@@ -8489,17 +8489,136 @@ mod tests {
         }
     }
 
+    /// Decoded the way a relay page is, so a field the DTO grows does not need
+    /// every caller to learn it.
     fn relay_event(
         kind: &str,
         text: Option<&str>,
         outcome: Option<&str>,
     ) -> ClusterMessageReplyEvent {
-        ClusterMessageReplyEvent {
-            kind: kind.to_string(),
-            text: text.map(str::to_string),
-            status: None,
-            outcome: outcome.map(str::to_string),
+        serde_json::from_value(serde_json::json!({
+            "event": kind,
+            "text": text,
+            "outcome": outcome,
+        }))
+        .expect("a relay event")
+    }
+
+    /// A reply wire 1.1 progress body as the worker's relay adapter stores it:
+    /// a card edit carries no answer fields, a post carries its text fallback.
+    fn relay_progress(kind: &str, progress: serde_json::Value) -> ClusterMessageReplyEvent {
+        let mut body = serde_json::json!({
+            "version": "1.1",
+            "event": kind,
+            "target": {
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "conversation_id": "thread-example",
+                "reply_ref": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            },
+            "delivery_id": "00000000-0000-4000-8000-000000000002",
+            "progress": progress,
+        });
+        if kind == "reply.post" {
+            body["message"] = serde_json::json!({"version": "1.0", "text": "fallback text"});
+            body["requested_by"] = serde_json::json!("U0EXAMPLE1");
+        } else {
+            for field in ["text", "message", "settled", "nav"] {
+                body[field] = serde_json::Value::Null;
+            }
         }
+        serde_json::from_value(body).expect("a relay progress event")
+    }
+
+    fn relay_card(state: &str, summary: &str, terminal: bool) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "card",
+            "state": state,
+            "summary": summary,
+            "revision": 2,
+            "terminal": terminal,
+        })
+    }
+
+    /// ADR-0130 decision 5: a card edit is a status line, never the reply, and
+    /// the answer that follows it is still the reply.
+    #[test]
+    fn a_progress_update_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.update",
+                    relay_card("testing", "Running the integration suite", false),
+                ),
+                relay_event("reply.update", Some("the answer"), None),
+                relay_progress("reply.update", relay_card("complete", "Fix verified", true)),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        match outcome {
+            Outcome::Replied(reply) => assert_eq!(reply, "the answer"),
+            other => panic!("expected Replied, got {other:?}"),
+        }
+        assert_eq!(observed.len(), 3, "{observed:?}");
+        assert!(observed[0].starts_with("Progress") && observed[0].contains("Running the integration suite"));
+        assert_eq!(observed[1], "the answer");
+        assert!(observed[2].starts_with("Progress") && observed[2].contains("Fix verified"));
+    }
+
+    /// A closed card is not the turn's completion: with no `turn.completed` the
+    /// wait keeps polling for the answer.
+    #[test]
+    fn a_terminal_card_without_a_completion_keeps_waiting() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_progress("reply.update", relay_card("complete", "Fix verified", true))],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification");
+
+        assert!(outcome.is_none());
+        assert_eq!(latest, None);
+    }
+
+    /// A progress post (a card's first revision or a milestone) is a status
+    /// line; its text fallback is not a reply the wait could report.
+    #[test]
+    fn a_progress_post_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.post",
+                    serde_json::json!({
+                        "kind": "milestone",
+                        "milestone": "evidence",
+                        "summary": "Found the failing migration",
+                        "ordinal": 1,
+                    }),
+                ),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        assert!(matches!(outcome, Outcome::CompletedNoEdit), "{outcome:?}");
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert!(observed[0].starts_with("Milestone") && observed[0].contains("Found the failing migration"));
     }
 
     #[test]
