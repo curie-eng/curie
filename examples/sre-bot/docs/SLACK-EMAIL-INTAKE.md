@@ -68,6 +68,12 @@ is older than two poll intervals. Kubernetes restarts a failed process, while
 the SRE observability rules page when the Deployment has no ready replica, is
 scaled to zero, or its container restarts.
 
+The `sre-slack-email-intake-code` ConfigMap is the durable opt-in marker. While
+it exists, an absent Deployment is a failure and continues paging; a deliberate
+uninstall removes the Deployment, Secret, code ConfigMap, and its alert routing
+together. This avoids an absence alarm on installations that never opted in
+without letting a deleted Deployment become quiet after metric retention ends.
+
 Failures after the hook was accepted stay covered by the platform alerts:
 
 | Broken stage | Signal |
