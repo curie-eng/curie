@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import sandbox_token
+from curie_api import channel_token, sandbox_token
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.routers import turn_progress as turn_progress_router
@@ -148,6 +148,30 @@ def test_the_platform_key_is_refused(api: TestClient, valkey: redis.Redis, prefi
     response = _post(api, progress_id, get_settings().api_key)
 
     assert response.status_code == 401
+    assert _inbox(valkey, prefix, progress_id) == []
+
+
+def test_a_channel_token_is_refused_before_command_validation(
+    api: TestClient, valkey: redis.Redis, prefix: str
+) -> None:
+    """@spec ADR-0130 d1: sibling channel authority never reaches this ingress."""
+
+    progress_id = str(uuid.uuid4())
+    token = channel_token.mint(
+        get_settings().api_key,
+        channel_id=str(uuid.uuid4()),
+        generation=1,
+        scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
+        exp=int(time.time()) + 3600,
+    )
+
+    response = api.post(
+        f"/v1/turn-progress/{progress_id}",
+        json={},
+        headers={"X-API-Key": token},
+    )
+
+    assert response.status_code == 401, response.text
     assert _inbox(valkey, prefix, progress_id) == []
 
 
