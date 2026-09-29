@@ -792,6 +792,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-eval-wiring-assertions.sh
 
+      # ADR-0180: worker.turnReceipt reaches the worker env as
+      # CURIE_TURN_RECEIPT, only the three modes the worker accepts render, and
+      # extraEnv cannot shadow it. A mode the chart let through would install
+      # green and crash-loop every worker at config load.
+      - name: helm render assertions (worker turn receipt mode)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-turn-receipt-assertions.sh
+
       # This otherwise Python-free chart job needs the workspace because the
       # web-identity gate below does not stop at the rendered YAML: it builds
       # the real API and worker BundleStore objects under each rendered

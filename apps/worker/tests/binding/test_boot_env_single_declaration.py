@@ -123,6 +123,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # exactly like CURIE_BOOTING_TEXT above. Read from the worker's env by
         # WorkerConfig; never a sandbox boot key.
         "CURIE_TURN_NOT_STARTED_TEXT",
+        # The install's receipt mode (ADR-0180), read from the WORKER's env by
+        # WorkerConfig and consumed where the kernel assembles the final reply.
+        # It decides what the person is shown, never what a sandbox boots with.
+        "CURIE_TURN_RECEIPT",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
