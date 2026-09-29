@@ -123,8 +123,22 @@ def test_two_agents_bind_one_channel_under_two_identities(
     assert _resolved_agent("default") == first
     assert _resolved_agent("second") == second
     listed = {a["name"]: a["channels"] for a in client.get("/agents", headers=auth_headers).json()}
-    assert listed["default-bot"] == [{"kind": "slack", "address": CHANNEL, "adapter": "default"}]
-    assert listed["second-bot"] == [{"kind": "slack", "address": CHANNEL, "adapter": "second"}]
+    assert listed["default-bot"] == [
+        {
+            "kind": "slack",
+            "address": CHANNEL,
+            "adapter": "default",
+            "allowed_callers": None,
+        }
+    ]
+    assert listed["second-bot"] == [
+        {
+            "kind": "slack",
+            "address": CHANNEL,
+            "adapter": "second",
+            "allowed_callers": None,
+        }
+    ]
 
 
 def test_one_agent_binds_one_channel_under_two_identities(
@@ -170,7 +184,14 @@ def test_a_repost_of_the_same_route_is_idempotent(
         headers=auth_headers,
     )
     assert again.status_code == 201, again.text
-    assert again.json()["channels"] == [{"kind": "slack", "address": CHANNEL, "adapter": "second"}]
+    assert again.json()["channels"] == [
+        {
+            "kind": "slack",
+            "address": CHANNEL,
+            "adapter": "second",
+            "allowed_callers": None,
+        }
+    ]
 
 
 def _binding_ids(agent_id: str) -> dict[str, str]:
