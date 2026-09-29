@@ -13,6 +13,14 @@ Measured on claude-agent-sdk 0.2.159 with bundled CLI 2.1.281 (2026-09-29):
 - a PreToolUse hook deny arrives as ``is_error=True`` for a call that never
   reached the connector, which is why a call the runner's own approval gate
   held must count as awaiting_approval and never as a connector error;
+- a connector answering with a JSON-RPC ``error`` instead of a result also
+  arrives as ``is_error=True``, carrying the error's message;
+- an SDK interrupt while a connector call is in flight is answered by the CLI
+  itself with a synthetic ``is_error=True`` result ("The user doesn't want to
+  proceed with this tool use..."), then a ResultMessage with subtype
+  ``error_during_execution`` and terminal_reason ``aborted_tools``; the
+  connector never finishes the call. An operator stop and a turn deadline both
+  reach the CLI as that same interrupt;
 - the CLI puts ``system`` role entries in ``messages``, so the stand-in cannot
   read "the last message is the tool result". It ends the turn once any message
   carries a tool_result block.
@@ -26,7 +34,7 @@ import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import anyio
 import pytest
@@ -56,6 +64,8 @@ _LEDGER_ERROR_TEXT = "upstream answered 401 for acme-ledger-PLACEHOLDER"
 _TOOL = web.AppKey("tool", str)
 _BODIES = web.AppKey("bodies", list[dict[str, Any]])
 _TURN_TIMEOUT_S = 90
+# The opaque turn epoch the server hands a turn, which a timeout names.
+_EPOCH = "acme-epoch-PLACEHOLDER"
 
 
 @pytest.fixture
@@ -212,19 +222,43 @@ async def _anything_else(_request: web.Request) -> web.Response:
     return web.json_response({"input_tokens": 1})
 
 
+def _recorded(calls: Path) -> list[str]:
+    return calls.read_text(encoding="utf-8").split() if calls.exists() else []
+
+
+async def _stop_once_started(
+    runner: SessionRunner, calls: Path, tool: str, stop: Literal["interrupt", "timeout"]
+) -> None:
+    """Stop the turn once the connector has recorded the call's start.
+
+    Waits on the connector's own record, never on a fixed delay, so the stop
+    always lands while the call is in flight.
+    """
+
+    while tool not in _recorded(calls):
+        await anyio.sleep(0.05)
+    if stop == "interrupt":
+        await runner.interrupt()
+    else:
+        assert await runner.timeout(_EPOCH)
+
+
 def _run_turn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     tool: str,
     gate: ApprovalGate | None = None,
+    stop: Literal["interrupt", "timeout"] | None = None,
 ) -> tuple[Final, list[str], list[dict[str, Any]]]:
     """One real turn in which the model calls ``mcp__acme__<tool>`` once.
 
-    Returns the turn's final, the tools the connector actually ran, and the
-    requests the stand-in received. Wired the way ``__main__`` wires a gated
-    session: the gate's PreToolUse hook, its can_use_tool backstop, and the same
-    gate on the SessionRunner.
+    Returns the turn's final, what the connector recorded, and the requests the
+    stand-in received. Wired the way ``__main__`` wires a gated session: the
+    gate's PreToolUse hook, its can_use_tool backstop, and the same gate on the
+    SessionRunner. With ``stop``, a second task stops the turn the way the
+    server does (an operator interrupt, or the turn's deadline) once the
+    connector has started the call.
     """
 
     # The SDK and the CLI must agree on the config directory, and a developer's
@@ -282,15 +316,22 @@ def _run_turn(
                 model="claude-sonnet-5",
                 approval_gate=gate,
             )
+            lines: list[str] = []
+
+            async def drive() -> None:
+                async for line in runner.run_turn(
+                    Event(type="message", text="read it", user="U0EXAMPLE1", ts="1"),
+                    turn_epoch=_EPOCH,
+                ):
+                    lines.append(line)
+
             await runner.start()
             try:
                 with anyio.fail_after(_TURN_TIMEOUT_S):
-                    lines = [
-                        line
-                        async for line in runner.run_turn(
-                            Event(type="message", text="read it", user="U0EXAMPLE1", ts="1")
-                        )
-                    ]
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(drive)
+                        if stop is not None:
+                            tasks.start_soon(_stop_once_started, runner, calls, tool, stop)
             finally:
                 await runner.close()
             finals = [event for event in parse_ndjson("".join(lines)) if isinstance(event, Final)]
@@ -299,8 +340,7 @@ def _run_turn(
             return finals[0], list(bodies)
 
     final, bodies = anyio.run(scenario)
-    ran = calls.read_text(encoding="utf-8").split() if calls.exists() else []
-    return final, ran, bodies
+    return final, _recorded(calls), bodies
 
 
 def test_a_connector_answering_is_error_counts_as_a_connector_error(
@@ -389,3 +429,87 @@ def test_a_call_the_approval_gate_held_counts_as_awaiting_approval_not_error(
     assert ran == []
     assert _points(reader) == {("connector", "awaiting_approval"): 1}
     assert _connector_warnings(caplog) == []
+
+
+def test_a_connector_answering_a_json_rpc_error_counts_as_a_connector_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC3 on the real path: a connector's second error channel is is_error too.
+
+    A dependency pin, green when written. The fixture's ``rpc_fail`` answers
+    with a JSON-RPC ``error`` response (code -32000), not an ``isError`` result.
+    Measured on claude-agent-sdk 0.2.159 with bundled CLI 2.1.281 (2026-09-29):
+    the CLI delivers that as ``is_error=True`` carrying the error's message, so
+    the runner counts it without reading any payload. Red if an SDK or CLI
+    upgrade stops setting is_error for a JSON-RPC error, which would make a
+    connector that fails this way invisible to the alert.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="rpc_fail")
+
+    assert final.status is SessionStatus.DONE
+    assert ran == ["rpc_fail"]
+    assert _points(reader) == {("connector", "error"): 1}
+    warnings = _connector_warnings(caplog)
+    assert [(server, tool) for server, tool, _ in warnings] == [("acme", "rpc_fail")]
+    for record in caplog.records:
+        if record.levelno >= logging.WARNING:
+            for fragment in (_ARGUMENT, "acme-ledger-PLACEHOLDER", "upstream answered"):
+                assert fragment not in record.getMessage()
+
+
+def test_an_operator_stop_during_a_connector_call_counts_as_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interrupted call is cancelled: the operator stopped it, the connector did not fail.
+
+    The turn is interrupted (``SessionRunner.interrupt``) once the connector has
+    started ``slow_read``. The CLI answers the cut-off call with its own
+    is_error result (measured, see the module docstring), which is no evidence
+    about the connector at all. The turn ending idle and the connector never
+    finishing the call hold today. Red until the manifest declares
+    ``cancelled`` and the session records it for a result that arrives after an
+    operator interrupt; red again if that result counts as a connector error or
+    logs the connector WARNING, which would page on every stopped turn.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="slow_read", stop="interrupt")
+
+    assert final.status is SessionStatus.IDLE_AWAITING_INPUT
+    assert ran == ["slow_read"], "the connector finished a call the stop should have cut off"
+    assert _points(reader) == {("connector", "cancelled"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_connector_call_cut_off_by_the_turn_deadline_is_a_connector_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A call still running at the turn's deadline is an error, not a cancellation.
+
+    Same slow call, stopped by ``SessionRunner.timeout(epoch)`` instead of an
+    operator. The CLI answers it with the same synthetic is_error result, but a
+    connector that holds a call until the deadline is failing, so it counts as
+    connector/error and logs the WARNING. Green today; red if the cancelled
+    branch reads any interrupt as an operator stop, which would hide a connector
+    that hangs.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="slow_read", stop="timeout")
+
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    assert ran == ["slow_read"], "the connector finished a call the deadline should have cut off"
+    assert _points(reader) == {("connector", "error"): 1}
+    warnings = _connector_warnings(caplog)
+    assert [(server, tool) for server, tool, _ in warnings] == [("acme", "slow_read")]

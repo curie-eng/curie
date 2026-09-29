@@ -862,9 +862,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
       - eval_time: 24m
         alertname: CurieConnectorToolErrors
         exp_alerts:
@@ -879,9 +879,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
       - eval_time: 25m
         alertname: CurieConnectorToolErrors
         exp_alerts: []
@@ -919,9 +919,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
       - eval_time: 25m
         alertname: CurieConnectorToolErrors
         exp_alerts: []
@@ -956,9 +956,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
       - eval_time: 44m
         alertname: CurieConnectorToolErrors
         exp_alerts:
@@ -973,9 +973,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
       - eval_time: 45m
         alertname: CurieConnectorToolErrors
         exp_alerts: []
@@ -1081,9 +1081,9 @@ tests:
               description: >-
                 curie_tool_result_total with origin connector and outcome error
                 increased by three or more in 15 minutes and was at least half of
-                connector tool results, counting a series' first sample as an increase
-                from zero. The runner logs one WARNING per failed call naming the
-                connector server and tool.
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
 
   # The dispatcher down is the quietest failure an installation has: every pod
   # is Running, nothing errors, and no Slack message reaches any agent.

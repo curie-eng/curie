@@ -15,15 +15,18 @@ The fake stops replaying at an interrupting deny, before the denied call's
 result the real CLI delivers, so its own ``can_use_tool`` path cannot reach
 awaiting_approval. The gate case here runs the runner's real PreToolUse approval
 hook itself and scripts the result the real CLI was measured to deliver; the
-same case on the real CLI is in ``test_tool_result_real_cli.py``.
+same case on the real CLI is in ``test_tool_result_real_cli.py``. The stop
+cases call the runner's own ``interrupt`` and ``timeout`` from inside the fake
+between a call and its result, where the real CLI's cut-off result lands.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from functools import partial
+from typing import Any, Literal
 
 import anyio
 import pytest
@@ -50,6 +53,14 @@ _METRIC = "curie.tool.result"
 # connector WARNING must name the server and tool and nothing the call said.
 _ARGUMENT = "acme-account-PLACEHOLDER"
 _RESULT_TEXT = "upstream answered 401 for acme-ledger-PLACEHOLDER"
+# The opaque turn epoch the server hands a turn, which a timeout names.
+_EPOCH = "acme-epoch-PLACEHOLDER"
+# What the real CLI answers a call it cut off on an SDK interrupt with, as an
+# is_error result, followed by an error_during_execution result whose
+# terminal_reason is aborted_tools (measured on claude-agent-sdk 0.2.159,
+# bundled CLI 2.1.281, 2026-09-29). An operator stop and a turn deadline both
+# reach the CLI as that interrupt.
+_CUT_OFF_TEXT = "The user doesn't want to proceed with this tool use. The tool use was rejected."
 
 
 @pytest.fixture
@@ -166,7 +177,38 @@ class _HookedFake(FakeModelSession):
                         )
 
 
-def _run(*scripts: list[Any], gate: ApprovalGate | None = None) -> list[Final]:
+class _StoppingFake(FakeModelSession):
+    """The fake, stopping the turn once the first tool call has reached the session.
+
+    ``stop`` is the runner's own stop entry point (``interrupt`` or ``timeout``),
+    bound after the runner is built. The replay is not truncated by the stop:
+    the script carries what the real CLI delivers after an interrupt, the cut-off
+    call's synthetic result and the aborted terminal result.
+    """
+
+    def __init__(self, script_factory: Any) -> None:
+        super().__init__(script_factory, truncate_on_interrupt=False)
+        self.stop: Callable[[], Awaitable[object]] | None = None
+
+    async def receive_turn(self) -> Any:
+        stopped = False
+        async for message in super().receive_turn():
+            yield message
+            if (
+                not stopped
+                and self.stop is not None
+                and isinstance(message, AssistantMessage)
+                and any(isinstance(block, ToolUseBlock) for block in message.content)
+            ):
+                stopped = True
+                await self.stop()
+
+
+def _run(
+    *scripts: list[Any],
+    gate: ApprovalGate | None = None,
+    stop: Literal["interrupt", "timeout"] | None = None,
+) -> list[Final]:
     """Run one turn per script through a real SessionRunner; return each final."""
 
     remaining = list(scripts)
@@ -174,7 +216,13 @@ def _run(*scripts: list[Any], gate: ApprovalGate | None = None) -> list[Final]:
     def next_script() -> list[Any]:
         return remaining.pop(0)
 
-    fake = FakeModelSession(next_script) if gate is None else _HookedFake(next_script, gate)
+    fake: FakeModelSession
+    if gate is not None:
+        fake = _HookedFake(next_script, gate)
+    elif stop is not None:
+        fake = _StoppingFake(next_script)
+    else:
+        fake = FakeModelSession(next_script)
     runner = SessionRunner(
         session_factory=lambda: fake,
         ceiling=0,
@@ -185,6 +233,8 @@ def _run(*scripts: list[Any], gate: ApprovalGate | None = None) -> list[Final]:
         model="fake-model",
         approval_gate=gate,
     )
+    if isinstance(fake, _StoppingFake):
+        fake.stop = runner.interrupt if stop == "interrupt" else partial(runner.timeout, _EPOCH)
     finals: list[Final] = []
 
     async def go() -> None:
@@ -194,7 +244,8 @@ def _run(*scripts: list[Any], gate: ApprovalGate | None = None) -> list[Final]:
                 lines = [
                     line
                     async for line in runner.run_turn(
-                        Event(type="message", text="go", user="U0EXAMPLE1", ts=str(index))
+                        Event(type="message", text="go", user="U0EXAMPLE1", ts=str(index)),
+                        turn_epoch=_EPOCH,
                     )
                 ]
                 finals.extend(
@@ -509,3 +560,61 @@ def test_a_held_call_is_awaiting_approval_and_another_tools_error_is_still_an_er
     assert _points(reader) == {("connector", "awaiting_approval"): 1, ("connector", "error"): 1}
     warnings = _connector_warnings(caplog)
     assert [(server, tool) for server, tool, _ in warnings] == [("acme", "read_ledger")]
+
+
+def _cut_off_turn() -> list[Any]:
+    """A connector call the stop cuts off, shaped as the real CLI delivers it."""
+
+    return [
+        _use(("toolu_slow", "mcp__acme__slow_read", {"account": _ARGUMENT})),
+        _answer(("toolu_slow", _CUT_OFF_TEXT, True)),
+        ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="fake-session",
+            terminal_reason="aborted_tools",
+        ),
+    ]
+
+
+def test_a_connector_call_an_operator_stopped_counts_as_cancelled(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fake-tier twin of the real CLI's operator stop case.
+
+    ``SessionRunner.interrupt`` lands after the call reached the session and
+    before its result, where the real CLI's cut-off result lands. The turn
+    ending idle holds today. Red until the manifest declares ``cancelled`` and
+    the session records it for an errored result after an operator interrupt;
+    red again if that result counts as a connector error or logs the WARNING.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    finals = _run(_cut_off_turn(), stop="interrupt")
+
+    assert [final.status for final in finals] == [SessionStatus.IDLE_AWAITING_INPUT]
+    assert _points(reader) == {("connector", "cancelled"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_connector_call_the_turn_deadline_cut_off_is_still_a_connector_error(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fake-tier twin of the real CLI's deadline case.
+
+    ``SessionRunner.timeout`` is not an operator stop: a connector holding a
+    call to the turn's deadline is failing, so the cut-off result is a connector
+    error with its WARNING. Green today; red if the cancelled branch reads the
+    timeout's interrupt as an operator stop.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    finals = _run(_cut_off_turn(), stop="timeout")
+
+    assert [final.status for final in finals] == [SessionStatus.CLASSIFIED_FAILURE]
+    assert _points(reader) == {("connector", "error"): 1}
+    warnings = _connector_warnings(caplog)
+    assert [(server, tool) for server, tool, _ in warnings] == [("acme", "slow_read")]
