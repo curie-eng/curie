@@ -635,11 +635,16 @@ def test_capacity_wake_headers_before_runner_lock_do_not_start_turn(
 
 
 def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness) -> None:
+    """@spec ADR-0130 d1: pre-stream admission failure closes progress authority."""
+
+    from curie_worker.progress import ProgressStore, progress_id_for
+
     async def go() -> None:
         async with make_harness(
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
             capacity_wait_budget_s=1.0,
+            progress_factory=lambda redis, config: ProgressStore(redis, config),
         ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
@@ -688,6 +693,10 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
                 await owner._handle(wake_id, wake_fields)
             finally:
                 h.kernel._runner.admit_turn = real_admit  # type: ignore[method-assign]
+            progress_id = progress_id_for(kernel_module._thread_key_for(event), event.event_id)
+            progress = await ProgressStore(h.async_redis, h.config).read(progress_id)
+            assert progress is not None
+            assert progress.active_generation == 0
             assert failed_grants == [h.runner.request_epochs[0][1]]
             assert h.runner.opened == ["hello"]
             assert h.runner.queried == []

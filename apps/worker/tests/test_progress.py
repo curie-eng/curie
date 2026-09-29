@@ -76,7 +76,12 @@ from curie_worker.progress import (
     sweep_pending_progress_inboxes,
 )
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.turn_progress import ProgressPump, TurnProgressPlan, deactivate_turn_progress
+from curie_worker.turn_progress import (
+    ProgressLeaseKeeper,
+    ProgressPump,
+    TurnProgressPlan,
+    deactivate_turn_progress,
+)
 from pydantic import TypeAdapter
 from redis.asyncio import Redis as AsyncRedis
 
@@ -385,6 +390,36 @@ def test_the_live_pump_renews_its_generation_until_stopped() -> None:
         await pump.stop()
         assert len(store.renewals) >= 2
         assert set(store.renewals) == {("pid", 7)}
+
+    asyncio.run(go())
+
+
+def test_stopping_the_startup_keeper_preserves_owner_cancellation() -> None:
+    """@spec ADR-0130 d1: keeper cleanup cannot consume delivery cancellation."""
+
+    class _BlockedStore:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def renew_turn(self, progress_id: str, generation: int) -> bool:
+            del progress_id, generation
+            self.entered.set()
+            await asyncio.Event().wait()
+            return True
+
+    async def go() -> None:
+        store = _BlockedStore()
+        keeper = ProgressLeaseKeeper(  # type: ignore[arg-type]
+            store, progress_id="pid", generation=1
+        )
+        keeper.start()
+        await store.entered.wait()
+
+        owner = asyncio.create_task(keeper.stop())
+        await asyncio.sleep(0)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
 
     asyncio.run(go())
 
