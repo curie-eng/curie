@@ -78,7 +78,7 @@ REPO=curie-eng/curie
 ASSET=
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64)                 ASSET=curie-x86_64-unknown-linux-gnu ;;
-  Linux/aarch64)                ASSET=curie-aarch64-unknown-linux-gnu ;;
+  Linux/arm64|Linux/aarch64)    ASSET=curie-aarch64-unknown-linux-gnu ;;
   Darwin/arm64|Darwin/aarch64)  ASSET=curie-aarch64-apple-darwin ;;
 esac
 : "${ASSET:?no prebuilt binary for this platform; build the CLI from source in cli/}"
