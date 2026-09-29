@@ -1430,6 +1430,27 @@ This lets a developer iterate on an agent built for someone else's
 workspace with no Slack access. Full flag reference is in
 [`cli/README.md`](../cli/README.md).
 
+### What a reply says the agent changed
+
+A turn that ran a tool outside the read-only allowlist ends its reply with a
+`_What I changed:_` receipt, one line per action, each saying whether it can
+be undone ([ADR-0117](adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md)).
+How much of it the people using the install see is the chart value
+`worker.turnReceipt`
+([ADR-0180](adr/0180-the-turn-receipt-is-an-install-choice.md)):
+
+| Value | The reply ends with |
+|---|---|
+| `all` (default) | every action, each saying whether it can be undone |
+| `failures` | only the actions that reported failure, which a person should check before asking again; nothing when none failed |
+| `off` | no receipt, even when an action failed |
+
+The value changes only the reply. Every action is still recorded and readable
+through the API's `GET /actions`, and a turn that touched anything is still
+never retried automatically. It reaches the worker as `CURIE_TURN_RECEIPT`, so
+changing it rolls the workers. The chart refuses any other value at render,
+and the worker refuses one at startup.
+
 ### Connecting Slack
 
 ```bash

@@ -889,8 +889,9 @@ def test_no_edit_streaming_final_carries_the_announcement(make_harness) -> None:
 def test_announcement_sits_between_answer_and_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A unit on the composition order: answer, announcement, receipt.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows: "RECEIPT")
+    # A unit on the composition order: answer, announcement, receipt. The stub
+    # takes the install's receipt mode too (ADR-0180), which the order ignores.
+    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
     announced = kernel_module._StreamAccumulator(
         text_parts=["answer"],

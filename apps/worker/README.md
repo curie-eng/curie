@@ -377,9 +377,11 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_MAX_ATTEMPTS`, `CURIE_MAX_DELIVERY` / `CURIE_DEAD_LETTER_STREAM` /
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
 `1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
-one delivery lease TTL) and `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
-when a delivery's handler raises), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
-the substrate. Run with `python -m curie_worker`.
+one delivery lease TTL), `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
+when a delivery's handler raises) and `CURIE_TURN_RECEIPT` (what the receipt
+beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180),
+plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
+substrate. Run with `python -m curie_worker`.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose

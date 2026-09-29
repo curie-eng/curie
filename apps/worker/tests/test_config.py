@@ -299,6 +299,18 @@ _ENV_TABLE: list[_Row] = [
     # interval is shorter than the lease".
     _Row("reclaim_interval_s", "CURIE_RECLAIM_INTERVAL_S", "10", 10.0, 30.0),
     _Row("work_item_max_turns", "CURIE_WORK_ITEM_MAX_TURNS", "5", 5, 1000),
+    # The install's receipt mode (ADR-0180). The sentinel is a NON-default mode
+    # so a field that never read its alias cannot pass, and the bare decoy is a
+    # third mode so ``populate_by_name`` cannot satisfy the read either.
+    _Row(
+        "turn_receipt",
+        "CURIE_TURN_RECEIPT",
+        "failures",
+        "failures",
+        "all",
+        bare="TURN_RECEIPT",
+        bare_raw="off",
+    ),
     # --- inbound attachment lane envelope (#2567, S4) ---
     # Defaults are asserted AGAINST ``AttachmentLimits`` rather than literals:
     # two independently written copies of "32 MiB" is exactly how a chart
@@ -1342,6 +1354,75 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
     # bounded, and a zero TTL mints a capability that is already expired.
     with pytest.raises(ValidationError):
         WorkerConfig.model_validate(overrides)
+
+
+@pytest.mark.parametrize("mode", ["all", "failures", "off"])
+def test_each_turn_receipt_mode_is_read_from_its_env(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """ADR-0180 decision 1: the install chooses one of exactly three modes."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", mode)
+
+    assert WorkerConfig().turn_receipt == mode
+
+
+def test_the_turn_receipt_defaults_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An install that sets nothing keeps ADR-0117's receipt as built."""
+
+    _clear_all_config_env(monkeypatch)
+
+    assert WorkerConfig().turn_receipt == "all"
+
+
+@pytest.mark.parametrize("raw", ["ALL", "Off", "none", "failure", "true", " off", ""])
+def test_an_unknown_turn_receipt_mode_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Not a fallback to a mode nobody chose: the worker fails at config load.
+
+    Casing and whitespace are refused rather than normalized, because the chart
+    schema admits the three lowercase spellings only, and a worker that quietly
+    accepted "Off" would read a value the chart would never render.
+    """
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", raw)
+
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+
+    assert "CURIE_TURN_RECEIPT" in str(exc_info.value)
+
+
+def test_an_unknown_turn_receipt_mode_is_refused_by_field_name_too() -> None:
+    with pytest.raises(ValidationError):
+        WorkerConfig(turn_receipt="quiet")
+
+
+def test_the_chart_offers_exactly_the_turn_receipt_modes_the_worker_accepts() -> None:
+    """Two languages, one vocabulary: the chart value and the worker field.
+
+    A mode the schema admits and the worker refuses renders green and
+    crash-loops the worker; a mode the worker accepts and the schema refuses is
+    unreachable from Helm. The shipped default must agree on both sides too.
+    """
+
+    from typing import get_args
+
+    from curie_worker.receipt import TurnReceiptMode
+
+    repo_root = Path(__file__).resolve().parents[3]
+    chart = repo_root / "charts" / "curie"
+    values = yaml.safe_load((chart / "values.yaml").read_text())
+    schema = json.loads((chart / "values.schema.json").read_text())
+    offered = schema["properties"]["worker"]["properties"]["turnReceipt"]
+
+    assert offered["type"] == "string"
+    assert sorted(offered["enum"]) == sorted(get_args(TurnReceiptMode))
+    assert values["worker"]["turnReceipt"] == WorkerConfig.model_fields["turn_receipt"].default
+    assert values["worker"]["turnReceipt"] == "all"
 
 
 def test_the_chart_defaults_match_the_worker_defaults() -> None:
