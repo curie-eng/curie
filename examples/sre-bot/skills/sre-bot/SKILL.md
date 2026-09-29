@@ -418,6 +418,11 @@ in the default install.
   A request to act still gets its answer first, as above: whether you can
   comes before the marker line.
 
+  The shape holds on an alert delivery even when the message also asks you to
+  explain something -- "what does that timestamp prove?". Answer it inside the
+  verdict and `What I checked:`, in a sentence each, with no headings, bullets
+  or tables; the longer explanation waits until someone asks for it.
+
   The shape is for alerts and status checks, not for everything. A catalogue
   or listing question -- "which metrics exist", "list the alert rules" --
   still gets the complete answer, every item, under the enumeration rule in
