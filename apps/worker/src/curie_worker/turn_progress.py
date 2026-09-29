@@ -252,16 +252,35 @@ async def activate_turn_progress(
 async def deactivate_turn_progress(store: ProgressStore, plan: TurnProgressPlan) -> None:
     """Close this plan's generation without clearing a newer owner."""
 
+    cancellation: asyncio.CancelledError | None = None
     keeper = plan.lease_keeper
     plan.lease_keeper = None
     if keeper is not None:
-        await keeper.stop()
+        try:
+            await keeper.stop()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
     if plan.generation is None:
+        if cancellation is not None:
+            raise cancellation
         return
+
+    close = asyncio.create_task(store.end_turn(plan.progress_id, plan.generation))
+    while not close.done():
+        try:
+            await asyncio.shield(close)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except Exception:  # handled from task.result() below
+            break
     try:
-        await store.end_turn(plan.progress_id, plan.generation)
+        close.result()
+    except asyncio.CancelledError as exc:
+        cancellation = cancellation or exc
     except Exception:  # noqa: BLE001 - progress never fails a turn
         logger.warning("progress turn %s did not deactivate", plan.progress_id, exc_info=True)
+    if cancellation is not None:
+        raise cancellation
 
 
 def resume_event_id_for(approval_id: object) -> str:
