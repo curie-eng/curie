@@ -207,28 +207,26 @@ class SocketModeConnection(Connection):
         self._handler.client.message_listeners.append(self._on_socket_message)
 
     def _track_own_sockets_for_hello(self) -> None:
-        """Bind each hello to the number of our sockets at queue delivery.
+        """Bind each hello to the number of our sockets when the SDK receives it.
 
         Slack's hello counts every socket open at its handshake. When Slack asks
         for a refresh with a ``disconnect`` frame, slack_sdk opens the
         replacement and closes the previous socket only once the new one is up
         (``SocketModeClient.connect``, slack_sdk 3.44.1), so that hello counts
         two sockets of this one client. Listener work runs on a thread pool, so
-        preserve the count when the SDK dequeues each hello; a later reconnect
+        preserve the count when the SDK enqueues each hello; a later reconnect
         must not change the count used for an already queued message.
         """
         client = self._handler.client
         sdk_connect = client.connect
-        message_queue = getattr(client, "message_queue", None)
-        sdk_queue_get = getattr(message_queue, "get", None)
+        sdk_enqueue_message = getattr(client, "enqueue_message", None)
 
         def connect() -> None:
             self._own_sockets = 2 if client.is_connected() else 1
             sdk_connect()
 
-        def get_message(*args: Any, **kwargs: Any) -> Any:
-            assert sdk_queue_get is not None
-            raw_message = sdk_queue_get(*args, **kwargs)
+        def enqueue_message(raw_message: str) -> None:
+            assert sdk_enqueue_message is not None
             try:
                 message = (
                     json.loads(raw_message)
@@ -240,11 +238,16 @@ class SocketModeConnection(Connection):
             if isinstance(message, dict) and message.get("type") == "hello":
                 with self._hello_own_sockets_lock:
                     self._hello_own_sockets[id(raw_message)] = self._own_sockets
-            return raw_message
+            try:
+                sdk_enqueue_message(raw_message)
+            except BaseException:
+                with self._hello_own_sockets_lock:
+                    self._hello_own_sockets.pop(id(raw_message), None)
+                raise
 
         client.connect = connect  # type: ignore[method-assign]
-        if sdk_queue_get is not None and message_queue is not None:
-            message_queue.get = get_message
+        if sdk_enqueue_message is not None:
+            client.enqueue_message = enqueue_message  # type: ignore[assignment]
 
     def _on_socket_message(
         self, client: Any, message: dict[str, Any], raw_message: Any
