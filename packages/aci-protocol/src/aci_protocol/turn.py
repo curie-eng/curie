@@ -211,6 +211,11 @@ class ReplyHandle(_AciModel):
     ``adapter`` is optional at the schema so a third-party or pre-upgrade
     producer is not rejected outright, but every first-party mint site sets it
     explicitly.
+
+    ``identity`` is an optional Slack binding selector for a disconnected
+    cluster message whose reserved ``adapter`` selects reply delivery. An absent
+    value retains the default identity. Ordinary Slack turns continue to name
+    their identity in ``adapter`` (INGRESS-CANARY-1).
     """
 
     kind: str
@@ -218,6 +223,7 @@ class ReplyHandle(_AciModel):
     placeholder: str | None
     endpoint: str | None = None
     adapter: str | None = None
+    identity: str | None = None  # @spec INGRESS-CANARY-1
 
 
 class Attachment(_AciModel):
