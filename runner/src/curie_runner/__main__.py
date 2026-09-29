@@ -77,7 +77,7 @@ from .mcp_tool_capability import (
 )
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
-from .plugin import load_bundle_web_search_enabled
+from .plugin import bundle_mcp_servers, load_bundle_web_search_enabled
 from .progress import (
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -522,8 +522,9 @@ def build_runner(
     # Tell the gate whether the platform's own ``curie-state`` tools exist this
     # session (#2286 adversarial round). The toolPolicy exemption is by exact
     # live tool name, and a name the platform never published is not ours -- an
-    # ambient project ``.mcp.json`` can mount a server keyed ``curie-state``,
-    # because ``strict_mcp_config`` is off. Set AFTER construction rather than
+    # ambient server keyed ``curie-state`` would publish the same names.
+    # ``strict_mcp_config`` (#2899) now keeps ambient servers from loading at
+    # all; the exact-name rule stays as the second line. Set AFTER construction rather than
     # passed to ``build_approval_gate`` deliberately: the gate is built above at
     # the three fail-closed approval boot checks, which must raise before any
     # other boot work happens, and hoisting ``resolve_state_client`` above them
@@ -683,10 +684,16 @@ def build_runner(
             # Platform tools and connectors share the SDK MCP channel. The
             # generic policy pager is present only on an actionable surface;
             # state and publication remain independent platform capabilities.
-            mcp_servers=build_mcp_servers(
-                platform=platform_servers,
-                derived=derived_mcp_servers,
-            ),
+            mcp_servers={
+                # strict_mcp_config drops plugin-loaded servers (#2899), so the
+                # bundle's own servers ride the same channel under the name the
+                # plugin loader would have given them.
+                **bundle_mcp_servers(config.session.plugin_dir),
+                **build_mcp_servers(
+                    platform=platform_servers,
+                    derived=derived_mcp_servers,
+                ),
+            },
             can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,

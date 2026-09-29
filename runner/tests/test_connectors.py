@@ -736,10 +736,11 @@ def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The pin on the WIRING rather than the helper, through a boot env the
-    # worker really renders. The bundle's own upstream must reach the SDK on the
-    # plugins channel -- the read-only bundle directory, loaded verbatim -- and
-    # must never appear on the platform `mcp_servers` channel, which is where
-    # the servers Curie hosts and derives URLs for ride.
+    # worker really renders. The bundle's own upstream stays the bundle's: it is
+    # never hosted or given a derived URL. Under strict_mcp_config (#2899) the
+    # CLI no longer loads plugin servers itself, so it rides `mcp_servers` under
+    # the plugin loader's own name, `plugin:<bundle>:<server>`, with its config
+    # verbatim -- never as a bare-named server Curie hosts.
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     root = _bundle(tmp_path, HOSTED, mcp=UPSTREAM_MCP_JSON)
     config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
@@ -748,8 +749,9 @@ def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
     mounted = options.mcp_servers
     # Exact, not `"github-upstream" not in mounted`: an extra key of any name is
     # a server Curie would be hosting that the bundle never declared to it.
-    assert set(mounted) == {APPROVAL_SERVER_NAME, "grafana"}
+    assert set(mounted) == {APPROVAL_SERVER_NAME, "grafana", "plugin:b:github-upstream"}
     assert "svc.cluster.local" in mounted["grafana"]["url"]
+    assert mounted["plugin:b:github-upstream"] == {"type": "http", "url": UPSTREAM}
 
     # The other half of "stays external": it is not dropped either. The SDK gets
     # the bundle directory itself, and the upstream entry in it is untouched.
@@ -835,9 +837,9 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     # The #2286 adversarial round. The toolPolicy exemption stopped being "any
     # name on a platform server's prefix" -- which also exempted every tool of
     # an ambient MCP server keyed `curie__extra` or `curie-state__extra`, since
-    # `strict_mcp_config` is off and the CLI loads ambient servers beside the
-    # ones the runner mounts -- and became exact membership in the set of names
-    # Curie's own servers publish.
+    # `strict_mcp_config` was then off (#2899 turned it on) and the CLI loaded
+    # ambient servers beside the ones the runner mounts -- and became exact
+    # membership in the set of names Curie's own servers publish.
     #
     # That makes a THIRD thing capable of drifting: the exemption set and the
     # tools actually registered. So it is pinned against the live tool list the

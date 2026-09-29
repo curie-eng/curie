@@ -38,7 +38,7 @@ from plugin_format.yaml_loader import safe_load_unique
 
 from .adapter import build_options
 from .connectors import derive_mcp_servers
-from .plugin import PluginBundleError, load_plugins
+from .plugin import PluginBundleError, bundle_mcp_servers, load_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +463,10 @@ def evaluate(declared: list[dict[str, Any]], registered: list[dict[str, Any]]) -
 
     The registered list is ``McpServerStatus``-shaped. Only the bundle's **own**
     servers (``scope == "dynamic"`` or a ``plugin:``-prefixed name when scope is
-    absent) affect the verdict; ambient project/user servers never do. The rule is
+    absent) affect the verdict. Ambient project/user servers cannot appear: the
+    runner sets ``strict_mcp_config`` (#2899), so the CLI loads only the servers
+    ``_connect_and_poll`` mounts, exactly as it does for a real session. The scope
+    filter stays as a second line, not as a carve-out for servers that load. The rule is
     declared-anchored: one match row per declared server, green iff every declared
     server matched a connected own-server with at least one tool (plan Section 3).
     """
@@ -627,10 +630,12 @@ async def _connect_and_poll(plugins: list[Any], plugin_dir: str) -> list[dict[st
     """Connect a real client and poll get_mcp_status until own servers settle.
 
     Runs no query. Returns the verbatim ``mcpServers`` list once no plugin-owned
-    server is still ``pending`` (ambient servers included for transparency). The
+    server is still ``pending``. The
     caller wraps this in ``asyncio.wait_for``; ``disconnect()`` runs on every path.
 
-    The bundle's declared connectors are mounted alongside the plugins so the
+    The bundle's own servers are mounted by name (``bundle_mcp_servers``)
+    because ``strict_mcp_config`` stops the CLI loading them from the plugin,
+    and the bundle's declared connectors are mounted alongside them so the
     check actually TRIES them. There is no connector scope here (no release, no
     agent, no namespace -- this tier hosts nothing), so ``derive_mcp_servers``
     yields exactly the reachable fallback set: a remote connector's own ``url``
@@ -641,7 +646,10 @@ async def _connect_and_poll(plugins: list[Any], plugin_dir: str) -> list[dict[st
 
     options = build_options(
         plugins=plugins,
-        mcp_servers=derive_mcp_servers(plugin_dir, release=None, agent=None, namespace=None),
+        mcp_servers={
+            **bundle_mcp_servers(plugin_dir),
+            **derive_mcp_servers(plugin_dir, release=None, agent=None, namespace=None),
+        },
         model=None,
         system_prompt=None,
         max_turns=1,
