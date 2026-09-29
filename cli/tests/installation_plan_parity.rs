@@ -3303,6 +3303,55 @@ fn apply_string_egress_does_not_warn_that_model_credential_is_sealed() {
 }
 
 #[test]
+fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
+    // #1300: the declared set lane must not turn a committed credential into
+    // plain Helm argv or expose it in either operator output stream. The first
+    // four keys are the regression paths named in the issue; the last case
+    // catches token-shaped values on otherwise ordinary chart keys.
+    for (key, value) in [
+        (
+            "agentSandbox.runner.credentials",
+            "opaque-runner-placeholder",
+        ),
+        ("api.githubToken", "opaque-github-placeholder"),
+        ("dispatcher.slack.appToken", "opaque-app-placeholder"),
+        ("dispatcher.slack.botToken", "opaque-bot-placeholder"),
+        ("example.label", "sk-ant-placeholder"),
+    ] {
+        let config = format!(
+            "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  {key}: {value}\n"
+        );
+        for dry_run in [true, false] {
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+            let output = if dry_run {
+                fixture.apply_dry_run(&[])
+            } else {
+                fixture.apply(&[], &[])
+            };
+            assert!(
+                !output.status.success(),
+                "{key} must fail before {}",
+                if dry_run { "dry run" } else { "apply" }
+            );
+            let visible = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !visible.contains(value),
+                "{key} credential leaked into operator output: {visible}"
+            );
+            assert!(
+                fixture.calls().is_empty(),
+                "{key} reached Helm or kubectl before rejection: {}",
+                fixture.calls()
+            );
+        }
+    }
+}
+
+#[test]
 fn numeric_looking_declared_set_values_use_helm_string_semantics() {
     let fixture = HelmFixture::new(
         "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  example.label: plain\n  example.leadingZero: \"00123\"\n  ui.deploy: disabled\n  worker.replicas: \"3\"\n",
