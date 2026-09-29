@@ -601,6 +601,9 @@ fn valid_helm_set_path(key: &str) -> bool {
 /// allowing reference fields such as `existingSecret`, `secretName`, and
 /// `secretKey` to name Kubernetes Secret resources and entries.
 fn set_key_is_secret_bearing(key: &str) -> bool {
+    if is_current_secret_name_reference_key(key) {
+        return false;
+    }
     let reference_leaf = crate::ops::is_external_secret_ref_key(key)
         || crate::ops::is_grafana_connector_reference_key(key);
     let segments = key.split('.').collect::<Vec<_>>();
@@ -624,8 +627,51 @@ fn set_key_is_secret_bearing(key: &str) -> bool {
             || name.ends_with("secretkey")
             || name.ends_with("signingkey")
             || name.ends_with("authheader")
+            || name_is_sensitive_header(&name)
             || name == "salt"
     })
+}
+
+/// Secret resource names are safe declarations, but only for chart paths that
+/// currently consume them as Kubernetes references. Keep this allowlist
+/// narrower than the generic `*Secret` spelling so value maps such as
+/// `agentSandbox.connectorSecrets` still fail closed.
+fn is_current_secret_name_reference_key(key: &str) -> bool {
+    if key == "api.migrate.provenanceDeclarationsSecret" {
+        return true;
+    }
+
+    const IMAGE_PULL_SECRET_ROOTS: &[&str] = &[
+        "api",
+        "dispatcher",
+        "mailAdapter",
+        "worker",
+        "ui",
+        "agentSandbox.runner",
+    ];
+    IMAGE_PULL_SECRET_ROOTS.iter().any(|root| {
+        let Some(index_and_name) = key.strip_prefix(&format!("{root}.imagePullSecrets[")) else {
+            return false;
+        };
+        let Some(index) = index_and_name.strip_suffix("].name") else {
+            return false;
+        };
+        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Mirror the chart's sensitive-header name vocabulary from `_helpers.tpl`.
+/// Header names commonly use `-`/`_`, so suffix checks alone miss
+/// `Authorization`, `Proxy-Authorization`, and `X-API-Key`.
+fn name_is_sensitive_header(name: &str) -> bool {
+    let words = name.split(['-', '_']).collect::<Vec<_>>();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "authorization" | "token" | "secret" | "password" | "credential"
+        )
+    }) || words.windows(2).any(|pair| pair == ["api", "key"])
+        || name == "apikey"
 }
 
 /// This exact empty object is the chart's typed clear for the worker credential
@@ -2974,7 +3020,12 @@ mod diff_tests {
             "worker.adapterCredentials.acme",
             "agentSandbox.connectorSecrets.acme.GRAFANA_TOKEN",
             "agentSandbox.connectorSecrets.acme.APIExistingSecret",
+            "custom.imagePullSecrets[0].name",
+            "api.migrate.provenanceDeclarationsSecret.value",
             "otelCollector.otlpAuthHeader",
+            "otelCollector.extraExporters.backend.headers.Authorization",
+            "otelCollector.extraExporters.backend.headers.Proxy-Authorization",
+            "otelCollector.extraExporters.backend.headers.X-API-Key",
         ] {
             let config = format!(
                 "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  {key}: opaque-placeholder\n"
@@ -3074,6 +3125,13 @@ mod diff_tests {
             "mailAdapter.channelTokenExistingSecretKey",
             "grafanaConnector.secretName",
             "grafanaConnector.secretKey",
+            "api.migrate.provenanceDeclarationsSecret",
+            "api.imagePullSecrets[0].name",
+            "dispatcher.imagePullSecrets[0].name",
+            "mailAdapter.imagePullSecrets[0].name",
+            "worker.imagePullSecrets[0].name",
+            "ui.imagePullSecrets[0].name",
+            "agentSandbox.runner.imagePullSecrets[0].name",
         ] {
             let config = format!(
                 "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  {key}: reference-name\n"

@@ -3339,6 +3339,18 @@ fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
         ("api.githubToken", "opaque-github-placeholder"),
         ("dispatcher.slack.appToken", "opaque-app-placeholder"),
         ("dispatcher.slack.botToken", "opaque-bot-placeholder"),
+        (
+            "otelCollector.extraExporters.backend.headers.Authorization",
+            "opaque-authorization-placeholder",
+        ),
+        (
+            "otelCollector.extraExporters.backend.headers.Proxy-Authorization",
+            "opaque-proxy-authorization-placeholder",
+        ),
+        (
+            "otelCollector.extraExporters.backend.headers.X-API-Key",
+            "opaque-api-key-placeholder",
+        ),
         ("example.label", "sk-ant-placeholder"),
     ] {
         let config = format!(
@@ -3369,6 +3381,53 @@ fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
                 fixture.calls().is_empty(),
                 "{key} reached Helm or kubectl before rejection: {}",
                 fixture.calls()
+            );
+        }
+    }
+}
+
+#[test]
+fn documented_secret_name_references_reach_dry_run_and_apply() {
+    for key in [
+        "api.migrate.provenanceDeclarationsSecret",
+        "api.imagePullSecrets[0].name",
+        "agentSandbox.runner.imagePullSecrets[0].name",
+    ] {
+        let config = format!(
+            "{}set:\n  {key}: reference-name\n",
+            installation_for_the_stateful_guard()
+        );
+        for dry_run in [true, false] {
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+            let output = if dry_run {
+                fixture.apply_dry_run(&[])
+            } else {
+                fixture.apply(&[], &[])
+            };
+            assert!(
+                output.status.success(),
+                "{key} reference failed during {}:\n{}{}",
+                if dry_run { "dry run" } else { "apply" },
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let observed = if dry_run {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            } else {
+                fixture.calls()
+            };
+            let expected = if dry_run {
+                format!("{key}=")
+            } else {
+                format!("{key}=reference-name")
+            };
+            assert!(
+                observed.contains(&expected),
+                "{key} reference did not reach the Helm plan: {observed}"
             );
         }
     }
