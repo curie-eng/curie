@@ -298,7 +298,9 @@ assert "/var/log/pods/" in alloy_content, "Alloy must discover Kubernetes pod lo
 
 assert at(prometheus_values, "alertmanager", "enabled") is False
 assert at(prometheus_values, "prometheus-pushgateway", "enabled") is False
-assert at(prometheus_values, "configmapReload", "prometheus", "enabled") is False
+assert at(prometheus_values, "configmapReload", "prometheus", "enabled") is True, (
+    "Prometheus must reload chart-managed rule ConfigMap changes without a manual restart"
+)
 assert_quantity(at(prometheus_values, "server", "persistentVolume", "size"), "8Gi", "Prometheus PVC")
 assert "storageClass" not in at(prometheus_values, "server", "persistentVolume"), (
     "Prometheus must defer storage class selection to the cluster default"
