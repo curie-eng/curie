@@ -73,7 +73,8 @@ Three models carry them:
 - `ProgressCommand` is what a model submits through the platform's
   `curie_progress` tool: `version` (`"1.0"`), `update_id`, `state`, `summary`
   and an optional `milestone`. `update_id` is 1 to 64 characters of letters,
-  digits, `.`, `_`, `:` and `-`, and identifies one update for idempotency. The
+  digits, `.`, `_`, `:` and `-`, starting with a letter or digit, and
+  identifies one update for idempotency. The
   model is closed: a command naming a channel kind, channel address, reply
   ref, endpoint, credential, adapter payload, delivery id, progress record or
   milestone budget is refused, not ignored. It names no progress record at
