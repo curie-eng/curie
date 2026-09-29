@@ -59,7 +59,12 @@ conversation, reconstructed through the selected harness adapter.
   reconstructs the ordered portable prefix. The Claude adapter prefers an
   optional native checkpoint so its exact
   cache-breakpoint shape survives; without one it materializes deterministic
-  provider-local entries from role/content. The fake consumes the same portable prefix, and a
+  provider-local entries from role/content. It restores a checkpoint only when
+  every system prompt the checkpoint recorded is the one this boot composed:
+  the Claude CLI resends a recorded prompt on resume instead of the one it is
+  given, so a checkpoint from an earlier prompt would hide this turn's
+  attachments, new memory, or a redeployed bundle prompt. A checkpoint recorded
+  under another prompt is set aside and the portable prefix is materialized. The fake consumes the same portable prefix, and a
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
