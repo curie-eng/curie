@@ -1462,14 +1462,16 @@ The path, and what an operator can check on each hop:
 
 1. **The capability.** For a person's Slack turn (and the approval resume of
    one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
-   allocates a durable generation and marks it active with a Valkey-server-time
-   deadline equal to the runner request ceiling plus 30 seconds. It mints a
+   allocates a durable generation and marks it active with a five-second lease
+   on Valkey's server clock. The live pump renews only that active, unexpired
+   generation; a missed lease cannot be revived. It mints a
    sandbox token with scope `turn.progress`, bound to
    `progress_id:generation`. It sends token, URL, and generation to the runner.
    Jobs, cron and targetless hook turns, factory executions and
    `curie cluster message` relay turns get neither the boot flag nor the
-   model-visible tool/prompt. Sandbox reuse compares the flag, so eligibility
-   cannot be inherited from an earlier occupant.
+   model-visible tool/prompt. The route record persists whether the sandbox
+   booted with the flag, and sandbox reuse compares both directions, so
+   eligibility cannot be inherited from an earlier occupant.
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
    The API accepts only a `turn.progress` token whose subject matches the path

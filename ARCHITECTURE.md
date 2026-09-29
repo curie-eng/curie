@@ -396,14 +396,14 @@ The report never rides the ACI stream: tool notes stay internal telemetry, and
 the frozen ACI is unchanged. Instead the kernel boots only an eligible human
 Slack thread (or its approval resume) with a direct runner eligibility fact, so
 other sessions mount neither the tool nor its prompt. It durably allocates and
-activates a monotonically increasing chain generation with a bounded
-server-time deadline, then sends a `turn.progress` sandbox token bound to
+activates a monotonically increasing chain generation with a short renewable
+server-time lease, then sends a `turn.progress` sandbox token bound to
 `progress_id:generation`, the
 generation, and the URL as runner control headers on `POST /v1/event`
 ([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
 The runner's platform `progress` tool posts each command to the API with it
 ([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).
-The API verifies the token, active generation and deadline, rate limits it, and atomically
+The API verifies the token and renewable active-generation lease, rate limits it, and atomically
 appends the command to the chain's inbox stream and durable pending-inbox index
 ([`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`](apps/api/src/curie_api/routers/turn_progress.py)).
 While the kernel consumes the turn, a per-turn pump applies the inbox to the

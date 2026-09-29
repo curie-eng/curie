@@ -98,9 +98,10 @@ on `POST /v1/event` in three runner control headers, `X-Curie-Progress-Url`,
 next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
 fields. The token is signed for `progress_id:generation`, and the API also
 checks that the same generation is still active and before its bounded
-server-time deadline before it appends anything. The deadline is the runner
-request ceiling plus 30 seconds, so a failed turn-end clear cannot leave a
-24-hour token usable.
+server-time lease before it appends anything. The worker renews that five-second
+lease while the stream is open, and cannot revive a missed lease, so a failed
+turn-end clear loses authority promptly rather than leaving a 24-hour token
+usable.
 The runner holds the three values only while that turn is open, sets them when
 the turn starts and clears them when it ends, so a steer uses the turn's
 capability and a closed or superseded turn cannot enqueue. The names are frozen
