@@ -61,7 +61,7 @@ from curie_worker.sandbox import (
     SandboxSubstrate,
     SubstrateConfig,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxTermination, SandboxView
+from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -447,7 +447,7 @@ class FakeK8s:
     ready_reason: str | None = None
     ready_message: str | None = None
     unschedulable_message: str | None = None
-    termination: SandboxTermination | None = None
+    termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
@@ -594,7 +594,7 @@ class FakeK8s:
 
     def pod_termination(
         self, name: str, *, request_timeout_seconds: float, since: datetime
-    ) -> SandboxTermination | None:
+    ) -> Any | None:
         assert request_timeout_seconds > 0
         assert since.tzinfo is not None
         self.termination_queries.append(name)
