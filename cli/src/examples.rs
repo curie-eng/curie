@@ -227,6 +227,7 @@ const PLATFORM_UPGRADE_SCRIPT: &[u8] =
 
 pub struct SreBotInstallOpts {
     pub observability: bool,
+    pub observability_only: bool,
     pub dry_run: bool,
     pub slack_channel: Option<String>,
     /// Install the upgrade path: the self-upgrade connector, the platform
@@ -264,6 +265,46 @@ impl InstallIdentity {
 pub enum SreBotInstallResult {
     DryRun(DryRunPlan),
     Installed(Box<commands::DeployOutput>),
+    ObservabilityInstalled(ObservabilityOnlyOutput),
+}
+
+pub struct ObservabilityOnlyOutput {
+    pub namespace: String,
+}
+
+impl CliOutput for ObservabilityOnlyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"observability_namespace": self.namespace, "ready": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!(
+            "SRE observability stack ready in namespace {}",
+            self.namespace
+        ));
+    }
+}
+
+pub struct SreBotRenderOpts {
+    pub out: PathBuf,
+    pub platform_upgrade: bool,
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+}
+
+pub struct SreBotRenderOutput {
+    pub path: PathBuf,
+}
+
+impl CliOutput for SreBotRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"bundle_dir": self.path, "rendered": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("SRE bot runtime bundle: {}", self.path.display()));
+    }
 }
 
 pub struct ObservabilityProvisionOpts {
@@ -540,6 +581,32 @@ fn read_access_command() -> InstallCommand {
 }
 
 pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallResult> {
+    if opts.observability_only {
+        let stack_commands = stack_install_commands(&opts.observability_namespace);
+        if opts.dry_run {
+            let mut lines = vec![format!(
+                "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
+                opts.observability_namespace
+            )];
+            lines.extend(
+                stack_commands
+                    .iter()
+                    .map(|command| command.display(Path::new("charts/curie"))),
+            );
+            return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
+        }
+        preflight_capacity(&opts.observability_namespace).await?;
+        ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+        let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
+        for command in &stack_commands {
+            run_install_command(command, &workspace, Path::new("charts/curie")).await?;
+        }
+        return Ok(SreBotInstallResult::ObservabilityInstalled(
+            ObservabilityOnlyOutput {
+                namespace: opts.observability_namespace,
+            },
+        ));
+    }
     if !opts.observability {
         return Err(crate::exit::usage(
             "the SRE bot example installer currently requires --observability",
@@ -717,6 +784,75 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     )
     .await?;
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
+}
+
+pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
+    if opts.out.exists() {
+        return Err(crate::exit::usage(format!(
+            "render output {} already exists; choose a new directory",
+            opts.out.display()
+        )));
+    }
+    let tempo_digest = resolve_tempo_index_digest().await?;
+    let upgrade_digest = if opts.platform_upgrade {
+        Some(resolve_index_digest(SELF_UPGRADE_IMAGE_REPOSITORY, SELF_UPGRADE_IMAGE_TAG).await?)
+    } else {
+        None
+    };
+    let identity = InstallIdentity {
+        namespace: opts.namespace,
+        release: opts.release,
+        observability_namespace: opts.observability_namespace,
+    };
+    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
+    if let Some(parent) = opts
+        .out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating SRE bot render parent {}", parent.display()))?;
+    }
+    std::fs::create_dir(&opts.out)
+        .with_context(|| format!("creating SRE bot render output {}", opts.out.display()))?;
+    let copy_result = (|| -> Result<()> {
+        for (name, _) in BUNDLE_FILES {
+            if upgrade_digest.is_none()
+                && matches!(
+                    *name,
+                    "manifests/upgrade-role.yaml" | "manifests/platform-upgrade-role.yaml"
+                )
+            {
+                continue;
+            }
+            copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+        }
+        if upgrade_digest.is_some() {
+            for name in [
+                "manifests/platform-upgrade-configmap.yaml",
+                "manifests/platform-upgrade-cronjob.yaml",
+            ] {
+                copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = copy_result {
+        let _ = std::fs::remove_dir_all(&opts.out);
+        return Err(err);
+    }
+    Ok(SreBotRenderOutput { path: opts.out })
+}
+
+fn copy_rendered_file(source_root: &Path, out: &Path, name: &str) -> Result<()> {
+    let target = out.join(name);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(source_root.join(name), &target)
+        .with_context(|| format!("copying rendered SRE bot file {name}"))?;
+    Ok(())
 }
 
 pub fn observability_provision_plan(

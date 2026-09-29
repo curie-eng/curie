@@ -232,6 +232,12 @@
       "version": "1.0"
     },
     {
+      "result": "ObservabilityOnlyOutput",
+      "kind": "CliOutput",
+      "schema": "observability-only.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityMetricsOutput",
       "kind": "CliOutput",
       "schema": "observability-metrics.schema.json",
@@ -331,6 +337,12 @@
       "result": "HookFireOutput",
       "kind": "CliOutput",
       "schema": "hook-fire.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "SreBotRenderOutput",
+      "kind": "CliOutput",
+      "schema": "sre-bot-render.schema.json",
       "version": "1.0"
     },
     {
