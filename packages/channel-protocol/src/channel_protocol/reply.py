@@ -24,6 +24,39 @@ Two contracts an adapter must build against:
 
 ``reply_ref`` is OPAQUE and adapter-minted: Slack's is the placeholder ``ts``,
 email's is the upstream message id. The platform never parses it.
+
+Two wire versions, and a body carries the one it needs (ADR-0130 section 4):
+
+- **1.0** (``REPLY_WIRE_VERSION``) is every form above. The models are closed,
+  so an adapter built against 1.0 refuses any body carrying a field it does not
+  model. Every 1.0 body therefore serializes exactly as it did before 1.1
+  existed: an absent 1.1 field is omitted from the body, never sent as null.
+- **1.1** (``PROGRESS_REPLY_WIRE_VERSION``) adds two optional fields to
+  ``reply.update`` and ``reply.post`` and changes nothing else.
+  ``delivery_id`` is a canonical lowercase UUID the platform mints for one
+  externally visible operation (one post, or one edit of a posted message), and
+  it is the adapter's idempotency key for that operation: a retry of an
+  ambiguous attempt carries the same ``delivery_id``, so the adapter adopts the
+  earlier result instead of posting twice. It flows OUTBOUND, platform to
+  adapter, and is unrelated to the inbound ``delivery_id`` an adapter sends to
+  ``POST /channels/turns`` to name its own upstream message. ``progress`` is
+  the rendering-free progress payload from ``channel_protocol.progress``: a
+  ``ProgressCard`` on ``reply.update`` or ``reply.post``, or a
+  ``ProgressMilestone`` on ``reply.post``.
+
+The version is ``"1.1"`` exactly when the body carries ``delivery_id``, and a
+body carrying ``progress`` carries ``delivery_id``. ``turn.status`` and
+``turn.completed`` have no 1.1 field and are 1.0 only. A body that breaks either
+rule is refused at validation, so no producer can put a 1.1 version on a body a
+1.0 adapter could otherwise have read, or a 1.1 field on a body labelled 1.0.
+
+A progress body is never an answer (ADR-0130 section 5). A ``reply.update``
+carrying ``progress`` carries no ``text``, ``message``, ``settled`` or ``nav``,
+so an adapter that switches on ``progress`` first never mistakes a card edit for
+answer text. A ``reply.post`` carrying ``progress`` still carries its
+``message``, whose ``text`` is the mandatory plain-text fallback, and that
+message has no ``interaction``: the approval card remains the only actionable
+platform message (ADR-0130 section 3).
 """
 
 from typing import Annotated, Literal
