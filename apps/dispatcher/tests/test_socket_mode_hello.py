@@ -136,6 +136,17 @@ def _connected(logger: logging.Logger) -> SocketModeConnection:
     return conn
 
 
+def _refresh_socket(client: Any) -> Any:
+    previous = client.current_session
+    client.enqueue_message(json.dumps({"type": "disconnect", "reason": "refresh_requested"}))
+    deadline = time.monotonic() + 5
+    while client.current_session is previous and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.current_session is not previous, "the SDK did not refresh its socket"
+    assert previous is not None and not previous.is_active()
+    return client.current_session
+
+
 def test_hello_after_a_slack_refresh_does_not_count_this_clients_previous_socket(
     offline_socket_mode: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -155,11 +166,8 @@ def test_hello_after_a_slack_refresh_does_not_count_this_clients_previous_socket
     previous = client.current_session
     try:
         with caplog.at_level(logging.WARNING):
-            deliver_frames(
-                client,
-                {"type": "disconnect", "reason": "refresh_requested"},
-                {"type": "hello", "num_connections": 2},
-            )
+            _refresh_socket(client)
+            deliver_frames(client, {"type": "hello", "num_connections": 2})
 
         assert client.current_session is not previous, "the SDK did not replace its socket"
         assert previous is not None and not previous.is_active()
@@ -197,15 +205,8 @@ def test_queued_refresh_hello_uses_its_own_socket_count_after_a_later_reconnect(
     client.message_listeners.append(mark_delivery)
     try:
         with caplog.at_level(logging.WARNING):
-            client.enqueue_message(
-                json.dumps({"type": "disconnect", "reason": "refresh_requested"})
-            )
-            deadline = time.monotonic() + 5
-            while client.current_session is original and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert client.current_session is not original, "the SDK did not refresh its socket"
-            replacement = client.current_session
-            assert original is not None and not original.is_active()
+            replacement = _refresh_socket(client)
+            assert client.current_session is not original
 
             client.enqueue_message(json.dumps(refresh_hello))
             assert held.wait(5), "the queued refresh hello did not reach the listener"
@@ -226,6 +227,61 @@ def test_queued_refresh_hello_uses_its_own_socket_count_after_a_later_reconnect(
         conn.close()
 
 
+def test_refresh_hello_waiting_for_sdk_dequeue_keeps_its_socket_count(
+    offline_socket_mode: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A later reconnect cannot reclassify a hello still in the SDK queue."""
+
+    monkeypatch.setenv("CURIE_RELEASE_IDENTITY", _IDENTITY)
+    conn = _connected(logging.getLogger("test-socket-mode-hello-delayed-dequeue"))
+    client = conn._handler.client
+    entered_get = threading.Event()
+    release_get = threading.Event()
+    delivered = threading.Event()
+    sdk_get = client.message_queue.get
+    refresh_hello = {"type": "hello", "num_connections": 2}
+
+    def pause_before_dequeue(*args: Any, **kwargs: Any) -> Any:
+        entered_get.set()
+        release_get.wait(5)
+        return sdk_get(*args, **kwargs)
+
+    def mark_delivery(_client: Any, message: dict[str, Any], _raw: Any) -> None:
+        if message == refresh_hello:
+            delivered.set()
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            replacement = _refresh_socket(client)
+            # Observed in slack_sdk 3.44.1 SocketModeClient.process_message:
+            # the processor calls message_queue.get(timeout=1).
+            client.message_queue.get = pause_before_dequeue
+            client.message_listeners.append(mark_delivery)
+            # Drain a get that was already in progress when the wrapper was installed.
+            client.enqueue_message(json.dumps({"type": "events_api", "probe": "drain"}))
+            assert entered_get.wait(5), "the SDK processor did not pause before dequeue"
+
+            client.enqueue_message(json.dumps(refresh_hello))
+            assert client.message_queue.qsize() >= 1, "refresh hello left the queue too soon"
+            assert replacement is not None
+            replacement.close()
+            client.connect_to_new_endpoint()
+            assert client.current_session is not replacement and client.is_connected()
+
+            release_get.set()
+            assert delivered.wait(5), "the queued refresh hello was not delivered"
+
+        assert _ONE_RELEASE_PHRASE not in _warning_text(caplog)
+    finally:
+        release_get.set()
+        client.message_queue.get = sdk_get
+        if mark_delivery in client.message_listeners:
+            client.message_listeners.remove(mark_delivery)
+        conn.close()
+
+
 def test_hello_after_a_slack_refresh_still_warns_about_a_second_client(
     offline_socket_mode: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -239,13 +295,11 @@ def test_hello_after_a_slack_refresh_still_warns_about_a_second_client(
 
     monkeypatch.setenv("CURIE_RELEASE_IDENTITY", _IDENTITY)
     conn = _connected(logging.getLogger("test-socket-mode-hello-refresh-shared"))
+    client = conn._handler.client
     try:
         with caplog.at_level(logging.WARNING):
-            deliver_frames(
-                conn._handler.client,
-                {"type": "disconnect", "reason": "refresh_requested"},
-                {"type": "hello", "num_connections": 3},
-            )
+            _refresh_socket(client)
+            deliver_frames(client, {"type": "hello", "num_connections": 3})
 
         warnings = _warning_text(caplog)
         assert _ONE_RELEASE_PHRASE in warnings
