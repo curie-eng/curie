@@ -62,6 +62,14 @@ and the reply. It may give earlier exchanges in the same thread first; judge
 only the probe it says to. Judge that one probe by the rules under Verdicts,
 or under Without a spec when it has none. Report it as round 1/1, with
 `<bundle> @ recorded` in place of the source, or `<target> @ recorded (no spec)`.
+Reply with the report directly, with no preamble or analysis before it. Its
+first line must use this exact field order so the recorded-exchange grader can
+read the verdict:
+
+```
+<target> @ recorded — round 1/1: <n> PASS · <n> FAIL · <n> UNCLEAR
+<target> @ recorded (no spec) — round 1/1: <n> PASS · <n> FAIL · <n> UNCLEAR
+```
 
 ## Where the spec comes from
 
@@ -297,7 +305,9 @@ Without a spec, grade by the rules under Without a spec instead.
   nothing about why.
 - **FAIL** if the probe timed out with no final reply.
 - **UNCLEAR**, not FAIL, for a follow-up that was not admitted (see Running a
-  campaign). Say that the target's installation must list you on its
+  campaign). This rule takes precedence over the timeout rule when the first
+  probe in the thread was answered promptly but the follow-up has no reply or
+  placeholder at all. Say that the target's installation must list you on its
   threaded-bot allowlist.
 - **UNCLEAR** when you cannot tell. Say what a person should check. Never round
   UNCLEAR to PASS.
