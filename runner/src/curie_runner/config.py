@@ -48,6 +48,10 @@ class RunnerConfig:
     connector_agent: str | None
     connector_namespace: str | None
     history_ref: str | None
+    # This turn's channel memory (#1461, ADR-0167): the binding-scoped memory
+    # namespace URL. The worker sets it only when memory writes are on and the
+    # turn has a binding; its presence mounts the remember/update/forget tools.
+    channel_memory_ref: str | None
     # Tool names whose calls require human approval (#245, ADR-0010). The
     # runner intercepts these proactively via the SDK can_use_tool callback
     # and ends the turn awaiting-approval instead of executing. Injected
@@ -158,6 +162,7 @@ class RunnerConfig:
             connector_agent=boot.connector_agent,
             connector_namespace=boot.connector_namespace,
             history_ref=boot.history_ref,
+            channel_memory_ref=boot.channel_memory_ref,
             approval_required_tools=boot.approval_required_tools,
             approval_grant_tool=boot.approval_grant_tool,
             approval_grant_arguments=boot.approval_grant_arguments,

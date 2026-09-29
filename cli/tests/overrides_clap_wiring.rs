@@ -27,7 +27,11 @@
 //! cluster tier MUST still be given explicit `--api-url`/`--api-key`, since
 //! `resolve_cluster_conn` otherwise shells out to `kubectl` to discover them.
 
+mod support;
+
 use std::process::Command;
+
+use support::{serve, Response};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -365,5 +369,311 @@ fn execution_deadline_above_the_maximum_is_refused_client_side() {
     assert!(
         !output.status.success(),
         "a deadline above 10800 seconds must be refused before any request"
+    );
+}
+
+// --- `--memory-writes on|off` (issue #1461) ---------------------------------
+//
+// `memory_writes` is a NOT NULL boolean on the agent, so the flag takes an
+// explicit `on`/`off` and the PATCH body carries a JSON BOOLEAN under
+// `memory_writes` -- never the strings "on"/"off", and never null.
+
+fn usage_refused(argv: &[&str]) {
+    let output = Command::new(bin())
+        .args(argv)
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")));
+    assert!(
+        !output.status.success(),
+        "curie {} must be refused; stdout: {}",
+        argv.join(" "),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn local_overrides_memory_writes_on_sends_json_true() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": true}),
+        "--memory-writes on must send a JSON boolean true under its own key: {plan}"
+    );
+}
+
+#[test]
+fn local_overrides_memory_writes_off_sends_json_false() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": false}),
+        "--memory-writes off must send a JSON boolean false, not null: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_memory_writes_on_sends_json_true() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": true}),
+        "--memory-writes on must send a JSON boolean true under its own key: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_memory_writes_off_sends_json_false() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": false}),
+        "--memory-writes off must send a JSON boolean false, not null: {plan}"
+    );
+}
+
+#[test]
+fn memory_writes_combines_with_model_under_separate_keys() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--model",
+        MODEL_SENTINEL,
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"model": MODEL_SENTINEL, "memory_writes": true}),
+        "each flag must land under its own body key: {plan}"
+    );
+}
+
+#[test]
+fn memory_writes_rejects_a_value_other_than_on_or_off_at_both_tiers() {
+    // Anchor: the flag exists and takes `on`. Without this the refusals below
+    // would pass vacuously against a binary that has no --memory-writes at all.
+    dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    for value in ["yes", "true", "1", ""] {
+        usage_refused(&[
+            "local",
+            "overrides",
+            "deal-desk",
+            "--memory-writes",
+            value,
+            "--dry-run",
+            "--json",
+        ]);
+        usage_refused(&[
+            "cluster",
+            "overrides",
+            "deal-desk",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+            "--memory-writes",
+            value,
+            "--dry-run",
+            "--json",
+        ]);
+    }
+}
+
+#[test]
+fn memory_writes_without_a_value_is_refused() {
+    // Anchor, as above: `off` must parse before a bare flag's refusal means anything.
+    dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    usage_refused(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "--dry-run",
+        "--json",
+    ]);
+}
+
+// --- overrides output reports memory_writes (issue #1461, fix round 2 G5) ---
+//
+// Like model and thinking, the switch is part of what `overrides` shows: an
+// inspect (no change flags) reports it as stored, `--json` carries it as a
+// boolean, and a write reports the value the API stored. Driven through the
+// binary against the wire-level test server so the clap layer, the handler and
+// the renderer are all on the path.
+
+const MW_AGENT_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+fn mw_agent_json(memory_writes: bool) -> String {
+    format!(
+        r##"{{"id":"{MW_AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":{memory_writes}}}"##
+    )
+}
+
+fn mw_server(stored: bool, after_patch: bool) -> support::MockServer {
+    serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, &format!("[{}]", mw_agent_json(stored))),
+        ("PATCH", p) if *p == format!("/agents/{MW_AGENT_ID}") => {
+            Response::json(200, &mw_agent_json(after_patch))
+        }
+        _ => Response::json(404, r#"{"detail":"not found"}"#),
+    })
+}
+
+fn run_against(base_url: &str, rest: &[&str]) -> (String, String) {
+    let mut argv: Vec<&str> = vec!["local", "overrides", "deal-desk"];
+    argv.extend(rest);
+    argv.extend(["--api-url", base_url, "--api-key", "k"]);
+    let output = Command::new(bin())
+        .args(&argv)
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")));
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "curie {} must exit 0; stdout: {stdout}; stderr: {stderr}",
+        argv.join(" ")
+    );
+    (stdout, stderr)
+}
+
+fn json_of(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one JSON object: {e}; stdout: {stdout}"))
+}
+
+#[test]
+fn overrides_inspect_json_includes_memory_writes_on() {
+    let server = mw_server(true, true);
+    let (stdout, _) = run_against(&server.base_url, &["--json"]);
+    let json = json_of(&stdout);
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(true)),
+        "inspect --json must carry memory_writes as a boolean: {json}"
+    );
+    assert_eq!(json["model"], "kimi-k2", "{json}");
+    assert_eq!(json["thinking"], "adaptive", "{json}");
+    assert_eq!(json["changed"], false, "{json}");
+    assert!(
+        server.recorded().iter().all(|r| r.method == "GET"),
+        "an inspect must not write"
+    );
+}
+
+#[test]
+fn overrides_inspect_json_includes_memory_writes_off() {
+    let server = mw_server(false, false);
+    let (stdout, _) = run_against(&server.base_url, &["--json"]);
+    let json = json_of(&stdout);
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(false)),
+        "off is false, not null or absent: {json}"
+    );
+}
+
+#[test]
+fn overrides_inspect_text_shows_memory_writes() {
+    let on = mw_server(true, true);
+    let (stdout, stderr) = run_against(&on.base_url, &[]);
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains("memory writes on"),
+        "inspect must show the switch beside model and thinking: {text}"
+    );
+    let off = mw_server(false, false);
+    let (stdout, stderr) = run_against(&off.base_url, &[]);
+    let text = format!("{stdout}{stderr}");
+    assert!(text.contains("memory writes off"), "{text}");
+}
+
+#[test]
+fn overrides_write_reports_the_stored_memory_writes() {
+    let server = mw_server(false, true);
+    let (stdout, _) = run_against(&server.base_url, &["--memory-writes", "on", "--json"]);
+    let json = json_of(&stdout);
+    assert_eq!(json["changed"], true, "{json}");
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(true)),
+        "a write reports memory_writes as the API stored it: {json}"
+    );
+}
+
+#[test]
+fn overrides_write_of_another_field_still_reports_memory_writes() {
+    let server = mw_server(true, true);
+    let (stdout, _) = run_against(&server.base_url, &["--model", MODEL_SENTINEL, "--json"]);
+    let json = json_of(&stdout);
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(true)),
+        "{json}"
     );
 }

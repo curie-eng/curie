@@ -215,6 +215,11 @@
       "omissions": []
     },
     {
+      "struct": "MemoryGuidance",
+      "schema": "MemoryGuidanceOut",
+      "omissions": []
+    },
+    {
       "struct": "Bundle",
       "schema": "BundleOut",
       "omissions": [
@@ -409,6 +414,7 @@
         {"field": "execution_deadline_seconds", "why": "Execution deadline belongs to the overrides command."},
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
+        {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
@@ -447,6 +453,11 @@
     {
       "output": "ApprovalsOutput",
       "struct": "ApprovalRecord",
+      "omissions": []
+    },
+    {
+      "output": "MemoryGuidanceOutput",
+      "struct": "MemoryGuidance",
       "omissions": []
     },
     {

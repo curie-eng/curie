@@ -223,6 +223,36 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
         assert client.delete(f"/agents/{aid}/state/{ns}/k", headers=headers).status_code == 403
 
 
+def test_app_scoped_token_is_refused_on_binding_scoped_memory(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #1461: channel memory lives at /state/bindings/<kind>/<address>/memory and
+    # holds facts the prompt treats as remembered. The bundle's narrow state.app
+    # token must be fenced off it exactly as off agent memory, on every verb,
+    # while the broad state token (the runner's memory token) still reaches it.
+    aid = _agent(client, auth_headers)
+    app = mint(get_settings().api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
+    broad = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE)
+    base = f"/agents/{aid}/state/bindings/slack/C000000S01/memory"
+    fact = f"{base}/fact-{'a' * 32}"
+    headers = {"X-API-Key": app}
+
+    put = client.put(fact, json={"value": {"statement": "x"}}, headers=headers)
+    assert put.status_code == 403, put.text
+    assert "reserved" in put.text
+    assert client.get(fact, headers=headers).status_code == 403
+    assert client.get(base, headers=headers).status_code == 403
+    assert (
+        client.post(f"{base}/log/append", json={"item": 1}, headers=headers).status_code
+        == 403
+    )
+    assert client.delete(fact, headers=headers).status_code == 403
+
+    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": broad})
+    assert ok.status_code == 200, ok.text
+    assert client.get(fact, headers={"X-API-Key": broad}).status_code == 200
+
+
 def test_namespace_enumeration_hides_reserved_from_the_app_token(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
