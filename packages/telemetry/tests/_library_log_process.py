@@ -17,7 +17,7 @@ import os
 from collections.abc import Callable
 
 SCENARIO_ENV = "CURIE_LIBRARY_LOG_SCENARIO"
-PLANTED_SECRET_ENV = "CURIE_LIBRARY_LOG_PLANTED_SECRET"
+PLANTED_PROBE_ENV = "CURIE_LIBRARY_LOG_PLANTED_PROBE"
 
 WARNING_CARRIER = "library warning probe 2535"
 INFO_CARRIER = "library info probe 2535"
@@ -33,8 +33,10 @@ _SERVICE_LOGGERS = {
 
 
 def _emit_configured(service_logger: str) -> None:
-    secret = os.environ[PLANTED_SECRET_ENV]
-    logging.getLogger(LIBRARY_LOGGER).warning(WARNING_CARRIER + ": credential=%s", secret)
+    logging.getLogger(LIBRARY_LOGGER).warning(
+        WARNING_CARRIER + ": credential=%s",
+        os.environ[PLANTED_PROBE_ENV],
+    )
     logging.getLogger(LIBRARY_LOGGER).info(INFO_CARRIER)
     logging.getLogger(service_logger).info(SERVICE_CARRIER)
     raise SystemExit(0)
@@ -76,7 +78,7 @@ def _arm(scenario: str) -> Callable[[], None]:
 def _unconfigured() -> None:
     logging.getLogger(LIBRARY_LOGGER).warning(
         WARNING_CARRIER + ": credential=%s",
-        os.environ[PLANTED_SECRET_ENV],
+        os.environ[PLANTED_PROBE_ENV],
     )
     raise SystemExit(0)
 

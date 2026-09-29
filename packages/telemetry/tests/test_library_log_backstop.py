@@ -126,7 +126,7 @@ def driver_env(scenario: str, **extra: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "CURIE_LIBRARY_LOG_SCENARIO": scenario,
-        "CURIE_LIBRARY_LOG_PLANTED_SECRET": PLANTED_CHANNEL_TOKEN,
+        "CURIE_LIBRARY_LOG_PLANTED_PROBE": PLANTED_CHANNEL_TOKEN,
     }
     env.update(extra)
     return env
