@@ -43,6 +43,22 @@ def test_platform_approval_tool_is_idempotent_under_any_harness() -> None:
     assert not classifier.is_side_effecting(approval_tool)
 
 
+def test_platform_progress_tool_is_idempotent_under_any_harness() -> None:
+    """A factory execution's ``report_progress`` call (#3077) never acts on the world.
+
+    It reports a phase to the status card, so a repeat on retry duplicates nothing
+    real. Flagging it disarmed the automatic retry of every factory turn that had
+    reported progress, and put a changed-nothing call on the turn's receipt (#3464).
+    The name comes from the constant that mounts the tool, so the two cannot drift.
+    """
+
+    from curie_runner.approval import PROGRESS_TOOL_NAME
+
+    assert PROGRESS_TOOL_NAME in PLATFORM_IDEMPOTENT_TOOLS
+    classifier = SideEffectClassifier(["read"])
+    assert not classifier.is_side_effecting(PROGRESS_TOOL_NAME)
+
+
 def test_opencode_named_read_only_tools_do_not_flag() -> None:
     """#308 regression: a second harness declares lowercase read-only names.
 
