@@ -394,17 +394,22 @@ def test_the_live_pump_renews_its_generation_until_stopped() -> None:
     asyncio.run(go())
 
 
-def test_stopping_the_startup_keeper_preserves_owner_cancellation() -> None:
-    """@spec ADR-0130 d1: keeper cleanup cannot consume delivery cancellation."""
+def test_cancelled_deactivation_closes_generation_before_propagating() -> None:
+    """@spec ADR-0130 d1: cancellation propagates only after the close attempt."""
 
     class _BlockedStore:
         def __init__(self) -> None:
             self.entered = asyncio.Event()
+            self.ended: list[tuple[str, int]] = []
 
         async def renew_turn(self, progress_id: str, generation: int) -> bool:
             del progress_id, generation
             self.entered.set()
             await asyncio.Event().wait()
+            return True
+
+        async def end_turn(self, progress_id: str, generation: int) -> bool:
+            self.ended.append((progress_id, generation))
             return True
 
     async def go() -> None:
@@ -413,13 +418,23 @@ def test_stopping_the_startup_keeper_preserves_owner_cancellation() -> None:
             store, progress_id="pid", generation=1
         )
         keeper.start()
+        plan = TurnProgressPlan(
+            progress_id="pid",
+            thread_key="thread",
+            root_event_id="root",
+            generation=1,
+            lease_keeper=keeper,
+        )
         await store.entered.wait()
 
-        owner = asyncio.create_task(keeper.stop())
+        owner = asyncio.create_task(
+            deactivate_turn_progress(store, plan)  # type: ignore[arg-type]
+        )
         await asyncio.sleep(0)
         owner.cancel()
         with pytest.raises(asyncio.CancelledError):
             await owner
+        assert store.ended == [("pid", 1)]
 
     asyncio.run(go())
 
