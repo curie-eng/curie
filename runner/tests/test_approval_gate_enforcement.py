@@ -59,7 +59,9 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk.types import (
     PermissionResultAllow,
@@ -1143,11 +1145,12 @@ def _collect(session: FakeModelSession) -> list[Any]:
     return anyio.run(go)
 
 
-def test_fake_session_stops_replaying_after_an_interrupting_deny() -> None:
-    # revert: FakeModelSession._apply_gate ignores the PermissionResultDeny result
-    # -> the offline tier keeps replaying past a call the real SDK would have
-    # aborted, so the fake/CI/chart-default path stops modelling the gate it is
-    # supposed to prove (the tier-parity rule).
+def test_fake_can_use_tool_interrupt_delivers_denied_result_then_terminal() -> None:
+    # Measured with claude-agent-sdk 0.2.159 / bundled CLI 2.1.281 (#3487):
+    # can_use_tool interrupt=True delivers an is_error tool result with the
+    # CLI's rejection text, then an error_during_execution terminal. The tool
+    # is not executed. A fake that merely truncates after tool_use misses the
+    # closing side-effect flag and approval-result accounting.
     sentinel = "MUST-NOT-REPLAY-AFTER-INTERRUPTING-DENY"
     gate = ApprovalGate(required=frozenset({"Bash"}))
     script = [
@@ -1169,15 +1172,66 @@ def test_fake_session_stops_replaying_after_an_interrupting_deny() -> None:
     session = FakeModelSession(lambda: script, can_use_tool=_recording_deny(gate, interrupt=True))
     messages = _collect(session)
 
-    texts = [
-        block.text
-        for message in messages
-        if isinstance(message, AssistantMessage)
-        for block in message.content
-        if isinstance(block, TextBlock)
+    assert len(messages) == 3
+    assert messages[0] is script[0]
+    assert isinstance(messages[1], UserMessage)
+    assert isinstance(messages[1].content, list)
+    assert len(messages[1].content) == 1
+    denied_result = messages[1].content[0]
+    assert isinstance(denied_result, ToolResultBlock)
+    assert denied_result.tool_use_id == "t1"
+    assert denied_result.is_error is True
+    assert denied_result.content == (
+        "The user doesn't want to proceed with this tool use. The tool use was rejected."
+    )
+    assert isinstance(messages[2], ResultMessage)
+    assert messages[2].subtype == "error_during_execution"
+    assert messages[2].is_error is True
+    assert gate.pending_summary is not None
+
+
+def test_fake_pre_tool_use_interrupt_delivers_hook_error_then_hook_stopped() -> None:
+    # The same pinned real CLI (#3487) delivers a hook-shaped is_error result
+    # before a success terminal with terminal_reason=hook_stopped. Inject only
+    # Curie's in-process approval hook; fake mode must not execute a bundle's
+    # command hooks or make a network/model call.
+    sentinel = "MUST-NOT-REPLAY-AFTER-HOOK-DENY"
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="hook-t1", name="Bash", input={"command": "x"})], model="m"
+        ),
+        AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
+        ),
     ]
-    assert sentinel not in texts
-    assert not any(isinstance(m, ResultMessage) for m in messages)
+
+    session = FakeModelSession(lambda: script, pre_tool_use_hook=_hook_callback(gate))
+    messages = _collect(session)
+
+    assert len(messages) == 3
+    assert messages[0] is script[0]
+    assert isinstance(messages[1], UserMessage)
+    assert isinstance(messages[1].content, list)
+    assert len(messages[1].content) == 1
+    denied_result = messages[1].content[0]
+    assert isinstance(denied_result, ToolResultBlock)
+    assert denied_result.tool_use_id == "hook-t1"
+    assert denied_result.is_error is True
+    assert isinstance(denied_result.content, str)
+    assert denied_result.content.startswith("PreToolUse:Bash hook error: ")
+    assert "human approval" in denied_result.content
+    assert isinstance(messages[2], ResultMessage)
+    assert messages[2].subtype == "success"
+    assert messages[2].is_error is False
+    assert messages[2].terminal_reason == "hook_stopped"
     assert gate.pending_summary is not None
 
 

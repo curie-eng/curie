@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from claude_agent_sdk import (
@@ -22,7 +22,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
+from claude_agent_sdk.types import (
+    CanUseTool,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 
 from .adapter import PartialMessageBoundary
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
@@ -39,6 +43,7 @@ def _result(
     is_error: bool = False,
     subtype: str = "success",
     usage: dict[str, Any] | None = None,
+    terminal_reason: str | None = None,
 ) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
@@ -49,6 +54,7 @@ def _result(
         session_id="fake-session",
         result=text,
         usage=usage,
+        terminal_reason=terminal_reason,
     )
 
 
@@ -181,7 +187,9 @@ class FakeModelSession:
     turn still surfaces the tool note it would in production. Defaults None, so
     a fake constructed without it behaves exactly as before. Bundle PreToolUse
     command hooks (#272) are NOT run here: they shell out and would break the
-    fake's offline no-op guarantee.
+    fake's offline no-op guarantee. Tests may inject Curie's in-process
+    ``pre_tool_use_hook`` callback explicitly to exercise the real hook decision
+    shape without running bundle code.
     """
 
     def __init__(
@@ -190,6 +198,10 @@ class FakeModelSession:
         *,
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
+        pre_tool_use_hook: Callable[
+            [Any, str | None, Any], Awaitable[dict[str, Any]]
+        ]
+        | None = None,
         approval_gate: ApprovalGate | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
@@ -198,6 +210,7 @@ class FakeModelSession:
         self._script_factory = script_factory or self._default_script
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
+        self._pre_tool_use_hook = pre_tool_use_hook
         self._emit_partial_boundaries = emit_partial_boundaries
         self._disallowed_tools = tuple(disallowed_tools or ())
         # The shared policy gate (#561): a scripted request_approval block must
@@ -250,10 +263,14 @@ class FakeModelSession:
         for message in self._script_factory():
             if self._interrupted and self._truncate_on_interrupt:
                 return
-            await self._apply_gate(message)
+            denied_messages = await self._apply_gate(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
                 yield PartialMessageBoundary(event_type="message_start")
             yield message
+            if denied_messages is not None:
+                for denied_message in denied_messages:
+                    yield denied_message
+                return
             if self._halted:
                 # The denied ToolUseBlock above IS delivered (the real SDK emits
                 # the tool_use even for a denied call), and nothing after it is:
@@ -263,7 +280,7 @@ class FakeModelSession:
                 # which models an OPERATOR stop and must keep working on its own.
                 return
 
-    async def _apply_gate(self, message: Any) -> None:
+    async def _apply_gate(self, message: Any) -> tuple[UserMessage, ResultMessage] | None:
         """Run the permission gate over each ToolUseBlock and honor its decision.
 
         Mirrors the SDK: the gate decides a call before it executes, and a gated
@@ -284,7 +301,7 @@ class FakeModelSession:
         """
 
         if not isinstance(message, AssistantMessage):
-            return
+            return None
         for block in message.content:
             if not isinstance(block, ToolUseBlock):
                 continue
@@ -303,12 +320,47 @@ class FakeModelSession:
                 # execute the write (#2429).
                 self._halted = True
                 continue
+            if self._pre_tool_use_hook is not None:
+                hook_output = await self._pre_tool_use_hook(
+                    {"tool_name": block.name, "tool_input": block.input},
+                    block.id,
+                    {"signal": None},
+                )
+                specific = hook_output.get("hookSpecificOutput", {})
+                if (
+                    specific.get("permissionDecision") == "deny"
+                    and hook_output.get("continue_") is False
+                ):
+                    reason = specific.get("permissionDecisionReason")
+                    if not isinstance(reason, str) or not reason:
+                        reason = hook_output.get("stopReason")
+                    if not isinstance(reason, str) or not reason:
+                        reason = "tool use denied"
+                    return (
+                        _tool_result(
+                            block.id,
+                            f"PreToolUse:{block.name} hook error: {reason}",
+                            is_error=True,
+                        ),
+                        _result(terminal_reason="hook_stopped"),
+                    )
+                if specific.get("permissionDecision") == "allow":
+                    continue
             if self._can_use_tool is not None:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
-                    self._halted = True
+                    return (
+                        _tool_result(
+                            block.id,
+                            "The user doesn't want to proceed with this tool use. "
+                            "The tool use was rejected.",
+                            is_error=True,
+                        ),
+                        _result(is_error=True, subtype="error_during_execution"),
+                    )
+        return None
 
     async def close(self) -> None:
         self.connected = False
