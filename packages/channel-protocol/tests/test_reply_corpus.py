@@ -6,6 +6,9 @@ file reads them through ``TypeAdapter(ReplyEvent)``, the same decoder the
 Discord adapter (``adapters/discord/src/curie_discord_adapter/http.py``) and
 the mail adapter (``apps/mail-adapter/src/curie_mail_adapter/egress.py``) run.
 
+The mail adapter enters the same adapter through ``validate_python`` on the
+parsed body, so accepted bodies are decoded that way too.
+
 The ``v1_0`` bodies were captured from the 1.0-only package before 1.1 existed.
 Re-serializing each one to the same bytes is what shows that adding 1.1 left
 every 1.0 form alone: the worker sends ``model_dump_json()`` verbatim, and a
@@ -89,6 +92,24 @@ def test_every_refused_body_is_refused_for_its_stated_reason(case: dict[str, Any
     # A decoder that refuses them for that reason has not implemented the rule
     # the case names.
     assert matching, f"{case['name']}: expected {expected}, got {errors}"
+
+
+@pytest.mark.parametrize("case", _cases("refused"))
+def test_every_refusal_encodes_as_json(case: dict[str, Any]) -> None:
+    # The Discord adapter answers a refused body with
+    # HTTPException(422, exc.errors()). An error list it cannot encode turns
+    # that 422 into a 500 from the adapter's own error path.
+    with pytest.raises(ValidationError) as caught:
+        _EVENTS.validate_json(_wire_bytes(case["body"]))
+    json.dumps(caught.value.errors())
+
+
+@pytest.mark.parametrize("case", _cases("v1_0") + _cases("v1_1"))
+def test_every_accepted_body_also_decodes_from_python_objects(case: dict[str, Any]) -> None:
+    # The mail adapter's egress parses the body with json.loads and then calls
+    # validate_python, not validate_json, so the corpus is held to that path too.
+    event = _EVENTS.validate_python(json.loads(_wire_bytes(case["body"])))
+    assert event.model_dump_json() == _wire_bytes(case["body"])
 
 
 def test_the_corpus_covers_every_event_and_every_progress_form() -> None:

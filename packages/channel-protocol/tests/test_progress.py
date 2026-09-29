@@ -280,8 +280,9 @@ def test_a_cards_terminal_flag_must_match_its_state(state: str) -> None:
     with pytest.raises(ValidationError) as caught:
         ProgressCard.model_validate(_card(state=state, terminal=not terminal))
     error = _only_error(caught)
-    assert error["type"] == "value_error"
+    assert error["type"] == "progress_terminal"
     assert "terminal must be true exactly when" in str(error["msg"])
+    json.dumps(caught.value.errors())
 
 
 @pytest.mark.parametrize("revision", [0, -1])

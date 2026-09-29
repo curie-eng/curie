@@ -1,5 +1,5 @@
 {
-  "_comment": "Reply-wire compatibility fixtures (ADR-0130 section 4), decoded by packages/channel-protocol/tests/test_reply_corpus.py through the same TypeAdapter(ReplyEvent) the Discord and mail adapters use. v1_0 holds every 1.0 form exactly as the 1.0-only package serialized it, captured from origin/next at 522dd55eb before 1.1 existed: each must decode and re-serialize to the same bytes, so a 1.0-built adapter keeps accepting everything the platform sends it. v1_1 holds every 1.1 form in the platform's canonical serialization. refused holds bodies every conforming decoder must refuse, each with the error type the Python models raise, a fragment of its message for a cross-field rule, and, under at, the last element of its location where that pins which field refused it. Bytes are compared as compact JSON: separators (',', ':'), keys in the order written here, non-ASCII unescaped.",
+  "_comment": "Reply-wire compatibility fixtures (ADR-0130 section 4), decoded by packages/channel-protocol/tests/test_reply_corpus.py through the same TypeAdapter(ReplyEvent) the Discord and mail adapters use. v1_0 holds every 1.0 form exactly as the 1.0-only package serialized it, captured from origin/next at 522dd55eb before 1.1 existed: each must decode and re-serialize to the same bytes, so a 1.0-built adapter keeps accepting everything the platform sends it. v1_1 holds every 1.1 form in the platform's canonical serialization. refused holds bodies every conforming decoder must refuse, each with the error type the Python models raise (each cross-field rule has its own), a fragment of its message where one type covers two rules, and, under at, the last element of its location where that pins which field refused it. Bytes are compared as compact JSON: separators (',', ':'), keys in the order written here, non-ASCII unescaped.",
   "v1_0": [
     {
       "name": "turn-status-caption",
@@ -527,7 +527,7 @@
         "delivery_id": "00000000-0000-4000-8000-00000000000a"
       },
       "error": {
-        "type": "value_error",
+        "type": "reply_wire_version",
         "contains": "need reply wire 1.1"
       }
     },
@@ -563,7 +563,7 @@
         }
       },
       "error": {
-        "type": "value_error",
+        "type": "reply_wire_version",
         "contains": "need reply wire 1.1"
       }
     },
@@ -584,7 +584,7 @@
         "nav": null
       },
       "error": {
-        "type": "value_error",
+        "type": "reply_wire_version",
         "contains": "carries a delivery_id"
       }
     },
@@ -625,7 +625,7 @@
         "requested_by": "U0EXAMPLE1"
       },
       "error": {
-        "type": "value_error",
+        "type": "reply_wire_version",
         "contains": "carries a delivery_id"
       }
     },
@@ -653,8 +653,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "progress needs a delivery_id"
+        "type": "progress_delivery_id"
       }
     },
     {
@@ -740,8 +739,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "carries no text, message, settled or nav"
+        "type": "progress_not_an_answer"
       }
     },
     {
@@ -783,8 +781,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "carries no text, message, settled or nav"
+        "type": "progress_not_an_answer"
       }
     },
     {
@@ -815,8 +812,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "carries no text, message, settled or nav"
+        "type": "progress_not_an_answer"
       }
     },
     {
@@ -891,8 +887,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "carries no interaction"
+        "type": "progress_not_actionable"
       }
     },
     {
@@ -986,8 +981,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "terminal must be true exactly when",
+        "type": "progress_terminal",
         "at": "progress"
       }
     },
@@ -1016,8 +1010,7 @@
         }
       },
       "error": {
-        "type": "value_error",
-        "contains": "terminal must be true exactly when",
+        "type": "progress_terminal",
         "at": "progress"
       }
     },

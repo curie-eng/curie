@@ -85,11 +85,14 @@ def _refusal(body: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(error) for error in caught.value.errors()]
 
 
-def _refused_by_rule(body: dict[str, Any], fragment: str) -> None:
+def _refused_by_rule(body: dict[str, Any], error_type: str, fragment: str = "") -> None:
     errors = _refusal(body)
     assert any(
-        error["type"] == "value_error" and fragment in str(error["msg"]) for error in errors
+        error["type"] == error_type and fragment in str(error["msg"]) for error in errors
     ), errors
+    # An adapter that answers 422 with these errors (the Discord adapter does)
+    # must be able to encode them.
+    json.dumps(errors)
 
 
 # --- versions -------------------------------------------------------------------
@@ -153,7 +156,7 @@ def test_the_schema_says_which_events_have_a_1_1_form() -> None:
     ],
 )
 def test_a_1_0_body_carries_no_1_1_field(body: dict[str, Any]) -> None:
-    _refused_by_rule(body, "need reply wire 1.1")
+    _refused_by_rule(body, "reply_wire_version", "need reply wire 1.1")
 
 
 @pytest.mark.parametrize(
@@ -166,7 +169,7 @@ def test_a_1_0_body_carries_no_1_1_field(body: dict[str, Any]) -> None:
 def test_a_1_1_body_carries_a_delivery_id(body: dict[str, Any]) -> None:
     # Otherwise a producer could label an ordinary body 1.1 and a 1.0-built
     # adapter would refuse a body it could have read.
-    _refused_by_rule(body, "carries a delivery_id")
+    _refused_by_rule(body, "reply_wire_version", "carries a delivery_id")
 
 
 @pytest.mark.parametrize(
@@ -178,7 +181,7 @@ def test_a_1_1_body_carries_a_delivery_id(body: dict[str, Any]) -> None:
     ],
 )
 def test_progress_needs_a_delivery_id(body: dict[str, Any]) -> None:
-    _refused_by_rule(body, "progress needs a delivery_id")
+    _refused_by_rule(body, "progress_delivery_id")
 
 
 # --- the accepted 1.1 forms ------------------------------------------------------
@@ -243,7 +246,7 @@ def test_a_progress_update_carries_no_answer_field(answer_field: dict[str, Any])
     # with an update's text: a progress edit must give neither path anything.
     _refused_by_rule(
         _update(delivery_id=_ID, progress=_CARD, **answer_field),
-        "carries no text, message, settled or nav",
+        "progress_not_an_answer",
     )
 
 
@@ -258,7 +261,7 @@ def test_a_progress_post_is_never_actionable(progress: dict[str, Any]) -> None:
     }
     _refused_by_rule(
         _post(delivery_id=_ID, progress=progress, message=_message(interaction=confirm)),
-        "carries no interaction",
+        "progress_not_actionable",
     )
 
 
