@@ -368,6 +368,18 @@ def _forges_the_render_join(name: str) -> bool:
     return connector_forges_join(name)
 
 
+def _shadows_a_direct_service(name: str, hosted: set[str]) -> bool:
+    """Whether a hosted connector's name is a sibling's direct Service name.
+
+    Deferred for the same circular import as ``_forges_the_render_join``, and
+    for the same reason the rule is the renderer's alone.
+    """
+
+    from .connector_render import shadows_a_direct_service
+
+    return shadows_a_direct_service(name, hosted)
+
+
 def _is_valid_name(name: str) -> bool:
     """RFC 1123 label, capped: the name becomes a k8s object and a DNS label."""
 
@@ -475,6 +487,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
     except Exception as exc:  # pydantic ValidationError -- surface it verbatim
         return None, [("connectors.invalid", str(exc)[:400])]
 
+    hosted = {name for name, spec in parsed.connectors.items() if spec.is_hosted}
     for name, spec in parsed.connectors.items():
         where = f"connectors.{name}"
         if not _is_valid_name(name):
@@ -531,8 +544,22 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "render the same Service, Deployment, both NetworkPolicies and the "
                     "same `app.kubernetes.io/name` pod selector, handing one agent's "
                     "sandbox the other's connector and the credential bound to it "
-                    "(the connector is deliberately unauthenticated, ADR-0086) -- rename "
-                    "the connector so it does not start with `mcp-` or contain `-mcp-`",
+                    "(ADR-0086) -- rename the connector so it does not start with `mcp-` "
+                    "or contain `-mcp-`",
+                )
+            )
+        # ADR-0168 decision 7: with a caller proxy, hosted `x` also renders the
+        # Service `<x's object name>-direct`, which is hosted `x-direct`'s own
+        # object name.
+        if spec.is_hosted and _shadows_a_direct_service(name, hosted):
+            errors.append(
+                (
+                    "connectors.direct_service_collision",
+                    f"{where}: `{name}` renders the same Service name as the direct "
+                    f"Service Curie gives the hosted connector "
+                    f"`{name.removesuffix('-direct')}` on an install with a caller proxy "
+                    "(`<release>-<agent>-mcp-<connector>-direct`), so one would overwrite "
+                    "the other -- rename the connector so it does not end in `-direct`",
                 )
             )
         forms = [bool(spec.image), bool(spec.build), bool(spec.url)]

@@ -1,0 +1,24 @@
+{
+  "comment": "What a hosted connector's caller proxy answers when it refuses a caller (ADR-0168 decision 7), and what the runner reads back to name the refusal. The proxy (apps/worker/src/curie_connector_proxy/server.py) answers every refusal with `status` and a JSON-RPC error body, never contacts the connector, and sends no WWW-Authenticate: a 401 sends the bundled Claude CLI into OAuth discovery and client registration against the connector, and a 403 does not. The MCP client surfaces a JSON-RPC error body at a non-2xx status as the request's error, so the runner (runner/src/curie_runner/mcp_tool_capability.py) finds `error.data.curie_caller` and reports the refusal by name. `header` is the request header the token travels in. Read by apps/worker/tests/test_connector_proxy.py and runner/tests/test_mcp_tool_capability_caller.py, which reject an unknown key so a key added for one reader cannot pass vacuously.",
+  "header": "X-Curie-Caller",
+  "status": 403,
+  "content_type": "application/json",
+  "vectors": [
+    {
+      "refusal": "missing",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: no caller token was presented", "data": {"curie_caller": "missing"}}}
+    },
+    {
+      "refusal": "invalid",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: the caller token is not valid", "data": {"curie_caller": "invalid"}}}
+    },
+    {
+      "refusal": "expired",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: the caller token has expired", "data": {"curie_caller": "expired"}}}
+    },
+    {
+      "refusal": "not_admitted",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: this agent is not admitted by the connector", "data": {"curie_caller": "not_admitted"}}}
+    }
+  ]
+}
