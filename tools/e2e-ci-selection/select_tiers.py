@@ -378,6 +378,7 @@ def _run() -> None:
     registry = _load_registry(args.registry)
 
     paths: list[str] = []
+    workflow_upgrade_changed = False
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -392,6 +393,10 @@ def _run() -> None:
             paths = args.path
         elif args.base and args.head:
             paths = _changed_paths(args.base, args.head)
+            if WORKFLOW_PATH in paths:
+                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(
+                    args.base, args.head
+                )
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
@@ -406,11 +411,15 @@ def _run() -> None:
         # never drops the tier that proves it.
         if any(_is_runtime_assertion(path) for path in paths):
             selected.add("cluster")
+    if workflow_upgrade_changed:
+        selected.add("released-upgrade")
 
-    # A pull request that selects released-upgrade runs one upgrade matrix
-    # smoke shard. The full matrix and the released chart upgrade jobs run only
-    # on pushes and dispatches (the nightly), which are the --push runs.
-    released_upgrade_full = args.push and "released-upgrade" in selected
+    # Ordinary pull requests run one upgrade matrix smoke shard. A change to
+    # the upgrade jobs themselves runs the full matrix and released chart jobs
+    # before merge, as do pushes and dispatches (the nightly).
+    released_upgrade_full = (
+        args.push or workflow_upgrade_changed
+    ) and "released-upgrade" in selected
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
+REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW_PATH = Path(".github/workflows/ci.yaml")
 TARGETS = (
     "e2e-released-upgrade",
@@ -70,6 +72,25 @@ def _commit_workflow(repo: Path, content: str) -> str:
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "candidate")
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _invoke_selector(
+    repo: Path, tmp_path: Path, *options: str
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    output_path = tmp_path / "selector-output"
+    result = subprocess.run(
+        [sys.executable, str(SELECTOR), "--registry", str(REGISTRY), *options],
+        cwd=repo,
+        env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = dict(
+        line.split("=", 1)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ) if output_path.exists() else {}
+    return result, output
 
 
 @pytest.mark.parametrize("target", TARGETS)
@@ -204,3 +225,80 @@ def test_workflow_change_without_text_hunk_fails_closed(
     monkeypatch.setattr(SELECTOR_MODULE.subprocess, "run", no_hunks)
     with pytest.raises(SELECTOR_MODULE.RegistryError):
         SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head)
+
+
+@pytest.mark.parametrize("omit_kind", (False, True), ids=("main", "next"))
+def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
+    git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool
+) -> None:
+    repo, base = git_repo
+    head = _commit_workflow(
+        repo, _workflow().replace("echo e2e-released-upgrade", "echo changed", 1)
+    )
+    options = ("--base", base, "--head", head)
+    if omit_kind:
+        options += ("--omit-kind",)
+
+    result, output = _invoke_selector(repo, tmp_path, *options)
+
+    assert result.returncode == 0, result.stderr
+    assert output["released_upgrade"] == "true"
+    assert output["released_upgrade_full"] == "true"
+    assert output["cluster"] == "false"
+
+
+def test_unrelated_workflow_edit_keeps_upgrade_tier_off(
+    git_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    repo, base = git_repo
+    head = _commit_workflow(repo, _workflow().replace("echo before", "echo changed"))
+
+    result, output = _invoke_selector(repo, tmp_path, "--base", base, "--head", head)
+
+    assert result.returncode == 0, result.stderr
+    assert output["released_upgrade"] == "false"
+    assert output["released_upgrade_full"] == "false"
+
+
+def test_ordinary_upgrade_code_edit_remains_smoke_only(
+    git_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    repo, base = git_repo
+    chart = repo / "charts/curie/values.yaml"
+    chart.parent.mkdir(parents=True)
+    chart.write_text("example: true\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "chart edit")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    result, output = _invoke_selector(repo, tmp_path, "--base", base, "--head", head)
+
+    assert result.returncode == 0, result.stderr
+    assert output["released_upgrade"] == "true"
+    assert output["released_upgrade_full"] == "false"
+
+
+def test_path_only_workflow_selection_has_no_hunks_to_select(tmp_path: Path) -> None:
+    result, output = _invoke_selector(
+        tmp_path, tmp_path, "--path", WORKFLOW_PATH.as_posix()
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output["released_upgrade"] == "false"
+    assert output["released_upgrade_full"] == "false"
+
+
+def test_ordinary_next_pr_still_omits_kind(
+    git_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    repo, base = git_repo
+    head = _commit_workflow(repo, _workflow().replace("echo before", "echo changed"))
+
+    result, output = _invoke_selector(
+        repo, tmp_path, "--base", base, "--head", head, "--omit-kind"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output["cluster"] == "false"
+    assert output["released_upgrade"] == "false"
+    assert output["released_upgrade_full"] == "false"

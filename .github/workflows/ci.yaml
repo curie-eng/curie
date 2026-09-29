@@ -3036,11 +3036,11 @@ jobs:
   # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 12 kind
   # runners. The shard lister stays on every PR so coverage cannot drift.
   #
-  # A pull request that selects released-upgrade runs only the smoke shard,
-  # s01: no failure injection, and it covers a fresh install, the N-1 to N
-  # upgrade with state, a same-version upgrade, and the soak refusal. Pushes
-  # to main and dispatches (the nightly kind run on next) run every shard,
-  # plus the released chart upgrade jobs above.
+  # An ordinary pull request that selects released-upgrade runs only the
+  # smoke shard, s01: no failure injection, covering fresh install, N-1 to N
+  # upgrade with state, same-version upgrade, and soak refusal. A PR editing
+  # these upgrade jobs, a push to main, or a dispatch (nightly on next) runs
+  # every shard plus the released chart upgrade jobs above.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -3279,10 +3279,9 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
           fi
-          # The released chart upgrade jobs run only on the full runs (push
-          # and dispatch). The matrix runs whenever released-upgrade is
-          # selected, one smoke shard on a pull request: a matrix job reports
-          # success only when every selected shard succeeded.
+          # Full runs include pushes, dispatches, and PRs editing an upgrade
+          # job. Ordinary PRs selecting released-upgrade run one smoke shard.
+          # The matrix reports success only when all selected shards succeed.
           released_upgrade_expected="skipped"
           if [[ "$RELEASED_UPGRADE_FULL" == "true" ]]; then
             released_upgrade_expected="success"
