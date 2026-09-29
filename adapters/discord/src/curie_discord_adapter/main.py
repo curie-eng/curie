@@ -33,6 +33,27 @@ SERVICE_NAME = "curie-discord-adapter"
 # start, so this is observed rather than hypothetical.
 _THIRD_PARTY_LOG_NAMESPACES = ("discord", "uvicorn", "httpx")
 
+# The detail the channel port puts on the 403 it answers when a binding's caller
+# list does not admit a turn's author (ADR 0175). Only a 403 carrying exactly
+# this code is final; any other 403, from a proxy or a firewall in front of the
+# API, stays an infrastructure fault. Frozen with the platform side in
+# `tests/vectors/channel-port-refusal.json`.
+CALLER_NOT_ALLOWED_DETAIL = "caller_not_allowed"
+
+
+class CallerRefusedError(Exception):
+    """The channel port refused the turn's author. Final: never retried, never answered."""
+
+
+def _is_caller_refusal(response: httpx.Response) -> bool:
+    if response.status_code != 403:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("detail") == CALLER_NOT_ALLOWED_DETAIL
+
 
 class DiscordAdapter(discord.Client):
     def __init__(self, config: DiscordConfig, state: DiscordState) -> None:
@@ -89,9 +110,11 @@ class DiscordAdapter(discord.Client):
         if not self._state.claim_delivery(delivery_id):
             return
         placeholder: discord.Message | None = None
+        created_thread: discord.Thread | None = None
         try:
             if thread is None:
                 thread = await message.create_thread(name=self._thread_name(message.content))
+                created_thread = thread
                 self._state.remember_thread(str(thread.id), binding)
             placeholder = await thread.send(
                 self._config.placeholder_text,
@@ -109,6 +132,16 @@ class DiscordAdapter(discord.Client):
                 self._state.release_delivery(delivery_id)
                 return
             await self._post_turn(binding, turn)
+        except CallerRefusedError:
+            # ADR 0175 decision 3: a refused caller gets nothing back, not even
+            # a sign the bot exists. The delivery stays claimed so the refusal
+            # is final, and what was posted before asking is taken down.
+            logger.info(
+                "Curie refused the author of Discord message %s on binding %s",
+                message.id,
+                binding.address,
+            )
+            await self._withdraw(placeholder, created_thread)
         except Exception:
             self._state.release_delivery(delivery_id)
             logger.exception("Failed to deliver Discord message %s to Curie", message.id)
@@ -117,6 +150,18 @@ class DiscordAdapter(discord.Client):
                     content="Curie could not accept this message. Please try again.",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+
+    async def _withdraw(
+        self, placeholder: discord.Message | None, created_thread: discord.Thread | None
+    ) -> None:
+        try:
+            if created_thread is not None:
+                # Deleting the thread takes its placeholder with it.
+                await created_thread.delete()
+            elif placeholder is not None:
+                await placeholder.delete()
+        except Exception:
+            logger.exception("Failed to withdraw the reply to a refused Discord caller")
 
     def _binding_for_parent(self, parent_channel_id: str) -> DiscordBinding | None:
         bindings = {
@@ -165,6 +210,8 @@ class DiscordAdapter(discord.Client):
                         "ingress for that binding is disabled until the mounted token changes",
                         binding.address,
                     )
+                if _is_caller_refusal(response):
+                    raise CallerRefusedError(binding.address)
                 response.raise_for_status()
                 return
             except httpx.TransportError:
