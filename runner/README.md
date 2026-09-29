@@ -85,13 +85,22 @@ milestone (`evidence`, `scope` or `verification`) only when the step is
 material, at most three per task; and never reasoning, raw tool output, secrets
 or a draft answer in the summary. The tool description repeats the rules.
 
+The tool and its progress prompt are mounted only when the worker booted this
+sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`. The worker sets that direct
+runner boot fact only for a human Slack thread and includes it in sandbox reuse
+comparison; jobs, cron, email, relay, targetless and factory sessions retain
+their pre-progress model surface. This leaves the frozen ACI unchanged.
+
 The capability is per turn. The worker first allocates a durable, monotonically
 increasing generation on the chain and marks it active. It sends the capability
 on `POST /v1/event` in three runner control headers, `X-Curie-Progress-Url`,
 `X-Curie-Progress-Token`, and `X-Curie-Progress-Generation`,
 next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
 fields. The token is signed for `progress_id:generation`, and the API also
-checks that the same generation is still active before it appends anything.
+checks that the same generation is still active and before its bounded
+server-time deadline before it appends anything. The deadline is the runner
+request ceiling plus 30 seconds, so a failed turn-end clear cannot leave a
+24-hour token usable.
 The runner holds the three values only while that turn is open, sets them when
 the turn starts and clears them when it ends, so a steer uses the turn's
 capability and a closed or superseded turn cannot enqueue. The names are frozen

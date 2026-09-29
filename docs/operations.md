@@ -1461,18 +1461,23 @@ it on later changes what people see, not what is stored.
 The path, and what an operator can check on each hop:
 
 1. **The capability.** For a person's Slack turn (and the approval resume of
-   one) the worker allocates a durable generation, marks it active, and mints a
+   one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
+   allocates a durable generation and marks it active with a Valkey-server-time
+   deadline equal to the runner request ceiling plus 30 seconds. It mints a
    sandbox token with scope `turn.progress`, bound to
    `progress_id:generation`. It sends token, URL, and generation to the runner.
    Jobs, cron and targetless hook turns, factory executions and
-   `curie cluster message` relay turns get none.
+   `curie cluster message` relay turns get neither the boot flag nor the
+   model-visible tool/prompt. Sandbox reuse compares the flag, so eligibility
+   cannot be inherited from an earlier occupant.
 2. **The ingress.** The runner's `progress` tool POSTs each update to the API
    at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
    The API accepts only a `turn.progress` token whose subject matches the path
-   and body generation, and whose generation is still active. It rejects a
+   and body generation, and whose generation is still active and unexpired. It rejects a
    channel adapter's sibling `chn` token before validating the command body;
    the platform key, another chain's token, an expired token, and a token from
-   a closed or superseded turn are also refused 401. A body that is not a `ProgressCommand` plus
+   a closed, superseded, or deadline-expired turn are also refused 401. A body
+   that is not a `ProgressCommand` plus
    the worker-issued `generation` and runner-issued `seq` is refused 422. Each
    token may send one update a second, with a burst of five; past that the API
    answers 429. An accepted update is atomically appended and indexed for the

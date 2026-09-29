@@ -745,8 +745,13 @@ delivery written after it.
   `slack`, its reply handle's kind is `slack`, it has a reply target, and it is
   neither a factory work-item turn nor a `curie cluster message` relay turn
   (adapter `curie-cluster-message`). An approval resume of such a turn is
-  eligible too. A job, a cron turn, a targetless hook, a factory execution and
-  a relay turn never get one, and their runner is sent no progress header.
+  eligible too. Before claiming its sandbox, the worker writes
+  `CURIE_TURN_PROGRESS_ENABLED=1` only for an eligible turn. That boot fact is
+  part of sandbox reuse comparison, so a sandbox with the opposite eligibility
+  is cold-recreated rather than adopted. The runner mounts the progress tool
+  and prompt only when the fact is present. A job, cron turn, targetless hook,
+  factory execution and relay turn therefore see neither the tool nor its
+  prompt, in addition to receiving no progress headers.
 - **The chain.** A fresh turn's chain is `progress_id_for(thread_key,
   event_id)`, so a retry of the same event, in the same delivery or a
   redelivery, names the same record. An approval resume follows only the
@@ -763,8 +768,11 @@ delivery written after it.
   `X-Curie-Progress-Token`, `X-Curie-Progress-Generation`, and
   `X-Curie-Progress-Url`. They are runner control headers, like
   `X-Curie-Turn-Epoch`, and not ACI fields. The API's append script checks the
-  signed generation is still active. The worker clears it when the turn closes;
-  a retry or cold resume advances it first, so an old token cannot enqueue or
+  signed generation is still active and its Valkey-server-time deadline has not
+  passed. The deadline is the configured runner request ceiling plus 30 seconds.
+  The worker clears the generation and deadline when the turn closes; if that
+  best-effort clear loses Valkey, the deadline is the fail-closed backstop. A
+  retry or cold resume advances it first, so an old token cannot enqueue or
   fence the current turn. Nothing opens a generation when the API key is unset.
 - **The pump.** While the kernel consumes the turn's stream, a pump reads the
   chain's inbox after the record's `inbox_cursor`, at most 64 entries every
