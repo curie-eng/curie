@@ -8,7 +8,7 @@
 //! broken for everything. Capability removal is the separate proof that a
 //! case requires its declared capability.
 //!
-//! Four controls, all offline and deterministic, all driven off the committed
+//! Five controls, all offline and deterministic, all driven off the committed
 //! suites discovered on disk (so a new suite is covered with no edit here):
 //!
 //!   A. Negative (null agent): no committed case may green against a canned
@@ -39,7 +39,11 @@
 //!      where both the required claim and its direct negation contain the same
 //!      keywords.
 //!
-//! Fixtures (exemplars + counterexamples + input-satisfiable baseline) live in
+//!   E. Positive (selected paraphrases): a case may name additional compliant
+//!      answers that must stay green. This prevents a polarity repair from
+//!      overfitting the grader to one exact exemplar sentence.
+//!
+//! Fixtures (exemplars + paraphrases + counterexamples + input-satisfiable baseline) live in
 //! `tests/data/eval_falsifiability_fixtures.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -123,6 +127,7 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
 #[derive(Debug, Deserialize)]
 struct Fixtures {
     exemplars: BTreeMap<String, String>,
+    paraphrases: BTreeMap<String, Vec<String>>,
     counterexamples: BTreeMap<String, Vec<String>>,
     input_satisfiable_baseline: BTreeSet<String>,
 }
@@ -287,5 +292,40 @@ fn selected_semantic_opposites_stay_red() {
         offenders.is_empty(),
         "these committed eval cases accept a known semantic opposite:\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+/// Control E -- selected compliant paraphrases stay green. One exemplar proves
+/// a grader has a positive path; these additional phrasings prove that path is
+/// semantic enough to accept an ordinary equivalent answer.
+#[test]
+fn selected_compliant_paraphrases_stay_green() {
+    let paraphrases = fixtures().paraphrases;
+    let mut case_keys: BTreeSet<String> = BTreeSet::new();
+    let mut rejected: Vec<String> = Vec::new();
+
+    for (name, suite) in discover_suites() {
+        for case in &suite.cases {
+            let key = case_key(&name, case);
+            case_keys.insert(key.clone());
+            for output in paraphrases.get(&key).into_iter().flatten() {
+                if !turn_passes(case, &done_turn(output)) {
+                    rejected.push(format!("{key} rejects compliant paraphrase {output:?}"));
+                }
+            }
+        }
+    }
+
+    let fixture_keys: BTreeSet<String> = paraphrases.keys().cloned().collect();
+    let orphan: Vec<&String> = fixture_keys.difference(&case_keys).collect();
+    assert!(
+        orphan.is_empty(),
+        "these paraphrases reference cases that no longer exist:\n  {:?}",
+        orphan
+    );
+    assert!(
+        rejected.is_empty(),
+        "these committed eval cases reject a compliant paraphrase:\n  {}",
+        rejected.join("\n  ")
     );
 }
