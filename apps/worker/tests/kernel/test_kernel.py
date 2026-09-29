@@ -4857,6 +4857,52 @@ def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
     asyncio.run(go())
 
 
+class _IdentityResolved(_FakeResolved):
+    """A Slack binding row as migration 0070 leaves every one: it names its
+    identity (ADR-0168 decision 5), ``default`` unless another app serves it."""
+
+    def __init__(self, agent_id: uuid.UUID) -> None:
+        super().__init__(agent_id)
+        self.adapter = "default"
+
+
+class _IdentityBinding(_TokenBinding):
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
+        return _IdentityResolved(self._agent_id)
+
+
+def test_reply_handle_relay_adapter_survives_a_binding_that_names_its_identity(
+    make_harness,
+) -> None:
+    """A ``curie cluster message`` turn replies through the relay on a 0070 row.
+
+    The turn keeps its Slack binding and selects the reserved relay adapter with
+    no endpoint. The binding row now names its Slack identity, and that identity
+    must not replace the relay: a relay turn routed to the Slack sink has no
+    endpoint, so it posts to real Slack with the install's token and the CLI
+    never hears the reply.
+    """
+
+    async def go() -> None:
+        binding = _IdentityBinding("tok-route", uuid.uuid4())
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                qevent(
+                    "hi",
+                    thread="tClusterMessageIdentity",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                )
+            )
+
+            routes = h.sink.routes_for("reply.update")
+            assert routes, "the completed turn emitted no reply update"
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+
+    asyncio.run(go())
+
+
 def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
     async def go() -> None:
         binding = _TokenBinding("tok-24", uuid.uuid4())

@@ -442,6 +442,21 @@ def _check_targetless_shape(qevent: QueuedTurn) -> None:
 _NO_EGRESS_ROUTE = TargetRoute()
 
 
+def _bound_egress_adapter(bound: str | None, handle_adapter: str | None) -> str | None:
+    """The adapter a resolved turn replies through (#3475).
+
+    The binding row's adapter wins, except over the reserved relay adapter a
+    ``curie cluster message`` turn selects on its handle: since migration 0070
+    every Slack row names its identity, and letting that identity replace the
+    relay sends the reply to the Slack sink with no endpoint, which is real
+    Slack, instead of to the relay the CLI is polling.
+    """
+
+    if handle_adapter == CLUSTER_MESSAGE_ADAPTER:
+        return handle_adapter
+    return bound or handle_adapter
+
+
 def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
     """The agent's hub button as the wire carries it, or nothing at all.
 
@@ -1102,6 +1117,12 @@ class TurnOutcome:
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False
+    # The worker could not start this turn and answered with its own text: no
+    # pool for the agent (#2943), an attachment it could not fetch, or no
+    # capacity on a source that cannot wait for it. The reply is delivered as
+    # is, but the turn did no work, so its telemetry outcome is
+    # classified_failure rather than done.
+    start_failed: bool = False
     # The approval summary and route off an awaiting-approval final (ADR-0010,
     # #247), persisted onto the durable record by the pause path. None on
     # every other status; route also None when the request named none.
@@ -2595,7 +2616,7 @@ class Kernel:
                         _TURN_AGENT.set(undeployed.agent_name)
                         route = TargetRoute(
                             endpoint=undeployed.endpoint or handle.endpoint,
-                            adapter=undeployed.adapter or handle.adapter,
+                            adapter=_bound_egress_adapter(undeployed.adapter, handle.adapter),
                         )
                         logger.warning(
                             "undeployed agent turn dropped for agent=%s route=%s:%s",
@@ -2630,7 +2651,7 @@ class Kernel:
                 # dispatcher and CLI bind no endpoint of their own.
                 route = TargetRoute(
                     endpoint=resolved.endpoint or handle.endpoint,
-                    adapter=resolved.adapter or handle.adapter,
+                    adapter=_bound_egress_adapter(resolved.adapter, handle.adapter),
                 )
                 _TURN_AGENT.set(getattr(resolved, "agent_name", None))
                 hook_carry = _HOOK_RUN_CARRY.get()
@@ -2994,7 +3015,9 @@ class Kernel:
                         route,
                         "delivered",
                         telemetry_outcome=(
-                            "idle"
+                            "classified_failure"
+                            if outcome.start_failed
+                            else "idle"
                             if outcome.status is SessionStatus.IDLE_AWAITING_INPUT
                             else "done"
                         ),
@@ -4527,7 +4550,7 @@ class Kernel:
             if qevent.source is TurnSource.SLACK and handle is not None:
                 raise CapacityWaitRequested()
             await self._reply_for(qevent, route, _CAPACITY_REPLY)
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
 
         try:
             try:
@@ -4752,7 +4775,7 @@ class Kernel:
                 reason,
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
         except MissingAgentPoolError as exc:
             # Before the SandboxError clause below, which would retry it. The
             # pool appears only after an operator changes the release values,
@@ -4768,7 +4791,7 @@ class Kernel:
                 route,
                 f"This agent cannot start: {exc}. An operator has to make that change.",
             )
-            return TurnOutcome(terminal_ok=True)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
         except (
             RunnerError,
             aiohttp.ClientError,
