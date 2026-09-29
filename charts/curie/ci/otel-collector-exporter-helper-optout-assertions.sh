@@ -44,6 +44,36 @@ if helm template curie "$CHART" -f "$TMP/undeclared.yaml" >/dev/null 2>&1; then
   fail "network exporter without helper durability or exemption rendered"
 fi
 
+# A named exemption must not let exporterhelper-capable network exporters
+# bypass retry and queue validation. These both render with the broad check.
+cat > "$TMP/otlphttp-bypass.yaml" <<'YAML'
+otelCollector:
+  extraExporters:
+    otlphttp/exempt:
+      endpoint: https://collector.example.com
+  extraMetricPipelineExporters: [otlphttp/exempt]
+  exportersWithoutExporterHelper:
+    otlphttp/exempt: "purported exception under contrib 0.119.0"
+YAML
+if helm template curie "$CHART" -f "$TMP/otlphttp-bypass.yaml" > "$TMP/otlphttp-rendered" 2> "$TMP/otlphttp-error"; then
+  fail "otlphttp bypassed retry and persistent queue requirements"
+fi
+grep -q 'only awsemf' "$TMP/otlphttp-error" || fail "otlphttp exemption failed for an unrelated reason"
+
+cat > "$TMP/prometheus-bypass.yaml" <<'YAML'
+otelCollector:
+  extraExporters:
+    prometheusremotewrite/exempt:
+      endpoint: https://prometheus.example.com/api/v1/write
+  extraMetricPipelineExporters: [prometheusremotewrite/exempt]
+  exportersWithoutExporterHelper:
+    prometheusremotewrite/exempt: "purported exception under contrib 0.119.0"
+YAML
+if helm template curie "$CHART" -f "$TMP/prometheus-bypass.yaml" > "$TMP/prometheus-rendered" 2> "$TMP/prometheus-error"; then
+  fail "prometheusremotewrite bypassed retry and remote_write_queue requirements"
+fi
+grep -q 'only awsemf' "$TMP/prometheus-error" || fail "prometheusremotewrite exemption failed for an unrelated reason"
+
 cat > "$TMP/stale.yaml" <<'YAML'
 otelCollector:
   exportersWithoutExporterHelper:
