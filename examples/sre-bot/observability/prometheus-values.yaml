@@ -626,10 +626,11 @@ serverFiles:
                 zero. Its agent still answers, and tells the person it cannot
                 reach the systems it reads from.
           - alert: SreSlackEmailIntakeNotReady
-            # @spec SRE-EMAIL-3. The historical term arms only after this
-            # opt-in Deployment has existed, so default SRE installs do not
-            # page for a component they never enabled. With the shipped 7d
-            # retention it keeps a deleted Deployment visible for seven days.
+            # @spec SRE-EMAIL-3. The code ConfigMap is the durable opt-in
+            # marker: default SRE installs stay quiet, while deleting only the
+            # Deployment pages for as long as the install remains opted in.
+            # The historical term bridges a missing marker scrape for up to
+            # the shipped seven-day retention.
             expr: |
               sre_slack_email_intake_ready == 0
               or
@@ -652,6 +653,16 @@ serverFiles:
                     pod=~"sre-slack-email-intake-.*"
                   }
                 )
+              )
+              or
+              (
+                kube_configmap_info{
+                  configmap="sre-slack-email-intake-code"
+                }
+                unless on (namespace)
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
               )
               or
               (
