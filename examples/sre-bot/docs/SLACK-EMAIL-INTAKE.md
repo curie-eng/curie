@@ -27,6 +27,13 @@ configuration. This public example carries no tenant-specific values. The scan
 is oldest first and follows Slack pagination, so a later alert cannot starve an
 older one.
 
+One known matching root is configured as the canary. Every complete scan must
+still find it, classify it as a candidate, read its replies, download its file,
+and receive the source conversation id from the signed hook. Once its original
+delivery has completed, the stable delivery id makes this a duplicate receipt,
+not another turn. This distinguishes a genuinely quiet channel from a broken
+source identity, subject prefix, file permission, or hook configuration.
+
 ### SRE-EMAIL-2 — one ordinary turn per unacknowledged root
 
 A nonempty reply from the configured Curie bot is a durable acknowledgement.
@@ -83,6 +90,7 @@ The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
 - `SLACK_EMAIL_SOURCE_USER_ID`
 - `ALERT_SUBJECT_PREFIXES` (comma-separated)
 - `SLACK_SCAN_NOT_BEFORE` (Slack timestamp or Unix seconds)
+- `SLACK_CANARY_THREAD_TS` (a matching root at or after that floor)
 - `CURIE_HOOK_URL` (the full `/hooks/{agent}/email-alert` URL)
 - `CURIE_HOOK_SECRET`
 
