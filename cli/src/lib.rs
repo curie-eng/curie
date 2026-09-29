@@ -40,6 +40,7 @@ pub mod migrate_store;
 pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
+pub mod oci_registry;
 pub mod ops;
 pub mod queue;
 pub mod recipes;

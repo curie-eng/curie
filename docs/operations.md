@@ -960,9 +960,13 @@ upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade`. After that upgrade it deletes those agents'
 SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
 starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
-layer until their owners rebuild with `curie build` and redeploy. Both checks need
-docker buildx and registry access to resolve runner digests: without it, `curie
-cluster deploy` refuses and `curie cluster upgrade` clears every layer.
+layer until their owners rebuild with `curie build` and redeploy. Both checks
+resolve runner digests by reading the registry directly, so the operator host
+needs no docker. A registry that refuses anonymous reads falls back to `docker
+buildx imagetools` and its registry login when docker is on PATH. When no digest
+can be resolved, `curie cluster deploy` refuses and `curie cluster upgrade`
+clears every layer; setting the chart value `agentSandbox.runner.digest` pins
+the runner so no lookup is needed.
 
 For a run that can last three hours, set an illustrative $100 USD cap after
 deploying the agent:
