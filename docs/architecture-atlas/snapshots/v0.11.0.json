@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "next",
-    "commit": "a9a154edb110aa35d762263197ab9b780c3d04d7",
-    "shortCommit": "a9a154ed",
+    "commit": "ece709b7b15985ee3095fe7c15ee11a866718aa8",
+    "shortCommit": "ece709b7",
     "release": "v0.11.0"
   },
   "title": "Curie architecture atlas",
@@ -1661,6 +1661,27 @@
       "title": "Current API schema compatibility window",
       "path": "apps/api/src/curie_api/schema_compat.json",
       "href": "https://github.com/curie-eng/curie/blob/a9a154edb110aa35d762263197ab9b780c3d04d7/apps/api/src/curie_api/schema_compat.json"
+    },
+    {
+      "id": "progress-store-v0110",
+      "type": "code",
+      "title": "Durable progress state and pending delivery store",
+      "path": "apps/worker/src/curie_worker/progress.py",
+      "href": "https://github.com/curie-eng/curie/blob/ece709b7b15985ee3095fe7c15ee11a866718aa8/apps/worker/src/curie_worker/progress.py"
+    },
+    {
+      "id": "relay-route-v0110",
+      "type": "code",
+      "title": "Cluster reply relay route preservation",
+      "path": "apps/worker/src/curie_worker/kernel.py",
+      "href": "https://github.com/curie-eng/curie/blob/ece709b7b15985ee3095fe7c15ee11a866718aa8/apps/worker/src/curie_worker/kernel.py"
+    },
+    {
+      "id": "channel-interaction-v0110",
+      "type": "doc",
+      "title": "Semantic message and progress contracts",
+      "path": "docs/interfaces/channel-interaction/INTERFACE.md",
+      "href": "https://github.com/curie-eng/curie/blob/ece709b7b15985ee3095fe7c15ee11a866718aa8/docs/interfaces/channel-interaction/INTERFACE.md"
     }
   ],
   "documentationDrift": [
@@ -2236,7 +2257,7 @@
       "zone": "core",
       "x": 0.575,
       "y": 0.31,
-      "description": "The concurrency hub: resolves the active deployment, emits a typed terminal failure instead of dropping turns when none exists, enforces one live session per scoped conversation, selects steer versus fresh turn, and protects side effects. It resolves channel attachment references, stores accepted files under a private prefix, and issues a short lived signed redemption reference before claiming the sandbox. Managed coding uses the canonical scoped thread identity rather than a bare reply id. The worker selects and sanitizes an allowlisted repository checkout, archives it privately, and swaps a late workspace into the route only at a fenced turn boundary; multiple ambiguous bare owner/repo-like tokens leave repository selection absent, while multiple explicit repository URLs are refused. Review turns never steer a live sandbox: fresh authority is verified again, the exact accepted pull request head is reserved and materialized, and a replacement sandbox cold-claims that checkout. Publication validates a revision against its base, captures the immutable GitHub repository, installation, and pull request node identities in the same write that opens the pull request, creates a fresh approval, and reconciles approved work through the same pull request lineage; stale, terminal, unavailable, or mismatched authority is refused before model or write work. Runs, evals, kill switch, heartbeat, connector, publication, and completion loops are individually supervised with exponential backoff; a repeatedly crashing loop is parked after a bounded streak while siblings continue. Terminal reply events enter a durable, generation fenced completion outbox before the done marker; independent bounded sweeps retry delivery and quarantine expired or malformed records. Each runner request is capped by both the configured runner ceiling and the delivery's remaining deadline. Upgrade drain refuses a fenced quiesce write and holds its quiesce marker as a short lease renewed while the gate waits, so a killed or deleted gate releases the fleet within one lease; SIGTERM and SIGINT clear it. Runner error classifications are allowlisted across runner and worker; escalation detail is redacted before it reaches either the user reply or logs. Generic turns still execute with repository workspaces disabled; named repository requests, verified review feedback, and retained repository sessions refuse before execution. Retained generic attachment turns replace only an authenticated idle runner with durable history through an exact claim and generation fence. Repository attachment replacement remains deferred. One bounded idle route reclamation follows a proven ResourceQuota refusal and retries only after exact quota headroom is observed. The effective runner timeout bounds the whole stream; unconfirmed timeout ownership ends terminally instead of retrying. The factory dispatcher acquires durable requests before starting a turn, waits on capacity, reconciles orphaned runs, observes cancellation, and rotates CI repair rounds without losing the WorkItem. A declared cron trigger is claimed once per slot in SQL and enqueued onto the same bounded run stream. Factory execution is capped by its three hour deadline and an explicit turn budget. Before each covered factory execute or CI turn, including warm runner reuse and continuations, the worker requests fresh publication precheck context from the API and binds it to the ACI Event; if minting fails it stops before starting the turn. A streaming turn refreshes its live route and workspace lease every third of the route TTL. An unpublished factory execute turn gets one continuation, and a factory execution whose claimed pod is Unschedulable at the claim timeout defers as capacity instead of failing. Slack edits are cut to the 4,000 byte chat.update limit and receipts list at most ten actions. Interactive turns now park in a durable capacity wait when a sandbox cannot start. A fixed deadline, generation fence, wake reconciliation, and terminal notice prevent an unbounded or silently lost wait; the runner grants admission to the exact waiting turn epoch before input is sent. A failed runner turn produces a marked channel reply and a failed message result, with distinct causes for exhausted turns and unclassified failures. The worker carries the selected bot identity through reply delivery, mints a signed connector caller token for the agent at sandbox boot, and reports factory usage. Progress updates use stable delivery identity, while the installation chooses whether terminal replies include all, failed, or no action receipts.",
+      "description": "The concurrency hub: resolves the active deployment, emits a typed terminal failure instead of dropping turns when none exists, enforces one live session per scoped conversation, selects steer versus fresh turn, and protects side effects. It resolves channel attachment references, stores accepted files under a private prefix, and issues a short lived signed redemption reference before claiming the sandbox. Managed coding uses the canonical scoped thread identity rather than a bare reply id. The worker selects and sanitizes an allowlisted repository checkout, archives it privately, and swaps a late workspace into the route only at a fenced turn boundary; multiple ambiguous bare owner/repo-like tokens leave repository selection absent, while multiple explicit repository URLs are refused. Review turns never steer a live sandbox: fresh authority is verified again, the exact accepted pull request head is reserved and materialized, and a replacement sandbox cold-claims that checkout. Publication validates a revision against its base, captures the immutable GitHub repository, installation, and pull request node identities in the same write that opens the pull request, creates a fresh approval, and reconciles approved work through the same pull request lineage; stale, terminal, unavailable, or mismatched authority is refused before model or write work. Runs, evals, kill switch, heartbeat, connector, publication, and completion loops are individually supervised with exponential backoff; a repeatedly crashing loop is parked after a bounded streak while siblings continue. Terminal reply events enter a durable, generation fenced completion outbox before the done marker; independent bounded sweeps retry delivery and quarantine expired or malformed records. Each runner request is capped by both the configured runner ceiling and the delivery's remaining deadline. Upgrade drain refuses a fenced quiesce write and holds its quiesce marker as a short lease renewed while the gate waits, so a killed or deleted gate releases the fleet within one lease; SIGTERM and SIGINT clear it. Runner error classifications are allowlisted across runner and worker; escalation detail is redacted before it reaches either the user reply or logs. Generic turns still execute with repository workspaces disabled; named repository requests, verified review feedback, and retained repository sessions refuse before execution. Retained generic attachment turns replace only an authenticated idle runner with durable history through an exact claim and generation fence. Repository attachment replacement remains deferred. One bounded idle route reclamation follows a proven ResourceQuota refusal and retries only after exact quota headroom is observed. The effective runner timeout bounds the whole stream; unconfirmed timeout ownership ends terminally instead of retrying. The factory dispatcher acquires durable requests before starting a turn, waits on capacity, reconciles orphaned runs, observes cancellation, and rotates CI repair rounds without losing the WorkItem. A declared cron trigger is claimed once per slot in SQL and enqueued onto the same bounded run stream. Factory execution is capped by its three hour deadline and an explicit turn budget. Before each covered factory execute or CI turn, including warm runner reuse and continuations, the worker requests fresh publication precheck context from the API and binds it to the ACI Event; if minting fails it stops before starting the turn. A streaming turn refreshes its live route and workspace lease every third of the route TTL. An unpublished factory execute turn gets one continuation, and a factory execution whose claimed pod is Unschedulable at the claim timeout defers as capacity instead of failing. Slack edits are cut to the 4,000 byte chat.update limit and receipts list at most ten actions. Interactive turns now park in a durable capacity wait when a sandbox cannot start. A fixed deadline, generation fence, wake reconciliation, and terminal notice prevent an unbounded or silently lost wait; the runner grants admission to the exact waiting turn epoch before input is sent. A failed runner turn produces a marked channel reply and a failed message result, with distinct causes for exhausted turns and unclassified failures. The worker carries the selected bot identity through reply delivery, mints a signed connector caller token for the agent at sandbox boot, and reports factory usage. The progress store now persists one fenced, bounded record per logical turn chain and an idempotent card and milestone outbox in Valkey. No model command ingress opens a chain and no adapter delivers that outbox yet; the maintenance sweep can quarantine pending records. A disconnected cluster message keeps its reserved internal relay adapter after the Slack binding resolves, so its reply returns to the CLI instead of real Slack. The installation chooses whether terminal replies include all, failed, or no action receipts.",
       "technology": [
         "Python",
         "Valkey",
@@ -2272,7 +2293,9 @@
         "caller-token-v0110",
         "worker-reply-v0110",
         "factory-usage-v0110",
-        "receipt-v0110"
+        "receipt-v0110",
+        "progress-store-v0110",
+        "relay-route-v0110"
       ],
       "adrIds": [
         "ADR-0013",
@@ -2973,7 +2996,7 @@
       "grade": "B-",
       "implementations": "SlackReplyAdapter plus HttpReplyAdapter consumed by Discord and email",
       "contract": "ReplySink.emit over turn.status, reply.update, reply.post, and turn.completed",
-      "reason": "The four versioned reply events now leave the worker for three surfaces. Slack still owns edit-in-place streaming and approval-card settlement. Progress updates carry a stable update identity. Terminal action receipts follow the installation setting.",
+      "reason": "The four versioned reply events now leave the worker for three surfaces. Slack still owns edit-in-place streaming and approval-card settlement. The reply wire defines stable progress delivery identities, while the new worker progress store is not yet connected to command ingress or adapter delivery. The cluster message reply relay retains its reserved adapter after channel binding. Terminal action receipts follow the installation setting.",
       "leakage": "Discord v1 falls back to text and does not implement buttons. Email sends one correspondent-visible reply per turn.completed and does not settle approvals. Neither surface may fall back to Slack.",
       "nextStep": "Keep the HTTP reply wire; add Discord interaction or treat email's one-shot reply as a distinct delivery policy rather than a missing Slack feature.",
       "evidence": [
@@ -2985,7 +3008,9 @@
         "message-flow",
         "reply-wire-v0110",
         "worker-reply-v0110",
-        "receipt-v0110"
+        "receipt-v0110",
+        "progress-store-v0110",
+        "relay-route-v0110"
       ],
       "adrIds": [
         "ADR-0020",
@@ -3011,11 +3036,12 @@
       "grade": "—",
       "implementations": "2 real renderers (Slack Block Kit, terminal selector)",
       "contract": "Versioned OutboundMessage with text fallback, Choice, Confirm, and semantic action values",
-      "reason": "Two distinct surfaces render the same semantic message without putting their widgets in the contract.",
+      "reason": "Two distinct surfaces render the same semantic message without putting their widgets in the contract. Closed semantic progress card and milestone models are defined, but the new worker store is not yet connected to their delivery.",
       "leakage": "The terminal mirror is handwritten and capabilities are modeled but not dynamically negotiated. Discord and email do not render Choice or Confirm.",
       "nextStep": "Wire capability negotiation when a shipped surface other than Slack needs buttons or cards.",
       "evidence": [
-        "interfaces"
+        "interfaces",
+        "channel-interaction-v0110"
       ],
       "adrIds": [
         "ADR-0020"
@@ -4052,7 +4078,7 @@
       "id": "worker-slack",
       "from": "worker",
       "to": "slack",
-      "label": "identity scoped reply and progress",
+      "label": "identity scoped reply",
       "state": "current",
       "seamId": "channel-reply",
       "bend": -92
@@ -5809,7 +5835,7 @@
       "number": 130,
       "title": "Deliberate progress is bounded durable channel state",
       "status": "accepted",
-      "implementation": "implemented",
+      "implementation": "partial",
       "summary": "Progress is durable channel state with a bound, not a substitute for streaming the final answer.",
       "nodeIds": [
         "worker",
