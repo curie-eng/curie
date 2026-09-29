@@ -61,6 +61,7 @@ worker:
   CURIE_STATUS_TEXT: worker.statusText
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS: worker.suspendedRouteTtlSeconds
   CURIE_TERMINATION_GRACE_PERIOD_S: worker.terminationGracePeriodSeconds
+  CURIE_TURN_RECEIPT: worker.turnReceipt
   CURIE_UPGRADE_LEGACY_QUIESCE: the Helm-managed mixed-version upgrade mode (remove this override)
   CURIE_UPGRADE_REVISION: the Helm release revision (remove this override)
   CURIE_WARM_POOL: worker.warmPool

@@ -135,7 +135,7 @@ from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, re
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, DoneMarkerValue, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
-from .receipt import render_receipt
+from .receipt import TurnReceiptMode, render_receipt
 from .reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
     DeletedReplyTargetError,
@@ -1268,6 +1268,9 @@ class _StreamAccumulator:
     # here, because ``undoable`` is derived on the record and a receipt built
     # from what the worker SENT could claim a reversibility the row lacks.
     receipt_rows: list[dict[str, Any]] = field(default_factory=list)
+    # The install's receipt mode (ADR-0180). Read only by rendered_with_receipt:
+    # the ledger rows above and saw_side_effect are the same in every mode.
+    receipt_mode: TurnReceiptMode = "all"
     # The repository this turn attached from its own message (#2659), announced
     # at finalize only. Intermediate streaming edits show `rendered()` alone.
     workspace_inferred_repo: str | None = None
@@ -1292,7 +1295,7 @@ class _StreamAccumulator:
         return _join_reply_blocks(
             self.rendered(),
             _workspace_inference_notice(self.workspace_inferred_repo),
-            render_receipt(self.receipt_rows),
+            render_receipt(self.receipt_rows, mode=self.receipt_mode),
         )
 
 
@@ -7523,7 +7526,10 @@ class Kernel:
         *,
         workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
-        acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
+        acc = _StreamAccumulator(
+            workspace_inferred_repo=workspace_inferred_repo,
+            receipt_mode=self._config.turn_receipt,
+        )
         silent_requesting_chat = self._is_factory_work_item_turn(qevent.event_id)
         reply = _ThrottledReply(
             self._sink,
