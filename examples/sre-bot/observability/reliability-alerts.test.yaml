@@ -563,6 +563,29 @@ tests:
                 deployed. Alert emails may not be starting SRE turns in their
                 source threads.
 
+  - name: Slack Email intake marker keeps a deleted deployment alarming
+    interval: 1m
+    input_series:
+      - series: 'kube_configmap_info{configmap="sre-slack-email-intake-code",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              configmap: sre-slack-email-intake-code
+              namespace: observability
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
   - name: first Slack Email intake restart sample fires
     interval: 1m
     input_series:
