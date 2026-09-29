@@ -6469,14 +6469,28 @@ def _record_factory_verification(
     request_id: uuid.UUID,
     *,
     outcome: str = "unavailable",
+    check: str = "python",
+    command: str = "uv run pytest runner/tests -q",
 ) -> Any:
-    observation: dict[str, Any] = {
-        "command": "uv run pytest runner/tests -q",
-        "outcome": outcome,
-        "exit_status": None if outcome == "unavailable" else 1,
-        "missing_binaries": ["uv"] if outcome == "unavailable" else [],
-        "blocked_services": [],
-    }
+    observation: dict[str, Any]
+    if outcome == "not_declared":
+        observation = {
+            "check": None,
+            "command": None,
+            "outcome": "not_declared",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": [],
+        }
+    else:
+        observation = {
+            "check": check,
+            "command": command,
+            "outcome": outcome,
+            "exit_status": {"unavailable": None, "passed": 0}.get(outcome, 1),
+            "missing_binaries": ["uv"] if outcome == "unavailable" else [],
+            "blocked_services": [],
+        }
     token = sandbox_token.mint(
         get_settings().api_key,
         agent=str(request_id),
@@ -6529,6 +6543,162 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
     assert "In-sandbox verification was unavailable." in body
     assert "Python (ruff + mypy + pytest) is pending proof." in body
     assert "verification passed" not in body.casefold()
+
+
+_NOT_DECLARED_STAMP = "No in-sandbox Python verification check was declared."
+_PENDING_PROOF_STAMP = "Python (ruff + mypy + pytest) is pending proof."
+
+
+def _factory_publication_body(publication_id: str) -> str:
+    return str(
+        _factory_rows(
+            "SELECT body FROM curie.publications WHERE id = :id",
+            {"id": publication_id},
+        )[0]["body"]
+    )
+
+
+def test_factory_python_publication_with_no_declared_check_states_it_was_not_declared(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="not_declared")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert payload["body"] in body
+    assert _NOT_DECLARED_STAMP in body
+    assert _PENDING_PROOF_STAMP in body
+    assert "In-sandbox verification was unavailable." not in body
+    assert "verification passed" not in body.casefold()
+
+
+def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_python(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert _NOT_DECLARED_STAMP in body
+    assert _PENDING_PROOF_STAMP in body
+    assert "In-sandbox verification was unavailable." not in body
+
+
+def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["body"] == payload["body"]
+
+
+def test_factory_python_publication_uses_the_python_check_among_several(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    rust = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert rust.status_code == 201, rust.text
+    python = _record_factory_verification(client, request_id)
+    assert python.status_code == 201, python.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "In-sandbox verification was unavailable." in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
+
+
+def test_factory_python_publication_refuses_a_failed_python_check_beside_a_passed_one(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    rust = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert rust.status_code == 201, rust.text
+    python = _record_factory_verification(client, request_id, outcome="failed")
+    assert python.status_code == 201, python.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_any_failed_declared_check(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    failed = _record_factory_verification(
+        client,
+        request_id,
+        outcome="failed",
+        check="api",
+        command="uv run pytest apps/api/tests -q",
+    )
+    assert failed.status_code == 201, failed.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+
+
+def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="api",
+        command="uv run pytest apps/api/tests -q",
+    )
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "In-sandbox verification was unavailable." in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(

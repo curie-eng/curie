@@ -407,7 +407,7 @@ async def create_publication(
             )
         if factory_ci._python_paths(changed_paths):
             try:
-                observation = await factory_progress.read_verification_observation(
+                observations = await factory_progress.read_verification_observations(
                     session, data.work_item_request_id
                 )
             except ValueError as exc:
@@ -418,7 +418,7 @@ async def create_publication(
                         "message": "stored verification preflight is unreadable",
                     },
                 ) from exc
-            if observation is None:
+            if not observations:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -426,7 +426,11 @@ async def create_publication(
                         "message": "verification preflight observation is missing",
                     },
                 )
-            if observation.outcome == "failed":
+            # A Python check can be declared under any id, so every stored check
+            # counts: any failure refuses a Python change and any unavailable check
+            # stamps the unavailable disclosure. Only when nothing was unavailable
+            # does a missing ``python`` check stamp the not-declared pair.
+            if factory_progress.failed_verification(observations) is not None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -434,16 +438,22 @@ async def create_publication(
                         "message": "verification preflight failed; rerun after fixing the failure",
                     },
                 )
-            if observation.outcome == "unavailable":
-                body = data.body or ""
+            statements: tuple[str, ...] = ()
+            if any(observation.outcome == "unavailable" for observation in observations):
                 statements = (
                     "In-sandbox verification was unavailable.",
                     "Python (ruff + mypy + pytest) is pending proof.",
                 )
-                missing = [statement for statement in statements if statement not in body]
-                if missing:
-                    body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
-                    data = data.model_copy(update={"body": body})
+            elif factory_progress.python_verification(observations) is None:
+                statements = (
+                    "No in-sandbox Python verification check was declared.",
+                    "Python (ruff + mypy + pytest) is pending proof.",
+                )
+            body = data.body or ""
+            missing = [statement for statement in statements if statement not in body]
+            if missing:
+                body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:

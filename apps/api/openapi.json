@@ -7097,7 +7097,7 @@
       },
       "VerificationObservation": {
         "additionalProperties": false,
-        "description": "Exact sandbox command result recorded before the model starts.",
+        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers.",
         "properties": {
           "blocked_services": {
             "items": {
@@ -7107,11 +7107,30 @@
             "title": "Blocked Services",
             "type": "array"
           },
+          "check": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,31}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
           "command": {
-            "maxLength": 180,
-            "minLength": 1,
-            "title": "Command",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 180,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
           },
           "exit_status": {
             "anyOf": [
@@ -7138,13 +7157,15 @@
             "enum": [
               "passed",
               "unavailable",
-              "failed"
+              "failed",
+              "not_declared"
             ],
             "title": "Outcome",
             "type": "string"
           }
         },
         "required": [
+          "check",
           "command",
           "outcome",
           "exit_status",
