@@ -18,6 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1462,9 +1463,9 @@ def test_ordinary_approval_notice_keeps_the_announcement_above_it(make_harness) 
             assert h.sink.last_text.split("\n\n") == [
                 "Requesting sign-off",
                 "Working in acme-corp/acme-bot, from the repository named in your message.",
-                "Awaiting approval (appr-1): Give ACME a 20% discount\n"
-                "The session is paused and will resume once an authorized member "
-                "resolves this request.",
+                # The card follows in this thread, so the notice is one line
+                # (ADR-0179 decision 2); the announcement still precedes it.
+                _SHORT_NOTICE,
             ]
 
     asyncio.run(go())
@@ -1771,6 +1772,46 @@ def test_worker_approval_http_requests_carry_the_active_turn_parent() -> None:
         assert all(request.headers.get("traceparent") == _HTTP_TRACEPARENT for request in requests)
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The API serializes the row's naive UTC ``resolved_at`` with no offset.
+        ("2026-09-21T14:13:20", datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)),
+        (None, None),
+        ("garbage", None),
+    ],
+)
+def test_the_approval_read_carries_the_decision_time(
+    raw: str | None, expected: datetime | None
+) -> None:
+    """ADR-0179 decision 1: the worker's settle path gets the time the click saw."""
+
+    async def go() -> SettledApproval | None:
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "approved",
+                    "resolved_by": "U0APPROVER1",
+                    "resolution_note": None,
+                    "resolved_at": raw,
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="platform-test-key",
+                client=http,
+                read_timeout_s=1.0,
+            )
+            return await client.get("00000000-0000-0000-0000-000000000001")
+
+    record = asyncio.run(go())
+    assert record is not None
+    assert record.resolved_at == expected
 
 
 def test_private_lineage_truth_is_read_from_api_without_publication_credentials() -> None:
@@ -2106,11 +2147,15 @@ def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
             record = h.substrate._affinity.get(_thread_key(ev.conversation_id))
             assert record is not None and record.state is RouteState.SUSPENDED
 
-            # The placeholder carries the pending notice with the record id,
-            # and the event is done (no retry loop).
+            # The placeholder carries the one-line notice above the card, which
+            # holds the summary and the record id (ADR-0179 decision 2), and the
+            # event is done (no retry loop).
             assert h.sink.last_text is not None
-            assert "Awaiting approval (appr-1)" in h.sink.last_text
-            assert "Give ACME a 20% discount" in h.sink.last_text
+            assert h.sink.last_text.endswith(_SHORT_NOTICE)
+            card_message = h.sink.posts[0][1]
+            assert card_message.text == "Give ACME a 20% discount"
+            assert isinstance(card_message.interaction, ConfirmIntent)
+            assert card_message.interaction.id == "appr-1"
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
@@ -2129,8 +2174,13 @@ def test_templated_display_reaches_the_notice_and_card_not_the_record(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script_with_display(machine, sentence)
+        # Routed, so the requester's thread carries the full notice: an in-thread
+        # card gets the one line instead (ADR-0179 decision 2).
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            script = _awaiting_script_with_display(machine, sentence)
+            script[-1] = script[-1].model_copy(update={"approval_route": "managers"})
+            h.runner.default_script = script
             ev = _qevent("please file", event_id="ev-appr-display")
             await h.kernel.process_event(ev)
 
@@ -2427,11 +2477,18 @@ def test_no_edit_placeholderless_approval_resumes_onto_the_minted_message(
 
     async def go() -> None:
         approvals = RecordingApprovals()
+        # Routed, so no card follows the notice in this thread and the resume
+        # answers on the notice. An in-thread card answers below itself instead
+        # (ADR-0179 decision 3, test_a_placeholderless_resume_answers_below_the_card).
+        binding = RoutedBinding({"managers": _resolution_route()})
         async with make_harness(
             approvals=approvals,
+            binding=binding,
             slack_no_edit_streaming=True,
         ) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            h.runner.default_script = _awaiting_routed_script(
+                "Give ACME a 20% discount", "managers"
+            )
             thread = "th_no_edit_approval"
             event = _qevent(
                 "please discount",
@@ -2566,7 +2623,7 @@ def test_stream_minted_ref_survives_a_booting_delivery_failure(make_harness) -> 
             assert approvals.requests[0].reply_placeholder == minted
             assert len(h.sink.updates) >= 2, h.sink.updates
             assert {ref for _, ref, _ in h.sink.updates} == {minted}
-            assert "Awaiting approval (appr-1)" in h.sink.updates[-1][2]
+            assert h.sink.updates[-1][2].endswith(_SHORT_NOTICE)
 
     asyncio.run(go())
 
@@ -2587,9 +2644,12 @@ def test_multiparagraph_summary_yields_a_single_block_parseable_notice(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
+        # Routed: the CLI parses the notice only where the card is not in its
+        # thread (ADR-0179 decision 2), so that is where the parse must hold.
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
             summary = "First paragraph of the summary.\n\nSecond paragraph.\nThird line."
-            h.runner.default_script = _awaiting_script(summary)
+            h.runner.default_script = _awaiting_routed_script(summary, "managers")
             ev = _qevent("please discount", event_id="ev-appr-multi")
             await h.kernel.process_event(ev)
 
@@ -3536,6 +3596,254 @@ def _resume_turn(text: str, *, thread: str, approval_id: str, author: str) -> Qu
     )
 
 
+# ADR-0179 decision 2: the one line left above a card posted in the requester's
+# own thread. No approval id and no session vocabulary; the card says the rest.
+_SHORT_NOTICE = "Approval requested. See the card below."
+
+
+def _card_post_index(h) -> int:
+    """Where the approval card sits in the neutral emit log."""
+
+    return next(
+        i
+        for i, (event, _route, _best) in enumerate(h.sink.events)
+        if isinstance(event, ReplyPost) and isinstance(event.message.interaction, ConfirmIntent)
+    )
+
+
+def test_an_in_thread_card_leaves_one_plain_line_above_it(make_harness) -> None:
+    """ADR-0179 decision 2: the notice points at the card instead of repeating it.
+
+    The card already shows the summary and the requester to the person it
+    addresses, so the placeholder above it says only that approval was asked.
+    The model's own text before the pause still comes first.
+    """
+
+    async def go() -> None:
+        async with make_harness(approvals=RecordingApprovals()) as h:
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            await h.kernel.process_event(_qevent("refund?", thread="th-short"))
+
+            placeholder_texts = [text for _, ref, text in h.sink.updates if ref == "p-1"]
+            assert placeholder_texts[-1].split("\n\n") == ["Requesting sign-off", _SHORT_NOTICE]
+            assert "appr-1" not in placeholder_texts[-1]
+            # And the card is the message after it, in the same thread.
+            _channel, _message, _requested_by, thread_ts, _endpoint = h.sink.posts[0]
+            assert thread_ts == "th-short"
+
+    asyncio.run(go())
+
+
+def test_a_routed_card_keeps_the_full_notice_with_its_id(make_harness) -> None:
+    """The negative of decision 2: no card follows the notice in this thread.
+
+    A routed card goes to its bound channel, so the requester's thread gets the
+    full notice, and the CLI reads the id from it (``parse_approval_id``).
+    """
+
+    async def go() -> None:
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-routed-notice"))
+
+            assert h.sink.last_text is not None
+            assert "Awaiting approval (appr-1): Discount for ACME" in h.sink.last_text
+            assert _SHORT_NOTICE not in h.sink.last_text
+
+    asyncio.run(go())
+
+
+def test_the_resumed_answer_is_posted_below_an_in_thread_card(make_harness) -> None:
+    """ADR-0179 decision 3: the thread reads request, card, answer.
+
+    The resume turn does not edit the placeholder above the card. Its first
+    delivery posts a new message after the card, and the rest of the turn edits
+    that message; the placeholder keeps the one line.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-order"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            card_index = _card_post_index(h)
+            paused_events = len(h.sink.events)
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            resumed_text = [
+                event
+                for event, _route, _best in h.sink.events[paused_events:]
+                if isinstance(event, ReplyUpdate) and event.message is None
+            ]
+            assert resumed_text, "the resume delivered no text"
+            assert resumed_text[0].target.reply_ref is None, "the first delivery must post"
+            assert paused_events > card_index
+            minted = h.sink.text_posts[-1][1]
+            assert {e.target.reply_ref for e in resumed_text[1:]} <= {minted}
+            assert h.sink.updates[-1] == ("C1", minted, "Refunded.")
+            placeholder_texts = [text for _, ref, text in h.sink.updates if ref == "p-1"]
+            assert placeholder_texts[-1].endswith(_SHORT_NOTICE)
+
+    asyncio.run(go())
+
+
+def test_the_answer_goes_below_the_card_even_after_the_card_ref_is_consumed(
+    make_harness,
+) -> None:
+    """The choice is remembered at pause time, not read from the card ref.
+
+    Settling the card consumes its ref, so a redelivered resume would otherwise
+    find nothing and answer above the card after the first try answered below.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-order-consumed"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            await h.async_redis.delete(h.config.approval_card_key("appr-1"))
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            minted = h.sink.text_posts[-1][1]
+            assert h.sink.updates[-1] == ("C1", minted, "Refunded.")
+
+    asyncio.run(go())
+
+
+def test_a_placeholderless_resume_answers_below_the_card(make_harness) -> None:
+    """Decision 3 on the #2721 path: the minted notice is above the card too.
+
+    A turn with no placeholder mints its notice message, and the resume would
+    adopt that ref. With the card below the notice, it posts after the card
+    instead and leaves the notice's one line alone.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            approvals=RecordingApprovals(), slack_no_edit_streaming=True
+        ) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            thread = "th_no_edit_in_thread"
+            await h.kernel.process_event(
+                _qevent("please discount", thread=thread, placeholder=None)
+            )
+            notice_ref = h.sink.text_posts[0][1]
+            assert h.sink.updates[-1] == (
+                "C1",
+                notice_ref,
+                f"Requesting sign-off\n\n{_SHORT_NOTICE}",
+            )
+
+            h.runner.default_script = [Final(text="Discount applied.", status=DONE)]
+            await h.kernel.process_event(
+                _qevent(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    event_id="approval-appr-1-resolved",
+                    placeholder=None,
+                )
+            )
+
+            assert len(h.sink.text_posts) == 2, h.sink.text_posts
+            answer_ref = h.sink.text_posts[1][1]
+            assert answer_ref != notice_ref
+            assert h.sink.updates[-1] == ("C1", answer_ref, "Discount applied.")
+
+    asyncio.run(go())
+
+
+def test_a_resume_without_the_memory_edits_the_notice_as_before(make_harness) -> None:
+    """The fallback of decision 3: a pause from before this change, or a lapsed TTL."""
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-order-forgotten"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            assert await h.async_redis.exists(h.config.approval_reply_below_card_key("appr-1"))
+            await h.async_redis.delete(h.config.approval_reply_below_card_key("appr-1"))
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            assert h.sink.updates[-1] == ("C1", "p-1", "Refunded.")
+
+    asyncio.run(go())
+
+
+def test_a_card_acknowledged_without_a_ref_keeps_todays_reply(make_harness) -> None:
+    """A channel with no message to address (email acks with no ref) keeps its reply.
+
+    The notice is still the one line, because it is chosen before the card is
+    posted, but nothing is remembered, so the resumed answer edits the turn's own
+    message exactly as it did before.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-order-refless"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            original_emit = h.sink.emit
+
+            async def refless_card(
+                event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                ack = await original_emit(
+                    event, route=route, best_effort_unreachable=best_effort_unreachable
+                )
+                return ReplyAck(ref=None) if isinstance(event, ReplyPost) else ack
+
+            h.sink.emit = refless_card
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            await h.kernel.process_event(_qevent("refund?", thread=thread))
+            assert not await h.async_redis.exists(
+                h.config.approval_reply_below_card_key("appr-1")
+            )
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            assert h.sink.updates[-1] == ("C1", "p-1", "Refunded.")
+
+    asyncio.run(go())
+
+
 def test_expiry_resume_disables_the_approval_card(make_harness) -> None:
     """#419: an EXPIRED approval's resume turn (author "system", enqueued by the
     #412 sweeper or a past-SLA resolve attempt) disables the live card in place --
@@ -3640,6 +3948,54 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
 
             # The memory is still consumed, so a later approval cannot collide.
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("timed", [True, False], ids=["with-time", "without-time"])
+def test_a_resolve_resume_carries_the_records_decision_time_to_the_card(
+    make_harness, timed: bool
+) -> None:
+    """ADR-0179 decision 1: the settled card says when, read off the record.
+
+    The reply wire's ``SettledOutcome`` is decoded strictly by out-of-process
+    adapters, so the instant travels in the settle message's existing ``fields``
+    list, which every adapter already accepts. A record with no time carries no
+    field rather than a guessed one.
+    """
+
+    from curie_worker.approvals import decided_at
+
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+    record = (
+        SettledApproval(
+            status="approved", resolved_by="U9", resolution_note=None, resolved_at=decided
+        )
+        if timed
+        else _APPROVED
+    )
+
+    async def go() -> None:
+        reader = RecordingReader(record)
+        thread = "th-decided"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            _channel, _ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert settled is not None and settled.decision == "approved"
+            if timed:
+                assert decided_at(message) == decided
+            else:
+                assert message.fields == []
 
     asyncio.run(go())
 

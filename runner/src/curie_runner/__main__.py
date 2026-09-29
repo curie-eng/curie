@@ -654,6 +654,7 @@ def build_runner(
             curie_session_id=config.session.session_id,
             cwd=workspace_cwd,
             harness_replay=conversation_replay.harness_replay,
+            system_prompt=system_prompt,
         )
         real_options = build_options(
             plugins=compiled.plugins,

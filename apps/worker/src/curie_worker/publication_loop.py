@@ -22,6 +22,7 @@ from channel_protocol.reply import (
 )
 
 from .approval_cards import ApprovalCardRef, ApprovalCardStore
+from .approvals import decided_field
 from .publication_k8s import (
     PublicationJobSettings,
     PublicationPayload,
@@ -541,6 +542,7 @@ class PublicationReconciler:
             decision = None
         resolver = result.resolved_by if decision is not None else None
         note = result.resolution_note if decision is not None else None
+        decided = result.resolved_at if decision is not None else None
         if decision is not None and (
             not isinstance(resolver, str) or not resolver.strip()
         ):
@@ -557,7 +559,12 @@ class PublicationReconciler:
                     conversation_id=result.target.conversation_id,
                     reply_ref=ref.ts,
                 ),
-                message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
+                message=OutboundMessage(
+                    version=MESSAGE_VERSION,
+                    text=ref.summary,
+                    # The click's decision time, so the rebuild keeps it (ADR-0179).
+                    fields=[decided_field(decided)] if decided is not None else [],
+                ),
                 settled=SettledOutcome(
                     requested_by=ref.requested_by,
                     decision=decision,

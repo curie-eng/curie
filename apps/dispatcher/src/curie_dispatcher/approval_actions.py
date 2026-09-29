@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -89,12 +90,17 @@ _VERDICT_LINE_MAX = 2900
 # verdict's context-block clamp above no longer covers it.
 _FALLBACK_TEXT_MAX = 39000
 
-# The live card's header, shared with the settled rebuild so the two cannot
-# drift: a rebuild under a different heading is a visibly different card for the
-# same decision. ``curie_worker.blocks.approval_card`` imports this rather than
-# repeating the literal.
+# The live card's header. ``curie_worker.blocks.approval_card`` imports this
+# rather than repeating the literal. A settled card is headed with its outcome
+# instead (ADR-0179), through ``settled_card_header`` on both settling paths.
 _APPROVAL_CARD_HEADER = "Approval required"
 APPROVAL_CARD_HEADER = _APPROVAL_CARD_HEADER
+
+_SETTLED_CARD_HEADERS = {
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "expired": "Expired",
+}
 
 _APPROVAL_ACTION_IDS = frozenset(
     {
@@ -206,6 +212,8 @@ class ResolveOutcome:
     detail: str = ""
     resolved_by: str | None = None
     decision: str | None = None
+    # When the API recorded the decision; None when the body did not say.
+    resolved_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +332,7 @@ class ApprovalResolveClient:
             detail=detail,
             resolved_by=str(resolved) if resolved else None,
             decision=str(decided) if decided else None,
+            resolved_at=parse_decision_time(parsed.get("resolved_at")) if parsed else None,
         )
 
     def exists(self, approval_id: str) -> bool | None:
@@ -353,7 +362,7 @@ class ApprovalResolveClient:
 
 
 def settled_approval_card(
-    *, summary: str, requested_by: str, verdict: str
+    *, summary: str, requested_by: str, verdict: str, header: str
 ) -> tuple[str, list[dict[str, Any]]]:
     """The approval card in its SETTLED form, rebuilt rather than edited (#1084).
 
@@ -362,9 +371,10 @@ def settled_approval_card(
     resume path holds only what it remembered at pause time and must rebuild.
     Left to themselves those two produce different-looking cards for the same
     decision, which is the divergence #1084 exists to prevent, so this renders
-    the rebuild to match the edit exactly: the same header, the same summary
-    section, the same requested-by context, the actions block gone, and the
-    verdict appended as a context line.
+    the rebuild to match the edit exactly: the outcome header
+    (``settled_card_header``, ADR-0179), the same summary section, the same
+    requested-by context, the actions block gone, and the verdict appended as a
+    context line.
 
     "Exactly" is asserted rather than asserted-in-a-docstring: a test renders a
     live card through ``curie_worker.blocks.approval_card``, settles it both
@@ -381,7 +391,7 @@ def settled_approval_card(
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": _APPROVAL_CARD_HEADER,
+                "text": header,
                 "emoji": True,
             },
         },
@@ -403,7 +413,9 @@ def settled_approval_card(
     return fallback, blocks
 
 
-def settled_verdict_line(*, decision: str, resolver: str, note: str | None) -> str:
+def settled_verdict_line(
+    *, decision: str, resolver: str, note: str | None, resolved_at: datetime | None = None
+) -> str:
     """The verdict line a settled card shows, for callers outside this module.
 
     The public name for ``_verdict_line``: the worker needs the identical string
@@ -411,7 +423,48 @@ def settled_verdict_line(*, decision: str, resolver: str, note: str | None) -> s
     start wording the same decision differently.
     """
 
-    return _verdict_line(decision, resolver, note)
+    return _verdict_line(decision, resolver, note, resolved_at)
+
+
+def settled_card_header(outcome: str) -> str:
+    """The header of a settled card: how the approval ended (ADR-0179)."""
+
+    return _SETTLED_CARD_HEADERS.get(outcome, outcome.capitalize())
+
+
+def parse_decision_time(raw: object) -> datetime | None:
+    """An approval row's ``resolved_at`` as an aware UTC instant, or None.
+
+    The row stores naive UTC like every instant on it, and the API serializes
+    that with no offset, so a naive value is read as UTC rather than local time.
+    Anything unreadable is None: a card without a time beats one with a wrong
+    time.
+    """
+
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _decision_time_token(resolved_at: datetime) -> str:
+    """The decision time as Slack's date token, shown in each reader's own zone.
+
+    ``<!date^unix^token_string|fallback>`` renders only in mrkdwn, which is why it
+    lives on the verdict's context line and not in the plain-text header. The
+    fallback, for clients that cannot render the token, is the instant in UTC.
+    """
+
+    instant = (
+        resolved_at.replace(tzinfo=UTC) if resolved_at.tzinfo is None else resolved_at
+    ).astimezone(UTC)
+    fallback = instant.strftime("%Y-%m-%d %H:%M UTC")
+    return f"<!date^{int(instant.timestamp())}^{{date_short_pretty}} at {{time}}|{fallback}>"
 
 
 def _card_is_readable(message: dict[str, Any]) -> bool:
@@ -468,18 +521,29 @@ def _fallback_text(verdict: str, message: dict[str, Any]) -> str:
     return combined[: _FALLBACK_TEXT_MAX - 1] + "\u2026"
 
 
-def _resolved_card_blocks(original: dict[str, Any], verdict: str) -> list[dict[str, Any]]:
+def _resolved_card_blocks(
+    original: dict[str, Any], verdict: str, header: str | None = None
+) -> list[dict[str, Any]]:
     """The clicked card with its buttons replaced by the verdict line.
 
     Every non-actions block of the original message is kept (the summary stays
     readable in place); the actions block is swapped for a context line naming
-    the decision and the resolver, so the card cannot be clicked twice.
+    the decision and the resolver, so the card cannot be clicked twice. With a
+    ``header``, the header block's text becomes it, so a resolved card is headed
+    with its outcome (ADR-0179). Without one, the header read stays: a claim-race
+    refresh knows who won but not how.
 
     Callers must gate this on ``_card_is_readable``: handed an unread message it
     returns the verdict alone, which as a ``chat_update`` payload is a wipe.
     """
 
-    blocks = [b for b in original.get("blocks", []) if b.get("type") != "actions"]
+    blocks = [
+        {**b, "text": {**(b.get("text") or {}), "text": header}}
+        if header is not None and b.get("type") == "header"
+        else b
+        for b in original.get("blocks", [])
+        if b.get("type") != "actions"
+    ]
     blocks.append(
         {
             "type": "context",
@@ -514,13 +578,16 @@ def escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _verdict_line(decision: str, user: str, note: str | None) -> str:
+def _verdict_line(
+    decision: str, user: str, note: str | None, resolved_at: datetime | None = None
+) -> str:
     """The context line stamped onto a settled card.
 
     The note is shown HERE as well as on the requester's thread: the approver
     channel is where the next person looks to understand a decision, and a
     reason that only reached the requester leaves that channel with a bare
-    verdict.
+    verdict. The decision time follows the resolver when it is known
+    (ADR-0179), as part of the attribution the cut below preserves.
     """
 
     # Build the whole line, then cut only if it does not fit. The cut takes from
@@ -532,6 +599,8 @@ def _verdict_line(decision: str, user: str, note: str | None) -> str:
     # the worker's ``_truncate`` in ``curie_worker.blocks`` uses, so a truncated
     # note ends the same way whichever service stamped the card.
     line = f"{decision.capitalize()} by <@{user}>"
+    if resolved_at is not None:
+        line = f"{line} on {_decision_time_token(resolved_at)}"
     if note:
         line = f"{line}\nNote: {escape_mrkdwn(note)}"
     if len(line) <= _VERDICT_LINE_MAX:
@@ -942,7 +1011,8 @@ def _render_outcome(
     """
 
     if outcome.status_code == 200:
-        verdict = _verdict_line(outcome.decision or decision, user, note)
+        decided = outcome.decision or decision
+        verdict = _verdict_line(decided, user, note, outcome.resolved_at)
         # Best-effort: the record is already resolved and the resume turn is
         # enqueued; a failed card edit must not undo either. And an UNREAD card
         # is not stamped at all (#1073): writing the verdict over a body we
@@ -954,7 +1024,9 @@ def _render_outcome(
                     channel=channel,
                     ts=card_ts,
                     text=_fallback_text(verdict, message),
-                    blocks=_resolved_card_blocks(message, verdict),
+                    blocks=_resolved_card_blocks(
+                        message, verdict, header=settled_card_header(decided)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - render is best-effort
                 log.warning("approval card update failed for %s: %s", approval_id, exc)
