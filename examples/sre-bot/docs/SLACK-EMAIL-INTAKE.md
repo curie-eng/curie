@@ -59,6 +59,8 @@ Configuration, Slack API, file download, hook authentication, hook routing, and
 receipt mismatches are fatal. Network calls have finite timeouts. An unchanged
 placeholder older than the configured deadline is also fatal. The Deployment
 uses one replica and `Recreate`, so rollouts cannot race two placeholder posts.
+Slack API and private-file redirects are followed only within `slack.com`; an
+external redirect is fatal before the bot bearer token can be forwarded.
 
 The process serves `/livez`, `/readyz`, and Prometheus metrics. Readiness is
 true only after a successful complete scan and becomes false when that success
