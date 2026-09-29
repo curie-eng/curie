@@ -30,7 +30,14 @@ def test_moving_a_slack_binding_to_another_kind_leaves_it_route_less(
         headers=auth_headers,
     )
     assert moved.status_code == 200, moved.text
-    assert moved.json()["channels"] == [{"kind": "webhook", "address": "room-1", "adapter": None}]
+    assert moved.json()["channels"] == [
+        {
+            "kind": "webhook",
+            "address": "room-1",
+            "adapter": None,
+            "allowed_callers": None,
+        }
+    ]
 
 
 def test_moving_a_routed_binding_to_slack_names_the_default_identity(
@@ -54,7 +61,12 @@ def test_moving_a_routed_binding_to_slack_names_the_default_identity(
     )
     assert moved.status_code == 200, moved.text
     assert moved.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default"}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE2",
+            "adapter": "default",
+            "allowed_callers": None,
+        }
     ]
 
 
@@ -79,7 +91,12 @@ def test_a_same_kind_move_keeps_the_stored_route(
     )
     assert moved.status_code == 200, moved.text
     assert moved.json()["channels"] == [
-        {"kind": "email", "address": "desk@example.com", "adapter": "agentmail"}
+        {
+            "kind": "email",
+            "address": "desk@example.com",
+            "adapter": "agentmail",
+            "allowed_callers": None,
+        }
     ]
 
 
