@@ -4550,7 +4550,7 @@ class Kernel:
         verified_review: VerifiedReviewFeedback | None = None
         review_receipt: str | None = None
 
-        def close_routed_turn() -> None:
+        async def close_routed_turn() -> None:
             # Unregister only a turn this attempt opened. A follow-up that
             # failed during steer or lock acquire never registered; dropping
             # the agent+thread key would hide the original live turn from kill.
@@ -4559,6 +4559,9 @@ class Kernel:
             if routed is not None and routed.turn is not None:
                 self._unregister_run(agent_id, thread_key)
                 routed.turn.close()
+            progress_plan = _TURN_PROGRESS.get()
+            if progress_plan is not None and self._progress is not None:
+                await deactivate_turn_progress(self._progress, progress_plan)
 
         def record_reclaimed_retry() -> None:
             if pressure_retried:
@@ -4643,7 +4646,7 @@ class Kernel:
                 # is before the route lock's async exit has finished. Preserve
                 # cancellation and every existing error policy, but release the
                 # response first if lock cleanup itself fails or is cancelled.
-                close_routed_turn()
+                await close_routed_turn()
                 raise
         except CapacityExhaustedError as exc:
             rejection = exc.rejection
@@ -4862,14 +4865,14 @@ class Kernel:
         try:
             release_order()
         except BaseException:
-            close_routed_turn()
+            await close_routed_turn()
             raise
 
         if review_receipt is not None:
             try:
                 await self._reply_for(qevent, route, review_receipt, terminal=False)
             except asyncio.CancelledError:
-                close_routed_turn()
+                await close_routed_turn()
                 raise
             except Exception:
                 # The result uses the existing durable completion path. A reply
@@ -4887,7 +4890,7 @@ class Kernel:
                 # minted ref before streaming so every later update edits it.
                 await self._reply_for(qevent, route, self._config.booting_text, terminal=False)
             except asyncio.CancelledError:
-                close_routed_turn()
+                await close_routed_turn()
                 raise
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)

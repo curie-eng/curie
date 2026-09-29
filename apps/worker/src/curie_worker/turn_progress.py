@@ -108,8 +108,13 @@ class ProgressLeaseKeeper:
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            try:
                 await self._task
+            except asyncio.CancelledError:
+                self._task.cancel()
+                raise
+            except Exception:  # noqa: BLE001 - progress never fails a turn
+                pass
 
     async def _run(self) -> None:
         while not self._stop.is_set():
