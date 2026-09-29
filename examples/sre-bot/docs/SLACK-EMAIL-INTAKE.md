@@ -107,6 +107,9 @@ Optional keys are `SLACK_EMAIL_SOURCE_BOT_ID`, `CURIE_SLACK_ADAPTER`,
 `PLACEHOLDER_STALE_SECONDS` must be greater than two poll intervals.
 
 The Slack app needs permission to read the configured channel and its thread
-replies, download the private email file, and post in the thread. It must be a
-member of a private channel. The selected Curie Slack binding and adapter must
-address the same channel and use this bot identity.
+replies, download the private email file, and post in the thread. Downloading a
+`url_private` file requires the bot token's `files:read` OAuth scope; message
+history access alone is insufficient. Add the scope and reinstall the app
+before using that token for the intake. It must be a member of a private
+channel. The selected Curie Slack binding and adapter must address the same
+channel and use this bot identity.
