@@ -4,7 +4,10 @@ prometheus-pushgateway:
   enabled: false
 configmapReload:
   prometheus:
-    enabled: false
+    # Alert rules live in this chart-managed ConfigMap. Keep the reloader on so
+    # a Helm upgrade changes the rules Prometheus is actually serving without
+    # an undocumented manual pod restart (#2981).
+    enabled: true
 kube-state-metrics:
   enabled: true
   # CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these

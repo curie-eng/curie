@@ -244,3 +244,12 @@ def test_default_install_carries_no_heartbeat() -> None:
         if str(rule.get("expr", "")).strip() == "vector(1)"
     ]
     assert not always_firing, f"default rules carry always-firing {always_firing}"
+
+
+def test_prometheus_reloads_rule_configmap_changes_without_a_restart() -> None:
+    values = _load(PROMETHEUS_VALUES)
+    reload_config = (values.get("configmapReload") or {}).get("prometheus") or {}
+    assert reload_config.get("enabled") is True, (
+        "the shipped alert rules must reload when Helm updates their ConfigMap; "
+        "otherwise /api/v1/rules keeps serving the previous revision until a restart"
+    )
