@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from runner_dockerfile_support import logical_instructions
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Shipped first-party images plus the other first-party product Dockerfiles
@@ -39,25 +41,9 @@ _FULL_VERSION = re.compile(r"\d+\.\d+\.\d+")
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$", re.IGNORECASE)
 
 
-def _logical_instructions(dockerfile_text: str) -> list[str]:
-    instructions: list[str] = []
-    pending: list[str] = []
-    for raw_line in dockerfile_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        continues = line.endswith("\\")
-        pending.append(line[:-1].rstrip() if continues else line)
-        if not continues:
-            instructions.append(" ".join(pending))
-            pending = []
-    assert not pending, "Dockerfile ends with an unfinished continuation"
-    return instructions
-
-
 def _from_images(dockerfile_text: str) -> list[str]:
     images: list[str] = []
-    for instruction in _logical_instructions(dockerfile_text):
+    for instruction in logical_instructions(dockerfile_text):
         match = _FROM.fullmatch(instruction)
         if match is None:
             continue

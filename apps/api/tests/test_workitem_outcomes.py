@@ -15,9 +15,9 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import channel_protocol
 import httpx
@@ -30,11 +30,13 @@ from curie_api.github_app import (
     GitHubInstallationRefused,
 )
 from curie_api.main import create_app
+from curie_api.models import ExecutionRequest, WorkItem
 from curie_api.publication_authority import VerifiedPublicationIdentity
 from curie_api.schemas import ApprovalRequest, PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
     acquire,
     admit,
+    admit_revision,
     cancel,
     claim_termination,
     defer,
@@ -42,10 +44,11 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
+from curie_api.workitem_outcomes import derive_outcome
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
 ADDRESS = "C0EXAMPLE1"
@@ -241,6 +244,19 @@ def _admit(facts: SimpleNamespace) -> SimpleNamespace:
         return SimpleNamespace(
             work_item_id=admitted.work_item.id,
             work_item_version=admitted.work_item.version,
+            request_id=facts.request_id,
+        )
+
+    return with_session(body)
+
+
+def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
+    async def body(session: AsyncSession) -> SimpleNamespace:
+        admitted = await admit_revision(session, facts)
+        assert admitted.request is not None, admitted
+        assert admitted.request.status == "queued", admitted
+        return SimpleNamespace(
+            work_item_id=admitted.work_item.id,
             request_id=facts.request_id,
         )
 
@@ -692,6 +708,39 @@ def test_pending_publication_approval_is_awaiting_approval(
     _assert_common(body)
 
 
+def test_queued_revision_preserves_active_approval_and_objective(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    _publish(stack, agent["deployment_id"])
+    revision_objective = "Revise the pull request after the current run"
+    revision = _admit_revision(
+        _facts(agent["agent_id"], objective=revision_objective, requester="U0REQUEST2")
+    )
+    assert revision.work_item_id == active.work_item_id
+
+    body = _detail(stack, auth_headers, active.work_item_id)
+    listed = stack.get("/work-items", headers=auth_headers)
+    assert listed.status_code == 200, listed.text
+    listed_item = next(
+        item for item in listed.json()["items"] if item["id"] == str(active.work_item_id)
+    )
+
+    for view in (body, listed_item):
+        assert view["state"] == "awaiting_approval"
+        assert view["objective"] == OBJECTIVE
+        assert view["requester"] == REQUESTER
+        assert "approval" in view["actionable_cause"].lower()
+        assert view["publication"]["approval_status"] == "pending"
+        assert [request["status"] for request in view["requests"]] == [
+            "running",
+            "queued",
+        ]
+        assert [request["sequence"] for request in view["requests"]] == [1, 2]
+    _assert_common(body)
+
+
 def test_pending_tool_approval_on_the_reply_tuple_is_awaiting_approval(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -951,6 +1000,106 @@ def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
         r["sequence"] for r in body["requests"]
     )
     assert [r["status"] for r in body["requests"]] == ["completed", "running"]
+
+
+def test_closed_lineage_cancellation_names_the_closed_lineage(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    revision = _admit_revision(
+        _facts(
+            agent["agent_id"],
+            objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
+        )
+    )
+    assert revision.work_item_id == active.work_item_id
+    _complete(active)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'closed', "
+        "version = version + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    )
+
+    async def promote(session: AsyncSession) -> None:
+        outcome = await workitems.admit_next_revision(
+            session,
+            work_item_id=active.work_item_id,
+            wait_deadline=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        assert isinstance(outcome, workitems.WorkItemOutcome), outcome
+        assert outcome.request is not None
+        assert outcome.request.id == revision.request_id
+        assert outcome.request.status == "cancelled"
+        assert outcome.request.terminal_cause == "lineage_closed"
+
+    with_session(promote)
+
+    body = _detail(stack, auth_headers, active.work_item_id)
+    assert body["state"] == "published"
+    assert body["objective"] == OBJECTIVE
+    assert body["requester"] == REQUESTER
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "closed"}
+    assert body["cancelled_at"] is None
+    assert [request["status"] for request in body["requests"]] == [
+        "completed",
+        "cancelled",
+    ]
+    assert body["requests"][-1]["terminal_cause"] == "lineage_closed"
+    _assert_common(body)
+
+
+def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+    item = WorkItem(
+        id=work_item_id,
+        github_repository_id=101,
+        github_issue_number=2577,
+        github_installation_id=202,
+        agent_id=uuid.uuid4(),
+        repo_full_name=REPO,
+        conversation_id=WIRE_CONVERSATION,
+        cancelled_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    request = ExecutionRequest(
+        id=uuid.uuid4(),
+        work_item_id=work_item_id,
+        sequence=1,
+        status="cancelled",
+        wait_deadline=None,
+        started_at=None,
+        execution_deadline=None,
+        terminal_at=now,
+        terminal_cause="lineage_closed",
+        termination_observation=None,
+        created_at=now,
+        capacity_deferrals=0,
+        last_deferral_reason=None,
+        objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
+        requester=REQUESTER,
+    )
+
+    outcome = derive_outcome(
+        item,
+        [request],
+        lineage=None,
+        publication=None,
+        approval=None,
+        pending_turn_approval=False,
+        now=now,
+        issue_base="https://github.com",
+    )
+
+    assert outcome.state == "cancelled"
+    assert "pull request closed" in outcome.actionable_cause
+    assert "issue label" not in outcome.actionable_cause
+    assert outcome.requests[0].terminal_cause == "lineage_closed"
 
 
 def test_sticky_cancel_with_retained_pr_reports_cancelled_and_pr(
@@ -1914,6 +2063,220 @@ def _actions_check_run(
     }
 
 
+PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+PYTHON_CI_PATHS = [
+    "apps/api/src/curie_api/factory_ci.py",
+    "apps/api/tests/test_workitem_outcomes.py",
+    "packages/test-support/factory_fixture.py",
+    "runner/tests/test_repo_toolchain_proof_ci.py",
+    "tools/verification.py",
+]
+
+
+def _factory_ci_detail(
+    *,
+    runs: list[dict[str, Any]] | None = None,
+    state: str = "observed",
+    reason: str | None = None,
+) -> Any:
+    return SimpleNamespace(
+        state=state,
+        reason=reason,
+        head_sha=HEAD_SHA,
+        check_runs=[] if runs is None else runs,
+        statuses=[],
+    )
+
+
+def _decide_factory_ci(
+    detail: Any,
+    changed_path: str,
+) -> Any:
+    return factory_ci.decide(
+        detail,
+        now=datetime(2026, 9, 24, 12, 5, tzinfo=UTC),
+        published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
+        ci_wait_seconds=1200,
+        changed_paths=[changed_path],
+    )
+
+
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_requires_the_exact_python_ci_run(
+    changed_path: str,
+) -> None:
+    successful = _actions_check_run(7001, PYTHON_CI_CHECK, "success")
+
+    verdict = _decide_factory_ci(
+        _factory_ci_detail(runs=[successful]), changed_path
+    )
+
+    assert verdict.kind == "green"
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "skipped")],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "neutral")],
+        [_actions_check_run(7001, "Python tests", "success")],
+        [
+            {
+                **_actions_check_run(7001, PYTHON_CI_CHECK, "success"),
+                "status": "in_progress",
+            }
+        ],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "failure")],
+    ],
+    ids=["missing", "skipped", "neutral", "unrelated", "incomplete", "failed"],
+)
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_never_accepts_incomplete_python_ci_evidence(
+    changed_path: str, runs: list[dict[str, Any]]
+) -> None:
+    verdict = _decide_factory_ci(_factory_ci_detail(runs=runs), changed_path)
+
+    assert verdict.kind != "green"
+
+
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_fails_closed_when_ci_is_unreadable(
+    changed_path: str,
+) -> None:
+    detail = _factory_ci_detail(state="unavailable", reason="github_forbidden")
+
+    verdict = _decide_factory_ci(detail, changed_path)
+
+    assert verdict.kind == "unverified"
+
+
+def test_unselected_python_path_is_unverified() -> None:
+    verdict = _decide_factory_ci(_factory_ci_detail(), "examples/coder/foo.py")
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
+
+
+@pytest.mark.parametrize(
+    ("preflight", "python_check"),
+    [("missing", "success"), ("failed", "success"), ("passed", None)],
+    ids=["missing-preflight", "failed-preflight", "missing-python-check"],
+)
+def test_ci_gate_requires_unavailable_preflight_and_python_ci_for_python_changes(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    preflight: str,
+    python_check: str | None,
+) -> None:
+    from curie_api import workitem_outcomes
+    from curie_api.factory_progress import (
+        VerificationObservation,
+        record_verification,
+    )
+
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    if preflight != "missing":
+        observation = VerificationObservation(
+            command="uv run pytest runner/tests -q",
+            outcome="passed" if preflight == "passed" else "failed",
+            exit_status=0 if preflight == "passed" else 1,
+            missing_binaries=[],
+            blocked_services=[],
+        )
+
+        async def record(session: AsyncSession) -> Any:
+            return await record_verification(
+                session,
+                token_request_id=seeded.request_id,
+                body=observation,
+            )
+
+        assert with_session(record).outcome == "recorded"
+
+    path = PYTHON_CI_PATHS[0]
+    patch = (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n+++ b/{path}\n@@ -1 +1,2 @@\n+change\n"
+    )
+    publication = _publish(
+        stack,
+        agent["deployment_id"],
+        changed_paths=[path],
+        patch_b64=base64.b64encode(patch.encode()).decode(),
+    )
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    _execute(
+        "UPDATE curie.publications SET terminal_at = now() - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+
+    async def green_ci(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return _factory_ci_detail(
+            runs=[]
+            if python_check is None
+            else [_actions_check_run(7002, PYTHON_CI_CHECK, python_check)]
+        )
+
+    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", green_ci)
+
+    async def settlement(session: AsyncSession) -> Any:
+        return await workitems.claim_publication_settlement(
+            session, exclude=frozenset()
+        )
+
+    settled = with_session(settlement)
+    assert settled is not None
+
+    class EmptyValkey:
+        async def exists(self, _key: str) -> bool:
+            return False
+
+    async def dispatch(*args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("a green Python check must not enqueue a fix turn")
+
+    async def run_gate() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with httpx.AsyncClient() as client:
+                return await factory_ci.gate(
+                    maker,
+                    cast(Any, EmptyValkey()),
+                    get_settings(),
+                    client,
+                    settled,
+                    owner=OWNER,
+                    next_poll={},
+                    dispatch=dispatch,
+                    may_observe=lambda _request_id: True,
+                )
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(run_gate())
+    assert result == "settled"
+
+    async def terminal_status(session: AsyncSession) -> tuple[str, str | None]:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT status, terminal_cause FROM curie.execution_requests "
+                    "WHERE id = :id"
+                ),
+                {"id": seeded.request_id},
+            )
+        ).one()
+        return str(row.status), row.terminal_cause
+
+    assert with_session(terminal_status) == ("failed", "ci_unverified")
+
+
 @pytest.mark.parametrize(
     "signed_log_url",
     [
@@ -1976,6 +2339,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
         ci_wait_seconds=1200,
+        changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
         f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
@@ -2119,6 +2483,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
         ci_wait_seconds=1200,
+        changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
         f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
@@ -2201,6 +2566,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
         ci_wait_seconds=1200,
+        changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
         f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail

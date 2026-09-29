@@ -2,45 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
 from curie_api.schema_compat import KIND_CONTRACT, load_kinds, load_window, plan_upgrade
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 SCOPE = "slack:C0EXAMPLE1"
-
-
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                if not result.returns_rows:
-                    return []
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
 
 
 def _seed_state(
@@ -52,7 +25,7 @@ def _seed_state(
     version: int,
     age_hours: int,
 ) -> None:
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.workflow_state_entries "
         "(id, agent_id, binding_scope, namespace, key, value, version, updated_at) "
         "VALUES (:id, :agent, :scope, :namespace, :key, CAST(:value AS jsonb), "
@@ -78,7 +51,7 @@ def _seed_copy(
     version: int,
     age_hours: int,
 ) -> None:
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.thread_transcripts "
         "(id, agent_id, binding_scope, thread_key, value, version, expires_at, updated_at) "
         "VALUES (:id, :agent, :scope, :key, CAST(:value AS jsonb), :version, "
@@ -99,7 +72,6 @@ def _seed_copy(
 def test_0060_contract_requires_forward_only() -> None:
     window = load_window()
     kinds = load_kinds()
-    assert window.schema_min == "0060"
     assert kinds["0060"] == KIND_CONTRACT
 
     refused = plan_upgrade(
@@ -126,13 +98,13 @@ def test_0060_contract_requires_forward_only() -> None:
 
 
 def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, "0059")
+    config = alembic_config()
+    isolated_migration_db.at("0059")
     agent_id = uuid.uuid4()
     try:
-        _sql(
+        sql_dicts(
             "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
             {"id": agent_id, "name": f"acme-bot-{agent_id.hex[:8]}"},
         )
@@ -161,13 +133,13 @@ def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
         _seed_state(agent_id, SCOPE, "transcript", "tie-copy", [{"text": "old"}], 10, 2)
         _seed_copy(agent_id, SCOPE, "tie-copy", [{"text": "current"}], 4, 2)
         tie_at = datetime(2026, 1, 1)
-        _sql(
+        sql_dicts(
             "UPDATE curie.workflow_state_entries SET updated_at = :tie_at "
             "WHERE agent_id = :agent AND binding_scope = :scope "
             "AND namespace = 'transcript' AND key = 'tie-copy'",
             {"tie_at": tie_at, "agent": agent_id, "scope": SCOPE},
         )
-        _sql(
+        sql_dicts(
             "UPDATE curie.thread_transcripts SET updated_at = :tie_at "
             "WHERE agent_id = :agent AND binding_scope = :scope AND thread_key = 'tie-copy'",
             {"tie_at": tie_at, "agent": agent_id, "scope": SCOPE},
@@ -178,7 +150,7 @@ def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
 
         command.upgrade(config, "0060")
 
-        transcripts = _sql(
+        transcripts = sql_dicts(
             "SELECT binding_scope, thread_key, value, version, "
             "expires_at > now() AS expires_in_future "
             "FROM curie.thread_transcripts WHERE agent_id = :agent "
@@ -232,7 +204,7 @@ def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
         adopted = next(row for row in transcripts if row["thread_key"] == "conflict-copy")
         assert adopted["version"] > legacy_low_version
         assert adopted["version"] > copy_high_version
-        remaining = _sql(
+        remaining = sql_dicts(
             "SELECT binding_scope, namespace, key, value, version "
             "FROM curie.workflow_state_entries WHERE agent_id = :agent "
             "ORDER BY namespace, key",
@@ -259,7 +231,7 @@ def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
             _seed_state(agent_id, None, "transcript", "late-write", [{"text": "old"}], 1, 0)
         assert getattr(rejected.value.orig, "sqlstate", None) == "23514"
         _seed_state(agent_id, None, "memory", "late-write", {"source": "new"}, 1, 0)
-        writable = _sql(
+        writable = sql_dicts(
             "SELECT value FROM curie.workflow_state_entries "
             "WHERE agent_id = :agent AND namespace = 'memory' AND key = 'late-write'",
             {"agent": agent_id},

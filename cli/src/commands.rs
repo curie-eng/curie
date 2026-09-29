@@ -12058,76 +12058,133 @@ mod tests {
     // returns {} -- zero gates armed. Reporting the well-formed sibling as armed
     // would claim a safety control the runner never arms.
 
+    // Also covers `--gate`/`--clear` argument misuse, and the set path, which
+    // must not be more credulous than the view path: both emit an answer ABOUT
+    // a specific bundle, so a missing or invalid manifest is a usage error on
+    // either path (previously `--plugin-dir /does/not/exist` exited 0 on set).
     #[tokio::test]
-    async fn skill_approvals_view_gate_missing_route_key_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"gate":"NoRoute"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-        // The sibling must not be reported as armed anywhere in the message.
-        assert!(
-            !format!("{err:#}").contains("Bash -> eng"),
-            "a key-missing gate disarms every gate: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_gate_missing_gate_key_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"route":"eng"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_manifest_without_name_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // `PluginManifest` requires `name`; without it the runner's parse raises
-        // and it arms zero gates, so listing `Bash` here would be a false report.
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"}]}}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_malformed_json_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x",,}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_view_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
+    async fn skill_approvals_invalid_input_is_usage_error() {
+        struct Case {
+            name: &'static str,
+            manifest: Option<&'static str>,
+            gates: &'static [&'static str],
+            clear: bool,
+            must_not_contain: Option<&'static str>,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "view_gate_missing_route_key",
+                manifest: Some(
+                    r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"gate":"NoRoute"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                // The sibling must not be reported as armed anywhere in the message.
+                must_not_contain: Some("Bash -> eng"),
+            },
+            Case {
+                name: "view_gate_missing_gate_key",
+                manifest: Some(
+                    r#"{"name":"x","version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"},{"route":"eng"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                // `PluginManifest` requires `name`; without it the runner's parse
+                // raises and it arms zero gates, so listing `Bash` would be false.
+                name: "view_manifest_without_name",
+                manifest: Some(
+                    r#"{"version":"1","approvalPolicy":{"gates":[{"gate":"Bash","route":"eng"}]}}"#,
+                ),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "view_malformed_json",
+                manifest: Some(r#"{"name":"x",,}"#),
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "view_without_manifest",
+                manifest: None,
+                gates: &[],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "clear_with_gate",
+                manifest: None,
+                gates: &["X"],
+                clear: true,
+                must_not_contain: None,
+            },
+            Case {
+                // A comma cannot round-trip through the CSV env encoding.
+                name: "comma_in_gate",
+                manifest: None,
+                gates: &["a,b"],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "whitespace_gate",
+                manifest: None,
+                gates: &["  "],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "set_without_manifest",
+                manifest: None,
+                gates: &["A"],
+                clear: false,
+                must_not_contain: None,
+            },
+            Case {
+                name: "clear_without_manifest",
+                manifest: None,
+                gates: &[],
+                clear: true,
+                must_not_contain: None,
+            },
+            Case {
+                // The view path rejects a manifest the runner's parse would
+                // reject; the set path names the same bundle, so it must too.
+                name: "set_with_invalid_manifest",
+                manifest: Some(r#"{"name":"x",,}"#),
+                gates: &["A"],
+                clear: false,
+                must_not_contain: None,
+            },
+        ];
+        for case in CASES {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(body) = case.manifest {
+                write_manifest(dir.path(), ".claude-plugin/plugin.json", body);
+            }
+            let gates = case.gates.iter().map(|g| g.to_string()).collect();
+            let err = super::skill_approvals(dir.path().to_path_buf(), gates, case.clear)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                usage_class(&err),
+                crate::exit::ExitClass::Usage,
+                "case {}: {err:#}",
+                case.name
+            );
+            if let Some(fragment) = case.must_not_contain {
+                assert!(
+                    !format!("{err:#}").contains(fragment),
+                    "case {}: a key-missing gate disarms every gate: {err:#}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -12295,57 +12352,11 @@ mod tests {
         assert_eq!(super::shell_quote("/tmp/plain"), "'/tmp/plain'");
     }
 
-    #[tokio::test]
-    async fn skill_approvals_clear_with_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["X".into()], true)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_comma_in_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // A comma cannot round-trip through the CSV env encoding.
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["a,b".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_whitespace_gate_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["  ".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
     // --- the set path must not be more credulous than the view path ----------
     // Both emit an answer ABOUT a specific bundle. The view path errors when the
     // bundle has no manifest; the set path emitted export-then-reboot guidance
     // naming a directory it had never opened, so `--plugin-dir /does/not/exist`
     // exited 0 and the guidance failed later at `skill up`.
-
-    #[tokio::test]
-    async fn skill_approvals_set_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["A".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_clear_without_manifest_is_usage_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec![], true)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
-    }
 
     #[tokio::test]
     async fn skill_approvals_set_with_valid_manifest_and_no_policy_succeeds() {
@@ -12363,22 +12374,6 @@ mod tests {
             out.to_json()["env"].as_str().unwrap(),
             "CURIE_APPROVAL_REQUIRED_TOOLS=A"
         );
-    }
-
-    #[tokio::test]
-    async fn skill_approvals_set_with_invalid_manifest_is_usage_error() {
-        // The view path rejects a manifest the runner's parse would reject; the
-        // set path names the same bundle, so it must reject it identically.
-        let dir = tempfile::tempdir().unwrap();
-        write_manifest(
-            dir.path(),
-            ".claude-plugin/plugin.json",
-            r#"{"name":"x",,}"#,
-        );
-        let err = super::skill_approvals(dir.path().to_path_buf(), vec!["A".into()], false)
-            .await
-            .unwrap_err();
-        assert_eq!(usage_class(&err), crate::exit::ExitClass::Usage);
     }
 
     /// AC2: an unavailable verb must name the concept's absence AND point at the

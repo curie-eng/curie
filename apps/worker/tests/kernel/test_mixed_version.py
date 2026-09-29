@@ -16,16 +16,17 @@ produced an answer.
 from __future__ import annotations
 
 import asyncio
+import functools
+import sys
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 from aci_protocol import (
     PROTOCOL_VERSION,
     Final,
     ProtocolVersionError,
-    QueuedTurn,
-    ReplyHandle,
     SessionStatus,
     TextDelta,
     is_compatible,
@@ -34,6 +35,20 @@ from aci_protocol import (
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+
+_qevent = functools.partial(
+    qevent,
+    kind="email",
+    channel="agent@example.test",
+    placeholder="msg_upstream",
+    endpoint="https://adapter.example/hook",
+    adapter="agentmail-sandbox",
+)
 
 DONE = SessionStatus.DONE
 
@@ -44,23 +59,6 @@ FRAME_0_2_9 = (
     '{"version":"0.2.9","type":"final","text":"an answer from an old runner",'
     '"status":"done"}'
 )
-
-
-def _qevent(*, thread: str, event_id: str) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id,
-        conversation_id=thread,
-        author="U1",
-        text="hi",
-        reply_handle=ReplyHandle(
-            kind="email",
-            channel="agent@example.test",
-            placeholder="msg_upstream",
-            endpoint="https://adapter.example/hook",
-            adapter="agentmail-sandbox",
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
 
 
 def test_the_worker_build_rejects_historical_and_previous_deployed_minors() -> None:

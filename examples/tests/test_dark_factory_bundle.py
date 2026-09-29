@@ -1,9 +1,9 @@
 """The default dark-factory agent bundle validates and holds its discipline (#2576).
 
 Pins the parts of ``examples/dark-factory`` that must not drift: the bundle
-validates, its only MCP server is GitHub, its toolPolicy (classified by the real
-plugin_format classifier) grants exactly ``get_issue`` and ``add_issue_comment``
-(the review gate hook narrows the comment to capped or failed reviews, #3092),
+validates, its only MCP server is GitHub, its toolPolicy grants exactly
+``get_issue`` and ``add_issue_comment`` (the review gate hook narrows the
+comment to capped or failed reviews, #3092),
 the one skill states the factory discipline and its nine phases, the evals are
 falsifiable, and no private identifier ships.
 """
@@ -18,10 +18,6 @@ import pytest
 import yaml
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
-    PluginManifest,
-    ToolPolicyDecision,
-    classify_tool,
-    load_tool_policy,
     validate_bundle,
 )
 
@@ -32,13 +28,6 @@ DRIVER = REPO_ROOT / "tools" / "factory-e2e" / "factory_e2e.py"
 
 def _manifest() -> dict:
     return json.loads((BUNDLE / ".claude-plugin" / "plugin.json").read_text())
-
-
-def _policy():
-    manifest = PluginManifest.model_validate(_manifest())
-    policy = load_tool_policy(manifest, enforces=TOOL_POLICY_ENFORCEMENT)
-    assert policy is not None
-    return policy
 
 
 def _skill_files() -> list[Path]:
@@ -88,43 +77,14 @@ def test_mcp_declares_only_github() -> None:
     assert github["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}
 
 
-@pytest.mark.parametrize("tool", ["get_issue", "add_issue_comment"])
-def test_allowed_tools(tool: str) -> None:
-    assert classify_tool(_policy(), f"github/{tool}") == ToolPolicyDecision.ALLOW
-
-
-DENIED_TOOLS = [
-    "create_branch",
-    "create_issue",
-    "create_or_update_file",
-    "create_pull_request",
-    "create_pull_request_review",
-    "create_repository",
-    "fork_repository",
-    "merge_pull_request",
-    "push_files",
-    "update_issue",
-    "update_pull_request_branch",
-    "search_code",
-    "search_repositories",
-    "search_users",
-    "list_issues",
-    "search_issues",
-    "get_file_contents",
-    "list_commits",
-    "get_pull_request",
-    "get_pull_request_comments",
-    "get_pull_request_files",
-    "get_pull_request_reviews",
-    "get_pull_request_status",
-    "list_pull_requests",
-    "delete_repository",
-]
-
-
-@pytest.mark.parametrize("tool", DENIED_TOOLS)
-def test_everything_else_is_denied(tool: str) -> None:
-    assert classify_tool(_policy(), f"github/{tool}") == ToolPolicyDecision.DENY
+def test_tool_policy_entries_are_exact() -> None:
+    # Unlisted tools are denied by the classifier (plugin-format
+    # test_tool_policy.py); this pins the entries so a widened glob such as
+    # github/* fails here.
+    policy = _manifest()["toolPolicy"]
+    assert policy["allow"] == ["github/get_issue", "github/add_issue_comment"]
+    assert policy["approvalRequired"] == []
+    assert policy["deny"] == []
 
 
 def test_exactly_one_skill_without_allowed_tools() -> None:

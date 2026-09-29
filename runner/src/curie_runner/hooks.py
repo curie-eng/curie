@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,22 @@ def _stdout_decision(out: bytes) -> dict[str, Any]:
     return result
 
 
+async def _kill_hook_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a hook's whole process group and reap its shell.
+
+    The hook starts in its own session, so its pid is the group id and the
+    kill reaches every process the shell started, even after the shell itself
+    exited. Best-effort: an already-empty group raising ProcessLookupError must
+    not mask the caller's original error.
+    """
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    await proc.wait()
+
+
 async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) -> dict[str, Any]:
     """Run one command hook and map its result to a PreToolUse decision.
 
@@ -150,21 +167,23 @@ async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) ->
             stderr=asyncio.subprocess.PIPE,
             cwd=plugin_root,
             env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+            start_new_session=True,
         )
         out, err = await asyncio.wait_for(
             proc.communicate(input=payload.encode("utf-8")), timeout=_HOOK_TIMEOUT_S
         )
+    except asyncio.CancelledError:
+        # The hook runs in its own session, so a signal to the runner's process
+        # group no longer reaches it: an aborted turn must reap it explicitly.
+        if proc is not None:
+            await _kill_hook_group(proc)
+        raise
     except (TimeoutError, OSError) as exc:
-        # A timed-out hook leaves its shell child still running; kill it so it
-        # doesn't orphan (an OSError from create_subprocess_exec itself has no
-        # live proc to clean up). Best-effort: an already-dead child raising
-        # ProcessLookupError must not mask the original timeout/OSError.
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+        # A timed-out hook leaves its shell and everything the shell started
+        # still running. Killing only the shell would orphan the grandchildren
+        # (an OSError from create_subprocess_exec itself has no live proc).
+        if proc is not None:
+            await _kill_hook_group(proc)
         # A hook that cannot run is a non-blocking error: surface context but do
         # not silently deny the tool (deploy-time validation already rejected
         # malformed declarations).

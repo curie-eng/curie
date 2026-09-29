@@ -66,24 +66,32 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import os
 import resource
 import subprocess
+import sys
 import time
-import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
 from .conftest import _ProcessEventSpy
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent, wait_until  # noqa: E402
+
+_qevent = functools.partial(qevent, received_at="2026-08-28T00:00:00+00:00")
+_wait_until = functools.partial(wait_until, timeout=30.0, interval=0.05)
 
 pytestmark = pytest.mark.skipif(
     "CURIE_LONG_TURN_EVIDENCE" not in os.environ,
@@ -143,26 +151,6 @@ _CONTROL_KNOBS: dict[str, object] = {
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return default if raw in (None, "") else float(str(raw))
-
-
-def _qevent(text: str, *, thread: str, event_id: str | None = None) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-08-28T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 30.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError("condition not met within timeout")
 
 
 class _DispatchSpy:

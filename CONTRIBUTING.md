@@ -8,6 +8,20 @@ Read [`AGENTS.md`](AGENTS.md) alongside this guide: it is the authoritative
 source for the build, test, and architecture conventions summarized here, and
 each area's own `CLAUDE.md` carries the rules specific to that directory.
 
+## Table of contents
+
+- [Scope of contributions](#scope-of-contributions)
+- [Labeling issues, PRs, and discussions](#labeling-issues-prs-and-discussions)
+- [Before you start](#before-you-start)
+- [Development setup](#development-setup)
+- [Running the checks](#running-the-checks)
+  - [Testing discipline](#testing-discipline)
+- [Frozen contracts: stop and escalate](#frozen-contracts-stop-and-escalate)
+- [Decisions: ADR vs GitHub issue](#decisions-adr-vs-github-issue)
+- [Release train, branch, commit, and PR conventions](#release-train-branch-commit-and-pr-conventions)
+- [Certifying your contribution](#certifying-your-contribution)
+- [Getting help while contributing](#getting-help-while-contributing)
+
 ## Scope of contributions
 
 We welcome bug reports, documentation improvements, tests, and focused feature

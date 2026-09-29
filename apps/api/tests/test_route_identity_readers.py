@@ -437,7 +437,7 @@ def test_honor_declarations_stores_a_wire_default_slack_declaration_as_null(
     `route_identity`.
     """
 
-    cfg = _at(BELOW_0022)
+    cfg = _at(isolated_migration_db, BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
     _write_declarations(
         tmp_path,

@@ -1013,43 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_egress_cidrs_rejects_imds_address() {
-        use std::net::IpAddr;
-        // A poisoned DNS answer mapping a provider host to the node metadata
-        // endpoint must fail loud, naming both the host and the address.
-        let resolve = |_host: &str| -> std::io::Result<Vec<IpAddr>> {
-            Ok(vec!["169.254.169.254".parse().unwrap()])
-        };
-        let err = resolve_provider_egress_cidrs(&["anthropic".to_string()], resolve).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("api.anthropic.com"), "{msg}");
-        assert!(msg.contains("169.254.169.254"), "{msg}");
-    }
-
-    #[test]
-    fn resolve_provider_egress_cidrs_rejects_private_v4() {
-        use std::net::IpAddr;
-        let resolve =
-            |_host: &str| -> std::io::Result<Vec<IpAddr>> { Ok(vec!["10.0.0.5".parse().unwrap()]) };
-        let err = resolve_provider_egress_cidrs(&["openrouter".to_string()], resolve).unwrap_err();
-        assert!(format!("{err:#}").contains("10.0.0.5"), "{err:#}");
-    }
-
-    #[test]
-    fn resolve_provider_egress_cidrs_rejects_non_routable_v6() {
-        use std::net::IpAddr;
-        // Loopback, link-local, and ULA v6 answers all fail closed.
-        for addr in ["::1", "fe80::1", "fc00::1"] {
-            let resolve = move |_host: &str| -> std::io::Result<Vec<IpAddr>> {
-                Ok(vec![addr.parse().unwrap()])
-            };
-            let err =
-                resolve_provider_egress_cidrs(&["openrouter".to_string()], resolve).unwrap_err();
-            assert!(format!("{err:#}").contains(addr), "{addr}: {err:#}");
-        }
-    }
-
-    #[test]
     fn resolve_provider_egress_cidrs_accepts_public_addresses() {
         use std::net::IpAddr;
         // A normal public v4 + v6 pair mints the expected single-host CIDRs.

@@ -1127,7 +1127,7 @@ expected="$(sha256_of "$actual")"
 
 # ---------------------------------------------------------------------------
 # 16: the build path. The chart defaults to an image tag no workflow publishes
-#     unless mail-adapter is a cell in ci.yaml's images matrix AND in every
+#     unless mail-adapter is a ci.yaml ci-images bake target AND in every
 #     release.yaml matrix that iterates a `name` list. An include-only entry
 #     attaches a dockerfile to a cell that is never iterated and publishes
 #     nothing; a build matrix without the manifest-merge matrix uploads per-arch
@@ -1152,20 +1152,31 @@ def jobs(path):
     return (doc.get("jobs") or {}).items()
 
 
-# ci.yaml: the `images` job is include-driven (name + dockerfile per cell), and
-# an include entry IS the iteration there because no `name:` list exists.
+# ci.yaml: every image CI runs is built once by the `ci-images` job, whose bake
+# definition is a JSON heredoc; a target there IS the build.
 ci_jobs = dict(jobs(ci_path))
-images = ci_jobs.get("images")
-if images is None:
-    problems.append("ci.yaml has no `images` job at all")
+build = ci_jobs.get("ci-images")
+if build is None:
+    problems.append("ci.yaml has no `ci-images` job at all")
 else:
-    include = ((images.get("strategy") or {}).get("matrix") or {}).get("include") or []
-    names = [str(cell.get("name")) for cell in include if isinstance(cell, dict)]
+    import json
+
+    writer = next(
+        (step.get("run") or "" for step in build.get("steps") or []
+         if step.get("name") == "Write the CI image bake definition"),
+        "",
+    )
+    try:
+        body = writer.split("<<'EOF'\n", 1)[1].rsplit("\nEOF", 1)[0]
+        definition = json.loads(body)
+        names = list(definition["group"]["default"]["targets"])
+    except (IndexError, KeyError, ValueError):
+        names = []
     if not names:
-        problems.append("ci.yaml `images` job has no matrix include entries; the check would be vacuous")
+        problems.append("ci.yaml `ci-images` job has no bake targets; the check would be vacuous")
     elif image not in names:
         problems.append(
-            "ci.yaml `images` job does not build %r (builds: %s); the image is never built on a PR"
+            "ci.yaml `ci-images` job does not build %r (builds: %s); the image is never built on a PR"
             % (image, ", ".join(names))
         )
 
@@ -1201,7 +1212,7 @@ if problems:
     sys.exit(1)
 
 sys.stdout.write(
-    "  ok: %r builds in ci.yaml `images` and in all %d release.yaml name matrices (%s)\n"
+    "  ok: %r builds in ci.yaml `ci-images` and in all %d release.yaml name matrices (%s)\n"
     % (image, len(name_matrices), ", ".join(sorted(name_matrices)))
 )
 PY

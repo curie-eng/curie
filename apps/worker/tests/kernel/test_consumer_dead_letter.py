@@ -35,14 +35,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import curie_worker.consumer as consumer_module
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import Final, QueuedTurn, SessionStatus
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
@@ -52,21 +55,15 @@ from pydantic import ValidationError
 
 from .conftest import _pending_rows, _updates_for
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+
+# The #505 shape: a reply endpoint that is durably persisted but dead.
+_qevent = functools.partial(qevent, endpoint="http://localhost:8155/api/")
+
 DONE = SessionStatus.DONE
-
-
-def _qevent(text: str, *, thread: str, event_id: str) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        # The #505 shape: a reply endpoint that is durably persisted but dead.
-        reply_handle=ReplyHandle(
-            kind="slack", channel="C1", placeholder="p-1", endpoint="http://localhost:8155/api/"
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
 
 
 def _dead_stream(config: WorkerConfig) -> str:

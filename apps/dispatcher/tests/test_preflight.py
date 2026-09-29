@@ -494,6 +494,36 @@ def test_the_loop_spends_its_whole_budget_with_production_backoff_ratios() -> No
     )
 
 
+def test_a_budget_clipped_final_probe_keeps_the_real_last_error() -> None:
+    """The tail probe's clipped timeout must not overwrite the API's own answer.
+
+    The last probe is bounded by whatever budget is left, so it can time out
+    only because the budget ran out. Reporting that timeout as ``last error``
+    hides the 503 the API actually returned from the operator.
+    """
+    clock = _FakeClock()
+    answers = iter(["503", "timeout"])
+
+    def unhealthy_then_clipped(request: httpx.Request) -> httpx.Response:
+        if next(answers, "timeout") == "503":
+            clock.sleep(0.15)
+            return httpx.Response(503)
+        # The tail probe spends the rest of its clipped budget, then times out.
+        clock.sleep(0.2 - clock.monotonic())
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(ApiUnreachableError) as excinfo:
+        check_api_reachable(
+            _config(),
+            logger=logging.getLogger("test-preflight"),
+            client=_client(unhealthy_then_clipped),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+    assert "last error: HTTP 503" in str(excinfo.value), str(excinfo.value)
+
+
 def test_the_loop_does_not_probe_past_its_deadline() -> None:
     """The upper bound: the gate must spend its budget and then stop.
 

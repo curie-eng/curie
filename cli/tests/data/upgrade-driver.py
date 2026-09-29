@@ -78,11 +78,13 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     document, so a re-read anywhere after Validate is visible
 #   failed_hook       ""                    both pre-upgrade hooks succeed
 #                     "upgrade-drain"       the #2010 drain gate Job fails
+#                     "upgrade-drain-attest" the attest Job fails
 #                     "schema-migrate"      a NON-drain pre-upgrade hook fails
 #                     Ruling 13: `queues_drained` binds to the upgrade-drain
-#                     hook alone and `hooks_healthy` to every other hook, so the
-#                     two are only provably distinct if the fixture can fail
-#                     either one while the other stays healthy.
+#                     hook and the upgrade-drain-attest hook. `hooks_healthy`
+#                     binds to every other hook, so the facets are only
+#                     provably distinct if the fixture can fail one of those
+#                     drain hooks while the other hooks stay healthy.
 #   selector_drift    live workload selector differs from the target manifest
 #   terminal          stamp ProgressDeadlineExceeded so an observer stops at
 #                     once instead of retrying to its 300s deadline. This is a
@@ -200,6 +202,7 @@ SCENARIOS = {
     # pre-upgrade hook that fires during Apply, so Converge is the only phase
     # that can see its verdict.
     "failed-drain-hook": {"failed_hook": "upgrade-drain"},
+    "failed-attest-hook": {"failed_hook": "upgrade-drain-attest"},
     "selector-drift": {"selector_drift": True, "terminal": True},
     # `observedGeneration` lags `generation`: the controller has not yet acted
     # on the target spec. Images, replicas, hooks and selectors all agree, so
@@ -546,11 +549,11 @@ pod = {
     },
 }
 
-# Both pre-upgrade hooks the chart installs, by their real rendered names
+# The pre-upgrade hooks the chart installs, by their real rendered names
 # (`charts/curie/templates/worker-upgrade-drain.yaml` and `schema-migrate.yaml`).
-# Both are always present; only `failed_hook` decides which one refused. A
-# fixture that published just one hook could not tell the drain facet apart
-# from the general hook facet.
+# The drain Job, the attest Job, and schema-migrate are always present; only
+# `failed_hook` decides which one refused. A fixture that published just one
+# hook could not tell the drain facet apart from the general hook facet.
 # The two documents the `values-drift` scenario serves, distinguished by an
 # extraEnv entry the migration carries through untouched. Only the FIRST is a
 # legitimate input: it is what Validate read and migrated.
@@ -565,6 +568,7 @@ DRIFTED_VALUES = {
 
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
+    "upgrade-drain-attest": f"{RELEASE}-upgrade-drain-attest",
     "schema-migrate": f"{RELEASE}-schema-migrate",
 }
 

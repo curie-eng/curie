@@ -12,14 +12,9 @@ import json
 import re
 from pathlib import Path
 
-import pytest
 import yaml
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
-    PluginManifest,
-    ToolPolicyDecision,
-    classify_tool,
-    load_tool_policy,
     validate_bundle,
 )
 
@@ -55,14 +50,6 @@ DENIED = [
 
 def _manifest() -> dict:
     return json.loads((BUNDLE / ".claude-plugin" / "plugin.json").read_text())
-
-
-def _policy():
-    policy = load_tool_policy(
-        PluginManifest.model_validate(_manifest()), enforces=TOOL_POLICY_ENFORCEMENT
-    )
-    assert policy is not None
-    return policy
 
 
 def _skill() -> str:
@@ -132,14 +119,13 @@ def test_the_manifest_declares_the_three_secrets_and_no_approval_route():
     assert manifest["toolPolicy"]["approvalRequired"] == []
 
 
-@pytest.mark.parametrize("tool", ALLOWED)
-def test_the_named_tools_are_allowed(tool: str):
-    assert classify_tool(_policy(), tool) == ToolPolicyDecision.ALLOW
-
-
-@pytest.mark.parametrize("tool", DENIED)
-def test_everything_else_is_denied(tool: str):
-    assert classify_tool(_policy(), tool) == ToolPolicyDecision.DENY
+def test_the_tool_policy_entries_are_exact():
+    # Unlisted tools are denied by the classifier (plugin-format
+    # test_tool_policy.py); this pins the entries so a widened glob such as
+    # github/* fails here.
+    policy = _manifest()["toolPolicy"]
+    assert policy["allow"] == ALLOWED
+    assert policy["deny"] == []
 
 
 def test_the_skill_names_every_allowed_tool_and_files_nothing():

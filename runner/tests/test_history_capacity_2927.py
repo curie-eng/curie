@@ -27,7 +27,6 @@ import aiohttp
 import anyio
 import pytest
 from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
-from aiohttp import web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import (
     AssistantMessage,
@@ -52,137 +51,13 @@ from curie_runner.history import (
     build_conversation_replay,
 )
 from curie_runner.session import SessionRunner
+from runner_state_fake import TRANSCRIPT_CAP as _CAP
+from runner_state_fake import TRANSCRIPT_KEY as _KEY
+from runner_state_fake import CappedCasState
+from runner_state_fake import json_size as _size
 
-_CAP = 65_536
 _RESERVE = 8_192
-_KEY = "/agents/A/state/transcript/t1"
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-
-
-def _size(value: Any) -> int:
-    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
-
-
-class _CappedCasState:
-    """A transcript key on a fake state API with the real API's write rules.
-
-    - whole-array compact-JSON cap on POST /append and on PUT (413);
-    - optional ``reserve_bytes`` on append: 413 when the new array would leave
-      fewer than that many bytes free under the cap;
-    - a version bumped on every write, and CAS PUT with ``expected_version``
-      (409 on mismatch);
-    - every request recorded as ``(method, body, status)``.
-    """
-
-    def __init__(
-        self, seed: list[dict[str, Any]] | None = None, *, max_bytes: int = _CAP
-    ) -> None:
-        self.value: list[dict[str, Any]] | None = list(seed) if seed else None
-        self.max_bytes = max_bytes
-        self.cap_header: str | None = str(max_bytes)
-        self.version = 1 if seed else 0
-        self.requests: list[tuple[str, Any, int]] = []
-        # Test hooks for interleavings and forced statuses.
-        self.inject_after_first_get: dict[str, Any] | None = None
-        self.concurrent_item_before_first_put: dict[str, Any] | None = None
-        self.force_append_status: int | None = None
-        self.force_put_status: int | None = None
-        self._gets = 0
-        self._puts = 0
-
-    def methods(self) -> list[tuple[str, int]]:
-        return [(method, status) for method, _body, status in self.requests]
-
-    def _write(self, value: list[dict[str, Any]]) -> None:
-        self.value = value
-        self.version += 1
-
-    def _entry(self) -> dict[str, Any]:
-        return {
-            "namespace": "transcript",
-            "key": "t1",
-            "value": list(self.value or []),
-            "version": self.version,
-        }
-
-    def app(self) -> web.Application:
-        app = web.Application()
-
-        async def get_key(_request: web.Request) -> web.Response:
-            self._gets += 1
-            headers = (
-                {"X-Curie-Transcript-Max-Bytes": self.cap_header}
-                if self.cap_header is not None
-                else {}
-            )
-            if self.value is None:
-                self.requests.append(("GET", None, 404))
-                return web.json_response({"detail": "not found"}, status=404, headers=headers)
-            response = self._entry()
-            self.requests.append(("GET", None, 200))
-            if self._gets == 1 and self.inject_after_first_get is not None:
-                # A concurrent writer lands right after this reader's load.
-                self._write([*(self.value or []), self.inject_after_first_get])
-                self.inject_after_first_get = None
-            return web.json_response(response, headers=headers)
-
-        async def append_key(request: web.Request) -> web.Response:
-            body = await request.json()
-            if self.force_append_status is not None:
-                self.requests.append(("POST", body, self.force_append_status))
-                return web.json_response({"detail": "forced"}, status=self.force_append_status)
-            candidate = [*(self.value or []), body["item"]]
-            size = _size(candidate)
-            reserve = body.get("reserve_bytes")
-            if size > self.max_bytes:
-                self.requests.append(("POST", body, 413))
-                return web.json_response(
-                    {"detail": f"value is {size} bytes, over the {self.max_bytes}-byte cap"},
-                    status=413,
-                )
-            if reserve is not None and self.max_bytes - size < int(reserve):
-                self.requests.append(("POST", body, 413))
-                return web.json_response(
-                    {"detail": f"value is {size} bytes, leaves under the {reserve}-byte reserve"},
-                    status=413,
-                )
-            self._write(candidate)
-            self.requests.append(("POST", body, 200))
-            return web.json_response(self._entry())
-
-        async def put_key(request: web.Request) -> web.Response:
-            body = await request.json()
-            self._puts += 1
-            if self._puts == 1 and self.concurrent_item_before_first_put is not None:
-                # Another writer appends between the compactor's GET and its PUT.
-                self._write([*(self.value or []), self.concurrent_item_before_first_put])
-                self.concurrent_item_before_first_put = None
-            if self.force_put_status is not None:
-                self.requests.append(("PUT", body, self.force_put_status))
-                return web.json_response({"detail": "forced"}, status=self.force_put_status)
-            expected = body.get("expected_version")
-            if expected is not None and (self.value is None or expected != self.version):
-                self.requests.append(("PUT", body, 409))
-                return web.json_response(
-                    {"detail": f"version mismatch: expected {expected}, stored {self.version}"},
-                    status=409,
-                )
-            value = body["value"]
-            size = _size(value)
-            if size > self.max_bytes:
-                self.requests.append(("PUT", body, 413))
-                return web.json_response(
-                    {"detail": f"value is {size} bytes, over the {self.max_bytes}-byte cap"},
-                    status=413,
-                )
-            self._write(list(value))
-            self.requests.append(("PUT", body, 200))
-            return web.json_response(self._entry())
-
-        app.router.add_get(_KEY, get_key)
-        app.router.add_post(f"{_KEY}/append", append_key)
-        app.router.add_put(_KEY, put_key)
-        return app
 
 
 # --- realistic coding-turn payloads ---------------------------------------------
@@ -441,7 +316,7 @@ async def _post_item(url: str, item: dict[str, Any]) -> int:
 def test_one_turn_coding_thread_resumes_review_turn_without_capacity_refusal(
     tmp_path: Path,
 ) -> None:
-    state = _CappedCasState()
+    state = CappedCasState()
     coding_text = "CODING-2927: quantize the pricing rules to cents and publish a PR"
     review_text = "REVIEW-2927: address the review comments on PR 41 and push a revision"
     publication = _publication_item()
@@ -564,7 +439,7 @@ def _near_cap_seed(free_after_summary: int) -> list[dict[str, Any]]:
 def test_near_cap_boot_summary_is_refused_by_the_reserve_and_compacted(
     tmp_path: Path,
 ) -> None:
-    state = _CappedCasState(_near_cap_seed(free_after_summary=1_000))
+    state = CappedCasState(_near_cap_seed(free_after_summary=1_000))
     publication = _publication_item()
 
     async def go() -> None:
@@ -603,7 +478,7 @@ def _new_turn() -> TurnRecord:
 
 
 def test_turn_append_413_compacts_with_cas_and_retries_a_put_conflict_with_a_fresh_get() -> None:
-    state = _CappedCasState(_near_cap_turns())
+    state = CappedCasState(_near_cap_turns())
     concurrent = _publication_item()
     state.concurrent_item_before_first_put = concurrent
 
@@ -635,7 +510,7 @@ def test_turn_append_413_compacts_with_cas_and_retries_a_put_conflict_with_a_fre
 
 def test_turn_append_compaction_put_413_raises_history_capacity_error() -> None:
     seed = _near_cap_turns()
-    state = _CappedCasState(seed)
+    state = CappedCasState(seed)
     state.force_put_status = 413
 
     async def go() -> None:
@@ -654,7 +529,7 @@ def test_turn_append_compaction_put_413_raises_history_capacity_error() -> None:
 
 def test_non_capacity_append_failure_does_not_compact() -> None:
     seed = _near_cap_turns()
-    state = _CappedCasState(seed)
+    state = CappedCasState(seed)
     state.force_append_status = 500
 
     async def go() -> None:
@@ -673,7 +548,7 @@ def test_non_capacity_append_failure_does_not_compact() -> None:
 
 def test_summary_record_append_413_raises_capacity_error_without_a_put() -> None:
     seed = _near_cap_turns()
-    state = _CappedCasState(seed)
+    state = CappedCasState(seed)
     summary = SummaryRecord(
         content="summary " + ("s" * 8_000),
         digest="0" * 64,
@@ -702,7 +577,7 @@ def test_boot_compaction_conflict_reloads_and_replays_the_intervening_record(
 
     first = _big_turn("FIRST-2927", 30_000, "2026-09-22T00:00:01+00:00").to_dict()
     second = _big_turn("SECOND-2927", 25_000, "2026-09-22T00:00:02+00:00").to_dict()
-    state = _CappedCasState([first, second])
+    state = CappedCasState([first, second])
     injected = TurnRecord(
         user="INJECTED-2927: late turn from another runner",
         assistant="acknowledged",
@@ -758,7 +633,7 @@ _FACTORY_FINAL = "The implementation passed review and the pull request was publ
 
 def test_factory_sized_turn_persists_with_old_tool_calls_compacted() -> None:
     """The HTTP store persists hundreds of tool calls and the exact final answer."""
-    state = _CappedCasState()
+    state = CappedCasState()
 
     async def go() -> None:
         async with TestServer(state.app()) as server:
@@ -804,7 +679,7 @@ def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None
     first_user = "Complete factory issue 3211 with its original requirements"
     final_answer = "Review complete. " + ("The requested behavior is verified. " * 100)
     assert len(final_answer) > 3_000
-    state = _CappedCasState()
+    state = CappedCasState()
 
     async def go() -> None:
         async with TestServer(state.app()) as server:
@@ -832,7 +707,7 @@ def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None
 
 
 def test_runner_uses_the_cap_advertised_by_the_state_api() -> None:
-    state = _CappedCasState(max_bytes=128 * 1024)
+    state = CappedCasState(max_bytes=128 * 1024)
 
     async def go() -> None:
         async with TestServer(state.app()) as server:
@@ -858,7 +733,7 @@ def test_runner_uses_the_cap_advertised_by_the_state_api() -> None:
 
 @pytest.mark.parametrize("cap_header", [None, "invalid", "0", "8000", "8192"])
 def test_store_refuses_missing_or_invalid_api_capacity(cap_header: str | None) -> None:
-    state = _CappedCasState()
+    state = CappedCasState()
     state.cap_header = cap_header
 
     async def go() -> None:

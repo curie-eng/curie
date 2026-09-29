@@ -13,6 +13,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import anyio
 from aci_protocol import BootEnv
@@ -80,8 +81,10 @@ from .plugin import load_bundle_web_search_enabled
 from .progress import (
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
+    VERIFICATION_COMMAND,
     ProgressActivity,
     build_progress_tool,
+    preflight_workspace_verification,
     resolve_progress,
 )
 from .publication_precheck import PublicationPrecheck
@@ -183,7 +186,10 @@ def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
     return resolve_harness(name)
 
 
-def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
+def format_workspace_preamble(
+    mounted_workspace: Path | None,
+    verification: dict[str, Any] | None = None,
+) -> str | None:
     """Render mounted-workspace facts as a system-prompt preamble, or None.
 
     Hardcodes ``/workspace`` in the text so a caller Path never leaks into the
@@ -192,7 +198,7 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
 
     if mounted_workspace is None:
         return None
-    return (
+    lines = [
         "# Mounted workspace\n"
         "\n"
         "A managed checkout is already at /workspace (complete git working tree, "
@@ -206,13 +212,84 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
         "Create a virtualenv only under /workspace.\n"
         "Install dependencies only from files already in the checkout, with pip --no-index. "
         "Do not contact a package index.\n"
-        "Run only the repository's documented check command.\n"
-        "Do not write a substitute test runner or shim.\n"
-        "If those checks cannot be installed from files already in the checkout, say that "
-        "in-sandbox verification is unavailable. Do not request publication. "
-        "The published pull request's CI is the only repository check, and it runs only "
-        "after a person publishes the change."
+        "Run only the repository's documented focused check command.\n"
+        "Do not write a substitute test runner or shim."
+    ]
+    lines.append(f"Verification command: {VERIFICATION_COMMAND}")
+    if verification is None:
+        lines.append(
+            "No factory "
+            "verification preflight result is available in this turn. If in-sandbox "
+            "verification is unavailable, report only observed missing binaries or "
+            "blocked services. Do not claim that the check passed."
+        )
+    else:
+        command = verification.get("command", VERIFICATION_COMMAND)
+        outcome = verification.get("outcome", "unavailable")
+        exit_status = verification.get("exit_status")
+        missing = verification.get("missing_binaries", [])
+        blocked = verification.get("blocked_services", [])
+        missing_text = ", ".join(str(name) for name in missing) if missing else "none"
+        blocked_text = ", ".join(str(name) for name in blocked) if blocked else "none"
+        result_suffix = f" (exit status {exit_status})" if exit_status is not None else ""
+        lines.append(f"Verification result: {outcome}{result_suffix}")
+        if outcome == "passed":
+            result_text = (
+                f"At factory startup, in-sandbox verification passed: `{command}` "
+                f"completed with exit status {exit_status}. This records the preflight "
+                "only; run the check again after edits."
+            )
+        elif outcome == "failed":
+            result_text = (
+                f"At factory startup, `{command}` completed with exit status "
+                f"{exit_status}; its outcome is failed. Do not claim that in-sandbox "
+                "verification passed or use this as a successful check."
+            )
+        else:
+            result_text = (
+                f"At factory startup, in-sandbox verification is unavailable: "
+                f"`{command}` could not be completed."
+            )
+        lines.append(
+            f"{result_text} Missing binaries: {missing_text}. "
+            f"Blocked services: {blocked_text}."
+        )
+        if verification.get("report_status") != 201:
+            lines.append(
+                "The verification preflight report was not accepted by the factory "
+                f"status endpoint; observed status was {verification.get('report_status')}. "
+                "Do not present the preflight as recorded work item evidence."
+            )
+        failure_reason = verification.get("failure_reason")
+        if failure_reason:
+            lines.append(f"The observed command failure was: {failure_reason}.")
+        if outcome == "unavailable":
+            lines.append(
+                "State that in-sandbox verification was unavailable and that the "
+                "matching required CI check is pending proof only if that check selects "
+                "all changed paths. You may use publish_changes only after confirming "
+                "that matching required route, and the pull request body must state that "
+                "in-sandbox verification was unavailable and CI is pending proof. If no "
+                "matching required check exists, do not publish and the work item cannot "
+                "succeed."
+            )
+        elif outcome == "failed":
+            lines.append(
+                "Do not use publish_changes while this command fails. Repair the cause "
+                "and rerun the documented command after edits."
+            )
+        else:
+            lines.append(
+                "This pre-edit pass does not verify later changes. Run the documented "
+                "command again after edits before using publish_changes."
+            )
+    lines.append(
+        "Do not claim successful verification until a matching required check for the "
+        "changed paths has actually run and passed. A missing, skipped, unreadable, "
+        "unrelated, or failed check is not success. Do not publish if the preflight "
+        "report was not accepted by the status endpoint."
     )
+    return "\n".join(lines)
 
 
 def _compose_system_prompt(
@@ -331,6 +408,17 @@ def build_runner(
         and (workspace_path / ".git").exists()
         else None
     )
+    verification: dict[str, Any] | None = None
+    if mounted_workspace is not None and not fake_model:
+        verification_url = os.environ.get(PROGRESS_URL_ENV)
+        verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
+        if verification_url and verification_token:
+            verification = anyio.run(
+                preflight_workspace_verification,
+                mounted_workspace,
+                verification_url,
+                verification_token,
+            )
     # Prior memory (#264) still leads the system prompt. Workspace facts are a
     # mounted-only boot block after memory. Conversation history (#20)
     # deliberately does not: ADR-0119 sends its ordered messages through the
@@ -346,7 +434,7 @@ def build_runner(
         system_prompt,
         memory_preamble,
         model=config.model,
-        workspace_preamble=format_workspace_preamble(mounted_workspace),
+        workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
@@ -371,6 +459,8 @@ def build_runner(
             operator_tools=config.approval_required_tools,
             policy_routes=resolution.route_by_tool,
             grant_tool=config.approval_grant_tool,
+            grant_arguments=config.approval_grant_arguments,
+            resumed_kind=config.approval_resumed_kind,
             grantable_by_route=resolution.grantable_by_route,
             summary_by_tool=resolution.summary_by_tool,
             # Bundle identity so an operator mcp__<server>__<tool> shorthand

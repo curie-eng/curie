@@ -501,6 +501,12 @@ valkey:
   persistence:
     enabled: true
     size: 1Gi
+  # Internal memory ceiling (#3350), passed as `--maxmemory`. Empty derives 75%
+  # of resources.limits.memory so a full broker refuses writes with an OOM error
+  # instead of being OOMKilled, leaving headroom for the BGSAVE fork. Set a
+  # Valkey size ("200mb", bytes) to override; with no memory limit and no value,
+  # no ceiling is set. The policy is always noeviction (Langfuse BullMQ needs it).
+  maxmemory: ""
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 250m, memory: 256Mi }
@@ -1328,6 +1334,13 @@ api:
   # limit becomes a false denial of a legitimate approver, so 0 suits low-volume
   # or strict-revocation deployments.
   slackUsergroupCacheTtlSeconds: 60
+  # Per-thread conversation transcript cap in bytes (#3301). The runner bounds
+  # each turn to this cap less an 8 KiB append reserve and compacts older turns
+  # when a thread fills; a single turn that still cannot fit fails the run with
+  # a history-persistence-error naming the turn size and this cap. The default
+  # (16 MiB) holds a dark-factory turn with several plan-review rounds. Raise it
+  # for longer factory runs; lower it only to bound Postgres row size.
+  transcriptMaxThreadBytes: 16777216
   # Level for the API's own loggers (#1270). INFO surfaces the operator-facing
   # records -- connector drift corrected, polled deploys, webhook outcomes --
   # which were silently dropped before. WARNING to quieten it.
@@ -2035,7 +2048,8 @@ worker:
   # Turn budget for a work-item (factory) delivery (#3071), rendered as
   # CURIE_WORK_ITEM_MAX_TURNS. The worker writes it into that delivery's
   # sandbox as CURIE_MAX_TURNS; chat and other deliveries keep the runner's
-  # short default. A run that exhausts it fails as `max-turns`.
+  # short default (CURIE_MAX_TURNS via runner.extraEnv). A run that exhausts
+  # either cap fails as `max-turns`, and the escalation names the one it hit.
   workItemMaxTurns: 1000
   # Pre-upgrade drain gate (issue #2010). ADR-0131 made one worker's own
   # shutdown safe; it says nothing about the roll happening around it. A
@@ -2056,6 +2070,10 @@ worker:
   # Disable it for a release where an interrupted turn is acceptable (a dev
   # cluster, a fake-model install). The chart's behavior without it is exactly
   # what it was before the gate existed.
+  #
+  # A second pre-upgrade hook refuses the upgrade unless the drain recorded
+  # success for this revision, so deleting the drain Job mid-wait does not
+  # roll workers.
   upgradeDrain:
     enabled: true
     # How long to wait for the in-flight deliveries before refusing. A FLOOR,

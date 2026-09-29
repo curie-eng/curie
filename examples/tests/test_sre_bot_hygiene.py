@@ -35,7 +35,6 @@ from plugin_format.deploy_targets import validate_deploy_targets
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "examples" / "sre-bot"
-CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yaml"
 UPGRADE_SCRIPT = BUNDLE / "platform-upgrade" / "upgrade.sh"
 # Named allowlisted ids, not a prefix-plus-digit regex. A bare prefix
 # of the sanctioned placeholders matches slack-conversation-id and is
@@ -217,42 +216,11 @@ def test_permission_map_matches_the_vanilla_kubernetes_connector() -> None:
     assert "kubernetes/resources_scale" in text
 
 
-def test_ci_shellchecks_the_platform_upgrade_script() -> None:
-    """upgrade.sh is the Job body. CI must run shellcheck on that path.
-
-    A pytest that shells out to shellcheck is not enough on its own: if
-    that test were deleted, CI would still have zero coverage of this
-    script. The workflow must invoke shellcheck on this path so the gate
-    is visible in the job that actually runs on every PR.
-
-    Comments do not count. An earlier pin matched the path and the word
-    ``shellcheck`` anywhere in the file, so deleting the ``run:`` line
-    left both asserts green.
-    """
-
-    workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")) or {}
-    python_job = (workflow.get("jobs") or {}).get("python") or {}
-    steps = python_job.get("steps") or []
-    runs = [step.get("run") or "" for step in steps if isinstance(step, dict)]
-    matching = [
-        run
-        for run in runs
-        if "shellcheck" in run and "examples/sre-bot/platform-upgrade/upgrade.sh" in run
-    ]
-    assert matching, (
-        "the python CI job has no step whose run: invokes shellcheck on "
-        "examples/sre-bot/platform-upgrade/upgrade.sh. A comment naming "
-        "the path is not a gate. Add a step that runs "
-        "`shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh`."
-    )
-
-
 def test_platform_upgrade_script_is_shellcheck_clean() -> None:
-    """The Job script itself must be clean, not merely mentioned in CI.
+    """The Job script itself must be clean under shellcheck.
 
-    The sibling test asserts the workflow names the path. This one runs
-    shellcheck against the script so a syntax error still fails even if
-    the workflow step is later pointed at a different file.
+    Pytest runs shellcheck against upgrade.sh, so a syntax error fails
+    the suite even if a workflow step is later pointed at a different file.
     """
 
     assert UPGRADE_SCRIPT.is_file(), f"missing {UPGRADE_SCRIPT}"

@@ -38,7 +38,8 @@ locally in Docker.
 - Rehydrates from a history ref on start (`resume`), stateless-first
   (ADR-0003, an Architecture Decision Record). Completed turns are stored as
   structured replay; oversized text payloads are replaced with stable digest
-  markers before the state API's 64 KiB value boundary while tool-call
+  markers before the per-thread transcript cap the state API advertises
+  (`api.transcriptMaxThreadBytes`, 16 MiB by default) while tool-call
   structure remains intact. An append failure makes the runner's
   `history_durable` status fail closed for the rest of that process.
 

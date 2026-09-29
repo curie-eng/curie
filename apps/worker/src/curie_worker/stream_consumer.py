@@ -132,6 +132,7 @@ class StreamConsumer:
         *,
         leases: DeliveryLeaseStore | None = None,
         on_lease_lost: LeaseLostHandler | None = None,
+        on_entry_vanished: LeaseLostHandler | None = None,
         drain: UpgradeDrainGate | None = None,
         liveness_store: ConsumerLivenessStore | None = None,
     ) -> None:
@@ -186,6 +187,13 @@ class StreamConsumer:
         # cancels a handler task itself: a bare cancel skips the runner-side
         # stop and leaves a turn producing effects on a sandbox we no longer own.
         self._on_lease_lost: LeaseLostHandler | None = on_lease_lost
+        self._on_entry_vanished: LeaseLostHandler | None = on_entry_vanished
+        # Lease objects captured for a vanished-entry notice. The handler's
+        # ``_delivery_lease`` finally drops ``_held_leases`` and cancels the
+        # heartbeat task; the notice runs on a separate task and must still
+        # see the lease after that.
+        self._notice_lease: dict[str, DeliveryLease] = {}
+        self._lease_loss_tasks: set[asyncio.Task[None]] = set()
         # The pre-upgrade drain gate (#2010), or None for a consumer that has no
         # platform to be rolled by (compose, the base-only unit tests). While it
         # reports a drain in progress this consumer takes NO new work -- neither
@@ -608,16 +616,20 @@ class StreamConsumer:
         await self._redis.xack(stream, group, entry_id)
 
     async def _ack(self, entry_id: str) -> None:
-        lease = self._held_leases.get(entry_id)
+        lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
         if lease is None:
             await self._redis.xack(self._spec.stream, self._spec.group, entry_id)
             return
         async with lease.settlement_lock:
-            lease.raise_if_lost()
+            # A vanished entry has no successor (ADR-0131). XACK of a missing
+            # id removes nothing and must not fail the graveyard settlement.
+            vanished = lease.entry_vanished.is_set()
+            if not vanished:
+                lease.raise_if_lost()
             removed = await self._redis.xack(
                 self._spec.stream, self._spec.group, entry_id
             )
-            if removed != 1:
+            if not vanished and removed != 1:
                 lease.lost.set()
                 raise LeaseLostError(
                     f"entry {entry_id} was not pending at terminal acknowledgement"
@@ -866,21 +878,23 @@ class StreamConsumer:
                 else:
                     reason = "renewal refused by Valkey"
                 if budget is None:
+                    # Authority drops before the vanished probe. The probe is
+                    # extra Valkey reads and must not keep this owner live.
                     lease.lost.set()
                 else:
                     # The deadline does not move; only this clock anchor does.
                     lease.budget = budget
             if budget is None:
-                spec.logger.warning(
-                    "delivery lease LOST for entry %s on stream %s "
-                    "(owner=%s generation=%d): %s; this owner may no longer ack, "
-                    "dead-letter, or emit a terminal result",
-                    entry_id,
-                    spec.stream,
-                    lease.owner,
-                    lease.generation,
-                    reason,
+                # Settlement and the placeholder edit run off this task. The
+                # handler cancels the heartbeat when the body exits, which is
+                # exactly when a lost lease makes the body return, so a notice
+                # awaited here is cancelled before it can edit.
+                self._notice_lease[entry_id] = lease
+                task = asyncio.create_task(
+                    self._finish_lease_loss(lease, entry_id, fields, reason)
                 )
+                self._lease_loss_tasks.add(task)
+                task.add_done_callback(self._lease_loss_tasks.discard)
                 if self._on_lease_lost is not None:
                     try:
                         await self._on_lease_lost(entry_id, fields)
@@ -894,6 +908,74 @@ class StreamConsumer:
                             spec.stream,
                         )
                 return
+
+    async def _finish_lease_loss(
+        self,
+        lease: DeliveryLease,
+        entry_id: str,
+        fields: dict[str, str],
+        reason: str,
+    ) -> None:
+        """Record a vanished entry, or log an ordinary fence-out.
+
+        Runs off the heartbeat task so the handler can cancel that task
+        without dropping the graveyard row or the placeholder edit.
+        """
+        spec = self._spec
+        assert self._leases is not None
+        try:
+            verdict = await self._leases.entry_vanished(
+                spec.stream,
+                spec.group,
+                entry_id,
+                owner=lease.owner,
+            )
+            if verdict is not True:
+                spec.logger.warning(
+                    "delivery lease LOST for entry %s on stream %s "
+                    "(owner=%s generation=%d): %s; this owner may no longer ack, "
+                    "dead-letter, or emit a terminal result",
+                    entry_id,
+                    spec.stream,
+                    lease.owner,
+                    lease.generation,
+                    reason,
+                )
+                return
+            lease.entry_vanished.set()
+            spec.logger.warning(
+                "stream entry %s vanished on stream %s "
+                "(owner=%s generation=%d): %s; this owner will record it",
+                entry_id,
+                spec.stream,
+                lease.owner,
+                lease.generation,
+                reason,
+            )
+            try:
+                await self._dead_letter(
+                    entry_id,
+                    fields,
+                    reason="broker-entry-vanished",
+                    delivery_count=1,
+                )
+            except Exception:
+                spec.logger.exception(
+                    "recording vanished entry %s on stream %s failed",
+                    entry_id,
+                    spec.stream,
+                )
+            if self._on_entry_vanished is not None:
+                try:
+                    await self._on_entry_vanished(entry_id, fields)
+                except Exception:
+                    spec.logger.exception(
+                        "vanished-entry handler failed for entry %s on stream %s",
+                        entry_id,
+                        spec.stream,
+                    )
+        finally:
+            self._notice_lease.pop(entry_id, None)
 
     async def _dead_letter_refusal(self, entry_id: str) -> str | None:
         """Why this process may NOT dead-letter ``entry_id``, or None if it may.
@@ -927,8 +1009,24 @@ class StreamConsumer:
         """
         if self._leases is None:
             return None
-        held = self._held_leases.get(entry_id)
+        held = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
         if held is not None:
+            if held.entry_vanished.is_set():
+                # ADR-0131 bars a fenced owner from settling a successor's
+                # delivery. A vanished entry has no successor. Allow the
+                # graveyard row only while a fresh read still agrees.
+                fresh = await self._leases.entry_vanished(
+                    held.stream,
+                    held.group,
+                    entry_id,
+                    owner=held.owner,
+                )
+                if fresh is True:
+                    return None
+                return (
+                    "this owner's delivery lease was lost mid-flight "
+                    f"(owner={held.owner}, generation={held.generation})"
+                )
             if held.lost.is_set():
                 return (
                     "this owner's delivery lease was lost mid-flight "
@@ -1056,8 +1154,10 @@ class StreamConsumer:
                 # is already written, so unlike the precondition above there is
                 # no clean early return left, and a duplicate row on the true
                 # owner's later dead-letter is the ordering's accepted cost.
-                held = self._held_leases.get(entry_id)
-                if held is not None:
+                held = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
+                # A vanished entry has no successor (ADR-0131). Skip the fence
+                # only then, so XACK of the missing id can still run.
+                if held is not None and not held.entry_vanished.is_set():
                     held.raise_if_lost()
                 await self._ack(entry_id)
                 # ADR-0131: delivery state is "removed after terminal

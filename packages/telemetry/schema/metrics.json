@@ -1251,6 +1251,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
@@ -1281,7 +1282,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4440
+      "cardinality_bound": 4480
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1396,6 +1397,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
@@ -1426,7 +1428,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4440
+      "cardinality_bound": 4480
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1541,6 +1543,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
           "/v1/factory/cards/{token}.svg",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
@@ -1564,7 +1567,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 888
+      "cardinality_bound": 896
     },
     "curie.background.loop": {
       "type": "counter",

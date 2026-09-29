@@ -26,19 +26,18 @@ itself via `isolated_migration_db`, real Postgres, no mocking.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import (
+    IsolatedMigrationDb,
+    alembic_config,
+    column_names,
+    constraint_exists,
+    sql_rows,
+)
 from alembic import command
 from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Targeted explicitly, never as a relative "-1" (#1391).
 BELOW = "0023"
@@ -48,53 +47,14 @@ ROUTE_PAIR_CHECK = "agent_channels_route_pair_ck"
 ROUTE_COLUMNS = ("endpoint", "adapter", "generation")
 
 
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def _go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_go())
-
-
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
-def _at_below() -> Config:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
-    return cfg
-
-
-def _constraint_named(name: str) -> bool:
-    rows = _sql(
-        "SELECT 1 FROM pg_constraint c "
-        "JOIN pg_class t ON t.oid = c.conrelid "
-        "JOIN pg_namespace n ON n.oid = t.relnamespace "
-        "WHERE n.nspname = 'curie' AND c.conname = :name",
-        {"name": name},
-    )
-    return bool(rows)
-
-
-def _columns() -> set[str]:
-    rows = _sql(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'curie' AND table_name = 'agent_channels'"
-    )
-    return {row[0] for row in rows}
+def _at_below(db: IsolatedMigrationDb) -> Config:
+    db.at(BELOW)
+    return alembic_config()
 
 
 def _seed_agent(name: str) -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": name},
     )
@@ -116,7 +76,7 @@ def _insert_binding(
     """
 
     agent_id = _seed_agent(name)
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address, endpoint, adapter) "
         "VALUES (:id, :agent, :kind, :addr, :endpoint, :adapter)",
         {
@@ -133,7 +93,7 @@ def _insert_binding(
 
 def _seed_slack_binding(name: str, address: str) -> uuid.UUID:
     agent_id = _seed_agent(name)
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, 'slack', :addr)",
         {"id": uuid.uuid4(), "agent": agent_id, "addr": address},
@@ -142,7 +102,7 @@ def _seed_slack_binding(name: str, address: str) -> uuid.UUID:
 
 
 def test_the_upgrade_adds_the_route_columns_with_a_null_backfill(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """AC13c, upgrade half. The backfill is trivially all-NULL/zero (no binding
     has a route today), which is exactly why cutover steps 8-11 exist: every
@@ -154,19 +114,19 @@ def test_the_upgrade_adds_the_route_columns_with_a_null_backfill(
     rebind check silently vacuous for pre-0024 rows.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_slack_binding("slack-agent", "C0EXAMPLE1")
 
     command.upgrade(cfg, REVISION)
 
-    assert set(ROUTE_COLUMNS) <= _columns()
-    rows = _sql(
+    assert set(ROUTE_COLUMNS) <= column_names("agent_channels")
+    rows = sql_rows(
         "SELECT endpoint, adapter, generation FROM curie.agent_channels "
         "WHERE address = 'C0EXAMPLE1'"
     )
     assert rows == [(None, None, 0)]
 
-    nullable = _sql(
+    nullable = sql_rows(
         "SELECT column_name, is_nullable FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'agent_channels' "
         "AND column_name = ANY(:cols)",
@@ -183,7 +143,7 @@ def test_the_upgrade_adds_the_route_columns_with_a_null_backfill(
     ],
 )
 def test_a_half_configured_route_is_rejected_by_the_database(
-    isolated_migration_db: None, endpoint: str | None, adapter: str | None
+    isolated_migration_db: IsolatedMigrationDb, endpoint: str | None, adapter: str | None
 ) -> None:
     """T-A16 / AC13b. Both directions of the pair, because a CHECK written as
     `endpoint IS NOT NULL OR adapter IS NULL` catches one and waves the other
@@ -195,7 +155,7 @@ def test_a_half_configured_route_is_rejected_by_the_database(
     which is why T-C11/T-C12 (the schema half) are not sufficient on their own.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
 
     with pytest.raises(Exception) as caught:
@@ -205,12 +165,12 @@ def test_a_half_configured_route_is_rejected_by_the_database(
     assert ROUTE_PAIR_CHECK in str(caught.value), caught.value
 
 
-def test_both_set_and_both_absent_are_accepted(isolated_migration_db: None) -> None:
+def test_both_set_and_both_absent_are_accepted(isolated_migration_db: IsolatedMigrationDb) -> None:
     """T-A16's positive control. Without it, a CHECK of `false` would pass the
     two rejection cases above and make every binding uninsertable.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
 
     _insert_binding(
@@ -223,8 +183,8 @@ def test_both_set_and_both_absent_are_accepted(isolated_migration_db: None) -> N
     # Slack's route is legitimately implicit: the worker's configured origin.
     _insert_binding("slack-agent", "slack", "C0EXAMPLE1")
 
-    assert len(_sql("SELECT 1 FROM curie.agent_channels")) == 2
-    assert _constraint_named(ROUTE_PAIR_CHECK)
+    assert len(sql_rows("SELECT 1 FROM curie.agent_channels")) == 2
+    assert constraint_exists(ROUTE_PAIR_CHECK)
 
 
 def _seed_approval(*, reply_channel: str, reply_kind: str, status: str) -> uuid.UUID:
@@ -232,7 +192,7 @@ def _seed_approval(*, reply_channel: str, reply_kind: str, status: str) -> uuid.
     NULL for every row until this revision fills it)."""
 
     approval_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.approvals "
         "(id, conversation_id, author, summary, reply_kind, reply_channel, "
         " reply_placeholder, dedupe_key, status) "
@@ -250,7 +210,7 @@ def _seed_approval(*, reply_channel: str, reply_kind: str, status: str) -> uuid.
 
 
 def _reply_adapter(approval_id: uuid.UUID) -> str | None:
-    rows = _sql(
+    rows = sql_rows(
         "SELECT reply_adapter FROM curie.approvals WHERE id = :id", {"id": approval_id}
     )
     assert rows, f"approval {approval_id} vanished"
@@ -259,7 +219,7 @@ def _reply_adapter(approval_id: uuid.UUID) -> str | None:
 
 @pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
 def test_the_upgrade_refuses_a_non_slack_approval_with_no_adapter_provenance(
-    isolated_migration_db: None, status: str
+    isolated_migration_db: IsolatedMigrationDb, status: str
 ) -> None:
     """0022's other half, landed here because `adapter` does not exist until this
     revision. A non-Slack approval whose binding names no egress identity has no
@@ -280,12 +240,12 @@ def test_the_upgrade_refuses_a_non_slack_approval_with_no_adapter_provenance(
     the binding's route).
     """
 
-    cfg = _at_below()
-    _sql(
+    cfg = _at_below(isolated_migration_db)
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, 'mail-agent')",
         {"id": (agent_id := uuid.uuid4())},
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, 'email', 'agent@example.test')",
         {"id": uuid.uuid4(), "agent": agent_id},
@@ -306,7 +266,7 @@ def test_the_upgrade_refuses_a_non_slack_approval_with_no_adapter_provenance(
 
 @pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
 def test_a_slack_approval_upgrades_with_a_null_reply_adapter(
-    isolated_migration_db: None, status: str
+    isolated_migration_db: IsolatedMigrationDb, status: str
 ) -> None:
     """The sibling lane, and the positive control for the refusal above.
 
@@ -320,12 +280,12 @@ def test_a_slack_approval_upgrades_with_a_null_reply_adapter(
     adapter that does not own the turn.
     """
 
-    cfg = _at_below()
-    _sql(
+    cfg = _at_below(isolated_migration_db)
+    sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, 'slack-agent')",
         {"id": (agent_id := uuid.uuid4())},
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent, 'slack', 'C0EXAMPLE1')",
         {"id": uuid.uuid4(), "agent": agent_id},
@@ -337,13 +297,13 @@ def test_a_slack_approval_upgrades_with_a_null_reply_adapter(
     command.upgrade(cfg, REVISION)
 
     assert _reply_adapter(approval) is None
-    assert _sql(
+    assert sql_rows(
         "SELECT reply_kind FROM curie.approvals WHERE id = :id", {"id": approval}
     ) == [("slack",)]
 
 
 def test_the_round_trip_succeeds_on_a_slack_only_database(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A14, round-trip half / AC13c.
 
@@ -355,24 +315,24 @@ def test_the_round_trip_succeeds_on_a_slack_only_database(
     upgrade is what proves it.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     _seed_slack_binding("slack-agent", "C0EXAMPLE1")
 
     command.upgrade(cfg, REVISION)
     command.downgrade(cfg, BELOW)
 
-    assert not _constraint_named(ROUTE_PAIR_CHECK)
-    assert _columns().isdisjoint(ROUTE_COLUMNS)
+    assert not constraint_exists(ROUTE_PAIR_CHECK)
+    assert column_names("agent_channels").isdisjoint(ROUTE_COLUMNS)
     # The binding itself is untouched: a downgrade drops the route, never the row.
-    assert len(_sql("SELECT 1 FROM curie.agent_channels")) == 1
+    assert len(sql_rows("SELECT 1 FROM curie.agent_channels")) == 1
 
     command.upgrade(cfg, REVISION)
-    assert _constraint_named(ROUTE_PAIR_CHECK)
-    assert set(ROUTE_COLUMNS) <= _columns()
+    assert constraint_exists(ROUTE_PAIR_CHECK)
+    assert set(ROUTE_COLUMNS) <= column_names("agent_channels")
 
 
 def test_the_downgrade_refuses_and_names_any_routed_binding(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A14, refusal half / AC13c.
 
@@ -382,7 +342,7 @@ def test_the_downgrade_refuses_and_names_any_routed_binding(
     adapter lives and which credential authenticates the platform to it.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
     _insert_binding(
         "mail-agent",
@@ -402,13 +362,13 @@ def test_the_downgrade_refuses_and_names_any_routed_binding(
     # The unrouted slack binding is not blamed for its neighbour's state.
     assert "C0EXAMPLE1" not in message, message
     # And the refusal was total: the route survives.
-    assert _sql(
+    assert sql_rows(
         "SELECT adapter FROM curie.agent_channels WHERE address = 'ops@example.test'"
     ) == [("agentmail-sandbox",)]
 
 
 def test_the_downgrade_refuses_a_rebound_binding_whose_generation_is_nonzero(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """T-A14, the revocation half.
 
@@ -424,12 +384,12 @@ def test_the_downgrade_refuses_a_rebound_binding_whose_generation_is_nonzero(
     a revoked adapter token that starts working again.
     """
 
-    cfg = _at_below()
+    cfg = _at_below(isolated_migration_db)
     command.upgrade(cfg, REVISION)
     _seed_slack_binding("rebound-agent", "C0EXAMPLE1")
     _seed_slack_binding("settled-agent", "C0EXAMPLE2")
     # Two rebinds, exactly as `update_agent_binding` would have counted them.
-    _sql(
+    sql_rows(
         "UPDATE curie.agent_channels SET generation = 2 WHERE address = 'C0EXAMPLE1'"
     )
 
@@ -442,6 +402,6 @@ def test_the_downgrade_refuses_a_rebound_binding_whose_generation_is_nonzero(
     # The never-rebound binding is not blamed for its neighbour's state.
     assert "C0EXAMPLE2" not in message, message
     # And the refusal was total: the generation survives to be rotated against.
-    assert _sql(
+    assert sql_rows(
         "SELECT generation FROM curie.agent_channels WHERE address = 'C0EXAMPLE1'"
     ) == [(2,)]

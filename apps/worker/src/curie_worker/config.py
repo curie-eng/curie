@@ -1323,6 +1323,19 @@ class WorkerConfig(BaseSettings):
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
 
+    def upgrade_drain_success_key(self) -> str:
+        """The record that this revision's drain finished cleanly (#3360).
+
+        Written only after a clean drain, read by the attest hook, and deleted
+        by the post-upgrade release. An unset hook revision is zero, matching
+        the marker revision the gate already uses.
+        """
+        revision = 0 if self.upgrade_revision is None else self.upgrade_revision
+        key = f"{self.key_prefix}:upgrade:drain-succeeded:{revision}"
+        if self.installation_id:
+            return f"{key}:{self.installation_id}"
+        return key
+
     def upgrade_legacy_quiesce_key(self) -> str:
         """The pre-#2374 global key used only by standalone or the bridge."""
 

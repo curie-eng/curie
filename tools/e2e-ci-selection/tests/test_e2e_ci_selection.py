@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
 import os
 import re
@@ -9,6 +11,8 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 import yaml
@@ -93,6 +97,33 @@ def _invoke_selector(
     return completed, output
 
 
+def _load_selector_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("select_tiers", SELECTOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered first: the module's dataclasses resolve their own module.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Checks that sweep many paths call the selector's own per-path function in
+# process; one interpreter per path cost seconds per test. The CLI boundary
+# (GITHUB_OUTPUT, --push, --omit-kind, revisions) keeps its subprocess tests
+# through `_invoke_selector`.
+_SELECTOR_MODULE = _load_selector_module()
+
+
+@functools.cache
+def _loaded_registry(registry: Path) -> Any:
+    return _SELECTOR_MODULE._load_registry(registry)
+
+
+def _selects_released_upgrade(path: str, registry: Path = REGISTRY) -> bool:
+    selected = _SELECTOR_MODULE._select_path(_loaded_registry(registry), path)
+    return "released-upgrade" in selected
+
+
 def _path_needs_images(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
@@ -109,6 +140,7 @@ def _expected_output(
     pytest_needed: bool = True,
     images_needed: bool = False,
     cli_release_needed: bool = False,
+    released_upgrade_full: bool = False,
 ) -> str:
     selected_tiers = set(selected)
     lines = [
@@ -120,6 +152,9 @@ def _expected_output(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
+    lines.append(
+        f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -292,7 +327,6 @@ def _matches(path: str, prefix: str) -> bool:
 
 
 def _unselected_matrix_inputs(
-    tmp_path: Path,
     script: str,
     registry: Path = REGISTRY,
 ) -> list[str]:
@@ -318,10 +352,7 @@ def _unselected_matrix_inputs(
             problems.append(f"{reference}: neither in the checkout nor ignored")
             continue
         for path in paths:
-            completed, output = _invoke_selector(tmp_path, path, registry=registry)
-            assert completed.returncode == 0, completed.stderr
-            outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
-            if outputs["released_upgrade"] != "true":
+            if not _selects_released_upgrade(path, registry):
                 problems.append(f"{path}: does not select released-upgrade")
     return problems
 
@@ -341,7 +372,7 @@ def test_released_upgrade_selects_every_repo_file_the_upgrade_matrix_reads(
     helmignore = (REPO_ROOT / "charts" / "curie" / ".helmignore").read_text()
     assert UPGRADE_MATRIX_DIRECTORY_INPUTS["charts/curie"] == ("charts/curie/ci",)
     assert "ci/" in helmignore.splitlines()
-    assert _unselected_matrix_inputs(tmp_path, script) == []
+    assert _unselected_matrix_inputs(script) == []
 
 
 def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> None:
@@ -355,7 +386,7 @@ def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> 
         text.replace(anchor, f"{anchor}    charts/curie/files/agent-sandbox: []\n")
     )
     assert _unselected_matrix_inputs(
-        tmp_path, 'helm package "$REPO_ROOT/charts/curie"\n', registry
+        'helm package "$REPO_ROOT/charts/curie"\n', registry
     ) == [
         "charts/curie/files/agent-sandbox/controller.yaml: does not select released-upgrade",
     ]
@@ -375,7 +406,7 @@ def test_matrix_input_guard_names_each_read_the_registry_drops(tmp_path: Path) -
     registry = tmp_path / "registry.yaml"
     registry.write_text(text)
     assert _unselected_matrix_inputs(
-        tmp_path, UPGRADE_MATRIX.read_text(), registry
+        UPGRADE_MATRIX.read_text(), registry
     ) == [f"{path}: does not select released-upgrade" for path in dropped]
 
 
@@ -411,7 +442,7 @@ def test_matrix_input_guard_classifies_each_reference(
     script: str,
     problems: list[str],
 ) -> None:
-    assert _unselected_matrix_inputs(tmp_path, script) == problems
+    assert _unselected_matrix_inputs(script) == problems
 
 
 def test_e2e_ladder_script_stays_off_released_upgrade(tmp_path: Path) -> None:
@@ -561,7 +592,7 @@ def test_released_upgrade_selects_chart_ci_scripts_its_own_jobs_run(
     } <= run_by_jobs
     for path in sorted(run_by_jobs):
         assert (REPO_ROOT / path).is_file(), path
-        assert _selector_outputs(tmp_path, path)["released_upgrade"] == "true", path
+        assert _selects_released_upgrade(path), path
 
 
 def test_every_shipped_chart_file_selects_released_upgrade(tmp_path: Path) -> None:
@@ -582,7 +613,7 @@ def test_every_shipped_chart_file_selects_released_upgrade(tmp_path: Path) -> No
     entries = {path.removeprefix(f"{CHART_ROOT}/").split("/", 1)[0] for path in shipped}
     assert {"Chart.yaml", "templates", "values.yaml"} <= entries
     for path in shipped:
-        assert _selector_outputs(tmp_path, path)["released_upgrade"] == "true", path
+        assert _selects_released_upgrade(path), path
 
 
 @pytest.mark.parametrize(
@@ -647,14 +678,28 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
     completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
-        *TIERS, images_needed=True, cli_release_needed=True
+        *TIERS,
+        images_needed=True,
+        cli_release_needed=True,
+        released_upgrade_full=True,
     )
+
+
+def test_pull_request_released_upgrade_runs_the_smoke_shard_only(
+    tmp_path: Path,
+) -> None:
+    # A pull request path selection never asks for the full upgrade matrix or
+    # the released chart upgrade jobs. Push and dispatch (the nightly) do.
+    outputs = _selector_outputs(tmp_path, "charts/curie/values.yaml")
+    assert outputs["released_upgrade"] == "true"
+    assert outputs["released_upgrade_full"] == "false"
 
 
 def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> None:
     kept = tuple(tier for tier in TIERS if tier not in {"cluster", "released-upgrade"})
     completed, output = _invoke_selector(tmp_path, push=True, omit_kind=True)
     assert completed.returncode == 0, completed.stderr
+    # The next push omits kind, so it runs no upgrade job at all.
     assert output == _expected_output(
         *kept, images_needed=True, cli_release_needed=True
     )
@@ -831,9 +876,11 @@ AGGREGATE_EXPRESSIONS = {
     "local_release_selected": "${{ needs.changes.outputs.local_release }}",
     "cluster_selected": "${{ needs.changes.outputs.cluster }}",
     "released_upgrade_selected": "${{ needs.changes.outputs.released_upgrade }}",
+    "released_upgrade_full": "${{ needs.changes.outputs.released_upgrade_full }}",
     "skill_local_result": "${{ needs.e2e-ladder.result }}",
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
+    "cluster_chart_result": "${{ needs.e2e-cluster-chart-regressions.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": (
         "${{ needs.e2e-released-upgrade-negative.result }}"
@@ -882,9 +929,13 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "local_release": "${{ steps.filter.outputs.local_release }}",
         "cluster": "${{ steps.filter.outputs.cluster }}",
         "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
+        "released_upgrade_full": (
+            "${{ steps.filter.outputs.released_upgrade_full }}"
+        ),
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
         "images": "${{ steps.filter.outputs.images }}",
         "cli_release": "${{ steps.filter.outputs.cli_release }}",
+        "runtime_assertions": "${{ steps.runtime.outputs.runtime_assertions }}",
     }
 
     skill_local = jobs["e2e-ladder"]
@@ -909,7 +960,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "${{ needs.changes.outputs.cluster == 'true' }}"
     )
     assert jobs["e2e-released-upgrade"]["if"] == (
-        "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+        "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
     )
     assert jobs["e2e-released-upgrade-negative"]["if"] == (
         jobs["e2e-released-upgrade"]["if"]
@@ -918,17 +969,18 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         jobs["e2e-released-upgrade"]["needs"]
     )
     assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
-        jobs["e2e-released-upgrade"]["if"]
+        "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     )
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
     assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
-    assert jobs["worker-local-image"]["if"] == jobs["images"]["if"]
+    assert "worker-local-image" not in jobs
     assert jobs["dispatcher-image-smoke"]["if"] == jobs["images"]["if"]
     assert jobs["mail-adapter-image-smoke"]["if"] == jobs["images"]["if"]
     assert jobs["ui-image-smoke"]["if"] == jobs["images"]["if"]
     assert jobs["repo-toolchain-proof"]["if"] == jobs["images"]["if"]
     assert jobs["cli-portability"]["if"] == (
-        "${{ needs.changes.outputs.cli_release == 'true' }}"
+        "${{ github.event_name != 'pull_request' && "
+        "needs.changes.outputs.cli_release == 'true' }}"
     )
     assert jobs["cli-darwin"]["if"] == jobs["cli-portability"]["if"]
     assert "changes" in jobs["rust-build"]["needs"]
@@ -949,6 +1001,46 @@ def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
     assert len(list_steps) == 1
     assert "--list-shards --json" in list_steps[0]["run"]
     assert "$GITHUB_OUTPUT" in list_steps[0]["run"]
+    assert job["needs"] == ["changes"]
+    assert list_steps[0]["env"]["FULL"] == (
+        "${{ needs.changes.outputs.released_upgrade_full }}"
+    )
+
+
+def _list_shards(tmp_path: Path, full: str, smoke: str | None = None) -> str:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    job = workflow["jobs"]["e2e-cluster-upgrade-matrix-shards"]
+    step = next(step for step in job["steps"] if step.get("id") == "list")
+    output = tmp_path / f"list-{full}-{smoke}"
+    environment = os.environ.copy()
+    environment.update(step["env"])
+    environment.update({"FULL": full, "GITHUB_OUTPUT": str(output)})
+    if smoke is not None:
+        environment["SMOKE_SHARD"] = smoke
+    completed = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return output.read_text()
+
+
+def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
+    tmp_path: Path,
+) -> None:
+    full = _list_shards(tmp_path, "true")
+    shards = json.loads(full.removeprefix("shards="))
+    assert len(shards) == 12
+    assert _list_shards(tmp_path, "false") == 'shards=["s01"]\n'
+
+
+def test_upgrade_matrix_smoke_shard_must_be_listed(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError):
+        _list_shards(tmp_path, "false", smoke="s99")
 
 
 def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
@@ -961,13 +1053,13 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
         "rust-build",
         "changes",
         "e2e-cluster-upgrade-matrix-shards",
+        "ci-images",
     }
     assert job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     assert job["timeout-minutes"] == 45
     assert job["strategy"]["fail-fast"] is False
-    # 14 shards of 9 to 18 minutes: 4 at a time took four waves (57 minutes on
-    # run 36204726414, past #2733's 45 minute ceiling); 7 takes two.
-    assert job["strategy"]["max-parallel"] == 7
+    # 14 shards run in one wave on push and dispatch; 7 took two waves.
+    assert job["strategy"]["max-parallel"] == 14
     assert job["strategy"]["matrix"] == {
         "shard": (
             "${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}"
@@ -993,56 +1085,41 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
     assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
 
-    # #2733: one parallel bake replaces five serial image builds. The script
-    # retags matrix-candidate from local docker and kind-loads exclusive tags
-    # itself, so the workflow-level kind load of matrix-candidate is gone.
+    # #2733: the script retags matrix-candidate from local docker and
+    # kind-loads exclusive tags itself, so the workflow-level kind load of
+    # matrix-candidate is gone. The candidate images are built once per run by
+    # the ci-images job; a shard only loads and tags them.
     assert not any(
-        str(step.get("uses", "")).startswith("docker/build-push-action@")
+        str(step.get("uses", "")).startswith(
+            ("docker/build-push-action@", "docker/bake-action@", "docker/setup-buildx-action@")
+        )
         for step in job["steps"]
     )
     assert "Load candidate images into the kind cluster" not in named_steps
     assert not any(
         "kind load" in str(step.get("run", "")) for step in job["steps"]
     )
-    builder = named_steps["Set up a cache-only buildx builder (named, NOT the default)"]
-    assert builder["with"]["use"] is False
-    bake = named_steps["Build the candidate images locally in parallel"]
-    assert bake["uses"].startswith("docker/bake-action@")
-    assert len(bake["uses"].split("@", 1)[1].split()[0]) == 40
-    assert bake["with"]["builder"] == "${{ steps.matrixcache.outputs.name }}"
-    assert bake["with"]["load"] is True
-    assert bake["with"]["push"] is False
-    assert bake["with"]["files"] == "matrix-bake.json"
-    assert bake["with"]["source"] == "."
-    writer = named_steps["Write the candidate image bake definition"]["run"]
-    body = writer.split("<<'EOF'\n", 1)[1].rsplit("\nEOF", 1)[0]
-    definition = json.loads(body)
-    targets = definition["target"]
-    assert set(definition["group"]["default"]["targets"]) == set(targets)
-    expected = {
-        "api": "apps/api/Dockerfile",
-        "dispatcher": "apps/dispatcher/Dockerfile",
-        "worker": "apps/worker/Dockerfile",
-        "ui": "apps/ui/Dockerfile",
-        "runner": "runner/Dockerfile",
-    }
-    assert set(targets) == set(expected)
-    for component, dockerfile in expected.items():
-        target = targets[component]
-        assert target["context"] == "."
-        assert target["dockerfile"] == dockerfile
-        assert target["tags"] == [f"curie-{component}:matrix-candidate"]
-        assert target["cache-from"] == [f"type=gha,scope=ladder-{component}"]
-        assert target["cache-to"] == [f"type=gha,mode=max,scope=ladder-{component}"]
+    load = named_steps["Load the images built by the ci-images job"]
+    assert load["uses"] == "./.github/actions/load-ci-images"
+    assert load["with"]["images"] == "{api,dispatcher,worker,ui,runner}"
+    tag_run = named_steps["Tag the images as the matrix candidate"]["run"]
+    for component in ("api", "dispatcher", "worker", "ui", "runner"):
+        assert (
+            f"docker tag curie-ci/{component}:candidate "
+            f"curie-{component}:matrix-candidate"
+        ) in tag_run
     step_names = [step.get("name") for step in job["steps"]]
-    assert step_names.index(bake["name"]) < step_names.index(run_step["name"])
+    assert step_names.index(load["name"]) < step_names.index(
+        "Tag the images as the matrix candidate"
+    ) < step_names.index(run_step["name"])
+
 
 
 def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
     job = workflow["jobs"]["e2e-released-upgrade"]
-    assert set(job["needs"]) == {"rust-build", "changes"}
+    assert set(job["needs"]) == {"rust-build", "changes", "ci-images"}
 
     named_steps = {
         step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
@@ -1059,14 +1136,12 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         "ui": ("apps/ui/Dockerfile", "curie-ui:upgrade-candidate"),
         "runner": ("runner/Dockerfile", "curie-runner:upgrade-candidate"),
     }
-    for component, (dockerfile, tag) in candidate_images.items():
-        step = named_steps[f"Build the candidate {component} image locally"]
-        assert step["uses"].startswith("docker/build-push-action@")
-        assert step["with"]["context"] == "."
-        assert step["with"]["file"] == dockerfile
-        assert step["with"]["tags"] == tag
-        assert step["with"]["push"] is False
-        assert step["with"]["load"] is True
+    load_images = named_steps["Load the images built by the ci-images job"]
+    assert load_images["uses"] == "./.github/actions/load-ci-images"
+    assert load_images["with"]["images"] == "{api,dispatcher,worker,ui,runner}"
+    tag_run = named_steps["Tag the images as the upgrade candidate"]["run"]
+    for component, (_dockerfile, tag) in candidate_images.items():
+        assert f"docker tag curie-ci/{component}:candidate {tag}" in tag_run
 
     load_run = named_steps["Load candidate images into the kind cluster"]["run"]
     for _component, (_dockerfile, tag) in candidate_images.items():
@@ -1195,14 +1270,18 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     assert len(negative_steps) == sum("name" in step for step in negative_job["steps"])
     for shared in (
         "Install Helm",
-        "Set up a cache-only buildx builder (named, NOT the default)",
-        "Build the candidate worker image locally",
         "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    negative_load = negative_steps["Load the worker image built by the ci-images job"]
+    assert negative_load["uses"] == "./.github/actions/load-ci-images"
+    assert negative_load["with"]["images"] == "worker"
+    assert negative_steps["Tag the worker image as the upgrade candidate"]["run"] == (
+        "docker tag curie-ci/worker:candidate curie-worker:upgrade-candidate"
+    )
     assert negative_job["steps"][0] == job["steps"][0]
     assert 'kind load docker-image curie-worker:upgrade-candidate' in negative_steps[
         "Load the candidate worker image into the kind cluster"
@@ -1416,7 +1495,8 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
     )
     helm_runs = "\n".join(
         step.get("run", "")
-        for step in helm_ci["jobs"]["helm"]["steps"]
+        for job in helm_ci["jobs"].values()
+        for step in job.get("steps", [])
         if isinstance(step.get("run"), str)
     )
     assert "charts/curie/ci/live-manifest-parity-assertions.sh" in helm_runs
@@ -1431,6 +1511,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder",
         "e2e-ladder-release",
         "e2e-ladder-cluster",
+        "e2e-cluster-chart-regressions",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -1473,9 +1554,11 @@ def _run_aggregate(
         "local_release_selected": "false",
         "cluster_selected": "false",
         "released_upgrade_selected": "false",
+        "released_upgrade_full": "false",
         "skill_local_result": "skipped",
         "local_release_result": "skipped",
         "cluster_result": "skipped",
+        "cluster_chart_result": "skipped",
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
@@ -1535,9 +1618,11 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
             "skill_local_result": "success",
             "local_release_result": "success",
             "cluster_result": "success",
+            "cluster_chart_result": "success",
         },
         {
             "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
             "released_upgrade_result": "success",
             "released_upgrade_negative_result": "success",
             "upgrade_matrix_result": "success",
@@ -1552,6 +1637,7 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
 def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -> None:
     ok = _run_aggregate(
         released_upgrade_selected="true",
+        released_upgrade_full="true",
         released_upgrade_result="success",
         released_upgrade_negative_result="success",
         upgrade_matrix_result="success",
@@ -1560,6 +1646,7 @@ def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -
     for result in ("skipped", "failure", "cancelled"):
         rejected = _run_aggregate(
             released_upgrade_selected="true",
+            released_upgrade_full="true",
             released_upgrade_result="success",
             released_upgrade_negative_result="success",
             upgrade_matrix_result=result,
@@ -1573,6 +1660,44 @@ def test_aggregate_requires_upgrade_matrix_skip_when_released_upgrade_is_not_sel
     for result in ("success", "failure", "cancelled"):
         rejected = _run_aggregate(upgrade_matrix_result=result)
         assert rejected.returncode != 0, result
+
+
+def test_aggregate_pull_request_smoke_runs_matrix_without_released_trio() -> None:
+    ok = _run_aggregate(
+        released_upgrade_selected="true",
+        released_upgrade_full="false",
+        upgrade_matrix_result="success",
+    )
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for matrix, positive, negative in (
+        ("skipped", "skipped", "skipped"),
+        ("failure", "skipped", "skipped"),
+        ("success", "success", "skipped"),
+        ("success", "skipped", "success"),
+    ):
+        rejected = _run_aggregate(
+            released_upgrade_selected="true",
+            released_upgrade_full="false",
+            upgrade_matrix_result=matrix,
+            released_upgrade_result=positive,
+            released_upgrade_negative_result=negative,
+        )
+        assert rejected.returncode != 0, (matrix, positive, negative)
+
+
+@pytest.mark.parametrize("full", ["", "yes"])
+def test_aggregate_rejects_malformed_released_upgrade_full(full: str) -> None:
+    completed = _run_aggregate(released_upgrade_full=full)
+    assert completed.returncode != 0
+
+
+def test_aggregate_rejects_full_run_without_released_upgrade() -> None:
+    completed = _run_aggregate(
+        released_upgrade_full="true",
+        released_upgrade_result="success",
+        released_upgrade_negative_result="success",
+    )
+    assert completed.returncode != 0
 
 
 @pytest.mark.parametrize("result", ["skipped", "failure", "cancelled"])
@@ -1590,6 +1715,22 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         {"local_release_selected": "true", "local_release_result": "failure"},
         {"cluster_selected": "true", "cluster_result": "skipped"},
         {"cluster_selected": "true", "cluster_result": "cancelled"},
+        {
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "failure",
+        },
+        {
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "skipped",
+        },
+        {
+            "cluster_selected": "true",
+            "cluster_result": "failure",
+            "cluster_chart_result": "success",
+        },
+        {"cluster_chart_result": "success"},
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
@@ -1598,16 +1739,19 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         {"released_upgrade_negative_result": "success"},
         {
             "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
             "released_upgrade_result": "success",
             "released_upgrade_negative_result": "skipped",
         },
         {
             "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
             "released_upgrade_result": "success",
             "released_upgrade_negative_result": "failure",
         },
         {
             "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
             "released_upgrade_result": "skipped",
             "released_upgrade_negative_result": "success",
         },
@@ -1669,3 +1813,52 @@ def test_selector_directory_has_no_stdlib_shadowing_modules() -> None:
             "the script on platforms where it's a dynamic extension instead "
             "(e.g. macOS's `select`), per issue #1878."
         )
+
+
+def test_omit_kind_keeps_cluster_for_a_changed_runtime_assertion(tmp_path: Path) -> None:
+    # #3391: E2E required refuses a changed runtime assertion without a pass
+    # receipt from the cluster rung, so omitting kind must not drop that rung.
+    runtime = "charts/curie/ci/runtime/connector-readiness-runtime.sh"
+    outputs = _selector_outputs_omit_kind(tmp_path, runtime)
+    assert outputs["cluster"] == "true"
+    assert outputs["released_upgrade"] == "false"
+    # Negative control: a sibling chart CI file is still dropped.
+    other = _selector_outputs_omit_kind(tmp_path, "charts/curie/ci/runtime/README.md")
+    assert other["cluster"] == "false"
+
+
+def _selector_outputs_omit_kind(tmp_path: Path, path: str) -> dict[str, str]:
+    completed, output = _invoke_selector(tmp_path, path, omit_kind=True)
+    assert completed.returncode == 0, completed.stderr
+    return dict(line.split("=", maxsplit=1) for line in output.splitlines())
+
+
+CLUSTER_RUNG_MOVED_PROOFS = {
+    "Langfuse web waits for delayed Postgres without restarting": "e2e-cluster-chart-regressions",
+    "Connector that never listens stays not-Ready until it binds": "e2e-cluster-chart-regressions",
+    "Runner BYO egress enforces (not just rendered)": "e2e-cluster-chart-regressions",
+    "Rollout-free first invocation and dead-consumer recovery": "e2e-cluster-rollout-recovery",
+}
+
+
+def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    rung_steps = {step.get("name") for step in jobs["e2e-ladder-cluster"]["steps"]}
+    for name, job_id in CLUSTER_RUNG_MOVED_PROOFS.items():
+        assert name not in rung_steps, name
+        steps = [step for step in jobs[job_id]["steps"] if step.get("name") == name]
+        assert len(steps) == 1, (job_id, name)
+        assert "if" not in steps[0]
+        assert "continue-on-error" not in steps[0]
+
+    chart = jobs["e2e-cluster-chart-regressions"]
+    assert chart["if"] == "${{ needs.changes.outputs.cluster == 'true' }}"
+    assert chart["needs"] == ["changes", "ci-images"]
+    assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
+
+    rollout = jobs["e2e-cluster-rollout-recovery"]
+    assert rollout["if"] == (
+        "${{ github.event_name != 'pull_request' && "
+        "needs.changes.outputs.cluster == 'true' }}"
+    )
+    assert "e2e-cluster-rollout-recovery" not in jobs["e2e-required"]["needs"]
