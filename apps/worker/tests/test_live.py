@@ -565,12 +565,20 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
 
 # --- ADR-0130: does Slack deduplicate an ambiguous progress post? ------------
 #
-# RECORDED: not yet run. After the first run, replace this line with the run
-# date, the worker commit, the exact command, what the second chat.postMessage
-# answered (the PROGRESS-PROOF lines this test prints), and how many messages
-# the thread showed. Use placeholders for every channel, user and team id.
-# apps/worker/src/curie_worker/slack_sink.py::_adopt_posted_ts is then settled
-# from that record, and from nothing else.
+# RECORDED 2026-09-29 at 0b26aa3e3bd5d0663267e4393030200d88ece156:
+# CURIE_LIVE_PROGRESS_PROOF=1 SLACK_BOT_TOKEN=<redacted>
+# SLACK_TEST_CHANNEL=<redacted> uv run pytest
+# apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry
+# -q -s
+# The first post and its same-client_msg_id retry both answered ``ok: true``
+# with the same ``ts``; the fresh milestone answered with a different ``ts``.
+# Adapter results were first_ref_is_ts=true, second_ref_equals_first=true,
+# second_error=null and milestone_ref_is_new=true. The thread showed
+# messages_below_root=2, progress_cards=1 and milestones=1. The test deliberately
+# leaves the proof thread available for inspection; the authorized external
+# driver then deleted the root and its two replies and verified
+# roots=1, deleted=3, failed=0, remaining_roots=0. No credential or real Slack
+# identifier is retained in this record.
 
 _PROGRESS_REQUIRED_ENV = ("SLACK_BOT_TOKEN", "SLACK_TEST_CHANNEL")
 _PROGRESS_PROOF_DEADLINE_S = 60.0
@@ -650,7 +658,9 @@ def test_live_slack_client_msg_id_dedupes_an_ambiguous_retry() -> None:
     a fresh one. It then reads the thread back with ``conversations.replies``.
     The bot token needs ``chat:write`` and history and info read access to
     ``SLACK_TEST_CHANNEL`` (``channels:*`` for a public channel, ``groups:*``
-    for a private one), and the bot must be a member. Nothing is deleted.
+    for a private one), and the bot must be a member. The test leaves its root
+    and replies available for inspection; the authorized external driver owns
+    deleting all three messages after it captures the printed evidence.
 
     It prints what Slack answered each post, which is the record the comment
     above this test is filled in from, and it fails unless the retry converged

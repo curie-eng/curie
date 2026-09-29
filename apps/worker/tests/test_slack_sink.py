@@ -1104,9 +1104,9 @@ def test_an_edit_within_the_limit_is_sent_unchanged() -> None:
 # here are read from the frozen vector, not imported, so these cases pin the
 # wire the CLI stub reads rather than whatever the builders happen to export.
 # Slack documents ``client_msg_id`` on chat.postMessage as the duplicate key the
-# approval card already relies on (the test above); what Slack ANSWERS a second
-# post with the same key is not measured, and these cases assert nothing about
-# it beyond "an error is raised for the retry, never swallowed".
+# approval card already relies on. The live proof records that a second post
+# under the same key answers with the first post's ts; these unit cases also pin
+# that an API error still raises for retry rather than being swallowed.
 
 _PROGRESS_VECTOR = json.loads(
     (Path(__file__).resolve().parents[3] / "tests" / "vectors" / "progress-blocks.json").read_text(
@@ -1349,7 +1349,7 @@ def test_a_rejected_progress_edit_falls_back_to_text_and_clears_the_old_blocks()
 
 
 def test_a_failed_progress_post_raises_for_a_retry_under_the_same_key() -> None:
-    """What Slack answers a duplicate is unmeasured, so an error is not guessed at.
+    """A Slack API error is propagated rather than guessed into a delivered post.
 
     It propagates, the outbox keeps the delivery, and every attempt the adapter
     made carried the same ``client_msg_id``.

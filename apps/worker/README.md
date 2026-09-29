@@ -519,21 +519,24 @@ Slack has two verbs here and only one of them takes a key. `chat.update` takes
 none, so an edit is idempotent by its stable target. `chat.postMessage` takes
 `client_msg_id`, which is how the approval card has always survived an
 ambiguous retry, and every create that carries a reply wire 1.1 `delivery_id`
-now passes it there too (ADR-0130 section 4). What Slack answers the second
-`chat.postMessage` of a `client_msg_id` it has already accepted is not measured
-yet. `apps/worker/src/curie_worker/slack_sink.py::_adopt_posted_ts` is the one
-place that answer is read: it takes the `ts` of an ok response, and an error
-still raises, so the delivery is retried with the same `delivery_id` rather
-than guessed at. `apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`
-measures it, and the rows below that depend on it say so.
+passes it there (ADR-0130 section 4), including an approval post. Existing 1.0
+approval posts keep using the approval UUID because they carry no
+`delivery_id`; the CLI recognizes either form from the structured Approve
+button's UUID value. On 2026-09-29, exact candidate
+`0b26aa3e3bd5d0663267e4393030200d88ece156` ran
+`apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`
+against real Slack. The duplicate call answered `ok: true` with the first
+message's `ts`; the thread contained exactly one card and one fresh-key
+milestone. `_adopt_posted_ts` adopts that returned `ts`. An API error still
+raises, so the delivery remains retryable under the same key.
 
 | Adapter / path | Receiving boundary | Idempotent apply? | Claim |
 |---|---|---|---|
 | `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes, by **stable target**, not by `event_id`: `chat.update` takes no idempotency key. | One user-visible terminal effect per `event_id`. |
 | `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn), 1.0 body | `chat.postMessage`, a **create**, not a mutation, until the minted ts is adopted as the turn's ref. A 1.0 body carries no `delivery_id`, so the post carries no `client_msg_id`. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
-| `SlackReplyAdapter`, placeholder-less turn, 1.1 body carrying `delivery_id` | The same `chat.postMessage`, with `client_msg_id` set to the `delivery_id`. | Slack deduplicates by `client_msg_id`; what it answers the duplicate is unmeasured (above). | One visible answer message per `delivery_id`, pending that measurement. Until then an ok answer's `ts` is taken as given and an error is raised for the retry, so nothing is inferred about what Slack did. |
-| `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | `chat.postMessage` with `client_msg_id` set to the approval's own UUID. A 1.1 body's `delivery_id` does not replace it: the approval id is already the card's durable identity, and the CLI stub reads it back from `client_msg_id` (`cli/src/chat.rs::approval_card_id`). | Slack deduplicates by `client_msg_id`, as above. | One visible card per approval id, on the same measurement. |
-| `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`, as above. | One visible card or milestone per `delivery_id`, on the same measurement. |
+| `SlackReplyAdapter`, placeholder-less turn, 1.1 body carrying `delivery_id` | The same `chat.postMessage`, with `client_msg_id` set to the `delivery_id`. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible answer message per `delivery_id`; the adapter adopts the original `ts`. |
+| `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | For a 1.0 body, `chat.postMessage` keeps the approval UUID as `client_msg_id`. For a 1.1 body, `client_msg_id` is the wire operation's `delivery_id`; the approval UUID remains in the structured Approve button value, where `cli/src/chat.rs::approval_card_id` reads it. | Slack deduplicates by whichever stable key the body form supplies. | One visible card per approval UUID on 1.0, or per `delivery_id` on 1.1. |
+| `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible card or milestone per `delivery_id`; the adapter adopts the original `ts`. |
 | `SlackReplyAdapter`, progress edit (`reply.update` carrying `progress`) | `chat.update` on the card's own ts, the `ref` acknowledged for its first post, never the placeholder's. Never the answer path, and never the approval card's settle path. | Yes, by **stable target**. The `delivery_id` has no Slack expression on an edit. | One visible card whatever the retry count. Which revision shows last is the coordinator's order, because Slack keeps the last edit it received. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |

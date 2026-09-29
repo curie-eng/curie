@@ -273,18 +273,16 @@ def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
 def _adopt_posted_ts(response: Mapping[str, Any] | AsyncSlackResponse | None) -> str | None:
     """The ts of the message a ``chat.postMessage`` answered with, or None.
 
-    Every create reads its answer here, and this is the one place the open
-    question of ADR-0130's Slack path lives: what Slack answers a SECOND
-    ``chat.postMessage`` carrying a ``client_msg_id`` it has already accepted is
-    not measured. ``apps/worker/tests/test_live.py``'s
-    ``test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`` measures it,
-    and this function is settled from that record and nothing else. Until then
-    nothing about it is guessed: an ok answer's ts is taken as given, and an
-    error answer never reaches here, because the SDK raises ``SlackApiError``
-    out of ``_post_with_block_fallback``, the one call every create makes, and
-    the delivery is retried with the same ``delivery_id``. If the record shows
-    the duplicate answered as an error, recognizing it is this function's job,
-    reached from that call's error path, not each caller's.
+    Every create reads its answer here. On 2026-09-29, exact candidate
+    ``0b26aa3e3bd5d0663267e4393030200d88ece156`` ran
+    ``test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`` against real
+    Slack: the second ``chat.postMessage`` carrying the accepted
+    ``client_msg_id`` answered ``ok: true`` with the first message's ``ts``.
+    The thread contained one card and one fresh-key milestone. The redacted
+    durable record is above that test. An error still never reaches here,
+    because the SDK raises ``SlackApiError`` out of
+    ``_post_with_block_fallback`` and the delivery is retried under the same
+    key.
 
     ``None`` is the best-effort swallow (#708): nothing was delivered, so there
     is no ts to adopt.
