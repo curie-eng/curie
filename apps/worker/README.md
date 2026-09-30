@@ -24,9 +24,7 @@ sends as an `Authorization: Bearer` header on every ACI call to that sandbox
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
 > bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker. Per-channel
-> dev/prod bot-identity routing (the dispatcher carrying which bot was addressed)
-> is a git-flow/dispatcher refinement.
+> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
