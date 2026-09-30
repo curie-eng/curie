@@ -149,14 +149,14 @@ def assert_alert_identity_reply(case_id: str, answer: str) -> None:
         # collective or named-secondary current claims.
         current_prose = re.sub(
             r"\b(?:I )?(?:cannot|can't|do not) (?:say|confirm) "
-            r"[^.!?\n]*(?:[.!?]|$)",
+            r"both (?:refusal )?alerts (?:are|remain) (?:still )?firing now",
             "",
             authority_prose,
             flags=re.IGNORECASE,
         )
         assert not re.search(
             r"both (?:refusal )?alerts (?:are|remain) (?:still )?firing now"
-            r"|AcmeSandboxCapacityRefused (?:is|remains) "
+            r"|`?AcmeSandboxCapacityRefused`? (?:is|remains) "
             r"(?:(?:currently|still) firing|firing now)",
             current_prose,
             re.IGNORECASE,
