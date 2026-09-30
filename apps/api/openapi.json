@@ -1444,8 +1444,22 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default in Slack: the resolution-card channel's members\nare the approvers. Notification recipients never enter this policy.\n\n``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR 0183).\nEach surface reads only its own: a Slack card never reads ``emails``, and an\nemail card never reads ``users`` or ``group``.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -1478,6 +1492,20 @@
       "ApprovalApproversOut": {
         "description": "Repair-oriented read projection of the stored approver declaration.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -2344,7 +2372,7 @@
       },
       "ApprovalRequestingSurfaceTarget": {
         "additionalProperties": false,
-        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nthe requester alone (``approvers.RequesterOnly``).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
+        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nonly an address on the route's approver ``emails`` (``approvers.EmailApprovers``,\nADR 0183).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
         "properties": {
           "mode": {
             "const": "requesting_surface",

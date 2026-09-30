@@ -958,6 +958,32 @@ def _valid_notification_endpoint(endpoint: Any) -> bool:
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
+# ADR 0183: the channels whose approvals are answered from a route's approver
+# ``emails``. Only email today: the mail adapter's kind, and the API's
+# ``schemas.EMAIL_KIND``. A set rather than a comparison, because the question
+# the raise path asks is "does this channel read an email list", not "which
+# channel is this" (the reply seam stays kind-free, see test_reply_wire).
+_APPROVER_EMAIL_KINDS = frozenset({"email"})
+
+
+def _lists_approver_emails(binding: Any) -> bool:
+    """Whether a route binding lists approver email addresses (ADR 0183).
+
+    Without them, nobody can answer an approval shown in an email thread: the
+    requester is no longer admitted by default. The API validates the list's
+    entries when it is written and re-reads it at resolve time; this is only the
+    raise-time question "is there anyone at all", so it asks for a non-empty
+    list of strings and fails closed on any other shape.
+    """
+
+    if not isinstance(binding, dict):
+        return False
+    approvers = binding.get("approvers")
+    if not isinstance(approvers, dict):
+        return False
+    emails = approvers.get("emails")
+    return isinstance(emails, list) and bool(emails) and all(isinstance(e, str) for e in emails)
+
 
 def _parse_approval_targets(
     binding: Any,
@@ -7047,6 +7073,12 @@ class Kernel:
             fixed_target, notification_target = targets
             if fixed_target is not None:
                 card_kind, card_channel = fixed_target
+            elif handle.kind in _APPROVER_EMAIL_KINDS:
+                if not _lists_approver_emails(binding):
+                    await self._escalate_unanswerable_email_approval(
+                        qevent, route, agent_id, route_name
+                    )
+                    return False
             elif (
                 handle.kind != SLACK_KIND
                 and isinstance(binding, dict)
@@ -7072,6 +7104,11 @@ class Kernel:
                     failure_class="approval-approvers-unverifiable",
                 )
                 return False
+        elif handle.kind in _APPROVER_EMAIL_KINDS:
+            # ADR 0183 decision 3: a routeless approval has no binding, so no
+            # approver emails, and on email nobody else may answer it.
+            await self._escalate_unanswerable_email_approval(qevent, route, agent_id, None)
+            return False
 
         if not is_publication and self._approvals is None:
             await self._escalate(
@@ -8011,6 +8048,50 @@ class Kernel:
         text = turn_failure_reply(failure_class, message)
         logger.warning("escalating event %s: %s", qevent.event_id, text)
         await self._reply_for(qevent, route, text)
+
+    async def _escalate_unanswerable_email_approval(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        agent_id: uuid.UUID | None,
+        route_name: str | None,
+    ) -> None:
+        """Escalate an approval raised in an email thread that nobody may answer.
+
+        ADR 0183 decision 3: on email, only an address on the route's approver
+        list may answer, and there is no requester-only default. Creating the
+        approval would leave a card that can only expire, so the turn is
+        flagged for a human with the reason, as ADR-0177 decision 3 already does
+        for approvers that cannot be verified on the asking channel.
+
+        Args:
+            qevent: the turn that raised the approval.
+            route: the turn's reply route.
+            agent_id: the agent, for the log line.
+            route_name: the route the approval named, or None when routeless.
+        """
+
+        logger.warning(
+            "approval route %r has no approver emails but its card would land on an "
+            "email conversation for agent %s; escalating",
+            route_name,
+            agent_id,
+        )
+        if route_name is None:
+            why = "The run requested an approval without naming a route"
+        else:
+            why = (
+                f"The run requested approval via route {route_name!r}, which lists no "
+                "approver email addresses"
+            )
+        await self._escalate(
+            qevent,
+            route,
+            f"{why}, and on email only an address on a route's approver list may "
+            "answer; flagging for a human instead of creating an approval nobody "
+            "here can answer.",
+            failure_class="approval-no-email-approvers",
+        )
 
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))

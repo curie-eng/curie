@@ -38,17 +38,18 @@ from pydantic import ValidationError
 
 from .approvers import (
     ApproverSet,
+    EmailApprovers,
     ExplicitUsers,
     InvalidApprovers,
     MembershipVerdict,
-    RequesterOnly,
+    NoVerifiableApprovers,
     UnboundRoute,
-    answered_by_requester_only,
+    shown_off_slack,
 )
 from .config import Settings
 from .identities import slack_bot_tokens
 from .models import Approval
-from .schemas import ApprovalApprovers
+from .schemas import EMAIL_KIND, ApprovalApprovers
 from .slack_usergroups import SlackUserGroupClient
 from .usergroups import GroupMembershipSource, UserGroupLookupError
 
@@ -215,8 +216,9 @@ class SlackApproverSetSelector:
     with no binding to read is refused outright.
 
     Before any of that, a card shown in a non-Slack conversation (routeless, or
-    a route in ``requesting_surface`` mode) takes the provider-neutral
-    ``RequesterOnly`` set (ADR-0177): no Slack set can be proven there.
+    a route in ``requesting_surface`` mode) takes a provider-neutral set, since
+    no Slack set can be proven there (ADR-0177): the route's approver
+    ``emails`` on an email card, and nobody otherwise (ADR 0183).
     """
 
     def __init__(
@@ -247,19 +249,22 @@ class SlackApproverSetSelector:
             # approver set to everyone in the card's channel -- the opposite of
             # what the binding was trying to say.
             return InvalidApprovers(spec_error)
-        if answered_by_requester_only(approval, binding):
-            # ADR-0177 decision 3: the card is in a non-Slack conversation, so
-            # none of Slack's sets below can be proven there.
-            if approvers is not None:
-                # The worker escalates such a route at raise time, so this is an
-                # approvers block added while the approval pended. The operator
-                # narrowed the route to Slack users nobody on this channel can
-                # prove to be; falling back to the requester would widen it.
-                return InvalidApprovers(
-                    "route declares Slack approvers, which cannot be verified on a "
-                    f"{approval.reply_kind} conversation"
-                )
-            return RequesterOnly(approval.author, approval.reply_kind)
+        if shown_off_slack(approval, binding):
+            # ADR-0177: the card is in a non-Slack conversation, so none of
+            # Slack's sets below can be proven there. ADR 0183: an email card is
+            # answered only from the route's approver emails, and there is no
+            # requester-only fallback. A routeless approval has no binding, so
+            # no list, and admits nobody; the worker escalates it when raised.
+            if (
+                approval.reply_kind == EMAIL_KIND
+                and approvers is not None
+                and approvers.emails is not None
+            ):
+                return EmailApprovers(approvers.emails)
+            return NoVerifiableApprovers(
+                approval.reply_kind,
+                slack_declared=approvers is not None and approvers.slack_declared,
+            )
         if approvers is None:
             if approval.route and binding is None:
                 # The approval NAMED a route and there is no binding left to
@@ -285,12 +290,13 @@ class SlackApproverSetSelector:
             return ExplicitUsers(approvers.users)
         group = approvers.group
         if group is None:
-            # Unreachable via the schema, which rejects an approvers block
-            # declaring neither. Written as a branch rather than an assert so it
-            # stays a real refusal: an assert is stripped under `python -O`, and
-            # the line below would then bind a set to a group named None. A block
-            # the platform cannot make sense of denies, exactly as one that does
-            # not parse does.
+            # A Slack card whose route lists only approver ``emails`` (ADR 0183
+            # decision 4): an address is never proof on Slack, and falling back
+            # to channel membership would widen the set the operator narrowed.
+            # Also the refusal for a block declaring nothing, which the schema
+            # rejects. Written as a branch rather than an assert so it stays a
+            # real refusal: an assert is stripped under `python -O`, and the
+            # line below would then bind a set to a group named None.
             return InvalidApprovers("approvers block declares neither users nor group")
         identity = approval_token_identity(approval)
         if identity == DEFAULT_IDENTITY:

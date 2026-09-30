@@ -436,13 +436,16 @@ pub struct ApprovalNotificationTargetResponse {
 /// Who may resolve a route's approvals, mirroring the committed
 /// `ApprovalApprovers`. The API settles the precedence (`users` wins over
 /// `group`); the CLI never reorders or merges them, it forwards what was asked
-/// for and lets the one authoritative validator answer.
+/// for and lets the one authoritative validator answer. `emails` is read only
+/// for a card shown in an email thread (ADR 0183), never for a Slack card.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalApprovers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emails: Option<Vec<String>>,
 }
 
 // --- The input side of the same contract (#1072) -------------------------------
@@ -563,6 +566,8 @@ pub struct ApproversInput {
     pub group: Option<String>,
     #[serde(default)]
     pub users: Option<Vec<String>>,
+    #[serde(default)]
+    pub emails: Option<Vec<String>>,
 }
 
 impl From<ApproversInput> for ApprovalApprovers {
@@ -570,6 +575,7 @@ impl From<ApproversInput> for ApprovalApprovers {
         ApprovalApprovers {
             group: input.group,
             users: input.users,
+            emails: input.emails,
         }
     }
 }
