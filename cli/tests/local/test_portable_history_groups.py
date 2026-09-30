@@ -186,10 +186,14 @@ def native_runtime(tmp_path):
             raise RuntimeError("native fixture SDK/CLI version differs from measured pins")
         messages = data["portable"]["messages"]
         expected = _results(messages)
-        if set(expected) != {"call-acme-1", "call-acme-2", "call-acme-3"} or not all(
-            "meaningful portable evidence" in json.dumps(result)
-            and result.get("is_error") is not True
-            for result in expected.values()
+        if (
+            len(_result_blocks(messages)) != 3
+            or set(expected) != {"call-acme-1", "call-acme-2", "call-acme-3"}
+            or not all(
+                "meaningful portable evidence" in json.dumps(result)
+                and result.get("is_error") is not True
+                for result in expected.values()
+            )
         ):
             raise RuntimeError(
                 "actual MCP fixture did not return all three successful result bytes"
@@ -258,22 +262,38 @@ def _request_for(requests, text):
     raise AssertionError(f"no native provider request for {text}")
 
 
-def _results(messages):
-    return {
-        block["tool_use_id"]: block
+def _result_blocks(messages):
+    return [
+        block
         for message in messages
         if isinstance(message.get("content"), list)
         for block in message["content"]
         if block.get("type") == "tool_result"
-    }
+    ]
+
+
+def _results(messages):
+    return {block["tool_use_id"]: block for block in _result_blocks(messages)}
+
+
+def _assert_three_unique_results(messages):
+    blocks = _result_blocks(messages)
+    assert len(blocks) == 3
+    assert sorted(block["tool_use_id"] for block in blocks) == [
+        "call-acme-1",
+        "call-acme-2",
+        "call-acme-3",
+    ]
 
 
 def test_fresh_native_resume_preserves_interleaved_tool_results(native_runtime):
     proof, requests, expected = native_runtime
     assert proof["portable"]["harness_replay"] is None
     ordered = _request_for(requests, "acme resume ordered")
+    _assert_three_unique_results(ordered)
     assert _results(ordered) == expected
     grouped = _request_for(requests, "acme resume grouped")
+    _assert_three_unique_results(grouped)
     assert _results(grouped) == expected
     assert "[Tool result missing due to internal error]" not in json.dumps(grouped)
     assert proof["stripped_refusal"] and "group" in proof["stripped_refusal"].lower()
