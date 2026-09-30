@@ -584,3 +584,155 @@ class TestEveryRedRungIsFiled:
         workflow = yaml.load(NIGHTLY_YAML.read_text(), Loader=yaml.BaseLoader)
         job = workflow["jobs"]["file-failures"]
         assert (job.get("continue-on-error") or "false") == "false"
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "nightly"
+FALLBACK = "ladder job failed with no recognized error line"
+
+
+def fixture_signature(name: str) -> str:
+    log = (FIXTURES / f"{name}.log").read_text(encoding="utf-8")
+    return nightly._signature_text(log)
+
+
+EXPECTED_FIXTURE_SIGNATURES = {
+    "otel-healthy-trace-107099556729": (
+        "AssertionError: healthy trace <id> contains an ERROR span"
+    ),
+    "otel-healthy-trace-109318164125": (
+        "AssertionError: healthy trace <id> contains an ERROR span"
+    ),
+    "model-credit-108368893747": "✗ error [model-credit-exhausted]: model error",
+    # The underlying exception wins over the later health wrapper.
+    "plugin-bundle-101987301167": (
+        "curie_runner.plugin.PluginBundleError: invalid plugin bundle at "
+        "/plugin: [connectors.ambiguous_name] connectors.yaml: "
+        "connectors.mcp-receipt: `mcp-receipt` would forge a second `-mcp-` in "
+        "the object name Curie derives for this connector (`<"
+    ),
+    "cluster-claim-105441540120": (
+        "cluster: expected one exact worker claim for slack:C0LOCALDEV:<ts>, found 0"
+    ),
+    "ingestion-poll-103195302240": (
+        "exact trace failed the bounded ingestion poll: incomplete-membership (cli exit 0)"
+    ),
+    "local-eval-107550616537": "⚠ warn 0/1 passed; 1 failed",
+    "invalid-auth-109520501390": (
+        "invalid-auth rejection proof failed; product Collector auth was restored"
+    ),
+    "header-only-107694908196": (
+        "=== curie skill eval --json (the bundle's own evals/cases.json) ==="
+    ),
+    "live-skill-up-101670643725": "=== curie skill up (live model) ===",
+    "filer-105132283716": (
+        "ERROR: could not file nightly-ladder issues (CalledProcessError: "
+        "the response contains terminal escape sequences; pass "
+        "--allow-escape-sequences to output it anyway)"
+    ),
+    "deploy-failed-102796234269": ("deploying sre-bot as sre-bot: failed (failed) (<n>s)"),
+}
+
+
+class TestRealTimestampedLogs:
+    """#3011: real job logs prefix every line with a runner timestamp."""
+
+    def test_each_fixture_yields_its_specific_signature(self) -> None:
+        for name, expected in EXPECTED_FIXTURE_SIGNATURES.items():
+            assert fixture_signature(name) == expected, name
+
+    def test_no_fixture_falls_through_to_the_generic_fallback(self) -> None:
+        names = sorted(path.stem for path in FIXTURES.glob("*.log"))
+        assert len(names) == len(EXPECTED_FIXTURE_SIGNATURES) + 1
+        for name in names:
+            assert fixture_signature(name) != FALLBACK, name
+
+    def test_the_same_healthy_trace_failure_shares_one_signature_id(self) -> None:
+        jobs = [
+            {
+                "name": f"skill+local default {run}",
+                "conclusion": "failure",
+                "log": (FIXTURES / f"otel-healthy-trace-{run}.log").read_text(encoding="utf-8"),
+            }
+            for run in ("107099556729", "109318164125")
+        ]
+        signatures = nightly.extract_signatures(jobs)
+        assert len(signatures) == 1
+        first, second = (nightly.signature_id(nightly.job_signature_text(job)) for job in jobs)
+        assert first == second
+        assert signatures[0].text != FALLBACK
+
+    def test_skill_up_banner_then_a_later_assertion_uses_the_assertion(self) -> None:
+        log = (FIXTURES / "connector-bundle-108621212667.log").read_text(encoding="utf-8")
+        assert "=== curie skill up (fake model, offline) ===" in log
+        text = nightly._signature_text(log)
+        assertion = next(
+            line.split("Z ", 1)[1]
+            for line in log.splitlines()
+            if "AssertionError: expected a new end-to-end trace" in line
+        )
+        assert text.startswith(
+            "AssertionError: expected a new end-to-end trace after the before "
+            "snapshot; span names=["
+        )
+        assert text == " ".join(assertion.split())[: nightly._SIGNATURE_LIMIT]
+        assert len(text) == nightly._SIGNATURE_LIMIT
+
+    def test_decoys_and_post_job_lines_are_never_chosen(self) -> None:
+        decoys = (
+            "Error: refusing to",
+            "turn finalized with a reply",
+            "reply is not the fake sentinel",
+            "Process completed with exit code",
+            "Post job cleanup",
+            "exporting build record",
+            "stopping stack",
+            "dev stack stopped",
+            "volumes kept",
+            "=== teardown",
+            "cleanup: restored",
+            "git version",
+            "kubectl get",
+            "runner failed to become healthy",
+        )
+        for path in FIXTURES.glob("*.log"):
+            text = fixture_signature(path.stem)
+            for decoy in decoys:
+                assert decoy not in text, (path.stem, decoy)
+
+    def test_an_empty_log_keeps_the_generic_fallback(self) -> None:
+        assert nightly._signature_text("") == FALLBACK
+        assert nightly._signature_text("\n\n") == FALLBACK
+
+    def test_volatile_tokens_are_normalized(self) -> None:
+        log = (
+            "2026-09-23T08:27:10.0949264Z error: run "
+            "3a7ea1dc-34c9-4c37-9f4f-1dd5a0000000 at /tmp/tmp.AbC123xyZ/bundle "
+            "thread 1789693958.855760 digest deadbeefdeadbeef00\n"
+        )
+        assert nightly._signature_text(log) == (
+            "error: run <id> at /tmp/<tmp>/bundle thread <ts> digest <id>"
+        )
+
+    def test_a_changed_credit_balance_does_not_split_one_failure(self) -> None:
+        log = (FIXTURES / "model-credit-108368893747.log").read_text(encoding="utf-8")
+        assert "afford 23036" in log
+        for balance in ("22100", "999", "7"):
+            moved = log.replace("afford 23036", f"afford {balance}")
+            assert nightly._signature_text(moved) == nightly._signature_text(log)
+
+    def test_an_unclassified_cli_error_keeps_its_message(self) -> None:
+        log = "✗ error [unclassified]: model error: unknown\n"
+        assert nightly._signature_text(log) == "✗ error [unclassified]: model error: unknown"
+
+    def test_an_earlier_unrelated_exception_does_not_beat_the_final_failure(self) -> None:
+        log = (
+            "2026-09-23T08:27:10.0949264Z ValueError: expected rejection\n"
+            "2026-09-23T08:27:11.0949264Z cluster: timed out waiting for claim\n"
+        )
+        assert nightly._signature_text(log) == "cluster: timed out waiting for claim"
+
+    def test_a_step_duration_does_not_split_one_failure(self) -> None:
+        line = "2026-09-23T08:27:10.0949264Z deploying sre-bot as sre-bot: failed (failed) ({})\n"
+        fast, slow = line.format("0.1s"), line.format("12.4s")
+        assert nightly._signature_text(fast) == nightly._signature_text(slow)
+        assert "timed out at 45s" in nightly._signature_text(CLUSTER_LOG)
