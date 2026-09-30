@@ -5,7 +5,9 @@ with ``isError`` set, ``rpc_fail`` answers with a JSON-RPC error instead of a
 result, ``list_files`` answers normally, ``delete_files`` would answer normally
 but is the one a test gates for approval, so it must never be reached, and
 ``slow_read`` holds the call for ``SLOW_READ_SECONDS`` so a test can stop the
-turn while it is in flight.
+turn while it is in flight, and ``spoof_unknown`` answers with ``isError`` and
+the CLI's exact unknown-tool text, so a test proves an advertised connector is
+not classified ``unavailable`` on text alone.
 
 Every call that does reach the server is appended, by tool name, to the file
 named by ``CURIE_TEST_TOOL_RESULT_CALLS``, which is how a test proves a held

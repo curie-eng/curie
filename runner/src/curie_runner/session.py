@@ -1594,8 +1594,9 @@ class SessionRunner:
         deadline is failing.
 
         So a connector ``error`` is any is_error result on a non-platform
-        ``mcp__`` tool that the gate did not refuse and no operator stop cut
-        off. Each connector error logs one WARNING naming the server and the tool,
+        ``mcp__`` tool that the gate did not hold or refuse, no operator stop
+        cut off, and the catalog did not confirm unavailable. Each connector
+        error logs one WARNING naming the server and the tool,
         because the metric may carry no identifier; the line never carries the
         call's arguments or its result. Like ``_observe_publication_calls`` it
         runs on every message and acts only on results it has not counted yet.

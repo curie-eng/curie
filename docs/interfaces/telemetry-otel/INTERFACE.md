@@ -127,7 +127,10 @@ than an open bag of `gen_ai.*` names.
   matches result call IDs, not tool names: a same-name sibling that reached the
   connector can still be an `error`. A connector `error` covers its `isError`
   result, a JSON-RPC error, and a call the turn deadline cut off (a connector
-  that holds a call until the deadline is failing). A
+  that holds a call until the deadline is failing). Two runner-side denials
+  outside the approval gate still count as a connector `error`: a bundle's own
+  PreToolUse deny, and the connector exclusion deny for a connector whose
+  startup probe failed (#3580 tracks keying them by call ID). A
   connector that reports failure inside a success-shaped payload counts as `success`.
   The metric carries no connector or tool name, so each connector `error` also logs one
   WARNING naming the server and the tool, never the call's arguments or its result.
