@@ -3522,3 +3522,144 @@ tests:
       - eval_time: 16m
         alertname: CurieHistoryPersistenceFailed
         exp_alerts: []
+
+  # These are per DaemonSet pod. The pinned Alloy image exposes source metrics
+  # with component_id/component_path (and read path), but write metrics with
+  # component_id/component_path/host/tenant. Prometheus adds pod/namespace/node.
+  - name: zero file source pages only the broken Alloy pod
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b"}'
+        values: '1x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '0x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '2x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-broken
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: missing source gauge pages but failed scrape does not
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-no-files",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-down",node="node-b"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-no-files
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: quiet attached collector does not page
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a"}'
+        values: '1x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '1x25'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/quiet.log"}'
+        values: '0x25'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts: []
+
+  - name: fresh reads with zero writes page only the broken pod
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a"}'
+        values: '1x31'
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b"}'
+        values: '1x31'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '0+1x30'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/b.log"}'
+        values: '0+1x30'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0x31'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-broken
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+
+  - name: first positive read counter with absent write counter pages
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-new",node="node-a"}'
+        values: '1x31'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-new",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '_x15 5x16'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-new
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+
+  - name: old flat read counter stays quiet without write counter
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-old",node="node-a"}'
+        values: '1x41'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-old",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '5x41'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts: []
