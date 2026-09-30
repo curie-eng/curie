@@ -218,7 +218,45 @@ ladder_compose() {
   for f in "${COMPOSE_FILES[@]}"; do
     args+=(-f "$f")
   done
+  # `curie local up` stores this project's random API key and Postgres password
+  # (#3557) and hands them to compose; a raw recreate here would otherwise fall
+  # back to compose.dev.yaml's curie-dev-key / postgres and split the stack from
+  # its own database and callers. Prefix them on this one child only, never
+  # exported, so they cannot reach the cluster rung. No store file means a
+  # pre-store stack, where the compose fallbacks are correct.
+  local store
+  store="$(local_store_path)"
+  if [[ -f "$store" ]]; then
+    local vals
+    vals="$(read_local_store_fields api_key postgres_password)" || {
+      echo "local: could not read the stored credentials for compose project ${COMPOSE_PROJECT}." >&2
+      echo "fix: repair or remove ${store}, then re-run." >&2
+      return 1
+    }
+    local key pw
+    key="$(sed -n 1p <<<"$vals")"
+    pw="$(sed -n 2p <<<"$vals")"
+    # Subshell export, not `env VAR=...`: argv is visible in the process list.
+    (
+      if [[ -n "$key" ]]; then export CURIE_LOCAL_API_KEY="$key"; fi
+      if [[ -n "$pw" ]]; then export CURIE_LOCAL_POSTGRES_PASSWORD="$pw"; fi
+      "${args[@]}" "$@"
+    )
+    return
+  fi
   "${args[@]}" "$@"
+}
+# Path of the credential store `curie local up` writes for this compose project.
+local_store_path() {
+  echo "${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT}.json"
+}
+# Print the named store fields, one per line (empty line when absent), read by
+# python so values never reach a log. Fails when the store is unreadable.
+read_local_store_fields() {
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2:]:
+    print(d.get(k) or "")' "$(local_store_path)" "$@" 2>/dev/null
 }
 PROMPT="What is the weather in Denver right now?"
 # The live approval-gate case's turn (#2094). Deliberately explicit and
@@ -327,10 +365,11 @@ adopt_stored_local_api_key() {
     if [[ -n "${CURIE_API_KEY:-}" ]]; then
         return 0
     fi
-    local store="${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT}.json"
+    local store
+    store="$(local_store_path)"
     [[ -f "$store" ]] || return 0
     local stored
-    stored="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("api_key") or "")' "$store")" || {
+    stored="$(read_local_store_fields api_key)" || {
         echo "local: could not read the stored API key for compose project ${COMPOSE_PROJECT}." >&2
         echo "fix: export CURIE_API_KEY with the reused stack's key, then re-run." >&2
         return 1
