@@ -54,6 +54,7 @@ fn deploy_response(req: &support::Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => Response::json(200, &json!([agent_json()]).to_string()),
         ("POST", "/agents") => Response::json(201, &agent_json().to_string()),
+        ("GET", "/deployments?agent_id=agent-acme-bot") => Response::json(200, "[]"),
         ("POST", path) if path.ends_with("/versions") => Response::json(
             201,
             &json!({
