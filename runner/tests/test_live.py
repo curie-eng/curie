@@ -1654,12 +1654,73 @@ _COMPOUND_MEMORY_REQUEST = (
     " Thursday standup runs long, but don't repeat that to anyone."
 )
 
-# A reply claiming the instruction was kept. Small and loose on purpose, so a
-# rewording of the same claim still counts as one.
+# An affirmative claim that something was kept. Only first-person or passive
+# "it is saved" forms count, so an honest refusal ("I can't save that", "Nothing
+# was saved", "I won't remember this across channels") is not read as a claim, and
+# neither is a bare mention of the ``remember`` tool (review M3).
 _SAVE_CLAIM = re.compile(
-    r"\bnoted\b|\bsaved\b|\bremember|standing instruction|from now on,? i(?:'ll| will)\b",
+    r"\bi(?:'ve|’ve| have)\s+(?:saved|noted|stored|recorded|remembered)\b"
+    r"|\bi(?:'ll|’ll| will)\s+remember\b"
+    r"|\bfrom now on,?\s+i(?:'ll|’ll| will)\b"
+    r"|\b(?:saved|noted|stored|recorded)\s+(?:that|this|it)\b"
+    r"|\b(?:it|that|this)(?:'s|’s| is| has been)\s+(?:now\s+)?(?:saved|stored)\b",
     re.IGNORECASE,
 )
+# A negation in the same clause just before a match turns it into a refusal:
+# "I haven't saved that", "I have not saved it".
+_NEGATION = re.compile(
+    r"\b(?:not|never|nothing|no|unable|cannot)\b|n't|n’t",
+    re.IGNORECASE,
+)
+_NEGATION_WINDOW = 25
+
+
+def _save_claim(reply: str) -> str | None:
+    """The first affirmative save claim in ``reply``, or None when it makes none."""
+    for match in _SAVE_CLAIM.finditer(reply):
+        before = reply[max(0, match.start() - _NEGATION_WINDOW) : match.start()]
+        # Only the clause the match sits in: a negation before a comma or a full
+        # stop belongs to something else ("No problem, I've saved it").
+        clause = re.split(r"[.,;:!?]", before)[-1]
+        if not _NEGATION.search(clause):
+            return match.group(0)
+    return None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Noted that as a standing instruction.",
+        "I've saved that to channel memory.",
+        "I have stored this as a standing instruction.",
+        "I'll remember that from now on.",
+        "From now on, I'll sign every reply.",
+        "Done, it's saved.",
+        "No problem, I've saved it.",
+    ],
+)
+def test_save_claim_detects_an_affirmative_claim(reply: str) -> None:
+    assert _save_claim(reply) is not None, reply
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I can't save that.",
+        "I cannot save that for every channel.",
+        "That was not saved.",
+        "Nothing was saved.",
+        "I didn't save anything.",
+        "I won't remember this across channels.",
+        "I haven't saved that yet.",
+        "I have not saved it.",
+        "I can't set a standing instruction for every channel.",
+        "Noted, but I couldn't save it.",
+        "You can ask me to call remember later.",
+    ],
+)
+def test_save_claim_ignores_refusals_and_negations(reply: str) -> None:
+    assert _save_claim(reply) is None, reply
 
 
 @pytest.mark.skipif(
@@ -1729,14 +1790,21 @@ def test_live_compound_request_saves_or_does_not_claim_to() -> None:
     final = events[-1]
     assert final.type == "final"
     reply = final.text or "".join(e.text for e in events if e.type == "text_delta")
-    writes = channel_store.writes + agent_store.writes
-    stored = {**channel_store.facts, **agent_store.facts}
-    claim = _SAVE_CLAIM.search(reply)
+    # The guidance forbids agent-memory writes, so one is a failure on every run,
+    # whatever the reply says (review L1).
+    assert agent_store.writes == [], (
+        f"the turn wrote to agent memory, which the guidance forbids: "
+        f"{agent_store.writes!r}; reply: {reply!r}"
+    )
+    claim = _save_claim(reply)
     if claim is None:
         # No claim, so nothing is owed; the turn simply did not say it saved.
         return
-    assert writes, (
-        f"the reply claims a save ({claim.group(0)!r}) but no remember/update call "
-        f"reached the store: {reply!r}"
+    # Only a channel-memory write counts as the save.
+    assert channel_store.writes, (
+        f"the reply claims a save ({claim!r}) but no remember/update call "
+        f"reached channel memory: {reply!r}"
     )
-    assert stored, f"the reply claims a save but the store holds no fact: {reply!r}"
+    assert channel_store.facts, (
+        f"the reply claims a save but channel memory holds no fact: {reply!r}"
+    )

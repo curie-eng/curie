@@ -751,6 +751,69 @@ def test_remember_description_says_it_is_the_only_way_to_keep_something(
     assert "standing instruction" in lowered, description
 
 
+def test_remember_description_names_update_as_the_other_way_to_keep_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L2: "the only way" must not leave out ``update``, or the model may
+    # read it literally and add a duplicate fact instead of changing the one
+    # that exists. The guidance already says "a remember or update call".
+    options, _prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
+    description = _published_descriptions(options)[REMEMBER]
+    assert re.search(r"\bupdate\b", description, re.IGNORECASE), description
+
+
+def _save_paragraph() -> str:
+    """The paragraph of the default guidance that says when to call remember."""
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    paragraphs = [p for p in DEFAULT_GUIDANCE.split("\n\n") if "standing instruction" in p]
+    assert len(paragraphs) == 1, DEFAULT_GUIDANCE
+    return paragraphs[0]
+
+
+def test_save_paragraph_sends_standing_instructions_to_channel_memory() -> None:
+    # Review M1: the paragraph must name channel memory as where a standing
+    # instruction or "make it stick" request goes. Without it, a request to apply
+    # something "in every channel" pulls the model toward agent memory, which
+    # the guidance says not to write.
+    paragraph = _save_paragraph()
+    assert "channel memory" in paragraph.lower(), paragraph
+
+
+def test_save_paragraph_says_a_cross_channel_request_only_applies_here() -> None:
+    # Review M1: for a request to apply everywhere, the agent saves to channel
+    # memory and tells the person it only applies in this channel. Pinned as
+    # "only", then "this channel" or "here", in one sentence of the paragraph.
+    paragraph = _save_paragraph()
+    only_here = re.compile(r"\bonly\b[^.]*\b(?:this channel|here)\b", re.IGNORECASE)
+    assert any(only_here.search(s) for s in _sentences(paragraph)), paragraph
+
+
+def test_default_guidance_still_says_not_to_save_to_agent_memory() -> None:
+    # The M1 fix must not drop or soften the agent-memory ban.
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    assert "Agent memory: don't save anything here." in DEFAULT_GUIDANCE, DEFAULT_GUIDANCE
+
+
+# Review M2: the call-remember rule must be conditioned on the don't-save list
+# above it, not override it ("remember my API key" must not win). The pinned
+# phrase is one of "worth keeping", "allowed above" or "guidance allows", in the
+# same sentence as "remember". Any of the three ties the rule back to what the
+# guidance permits; the short alternation keeps the test from dictating prose.
+_ALLOWED_BY_GUIDANCE = re.compile(r"worth keeping|allowed above|guidance allows", re.IGNORECASE)
+
+
+def test_save_paragraph_limits_the_remember_call_to_what_the_guidance_allows() -> None:
+    paragraph = _save_paragraph()
+    tied = [
+        s
+        for s in _sentences(paragraph)
+        if "remember" in s.lower() and _ALLOWED_BY_GUIDANCE.search(s)
+    ]
+    assert tied, paragraph
+
+
 # --------------------------------------------------------------------------- #
 # 3. The toolPolicy exemption set
 # --------------------------------------------------------------------------- #
