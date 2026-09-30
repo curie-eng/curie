@@ -117,6 +117,10 @@ class FakeSlack:
 class FakeHook:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.capability_checks = 0
+
+    def verify_target_capability(self) -> None:
+        self.capability_checks += 1
 
     def deliver(
         self,
@@ -844,6 +848,7 @@ def test_scanner_waits_through_throttling_readiness_expires_and_recovers(
     with pytest.raises(KeyboardInterrupt):
         intake.main()
 
+    assert hook.capability_checks == 1
     assert sleeps == [60.0, 180.0, 60.0]
     assert ready == [True, False, True]
     assert health.snapshot() == (1790706540.0, 2)
@@ -852,3 +857,172 @@ def test_scanner_waits_through_throttling_readiness_expires_and_recovers(
         ("history", "1790700000.000000"),
         ("history", "1790705280.000000"),
     ]
+
+
+@pytest.mark.parametrize(
+    "name", ["POLL_SECONDS", "PLACEHOLDER_STALE_SECONDS", "HTTP_TIMEOUT_SECONDS"]
+)
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+# @spec SRE-EMAIL-3
+def test_config_rejects_nonfinite_timing(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    env(monkeypatch)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        intake.Config.from_env()
+
+
+@pytest.mark.parametrize("name", ["SLACK_SCAN_NOT_BEFORE", "SLACK_CANARY_THREAD_TS"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-1"])
+# @spec SRE-EMAIL-1
+def test_config_rejects_nonfinite_or_negative_timestamp_bounds(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    env(monkeypatch)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        intake.Config.from_env()
+
+
+def hook_schema(parameters: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Curie API", "version": "test"},
+        "paths": {"/hooks/{agent_id}/{hook}": {"post": {"parameters": parameters}}},
+    }
+
+
+# @spec SRE-EMAIL-2
+def test_target_capability_uses_a_read_only_prefixed_openapi_request(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env(monkeypatch)
+    monkeypatch.setenv(
+        "CURIE_HOOK_URL", "https://api.example.com/prefix/hooks/acme/email-alert?adapter=slack"
+    )
+    requests: list[urllib.request.Request] = []
+    timeouts: list[float] = []
+
+    def send(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
+        requests.append(request)
+        timeouts.append(timeout)
+        return 200, json.dumps(
+            hook_schema(
+                [
+                    {"name": "conversation_id", "in": "query"},
+                    {"name": "placeholder", "in": "query"},
+                ]
+            )
+        ).encode()
+
+    client = intake.CurieHookClient(intake.Config.from_env(), send=send)
+    client.verify_target_capability()
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.full_url == "https://api.example.com/prefix/openapi.json"
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert request.header_items() == []
+    assert timeouts == [30.0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        hook_schema([]),
+        hook_schema([{"name": "conversation_id", "in": "query"}]),
+        hook_schema([{"name": "placeholder", "in": "query"}]),
+        hook_schema(
+            [{"name": "conversation_id", "in": "path"}, {"name": "placeholder", "in": "query"}]
+        ),
+        hook_schema(
+            [{"name": "conversation_id", "in": "query"}, {"name": "placeholder", "in": "body"}]
+        ),
+        {
+            "paths": {
+                "/different": {
+                    "post": {
+                        "parameters": [
+                            {"name": "conversation_id", "in": "query"},
+                            {"name": "placeholder", "in": "query"},
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "paths": {
+                "/hooks/{agent_id}/{hook}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "conversation_id", "in": "query"},
+                            {"name": "placeholder", "in": "query"},
+                        ]
+                    }
+                }
+            }
+        },
+        {"paths": []},
+        [],
+        None,
+    ],
+)
+# @spec SRE-EMAIL-2
+def test_target_capability_denies_missing_or_wrong_query_contract(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, payload: Any
+) -> None:
+    env(monkeypatch)
+    client = intake.CurieHookClient(
+        intake.Config.from_env(), send=lambda *_args: (200, json.dumps(payload).encode())
+    )
+    with pytest.raises(RuntimeError):
+        client.verify_target_capability()
+
+
+@pytest.mark.parametrize(
+    "status,body", [(404, b"{}"), (202, b"{}"), (500, b"{}"), (200, b"not json")]
+)
+# @spec SRE-EMAIL-2
+def test_target_capability_denies_http_failures_and_malformed_document(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, status: int, body: bytes
+) -> None:
+    env(monkeypatch)
+    client = intake.CurieHookClient(intake.Config.from_env(), send=lambda *_args: (status, body))
+    with pytest.raises(RuntimeError):
+        client.verify_target_capability()
+
+
+# @spec SRE-EMAIL-2
+def test_main_denies_unsupported_api_before_any_slack_or_hook_side_effect(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env(monkeypatch)
+    slack = FakeSlack([root()])
+    hook = FakeHook()
+
+    def deny() -> None:
+        raise RuntimeError("target capability denied")
+
+    def forbidden_slack() -> str:
+        slack.calls.append(("forbidden", ""))
+        raise RuntimeError("Slack reached before capability check")
+
+    hook.verify_target_capability = deny  # type: ignore[method-assign]
+    slack.bot_user_id = forbidden_slack  # type: ignore[method-assign]
+    monkeypatch.setattr(intake, "SlackClient", lambda _config: slack)
+    monkeypatch.setattr(intake, "CurieHookClient", lambda _config: hook)
+    monkeypatch.setattr(
+        intake, "ThreadingHTTPServer", lambda *_args: SimpleNamespace(serve_forever=lambda: None)
+    )
+    monkeypatch.setattr(
+        intake.threading, "Thread", lambda **_kwargs: SimpleNamespace(start=lambda: None)
+    )
+
+    with pytest.raises(RuntimeError, match="target capability denied"):
+        intake.main()
+
+    assert slack.calls == []
+    assert slack.posts == []
+    assert hook.calls == []
