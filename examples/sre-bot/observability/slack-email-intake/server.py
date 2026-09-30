@@ -378,9 +378,23 @@ class SlackClient:
 Sender = Callable[[urllib.request.Request, float], tuple[int, bytes]]
 
 
+class CapabilityRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """A schema from another URL cannot attest to the configured hook route."""
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
 def _send(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        open_request = (
+            urllib.request.build_opener(CapabilityRedirectHandler()).open
+            if request.get_method() == "GET"
+            else urllib.request.urlopen
+        )
+        with open_request(request, timeout=timeout) as response:
             return response.status, bytes(response.read())
     except urllib.error.HTTPError as exc:
         return exc.code, bytes(exc.read())
