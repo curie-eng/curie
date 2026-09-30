@@ -106,6 +106,22 @@ def test_bash_prelude_unsets_platform_credentials_before_the_command() -> None:
         assert sentinel not in rendered
 
 
+def test_an_env_override_cannot_restore_a_declared_provider_credential() -> None:
+    source = {
+        "PATH": "/usr/bin",
+        "CURIE_MODEL_ENV_KEY": "ACME_PROVIDER_KEY",
+        "ACME_PROVIDER_KEY": "provider-sentinel",
+    }
+
+    hidden = shell_and_hook_env(source, extra={"CURIE_MODEL_ENV_KEY": ""})
+    renamed = shell_and_hook_env(source, extra={"CURIE_MODEL_ENV_KEY": "OTHER_KEY"})
+
+    assert "ACME_PROVIDER_KEY" not in hidden
+    assert "provider-sentinel" not in hidden.values()
+    assert "ACME_PROVIDER_KEY" not in renamed
+    assert "provider-sentinel" not in renamed.values()
+
+
 def test_a_declared_provider_credential_name_is_not_a_shell_variable() -> None:
     source = {
         "PATH": "/usr/bin",

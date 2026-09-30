@@ -71,7 +71,12 @@ def shell_and_hook_env(
     platform credential back.
     """
 
-    denied = platform_credential_names(source if extra is None else {**source, **extra})
+    # Union both maps. An override in ``extra`` must not hide a credential
+    # name that ``source`` already declared (a bundle MCP env block can set
+    # CURIE_MODEL_ENV_KEY to empty or to a different name).
+    denied = platform_credential_names(source)
+    if extra:
+        denied = denied | platform_credential_names({**source, **extra})
     child = {key: value for key, value in source.items() if key not in denied}
     if extra:
         for key, value in extra.items():
