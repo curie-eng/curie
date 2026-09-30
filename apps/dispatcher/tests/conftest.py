@@ -66,6 +66,22 @@ def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def person_rooted_thread(**kwargs: Any) -> dict[str, Any]:
+    """Slack's ``conversations.replies`` answer for a thread a person started.
+
+    A threaded mention may look up its thread's root (spec
+    slack-alert-followup-context), so a harness built on a real ``WebClient``
+    answers that call here instead of reaching Slack. The parent message comes
+    first (https://docs.slack.dev/reference/methods/conversations.replies/),
+    and a person's root never belongs to the bot, so the turn is unchanged.
+    """
+    return {
+        "ok": True,
+        "messages": [{"ts": kwargs["ts"], "user": "U0PERSON", "text": "A person's root."}],
+        "has_more": False,
+    }
+
+
 class _TestTelemetry:
     """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
 
@@ -267,10 +283,15 @@ def config(
         approval_chat_attester_secret="dispatcher-attester-test-secret",
         api_base_url=admission_api.url,
         admission_cache_prefix=f"test:curie:admission:{token}:",
+        # Every threaded mention may consult the root-context cache, so every
+        # test gets its own prefix: tests reuse the same example channel, bot
+        # and timestamps, and must never read each other's cached roots.
+        thread_context_cache_prefix=f"test:curie:thread-context:{token}:",
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))
     keys.extend(redis_client.scan_iter(f"test:curie:admission:{token}:*"))
+    keys.extend(redis_client.scan_iter(f"test:curie:thread-context:{token}:*"))
     keys.append(cfg.stream)
     if keys:
         redis_client.delete(*keys)

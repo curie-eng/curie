@@ -11,6 +11,10 @@ summary.
   the worker (`apps/worker`). If you find yourself adding any
   decision about *how* a message gets answered, that decision belongs one
   layer up -- stop and move it, don't grow the dispatcher's scope.
+  Normalizing *what was said* is in scope: `derive_text`, the self-mention
+  strip, attachment refs, and the quoted root of a thread this bot started
+  (`thread_context.py`), which is read after the claim, never raises, and
+  never changes the turn's identity or authority.
 - **Caller admission is asked, never decided, here (ADR 0175).** Every
   turn-starting lane asks the platform API (`admission.AdmissionGate`) after its
   own filters and BEFORE the dedupe claim, so a refused caller gets no

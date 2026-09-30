@@ -76,6 +76,13 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
   Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
   the delivery arrived on (ADR-0168 decisions 2 and 3).
+  Its `text` is the person's message, except in a thread whose root this bot
+  posted: there the root is quoted ahead of it as untrusted context inside a
+  `<prior_assistant_reply>` block
+  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
+  with root slashes neutralized as XML entities so repository-looking alert
+  text stays inert even to an older worker's raw repository parser during a
+  rolling upgrade.
 
   **Named relay identity contract (INGRESS-CANARY-1).** A disconnected cluster
   message may use `adapter=curie-cluster-message` to select reply delivery and
