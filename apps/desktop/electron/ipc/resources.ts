@@ -340,7 +340,10 @@ export async function sampleDocker(): Promise<{ samples: ResourceSample[]; error
         name.startsWith("curie") || /curie/.test(project) || /curie/.test(row.Image ?? "");
       if (!mine) continue;
 
-      const stat = stats.get(name);
+      // ps and stats are separate snapshots; a container can stop between them.
+      // Docker also returns zeroed stats for some non-running states. Only a
+      // running identity can make the sampled measurements meaningful.
+      const stat = row.State === "running" ? stats.get(name) : undefined;
       const [memBytes, memLimitBytes] = parsePair(stat?.MemUsage);
       const [netRxBytes, netTxBytes] = parsePair(stat?.NetIO);
       const [blockReadBytes, blockWriteBytes] = parsePair(stat?.BlockIO);
@@ -356,8 +359,7 @@ export async function sampleDocker(): Promise<{ samples: ResourceSample[]; error
         state: row.State ?? "unknown",
         health: parseHealth(row.Status),
         exitCode: parseExitCode(row.Status),
-        // A stopped container has no stats row at all; null (rendered as a dash)
-        // is the honest answer, not 0.
+        // A non-running container has no live measurement; render a dash.
         cpuPercent: stat ? parsePercent(stat.CPUPerc) : null,
         memBytes,
         memLimitBytes,
