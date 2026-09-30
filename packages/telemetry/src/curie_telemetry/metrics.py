@@ -329,6 +329,9 @@ _HTTP_OPERATIONS = [
     "/observability/metrics/summary",
     "/observability/runners",
     "/observability/runners/{namespace}/{pod}/logs",
+    # Provider installation admin CRUD (#2909).
+    "/provider-installations",
+    "/provider-installations/{installation_id}",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

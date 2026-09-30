@@ -1221,6 +1221,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -1284,7 +1286,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4560
+      "cardinality_bound": 4640
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1369,6 +1371,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -1432,7 +1436,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4560
+      "cardinality_bound": 4640
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1517,6 +1521,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -1573,7 +1579,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 912
+      "cardinality_bound": 928
     },
     "curie.background.loop": {
       "type": "counter",
