@@ -70,7 +70,7 @@
 ### Task 3: Verify the installer slice and hand it to the alert slice
 
 **Files:**
-- Modify: `.projects/plans/codex-fix-1912-observability-portability.state.json` (ignored run evidence only)
+- Modify: the run's ignored state record (run evidence only, not committed; the pull request carries the evidence)
 
 **Interfaces:**
 - Consumes Task 1 runtime variants and Task 2 diagnostics; produces no product API.

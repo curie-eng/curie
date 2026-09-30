@@ -34,7 +34,7 @@
 ### Task 1: Confirm the pinned metric and scrape contracts
 
 **Files:**
-- Create: `.projects/plans/codex-fix-1912-observability-portability.alloy-probe.md` (ignored experimental evidence) <!-- doclint:ignore-line -->
+- Create: the run's ignored probe record (experimental evidence, not committed)
 - Modify: `examples/sre-bot/observability/alloy-values.yaml`
 - Modify: `charts/curie/ci/observability-stack-assertions.sh`
 
@@ -66,7 +66,7 @@
 ### Task 3: Verify real collection and review the full #1912 diff
 
 **Files:**
-- Modify: `.projects/plans/codex-fix-1912-observability-portability.state.json` (ignored run evidence)
+- Modify: the run's ignored state record (run evidence, not committed; the pull request carries the evidence)
 
 **Interfaces:**
 - Consumes Tasks 1 and 2 and the installer plan; produces no product API.
