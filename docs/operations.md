@@ -1034,6 +1034,17 @@ list. Admission, acquire, start, heartbeat, finish, and termination are internal
 worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
 publishes execute and terminate wakes onto `curie:runs`.
 
+Reconciler steps fail independently: each failure logs the step and traceback,
+and execute wakes continue despite an unrelated step failure. OpenTelemetry
+records the `curie.work_item.reconciler.step.failure` counter and
+`curie.work_item.reconciler.step.consecutive_failures` gauge with
+`service.name=curie-api` and a `step` attribute drawn from a fixed set of labels.
+The gauge increments for each consecutive failing pass, resets to zero after a
+successful pass for that step, and starts fresh when the API process restarts.
+For example, configure an alert in your metrics backend when a step's gauge is
+`>= 3`. This alert is not installed automatically; the default metrics exporter
+is `nop`, so an explicit metrics backend may be needed.
+
 The knobs are `CURIE_WORK_ITEM_*` on the API (settable through `api.extraEnv`
 until chart-owned values land):
 
