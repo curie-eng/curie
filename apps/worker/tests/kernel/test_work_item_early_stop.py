@@ -477,6 +477,49 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
     asyncio.run(exercise())
 
 
+def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3617: the API's refusal code and message reach run.finish as the detail."""
+
+    from curie_worker.approvals import ApprovalBackendError
+
+    code = "publication.required_python_ci_unselected"
+    message = "required Python CI does not select unitconv/convert.py"
+
+    class RefusedPublicationApi(_PublicationApi):
+        async def create_publication(self, request: object) -> object:
+            self.creates.append(request)
+            error = ApprovalBackendError(f"publication create failed: HTTP 409: {message}")
+            error.refusal = f"{code}: {message}"
+            raise error
+
+    async def exercise() -> None:
+        publications = RefusedPublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            assert finish["outcome"] == "failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert code in detail
+            assert message in detail
+
+    asyncio.run(exercise())
+
+
 # --- W4: bounded to one ------------------------------------------------------------
 
 

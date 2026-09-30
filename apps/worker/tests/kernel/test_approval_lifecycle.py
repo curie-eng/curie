@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import aiohttp
 import httpx
@@ -1965,6 +1966,91 @@ def test_publication_create_workspace_409_is_a_terminal_refusal(message: str) ->
         assert excinfo.value.public_detail == message
 
     asyncio.run(go())
+
+
+def _refusal_publication_request() -> PublicationCreateRequest:
+    return PublicationCreateRequest(
+        deployment_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        conversation_id="slack:C0EXAMPLE1:1700000000.000100",
+        repo_full_name="acme-corp/acme-private",
+        author="U0REQUEST1",
+        summary="Publish the bounded change",
+        reply_kind="slack",
+        reply_channel="C0EXAMPLE1",
+        reply_placeholder="1700000000.000001",
+        reply_endpoint=None,
+        reply_adapter=None,
+        dedupe_key="publication-example",
+        base_sha="a" * 40,
+        patch=b"diff --git a/unitconv/convert.py b/unitconv/convert.py\n",
+        changed_paths=("unitconv/convert.py",),
+        expires_in_seconds=600,
+        title="Update converter",
+        body="Approved platform publication.",
+    )
+
+
+async def _create_publication_error(response: httpx.Response) -> Any:
+    from curie_worker.approvals import ApprovalBackendError
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: response)
+    ) as http:
+        client = ApprovalClient(
+            api_base_url="https://api.example.test",
+            api_key="",
+            client=http,
+            read_timeout_s=1.0,
+            worker_token="worker-test-token",
+        )
+        with pytest.raises(ApprovalBackendError) as excinfo:
+            await client.create_publication(_refusal_publication_request())
+    return excinfo.value
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (
+            409,
+            "publication.required_python_ci_unselected",
+            "required Python CI does not select unitconv/convert.py",
+        ),
+        (
+            409,
+            "publication.verification_preflight_missing",
+            "verification preflight observation is missing",
+        ),
+        (422, "publication.patch_too_large", "patch exceeds the limit"),
+    ],
+)
+def test_a_coded_publication_refusal_carries_its_code_and_message(
+    status: int, code: str, message: str
+) -> None:
+    """#3617: the API's refusal reaches the factory run instead of a generic cause."""
+
+    error = asyncio.run(
+        _create_publication_error(
+            httpx.Response(status, json={"detail": {"code": code, "message": message}})
+        )
+    )
+
+    assert error.refusal == f"{code}: {message}"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, text="internal error"),
+        httpx.Response(409, json={"detail": "some other conflict"}),
+        httpx.Response(409, json={"detail": {"code": 7, "message": "not a code"}}),
+    ],
+    ids=["plain-500", "string-detail", "non-string-code"],
+)
+def test_an_uncoded_publication_failure_has_no_refusal(response: httpx.Response) -> None:
+    error = asyncio.run(_create_publication_error(response))
+
+    assert error.refusal is None
 
 
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:

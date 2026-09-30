@@ -122,7 +122,24 @@ def test_a_provider_cause_still_labels_a_provider_message() -> None:
 
 def test_approval_create_failure_has_plain_terminal_issue_notice() -> None:
     body = result_section("approval_create_failed", pr_url=None)
-    assert body.startswith("Could not complete: the requested approval could not be created.")
+    assert body.startswith("Could not complete: ")
+    # #3617: the cause is a refused publication request, not a generic approval
+    # failure, and the notice points at the details line.
+    assert "the requested approval could not be created" not in body
+    assert "publication" in body.casefold()
+    assert body.endswith("Cause: approval_create_failed\n")
+    assert "```" not in body
+
+
+def test_approval_create_failure_renders_the_refusal_as_details() -> None:
+    refusal = (
+        "publication.required_python_ci_unselected: "
+        "required Python CI does not select unitconv/convert.py"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+    assert f"Details: {refusal}\n" in body
+    assert "Provider message" not in body
+    assert "the requested approval could not be created" not in body
     assert body.endswith("Cause: approval_create_failed\n")
     assert "```" not in body
 
