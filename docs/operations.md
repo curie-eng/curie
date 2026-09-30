@@ -670,7 +670,7 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | Flag / env var | What it does |
 |---|---|
 | `--plugin-dir <dir>` | The bundle directory to package and push. |
-| `--repo <owner/name>` | Bind this agent to a GitHub repo so pushes deploy it; set only on the deploy that creates the agent and unchangeable after. Omit it and the agent can never use git-flow. |
+| `--repo <owner/name>` | Bind this agent to a GitHub repo so pushes can deploy it. A later deploy can bind an unbound agent; it refuses to replace an existing different binding. The API can change the binding with `PATCH /agents/{id}`. |
 | `--api-url <url>` / `CURIE_API_URL` | Direct-dial this URL instead of self-plumbing a loopback tunnel. |
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
 | `--api-local-port <port>` | Local end of the self-plumbed tunnel. Default `0` lets the kernel assign an ephemeral port, so two deploys never fight over the same one. |
@@ -722,21 +722,47 @@ deployed.
 Four things need to be true for a push over the webhook path to actually
 promote:
 
-1. **The agent's repo is set.** (This applies to both delivery paths --
-   commit polling still needs to know which repo to pull.) The webhook resolves which agent a push
-   belongs to by matching the payload's `repo.full_name` (owner/name)
-   against that agent's `repo_full_name`. This field is set when the
-   agent is created (`curie <tier> deploy --repo owner/name`, or the
-   Curie API), and a later `curie <tier> deploy --repo owner/name` binds
-   an agent that has none yet. If the agent is already bound to a
-   different repository, the deploy declines to rebind it and prints a
-   warning naming the repository it kept, so `--repo` never silently
-   reroutes which repository's pushes deploy an agent. The match is
-   case sensitive, so the stored `repo_full_name` must match GitHub's
-   canonical owner and repository casing exactly, or the lookup finds
-   no agent, the push is silently ignored, and (unlike a rejection)
-   nothing is logged, so the only symptom is a green delivery in GitHub
-   with nothing deployed.
+1. **The agent's repo and bundle targets agree.** This applies to both
+   delivery paths. The API finds candidate agents by matching the payload's
+   `repository.full_name` against their `repo_full_name`, with exact casing.
+   Create the binding with `curie <tier> deploy --repo owner/name`, or bind an
+   existing unbound agent with a later deploy. The CLI refuses to replace a
+   different binding; `PATCH /agents/{id}` can explicitly change
+   `repo_full_name`. The console does not configure that field.
+
+   The pushed bundle's `deploy.yaml` selects among those candidates. The ref
+   must be the configured dev or prod branch (defaults `dev` and `main`), and
+   exactly one target must declare that environment and name its agent:
+
+   ```yaml
+   targets:
+     development:
+       agent: acme-dev
+       env: dev
+       slack_channel: C0EXAMPLE1
+     production:
+       agent: acme-bot
+       env: prod
+       slack_channel: C0EXAMPLE2
+   ```
+
+   With both agents bound to the same repository, a push to `dev` selects
+   `acme-dev`, and a push to `main` selects `acme-bot`. Target keys are labels;
+   `env` and `agent` decide routing. If `deploy.yaml` is absent or `targets` is
+   empty, exactly one bound agent is the fallback. Several bound agents need
+   explicit targets. No bound candidate, a non-deploy branch, or a declared
+   target map with no matching environment returns `status: ignored` without
+   deploying. A declared target that cannot be resolved returns
+   `status: rejected` with one of these codes:
+
+   | Code | Cause and repair |
+   | --- | --- |
+   | `deploy.no_targets` | Several agents are bound but the bundle declares no targets. Add an explicit target for each intended environment. |
+   | `deploy.unknown_agent` | The named agent does not exist. Create it and set its repository binding. |
+   | `deploy.ambiguous_env` | Several targets name the same environment. Keep exactly one target for that environment. |
+   | `deploy.agent_bound_elsewhere` | The named agent exists but is not bound to this repository, including an unbound agent. Correct the target or explicitly set the binding through the API. |
+   | `deploy.missing_agent` | A matching declared target omits `agent`. Name the intended agent. |
+
 2. **GitHub can reach the Curie API.** Add a webhook, in the repo's GitHub
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
@@ -754,10 +780,22 @@ promote:
    trusted clone URL from `GITHUB_CLONE_BASE` (chart value
    `api.githubCloneBase`), which defaults to `https://github.com`, and
    rejects any push whose `clone_url` doesn't match with the error code
-   `git.origin_mismatch` -- the webhook still returns 200, so this fails
-   silently from GitHub's side. The default covers github.com with no extra setup; set
+   `git.origin_mismatch`. Rejected pushes still return HTTP 200; inspect the
+   response body and the API warning log rather than the delivery status alone. The default covers github.com with no extra setup; set
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
+
+Each target agent owns its own Version row for the commit SHA. Dev and prod
+versions can share one immutable stored bundle object (`bundle_ref`); they do
+not share a Version row. A dev delivery always clones, checks commit ancestry,
+archives and validates, including on redelivery. A prod delivery first looks
+for a stored bundle for the SHA across agents bound to this repository. When
+found, it reads `deploy.yaml` from that object and promotes those exact bytes
+without fetching the remote, creating the target agent's Version row if needed
+and a Deployment row. Without a stored bundle, prod clones and validates too.
+The stored-bundle prod path verifies the clone origin and SHA format but does
+not recheck remote branch ancestry. These rules apply to webhook and polling
+because both use the same push flow.
 
 ### Accepting review feedback from GitHub
 
