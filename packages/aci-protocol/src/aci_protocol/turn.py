@@ -315,10 +315,11 @@ class QueuedTurn(_AciModel):
     scheduled run identity without inventing a reply route. Every targeted turn,
     including cron, keeps the existing reply handle contract unchanged.
 
-    ``tool_access`` restricts what this one turn may execute (TOOL-ACCESS-1);
-    the worker forwards it as ``Event.tool_access`` (TOOL-ACCESS-6). It
-    defaults to ``None``, today's unrestricted turn, so a pre-upgrade producer
-    keeps decoding unchanged. No first-party ingress sets it.
+    ``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);
+    a worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,
+    and one that does not drops it. It defaults to ``None``, today's
+    unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
+    first-party ingress sets it.
     """
 
     event_id: str

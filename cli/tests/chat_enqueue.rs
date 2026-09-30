@@ -104,7 +104,7 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
             "reply_handle",
             "source",
             "text",
-            // TOOL-ACCESS-1: optional, null on every operator lane turn.
+            // TOOL-ACCESS-1: optional, and null on these unrestricted turns.
             "tool_access",
         ]
     );

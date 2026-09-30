@@ -102,9 +102,12 @@ class ToolAccess(StrEnum):
     """Which tools one turn may execute (TOOL-ACCESS-1, TOOL-ACCESS-3).
 
     Carried as ``QueuedTurn.tool_access`` and ``Event.tool_access``. Null means
-    the turn runs exactly as it always has. ``READ_ONLY`` restricts the turn to
-    tools the ACI server explicitly classifies as read-only, denies every other
-    tool before it executes, and never requests an approval.
+    the turn runs exactly as it always has. On a server that advertises it
+    under ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), ``READ_ONLY`` restricts
+    the turn to tools the server explicitly classifies as read-only, denies
+    every other tool before it executes, and never requests an approval. A
+    worker or server that does not implement the contract decodes the value and
+    drops it (TOOL-ACCESS-6).
 
     An enum, not free text (TOOL-ACCESS-2): an unknown value is refused on the
     wire, never read as null, because reading it as null would run a restricted
@@ -167,10 +170,11 @@ class Event(_AciModel):
     runner after its sandbox is bound. Both remain optional so older producers
     can omit them and tolerant consumers can adopt the additive wire shape.
 
-    ``tool_access`` restricts what this turn may execute (TOOL-ACCESS-1,
-    TOOL-ACCESS-3); null is an unrestricted turn. A producer sends it only to a
-    server that advertises the value under ``TOOL_ACCESS_STATUS_FIELD``
-    (TOOL-ACCESS-4), because a server that predates it would ignore it.
+    ``tool_access`` asks a server to restrict what this turn may execute
+    (TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent
+    only to a server that advertises the value under
+    ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does
+    not enforce it ignores it.
     """
 
     kind: Literal["event"] = "event"

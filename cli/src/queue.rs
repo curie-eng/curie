@@ -198,8 +198,8 @@ pub fn synthetic_turn(
         // for the same reason `source` is.
         attachments: Vec::new(),
         hook_run: None,
-        // An operator lane turn is an ordinary turn: it never restricts its own
-        // tool access (TOOL-ACCESS-1). Stated for the same reason `source` is.
+        // `local message` and `cluster message` send unrestricted turns; no CLI
+        // flag sets a tool access yet. Stated for the same reason `source` is.
         tool_access: None,
     }
 }
@@ -641,8 +641,7 @@ mod tests {
                 // message, so it is always "slack" on this lane.
                 "source",
                 "text",
-                // TOOL-ACCESS-1: an operator lane turn is unrestricted, so the
-                // key rides the wire as null.
+                // TOOL-ACCESS-1: optional, and null on these unrestricted turns.
                 "tool_access",
             ]
         );

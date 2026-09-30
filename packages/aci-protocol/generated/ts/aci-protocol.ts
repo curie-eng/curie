@@ -124,9 +124,12 @@ export type Text = string;
  * Which tools one turn may execute (TOOL-ACCESS-1, TOOL-ACCESS-3).
  *
  * Carried as ``QueuedTurn.tool_access`` and ``Event.tool_access``. Null means
- * the turn runs exactly as it always has. ``READ_ONLY`` restricts the turn to
- * tools the ACI server explicitly classifies as read-only, denies every other
- * tool before it executes, and never requests an approval.
+ * the turn runs exactly as it always has. On a server that advertises it
+ * under ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), ``READ_ONLY`` restricts
+ * the turn to tools the server explicitly classifies as read-only, denies
+ * every other tool before it executes, and never requests an approval. A
+ * worker or server that does not implement the contract decodes the value and
+ * drops it (TOOL-ACCESS-6).
  *
  * An enum, not free text (TOOL-ACCESS-2): an unknown value is refused on the
  * wire, never read as null, because reading it as null would run a restricted
@@ -537,10 +540,11 @@ export interface EvalReport {
  * runner after its sandbox is bound. Both remain optional so older producers
  * can omit them and tolerant consumers can adopt the additive wire shape.
  *
- * ``tool_access`` restricts what this turn may execute (TOOL-ACCESS-1,
- * TOOL-ACCESS-3); null is an unrestricted turn. A producer sends it only to a
- * server that advertises the value under ``TOOL_ACCESS_STATUS_FIELD``
- * (TOOL-ACCESS-4), because a server that predates it would ignore it.
+ * ``tool_access`` asks a server to restrict what this turn may execute
+ * (TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent
+ * only to a server that advertises the value under
+ * ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does
+ * not enforce it ignores it.
  *
  * This interface was referenced by `ACIProtocolV058`'s JSON-Schema
  * via the `definition` "Event".
@@ -773,10 +777,11 @@ export interface SideEffectFlag {
  * scheduled run identity without inventing a reply route. Every targeted turn,
  * including cron, keeps the existing reply handle contract unchanged.
  *
- * ``tool_access`` restricts what this one turn may execute (TOOL-ACCESS-1);
- * the worker forwards it as ``Event.tool_access`` (TOOL-ACCESS-6). It
- * defaults to ``None``, today's unrestricted turn, so a pre-upgrade producer
- * keeps decoding unchanged. No first-party ingress sets it.
+ * ``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);
+ * a worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,
+ * and one that does not drops it. It defaults to ``None``, today's
+ * unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
+ * first-party ingress sets it.
  *
  * This interface was referenced by `ACIProtocolV058`'s JSON-Schema
  * via the `definition` "QueuedTurn".
