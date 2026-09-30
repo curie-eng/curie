@@ -263,6 +263,15 @@ def test_notice_never_falls_back_to_another_slack_identity(
         )
         task = asyncio.create_task(consumer.run())
         try:
+            # XPENDING answers NOGROUP until the consumer has created its group,
+            # so wait for the group before polling the pending list below.
+            for _ in range(100):
+                if await valkey.exists(names["stream"]) and any(
+                    group["name"] == names["group"]
+                    for group in await valkey.xinfo_groups(names["stream"])
+                ):
+                    break
+                await asyncio.sleep(0.05)
             entry = await valkey.xadd(
                 names["stream"],
                 {
