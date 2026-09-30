@@ -758,3 +758,29 @@ def test_current_prompt_cache_cannot_override_meaningful_portable_content(tmp_pa
     ids = [m.get("id") for m in conversation if m["role"] == "assistant"]
     assert len(ids) == 3 and all(isinstance(identifier, str) and identifier for identifier in ids)
     assert len(set(ids)) == 1
+
+
+def test_incomplete_current_prompt_native_cache_rebuilds_complete_portable_prefix(tmp_path):
+    messages = (
+        ConversationMessage(role="user", content="acme request"),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "acme exact answer"}]
+        ),
+    )
+    current_prompt = "current attachment unavailable"
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(
+            {"type": "user", "uuid": "acme-incomplete-user", "message": messages[0].to_dict()},
+            {
+                "type": "attachment",
+                "attachment": {"type": "prompt_snapshot", "systemPrompt": [current_prompt]},
+            },
+        ),
+    )
+    entries = _entries(messages, tmp_path, harness_replay=checkpoint, system_prompt=current_prompt)
+    conversation = [e["message"] for e in entries if e["type"] in {"user", "assistant"}]
+    assert [(m["role"], m["content"]) for m in conversation] == [
+        (m.role, m.content) for m in messages
+    ]
