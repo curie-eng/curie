@@ -2306,16 +2306,25 @@ async def complete_action(
     state a restore is about to replay. Returned unchanged.
     """
 
-    if action.status != ActionStatus.pending:
-        return action
-    action.status = ActionStatus.failed if data.failed else ActionStatus.succeeded
-    action.result = data.result
-    action.prior_state = data.prior_state
-    action.post_state = data.post_state
-    action.target = data.target
+    values: dict[str, Any] = {
+        "status": ActionStatus.failed if data.failed else ActionStatus.succeeded,
+        "result": data.result,
+        "prior_state": data.prior_state,
+        "post_state": data.post_state,
+        "target": data.target,
+        "completed_at": datetime.now(UTC).replace(tzinfo=None),
+    }
     if data.detail is not None:
-        action.detail = data.detail
-    action.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        values["detail"] = data.detail
+    await session.execute(
+        update(AgentAction)
+        .where(AgentAction.id == action.id, AgentAction.status == ActionStatus.pending)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    # The row's current state wins even when this session loaded ``pending``
+    # before another completion committed. The SQL predicate, not the stale ORM
+    # object, decides which completion is first.
     await session.commit()
     await session.refresh(action)
     return action
@@ -2332,7 +2341,7 @@ async def list_action_audit(session: AsyncSession, action_id: uuid.UUID) -> list
 
 async def claim_action_undo(
     session: AsyncSession, action: AgentAction, *, actor: str
-) -> AgentAction:
+) -> AgentAction | None:
     """Mark the undo claimed so a second ruling cannot authorize a second restore.
 
     Claimed at ruling time rather than on completion, because nothing reports
@@ -2342,9 +2351,16 @@ async def claim_action_undo(
     one action is the worse failure of the two.
     """
 
-    action.undone_at = datetime.now(UTC).replace(tzinfo=None)
-    action.undone_by = actor
-    session.add(action)
+    result = await session.execute(
+        update(AgentAction)
+        .where(AgentAction.id == action.id, AgentAction.undone_at.is_(None))
+        .values(undone_at=datetime.now(UTC).replace(tzinfo=None), undone_by=actor)
+        .returning(AgentAction.id)
+        .execution_options(synchronize_session=False)
+    )
+    if result.scalar_one_or_none() is None:
+        return None
+    await session.refresh(action)
     return action
 
 
