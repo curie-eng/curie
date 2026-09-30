@@ -121,6 +121,7 @@ class DeployNoticeQueue:
         payload: dict[str, object],
         settings: Settings,
     ) -> int:
+        """@spec docs/operations.md#automatically-with-git-flow."""
         if result.status not in {"deployed", "promoted", "rejected"}:
             return 0
         repo = payload.get("repository")
@@ -173,7 +174,7 @@ class DeployNoticeQueue:
                 for binding in agent.channels
                 if binding.kind == "slack" and binding.adapter is not None
             )
-        if result.status == "rejected" and result.agent_id is None and recipients:
+        if result.status == "rejected" and result.agent_id is None:
             # Unmatched: it may belong to any agent the repository builds, so a
             # prod channel never hears it (docs/operations.md).
             prod = await _prod_bound_routes(
