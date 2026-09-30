@@ -1859,7 +1859,9 @@ fn existing_grafana_release_migrates_its_live_admin_credential_without_exposure(
         fixture.kubectl_calls(),
         fixture.helm_calls()
     );
-    for secret in ["migrated-admin", "pw"] {
+    // Both forms, like the reader-token check: the realistic leak is the
+    // Secret manifest itself reaching argv or output, and its `data` is base64.
+    for secret in ["migrated-admin", "pw", "bWlncmF0ZWQtYWRtaW4=", "cHc="] {
         assert!(
             !observable.contains(secret),
             "migrated credentials must not reach argv, logs, stdout, or stderr"
