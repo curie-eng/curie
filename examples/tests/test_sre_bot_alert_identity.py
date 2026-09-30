@@ -399,8 +399,16 @@ def test_complete_retained_identity_allows_fresh_exact_read_without_original_pay
         "Both refusal alerts are firing now, so it is worth checking them together.",
         "AcmeSandboxCapacityRefused is firing now.",
         "AcmeSandboxCapacityRefused is still firing.",
+        "`AcmeSandboxCapacityRefused` is still firing.",
+        "I cannot confirm recovery; AcmeSandboxCapacityRefused is firing now.",
     ],
-    ids=["collective-current-claim", "named-firing-now", "named-still-firing"],
+    ids=[
+        "collective-current-claim",
+        "named-firing-now",
+        "named-still-firing",
+        "markdown-named-still-firing",
+        "affirmative-clause-after-negation",
+    ],
 )
 def test_exact_original_read_does_not_refresh_secondary_alert_current_state(
     unsupported_secondary_state: str,
