@@ -311,6 +311,9 @@ class SessionRunner:
         # on, so the session never again runs a restricted turn. Cleared only
         # by a new SDK session (reset).
         self._unrestricted_prompt_sent = False
+        # Whether a read-only prompt has been sent on this SDK session; the next
+        # unrestricted prompt then gets a fresh one (RUNNER-TOOL-ACCESS-11).
+        self._read_only_prompt_sent = False
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
@@ -761,6 +764,7 @@ class SessionRunner:
             self._result_pending = False
             # A new SDK session carries no earlier prompt (RUNNER-TOOL-ACCESS-4).
             self._unrestricted_prompt_sent = False
+            self._read_only_prompt_sent = False
             self._interrupt_requested = False
             self._timeout_requested = False
             self._timeout_interrupt_settled = None
@@ -771,6 +775,26 @@ class SessionRunner:
             self._active_state = None
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
+
+    async def _replace_session(self) -> None:
+        """Close this SDK session and connect a fresh one, as reset does.
+
+        Only the session is replaced: the caller owns the turn lock and the
+        turn's own state. @spec RUNNER-TOOL-ACCESS-11
+        """
+
+        if self._session is not None:
+            await self._session.close()
+        self._advertised_tools = None
+        self._session = self._factory()
+        await self._session.connect()
+        # Anything the old session owed died with it.
+        self._result_pending = False
+        self._read_only_prompt_sent = False
+        logger.info(
+            "replaced the model session before an unrestricted prompt session=%s",
+            self._session_id,
+        )
 
     async def steer(self, text: str, *, tool_access: ToolAccess | None = None) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
@@ -1036,6 +1060,12 @@ class SessionRunner:
                                     terminal_for_log = True
                                 yield line
                             return
+                        if event.tool_access is None and self._read_only_prompt_sent:
+                            # @spec RUNNER-TOOL-ACCESS-11: whatever a read-only
+                            # prompt left in the CLI (an answer still owed, a
+                            # turn a bundle hook woke) is discarded with its
+                            # session, so none of it can run unrestricted.
+                            await self._replace_session()
                         # Resynchronize before the turn is ready (#3425): steer is
                         # refused and a stop is only recorded, so nothing else
                         # can write to the SDK while the old turn is drained.
@@ -1352,6 +1382,8 @@ class SessionRunner:
             self._tool_access.begin(event.tool_access)
         if event.tool_access is None:
             self._unrestricted_prompt_sent = True
+        else:
+            self._read_only_prompt_sent = True
         self._result_pending = True
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
