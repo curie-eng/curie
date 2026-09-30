@@ -69,6 +69,12 @@
     "worker": {
       "type": "object",
       "properties": {
+        "maxConcurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Turns one worker runs at once (issue #760), rendered as CURIE_WORKER_MAX_CONCURRENCY. The worker refuses the same range at boot."
+        },
         "claimTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,

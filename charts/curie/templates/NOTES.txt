@@ -137,6 +137,9 @@ Kernel isolation (gVisor, security.gvisor.mode={{ $gvisorMode }}):
 
 Sandbox capacity (resourceQuota vs. node allocatable):
 {{- include "curie.sandboxCapacity.notes" (dict "fits" $cap.fits "ceiling" $cap.ceiling "cpu" $perSandbox.cpu "memory" $perSandbox.memory "fullname" (include "curie.fullname" .) "namespace" .Release.Namespace) }}
+{{- if .Values.worker.deploy }}
+  - Worker turn slots: worker.replicas {{ .Values.worker.replicas }} x worker.maxConcurrency {{ .Values.worker.maxConcurrency }} = {{ mul (int64 .Values.worker.replicas) (int64 .Values.worker.maxConcurrency) }} concurrent turns; the sandbox quota admits {{ $cap.ceiling }}.
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

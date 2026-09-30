@@ -1801,6 +1801,13 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
+  # Turns one worker runs at once (#760), rendered as
+  # CURIE_WORKER_MAX_CONCURRENCY; 1 through 256. Each running turn holds a
+  # sandbox, so replicas x maxConcurrency is how many sandboxes the workers can
+  # ask for at once. NOTES prints that product beside the sandbox quota
+  # ceiling (resourceQuota.hard): a product below the ceiling leaves quota
+  # unused, and one far above it turns the excess into capacity replies.
+  maxConcurrency: 16
   # Floor for the worker's voluntary termination grace. The chart renders the
   # effective grace as max(this, deliveryBudgetSeconds +
   # deliveryShutdownReserveSeconds) (ADR-0131, #3071), so a raised budget
