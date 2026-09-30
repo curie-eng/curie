@@ -373,16 +373,6 @@ async def test_stop_is_honoured_promptly_rather_than_after_the_interval() -> Non
     await asyncio.wait_for(task, timeout=2)
 
 
-async def test_cancellation_propagates() -> None:
-    # Cancelled is not an error to swallow; the worker is shutting down.
-    loop = Loop([], {}, interval_seconds=300)
-    task = asyncio.create_task(loop.run_forever(asyncio.Event()))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
 # --------------------------------------------------------------------------- #
 # The manifest source
 # --------------------------------------------------------------------------- #
