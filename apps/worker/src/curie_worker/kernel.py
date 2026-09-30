@@ -123,6 +123,7 @@ from .binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
     BindingResolver,
+    binding_adapter_for_handle,
 )
 from .capacity_wait import (
     CapacityWaitExpired,
@@ -378,11 +379,13 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         # never collide with a bound (kind, address).
         return scoped_conversation_id("@cron", qevent.hook_run.agent_id, qevent.conversation_id)
     handle = _reply_handle_for(qevent)
+    # @spec WORKER-CANARY-3: scope relay state by its binding identity while
+    # keeping the handle's adapter reserved for delivery.
     return scoped_conversation_id(
         handle.kind,
         handle.channel,
         qevent.conversation_id,
-        identity=route_identity(handle.kind, handle.adapter),
+        identity=route_identity(handle.kind, binding_adapter_for_handle(handle)),
     )
 
 
@@ -2611,9 +2614,11 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
+                # @spec WORKER-CANARY-1 WORKER-CANARY-2: the relay's identity
+                # chooses the binding; its adapter stays on the reply route.
                 try:
                     resolved = await self._binding.resolve(
-                        handle.kind, handle.adapter, handle.channel
+                        handle.kind, binding_adapter_for_handle(handle), handle.channel
                     )
                 except AmbiguousRoute as exc:
                     await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
@@ -2624,7 +2629,11 @@ class Kernel:
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
                     try:
                         undeployed = (
-                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            # @spec WORKER-CANARY-2 WORKER-CANARY-4: use the
+                            # same binding selector for the diagnostic path.
+                            await undeployed_lookup(
+                                handle.kind, binding_adapter_for_handle(handle), handle.channel
+                            )
                             if undeployed_lookup is not None
                             else None
                         )

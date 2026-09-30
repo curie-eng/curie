@@ -365,6 +365,18 @@ def test_named_relay_selects_only_its_active_slack_binding() -> None:
             for invalid in ("", " ", "SRE Bot", "sre/bot"):
                 assert await resolver.resolve("slack", invalid, channel) is None
                 assert await resolver.undeployed_binding("slack", invalid, channel) is None
+            # @spec WORKER-CANARY-5: after the named deployment disappears,
+            # the same binding remains diagnostic-only and cannot use default.
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"DELETE FROM {_SCHEMA}.deployments WHERE agent_id = :id"),
+                    {"id": named_id},
+                )
+            assert await resolver.resolve("slack", "sre-bot", channel) is None
+            undeployed = await resolver.undeployed_binding("slack", "sre-bot", channel)
+            assert undeployed is not None and undeployed.agent_id == named_id
+            still_default = await resolver.resolve("slack", "curie-cluster-message", channel)
+            assert still_default is not None and still_default.agent_id == default_id
         finally:
             if ids:
                 await _cleanup(engine, ids)

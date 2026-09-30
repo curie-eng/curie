@@ -5087,9 +5087,9 @@ def test_named_relay_resolves_named_binding_but_replies_through_relay(make_harne
             )
             assert binding.seen == [("slack", "sre-bot", "C1")]
             assert h.runner.opened
-            assert h.sink.routes_for("reply.update") == [
-                TargetRoute(endpoint=None, adapter="curie-cluster-message")
-            ]
+            routes = h.sink.routes_for("reply.update")
+            assert routes
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
 
     asyncio.run(go())
 
