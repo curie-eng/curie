@@ -646,6 +646,7 @@ def build_runner(
         agent=config.connector_agent,
         namespace=config.connector_namespace,
         caller_header=config.connector_caller_token is not None,
+        env=os.environ,
     )
     # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
     # cannot read the PAT from the process env (#2559). The on-disk catalog
@@ -1086,6 +1087,7 @@ async def _load_boot_fetches(
         agent=config.connector_agent,
         namespace=config.connector_namespace,
         caller_header=config.connector_caller_token is not None,
+        env=os.environ,
     )
     expansion_failures = (
         diagnose_derived_connector_headers(derived, {**os.environ, **dict(sdk_env or {})})

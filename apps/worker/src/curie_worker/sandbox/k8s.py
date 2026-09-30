@@ -554,6 +554,28 @@ class KubernetesSandboxClient:
 
     # -- Sandbox (core group) ------------------------------------------------
 
+    def warm_pool_exists(self, name: str) -> bool:
+        """Whether this namespace already has the named SandboxWarmPool.
+
+        A missing pool is false. Any other API error propagates so the caller
+        can keep today's pool choice instead of failing the claim.
+        """
+
+        try:
+            self._api.get_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxwarmpools",
+                name,
+                _request_timeout=5,
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float
     ) -> SandboxView | None:

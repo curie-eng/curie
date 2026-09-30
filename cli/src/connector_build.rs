@@ -1802,7 +1802,7 @@ pub(crate) fn compose_service_ids_command(
 
 /// Whether a declared connector is one Curie runs (as opposed to one already
 /// running somewhere else).
-fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
+pub(crate) fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
     spec.url.is_none() && spec.unhosted_url.is_none()
 }
 

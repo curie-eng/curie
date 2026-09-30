@@ -53,6 +53,9 @@ if "get" in args and "deployment" in args:
     raise SystemExit(0)
 if "exec" in args:
     command = args[args.index("--") + 1 :]
+    pod = args[args.index("exec") + 1]
+    if "other-agent" in pod:
+        raise SystemExit(0 if env("FAKE_OTHER_AGENT_REACHES", "0") == "1" else 1)
     if command[0] == "python":
         raise SystemExit(0 if env("FAKE_SERVER_LISTENS", "1") == "1" else 1)
     url = command[-1]

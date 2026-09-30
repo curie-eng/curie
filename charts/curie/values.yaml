@@ -2422,6 +2422,11 @@ agentSandbox:
   #   workspaceSizeLimits:
   #     dark-factory: 24Gi
   workspaceSizeLimits: {}
+  # Agents that get a labeled sandbox template and warm pool so connector
+  # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
+  # Empty by default. Agents already covered by connectorSecrets, registryEgress,
+  # runnerImages, or workspaceSizeLimits are unchanged.
+  poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with

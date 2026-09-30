@@ -262,6 +262,7 @@ fn both_emitters_label_a_connector_with_its_agent_and_object_name() {
         "curie-skill-abc123",
         dir.path(),
         &BTreeMap::new(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the start spec renders")
     .run_args();

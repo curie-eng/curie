@@ -40,10 +40,11 @@ APP="${3:-curie}"
 PROBE_IMAGE="${CURIE_NETPOL_PROBE_IMAGE:-curlimages/curl:8.10.1}"
 MINT_IMAGE="${CURIE_CALLER_MINT_IMAGE:-curie-worker:local}"
 PROBE_POD="caller-probe-sandbox"
+OTHER_AGENT_POD="caller-probe-other-agent"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 cleanup() {
-  kubectl -n "$NS" delete pod "$PROBE_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$NS" delete pod "$PROBE_POD" "$OTHER_AGENT_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -74,10 +75,37 @@ done < <(
 (( ${#CONNECTORS[@]} > 0 )) \
   || fail "found 0 connector Services in $NS; the caller proxy check would be vacuous"
 
-kubectl -n "$NS" delete pod "$PROBE_POD" --ignore-not-found --wait=true --timeout=90s \
+# `<release>-<agent>-mcp-<connector>`. The positive probe wears that agent so
+# ingress selects it. A second probe wears a different agent and must not connect.
+owning_agent() {
+  local name="$1"
+  local prefix="${RELEASE}-"
+  local rest agent
+  case "$name" in
+    "$prefix"*) rest="${name#"$prefix"}" ;;
+    *) return 1 ;;
+  esac
+  case "$rest" in
+    *-mcp-*) agent="${rest%%-mcp-*}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$agent" ] || return 1
+  printf '%s' "$agent"
+}
+
+FIRST_AGENT=""
+for svc in "${CONNECTORS[@]}"; do
+  if FIRST_AGENT="$(owning_agent "$svc")"; then
+    break
+  fi
+  FIRST_AGENT=""
+done
+
+kubectl -n "$NS" delete pod "$PROBE_POD" "$OTHER_AGENT_POD" --ignore-not-found --wait=true --timeout=90s \
   >/dev/null 2>&1 || true
 # The labels Rail 1 and the connector policies select, so the probe is treated
-# exactly as a sandbox is.
+# exactly as a sandbox is. curietech.ai/agent is the owning agent when the
+# object name carries one.
 kubectl -n "$NS" apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
@@ -87,6 +115,7 @@ metadata:
     app.kubernetes.io/name: $APP
     app.kubernetes.io/instance: $RELEASE
     app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: "${FIRST_AGENT:-unset}"
 spec:
   restartPolicy: Never
   containers:
@@ -96,6 +125,8 @@ spec:
 YAML
 kubectl -n "$NS" wait --for=condition=Ready "pod/$PROBE_POD" --timeout=180s >/dev/null \
   || fail "the sandbox-labelled probe pod did not become ready"
+CURRENT_AGENT="${FIRST_AGENT}"
+OTHER_AGENT_VALUE=""
 
 ADMITTED_LEGS=0
 for svc in "${CONNECTORS[@]}"; do
@@ -103,6 +134,41 @@ for svc in "${CONNECTORS[@]}"; do
     || fail "connector Deployment $svc did not become ready"
 
   PORT="$(kubectl -n "$NS" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')"
+  AGENT="$(owning_agent "$svc" || true)"
+  if [ -n "$AGENT" ] && [ "$AGENT" != "$CURRENT_AGENT" ]; then
+    kubectl -n "$NS" label pod "$PROBE_POD" "curietech.ai/agent=${AGENT}" --overwrite >/dev/null
+    CURRENT_AGENT="$AGENT"
+  fi
+  if [ -n "$AGENT" ]; then
+    other="not-${AGENT}"
+    if [ "$other" != "$OTHER_AGENT_VALUE" ]; then
+      OTHER_AGENT_VALUE="$other"
+      kubectl -n "$NS" apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $OTHER_AGENT_POD
+  labels:
+    app.kubernetes.io/name: $APP
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: ${other}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: $PROBE_IMAGE
+      command: ["sleep", "600"]
+YAML
+      kubectl -n "$NS" wait --for=condition=Ready "pod/$OTHER_AGENT_POD" --timeout=180s >/dev/null \
+        || fail "the other-agent probe did not become ready"
+    fi
+    if kubectl -n "$NS" exec "$OTHER_AGENT_POD" -- \
+         curl -s -m 8 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null; then
+      fail "a sandbox wearing curietech.ai/agent=${OTHER_AGENT_VALUE} reached connector Service $svc:$PORT; ingress is not limited to the owning agent"
+    fi
+    echo "  ok  other-agent probe cannot reach connector $svc:$PORT"
+  fi
   TARGET="$(kubectl -n "$NS" get svc "$svc" -o jsonpath='{.spec.ports[0].targetPort}')"
   [ "$TARGET" = "caller" ] \
     || fail "connector Service $svc targets '$TARGET', not the caller proxy; does the API hold a caller public key?"

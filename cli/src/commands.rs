@@ -14994,6 +14994,7 @@ async fn start_skill_connectors(
             project,
             plugin_dir,
             &secret_values,
+            None,
         )?;
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await
