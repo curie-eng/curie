@@ -209,7 +209,7 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   EVAL Lua) that bypasses the dispatcher's `StreamPublisher` port entirely. The hooks
   router also reads one exact `curie:runs` entry with `xrange` when a delivery claim
   already holds a stream id
-  (`apps/api/src/curie_api/routers/hooks.py::_landed_conversation_id`). The API also
+  (`apps/api/src/curie_api/routers/hooks.py::_landed_turn`). The API also
   *reads* the worker's `<stream>:dead` graveyard directly, with `xrevrange`/`xrange`
   on its own raw client:
   `apps/api/src/curie_api/graveyardwatcher.py::GraveyardWatcher` (`xrevrange` to seed the
