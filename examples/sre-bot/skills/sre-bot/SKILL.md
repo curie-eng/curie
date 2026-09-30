@@ -580,6 +580,14 @@ What I changed: nothing.
   start. An exact provider read can establish current state at its read time;
   the reported startsAt alone cannot.
 
+  A start timestamp and one current firing sample do not prove continuous
+  failures of the underlying service. You may state the reported episode age,
+  labelled as episode age, but do not infer that turns have been refused for
+  that duration or that a problem has been refusing turns since the start.
+  Such continuous impact claims require covering logs or range history of the
+  underlying behavior, not just alarm metadata. Without that history, say the
+  continuous impact is unverified even when the alarm is firing at read time.
+
   Each named alert or rule needs its own fresh read before reporting its current
   state, with the read's UTC date and time. A prior secondary or related rule's
   state stays historical until that separate rule is read again. Reading the
