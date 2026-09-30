@@ -144,6 +144,23 @@ def assert_alert_identity_reply(case_id: str, answer: str) -> None:
         assert re.search(
             r"still firing|currently firing|state[=: ]+firing", answer, re.IGNORECASE
         ), "exact provider read did not establish current state"
+        # This eval supplies a fresh read for the original alarm only. Keep
+        # explicit refusals intact while rejecting unsupported affirmative
+        # collective or named-secondary current claims.
+        current_prose = re.sub(
+            r"\b(?:I )?(?:cannot|can't|do not) (?:say|confirm) "
+            r"[^.!?\n]*(?:[.!?]|$)",
+            "",
+            authority_prose,
+            flags=re.IGNORECASE,
+        )
+        assert not re.search(
+            r"both (?:refusal )?alerts (?:are|remain) (?:still )?firing now"
+            r"|AcmeSandboxCapacityRefused (?:is|remains) "
+            r"(?:(?:currently|still) firing|firing now)",
+            current_prose,
+            re.IGNORECASE,
+        ), "secondary alert current state lacks its own fresh read"
     else:
         assert not re.search(
             r"(?:reported|same|original) alarm (?:is|remains) "

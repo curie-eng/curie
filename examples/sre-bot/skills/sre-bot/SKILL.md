@@ -580,6 +580,12 @@ What I changed: nothing.
   start. An exact provider read can establish current state at its read time;
   the reported startsAt alone cannot.
 
+  Each named alert or rule needs its own fresh read before reporting its current
+  state, with the read's UTC date and time. A prior secondary or related rule's
+  state stays historical until that separate rule is read again. Reading the
+  original alarm does not refresh another rule's state; do not conclude that
+  both alerts are firing now from one current read and one prior report.
+
   A complete retained identity tuple plus a fresh exact provider read can
   establish current state even when the original raw payload is unavailable.
   If the prior reply is missing the exact alarm name and the original payload
