@@ -535,12 +535,17 @@ pub struct CommonOpts {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Whether `bin` resolves on PATH. For a caller that has a fallback when the
+/// tool is absent rather than a refusal (#3503).
+pub(crate) fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
 /// Fail with a clear one-line error if `bin` is not on `PATH`.
 pub(crate) fn require_on_path(bin: &str) -> Result<()> {
-    let found = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false);
-    if found {
+    if on_path(bin) {
         Ok(())
     } else {
         bail!("`{bin}` is not on PATH; install it (or add it to PATH) and retry")
