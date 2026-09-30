@@ -171,7 +171,9 @@ serverFiles:
         # CurieApplicationMetricsAbsent.
         rules:
           - alert: CurieAlloyNoActiveLogFiles
-            # up is scoped to the annotated Alloy DaemonSet pods. The
+            # up is scoped to the annotated Alloy DaemonSet pods by job,
+            # namespace, and pod. Prometheus-generated up has no curie_source
+            # stamp because metric relabeling runs before up is generated. The
             # comparison on the right intentionally disappears for zero OR
             # missing source gauges, so a healthy scrape still alerts.
             expr: |
@@ -179,8 +181,7 @@ serverFiles:
                 up{
                   job="kubernetes-pods",
                   namespace="observability",
-                  pod=~"alloy-.*",
-                  curie_source="curie-sre-bot"
+                  pod=~"alloy-.*"
                 } == 1
               )
               unless on (namespace, pod)
@@ -269,8 +270,7 @@ serverFiles:
                 up{
                   job="kubernetes-pods",
                   namespace="observability",
-                  pod=~"alloy-.*",
-                  curie_source="curie-sre-bot"
+                  pod=~"alloy-.*"
                 } == 1
               )
             for: 5m

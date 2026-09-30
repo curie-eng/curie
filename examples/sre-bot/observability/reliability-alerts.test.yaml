@@ -3526,12 +3526,13 @@ tests:
   # These are per DaemonSet pod. The pinned Alloy image exposes source metrics
   # with component_id/component_path (and read path), but write metrics with
   # component_id/component_path/host/tenant. Prometheus adds pod/namespace/node.
+  # Unlike scraped Alloy metrics, Prometheus-generated up has no curie_source.
   - name: zero file source pages only the broken Alloy pod
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-broken",node="node-a"}'
         values: '1x25'
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-healthy",node="node-b"}'
         values: '1x25'
       - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
         values: '0x25'
@@ -3559,9 +3560,9 @@ tests:
   - name: missing source gauge pages but failed scrape does not
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-no-files",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-no-files",node="node-a"}'
         values: '1x25'
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-down",node="node-b"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-down",node="node-b"}'
         values: '0x25'
     alert_rule_test:
       - eval_time: 10m
@@ -3582,7 +3583,7 @@ tests:
   - name: quiet attached collector does not page
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-quiet",node="node-a"}'
         values: '1x25'
       - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
         values: '1x25'
@@ -3601,9 +3602,9 @@ tests:
   - name: fresh reads with zero writes page only the broken pod
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-broken",node="node-a"}'
         values: '1x31'
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-healthy",node="node-b"}'
         values: '1x31'
       - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
         values: '0+1x30'
@@ -3632,7 +3633,7 @@ tests:
   - name: first positive read counter with absent write counter pages
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-new",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-new",node="node-a"}'
         values: '1x31'
       - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-new",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
         values: '_x15 5x16'
@@ -3655,7 +3656,7 @@ tests:
   - name: old flat read counter stays quiet without write counter
     interval: 1m
     input_series:
-      - series: 'up{job="kubernetes-pods",curie_source="curie-sre-bot",namespace="observability",pod="alloy-old",node="node-a"}'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-old",node="node-a"}'
         values: '1x41'
       - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-old",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
         values: '5x41'
