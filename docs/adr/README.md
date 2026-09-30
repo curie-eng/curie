@@ -207,4 +207,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
 | 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
 | 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
+| 0183 | [An email approval is answered only by a listed address](0183-an-email-approval-is-answered-only-by-a-listed-address.md) | Draft |
 <!-- END GENERATED: adr-index -->
