@@ -119,19 +119,34 @@ than an open bag of `gen_ai.*` names.
   for any other `mcp__` tool, and `builtin` for a CLI tool. A result without `is_error`
   is `success`. An `is_error` result is `cancelled` when an operator stop cut the call
   off, since the CLI then answers the call itself; `awaiting_approval` when the runner's
-  approval gate held that call; `refused` when the gate rejected it through `toolPolicy`
-  or an approval grant's argument check; and `unavailable` when the CLI's exact
-  unknown-tool envelope names a tool absent from its init catalog. The catalog
-  check prevents a connector's identical error text from being misclassified;
-  absent or malformed catalog evidence leaves the result as `error`. The gate
-  matches result call IDs, not tool names: a same-name sibling that reached the
-  connector can still be an `error`. A connector `error` covers its `isError`
-  result, a JSON-RPC error, and a call the turn deadline cut off (a connector
-  that holds a call until the deadline is failing). Two runner-side denials
-  outside the approval gate still count as a connector `error`: a bundle's own
-  PreToolUse deny, and the connector exclusion deny for a connector whose
-  startup probe failed (#3580 tracks keying them by call ID). A
+  approval gate held that call and nothing later invalidated the hold; `refused` when
+  a runner-side PreToolUse or permission callback denied it before it ran: the gate
+  through `toolPolicy`, an approval grant's argument check or the publication
+  precheck (including a held publication call the precheck later invalidates), the
+  runner's registration of a bundle's own PreToolUse command, or the factory
+  foreground guard; and `unavailable` when the connector
+  exclusion denied a call to a connector whose startup probe failed, or when the
+  CLI's exact unknown-tool envelope names a tool absent from its init catalog. The
+  catalog check prevents a connector's identical error text from being
+  misclassified; absent or malformed catalog evidence leaves the result as `error`.
+  Every one of these matches result call IDs, not tool names: a same-name sibling
+  that reached the connector can still be an `error`. The runner records each
+  denial by the call ID its callback was given, in a ledger it clears before each
+  prompt. A gate decision is recorded where its two callbacks render it, from the
+  decision itself, so no decision branch can deny a call without recording it. A
+  hold keeps its `awaiting_approval` outcome when a bundle command denies the same
+  call concurrently. A connector `error` covers its `isError` result, a JSON-RPC
+  error, and a call the turn deadline cut off (a connector that holds a call until
+  the deadline is failing). The runner cannot see a deny from the CLI's own run of
+  a bundle's hook commands, so a bundle that ships PreToolUse hooks only in the
+  plugin's default hooks file, with no manifest `hooks` declaration for the runner
+  to register, still counts its denials as `error`. A
   connector that reports failure inside a success-shaped payload counts as `success`.
+  Connector `unavailable` results are the signal for a connector the agent calls
+  but cannot reach at all, a failed startup probe or a tool its server no longer
+  advertises; the SRE example pages on a sustained share of them
+  (`examples/sre-bot/observability/prometheus-values.yaml`,
+  `CurieConnectorToolsUnavailable`).
   The metric carries no connector or tool name, so each connector `error` also logs one
   WARNING naming the server and the tool, never the call's arguments or its result.
 
