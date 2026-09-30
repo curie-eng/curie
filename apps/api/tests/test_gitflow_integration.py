@@ -473,6 +473,62 @@ def test_success_notice_requires_opt_in_and_is_deduplicated(
     assert _notices_after(cursor) == []
 
 
+def test_success_notice_reloads_opt_in_and_binding_after_push_started(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A slow clone must not notify a channel removed during that clone."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.models import Agent, AgentChannel
+    from curie_api.schemas import WebhookResult
+    from redis.asyncio import Redis
+    from sqlalchemy import update
+
+    agent_id = _register_agent(client, auth_headers)
+    stream = f"test:deploy-notices:{uuid.uuid4()}"
+    sha = "a" * 40
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        try:
+            async with maker() as stale, maker() as writer:
+                agent = await crud.get_agent(stale, uuid.UUID(agent_id))
+                assert agent is not None
+                assert agent.deploy_notifications is False
+                assert [binding.address for binding in agent.channels] == ["C000000G01"]
+                await writer.execute(
+                    update(Agent)
+                    .where(Agent.id == agent.id)
+                    .values(deploy_notifications=True)
+                )
+                await writer.execute(
+                    update(AgentChannel)
+                    .where(AgentChannel.agent_id == agent.id)
+                    .values(address="C0EXAMPLE2")
+                )
+                await writer.commit()
+
+                count = await DeployNoticeQueue(valkey, stream).publish(
+                    stale,
+                    WebhookResult(status="deployed", agent_id=agent.id, commit_sha=sha),
+                    _push_payload("refs/heads/dev", sha, "file:///unused"),
+                    settings,
+                )
+                assert count == 1
+                notices = await valkey.xrange(stream)
+                assert len(notices) == 1
+                assert json.loads(notices[0][1]["payload"])["address"] == "C0EXAMPLE2"
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
 def test_archive_rejection_notifies_without_success_opt_in(
     client: Any,
     auth_headers: dict[str, str],

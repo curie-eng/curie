@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Literal
 
 from channel_protocol import MESSAGE_VERSION, OutboundMessage
-from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
+from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
 from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
 
@@ -169,7 +170,7 @@ class DeployNoticeConsumer(StreamConsumer):
                     )
                     return
                 event = ReplyPost(
-                    version=REPLY_WIRE_VERSION,
+                    version=PROGRESS_REPLY_WIRE_VERSION,
                     event="reply.post",
                     target=ReplyTarget(
                         kind="slack",
@@ -179,6 +180,12 @@ class DeployNoticeConsumer(StreamConsumer):
                     ),
                     message=OutboundMessage(version=MESSAGE_VERSION, text=render_notice(notice)),
                     requested_by="git-flow",
+                    delivery_id=str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"curie:deploy-notice:{self._stream}:{entry_id}",
+                        )
+                    ),
                 )
                 try:
                     await self._sink.emit(
@@ -190,5 +197,6 @@ class DeployNoticeConsumer(StreamConsumer):
                     )
                     return
                 await self._ack(entry_id)
+                await self._settle_delivery_best_effort(entry_id)
         finally:
             self._inflight_ids.discard(entry_id)

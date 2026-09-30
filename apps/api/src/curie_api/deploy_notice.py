@@ -73,7 +73,7 @@ class DeployNoticeQueue:
             if result.agent_id is None:
                 return 0
             agent = await crud.get_agent(session, result.agent_id)
-            agents = [agent] if agent is not None and agent.deploy_notifications else []
+            agents = [agent] if agent is not None else []
 
         environment = result.environment or environment_for_ref(ref, settings)
         codes = sorted(
@@ -81,6 +81,12 @@ class DeployNoticeQueue:
         )
         published = 0
         for agent in agents:
+            # A clone may finish after an operator changed opt-in or channels.
+            # The webhook shares process_push's expire_on_commit=False session,
+            # so an ordinary get_agent can return its stale identity-map row.
+            await session.refresh(agent, attribute_names=["deploy_notifications", "channels"])
+            if result.status != "rejected" and not agent.deploy_notifications:
+                continue
             for binding in agent.channels:
                 if binding.kind != "slack" or binding.adapter is None:
                     continue

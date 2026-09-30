@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +14,7 @@ import redis
 from aiohttp.test_utils import TestServer
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.config import WorkerConfig
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.deploy_notice import DeployNoticeConsumer
 from curie_worker.reply_sink import build_reply_sink
 from redis.asyncio import Redis as AsyncRedis
@@ -45,6 +47,7 @@ def test_notice_posts_as_the_bound_identity_and_acks(
             slack_bot_token="xoxb-default-test",
             slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
             read_block_ms=100,
+            key_prefix=names["prefix"],
         )
         sink = build_reply_sink(
             config,
@@ -60,6 +63,7 @@ def test_notice_posts_as_the_bound_identity_and_acks(
             stream=names["stream"],
             group=names["group"],
             consumer="notice-test",
+            leases=DeliveryLeaseStore(valkey, config),
         )
         task = asyncio.create_task(consumer.run())
         try:
@@ -84,9 +88,18 @@ def test_notice_posts_as_the_bound_identity_and_acks(
             assert body["channel"] == "C0EXAMPLE1"
             assert expected in body["text"]
             assert "thread_ts" not in body
+            assert body["client_msg_id"] == str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"curie:deploy-notice:{names['stream']}:{entry}")
+            )
             assert await valkey.xpending_range(
                 names["stream"], names["group"], min=entry, max=entry, count=1
             ) == []
+            state_key = config.delivery_state_key(names["stream"], names["group"], entry)
+            for _ in range(50):
+                if not await valkey.exists(state_key):
+                    break
+                await asyncio.sleep(0.01)
+            assert not await valkey.exists(state_key)
         finally:
             consumer.request_stop()
             await asyncio.wait_for(task, timeout=5)
