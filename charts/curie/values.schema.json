@@ -87,6 +87,17 @@
           "maximum": 31536000,
           "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
         },
+        "streamRetention": {
+          "type": ["object", "null"],
+          "properties": {
+            "minAgeSeconds": {
+              "type": "integer",
+              "minimum": 3600,
+              "maximum": 31536000,
+              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600, above the three-hour delivery budget ceiling, and at most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
+            }
+          }
+        },
         "deliveryBudgetSeconds": {
           "type": "integer",
           "minimum": 60,

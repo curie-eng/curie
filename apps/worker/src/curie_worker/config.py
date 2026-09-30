@@ -1200,6 +1200,19 @@ class WorkerConfig(BaseSettings):
     work_item_orphan_sweep_interval_s: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
+    # Settled stream entries are trimmed once they are older than this window
+    # (ADR 0184). The floor sits above the three-hour delivery budget ceiling;
+    # the ceiling is the one year shared by the other seconds knobs.
+    stream_retention_min_age_s: int = Field(
+        default=86400,
+        ge=3600,
+        le=31_536_000,
+        validation_alias="CURIE_STREAM_RETENTION_MIN_AGE_S",
+    )
+    # How often the retention pass runs over the consumed streams.
+    stream_retention_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_STREAM_RETENTION_INTERVAL_S"
+    )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built
     # from. They must agree: the runner dials a Service by the name those

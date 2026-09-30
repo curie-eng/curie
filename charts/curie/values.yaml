@@ -2022,6 +2022,15 @@ worker:
   # is accepted by YAML, renders fine, and used to boot healthy and then hang
   # every turn while leaking a sandbox per attempt (#1388).
   suspendedRouteTtlSeconds: 86400
+  # Settled stream retention (ADR 0184, #1523). The worker trims entries every
+  # consumer group has acknowledged off curie:runs and curie:evals; Valkey runs
+  # noeviction, so without it every settled turn stays until writes are
+  # refused. minAgeSeconds keeps settled entries this long for inspection.
+  # Pending and undelivered entries are never trimmed, whatever their age.
+  # An integer from 3600 to 31536000; values.schema.json and the worker both
+  # refuse anything else.
+  streamRetention:
+    minAgeSeconds: 86400
   # Delivery budget and ownership lease (ADR-0131, #1971). One overall
   # wall-clock deadline and one renewable fenced owner per delivery, replacing
   # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based

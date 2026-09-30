@@ -398,6 +398,27 @@ from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes clien
 sandboxes resolve to a local in-process fake runner, and a recording Slack sink.
 Only Slack and the model behind the runner are faked.
 
+### Settled stream retention (ADR 0184)
+
+A supervised `stream-retention` loop trims `CURIE_STREAM` and
+`CURIE_EVAL_STREAM` every `CURIE_STREAM_RETENTION_INTERVAL_S` (default 60).
+`apps/worker/src/curie_worker/stream_retention.py::trim_settled` runs one
+script that reads every consumer group on the stream and runs
+`XTRIM MINID` at the lowest of each group's oldest pending id (or the id after
+its `last-delivered-id` when nothing is pending) and now minus
+`CURIE_STREAM_RETENTION_MIN_AGE_S` (default 86400, bounded 3600 to 31536000,
+chart `worker.streamRetention.minAgeSeconds`).
+
+- Pending and undelivered entries are never trimmed, whatever their age, so a
+  reclaim always finds the body it re-runs.
+- A stream with no consumer group is left alone. The graveyard, progress and
+  marker streams have no group and keep their own approximate `MAXLEN`.
+- A group that stops acknowledging holds the floor for its stream, so memory
+  grows rather than a turn being lost. `curie.queue.depth` is the runs
+  stream's `XLEN` and shows it.
+- Producers never pass `MAXLEN` on a consumed stream; a producer cannot tell a
+  settled entry from a pending one.
+
 ### Running the worker as a bare process (`curie_worker.run`, Docker substrate)
 
 `curie_worker.run` is the `python -m curie_worker` entrypoint: it reads

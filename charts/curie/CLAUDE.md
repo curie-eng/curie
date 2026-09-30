@@ -258,7 +258,10 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`), plus the new
+  nonblank contract (`api.approvalChatAttesterSecret`), plus
+  `worker.streamRetention.minAgeSeconds` (a new key, so no existing values
+  file can disagree with it; the template reads it through `dig` for a
+  retained release without the block) and the new
   `e2eConnectorIdentity` block, whose prefix and label patterns keep its
   values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
