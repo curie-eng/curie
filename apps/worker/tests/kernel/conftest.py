@@ -649,6 +649,9 @@ class FakeRunner:
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
         self.supports_capacity_admission = True
+        # The tool access values this runner advertises under ``tool_access``
+        # (TOOL-ACCESS-4). None models a runner that predates the key.
+        self.tool_access_enforced: list[str] | None = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -656,6 +659,8 @@ class FakeRunner:
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
         self.abort_after_frames = False
         self.opened: list[str] = []
+        # Every /v1/event body as received, for asserting what the worker sent.
+        self.event_bodies: list[dict[str, object]] = []
         self.request_epochs: list[tuple[str, str]] = []
         self.queried: list[str] = []
         self.admissions: list[tuple[str, bool]] = []
@@ -698,6 +703,8 @@ class FakeRunner:
             "turn_active": self.turn_active,
             "history_durable": self.history_durable,
         }
+        if self.tool_access_enforced is not None:
+            body["tool_access"] = list(self.tool_access_enforced)
         if request.path == "/v1/status":
             body["turn_epoch"] = self.turn_epoch
             if self.supports_capacity_admission:
@@ -713,6 +720,7 @@ class FakeRunner:
         self.event_headers.append(dict(request.headers))
         body = await request.json()
         self.opened.append(body["text"])
+        self.event_bodies.append(body)
         epoch = uuid.uuid4().hex
         self.request_epochs.append((body["text"], epoch))
         if self.event_fail_times > 0:
