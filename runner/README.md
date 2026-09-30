@@ -205,10 +205,18 @@ marker. This grouping is replay metadata, never approval or tool authority.
   and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
   attachment availability, other envelope fields, and extra content are never
   imported by this recovery. If an overlapping tool-call sequence needs grouping
-  that neither portable metadata nor validated native mapping proves, fail
-  before SDK hydration with `HistoryError` identifying unprovable legacy
-  assistant grouping and the need for a fresh conversation. Never submit the
-  known corrupt replay, manufacture a result, or silently discard history.
+  that neither portable metadata nor validated native mapping proves, never
+  submit that known corrupt replay or manufacture a result. Replay that one turn
+  as its visible text instead: the turn runs from a genuine user message to the
+  next one, and it becomes that user message followed by one assistant message
+  carrying the turn's assistant text blocks in order (or, if it had none, a text
+  saying its tool activity could not be replayed). Every other turn keeps its
+  rows unchanged, a native checkpoint is set aside, and the runner logs a WARNING
+  naming the session and the number of turns reduced, never their content.
+  Refusing the whole history instead strands the thread: the runner exits
+  before it is ready, every retry and every later message in that thread fails
+  the same way, and a thread whose key is fixed, such as an inbound hook's, can
+  never start fresh.
 - **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
   inconsistent provenance, including attribution on user rows and reuse across
   genuine user or distinct assistant-group boundaries. Preserve group identity
