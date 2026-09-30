@@ -41,6 +41,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol import (
+    TOOL_ACCESS_STATUS_FIELD,
     ErrorEvent,
     Event,
     Final,
@@ -53,6 +54,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
     TurnSource,
 )
@@ -1199,6 +1201,30 @@ class ThreadBusyError(RuntimeError):
     cron turn does not take this path: the kernel records its hook run
     ``deferred`` and the scheduler retries it within the catch-up bound (#2929).
     """
+
+
+class ToolAccessUnenforced(Exception):
+    """The runner a restricted turn would go to does not enforce its access.
+
+    @spec WORKER-TOOL-ACCESS-2: a runner that does not list the value under
+    ``tool_access`` would ignore the field and run the turn unrestricted, so the
+    turn is refused once and never retried against the same boot.
+    """
+
+    def __init__(self, access: ToolAccess) -> None:
+        super().__init__(f"the runner does not advertise tool access {access.value!r}")
+        self.public_detail = (
+            f"This agent cannot start: its runner does not enforce {access.value} tool "
+            "access, so this turn was not run."
+        )
+
+
+#: The escalation a read-only turn gets when its runner nonetheless ends it
+#: awaiting approval (WORKER-TOOL-ACCESS-4).
+_READ_ONLY_APPROVAL_REFUSAL = (
+    "This read-only turn asked for an approval, which it may not do. "
+    "No approval was created."
+)
 
 
 class LiveSessionBusy(ThreadBusyError):
@@ -3000,6 +3026,29 @@ class Kernel:
                         telemetry_outcome="classified_failure",
                         lease=lease,
                         hook_outcome="failed",
+                    )
+                    return
+
+                if (
+                    outcome.status is SessionStatus.AWAITING_APPROVAL
+                    and qevent.tool_access is not None
+                ):
+                    # @spec WORKER-TOOL-ACCESS-4: a restricted turn may not raise
+                    # a card, whatever its runner reported. No record, no card,
+                    # no suspend: a failed turn.
+                    await self._escalate(
+                        qevent,
+                        route,
+                        _READ_ONLY_APPROVAL_REFUSAL,
+                        failure_class="tool-access-violation",
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="classified_failure",
+                        lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
                     )
                     return
 
@@ -4819,6 +4868,14 @@ class Kernel:
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
             return TurnOutcome(terminal_ok=True, start_failed=True)
+        except ToolAccessUnenforced as exc:
+            # @spec WORKER-TOOL-ACCESS-2: answered once, never retried; the
+            # model was not asked.
+            record_reclaimed_retry()
+            release_order()
+            logger.warning("turn start refused for %s: %s", qevent.event_id, exc)
+            await self._reply_for(qevent, route, exc.public_detail)
+            return TurnOutcome(terminal_ok=True, start_failed=True)
         except MissingAgentPoolError as exc:
             # Before the SandboxError clause below, which would retry it. The
             # pool appears only after an operator changes the release values,
@@ -5879,7 +5936,7 @@ class Kernel:
                     or capacity_status.get("turn_active") is not False
                 ):
                     raise CapacityWaitRequested()
-        elif source.is_job or verified_review is not None:
+        elif source.is_job or verified_review is not None or event.tool_access is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
             # saying. A verified review likewise owns a separately reserved
@@ -5903,8 +5960,17 @@ class Kernel:
                 # The claim can outlast what was left of a retry's catch-up
                 # bound; checked again here, right before the start (#2929).
                 raise CatchUpExpired(f"cron retry on {thread_key} passed its catch-up bound")
+            # @spec WORKER-TOOL-ACCESS-3: a restricted turn takes this branch too.
+            # Steering it would run its text under the live turn's access, and
+            # an ordinary live turn has none of its restriction.
             if await self._turn_active(handle, remaining_s=remaining_s):
-                deferred_kind = "review" if verified_review is not None else str(source)
+                deferred_kind = (
+                    "review"
+                    if verified_review is not None
+                    else "restricted"
+                    if event.tool_access is not None
+                    else str(source)
+                )
                 raise LiveSessionBusy(
                     f"thread {thread_key} has a live session; deferring the {deferred_kind} turn"
                 )
@@ -6024,6 +6090,8 @@ class Kernel:
             self._register_run(agent_id, thread_key)
         turn: TurnStream | None = None
         try:
+            if event.tool_access is not None:
+                await self._require_tool_access(handle, event.tool_access, remaining_s)
             event, remaining_s = await self._bind_publication_context(
                 event,
                 queued_event_id=queued_event_id,
@@ -6062,6 +6130,29 @@ class Kernel:
         return _RouteResult(
             steered=False, handle=handle, turn=turn, workspace_inferred_repo=inferred
         )
+
+    async def _require_tool_access(
+        self,
+        handle: SandboxHandle,
+        access: ToolAccess,
+        remaining_s: float | None,
+    ) -> None:
+        """Refuse unless THIS runner advertises ``access`` (WORKER-TOOL-ACCESS-2).
+
+        Read from the handle the event is about to be posted to, with its own
+        token, so a replaced or different runner cannot answer for it. An
+        unreadable status raises the client's own error, which the caller
+        retries like any turn the runner did not accept.
+        """
+
+        status = await self._runner.status(
+            handle.base_url,
+            token=handle.token or None,
+            remaining_s=None if remaining_s is None else min(2.0, remaining_s),
+        )
+        advertised = status.get(TOOL_ACCESS_STATUS_FIELD)
+        if not isinstance(advertised, list) or access.value not in advertised:
+            raise ToolAccessUnenforced(access)
 
     async def _bind_publication_context(
         self,
@@ -8009,4 +8100,6 @@ class Kernel:
             text=qevent.text,
             user=qevent.author,
             ts=qevent.conversation_id,
+            # @spec WORKER-TOOL-ACCESS-1: carried unchanged; None is today's turn.
+            tool_access=qevent.tool_access,
         )
