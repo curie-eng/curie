@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from curie_worker.receipt import render_receipt
 
 
@@ -448,3 +450,42 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
     for actions in ([], [_action()], _mixed_turn(), _long_turn(), _failed_only(_mixed_turn())):
         assert render_receipt(actions, mode="off") is None
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["non-idempotent tool completed", "non-idempotent tool executed", "tool result too large to record"],
+)
+def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: str) -> None:
+    # WORKER-RECEIPT-1: an unknown tool remains visible and irreversible; a
+    # bookkeeping detail neither explains its effect nor supplies prior state.
+    receipt = render_receipt(
+        [_action(tool="mcp__acme__stage_file", result=None, undoable=False, detail=detail)]
+    )
+
+    assert receipt == (
+        "_What I changed:_\n"
+        "• called `mcp__acme__stage_file` — cannot be undone: nothing reported a prior state"
+    )
+    assert detail not in receipt
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["non-idempotent tool completed", "non-idempotent tool executed", "tool result too large to record"],
+)
+@pytest.mark.parametrize(
+    "overrides,verdict",
+    [
+        ({"status": "failed", "undoable": False}, "failed — check before retrying"),
+        ({"undoable": True}, "can be undone"),
+    ],
+)
+def test_generic_detail_does_not_replace_failure_or_undoability(
+    detail: str, overrides: dict[str, Any], verdict: str
+) -> None:
+    receipt = render_receipt(
+        [_action(tool="mcp__acme__stage_file", result=None, detail=detail, **overrides)]
+    )
+
+    assert receipt == f"_What I changed:_\n• called `mcp__acme__stage_file` — {verdict}"
