@@ -681,3 +681,32 @@ def test_pending_overlap_requires_same_proven_group_not_merely_populated_tokens(
     messages = (_call(1, GROUP), _call(2, OTHER), _result(1), _result(2))
     with pytest.raises(HistoryError, match="(?i)group"):
         _entries(messages, tmp_path)
+
+
+def test_idless_native_cache_cannot_bypass_proven_portable_group(tmp_path):
+    messages = _interleaved()
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=tuple(
+            {
+                "type": m.role,
+                "uuid": f"acme-idless-{index}",
+                "message": {"role": m.role, "content": m.content},
+            }
+            for index, m in enumerate(messages)
+        ),
+    )
+    entries = _entries(
+        messages,
+        tmp_path,
+        harness_replay=checkpoint,
+        system_prompt="current attachment unavailable",
+    )
+    assert [(e["message"]["role"], e["message"]["content"]) for e in entries] == [
+        (m.role, m.content) for m in messages
+    ]
+    ids = [e["message"].get("id") for e in entries if e["type"] == "assistant"]
+    assert len(ids) == 3
+    assert all(isinstance(identifier, str) and identifier for identifier in ids)
+    assert len(set(ids)) == 1
