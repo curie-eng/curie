@@ -95,6 +95,17 @@ def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
     return parsed
 
 
+def declared_secret_names(plugin_dir: str | Path) -> frozenset[str]:
+    """Names from the same validated connector declaration the runner mounts."""
+
+    declared = _read(plugin_dir)
+    if declared is None:
+        return frozenset()
+    return frozenset(
+        name for spec in declared.connectors.values() for name in spec.secret_names()
+    )
+
+
 def _allowlist(plugin_dir: str | Path, agent: str) -> frozenset[str] | None:
     """The connectors ``agent`` runs, read from the bundle's deploy.yaml.
 

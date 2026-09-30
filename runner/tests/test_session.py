@@ -119,6 +119,7 @@ def _runner(
 ) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(script_factory)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=ceiling,
         tracer=RunTracer(None),
@@ -204,6 +205,7 @@ def _runner_with_history(
     fake = session or FakeModelSession(script_factory)
     return (
         SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: fake,
             ceiling=0,
             tracer=tracer or RunTracer(None),
@@ -634,6 +636,7 @@ def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
         ]
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(turn),
         ceiling=0,
         tracer=RunTracer(None),
@@ -683,6 +686,7 @@ def test_interrupting_a_stalled_phase_preserves_phase_and_cancels_cleanly(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(provider),
@@ -743,6 +747,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(provider),
@@ -800,6 +805,7 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     fake = FakeModelSession()
     store = _RecordingTranscriptStore()
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -944,6 +950,7 @@ def test_timeout_during_abandonment_cleanup_cannot_own_next_turn_stop() -> None:
 
     session = CleanupRaceSession()
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(None),
@@ -1070,6 +1077,7 @@ def test_next_turn_waits_for_timeout_interrupt_to_settle() -> None:
 
     session = SlowTimeoutInterruptSession()
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(None),
@@ -1238,6 +1246,7 @@ def _exercise_timeout_interrupt_failure(
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -1407,6 +1416,7 @@ def test_timeout_precedes_an_operator_interrupt_on_the_same_turn() -> None:
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -1460,6 +1470,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(provider),
@@ -1536,6 +1547,7 @@ def test_no_tool_turn_start_log_carries_its_agent_run_trace(
         ]
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -1610,6 +1622,7 @@ def test_interrupt_reclassifies_error_result_to_idle() -> None:
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake, ceiling=0, tracer=RunTracer(None),
         classifier=SideEffectClassifier(), trace_name="t",
     )
@@ -1644,6 +1657,7 @@ def test_sdk_exception_still_terminates_in_final() -> None:
         async def close(self) -> None: ...
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=RaisingSession, ceiling=0, tracer=RunTracer(None),
         classifier=SideEffectClassifier(), trace_name="t",
     )
@@ -1670,6 +1684,7 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
         async def close(self) -> None: ...
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=RaisingSession,
         ceiling=0,
         tracer=RunTracer(None),
@@ -1747,6 +1762,7 @@ def test_auth_fast_fail_survives_a_wedged_interrupt(caplog) -> None:
     script = [AssistantMessage(content=[], model="m", error="authentication_failed")]
     fake = WedgedInterruptSession(lambda: script)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),
@@ -2042,6 +2058,7 @@ def _connector_runner(
 ) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(default_turn)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=tracer or RunTracer(None),
@@ -2191,6 +2208,7 @@ def _reconnect_runner(
         return failures if len(reprobes) == 1 else ()
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(None),
@@ -2421,6 +2439,7 @@ def test_slow_session_confirmation_is_not_cancelled_by_the_budget(
         return ()
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(None),
@@ -2481,6 +2500,7 @@ def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
 
     fake = FakeModelSession(failing_turn)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),
