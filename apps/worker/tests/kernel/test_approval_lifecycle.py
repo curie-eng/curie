@@ -2062,6 +2062,33 @@ def test_a_string_detail_api_refusal_is_carried_as_the_refusal() -> None:
     assert error.refusal == message
 
 
+def test_a_long_refusal_is_redacted_whole_before_it_is_clipped() -> None:
+    """A secret whose closing delimiter lies past any clip must still redact.
+
+    The refusal reaches a public GitHub issue, so a clip that runs before
+    redaction would cut the PEM end line and leak the key body.
+    """
+
+    from curie_worker.kernel import _ApprovalPause
+
+    body = "A" * 900
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+    error = asyncio.run(
+        _create_publication_error(
+            httpx.Response(
+                409,
+                json={"detail": {"code": "publication.example", "message": f"x {pem}"}},
+            )
+        )
+    )
+
+    pause = _ApprovalPause.refused(error.refusal)
+
+    assert pause.failure_detail is not None
+    assert "publication.example" in pause.failure_detail
+    assert "AAAAAAAAAA" not in pause.failure_detail
+
+
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
     """A legacy/root call without an active trace stays a clean HTTP root."""
 
