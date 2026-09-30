@@ -85,9 +85,10 @@ ordinary turns on the same install are untouched.
   exact. A consumer decoding the wire rejects an unknown value; it never reads
   one as null. A value added later is therefore a breaking change under the
   change-class table in `packages/CLAUDE.md`, decided on its own.
-- **TOOL-ACCESS-3:** `read-only` means that, for the whole turn, including any
-  steer delivered into it, only tools the ACI server explicitly classifies as
-  read-only may execute. Every other tool, including one the server has no
+- **TOOL-ACCESS-3:** On a server that advertises it (TOOL-ACCESS-4),
+  `read-only` means that, for the whole turn, including any steer delivered
+  into it, only tools the server explicitly classifies as read-only may
+  execute. Every other tool, including one the server has no
   classification for, is denied before it executes, and the model is told it
   was denied. The turn never requests an approval and never ends
   `awaiting-approval`: a tool that needs approval is denied even when it is
@@ -100,24 +101,30 @@ ordinary turns on the same install are untouched.
   that the same server it is about to send it to does not advertise, because a
   server that does not enforce the field ignores it and would run the turn
   unrestricted. It refuses that turn instead.
-- **TOOL-ACCESS-5:** `POST /v1/steer` joins the live turn only when the steer
-  frame's `tool_access` equals the live turn's. Otherwise it answers `409`, so
+- **TOOL-ACCESS-5:** On a server that advertises a tool access, `POST /v1/steer`
+  joins the live turn only when the steer frame's `tool_access` equals the
+  live turn's. Otherwise it answers `409`, so
   the caller opens its own turn and neither message runs under the other's
   access.
 - **TOOL-ACCESS-6:** A worker that implements this contract forwards
   `QueuedTurn.tool_access` as `Event.tool_access` under TOOL-ACCESS-4, never
   steers a restricted turn into a live turn, and never creates an approval
   from a `read-only` turn: an `awaiting-approval` ending on one is a failed
-  turn. A worker that does not implement it decodes the field and drops it,
+  turn. A worker that does not implement it ignores or drops the field,
   whatever its protocol version, so a turn producer sets `tool_access` only
   toward workers known to implement TOOL-ACCESS-6, and ones whose runners
   advertise it under TOOL-ACCESS-4.
 - **TOOL-ACCESS-7:** A consumer that compares a turn it received with a copy it
   stored earlier compares the decoded models, each read tolerantly, never the
   raw JSON, so a turn stored before `tool_access` existed still matches the
-  same turn decoded after it.
+  same turn decoded after it. The comparison covers only the fields the
+  comparing consumer models, so a field that grants authority must be modelled
+  by that consumer before any worker acts on it.
 
 ## Implementations today
+
+TOOL-ACCESS is contract only so far: the reference runner advertises no
+`tool_access` and the worker does not forward it.
 
 One producer (the runner, `runner/src/curie_runner/adapter.py`, a `ModelSession` wrapping
 `ClaudeSDKClient`) plus the in-library `reference_producer` used by the conformance suite. The
