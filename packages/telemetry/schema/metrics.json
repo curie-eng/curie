@@ -1637,6 +1637,18 @@
       },
       "cardinality_bound": 10
     },
+    "curie.connector.reconcile.skipped_agents": {
+      "type": "gauge",
+      "unit": "{agent}",
+      "description": "Agents whose connector applies the reconciler is skipping.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1
+    },
     "curie.work_item.reconciler.step.failure": {
       "type": "counter",
       "unit": "{failure}",
