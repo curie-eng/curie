@@ -59,7 +59,7 @@ from oidc_test_idp import (  # noqa: E402
 # sibling subdomain or a plaintext response cannot plant a state of its own.
 STATE_COOKIE = "__Host-curie_oidc_state"
 LEGACY_STATE_COOKIE = "curie_oidc_state"
-SESSION_COOKIE = "curie_console_session"
+SESSION_COOKIE = "__Host-curie_console_session"
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
@@ -1021,10 +1021,12 @@ def test_oidc_session_cannot_resolve_an_approval(
     assert approval.status_code == 201, approval.text
     approval_id = approval.json()["id"]
 
+    # A matching Origin passes the cookie-only origin check, so the refusal
+    # below is the NULL subject's and not the origin's.
     denied = oidc_client.post(
         f"/approvals/{approval_id}/resolve",
         json={"decision": "approved"},
-        headers=_cookie(SESSION_COOKIE, token),
+        headers={**_cookie(SESSION_COOKIE, token), "Origin": "http://testserver"},
     )
     assert denied.status_code == 401, denied.text
     status = oidc_client.get(f"/approvals/{approval_id}", headers=auth_headers).json()["status"]
