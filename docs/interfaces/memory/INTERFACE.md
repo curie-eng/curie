@@ -90,7 +90,11 @@ reached with the same memory token:
 At boot the runner lists whichever of the two it was given and renders a
 "Remembered facts" block (agent facts, then channel facts, newest first, at
 most 200 per memory, each statement flattened to one line and framed as data,
-not instructions) after the legacy log preamble. With memory writes off no
+not instructions) after the legacy log preamble. Each line reads
+`- [<id>] <statement> (stated by <author> on <YYYY-MM-DD>)`, or
+`(author unknown, ...)` when no person is recorded; the author is flattened and
+capped at 64 characters, and the block tells the model to weigh each fact by who
+stated it. With memory writes off no
 channel ref is minted, so only agent facts are loaded. When
 `CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
 `forget` on the platform `curie` server and injects the guidance block
