@@ -307,3 +307,72 @@ fn dev_channel_build_with_a_local_compose_is_accepted() {
         "stdout must show the dev base tag being written\n{stdout}"
     );
 }
+
+/// `--dry-run --build` lists the image builds the real run performs (#1929
+/// item 7). They are its dominant cost and its only filesystem side effect,
+/// so a plan that shows only the compose line understates what the run does.
+///
+/// The expected lines come from `local::source_images_for`, the list
+/// `build_source_images` iterates, so the plan cannot name a different set of
+/// images than the build builds. The docker stub proves the dry run still
+/// builds nothing.
+#[test]
+fn build_dry_run_plans_every_image_build_before_the_compose_line() {
+    for minimal in [true, false] {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        write_checkout(temp.path());
+        let tools = temp.path().join("tools");
+        let docker_log = temp.path().join("docker-invocations.log");
+        write_docker_stub(&tools, &docker_log);
+
+        let mut args = vec!["--build", "--dry-run", "--json"];
+        if minimal {
+            args.push("--minimal");
+        }
+        let output = run_local_up(temp.path(), &args, None, Some(&tools));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "dev-channel --build --dry-run must succeed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+
+        let doc: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("--json dry run emits one JSON object");
+        let plan: Vec<String> = doc["plan"]
+            .as_array()
+            .expect("the dry run carries a plan array")
+            .iter()
+            .map(|line| line.as_str().expect("plan lines are strings").to_string())
+            .collect();
+
+        let images = curie::local::source_images_for(minimal);
+        assert_eq!(
+            plan.len(),
+            images.len() + 1,
+            "one docker build per source image, then the compose line: {plan:#?}"
+        );
+        for (line, image) in plan.iter().zip(&images) {
+            let tag = curie::local::source_image_ref(image.image, curie::local::SOURCE_IMAGE_TAG);
+            assert!(
+                line.starts_with(&format!("docker build -f {} -t {tag}", image.dockerfile))
+                    && line.ends_with(" ."),
+                "expected the {} build, got: {line}\nplan: {plan:#?}",
+                image.image
+            );
+        }
+        let last = plan.last().expect("the plan is not empty");
+        assert!(
+            last.contains("docker compose"),
+            "the compose line comes after every build: {plan:#?}"
+        );
+
+        // A dry run may still READ docker state (the stack-key resolver
+        // inspects the Postgres volume); it must never build.
+        let invoked = fs::read_to_string(&docker_log).unwrap_or_default();
+        assert!(
+            !invoked.lines().any(|line| line.starts_with("build")),
+            "a dry run must not run docker build; stub log: {invoked}"
+        );
+    }
+}
