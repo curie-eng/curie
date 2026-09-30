@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -11,6 +12,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -159,6 +161,18 @@ def _scan(
         "--exit-code",
         "1",
     ]
+    # A same-version native release lets contributors exercise the real scanner
+    # without starting Docker. CI still uses the workflow's immutable image.
+    if binary := os.environ.get("GITLEAKS_TEST_BINARY"):
+        version = subprocess.run(
+            [binary, "version"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        image_version = _gitleaks_image().split(":v", 1)[1].split("@", 1)[0]
+        assert version == image_version, "native scanner must match the pinned CI version"
+        command = [binary, "detect", "--source", str(repo), "--redact", "--verbose",
+                   "--exit-code", "1"]
+        if report_path is not None:
+            report_path = str(repo / PurePosixPath(report_path).relative_to("/repo"))
     if report_path is not None:
         command.extend(["--report-path", report_path])
     if log_range is not None:
@@ -470,3 +484,49 @@ def test_attribution_command_names_the_tag_a_finding_came_from(tmp_path: Path) -
     assert not re.search(rf"{re.escape(leaky_sha)} appears on:\s*$", attribution.stdout, re.M), (
         f"the finding was reported with no ref named: {attribution.stdout}"
     )
+
+
+@pytest.mark.parametrize(
+    ("owner", "name", "suffix", "expected_rules"),
+    [
+        ("curie-eng", "acme-private", "", {"downstream-repo-slug"}),
+        ("Curie-Eng", "acme-private", "", {"downstream-repo-slug"}),
+        ("CURIE-ENG", "acme-secret-agent", "", {"downstream-repo-slug"}),
+        ("curie-eng", "acme-private", "#123", {"downstream-repo-slug", "cross-repo-issue-ref"}),
+        ("Curie-Eng", "acme-private", "#123", {"downstream-repo-slug", "cross-repo-issue-ref"}),
+        ("acme-corp", "acme-bot", "#123", {"cross-repo-issue-ref"}),
+        ("curie-eng", "curie", "#123", set()),
+        ("Curie-Eng", "Curie", "#123", set()),
+        ("CURIE-ENG", "AGENTOS", "#123", set()),
+        ("curie-eng", "curie", ".git", set()),
+        ("Curie-Eng", "Curie", ".git", set()),
+        ("CURIE-ENG", "AGENTOS", ".git", set()),
+        ("curie-eng", "curie", ".", set()),
+        ("curie-eng", "curie", "-{runner,api}", set()),
+        ("Curie-Eng", "Curie-runner", "", set()),
+        ("curie-eng", "curie", ".git-extra", {"downstream-repo-slug"}),
+        ("curie-eng", "curie", ".git.other", {"downstream-repo-slug"}),
+        ("#456", "PR", "#503", set()),
+    ],
+)
+def test_repository_identifier_rules_preserve_case_and_clone_verdicts(
+    tmp_path: Path, owner: str, name: str, suffix: str, expected_rules: set[str]
+) -> None:
+    """Use the pinned scanner, including its RE2 match and allowlist semantics.
+
+    Every non-platform name is invented. Build the owner/name form at runtime
+    so the corpus does not itself name a forbidden downstream repository.
+    """
+    repo, base_sha = _new_repo(tmp_path / "repo")
+    (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
+    slug = f"{owner}/{name}{suffix}"
+    (repo / "identifiers.txt").write_text(
+        f"{slug}\nhttps://github.com/{slug}\ngit@github.com:{slug}\n", encoding="utf-8"
+    )
+    head_sha = _commit(repo, "add invented identifier probes")
+
+    scan = _scan(repo, f"{base_sha}..{head_sha}", report_path="/repo/findings.json")
+
+    assert scan.returncode == (1 if expected_rules else 0), _scan_diagnostics(scan)
+    findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
+    assert {finding["RuleID"] for finding in findings} == expected_rules
