@@ -45,13 +45,26 @@ PERMANENT = [
 ]
 TRANSIENT = ["timeout", "observation_busy", "github_rate_limited", "github_error"]
 
+
 # Curie's own layout, configured per repository since #3617. Defined here rather
-# than imported so the tests pin the operator-facing values.
-CURIE_PYTHON_CI = factory_ci.PythonCiPolicy(
-    check="Python (ruff + mypy + pytest)",
-    paths=("apps", "runner", "cli", "adapters", "packages", "examples/tests", "tools", "release"),
-    pending_check_prefix="Python pytest (shard ",
-)
+# than imported so the tests pin the operator-facing values. Built per test, not
+# at import, so this module still collects against a tree without the policy
+# and the fix pin attributes that failure to the pinned test.
+def curie_python_ci() -> factory_ci.PythonCiPolicy:
+    return factory_ci.PythonCiPolicy(
+        check="Python (ruff + mypy + pytest)",
+        paths=(
+            "apps",
+            "runner",
+            "cli",
+            "adapters",
+            "packages",
+            "examples/tests",
+            "tools",
+            "release",
+        ),
+        pending_check_prefix="Python pytest (shard ",
+    )
 
 
 def _run(
@@ -127,7 +140,7 @@ def test_later_non_python_fix_cannot_drop_prior_python_ci_requirement() -> None:
     skipped["app"] = {"slug": "github-actions"}
 
     verdict = _decide(
-        _detail(skipped), 130, changed_paths=changed_paths, python_ci=CURIE_PYTHON_CI
+        _detail(skipped), 130, changed_paths=changed_paths, python_ci=curie_python_ci()
     )
 
     assert verdict.kind == "unverified"
@@ -488,7 +501,7 @@ def test_in_progress_pytest_shards_keep_waiting_for_the_aggregate() -> None:
         _detail(*_pytest_shards(), _actions_run("PR body (real newlines)", run_id=4)),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -502,7 +515,7 @@ def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None
         _detail(*_pytest_shards()),
         30,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
         prior_round_had_checks=True,
     )
 
@@ -518,7 +531,7 @@ def test_a_pending_status_keeps_the_missing_python_aggregate_waiting() -> None:
         ),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -533,7 +546,7 @@ def test_a_visible_failure_still_fails_fast_while_pytest_shards_run() -> None:
         ),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "failing"
@@ -547,7 +560,7 @@ def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> N
         _detail(*_pytest_shards(status="completed")),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -556,7 +569,7 @@ def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> N
         _detail(*_pytest_shards(status="completed")),
         1200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
     assert expired.kind == "unverified"
     assert expired.reason == "required_python_ci_unrelated"
@@ -567,7 +580,7 @@ def test_settled_non_shard_checks_without_the_python_aggregate_are_unverified() 
         _detail(_actions_run("gitleaks (full history)"), _actions_run("cargo audit", run_id=2)),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "unverified"
@@ -579,7 +592,7 @@ def test_a_missing_python_aggregate_is_unverified_at_the_ci_deadline() -> None:
         _detail(*_pytest_shards()),
         1200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
 
     assert verdict.kind == "unverified"
@@ -593,7 +606,7 @@ def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
         _detail(*_pytest_shards()),
         200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
         execution_deadline=early,
     )
 
@@ -602,17 +615,17 @@ def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
 
 
 def test_python_changes_with_no_checks_follow_the_grace_window() -> None:
-    waiting = _decide(_detail(), 119, changed_paths=[_PYTHON_PATH], python_ci=CURIE_PYTHON_CI)
+    waiting = _decide(_detail(), 119, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
     assert waiting.kind == "pending"
     assert waiting.reason == "required_python_ci_missing"
-    missing = _decide(_detail(), 180, changed_paths=[_PYTHON_PATH], python_ci=CURIE_PYTHON_CI)
+    missing = _decide(_detail(), 180, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
     assert missing.kind == "unverified"
     assert missing.reason == "required_python_ci_missing"
 
 
 def test_the_python_aggregate_is_judged_once_it_appears() -> None:
     shards = _pytest_shards(status="completed")
-    paths = {"changed_paths": [_PYTHON_PATH], "python_ci": CURIE_PYTHON_CI}
+    paths = {"changed_paths": [_PYTHON_PATH], "python_ci": curie_python_ci()}
     running = _actions_run(_PYTHON_AGGREGATE, status="in_progress", run_id=9)
     pending = _decide(_detail(*shards, running), 600, **paths)
     assert pending.kind == "pending"
@@ -677,33 +690,34 @@ def test_without_a_policy_no_python_path_is_unselected() -> None:
 
 def test_the_curie_policy_still_refuses_an_unselected_path() -> None:
     assert (
-        factory_ci._unselected_python_path(["examples/coder/foo.py"], CURIE_PYTHON_CI)
+        factory_ci._unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
         == "examples/coder/foo.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], CURIE_PYTHON_CI) is None
+    assert factory_ci._unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
     verdict = _decide(
         _detail(_actions_run(_PYTHON_AGGREGATE)),
         180,
         changed_paths=["examples/coder/foo.py"],
-        python_ci=CURIE_PYTHON_CI,
+        python_ci=curie_python_ci(),
     )
     assert verdict.kind == "unverified"
     assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
 
 
-_CUSTOM_PYTHON_CI = factory_ci.PythonCiPolicy(check="Unit tests", paths=("src",))
+def custom_python_ci() -> factory_ci.PythonCiPolicy:
+    return factory_ci.PythonCiPolicy(check="Unit tests", paths=("src",))
 
 
 def test_a_custom_policy_selects_only_its_paths() -> None:
-    assert factory_ci._unselected_python_path(["src/widget.py"], _CUSTOM_PYTHON_CI) is None
-    assert factory_ci._unselected_python_path(["srcx/widget.py"], _CUSTOM_PYTHON_CI) == (
+    assert factory_ci._unselected_python_path(["src/widget.py"], custom_python_ci()) is None
+    assert factory_ci._unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
         "srcx/widget.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], _CUSTOM_PYTHON_CI) == _PYTHON_PATH
+    assert factory_ci._unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
 
 
 def test_a_custom_policy_requires_its_own_check_name() -> None:
-    paths = {"changed_paths": ["src/widget.py"], "python_ci": _CUSTOM_PYTHON_CI}
+    paths = {"changed_paths": ["src/widget.py"], "python_ci": custom_python_ci()}
     green = _decide(_detail(_actions_run("Unit tests")), 180, **paths)
     assert green.kind == "green"
 
@@ -722,7 +736,7 @@ def test_a_custom_policy_requires_its_own_check_name() -> None:
 
 
 def test_a_policy_without_a_pending_prefix_does_not_wait_on_shard_names() -> None:
-    paths = {"changed_paths": ["src/widget.py"], "python_ci": _CUSTOM_PYTHON_CI}
+    paths = {"changed_paths": ["src/widget.py"], "python_ci": custom_python_ci()}
     verdict = _decide(_detail(*_pytest_shards(status="completed")), 180, **paths)
     assert verdict.kind == "unverified"
     assert verdict.reason == "required_python_ci_unrelated"
@@ -740,8 +754,8 @@ def test_a_custom_pending_prefix_keeps_waiting_for_its_aggregate() -> None:
 
 def test_python_ci_policy_is_frozen() -> None:
     with pytest.raises(AttributeError):
-        CURIE_PYTHON_CI.check = "other"  # type: ignore[misc]
-    assert CURIE_PYTHON_CI.pending_check_prefix == "Python pytest (shard "
+        curie_python_ci().check = "other"  # type: ignore[misc]
+    assert curie_python_ci().pending_check_prefix == "Python pytest (shard "
     assert factory_ci.PythonCiPolicy(check="c", paths=("p",)).pending_check_prefix is None
 
 
@@ -757,7 +771,7 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
             {
                 "curie-eng/curie": {
                     "check": "Python (ruff + mypy + pytest)",
-                    "paths": list(CURIE_PYTHON_CI.paths),
+                    "paths": list(curie_python_ci().paths),
                     "pendingCheckPrefix": "Python pytest (shard ",
                 },
                 "Acme/Widgets": {
@@ -768,8 +782,8 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
             }
         )
     )
-    assert factory_ci.python_ci_policy(settings, "Curie-Eng/Curie") == CURIE_PYTHON_CI
-    assert factory_ci.python_ci_policy(settings, "acme/widgets") == _CUSTOM_PYTHON_CI
+    assert factory_ci.python_ci_policy(settings, "Curie-Eng/Curie") == curie_python_ci()
+    assert factory_ci.python_ci_policy(settings, "acme/widgets") == custom_python_ci()
     assert factory_ci.python_ci_policy(settings, "acme-corp/acme-fixture") is None
 
 
