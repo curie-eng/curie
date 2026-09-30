@@ -13,8 +13,13 @@ the placeholder it posts.
 
 ### SRE-EMAIL-1 — select only configured alert roots
 
-On every poll, the intake lists top-level messages in one configured channel,
-at or after a configured timestamp. A candidate must:
+The first scan after startup lists top-level messages in one configured channel
+at or after the configured timestamp floor. Later successful scans move the
+discovery window to the previous scan start minus the placeholder deadline and
+two poll intervals. Failed scans never advance that window. Pending roots remain
+tracked until a completed reply acknowledges them, even outside the discovery
+window. Restart reconstructs acknowledgement state from Slack starting at the
+configured floor. A candidate must:
 
 - have the configured Slack Email source user, and the configured source bot
   when one is supplied;
@@ -27,8 +32,12 @@ configuration. This public example carries no tenant-specific values. The scan
 is oldest first and follows Slack pagination, so a later alert cannot starve an
 older one.
 
-One known matching root is configured as the canary. Every complete scan must
-still find it, classify it as a candidate, read its replies, download its file,
+Acknowledged roots within the discovery overlap are cached in memory and do
+not reread their replies. That cache expires with the overlap window.
+
+One known matching root is configured as the canary. Each scan looks it up
+directly by timestamp, independent of the discovery window. Every complete scan
+must still classify it as a candidate, read its replies, download its file,
 and receive the source conversation id from the signed hook. Once its original
 delivery has completed, the stable delivery id makes this a duplicate receipt,
 not another turn. This distinguishes a genuinely quiet channel from a broken
@@ -55,8 +64,12 @@ tool or raise an approval from an email alert.
 
 ### SRE-EMAIL-3 — no silent failure
 
-Configuration, Slack API, file download, hook authentication, hook routing, and
-receipt mismatches are fatal. Network calls have finite timeouts. An unchanged
+Configuration, non-rate-limit Slack API and file download errors, hook
+authentication, hook routing, and receipt mismatches are fatal. Slack HTTP 429
+and `ratelimited` responses pause scanning according to `Retry-After` (one poll
+interval when the header is absent or invalid). An interrupted scan never marks
+readiness successful; prolonged throttling expires readiness and pages without
+a restart loop. Network calls have finite timeouts. An unchanged
 placeholder older than the configured deadline is also fatal. The Deployment
 uses one replica and `Recreate`, so rollouts cannot race two placeholder posts.
 Slack API and private-file redirects are followed only within `slack.com`; an
