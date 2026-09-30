@@ -562,11 +562,15 @@ def test_a_read_only_turn_accepts_no_steer_and_joins_no_other_turn() -> None:
     assert session.queries == ["first", "second"]
 
 
-def _refused_before_the_model(frames: list[Any], session: FakeModelSession) -> None:
+def _refused_before_the_model(
+    frames: list[Any],
+    session: FakeModelSession,
+    classification: str = "tool-access-unenforced",
+) -> None:
     final = _final(frames)
     assert final.status is SessionStatus.CLASSIFIED_FAILURE
     errors = [f for f in frames if isinstance(f, ErrorEvent)]
-    assert [e.classification for e in errors] == ["tool-access-unenforced"]
+    assert [e.classification for e in errors] == [classification]
     assert "read-only" not in session.queries
 
 
@@ -598,14 +602,62 @@ def test_a_session_that_accepted_a_steer_refuses_a_read_only_turn() -> None:
     assert session.queries == ["first", "ordinary follow-up"]
 
 
-def test_an_unsteered_session_still_runs_a_read_only_turn_after_an_ordinary_one() -> None:
-    # @spec RUNNER-TOOL-ACCESS-4: the control for the test above.
+def test_a_session_that_ran_an_ordinary_turn_refuses_a_read_only_turn() -> None:
+    # @spec RUNNER-TOOL-ACCESS-4 RUNNER-TOOL-ACCESS-5: an ordinary turn can
+    # leave work the CLI answers as its own turn later (a background task's
+    # notification), with no steer at all.
     runner, session = _fake_runner(default_turn, gate=None, access=_access())
 
-    turns = _drive(runner, _event("first"), _event("read-only", tool_access=ToolAccess.READ_ONLY))
+    first, second = _drive(
+        runner, _event("first"), _event("read-only", tool_access=ToolAccess.READ_ONLY)
+    )
 
-    assert _final(turns[1]).status is SessionStatus.DONE
-    assert session.queries == ["first", "read-only"]
+    assert _final(first).status is SessionStatus.DONE
+    _refused_before_the_model(second, session)
+    assert session.queries == ["first"]
+    assert runner.enforced_tool_access == ()
+
+
+def test_a_session_that_ran_only_read_only_turns_runs_another() -> None:
+    # @spec RUNNER-TOOL-ACCESS-4: the control; a read-only turn can leave no
+    # such work, so a retry on the same session still runs.
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    first, second = _drive(
+        runner,
+        _event("probe", tool_access=ToolAccess.READ_ONLY),
+        _event("probe again", tool_access=ToolAccess.READ_ONLY),
+    )
+
+    assert _final(first).status is SessionStatus.DONE
+    assert _final(second).status is SessionStatus.DONE
+    assert session.queries == ["probe", "probe again"]
+    assert runner.enforced_tool_access == ("read-only",)
+
+
+def test_a_reset_session_runs_a_read_only_turn_again() -> None:
+    # @spec RUNNER-TOOL-ACCESS-4: a new SDK session carries nothing over.
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    async def go() -> list[Any]:
+        await runner.start()
+        try:
+            async for _ in runner.run_turn(_event("first")):
+                pass
+            assert runner.enforced_tool_access == ()
+            await runner.reset()
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    _event("probe", tool_access=ToolAccess.READ_ONLY)
+                )
+            ]
+        finally:
+            await runner.close()
+        return list(parse_ndjson("".join(lines)))
+
+    assert _final(anyio.run(go)).status is SessionStatus.DONE
+    assert runner.enforced_tool_access == ("read-only",)
 
 
 @pytest.mark.parametrize("text", ["/acme-bot:probe", "  /acme-bot:probe now", "\n/compact"])
@@ -615,7 +667,7 @@ def test_a_read_only_slash_command_is_refused_before_the_model(text: str) -> Non
 
     [frames] = _drive(runner, _event(text, tool_access=ToolAccess.READ_ONLY))
 
-    _refused_before_the_model(frames, session)
+    _refused_before_the_model(frames, session, "tool-access-refused")
     assert session.queries == []
 
 
@@ -661,6 +713,8 @@ def test_a_decision_that_fails_denies(monkeypatch: pytest.MonkeyPatch) -> None:
         assert _is_deny(_run(matcher.hooks[0], "Read"))
     assert approval_calls == []
     assert bundle_calls == []
+    # @spec RUNNER-TOOL-ACCESS-6: recorded, so it counts refused, not error.
+    assert access.refused_call_ids == {"toolu_acme01"}
 
     async def go() -> Any:
         return await front_can_use_tool(None, access)(
