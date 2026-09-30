@@ -1207,15 +1207,16 @@ class ToolAccessUnenforced(Exception):
     """The runner a restricted turn would go to does not enforce its access.
 
     @spec WORKER-TOOL-ACCESS-2: a runner that does not list the value under
-    ``tool_access`` would ignore the field and run the turn unrestricted, so the
-    turn is refused once and never retried against the same boot.
+    ``tool_access`` would ignore the field and run the turn unrestricted, or
+    cannot enforce it on this session, so the turn is refused once and never
+    retried against the same boot.
     """
 
     def __init__(self, access: ToolAccess) -> None:
         super().__init__(f"the runner does not advertise tool access {access.value!r}")
         self.public_detail = (
-            f"This agent cannot start: its runner does not enforce {access.value} tool "
-            "access, so this turn was not run."
+            f"This agent cannot start: its runner cannot enforce {access.value} tool "
+            "access for this turn, so the turn was not run."
         )
 
 
