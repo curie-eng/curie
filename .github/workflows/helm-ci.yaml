@@ -385,6 +385,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/security-probe-byo-runner-egress-assertions.sh
 
+      # Prove a real model under security.gvisor.mode=auto stamps runtimeClassName
+      # on the runner SandboxTemplate when Helm lookup is empty, and that the
+      # security probe fails when that template lacks the class (#3558).
+      - name: helm render assertions (gVisor runtime class on the runner template)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/gvisor-runtime-class-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
