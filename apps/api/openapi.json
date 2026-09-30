@@ -20246,7 +20246,7 @@
         "parameters": [
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -20257,7 +20257,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
