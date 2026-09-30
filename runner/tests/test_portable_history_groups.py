@@ -710,3 +710,51 @@ def test_idless_native_cache_cannot_bypass_proven_portable_group(tmp_path):
     assert len(ids) == 3
     assert all(isinstance(identifier, str) and identifier for identifier in ids)
     assert len(set(ids)) == 1
+
+
+@pytest.mark.parametrize("difference", ["changed_input", "extra_conversation_row"])
+def test_current_prompt_cache_cannot_override_meaningful_portable_content(tmp_path, difference):
+    import copy
+
+    messages = _interleaved()
+    native = [
+        {
+            "type": m.role,
+            "uuid": f"acme-native-{index}",
+            "message": {
+                "role": m.role,
+                "content": copy.deepcopy(m.content),
+                **({"id": "msg_acme_native"} if m.role == "assistant" else {}),
+            },
+        }
+        for index, m in enumerate(messages)
+    ]
+    if difference == "changed_input":
+        native[0]["message"]["content"][0]["input"] = {"file_path": "/tmp/acme-unverified"}
+    else:
+        native.append(
+            {
+                "type": "user",
+                "uuid": "acme-extra-native",
+                "message": {"role": "user", "content": "unmatched native request"},
+            }
+        )
+    current_prompt = "current attachment unavailable"
+    native.append(
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "prompt_snapshot",
+                "systemPrompt": [current_prompt],
+            },
+        }
+    )
+    checkpoint = HarnessReplayState(harness="claude", kind="checkpoint", entries=tuple(native))
+    entries = _entries(messages, tmp_path, harness_replay=checkpoint, system_prompt=current_prompt)
+    conversation = [e["message"] for e in entries if e["type"] in {"user", "assistant"}]
+    assert [(m["role"], m["content"]) for m in conversation] == [
+        (m.role, m.content) for m in messages
+    ]
+    ids = [m.get("id") for m in conversation if m["role"] == "assistant"]
+    assert len(ids) == 3 and all(isinstance(identifier, str) and identifier for identifier in ids)
+    assert len(set(ids)) == 1
