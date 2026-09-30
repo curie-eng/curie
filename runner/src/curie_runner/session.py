@@ -77,6 +77,7 @@ from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 from .tool_access import (
     ENFORCED_TOOL_ACCESS,
+    TOOL_ACCESS_REFUSED_CLASSIFICATION,
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
@@ -304,11 +305,12 @@ class SessionRunner:
         # None means this session cannot enforce one, so it refuses a restricted
         # turn rather than run it unrestricted (RUNNER-TOOL-ACCESS-5).
         self._tool_access = tool_access
-        # Whether this SDK session has accepted a steer (RUNNER-TOOL-ACCESS-4).
-        # A late steer can be answered by the CLI as a turn of its own, after
-        # this runner has moved on, so a steered session never runs a
-        # restricted turn. Cleared only by a new SDK session (reset).
-        self._steered = False
+        # Whether this SDK session has sent an unrestricted prompt, an ordinary
+        # turn or any steer (RUNNER-TOOL-ACCESS-4). Such a prompt can leave
+        # work the CLI answers as turns of its own after this runner has moved
+        # on, so the session never again runs a restricted turn. Cleared only
+        # by a new SDK session (reset).
+        self._unrestricted_prompt_sent = False
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
@@ -491,27 +493,32 @@ class SessionRunner:
         @spec RUNNER-TOOL-ACCESS-5
         """
 
-        if self._tool_access is None:
+        if self._tool_access is None or self._unrestricted_prompt_sent:
             return ()
         return tuple(access.value for access in ENFORCED_TOOL_ACCESS)
 
-    def _tool_access_refusal(self, event: Event) -> str | None:
-        """Why this session will not run ``event``'s restricted turn, or None."""
+    def _tool_access_refusal(self, event: Event) -> tuple[str, str] | None:
+        """(message, classification) refusing ``event``'s restricted turn, or None."""
 
         access = event.tool_access
         if access is None:
             return None
-        if self._tool_access is None or access not in ENFORCED_TOOL_ACCESS:
-            return f"this runner cannot enforce tool access {access.value!r}; the turn was not run"
-        if self._steered:
+        if access.value not in self.enforced_tool_access:
+            reason = (
+                "this session has sent an unrestricted prompt"
+                if self._tool_access is not None and self._unrestricted_prompt_sent
+                else "this runner does not enforce it"
+            )
             return (
-                f"this session has accepted a steer, so it cannot run a {access.value} "
-                "turn; the turn was not run"
+                f"this session cannot enforce tool access {access.value!r} ({reason}); "
+                "the turn was not run",
+                TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
             )
         if event.text.lstrip().startswith("/"):
             return (
                 f"a {access.value} turn cannot start with a slash command, which can run "
-                "shell with no tool call; the turn was not run"
+                "shell with no tool call; the turn was not run",
+                TOOL_ACCESS_REFUSED_CLASSIFICATION,
             )
         return None
 
@@ -752,8 +759,8 @@ class SessionRunner:
             self._session = self._factory()
             await self._session.connect()
             self._result_pending = False
-            # A new SDK session carries no steered prompt (RUNNER-TOOL-ACCESS-4).
-            self._steered = False
+            # A new SDK session carries no earlier prompt (RUNNER-TOOL-ACCESS-4).
+            self._unrestricted_prompt_sent = False
             self._interrupt_requested = False
             self._timeout_requested = False
             self._timeout_interrupt_settled = None
@@ -785,7 +792,7 @@ class SessionRunner:
             # @spec RUNNER-TOOL-ACCESS-4: a restricted turn accepts no steer,
             # and a restricted steer joins no turn.
             return False
-        self._steered = True
+        self._unrestricted_prompt_sent = True
         await self._session.query(text)
         if self._active_state is not None:
             self._active_state.history_messages.append(
@@ -1002,8 +1009,8 @@ class SessionRunner:
                             terminal_for_log = True
                             yield to_ndjson_line(
                                 ErrorEvent(
-                                    message=access_refusal,
-                                    classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                                    message=access_refusal[0],
+                                    classification=access_refusal[1],
                                 )
                             )
                             yield to_ndjson_line(
@@ -1343,6 +1350,8 @@ class SessionRunner:
         if self._tool_access is not None:
             # @spec RUNNER-TOOL-ACCESS-4: in force from this prompt until the next.
             self._tool_access.begin(event.tool_access)
+        if event.tool_access is None:
+            self._unrestricted_prompt_sent = True
         self._result_pending = True
         await self._session.query(event.text)
         async for message in self._session.receive_turn():

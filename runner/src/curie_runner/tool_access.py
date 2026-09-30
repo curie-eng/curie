@@ -13,7 +13,9 @@ The fronts wrap callbacks rather than sit beside them as sibling matchers. The
 CLI dispatches every matcher on one event concurrently, so a sibling approval
 hook would still record a pending approval, or spend a one-shot grant, and a
 sibling bundle command would still run, for a call the front refuses. Wrapping
-means a refused call reaches none of them. The added ``matcher=None`` front is
+means a refused call reaches none of the runner's registrations. (The CLI's own
+native copy of the bundle's hooks is outside them; see RUNNER-TOOL-ACCESS-2.)
+The added ``matcher=None`` front is
 what decides a call no other matcher selects, and it is the only refusal layer a
 session without an approval gate has, because such a session runs under
 ``bypassPermissions`` and never consults a permission callback.
@@ -36,9 +38,13 @@ from claude_agent_sdk.types import (
 #: The ``ToolAccess`` values this runner enforces, advertised on ``/status``.
 ENFORCED_TOOL_ACCESS: tuple[ToolAccess, ...] = (ToolAccess.READ_ONLY,)
 
-#: The ``ErrorEvent`` classification for a restricted turn that a session built
-#: without enforcement refuses (RUNNER-TOOL-ACCESS-5).
+#: The ``ErrorEvent`` classification for a restricted turn this session cannot
+#: enforce: no enforcement, or an unrestricted prompt already sent
+#: (RUNNER-TOOL-ACCESS-4, RUNNER-TOOL-ACCESS-5).
 TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
+#: The ``ErrorEvent`` classification for a restricted turn whose own request
+#: is not allowed, a slash command (RUNNER-TOOL-ACCESS-9).
+TOOL_ACCESS_REFUSED_CLASSIFICATION = "tool-access-refused"
 
 _UNNAMED_TOOL = "this tool call"
 _DECISION_FAILED = (
@@ -130,6 +136,9 @@ def _safe_refusal(
     try:
         return access.refuse(tool_name, tool_use_id) if record else access.refusal(tool_name)
     except Exception:  # noqa: BLE001 - any failure to decide is a refusal
+        if record and tool_use_id:
+            # @spec RUNNER-TOOL-ACCESS-6: still a refusal, not a tool error.
+            access.refused_call_ids.add(tool_use_id)
         return _DECISION_FAILED
 
 
