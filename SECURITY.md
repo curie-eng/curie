@@ -33,7 +33,7 @@ Helm chart [`charts/curie`](charts/curie). See
 
 The rails are the actual control. Every agent runs inside them:
 
-- **Default-deny egress** (`security.networkPolicy.enabled`). A NetworkPolicy on
+1. **Default deny egress** (`security.networkPolicy.enabled`). A NetworkPolicy on
   runner-sandbox pods is fail-closed: an empty `allowedEgress` means the sandbox
   can resolve DNS and ship traces, but reach nothing else. Arbitrary internet
   and the cloud metadata endpoint `169.254.169.254` are denied. Only
@@ -44,9 +44,16 @@ The rails are the actual control. Every agent runs inside them:
   a refusal, not a hang: ~368s on unconfigured pip (`curie-runner:0.8.7`,
   2026-09-11); the runner image now ships `/etc/pip.conf` with `retries = 0`
   so the same command fails on the first unreachable attempt.
-- **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).
-- **Non-root runner containers** with a read-only root filesystem.
-- **Per-agent RBAC scoping** so one agent's secrets are isolated from another's. The chart ships a least-privilege baseline (a ServiceAccount with no bound Role and no mounted token); the control plane binds each agent's `resourceNames`-scoped Role when the agent is deployed.
+2. **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).
+3. **Non root runner containers** with a read only root filesystem.
+4. **Credential isolation through sandbox templates.** Each agent's connector
+   credentials enter its runner environment through `secretKeyRef` entries in
+   its own SandboxTemplate. The release runner ServiceAccount has no bound
+   Role and no mounted Kubernetes API token by default, so a sandbox cannot
+   fetch or enumerate Secrets through that identity. The control plane does
+   not create per agent Roles. A sandbox can inspect every credential injected
+   into its own process, including an explicitly configured shared model
+   credential.
 
 **How to confirm the rails hold.** The chart ships a PT-3 security probe as a
 `helm test`
@@ -65,7 +72,8 @@ The local developer loop (`curie local up` / `curie skill up`, the Docker
 substrate) **accepts TRUSTED bundles only.** It is a convenience for developing
 and demoing your own bundles on a laptop, not a security boundary for running
 untrusted code. The Kubernetes sandbox rails above (gVisor + default-deny
-NetworkPolicy + per-agent RBAC) are the only supported boundary for untrusted
+NetworkPolicy + scoped credential delivery with an unprivileged runner identity)
+are the only supported boundary for untrusted
 bundles; do not use local mode to run a bundle you would not run as a plain
 script on your machine.
 
@@ -113,18 +121,21 @@ version rather than a number pinned here (which only goes stale).
 The rails are defaults, but they only protect a deployment the operator
 configures and maintains. As an operator you are responsible for:
 
-- **A CNI that enforces NetworkPolicy.** The default-deny egress rail is inert on
+1. **A CNI that enforces NetworkPolicy.** The default deny egress rail is inert on
   a CNI that ignores NetworkPolicy. Verify with the security probe above.
-- **Installing the gVisor RuntimeClass** referenced by `security.gvisor.mode`.
+2. **Installing the gVisor RuntimeClass** referenced by `security.gvisor.mode`.
   Without it, the kernel-isolation rail does not isolate.
-- **Keeping `allowedEgress` minimal.** Declare only the model API and MCP hosts
+3. **Keeping `allowedEgress` minimal.** Declare only the model API and MCP hosts
   your agents actually need. Every entry widens the sandbox.
-- **Treating every bundle as trusted code.** Review what you deploy. A bundle
+4. **Treating every bundle as trusted code.** Review what you deploy. A bundle
   can run anything the sandbox permits.
-- **Protecting secrets and credentials** you supply to the platform (Slack
-  tokens, model API keys), and relying on per-agent RBAC scoping to keep them
-  isolated.
-- **Running a supported version** and applying security updates promptly.
+5. **Protecting secrets and credentials** you supply to the platform. A sandbox
+   can read credentials intentionally injected into its own process. Keep
+   connector Secret references scoped to the intended agent and treat any
+   shared model credential as accessible to every runner receiving it.
+   Adding credentials, mounting a Kubernetes API token, or granting runner
+   RBAC changes the default isolation boundary.
+6. **Running a supported version** and applying security updates promptly.
 
 ## Repository security baseline
 

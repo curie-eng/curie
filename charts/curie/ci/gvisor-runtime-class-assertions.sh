@@ -26,9 +26,9 @@
 #      is gvisor, RUNNER_TEMPLATES includes curie-runner, and with an acme
 #      runner image digest it also includes curie-agent-acme-runner. The
 #      probe command defines check_runner_sandbox_template_class.
-#   7. The rendered probe command (the Job container /bin/bash -c script, not
-#      an extracted function) exits non-zero when the SandboxTemplate class is
-#      empty. Its output contains the bad-template line (FAIL and curie-runner)
+#   7. The rendered Claim 4 block and final probe summary exit with a failure
+#      when the SandboxTemplate class is empty. Its output contains the
+#      bad-template line (FAIL and curie-runner)
 #      and SECURITY PROBE: FAIL. With the class set to gvisor it exits 0,
 #      prints SECURITY PROBE: PASS, and does not print FAIL: SandboxTemplate.
 #
@@ -395,55 +395,35 @@ if (
     or command[2] == ""
 ):
     raise SystemExit(f"{path}: probe command is not [/bin/bash, -c, script]")
-pathlib.Path(script_out).write_text(command[2])
+script = command[2]
+claim4 = re.search(r"(?m)^[ \t]*# =+ Claim 4:.*$", script)
+claim5 = re.search(r"(?m)^[ \t]*# =+ Claim 5:.*$", script)
+summary = re.search(
+    r'(?m)^[ \t]*\[ "\$fail" = 0 \].*\n[ \t]*exit \$fail[ \t]*(?:\n|$)',
+    script,
+)
+if claim4 is None or claim5 is None or claim4.start() >= claim5.start():
+    raise SystemExit(f"{path}: probe command has no bounded Claim 4 block")
+if summary is None:
+    raise SystemExit(f"{path}: probe command has no final fail summary and exit")
+pathlib.Path(script_out).write_text(
+    "fail=0\n" + script[claim4.start() : claim5.start()] + summary.group(0)
+)
 PY
 
 STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"
-CURL_COUNT="$TMP/curl-count"
-{
-  printf '%s\n' '#!/usr/bin/env bash'
-  printf '%s\n' 'set -euo pipefail'
-  printf 'COUNT_FILE=%q\n' "$CURL_COUNT"
-  cat <<'EOF'
-# One process per kubectl call. The curl reply sequence lives in COUNT_FILE.
+cat >"$STUB_BIN/kubectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 args=("$@")
 len=${#args[@]}
-
-has_exact() {
-  local want="$1"
-  local arg
-  for arg in "${args[@]}"; do
-    [[ "$arg" == "$want" ]] && return 0
-  done
-  return 1
-}
 
 contains_substr() {
   local needle="$1"
   local arg
   for arg in "${args[@]}"; do
     [[ "$arg" == *"$needle"* ]] && return 0
-  done
-  return 1
-}
-
-has_seq() {
-  local -a seq=("$@")
-  local slen=${#seq[@]}
-  local i j
-  local -i limit
-  (( slen > 0 && len >= slen )) || return 1
-  limit=$((len - slen))
-  i=0
-  while (( i <= limit )); do
-    j=0
-    while (( j < slen )); do
-      [[ "${args[$((i + j))]}" == "${seq[$j]}" ]] || break
-      j=$((j + 1))
-    done
-    (( j == slen )) && return 0
-    i=$((i + 1))
   done
   return 1
 }
@@ -473,68 +453,21 @@ if match_runtime_class_get; then
   fi
   exit 0
 fi
-if has_seq get networkpolicy; then
-  exit 1
-fi
-if has_seq create token; then
-  printf '%s\n' probe-token
-  exit 0
-fi
-if has_seq auth can-i get secret/sp-agent-a-creds; then
-  printf '%s\n' yes
-  exit 0
-fi
-if has_seq auth can-i get secret/sp-agent-b-creds; then
-  printf '%s\n' no
-  exit 0
-fi
-if has_seq auth can-i list secrets; then
-  printf '%s\n' no
-  exit 0
-fi
-if has_exact exec && contains_substr curl; then
-  n=0
-  if [[ -f "$COUNT_FILE" ]]; then
-    n=$(<"$COUNT_FILE")
-  fi
-  case "$n" in
-    ''|*[!0-9]*) n=0 ;;
-  esac
-  n=$((n + 1))
-  printf '%s\n' "$n" >"$COUNT_FILE"
-  case "$n" in
-    1) printf 'rc=0\n' ;;
-    2) printf 'rc=28\n' ;;
-    3) printf 'rc=28\n' ;;
-    4) printf 'rc=0\n' ;;
-    5) printf 'rc=28\n' ;;
-  esac
-  exit 0
-fi
-if has_exact exec && contains_substr nslookup; then
-  exit 0
-fi
-if has_exact exec && contains_substr 'nc '; then
-  if [[ -n "${DT_ALLOWED_POD:-}" ]] && contains_substr "$DT_ALLOWED_POD"; then
-    printf 'rc=0\n'
-  else
-    printf 'rc=1\n'
-  fi
-  exit 0
-fi
-if has_exact run && { contains_substr sp-gvisor-check || contains_substr runtimeClassName; }; then
+if [[ "${args[0]:-}" == run ]] && { contains_substr sp-gvisor-check || contains_substr runtimeClassName; }; then
   printf '%s\n' 'Error from server (NotFound): runtimeclasses.node.k8s.io "gvisor" not found'
   exit 0
 fi
-exit 0
+if [[ "${args[0]:-}" == delete ]] && contains_substr sp-gvisor-check; then
+  exit 0
+fi
+printf 'unexpected Claim 4 kubectl invocation: %s\n' "$*" >&2
+exit 1
 EOF
-} >"$STUB_BIN/kubectl"
 chmod 0755 "$STUB_BIN/kubectl"
 
 run_rendered_probe() {
   local fixture_class="$1"
   local log="$2"
-  printf '0\n' >"$CURL_COUNT"
   set +e
   PATH="${STUB_BIN}:${PATH}" \
     FIXTURE_RUNTIME_CLASS="$fixture_class" \
