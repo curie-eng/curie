@@ -1110,6 +1110,22 @@ def test_api_key_interpolates_the_local_install_key():
     assert service_env(doc, "curie-dispatcher")["CURIE_API_KEY"] == LOCAL_API_KEY_REF
 
 
+@pytest.mark.parametrize("label_index", [0, 1], ids=["dev", "release"])
+def test_every_api_key_consumer_uses_the_local_install_key(label_index):
+    label, doc = compose_docs()[label_index]
+    consumers = {
+        "curie-api": "API_KEY",
+        "curie-dispatcher": "CURIE_API_KEY",
+        "curie-worker": "CURIE_API_KEY",
+    }
+    for service, key in consumers.items():
+        env = service_env(doc, service)
+        assert key in env, f"{label}: {service} does not carry {key}"
+        assert env[key] == LOCAL_API_KEY_REF, (
+            f"{label}: {service} {key}={env[key]!r}, want {LOCAL_API_KEY_REF}"
+        )
+
+
 def test_postgres_password_interpolates_the_local_install_password():
     doc = yaml.safe_load(DEV_TEXT)
     assert service_env(doc, "postgres")["POSTGRES_PASSWORD"] == LOCAL_PG_PASSWORD_REF
