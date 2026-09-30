@@ -475,6 +475,51 @@ def test_success_notice_requires_opt_in_and_is_deduplicated(
     assert _notices_after(cursor) == []
 
 
+def test_rollback_to_an_announced_sha_is_announced_again(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A to B to A: the channel must hear that A is live again.
+
+    A notice follows each deployment that changes the active version. The
+    redelivery of an already-active push changes nothing and stays quiet
+    (the dedupe test above), but a rollback to a sha the channel already heard
+    about is a real change underneath its users (#1309 supports exactly that
+    rollback), and a content-only dedupe key swallowed it.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    changed = client.patch(
+        f"/agents/{agent_id}", json={"deploy_notifications": True}, headers=auth_headers
+    )
+    assert changed.status_code == 200
+    clone_url, first_sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    cursor = _notice_cursor()
+    first = _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)).json()
+    assert first["status"] == "deployed", first
+    second_sha = _push_commit(
+        trusted_clone_base,
+        {"skills/gamma/SKILL.md": "---\nname: gamma\ndescription: does gamma\n---\n"},
+    )
+    second = _post(client, "push", _push_payload("refs/heads/dev", second_sha, clone_url)).json()
+    assert second["status"] == "deployed", second
+    rollback = _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)).json()
+    assert rollback["status"] == "deployed", rollback
+    redelivery = _post(
+        client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)
+    ).json()
+    assert redelivery["status"] == "deployed", redelivery
+
+    assert [notice["sha"] for notice in _notices_after(cursor)] == [
+        first_sha,
+        second_sha,
+        first_sha,
+    ]
+
+
 def test_success_notice_reloads_opt_in_and_binding_after_push_started(
     client: Any,
     auth_headers: dict[str, str],
@@ -697,7 +742,14 @@ def test_webhook_reports_outbox_persistence_failure_instead_of_false_success(
         )
         response = _post(client, "push", payload)
         assert response.status_code == 503
-        assert response.json()["detail"] == {"code": "git.notice_outbox_unavailable"}
+        detail = response.json()["detail"]
+        assert detail["code"] == "git.notice_outbox_unavailable"
+        # GitHub's delivery body must still say what the push itself did, or a
+        # 503 hides the deploy outcome this issue is about.
+        assert detail["result"]["status"] == "rejected"
+        assert [error["code"] for error in detail["result"]["errors"]] == [
+            "git.repository_case_mismatch"
+        ]
     finally:
         asyncio.run(
             rename(
@@ -2345,6 +2397,40 @@ def test_a_prod_promote_is_refused_when_the_promoting_agent_lacks_the_binding(
             "/deployments", params={"agent_id": dev_id}, headers=auth_headers
         ).json()
     ] == ["dev"]
+
+
+def test_a_routed_rejection_notifies_only_the_agent_it_was_for(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A prod promote refused for the prod agent must not post in the dev channel.
+
+    One repository builds a dev bot and a prod bot (ADR-0091). Once the push
+    has resolved its target agent, a rejection belongs to that agent alone;
+    the sibling's channel may be a different audience entirely.
+    """
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, _gated_files(TWO_TARGET_FILES, "ops")
+    )
+    _bind_route(client, auth_headers, dev_id, "ops")
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+
+    cursor = _notice_cursor()
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "rejected", prod
+    assert "approval_routes.unbound" in _unbound_codes(prod), prod
+    assert prod["agent_id"] == prod_id, prod
+    assert [
+        (notice["address"], notice["agent_name"], notice["status"], notice["environment"])
+        for notice in _notices_after(cursor)
+    ] == [("C000000E01", "two-agent-prod", "rejected", "prod")]
 
 
 def test_a_sibling_attach_is_refused_when_the_sibling_object_declares_an_unbound_route(

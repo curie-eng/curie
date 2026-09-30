@@ -297,3 +297,173 @@ def test_notice_never_falls_back_to_another_slack_identity(
             await server.close()
 
     asyncio.run(go())
+
+
+def test_rendered_notice_uses_slack_shortcodes_not_literal_emoji() -> None:
+    """The copy ships in code, so it carries Slack shortcodes and no dashes.
+
+    AGENTS.md bars emojis in code and dashes in prose; Slack renders a
+    ``:rocket:`` shortcode in chat.postMessage text itself.
+    https://docs.slack.dev/messaging/formatting-message-text/#emoji
+    """
+    from curie_worker.deploy_notice import DeployNotice, render_notice
+
+    base = {
+        "address": "C0EXAMPLE1",
+        "identity": "ops",
+        "agent_name": "acme-dev",
+        "sha": "a" * 40,
+        "environment": "dev",
+    }
+    deployed = render_notice(DeployNotice(**base, status="deployed", codes=[]))
+    rejected = render_notice(
+        DeployNotice(**base, status="rejected", codes=["git.archive_failed"])
+    )
+    assert deployed == ":rocket: acme-dev deployed aaaaaaaa (dev)"
+    assert rejected.startswith(
+        ":warning: acme-dev push aaaaaaaa rejected: git.archive_failed (dev)\n"
+    )
+    for text in (deployed, rejected):
+        assert text.isascii(), text
+
+
+def test_notice_from_a_newer_api_with_an_extra_field_is_still_delivered(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """During a roll the API can be newer than this worker.
+
+    A field this worker does not know must not dead-letter every notice as
+    unparseable; the fields it does know still decide the post.
+    """
+
+    async def go() -> None:
+        capture = Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        assert server.port is not None
+        config = WorkerConfig(
+            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
+            read_block_ms=100,
+            key_prefix=names["prefix"],
+        )
+        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        valkey = AsyncRedis(
+            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
+        )
+        consumer = DeployNoticeConsumer(
+            redis=valkey,
+            sink=sink,
+            config=config,
+            stream=names["stream"],
+            group=names["group"],
+            consumer="notice-forward-compatible",
+            leases=DeliveryLeaseStore(valkey, config),
+        )
+        task = asyncio.create_task(consumer.run())
+        try:
+            notice = {
+                "address": "C0EXAMPLE1",
+                "identity": "ops",
+                "agent_name": "acme-dev",
+                "status": "deployed",
+                "sha": "a" * 40,
+                "environment": "dev",
+                "codes": [],
+                "introduced_by_a_newer_api": {"any": "shape"},
+            }
+            entry = await valkey.xadd(names["stream"], {"payload": json.dumps(notice)})
+            for _ in range(100):
+                if capture.requests:
+                    break
+                await asyncio.sleep(0.05)
+            assert capture.paths() == ["/slack/api/chat.postMessage"]
+            assert "deployed aaaaaaaa (dev)" in json.loads(capture.requests[0]["body"])["text"]
+            assert await valkey.xrange(f"{names['stream']}:dead") == []
+            assert await valkey.xpending_range(
+                names["stream"], names["group"], min=entry, max=entry, count=1
+            ) == []
+        finally:
+            consumer.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+            await valkey.delete(f"{names['stream']}:dead")
+            await sink.aclose()
+            await valkey.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_notice_slack_keeps_refusing_is_dead_lettered_at_the_delivery_cap(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """AGENTS.md: a stream lane without a delivery cap is a bug.
+
+    Every post fails at the transport, so the notice stays pending and the
+    reclaim loop redelivers it until the shared cap moves it to the lane's
+    graveyard and acks it off the group. Nothing is posted twice past the cap.
+    """
+
+    async def go() -> None:
+        capture = Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        assert server.port is not None
+        config = WorkerConfig(
+            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/dead/",
+            read_block_ms=100,
+            key_prefix=names["prefix"],
+            max_delivery=2,
+            reclaim_min_idle_ms=0,
+            reclaim_interval_s=0.1,
+        )
+        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        valkey = AsyncRedis(
+            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
+        )
+        consumer = DeployNoticeConsumer(
+            redis=valkey,
+            sink=sink,
+            config=config,
+            stream=names["stream"],
+            group=names["group"],
+            consumer="notice-capped",
+            leases=DeliveryLeaseStore(valkey, config),
+        )
+        task = asyncio.create_task(consumer.run())
+        grave = f"{names['stream']}:dead"
+        try:
+            notice = {
+                "address": "C0EXAMPLE1",
+                "identity": "ops",
+                "agent_name": "acme-dev",
+                "status": "rejected",
+                "sha": "a" * 40,
+                "environment": "dev",
+                "codes": ["git.archive_failed"],
+            }
+            entry = await valkey.xadd(names["stream"], {"payload": json.dumps(notice)})
+            dead: list[Any] = []
+            for _ in range(200):
+                dead = await valkey.xrange(grave)
+                if dead:
+                    break
+                await asyncio.sleep(0.05)
+            assert len(dead) == 1, dead
+            assert dead[0][1]["dl_reason"] == "max-delivery-exceeded"
+            assert int(dead[0][1]["dl_delivery_count"]) >= config.max_delivery
+            assert await valkey.xpending_range(
+                names["stream"], names["group"], min=entry, max=entry, count=1
+            ) == []
+            attempts = len(capture.requests)
+            assert 1 <= attempts <= config.max_delivery, capture.paths()
+            await asyncio.sleep(0.5)
+            assert len(capture.requests) == attempts, "a dead-lettered notice was retried"
+        finally:
+            consumer.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+            await valkey.delete(grave)
+            await sink.aclose()
+            await valkey.aclose()
+            await server.close()
+
+    asyncio.run(go())
