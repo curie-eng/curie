@@ -782,8 +782,7 @@ enum Command {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Target environment. Defaults to dev; a `--target` supplies it
-        /// instead, and an explicit value here still wins over the target.
+        /// Target environment. Defaults to dev.
         #[arg(long, value_enum)]
         env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
