@@ -82,6 +82,10 @@
           "why": "No CLI path reads an agent's behavior-pack list; deploy uploads a bundle rather than composing packs, so behavior_packs is never consumed."
         },
         {
+          "field": "deploy_notifications",
+          "why": "Deploy notices are configured through the agent API and emitted by the worker; no CLI command reads this opt-in from an agent response."
+        },
+        {
           "field": "secrets",
           "why": "update_agent_secrets WRITES connector-secret names; the CLI never reads the stored secrets list back, so the response field is not modeled."
         },
