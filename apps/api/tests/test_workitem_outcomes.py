@@ -2065,6 +2065,36 @@ def _actions_check_run(
 
 
 PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+# The repository CI policy that reproduces Curie's own layout (#3617). The API
+# no longer hardcodes it; tests configure it like an operator would.
+CURIE_PYTHON_CI_PATHS = (
+    "apps",
+    "runner",
+    "cli",
+    "adapters",
+    "packages",
+    "examples/tests",
+    "tools",
+    "release",
+)
+CURIE_PYTHON_CI_PENDING_PREFIX = "Python pytest (shard "
+CURIE_PYTHON_CI_ENV = json.dumps(
+    {
+        REPO: {
+            "check": PYTHON_CI_CHECK,
+            "paths": list(CURIE_PYTHON_CI_PATHS),
+            "pendingCheckPrefix": CURIE_PYTHON_CI_PENDING_PREFIX,
+        }
+    }
+)
+
+
+def _curie_python_ci() -> Any:
+    return factory_ci.PythonCiPolicy(
+        check=PYTHON_CI_CHECK,
+        paths=CURIE_PYTHON_CI_PATHS,
+        pending_check_prefix=CURIE_PYTHON_CI_PENDING_PREFIX,
+    )
 PYTHON_CI_PATHS = [
     "apps/api/src/curie_api/factory_ci.py",
     "apps/api/tests/test_workitem_outcomes.py",
@@ -2100,6 +2130,7 @@ def _decide_factory_ci(
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
         ci_wait_seconds=1200,
         changed_paths=[changed_path],
+        python_ci=_curie_python_ci(),
     )
 
 
@@ -2233,6 +2264,8 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
     from curie_api import workitem_outcomes
     from curie_api.factory_progress import record_verification
 
+    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", CURIE_PYTHON_CI_ENV)
+    get_settings.cache_clear()
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     for check, outcome, exit_status in preflight:
@@ -2402,6 +2435,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2546,6 +2580,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2629,6 +2664,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),

@@ -7,8 +7,9 @@ decides with the pure ``decide``:
 
 - green, or no checks after the grace period when no required check applies,
   completes the request;
-- selected Python changes require valid preflight evidence and a successful
-  ``Python (ruff + mypy + pytest)`` GitHub Actions check;
+- Python changes require valid preflight evidence; when the repository has a
+  required Python CI policy (``GITHUB_FACTORY_PYTHON_CI``, #3617), they must
+  also fall under its paths and pass its GitHub Actions check;
 - a failure below the round cap enqueues ONE continuation turn for the same
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
@@ -86,22 +87,35 @@ _ANNOTATIONS_MAX = 10
 _TITLE_MAX = 100
 _CHECKS_LINE_MAX = 400
 _NO_CI_NOTE = f"No CI checks appeared within {CI_GRACE_SECONDS} s."
-_REQUIRED_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
-# The aggregate job above is created only after these shard jobs finish.
-_PYTHON_PYTEST_SHARD_PREFIX = "Python pytest (shard "
-# Conservative subset of the release train's MUST_RUN_PYTEST_PREFIXES and
-# nonignored fallback paths in tools/e2e-ci-selection/select_tiers.py.
-# Unknown Python paths fail closed instead of assuming the selector fallback.
-_PYTHON_CI_SELECTED_PREFIXES = (
-    "apps",
-    "runner",
-    "cli",
-    "adapters",
-    "packages",
-    "examples/tests",
-    "tools",
-    "release",
-)
+
+
+@dataclass(frozen=True)
+class PythonCiPolicy:
+    """A repository's required Python CI (#3617), from ``GITHUB_FACTORY_PYTHON_CI``.
+
+    ``check`` is the github-actions check run a Python change must pass;
+    ``paths`` are the path prefixes that check selects (an unselected Python
+    path fails closed); ``pending_check_prefix`` names shard jobs that precede
+    the aggregate check, so their presence keeps the verdict waiting for it.
+    """
+
+    check: str
+    paths: tuple[str, ...]
+    pending_check_prefix: str | None = None
+
+
+def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy | None:
+    """The configured policy for ``owner/name``, matched case-insensitively."""
+
+    wanted = repo_full_name.casefold()
+    for name, value in settings.github_factory_python_ci.items():
+        if name.casefold() == wanted:
+            return PythonCiPolicy(
+                check=value["check"],
+                paths=tuple(value["paths"]),
+                pending_check_prefix=value.get("pendingCheckPrefix"),
+            )
+    return None
 
 VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]
@@ -143,16 +157,22 @@ def _python_paths(changed_paths: Sequence[str]) -> list[str]:
     return [path for path in changed_paths if path.endswith(".py")]
 
 
-def _python_path_is_selected(path: str) -> bool:
-    return any(
-        _matches_path_prefix(path, prefix)
-        for prefix in _PYTHON_CI_SELECTED_PREFIXES
-    )
+def _unselected_python_path(
+    changed_paths: Sequence[str], policy: PythonCiPolicy | None
+) -> str | None:
+    """The first Python path the repository's required CI does not select.
 
+    Without a policy there is no required Python check, so nothing is unselected.
+    """
 
-def _unselected_python_path(changed_paths: Sequence[str]) -> str | None:
+    if policy is None:
+        return None
     return next(
-        (path for path in _python_paths(changed_paths) if not _python_path_is_selected(path)),
+        (
+            path
+            for path in _python_paths(changed_paths)
+            if not any(_matches_path_prefix(path, prefix) for prefix in policy.paths)
+        ),
         None,
     )
 
@@ -212,19 +232,23 @@ def decide(
     execution_deadline: datetime,
     ci_wait_seconds: int,
     changed_paths: Sequence[str],
+    python_ci: PythonCiPolicy | None,
     prior_round_had_checks: bool = False,
     fresh_after: datetime | None = None,
 ) -> Verdict:
-    """The CI verdict for one observation. Pure: time is an argument."""
+    """The CI verdict for one observation. Pure: time is an argument.
 
-    changed_python_paths = _python_paths(changed_paths)
-    unselected_path = _unselected_python_path(changed_paths)
+    ``python_ci`` is the repository's required Python CI; ``None`` judges a
+    Python change on the repository's own checks like any other change.
+    """
+
+    unselected_path = _unselected_python_path(changed_paths, python_ci)
     if unselected_path is not None:
         return Verdict(
             kind="unverified",
             reason=f"required_python_ci_unselected: {unselected_path}",
         )
-    requires_python_ci = bool(changed_python_paths)
+    requires_python_ci = python_ci is not None and bool(_python_paths(changed_paths))
 
     ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
@@ -284,7 +308,8 @@ def decide(
     required_python_runs = [
         run
         for run in check_runs
-        if run.get("name") == _REQUIRED_PYTHON_CI_CHECK
+        if python_ci is not None
+        and run.get("name") == python_ci.check
         and isinstance(run.get("app"), dict)
         and run["app"].get("slug") == "github-actions"
     ]
@@ -340,8 +365,9 @@ def decide(
         # Shard jobs stay in the list after they complete, and the aggregate
         # check is created only then. Their presence means that check can
         # still appear, so keep waiting until the CI deadline.
-        shards_expect_aggregate = any(
-            _str(run.get("name")).startswith(_PYTHON_PYTEST_SHARD_PREFIX) for run in check_runs
+        shard_prefix = python_ci.pending_check_prefix if python_ci is not None else None
+        shards_expect_aggregate = shard_prefix is not None and any(
+            _str(run.get("name")).startswith(shard_prefix) for run in check_runs
         )
         if not expired and (pending or shards_expect_aggregate):
             return Verdict(
@@ -679,7 +705,8 @@ async def gate(
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = _python_paths(changed_paths)
-    unselected_path = _unselected_python_path(changed_paths)
+    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
+    unselected_path = _unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     if unselected_path is not None:
         preflight_verdict = Verdict(
@@ -738,6 +765,7 @@ async def gate(
                 execution_deadline=request.execution_deadline,
                 ci_wait_seconds=settings.github_factory_ci_wait_s,
                 changed_paths=changed_paths,
+                python_ci=python_ci,
                 prior_round_had_checks=round_ > 1,
                 fresh_after=fresh_after,
             )

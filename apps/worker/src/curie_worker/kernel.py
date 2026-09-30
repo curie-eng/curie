@@ -892,6 +892,23 @@ _PRESSURE_OUTCOMES = frozenset(
 
 
 @dataclass(frozen=True)
+class _ApprovalPause:
+    """What ``_pause_for_approval`` did: created the approval, or not and why.
+
+    ``failure_detail`` is the API's redacted, clipped coded refusal (#3617)
+    when the create was refused with one; the factory run reports it.
+    """
+
+    created: bool
+    failure_detail: str | None = None
+
+    @classmethod
+    def refused(cls, detail: str | None) -> _ApprovalPause:
+        clipped = redact_text(detail)[:_ESCALATION_DETAIL_MAX] if detail else None
+        return cls(created=False, failure_detail=clipped or None)
+
+
+@dataclass(frozen=True)
 class _PressureResult:
     reclaimed: bool
     outcome: str
@@ -3157,7 +3174,7 @@ class Kernel:
                     # A gate fired (ADR-0010): persist the durable record, then
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
-                    approval_created = await self._pause_for_approval(
+                    pause = await self._pause_for_approval(
                         qevent,
                         route,
                         outcome,
@@ -3165,6 +3182,7 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
+                    approval_created = pause.created
                     if not approval_created:
                         run = self._run_for_event(qevent.event_id)
                         if run is not None:
@@ -3172,7 +3190,7 @@ class Kernel:
                                 await run.finish(
                                     outcome="failed",
                                     cause="approval_create_failed",
-                                    detail=None,
+                                    detail=pause.failure_detail,
                                 )
                             except WorkItemConflict as exc:
                                 if exc.code != "publication_pending":
@@ -7170,7 +7188,7 @@ class Kernel:
         approval_routes: dict[str, Any] | None = None,
         *,
         deployment_id: uuid.UUID | None = None,
-    ) -> bool:
+    ) -> _ApprovalPause:
         """Persist the approval, suspend the session, and leave the pending notice.
 
         Ordering is deliberate: the durable record exists before the sandbox is
@@ -7194,6 +7212,9 @@ class Kernel:
         silently widening authority to whoever happens to be in the requesting
         channel is exactly the failure AC2 closes. No approval is created in
         that case.
+
+        Returns whether the approval was created and, when it was not, the
+        API's coded refusal (#3617) for the factory run's detail, if any.
         """
 
         handle = _reply_handle_for(qevent)
@@ -7242,7 +7263,7 @@ class Kernel:
                     "to this channel.",
                     failure_class="approval-route-unbound",
                 )
-                return False
+                return _ApprovalPause(created=False)
             fixed_target, notification_target = targets
             if fixed_target is not None:
                 card_kind, card_channel = fixed_target
@@ -7270,7 +7291,7 @@ class Kernel:
                     "instead of creating an approval nobody here can answer.",
                     failure_class="approval-approvers-unverifiable",
                 )
-                return False
+                return _ApprovalPause(created=False)
 
         if not is_publication and self._approvals is None:
             await self._escalate(
@@ -7280,7 +7301,7 @@ class Kernel:
                 "configured on this worker; flagging for a human instead of pausing.",
                 failure_class="approval-backend-missing",
             )
-            return False
+            return _ApprovalPause(created=False)
 
         if is_publication and self._publication_creator is None:
             await self._escalate(
@@ -7290,7 +7311,7 @@ class Kernel:
                 "published and no approval was created.",
                 failure_class="publication-unavailable",
             )
-            return False
+            return _ApprovalPause(created=False)
 
         base = outcome.text.strip()
         # #2659: the inferred repository is a reply block only. It is composed
@@ -7435,7 +7456,7 @@ class Kernel:
                 exc.public_detail,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return False
+            return _ApprovalPause.refused(exc.public_detail)
         except ApprovalRefused as exc:
             # #2885: a person rejected this approval in this thread and nobody
             # has asked since. The API refused it and audited the refusal; the
@@ -7447,7 +7468,7 @@ class Kernel:
                 qevent.event_id,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return False
+            return _ApprovalPause.refused(exc.public_detail)
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -7463,7 +7484,8 @@ class Kernel:
                 "not be created; flagging for a human instead of pausing.",
                 failure_class="approval-create-failed",
             )
-            return False
+            refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
+            return _ApprovalPause.refused(refusal)
 
         if self._workspace is not None:
             async with self._lock.hold(self._config.lock_key(thread_key)):
@@ -7634,7 +7656,7 @@ class Kernel:
                 thread_key,
                 created.id,
             )
-            return True
+            return _ApprovalPause(created=True)
 
         # Display attribution is distinct from the resume actor and the durable
         # approval author. An older API cannot prove a continuation's origin.
@@ -7798,7 +7820,7 @@ class Kernel:
             except Exception as exc:  # noqa: BLE001 - the durable pause stands
                 logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
-        return True
+        return _ApprovalPause(created=True)
 
     @contextlib.asynccontextmanager
     async def _keep_route_alive(self, thread_key: str, claim_name: str) -> AsyncIterator[None]:

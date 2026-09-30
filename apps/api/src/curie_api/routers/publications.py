@@ -401,7 +401,8 @@ async def create_publication(
         changed_paths = [
             path for paths in prior_paths for path in paths
         ] + data.changed_paths
-        unselected = factory_ci._unselected_python_path(changed_paths)
+        python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
+        unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -443,16 +444,21 @@ async def create_publication(
                         "message": "verification preflight failed; rerun after fixing the failure",
                     },
                 )
+            pending_proof = (
+                f"{python_ci.check} is pending proof."
+                if python_ci is not None
+                else "Repository CI is pending proof."
+            )
             statements: tuple[str, ...] = ()
             if any(observation.outcome == "unavailable" for observation in observations):
                 statements = (
                     "In-sandbox verification was unavailable.",
-                    "Python (ruff + mypy + pytest) is pending proof.",
+                    pending_proof,
                 )
             elif factory_progress.python_verification(observations) is None:
                 statements = (
                     "No in-sandbox Python verification check was declared.",
-                    "Python (ruff + mypy + pytest) is pending proof.",
+                    pending_proof,
                 )
             body = data.body or ""
             missing = [statement for statement in statements if statement not in body]

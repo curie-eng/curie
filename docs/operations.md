@@ -932,8 +932,8 @@ same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
 what each round tried. No checks within 120 s of the push completes with a
 note only when no required check applies. A factory Python publication needs
-the selected `Python (ruff + mypy + pytest)` Actions check to run and pass;
-missing, skipped, unreadable, unrelated, or failed evidence cannot complete it.
+in-sandbox verification evidence; beyond that it is judged on the repository's
+own checks unless the repository has a required Python CI policy (below).
 Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
@@ -943,6 +943,31 @@ comes first. Unreadable CI, such as missing Checks or Commit statuses permission
 ends as `ci_unverified`, which is never success;
 the pull request stays open either way. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
+
+Required Python CI is set per repository with `api.githubFactoryPythonCi` (API
+env `GITHUB_FACTORY_PYTHON_CI`, a JSON object, default `{}`, checked at boot).
+Each key is an `owner/name`, matched case-insensitively; each value names the
+Actions `check` a Python change must run and pass, the `paths` prefixes that
+check selects, and an optional `pendingCheckPrefix` for shard jobs that finish
+before the aggregate check appears. With a policy, a Python change outside
+`paths` is refused at publication (`publication.required_python_ci_unselected`)
+and missing, skipped, unrelated, or failed evidence for the check cannot
+complete the run. A repository without an entry is judged on its own checks,
+with no path refusal. This value reproduces Curie's own layout for
+`curie-eng/curie`:
+
+```yaml
+api:
+  githubFactoryPythonCi:
+    curie-eng/curie:
+      check: "Python (ruff + mypy + pytest)"
+      paths: [apps, runner, cli, adapters, packages, examples/tests, tools, release]
+      pendingCheckPrefix: "Python pytest (shard "
+```
+
+When a publication request is refused, the issue's `Could not complete:`
+notice (cause `approval_create_failed`) carries the refusal code and message
+on its `Details:` line.
 
 ### The default factory agent
 

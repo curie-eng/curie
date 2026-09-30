@@ -237,7 +237,38 @@ class PublicationLineage:
 
 class ApprovalBackendError(Exception):
     """The approval record could not be created; the kernel escalates rather
-    than suspending a session no resolution could ever wake."""
+    than suspending a session no resolution could ever wake.
+
+    ``refusal`` is ``"<code>: <message>"`` when the API refused the request
+    with a coded detail (#3617), or the plain message when the detail is a
+    non-empty string, redacted and clipped, so the factory run can name the
+    cause; ``None`` for any other failure.
+    """
+
+    refusal: str | None = None
+
+    def __init__(self, message: str, *, refusal: str | None = None) -> None:
+        super().__init__(message)
+        self.refusal = refusal
+
+
+def _coded_refusal(response: httpx.Response) -> str | None:
+    """``"<code>: <message>"`` from an API ``{"detail": {code, message}}`` body."""
+
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if isinstance(detail, str):
+        return detail if detail.strip() else None
+    if not isinstance(detail, dict):
+        return None
+    code, message = detail.get("code"), detail.get("message")
+    if not isinstance(code, str) or not code or not isinstance(message, str):
+        return None
+    # Unclipped: the kernel redacts the whole text before it clips, so a
+    # secret's closing delimiter is never cut off ahead of redaction.
+    return f"{code}: {message}"
 
 
 class ApprovalRefused(Exception):
@@ -620,7 +651,8 @@ class ApprovalClient:
             raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
-                f"publication create failed: HTTP {response.status_code}: {response.text}"
+                f"publication create failed: HTTP {response.status_code}: {response.text}",
+                refusal=_coded_refusal(response),
             )
         try:
             body = response.json()

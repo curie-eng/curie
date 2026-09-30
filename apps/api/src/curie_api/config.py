@@ -10,7 +10,9 @@ Override any field via the matching environment variable for shared or
 production deployments.
 """
 
+import json
 from functools import lru_cache
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -23,10 +25,10 @@ from aci_protocol import (
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from plugin_format.connector_render import ConnectorProxy
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .workspace_policy import valid_allowlist_entry
+from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -182,6 +184,14 @@ class Settings(BaseSettings):
         gt=0,
         le=10800,
         validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+    )
+    # Required Python CI per repository (#3617), a JSON object keyed by
+    # ``owner/name`` (matched case-insensitively): ``{"check": str, "paths":
+    # [str, ...], "pendingCheckPrefix": str | null}``. A repository without an
+    # entry is judged on its own checks with no path refusal. Empty by default.
+    github_factory_python_ci: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_PYTHON_CI",
     )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
@@ -694,6 +704,51 @@ class Settings(BaseSettings):
         if not self.installation_id:
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
+
+    @field_validator("github_factory_python_ci", mode="before")
+    @classmethod
+    def _validate_factory_python_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
+        policies: dict[str, dict[str, Any]] = {}
+        for repo, policy in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
+            if not isinstance(policy, dict) or set(policy) - {
+                "check",
+                "paths",
+                "pendingCheckPrefix",
+            }:
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}] has an invalid shape")
+            check = policy.get("check")
+            paths = policy.get("paths")
+            prefix = policy.get("pendingCheckPrefix")
+            if not isinstance(check, str) or not check.strip():
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].check must be non-empty")
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or not all(
+                    isinstance(path, str)
+                    and path.strip()
+                    and not path.startswith("/")
+                    and not path.endswith("/")
+                    for path in paths
+                )
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].paths must be non-empty relative"
+                    " prefixes without a leading or trailing slash"
+                )
+            if prefix is not None and (not isinstance(prefix, str) or not prefix):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].pendingCheckPrefix must be a"
+                    " non-empty string or null"
+                )
+            policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
+        return policies
 
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":

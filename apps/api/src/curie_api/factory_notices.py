@@ -115,8 +115,8 @@ _CAUSE_TEXT = {
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
-        "the requested approval could not be created. Check the publication "
-        "request or approval service, then retry."
+        "the publication request was refused, so no pull request was opened. "
+        "Read the details for the reason, fix it, then retry."
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
@@ -147,7 +147,9 @@ _CAUSE_TEXT = {
 }
 
 # Infrastructure and CI causes carry details, not a provider message.
-_DETAIL_CAUSES = frozenset({"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified"})
+_DETAIL_CAUSES = frozenset(
+    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
@@ -275,6 +277,11 @@ def result_section(
         text = f"Could not complete: {cause_text(cause)}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
+        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+            # The API refusal can quote caller-supplied paths (#3617): one line,
+            # so it cannot add a ``Cause:`` line, and no HTML comment opener.
+            inert = _break_html_comments(" ".join(detail.split()))
+            text += f"Details: {inert}\n"
         elif cause != "history_capacity" and detail is not None and detail.strip():
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
@@ -287,6 +294,10 @@ def result_section(
     return text
 
 
+def _break_html_comments(text: str) -> str:
+    return text.replace("<!--", "<\u200b!--")
+
+
 def _agent_message_block(message: str) -> str:
     """The agent's last message, fenced so GitHub renders none of it.
 
@@ -295,7 +306,7 @@ def _agent_message_block(message: str) -> str:
     broken because the marker scan reads the raw body.
     """
 
-    message = message.replace("<!--", "<\u200b!--")
+    message = _break_html_comments(message)
     longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"

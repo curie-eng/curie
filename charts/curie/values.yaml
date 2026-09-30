@@ -1238,6 +1238,13 @@ api:
   # Seconds a published factory run waits on its pull request's CI, from the
   # push (#3162). The run's execution deadline still caps it. 1 to 10800.
   githubFactoryCiWaitSeconds: 1200
+  # Required Python CI per repository (#3617), keyed by owner/name (matched
+  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
+  # change must fall under `paths` and pass the `check` Actions check; shard
+  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
+  # repository without an entry is judged on its own checks. Rendered as JSON
+  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
+  githubFactoryPythonCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
