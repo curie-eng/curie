@@ -267,10 +267,15 @@ def config(
         approval_chat_attester_secret="dispatcher-attester-test-secret",
         api_base_url=admission_api.url,
         admission_cache_prefix=f"test:curie:admission:{token}:",
+        # Every threaded mention may consult the root-context cache, so every
+        # test gets its own prefix: tests reuse the same example channel, bot
+        # and timestamps, and must never read each other's cached roots.
+        thread_context_cache_prefix=f"test:curie:thread-context:{token}:",
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))
     keys.extend(redis_client.scan_iter(f"test:curie:admission:{token}:*"))
+    keys.extend(redis_client.scan_iter(f"test:curie:thread-context:{token}:*"))
     keys.append(cfg.stream)
     if keys:
         redis_client.delete(*keys)

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import redis
-from aci_protocol import QueuedTurn, ReplyHandle
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher import handlers as handlers_module
 from curie_dispatcher import queue as queue_module
@@ -81,6 +81,62 @@ class _WebClient:
             self.order.append("placeholder")
         self.placeholder_contexts.append(trace.get_current_span().get_span_context())
         return {"ts": "1700000000.000200"}
+
+
+class _ThreadWebClient(_WebClient):
+    """Slack's Web API for a threaded reply: placeholders and the thread root.
+
+    ``conversations.replies`` returns the parent message first
+    (https://docs.slack.dev/reference/methods/conversations.replies/).
+    """
+
+    def __init__(
+        self,
+        root_ts: str = "1700000000.000100",
+        *,
+        order: list[str] | None = None,
+        history_error: Exception | None = None,
+    ) -> None:
+        super().__init__(order)
+        self.root_ts = root_ts
+        self.history_error = history_error
+        self.posts: list[dict[str, Any]] = []
+        self.history_calls: list[dict[str, Any]] = []
+
+    def chat_postMessage(self, **kwargs: Any) -> dict[str, str]:
+        self.posts.append(kwargs)
+        return super().chat_postMessage(**kwargs)
+
+    def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        if self.order is not None:
+            self.order.append("history")
+        self.history_calls.append(kwargs)
+        if self.history_error is not None:
+            raise self.history_error
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": self.root_ts,
+                    "user": "U0BOT",
+                    "bot_id": "B0BOT",
+                    "text": "Should I restart the example service?",
+                }
+            ],
+            "has_more": False,
+        }
+
+
+def _alert_reply(event_ts: str = "1700000000.000200", **extra: str) -> dict[str, str]:
+    return {
+        "channel": "C0EXAMPLE1",
+        "ts": event_ts,
+        "thread_ts": "1700000000.000100",
+        "parent_user_id": "U0BOT",
+        "user": "U0HUMAN",
+        "text": "<@U0BOT> yes please",
+        **extra,
+    }
 
 
 @contextmanager
@@ -397,3 +453,266 @@ def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
     assert web_client.placeholder_contexts == []
     assert redis_client.xlen(config.stream) == 0
     assert all(span.name != "curie.queue.enqueue" for span in exporter.get_finished_spans())
+
+
+# @spec slack-alert-followup-context: Decision
+def test_human_reply_to_own_bot_root_keeps_human_slack_identity_with_context(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    web_client = _ThreadWebClient()
+    result = process_event(
+        body={"event_id": "Ev-human-alert-reply"},
+        event=_alert_reply(),
+        lane="mention",
+        web_client=web_client,  # type: ignore[arg-type]
+        redis_client=redis_client,
+        config=config,
+        slack_identity=DEFAULT_IDENTITY,
+        admission=build_admission(config, redis_client),
+        bot_user_id="U0BOT",
+        bot_id="B0BOT",
+        clock=lambda: "2026-09-29T00:00:00+00:00",
+    )
+
+    assert result is not None
+    assert web_client.history_calls == [
+        {"channel": "C0EXAMPLE1", "ts": "1700000000.000100", "limit": 1}
+    ]
+    assert web_client.posts == [
+        {
+            "channel": "C0EXAMPLE1",
+            "thread_ts": "1700000000.000100",
+            "text": "Working on it.",
+        }
+    ]
+    ((_, fields),) = redis_client.xrange(config.stream)
+    queued = from_stream_fields(fields)
+    # A person's turn, in the person's Slack thread: nothing of the hook that
+    # posted the root rides along, so nothing of its authority does either.
+    assert queued.source == TurnSource.SLACK
+    assert queued.source.is_job is False
+    assert queued.hook_run is None
+    assert queued.author == "U0HUMAN"
+    assert queued.event_id == "Ev-human-alert-reply"
+    assert queued.conversation_id == "1700000000.000100"
+    assert not queued.conversation_id.startswith("hook:")
+    assert queued.reply_handle is not None
+    assert queued.reply_handle.kind == "slack"
+    assert queued.reply_handle.channel == "C0EXAMPLE1"
+    assert queued.reply_handle.placeholder == "1700000000.000200"
+    assert queued.reply_handle.adapter == DEFAULT_IDENTITY
+    assert queued.attachments == []
+    assert queued.received_at == "2026-09-29T00:00:00+00:00"
+    assert queued.text.endswith("yes please")
+    assert "Should I restart the example service?" in queued.text
+    assert "context only" in queued.text.lower()
+    assert "approval" in queued.text.lower()
+
+
+# @spec slack-alert-followup-context: Context cache and restart behavior
+def test_duplicate_human_reply_resolves_no_context_and_posts_no_second_placeholder(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    web_client = _ThreadWebClient()
+    kwargs: dict[str, Any] = {
+        "body": {"event_id": "Ev-duplicate-human-alert-reply"},
+        "event": _alert_reply(),
+        "lane": "mention",
+        "web_client": web_client,
+        "redis_client": redis_client,
+        "config": config,
+        "slack_identity": DEFAULT_IDENTITY,
+        "admission": build_admission(config, redis_client),
+        "bot_user_id": "U0BOT",
+        "bot_id": "B0BOT",
+    }
+
+    assert process_event(**kwargs) is not None
+    assert process_event(**kwargs) is None
+
+    assert web_client.history_calls == [
+        {"channel": "C0EXAMPLE1", "ts": "1700000000.000100", "limit": 1}
+    ]
+    assert len(web_client.posts) == 1
+    assert redis_client.xlen(config.stream) == 1
+
+
+# @spec slack-alert-followup-context: Context cache and restart behavior
+def test_restarted_dispatcher_reuses_root_context_from_valkey(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    common: dict[str, Any] = {
+        "lane": "mention",
+        "redis_client": redis_client,
+        "config": config,
+        "slack_identity": DEFAULT_IDENTITY,
+        "bot_user_id": "U0BOT",
+        "bot_id": "B0BOT",
+    }
+    before = _ThreadWebClient()
+    assert (
+        process_event(
+            body={"event_id": "Ev-before-restart"},
+            event=_alert_reply(),
+            web_client=before,  # type: ignore[arg-type]
+            admission=build_admission(config, redis_client),
+            **common,
+        )
+        is not None
+    )
+
+    # A restarted process: a new Web API client and a new admission gate, with
+    # only Valkey surviving. Slack history is down, so the context can only
+    # come from the cache.
+    after = _ThreadWebClient(history_error=ConnectionError("history is down"))
+    assert (
+        process_event(
+            body={"event_id": "Ev-after-restart"},
+            event=_alert_reply("1700000000.000300", text="<@U0BOT> go ahead"),
+            web_client=after,  # type: ignore[arg-type]
+            admission=build_admission(config, redis_client),
+            **common,
+        )
+        is not None
+    )
+
+    assert after.history_calls == []
+    _, (_, fields) = redis_client.xrange(config.stream)
+    queued = from_stream_fields(fields)
+    assert queued.event_id == "Ev-after-restart"
+    assert "Should I restart the example service?" in queued.text
+    assert queued.text.endswith("go ahead")
+
+
+# @spec slack-alert-followup-context: Failure behavior
+def test_failed_root_lookup_still_answers_with_the_restate_notice(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    web_client = _ThreadWebClient(history_error=ConnectionError("history is down"))
+
+    result = process_event(
+        body={"event_id": "Ev-lookup-failed"},
+        event=_alert_reply(),
+        lane="mention",
+        web_client=web_client,  # type: ignore[arg-type]
+        redis_client=redis_client,
+        config=config,
+        slack_identity=DEFAULT_IDENTITY,
+        admission=build_admission(config, redis_client),
+        bot_user_id="U0BOT",
+        bot_id="B0BOT",
+    )
+
+    assert result is not None
+    assert len(web_client.posts) == 1
+    ((_, fields),) = redis_client.xrange(config.stream)
+    queued = from_stream_fields(fields)
+    assert queued.source == TurnSource.SLACK
+    assert queued.author == "U0HUMAN"
+    assert "restate" in queued.text.lower()
+    assert "Should I restart" not in queued.text
+    assert queued.text.endswith("yes please")
+
+
+# @spec slack-alert-followup-context: Context cache and restart behavior
+def test_root_context_is_read_after_the_claim_and_before_the_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """#2006's claim -> placeholder -> XADD order, with the one read in between."""
+
+    order: list[str] = []
+    original_claim = handlers_module.claim_event
+    original_enqueue = handlers_module.enqueue
+
+    def ordered_claim(*args: Any, **kwargs: Any) -> bool:
+        order.append("claim")
+        return original_claim(*args, **kwargs)
+
+    def ordered_enqueue(*args: Any, **kwargs: Any) -> str:
+        order.append("enqueue")
+        return original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(handlers_module, "claim_event", ordered_claim)
+    monkeypatch.setattr(handlers_module, "enqueue", ordered_enqueue)
+
+    result = process_event(
+        body={"event_id": "Ev-ordered-reply"},
+        event=_alert_reply(),
+        lane="mention",
+        web_client=_ThreadWebClient(order=order),  # type: ignore[arg-type]
+        redis_client=redis_client,
+        config=config,
+        slack_identity=DEFAULT_IDENTITY,
+        admission=build_admission(config, redis_client),
+        bot_user_id="U0BOT",
+        bot_id="B0BOT",
+    )
+
+    assert result is not None
+    assert order == ["claim", "history", "placeholder", "enqueue"]
+
+
+# @spec slack-alert-followup-context: Failure behavior
+@pytest.mark.parametrize(
+    ("event_id", "event", "expected_text"),
+    [
+        (
+            "Ev-non-bot-parent",
+            {
+                "channel": "C0EXAMPLE1",
+                "ts": "1700000000.000600",
+                "thread_ts": "1700000000.000500",
+                "parent_user_id": "U0OTHER",
+                "user": "U0HUMAN",
+                "text": "<@U0BOT> what do you think?",
+            },
+            "what do you think?",
+        ),
+        (
+            "Ev-root-mention",
+            {
+                "channel": "C0EXAMPLE1",
+                "ts": "1700000000.000700",
+                "user": "U0HUMAN",
+                "text": "<@U0BOT> hello there",
+            },
+            "hello there",
+        ),
+    ],
+)
+def test_non_bot_parent_and_root_mentions_remain_byte_identical(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    event_id: str,
+    event: dict[str, str],
+    expected_text: str,
+) -> None:
+    web_client = _ThreadWebClient()
+    result = process_event(
+        body={"event_id": event_id},
+        event=event,
+        lane="mention",
+        web_client=web_client,  # type: ignore[arg-type]
+        redis_client=redis_client,
+        config=config,
+        slack_identity=DEFAULT_IDENTITY,
+        admission=build_admission(config, redis_client),
+        bot_user_id="U0BOT",
+        bot_id="B0BOT",
+    )
+
+    assert result is not None
+    ((_, fields),) = redis_client.xrange(config.stream)
+    queued = from_stream_fields(fields)
+    assert queued.text == expected_text
+    assert queued.source == TurnSource.SLACK
+    assert queued.author == "U0HUMAN"
+    assert queued.conversation_id == event.get("thread_ts", event["ts"])
+    assert web_client.history_calls == []
+    assert len(web_client.posts) == 1
