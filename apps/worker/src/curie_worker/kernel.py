@@ -7794,6 +7794,7 @@ class Kernel:
                 error_message=exc.public_detail,
                 tools_called=outcome.tools_called,
                 assistant_text=outcome.assistant_text,
+                continued=True,
             )
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
             # The agent never saw the prompt, so the ending is the runner's: the
