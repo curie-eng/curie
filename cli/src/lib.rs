@@ -34,6 +34,7 @@ pub mod installation;
 pub mod interactive;
 pub mod kube_context;
 pub mod local;
+pub mod local_stack_keys;
 pub mod mail_channel;
 pub mod message;
 pub mod migrate_store;

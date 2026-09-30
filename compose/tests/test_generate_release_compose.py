@@ -1040,3 +1040,111 @@ def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, t
         )
         dispatcher = json.loads(result.stdout)["services"]["curie-dispatcher"]
         assert dispatcher["environment"]["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] == (raw or "[]")
+
+
+# --- #3557: loopback-only published ports and per-install local credentials ---
+
+LOOPBACK = "127.0.0.1"
+LOCAL_API_KEY_REF = "${CURIE_LOCAL_API_KEY:-curie-dev-key}"
+LOCAL_PG_PASSWORD_REF = "${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}"
+# The postgres host mapping with or without a host IP, so the negative fixture
+# below can be built from the real dev file both before and after the fix.
+POSTGRES_PORT_RE = re.compile(r'"(?:[0-9.]+:)?25432:5432"')
+
+
+def published_ports(doc):
+    """Yield (service, entry) for every published port across all services."""
+    for name, svc in (doc.get("services") or {}).items():
+        for entry in (svc or {}).get("ports") or []:
+            yield name, entry
+
+
+def port_host_ip(entry):
+    """Host IP of a compose port entry, or None when it binds every interface.
+
+    Short syntax is `[ip:]host:container[/proto]`; long syntax is a mapping with
+    an optional `host_ip`.
+    """
+    if isinstance(entry, dict):
+        return entry.get("host_ip")
+    parts = str(entry).split(":")
+    return parts[0] if len(parts) == 3 else None
+
+
+def service_env(doc, service):
+    """A service's environment as a dict, whether written as a mapping or a list."""
+    env = doc["services"][service].get("environment") or {}
+    if isinstance(env, list):
+        # A bare `NAME` entry passes the host value through; it has no literal.
+        return dict(item.split("=", 1) for item in env if "=" in item)
+    return env
+
+
+@pytest.mark.parametrize("label_index", [0, 1], ids=["dev", "release"])
+def test_every_published_port_binds_loopback(label_index):
+    """AC1: no service publishes on all interfaces in the dev or release compose."""
+    label, doc = compose_docs()[label_index]
+    ports = list(published_ports(doc))
+    assert ports, f"{label}: no published ports found; the walk is broken"
+    exposed = [
+        f"{svc}: {entry!r}" for svc, entry in ports if port_host_ip(entry) != LOOPBACK
+    ]
+    assert not exposed, (
+        f"{label}: ports published without a {LOOPBACK} host IP (reachable from the "
+        f"LAN with fixed credentials): {exposed}"
+    )
+
+
+def test_generator_rejects_a_published_port_without_a_host_ip():
+    """AC3: the release generator fails loudly on a port bound to every interface."""
+    assert POSTGRES_PORT_RE.search(DEV_TEXT), "postgres port mapping not found in dev text"
+    bare = POSTGRES_PORT_RE.sub('"25432:5432"', DEV_TEXT, count=1)
+    generate = load_generate()
+    with pytest.raises(ValueError):
+        generate(bare, OTEL_TEXT, version="9.9.9")
+
+
+def test_api_key_interpolates_the_local_install_key():
+    doc = yaml.safe_load(DEV_TEXT)
+    assert service_env(doc, "curie-api")["API_KEY"] == LOCAL_API_KEY_REF
+    assert service_env(doc, "curie-dispatcher")["CURIE_API_KEY"] == LOCAL_API_KEY_REF
+
+
+@pytest.mark.parametrize("label_index", [0, 1], ids=["dev", "release"])
+def test_every_api_key_consumer_uses_the_local_install_key(label_index):
+    label, doc = compose_docs()[label_index]
+    consumers = {
+        "curie-api": "API_KEY",
+        "curie-dispatcher": "CURIE_API_KEY",
+        "curie-worker": "CURIE_API_KEY",
+    }
+    for service, key in consumers.items():
+        env = service_env(doc, service)
+        assert key in env, f"{label}: {service} does not carry {key}"
+        assert env[key] == LOCAL_API_KEY_REF, (
+            f"{label}: {service} {key}={env[key]!r}, want {LOCAL_API_KEY_REF}"
+        )
+
+
+def test_postgres_password_interpolates_the_local_install_password():
+    doc = yaml.safe_load(DEV_TEXT)
+    assert service_env(doc, "postgres")["POSTGRES_PASSWORD"] == LOCAL_PG_PASSWORD_REF
+
+
+def test_every_database_url_uses_the_local_install_password():
+    doc = yaml.safe_load(DEV_TEXT)
+    urls = {}
+    for name in doc["services"]:
+        url = service_env(doc, name).get("DATABASE_URL")
+        if url and "5432" in url:
+            urls[name] = url
+    assert urls, "no postgres DATABASE_URL found; the walk is broken"
+    wrong = {
+        name: url
+        for name, url in urls.items()
+        if f"postgres:{LOCAL_PG_PASSWORD_REF}@" not in url
+    }
+    assert not wrong, f"DATABASE_URLs not using {LOCAL_PG_PASSWORD_REF}: {wrong}"
+    assert "postgres:postgres@" not in DEV_TEXT, (
+        "a literal postgres:postgres@ credential remains in compose.dev.yaml"
+    )
