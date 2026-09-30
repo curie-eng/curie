@@ -1183,14 +1183,15 @@ api:
     # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
     annotations: {}
   # Deploy environment the API boots as (`dev` or `prod`), rendered as
-  # ENVIRONMENT on the api container. `prod` arms the API production boot gate,
-  # which refuses to start on the dev-default `apiKey`/`githubWebhookSecret`
-  # below -- so this backs up the render-time secret gate as defense in depth.
+  # ENVIRONMENT on the api container. The API refuses blank API keys in every
+  # environment. `prod` also refuses the published `apiKey`/`githubWebhookSecret`
+  # defaults below, backing up the render credential gate at boot.
   # Left at `dev` so a bare `helm install` and the dev overlays boot without
   # real secrets; set to `prod` (with real secrets) for a production install.
   environment: dev
-  # Single shared API key the UI and CLI authenticate with. Dev default; override
-  # (or point at an existingSecret) in any shared deployment.
+  # Single shared API key the UI and CLI authenticate with. Sealed installs
+  # generate and retain a key; a nonblank override replaces it. Blank values are
+  # refused. Dev mode keeps the published default.
   apiKey: curie-dev-key
   # Dedicated HMAC secret shared only by the Slack dispatcher (which attests a
   # click's authenticated user/channel) and API (which verifies it). It MUST

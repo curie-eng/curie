@@ -793,9 +793,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":
-        """Production boot gate (#57): with ENVIRONMENT=prod, refuse to start if a
-        shared secret is unset or still the shipped dev default, so a prod deploy
-        can never silently run on well-known credentials."""
+        """Refuse blank API keys in every environment.
+
+        Production also refuses unset shared secrets and shipped dev defaults (#57).
+        """
+        if not self.api_key.strip():
+            raise ValueError("API_KEY must be nonblank")
         attester_secret = self.approval_chat_attester_secret
         if attester_secret and not attester_secret.strip():
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")
