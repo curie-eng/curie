@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0070");
+        assert_eq!(candidate.schema_min, "0072");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -444,10 +444,11 @@ mod tests {
 
         let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert_eq!(retained.schema_min, "0070");
-        assert_eq!(retained.schema_head, "0071");
-        assert!(live_in_window("0070", &retained));
-        assert!(live_in_window("0071", &retained));
+        assert_eq!(retained.schema_min, "0072");
+        assert_eq!(retained.schema_head, "0072");
+        assert!(!live_in_window("0070", &retained));
+        assert!(!live_in_window("0071", &retained));
+        assert!(live_in_window("0072", &retained));
         assert!(!live_in_window("0069", &retained));
 
         assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
