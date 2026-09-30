@@ -40,7 +40,7 @@ _MAX_LINES = 10
 # explained itself are both not-undoable, and flattening them to one line would
 # hide which happened.
 _UNDECLARED = "cannot be undone: nothing reported a prior state"
-_GENERIC_BASH_DETAILS = {
+_GENERIC_DETAILS = {
     None,
     "non-idempotent tool completed",
     "non-idempotent tool executed",
@@ -84,7 +84,8 @@ def _verdict(action: dict[str, Any]) -> str:
     if action.get("undoable"):
         return "can be undone"
     detail = action.get("detail")
-    if isinstance(detail, str) and detail.strip():
+    # Runner bookkeeping is not a connector explanation of irreversibility.
+    if isinstance(detail, str) and detail.strip() and detail not in _GENERIC_DETAILS:
         return _clamp(detail)
     return _UNDECLARED
 
@@ -92,7 +93,7 @@ def _verdict(action: dict[str, Any]) -> str:
 def _generic_bash(action: dict[str, Any]) -> bool:
     if action.get("tool") != "Bash" or action.get("status") != "succeeded":
         return False
-    if action.get("undoable") or action.get("detail") not in _GENERIC_BASH_DETAILS:
+    if action.get("undoable") or action.get("detail") not in _GENERIC_DETAILS:
         return False
     result = action.get("result")
     summary = result.get("summary") if isinstance(result, dict) else None

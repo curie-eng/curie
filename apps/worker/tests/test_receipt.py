@@ -21,7 +21,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from curie_worker.receipt import render_receipt
 
 
@@ -454,7 +453,11 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
 @pytest.mark.parametrize(
     "detail",
-    ["non-idempotent tool completed", "non-idempotent tool executed", "tool result too large to record"],
+    [
+        "non-idempotent tool completed",
+        "non-idempotent tool executed",
+        "tool result too large to record",
+    ],
 )
 def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: str) -> None:
     # WORKER-RECEIPT-1: an unknown tool remains visible and irreversible; a
@@ -472,7 +475,11 @@ def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: s
 
 @pytest.mark.parametrize(
     "detail",
-    ["non-idempotent tool completed", "non-idempotent tool executed", "tool result too large to record"],
+    [
+        "non-idempotent tool completed",
+        "non-idempotent tool executed",
+        "tool result too large to record",
+    ],
 )
 @pytest.mark.parametrize(
     "overrides,verdict",
