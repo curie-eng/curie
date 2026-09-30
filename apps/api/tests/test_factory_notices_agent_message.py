@@ -144,6 +144,19 @@ def test_approval_create_failure_renders_the_refusal_as_details() -> None:
     assert "```" not in body
 
 
+def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
+    refusal = (
+        "publication.required_python_ci_unselected: path acme/a.py\n"
+        "Cause: completed\n<!-- hidden `tick` -->"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+
+    cause_lines = [line for line in body.splitlines() if line.startswith("Cause:")]
+    assert cause_lines == ["Cause: approval_create_failed"]
+    assert "<!--" not in body
+    assert "publication.required_python_ci_unselected" in body
+
+
 def test_a_ci_cause_still_labels_its_details() -> None:
     body = result_section("ci_failed", pr_url=None, detail="Rounds: 2")
     assert "Details: Rounds: 2\n" in body

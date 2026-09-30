@@ -520,6 +520,78 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
     asyncio.run(exercise())
 
 
+def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3617: lineage refusals used to finish with detail=None."""
+
+    from curie_worker.workspace import WorkspaceSelectionRefused
+
+    message = "GitHub pull request head differs from the stored lineage"
+
+    class StalePublicationApi(_PublicationApi):
+        async def create_publication(self, request: object) -> object:
+            self.creates.append(request)
+            raise WorkspaceSelectionRefused(message)
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=StalePublicationApi(),
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert message in detail
+
+    asyncio.run(exercise())
+
+
+def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_worker.approvals import ApprovalBackendError
+
+    message = "publication patch exceeds the 1048576-byte limit"
+
+    class TooLargePublicationApi(_PublicationApi):
+        async def create_publication(self, request: object) -> object:
+            self.creates.append(request)
+            error = ApprovalBackendError("publication create failed: HTTP 413")
+            error.refusal = message
+            raise error
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=TooLargePublicationApi(),
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            assert isinstance(finish["detail"], str)
+            assert message in finish["detail"]
+
+    asyncio.run(exercise())
+
+
 # --- W4: bounded to one ------------------------------------------------------------
 
 

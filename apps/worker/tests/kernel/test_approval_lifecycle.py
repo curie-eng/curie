@@ -2042,15 +2042,24 @@ def test_a_coded_publication_refusal_carries_its_code_and_message(
     "response",
     [
         httpx.Response(500, text="internal error"),
-        httpx.Response(409, json={"detail": "some other conflict"}),
         httpx.Response(409, json={"detail": {"code": 7, "message": "not a code"}}),
     ],
-    ids=["plain-500", "string-detail", "non-string-code"],
+    ids=["plain-500", "non-string-code"],
 )
 def test_an_uncoded_publication_failure_has_no_refusal(response: httpx.Response) -> None:
     error = asyncio.run(_create_publication_error(response))
 
     assert error.refusal is None
+
+
+def test_a_string_detail_api_refusal_is_carried_as_the_refusal() -> None:
+    message = "publication patch exceeds the 1048576-byte limit"
+
+    error = asyncio.run(
+        _create_publication_error(httpx.Response(413, json={"detail": message}))
+    )
+
+    assert error.refusal == message
 
 
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:

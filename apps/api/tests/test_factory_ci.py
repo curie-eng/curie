@@ -639,7 +639,7 @@ def test_decide_requires_the_python_ci_policy_keyword() -> None:
 
 
 def test_an_outside_python_layout_without_a_policy_is_judged_on_its_own_checks() -> None:
-    """TheConnMan/curie-factory-fixture: a root package and a plain unittest job."""
+    """acme-corp/acme-fixture: a root package and a plain unittest job."""
 
     paths = {"changed_paths": [_OUTSIDE_PATH], "python_ci": None}
     running = _decide(_detail(_actions_run("unittest", status="in_progress")), 60, **paths)
@@ -770,7 +770,7 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
     )
     assert factory_ci.python_ci_policy(settings, "Curie-Eng/Curie") == CURIE_PYTHON_CI
     assert factory_ci.python_ci_policy(settings, "acme/widgets") == _CUSTOM_PYTHON_CI
-    assert factory_ci.python_ci_policy(settings, "TheConnMan/curie-factory-fixture") is None
+    assert factory_ci.python_ci_policy(settings, "acme-corp/acme-fixture") is None
 
 
 @pytest.mark.parametrize(
