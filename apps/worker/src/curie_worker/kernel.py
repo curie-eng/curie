@@ -1678,14 +1678,60 @@ class Kernel:
     def owns_work_item(self, request_id: uuid.UUID) -> bool:
         """Whether this process still holds the WorkItem run (#3076).
 
-        A live run that has not finished, or one parked for approval, is ours;
-        the orphan sweeper must never declare either lost.
+        A live run that has not finished is ours, and the orphan sweeper must
+        never declare it lost. A run parked for approval is ours only until its
+        execution deadline: past it the continuation can no longer finish the
+        request, so the entry is evicted and the sweeper may declare it lost
+        (#3564).
         """
 
+        self._evict_expired_held_work_items()
         run = self._work_item_runs.get(request_id)
         if run is not None and not run.finished:
             return True
         return any(held.request_id == request_id for held in self._held_work_items.values())
+
+    def _evict_expired_held_work_items(self) -> None:
+        """Drop held runs whose execution deadline has passed (#3564).
+
+        A held run already closed its heartbeat when it parked, so eviction is
+        local bookkeeping only. A held run always has a deadline, because
+        holding requires start; an entry without one is kept.
+        """
+
+        now = datetime.now(UTC)
+        for thread_key, held in list(self._held_work_items.items()):
+            if held.execution_deadline is None or held.execution_deadline > now:
+                continue
+            del self._held_work_items[thread_key]
+            logger.warning(
+                "evicting held work item %s on thread %s: execution deadline %s passed",
+                held.request_id,
+                thread_key,
+                held.execution_deadline.isoformat(),
+            )
+
+    def _forget_held_work_items(
+        self,
+        *,
+        reason: str,
+        thread_key: str | None = None,
+        agent_id: uuid.UUID | None = None,
+    ) -> None:
+        """Drop held runs for a thread or an agent, so none outlives its end (#3564)."""
+
+        for key, held in list(self._held_work_items.items()):
+            if thread_key is not None and key != thread_key:
+                continue
+            if agent_id is not None and held.agent_id != agent_id:
+                continue
+            del self._held_work_items[key]
+            logger.warning(
+                "dropping held work item %s on thread %s: %s",
+                held.request_id,
+                key,
+                reason,
+            )
 
     def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
         """This turn's reply target, including any ref minted during the turn.
@@ -2217,6 +2263,9 @@ class Kernel:
         runner by the original execution deadline.
         """
 
+        # An expired held run cannot be finished by this continuation; evict it
+        # so the lookup below asks the API instead (#3564).
+        self._evict_expired_held_work_items()
         held = self._held_work_items.pop(thread_key, None)
         if held is None and self._work_items is not None:
             try:
@@ -3548,6 +3597,8 @@ class Kernel:
         thread is never left routeless.
 
         True if a route existed to release."""
+        # An operator release ends any run parked on the thread (#3564).
+        self._forget_held_work_items(thread_key=thread_key, reason="operator release")
         try:
             interrupted = await asyncio.wait_for(
                 self.interrupt_thread(thread_key, "operator requested a sandbox reset"),
@@ -3651,6 +3702,9 @@ class Kernel:
                 exc.code,
             )
             return
+        # Cleared only once the claim succeeds, so a refused claim leaves the
+        # held run in place for whoever does own the termination (#3564).
+        self._forget_held_work_items(thread_key=thread_key, reason="terminated")
         claim_name: str | None = None
         sandbox_name: str | None = None
         try:
@@ -3691,6 +3745,7 @@ class Kernel:
     async def _stop_owned_work_item(self, thread_key: str, run: WorkItemRun) -> None:
         """Heartbeat saw cancellation_requested: interrupt, observe, record."""
 
+        self._forget_held_run(thread_key, run, reason="cancellation requested")
         if self._work_items is None or run.runtime_epoch is None:
             return
         observation = await self._halt_work_item_runtime(
@@ -3722,11 +3777,18 @@ class Kernel:
         """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
         run.finished = True
+        self._forget_held_run(thread_key, run, reason="stale owner")
         logger.warning(
             "stale work-item owner abandoning request %s on thread %s without releasing the route",
             run.request_id,
             thread_key,
         )
+
+    def _forget_held_run(self, thread_key: str, run: WorkItemRun, *, reason: str) -> None:
+        """Drop the thread's held entry only when it is this very run (#3564)."""
+
+        if self._held_work_items.get(thread_key) is run:
+            self._forget_held_work_items(thread_key=thread_key, reason=reason)
 
     async def _halt_work_item_runtime(
         self,
@@ -3792,6 +3854,9 @@ class Kernel:
                 return False
 
         results = await asyncio.gather(*(_interrupt_one(key) for key in threads))
+        # A run parked for approval has no live turn to signal, but the kill
+        # still ends it here, so the sweeper can reclaim the request (#3564).
+        self._forget_held_work_items(agent_id=agent_id, reason=f"agent {agent_id} killed")
         signalled = sum(results)
         logger.info("kill: interrupted %d live turn(s) for agent %s", signalled, agent_id)
         return signalled
@@ -6106,6 +6171,9 @@ class Kernel:
             )
         elif run is not None:
             remaining_s = run.bound_remaining_s(remaining_s)
+        if run is not None and agent_id is not None:
+            # Lets a kill find this run if it later parks for approval (#3564).
+            run.agent_id = agent_id
         if agent_id is not None:
             self._register_run(agent_id, thread_key)
         turn: TurnStream | None = None
