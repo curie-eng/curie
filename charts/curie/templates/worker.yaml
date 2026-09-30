@@ -512,16 +512,12 @@ spec:
             # Kubernetes there is nothing on that port, so bundle_store's boto3
             # client connected to localhost and got ECONNREFUSED on every fetch.
             #
-            # It fails in the two places that are hardest to notice:
-            #
-            #   * eval default @ <sha> failed: unresolvable suite/bundle
-            #     -- the post-deploy eval never runs. Nothing alerts, because a
-            #     suite that cannot resolve is indistinguishable from one that
-            #     was not requested.
-            #   * every Slack turn dies as ClaimTimeoutError after 90s, whose
-            #     message blames a CPU-saturated node first. On the install where
-            #     this was found the node was at 11% CPU with 4% pressure, and
-            #     three people read that error as "the box is too small".
+            # The post-deploy eval reports "unresolvable suite/bundle" when
+            # this worker-side read fails, so the suite cannot run.
+            # Kubernetes chat turns fetch their bundles in the sandbox's
+            # bundle-fetch init container, using its own S3 environment.
+            # These worker variables do not explain a ClaimTimeoutError on
+            # that path; inspect claim readiness and the sandbox pod instead.
             #
             # Same values as api.yaml, deliberately: the API WRITES each uploaded
             # bundle to this bucket and the worker READS it back, so they have to

@@ -779,15 +779,12 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/live-manifest-parity-assertions.sh
 
-      # Prove the API and the worker agree about the object store. The API writes
-      # each uploaded plugin bundle to the bundle bucket and the worker reads it
-      # back, so a disagreement -- or an omission -- makes every bundle
-      # unfetchable. worker.yaml set none of the four variables, so the worker
-      # used its compose defaults (localhost:29000) and every fetch in
-      # Kubernetes hit ECONNREFUSED. Both symptoms point elsewhere: the
-      # post-deploy eval goes quiet with "unresolvable suite/bundle", and turns
-      # die as ClaimTimeoutError, whose message blames a CPU-saturated node --
-      # on the install where this was found the node was at 11% CPU.
+      # Prove the API and worker eval reader agree about the object store.
+      # Missing worker S3 variables select compose defaults (localhost:29000),
+      # so an in-cluster eval cannot fetch its suite and reports
+      # "unresolvable suite/bundle". Kubernetes chat turns fetch bundles through
+      # the sandbox bundle-fetch init container with its own S3 environment;
+      # this worker env fix does not explain turn-path ClaimTimeoutError.
       - name: helm render assertions (worker/api object store agree)
         run: |
           set -euo pipefail
