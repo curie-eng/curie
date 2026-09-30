@@ -521,7 +521,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/github-app-credential-assertions.sh
-          python3 charts/curie/ci/test_api_identity_assertions.py
+          bash charts/curie/ci/api-identity-mutation-assertions.sh
 
       # Prove GitHub review ingress stays off by default, renders explicit
       # operator values, rejects invalid types/cadences, and reserves both env
