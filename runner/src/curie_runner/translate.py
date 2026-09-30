@@ -183,6 +183,8 @@ class TurnState:
     # durable replay. The inbound user message is prepended by SessionRunner;
     # this list holds assistant output and user-shaped tool results.
     history_messages: list[ConversationMessage] = field(default_factory=list)
+    # Opaque identity from an observed provider message_start, history only.
+    assistant_group: str | None = field(default=None, repr=False)
     # Call id -> tool name, for side-effecting calls whose result has not arrived
     # yet. A tool result lands on a LATER message, so the name has to be
     # remembered to attribute it, and the id is what joins the two frames of one

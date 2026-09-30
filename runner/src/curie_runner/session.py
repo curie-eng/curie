@@ -25,6 +25,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 
 import anyio
 from aci_protocol import (
@@ -61,6 +62,7 @@ from .history import (
     TranscriptStore,
     TurnRecord,
     close_suspended_tool_calls,
+    is_tool_result_message,
 )
 from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
 from .memory import (
@@ -819,6 +821,7 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         await self._session.query(text)
         if self._active_state is not None:
+            self._active_state.assistant_group = None
             self._active_state.history_messages.append(
                 ConversationMessage(role="user", content=text)
             )
@@ -1399,6 +1402,8 @@ class SessionRunner:
                 continue
             if isinstance(message, PartialMessageBoundary):
                 gen.record_first_response_boundary()
+                if message.event_type == "message_start":
+                    state.assistant_group = message.assistant_group
                 continue
             if _is_auth_rejection(message):
                 # A rejected model credential is terminal: stop the live session
@@ -1423,6 +1428,12 @@ class SessionRunner:
                 )
             history_message = model_message_to_conversation(message)
             if history_message is not None:
+                if history_message.role == "assistant":
+                    history_message = replace(
+                        history_message, assistant_group=state.assistant_group
+                    )
+                elif not is_tool_result_message(history_message):
+                    state.assistant_group = None
                 # Some harness streams echo the submitted user prompt before
                 # assistant output. The durable turn already prepends the exact
                 # inbound event, so drop only that leading duplicate.
