@@ -878,6 +878,11 @@ def test_deploy_notices_are_bounded_per_repository(
     assert other.status_code == 201, other.text
     stream = f"test:deploy-notice:bound:{uuid.uuid4().hex}"
     rejected = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
+    # A case-variant repository name arrives as this rejection (see
+    # test_case_only_repository_binding_miss_is_a_rejection).
+    case_mismatch = WebhookResult(
+        status="rejected", errors=[{"code": "git.repository_case_mismatch"}]
+    )
 
     def payload_for(sha: str, repository: str = REPO) -> dict[str, Any]:
         payload = _push_payload("refs/heads/dev", sha, "file:///unused")
@@ -902,7 +907,7 @@ def test_deploy_notices_are_bounded_per_repository(
                 ) == 0
                 # A different casing is the same GitHub repository.
                 assert await queue.publish(
-                    session, rejected, payload_for(f"{21:040x}", REPO.upper()), settings
+                    session, case_mismatch, payload_for(f"{21:040x}", REPO.upper()), settings
                 ) == 0
                 assert _suppressed_counts(notice_metrics) == {"rate_limited": 2}
                 # Redelivering a recorded outcome adds nothing and is not counted.

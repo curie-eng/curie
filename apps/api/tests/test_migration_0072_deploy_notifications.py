@@ -32,13 +32,20 @@ def test_0072_upgrades_old_agent_and_outbox_then_downgrades(
         assert sql_rows(
             "SELECT deploy_notifications FROM curie.agents WHERE id = :id", {"id": agent_id}
         )[0][0] is False
+        # repo carries the case-folded repository the per-repository notice
+        # bound counts by (docs/operations.md).
         assert column_names("deploy_notice_outbox") == {
-            "key", "stream", "payload", "attempts", "created_at", "enqueued_at"
+            "key", "stream", "repo", "payload", "attempts", "created_at", "enqueued_at"
         }
         sql_rows(
-            "INSERT INTO curie.deploy_notice_outbox (key, stream, payload) "
-            "VALUES (:key, :stream, :payload)",
-            {"key": "a" * 64, "stream": "curie:runs:deploy-notices", "payload": "{}"},
+            "INSERT INTO curie.deploy_notice_outbox (key, stream, repo, payload) "
+            "VALUES (:key, :stream, :repo, :payload)",
+            {
+                "key": "a" * 64,
+                "stream": "curie:runs:deploy-notices",
+                "repo": "acme-corp/acme-bot",
+                "payload": "{}",
+            },
         )
         assert sql_rows(
             "SELECT attempts, enqueued_at IS NULL FROM curie.deploy_notice_outbox "
