@@ -54,8 +54,15 @@ The hook names the root message as `conversation_id` and the reply as
 `placeholder`. Its delivery id is stable for the source channel and root
 timestamp. A retry reuses the existing placeholder and the same delivery id;
 the hook receipt must name the requested root. These constraints make retries
-idempotent and make an older Curie API that ignores explicit reply targets fail
-closed instead of posting a detached answer.
+idempotent on an API that supports explicit reply targets.
+
+Curie v0.11.0 does not accept `conversation_id` or `placeholder` on the hook
+route. It ignores those query parameters, queues a placeholderless turn on its
+synthetic hook conversation, and then returns a receipt naming that conversation.
+The intake rejects that receipt and stops, but the turn has already been queued:
+its answer posts at channel level, outside the email thread. Retrying the same
+delivery id returns the original conversation and cannot repair its target.
+Receipt validation therefore detects this incompatibility only after enqueue.
 
 The payload contains source metadata and the extracted email text. It is
 untrusted evidence, never instructions. The SRE bot remains read-only for these
@@ -103,6 +110,14 @@ page-level rules to an independently observed notification destination and use
 the existing Alertmanager heartbeat to detect a broken notification path.
 
 ## Configuration
+
+Before applying the intake Deployment, install an API release that includes
+[ADR 0182](../../../docs/adr/0182-a-signed-hook-may-complete-a-preposted-reply.md).
+Confirm that the running API's OpenAPI description declares both
+`conversation_id` and `placeholder` query parameters on
+`POST /hooks/{agent_id}/{hook}`. Curie v0.11.0 does not meet this prerequisite;
+do not send a trial hook to discover compatibility, because it can enqueue a
+detached turn before the intake rejects its receipt.
 
 Before scanning or posting a placeholder, startup fetches the running API's
 OpenAPI description without a hook signature and requires both `conversation_id`
