@@ -44,6 +44,15 @@ before editing there, in addition to this file.
 The Python packages are one **uv workspace** (root `pyproject.toml`); ruff,
 mypy, and pytest are configured at the root and run across all members.
 
+## Parallel work
+
+At intake, identify independent tasks and their real dependencies. Start
+disjoint implementation, review, and verification concurrently in separate
+worktrees with isolated test resources; do not wait for one PR's CI or merge
+before starting work that is otherwise ready. Keep shared-file ownership and
+merge or deployment dependencies sequential. After a prerequisite merges,
+retarget its dependent PR promptly and rerun the required gates before merging.
+
 ## Verify commands (per package)
 
 Run these from the repo root unless noted. CI (`.github/workflows/ci.yaml`) runs
@@ -532,8 +541,11 @@ change is safe.
 
 If your task needs a change to either package: **stop, do not work around it, and
 open a GitHub issue or raise it in your PR** -- a contract change must land as
-its own reviewed, backward-compatible change first, before dependent lanes
-proceed. This also applies whenever an adopted component (Langfuse, Agent
+its own reviewed, backward-compatible PR before dependent lanes merge or
+deploy. Once that contract PR is open with a pinned head, dependent lanes may
+develop and verify in parallel in separate worktrees and draft stacked PRs;
+they must retarget to the release branch and rerun required gates after the
+contract lands. This also applies whenever an adopted component (Langfuse, Agent
 Sandbox, Bolt) cannot do what a spec claims: stop and raise it with the evidence
 rather than silently diverging.
 
