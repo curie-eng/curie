@@ -3480,6 +3480,43 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
+    /// The helm render gate templates the Docker variant of the Alloy values
+    /// from this file instead of re-implementing `render_alloy_values`.
+    /// Regenerate it with `CURIE_TEST_UPDATE_ALLOY_FIXTURE=1 cargo test
+    /// alloy_docker_variant_matches_ci_fixture` after changing the template.
+    #[test]
+    fn alloy_docker_variant_matches_ci_fixture() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../charts/curie/ci/fixtures/alloy-docker-values.yaml");
+        let template = OBSERVABILITY_FILES
+            .iter()
+            .find(|(name, _)| *name == "alloy-values.yaml")
+            .map(|(_, contents)| *contents)
+            .expect("embedded Alloy values");
+        // The same two steps `write_observability_files` takes for the
+        // default namespace the gate renders into.
+        let template = rewrite_observability_namespace(template, OBSERVABILITY_NAMESPACE);
+        let rendered = render_alloy_values(&template, LogRuntime::Docker).unwrap();
+        if std::env::var("CURIE_TEST_UPDATE_ALLOY_FIXTURE").as_deref() == Ok("1") {
+            std::fs::create_dir_all(fixture.parent().expect("fixture directory"))
+                .expect("create Alloy CI fixture directory");
+            std::fs::write(&fixture, &rendered).expect("write Alloy CI fixture");
+        }
+        let committed = std::fs::read(&fixture).unwrap_or_else(|error| {
+            panic!(
+                "{} is unreadable ({error}); regenerate it with \
+                 CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+                fixture.display()
+            )
+        });
+        assert!(
+            committed == rendered,
+            "{} drifted from render_alloy_values; regenerate it with \
+             CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+            fixture.display()
+        );
+    }
+
     #[test]
     fn log_runtime_classifies_supported_node_versions() {
         // Node.status.nodeInfo.containerRuntimeVersion is a runtime://version
