@@ -150,6 +150,31 @@ impl OpsCommand {
         self.args.iter().flat_map(CmdArg::value_tokens).collect()
     }
 
+    /// The `tokio::process::Command` for this command: program, real argv, env,
+    /// and secret env, with no stdio, `kill_on_drop`, or process group applied.
+    /// This is the one place a child `Command` is constructed, so a caller that
+    /// needs its own stdio or process group still never writes `Command::new`.
+    /// Call it on the result of
+    /// [`materialize_secret_files`](Self::materialize_secret_files), otherwise any
+    /// [`CmdArg::SecretValuesFile`] values are dropped rather than executed.
+    pub(crate) fn tokio_command(&self) -> Command {
+        debug_assert!(
+            !self.args.iter().any(|arg| matches!(
+                arg,
+                CmdArg::SecretValuesFile(_)
+                    | CmdArg::SecretValuesDocument(_)
+                    | CmdArg::PrivateJsonValuesFile(_)
+                    | CmdArg::SecretPatchFile { .. }
+            )),
+            "materialize_secret_files before tokio_command"
+        );
+        let mut command = Command::new(&self.program);
+        command
+            .args(self.argv())
+            .envs(self.env.iter().chain(self.secret_env.iter()).cloned());
+        command
+    }
+
     /// The full shell-quoted command line with secrets masked, one line as it
     /// would be typed into a shell.
     pub fn display(&self) -> String {
@@ -578,9 +603,8 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // reads by a timeout for a wedged daemon, and each timed-out call would
     // otherwise strand another hung `docker` client (#1031). Inert for every
     // caller that awaits to completion: the child has already exited by then.
-    let output = Command::new(&cmd.program)
-        .args(cmd.argv())
-        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+    let output = cmd
+        .tokio_command()
         .kill_on_drop(true)
         .output()
         .await
@@ -597,9 +621,8 @@ pub(crate) async fn run_capture_with_stdin(
     input: &[u8],
 ) -> Result<(bool, String, String)> {
     let (cmd, _secret_files) = cmd.materialize_secret_files()?;
-    let mut child = Command::new(&cmd.program)
-        .args(cmd.argv())
-        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+    let mut child = cmd
+        .tokio_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

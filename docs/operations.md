@@ -71,7 +71,8 @@ curie cluster status --context <your-production-context>
 
 ## Installing and inspecting the Curie platform on the cluster
 
-Every `curie cluster` verb takes `--context <NAME>`. The CLI resolves the
+Every `curie cluster` verb, and every `curie example sre-bot` verb, takes
+`--context <NAME>`. The CLI resolves the
 context once, prints `Kubernetes context: <NAME> (cluster <CLUSTER>)` on stderr,
 and pins it for every `helm` and `kubectl` call it makes, including any ambient
 `HELM_KUBECONTEXT`. Without the flag it pins the kubeconfig current-context. A

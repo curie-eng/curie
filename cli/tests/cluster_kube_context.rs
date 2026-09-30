@@ -351,7 +351,10 @@ fn example_sre_bot_explicit_context_pins_every_helm_and_kubectl_call() {
         // run after the first helm and kubectl calls; both must already be pinned.
         assert_all_pinned(&run, "test-ctx");
         let err = run.stderr();
-        assert!(err.contains("test-ctx"), "stderr must name the context: {err}");
+        assert!(
+            err.contains("test-ctx"),
+            "stderr must name the context: {err}"
+        );
         assert!(
             err.contains("test-cluster"),
             "stderr must name the cluster: {err}"
@@ -390,7 +393,11 @@ fn example_sre_bot_unknown_context_refuses_before_any_call() {
     );
     assert!(!run.out.status.success(), "unknown context must fail");
     assert!(run.stderr().contains("nope"), "stderr: {}", run.stderr());
-    assert!(run.log.is_empty(), "no helm or kubectl call may run: {:?}", run.log);
+    assert!(
+        run.log.is_empty(),
+        "no helm or kubectl call may run: {:?}",
+        run.log
+    );
 }
 
 #[test]
@@ -409,9 +416,16 @@ fn example_sre_bot_dry_run_names_the_context_and_prints_the_argv() {
         None,
     );
     assert!(run.out.status.success(), "stderr={}", run.stderr());
-    assert!(run.log.is_empty(), "a dry run spawns nothing: {:?}", run.log);
+    assert!(
+        run.log.is_empty(),
+        "a dry run spawns nothing: {:?}",
+        run.log
+    );
     let err = run.stderr();
-    assert!(err.contains("test-ctx") && err.contains("test-cluster"), "{err}");
+    assert!(
+        err.contains("test-ctx") && err.contains("test-cluster"),
+        "{err}"
+    );
     let plan: serde_json::Value = serde_json::from_slice(&run.out.stdout).expect("JSON plan");
     let lines: Vec<&str> = plan["plan"]
         .as_array()
