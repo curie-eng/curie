@@ -115,8 +115,8 @@ _CAUSE_TEXT = {
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
-        "the requested approval could not be created. Check the publication "
-        "request or approval service, then retry."
+        "the publication request was refused, so no pull request was opened. "
+        "Read the details for the reason, fix it, then retry."
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
@@ -147,7 +147,9 @@ _CAUSE_TEXT = {
 }
 
 # Infrastructure and CI causes carry details, not a provider message.
-_DETAIL_CAUSES = frozenset({"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified"})
+_DETAIL_CAUSES = frozenset(
+    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})

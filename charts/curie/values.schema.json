@@ -52,6 +52,36 @@
           "maximum": 10800,
           "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
         },
+        "githubFactoryPythonCi": {
+          "type": "object",
+          "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["check", "paths"],
+            "properties": {
+              "check": {
+                "type": "string",
+                "minLength": 1
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^/].*[^/]$|^[^/]$"
+                }
+              },
+              "pendingCheckPrefix": {
+                "type": ["string", "null"],
+                "minLength": 1
+              }
+            }
+          }
+        },
         "githubFactoryMention": {
           "type": "string",
           "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."

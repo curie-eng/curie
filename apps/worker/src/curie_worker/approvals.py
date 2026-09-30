@@ -28,6 +28,7 @@ from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, Qu
 from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
+from curie_telemetry.redact import redact_text
 
 from .workspace import WorkspaceSelectionRefused
 
@@ -237,7 +238,36 @@ class PublicationLineage:
 
 class ApprovalBackendError(Exception):
     """The approval record could not be created; the kernel escalates rather
-    than suspending a session no resolution could ever wake."""
+    than suspending a session no resolution could ever wake.
+
+    ``refusal`` is ``"<code>: <message>"`` when the API refused the request
+    with a coded detail (#3617), redacted and clipped, so the factory run can
+    name the cause; ``None`` for any other failure.
+    """
+
+    refusal: str | None = None
+
+    def __init__(self, message: str, *, refusal: str | None = None) -> None:
+        super().__init__(message)
+        self.refusal = refusal
+
+
+_REFUSAL_MAX = 500
+
+
+def _coded_refusal(response: httpx.Response) -> str | None:
+    """``"<code>: <message>"`` from an API ``{"detail": {code, message}}`` body."""
+
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(detail, dict):
+        return None
+    code, message = detail.get("code"), detail.get("message")
+    if not isinstance(code, str) or not code or not isinstance(message, str):
+        return None
+    return redact_text(f"{code}: {message}")[:_REFUSAL_MAX]
 
 
 class ApprovalRefused(Exception):
@@ -620,7 +650,8 @@ class ApprovalClient:
             raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
-                f"publication create failed: HTTP {response.status_code}: {response.text}"
+                f"publication create failed: HTTP {response.status_code}: {response.text}",
+                refusal=_coded_refusal(response),
             )
         try:
             body = response.json()

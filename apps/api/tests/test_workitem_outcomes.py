@@ -2435,6 +2435,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2579,6 +2580,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2662,6 +2664,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
