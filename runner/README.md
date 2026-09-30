@@ -152,8 +152,13 @@ turn whose `Event.tool_access` is `read-only`:
   prompt on a session is sent on a fresh SDK session, built exactly as
   `POST /v1/reset` builds one. Nothing a read-only prompt left in the CLI, an
   answer it still owes or a turn a bundle hook woke, can then run under
-  unrestricted access. The read-only turns' conversation is not carried into
-  the new session; the thread's history as it was at boot is.
+  unrestricted access; while the old CLI shuts down, it refuses such a call
+  itself. The read-only turns' conversation is not carried into the new
+  session, which is rebuilt from the thread's history as it was at boot, and
+  that ordinary turn pays the cost of a new session (the old CLI's shutdown,
+  a fresh start, no warm prompt cache). The read-only turns are still
+  recorded in the thread's durable history, so a later boot of that thread
+  replays them.
 
 ## Environment
 
