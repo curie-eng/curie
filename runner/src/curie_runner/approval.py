@@ -612,7 +612,13 @@ def build_memory_tools(
     def ok(payload: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(payload)}]}
 
-    @tool(REMEMBER_TOOL, "Save one new fact to memory. Returns its id.", _REMEMBER_SCHEMA)
+    @tool(
+        REMEMBER_TOOL,
+        "Save one new fact to memory and return its id. This is the only way to keep "
+        "something for a later conversation: a request to remember, note or make "
+        "something stick, or to set a standing instruction, means calling this tool.",
+        _REMEMBER_SCHEMA,
+    )
     async def remember(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:
