@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_work_item_workspace import _Binding, _turn, _WorkItems, _Workspace  # noqa: E402
 
 CHANNEL_MEMORY_REF_ENV = "CURIE_CHANNEL_MEMORY_REF"
+MEMORY_WRITES_ENV = "CURIE_MEMORY_WRITES"
 
 
 class _FailingMemoryWritesBinding(_Binding):
@@ -65,7 +66,12 @@ def test_a_failed_memory_writes_read_leaves_the_turn_running_with_writes_off(
             envs = [env or {} for env in h.fake_k8s.claim_envs]
             assert envs, "the turn must still claim a sandbox"
             for env in envs:
-                assert CHANNEL_MEMORY_REF_ENV not in env
+                # Writes are off, so the tools must not mount. The channel ref
+                # may still ride for reading (#3621), but then the worker says
+                # explicitly that writes are off.
+                assert env.get(MEMORY_WRITES_ENV) != "1"
+                if CHANNEL_MEMORY_REF_ENV in env:
+                    assert env.get(MEMORY_WRITES_ENV) == "0"
 
     asyncio.run(exercise())
     assert binding.reads >= 1, "the kernel never asked for the setting"
