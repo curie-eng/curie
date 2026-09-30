@@ -7,10 +7,13 @@ import hmac
 import importlib.util
 import json
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterator
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -1026,3 +1029,111 @@ def test_main_denies_unsupported_api_before_any_slack_or_hook_side_effect(
     assert slack.calls == []
     assert slack.posts == []
     assert hook.calls == []
+
+
+@pytest.fixture
+def local_capability_api() -> Iterator[Callable[[], SimpleNamespace]]:
+    """Own real HTTP stand-ins and tear down their listeners even on failure."""
+
+    owned: list[tuple[ThreadingHTTPServer, threading.Thread]] = []
+
+    def start() -> SimpleNamespace:
+        routes: dict[str, tuple[int, dict[str, str], bytes]] = {}
+        requests: list[tuple[str, str]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                requests.append(("GET", self.path))
+                status, headers, body = routes.get(self.path, (404, {}, b"missing"))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                requests.append(("POST", self.path))
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, _format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        owned.append((server, thread))
+        thread.start()
+        return SimpleNamespace(
+            url=f"http://127.0.0.1:{server.server_port}", routes=routes, requests=requests
+        )
+
+    try:
+        yield start
+    finally:
+        for server, thread in reversed(owned):
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2.0)
+            assert not thread.is_alive(), "local capability API failed to shut down"
+
+
+def compatible_openapi_bytes() -> bytes:
+    return json.dumps(
+        hook_schema(
+            [
+                {"name": "conversation_id", "in": "query"},
+                {"name": "placeholder", "in": "query"},
+            ]
+        )
+    ).encode()
+
+
+@pytest.mark.parametrize("destination_origin", ["same", "different"])
+# @spec SRE-EMAIL-2
+def test_default_capability_sender_denies_redirect_without_fetching_destination(
+    intake: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    local_capability_api: Callable[[], SimpleNamespace],
+    destination_origin: str,
+) -> None:
+    env(monkeypatch)
+    source = local_capability_api()
+    destination = source if destination_origin == "same" else local_capability_api()
+    destination.routes["/compatible/openapi.json"] = (200, {}, compatible_openapi_bytes())
+    source.routes["/prefix/openapi.json"] = (
+        302,
+        {"Location": f"{destination.url}/compatible/openapi.json"},
+        b"",
+    )
+    monkeypatch.setenv("CURIE_HOOK_URL", f"{source.url}/prefix/hooks/acme/email-alert")
+    monkeypatch.setenv("HTTP_TIMEOUT_SECONDS", "2")
+    client = intake.CurieHookClient(intake.Config.from_env())
+    denied = False
+    try:
+        client.verify_target_capability()
+    except RuntimeError:
+        denied = True
+
+    assert ("GET", "/compatible/openapi.json") not in destination.requests
+    assert source.requests == [("GET", "/prefix/openapi.json")]
+    assert not any(method == "POST" for method, _path in destination.requests)
+    assert denied, "redirected schema must not authorize a hook at the original API"
+
+
+# @spec SRE-EMAIL-2
+def test_default_capability_sender_accepts_direct_schema_without_posting_hook(
+    intake: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    local_capability_api: Callable[[], SimpleNamespace],
+) -> None:
+    env(monkeypatch)
+    source = local_capability_api()
+    source.routes["/prefix/openapi.json"] = (200, {}, compatible_openapi_bytes())
+    monkeypatch.setenv("CURIE_HOOK_URL", f"{source.url}/prefix/hooks/acme/email-alert")
+    monkeypatch.setenv("HTTP_TIMEOUT_SECONDS", "2")
+
+    intake.CurieHookClient(intake.Config.from_env()).verify_target_capability()
+
+    assert source.requests == [("GET", "/prefix/openapi.json")]
