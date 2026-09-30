@@ -207,8 +207,10 @@ def _switch_or_none(raw: str | None) -> bool | None:
 
     ``1``/``true`` is on and ``0``/``false`` is off, case-insensitively; absent
     or blank is ``None`` (unset), which is not the same as off. Any other value
-    reads as off, the same way ``_fake_model_or_none`` treats values outside its
-    truthy set, so a typo never turns a feature on.
+    reads as off. For ``memory_writes`` that matters: ``None`` means "an older
+    worker", and the runner then treats a present channel ref as writes on, so
+    reading an unknown value as ``None`` would turn writes on. Reading it as off
+    fails closed, so do not change unknown values to ``None``.
     """
 
     if raw is None or not raw.strip():
@@ -356,6 +358,8 @@ class BootEnv(_AciModel):
     # - None: an older worker that predates the flag. The runner then falls
     #   back to the channel ref: a present ``channel_memory_ref`` means writes
     #   are on, so a new runner behind an old worker keeps today's behaviour.
+    # An unknown value reads as False, not None: None would fall back to the
+    # channel ref and turn writes on, so False is the fail-closed choice.
     memory_writes: bool | None = Field(
         default=None, json_schema_extra=_env("CURIE_MEMORY_WRITES", "worker")
     )
