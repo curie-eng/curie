@@ -446,7 +446,9 @@ def test_the_same_gated_write_on_an_ordinary_turn_still_asks_for_approval() -> N
 
 def test_a_read_only_turn_ignores_the_models_approval_request() -> None:
     # @spec RUNNER-TOOL-ACCESS-3 RUNNER-TOOL-ACCESS-8
-    gate = build_approval_gate(operator_tools=None, policy_routes={"ops": "C0EXAMPLE1"})
+    gate = build_approval_gate(
+        operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"}
+    )
     assert gate is not None
     runner, _ = _fake_runner(
         lambda: approval_turn("deploy the fix", route="ops"), gate=gate, access=_access()
@@ -462,7 +464,9 @@ def test_a_read_only_turn_ignores_the_models_approval_request() -> None:
 
 def test_the_same_approval_request_on_an_ordinary_turn_is_a_card() -> None:
     # @spec RUNNER-TOOL-ACCESS-7: the control for the test above.
-    gate = build_approval_gate(operator_tools=None, policy_routes={"ops": "C0EXAMPLE1"})
+    gate = build_approval_gate(
+        operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"}
+    )
     assert gate is not None
     runner, _ = _fake_runner(
         lambda: approval_turn("deploy the fix", route="ops"), gate=gate, access=_access()

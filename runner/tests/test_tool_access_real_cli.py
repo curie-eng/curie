@@ -432,3 +432,34 @@ def test_an_unclassified_connector_tool_is_refused(
 
     assert final.status is SessionStatus.DONE
     assert ran == []
+
+
+def test_an_ordinary_turn_runs_the_same_shell_write_through_the_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: InMemoryMetricReader
+) -> None:
+    """RUNNER-TOOL-ACCESS-7 on the real path: the always-registered front abstains.
+
+    The same ``Bash`` write the first test refuses, on an unrestricted turn of
+    the same ungated session: it runs, exactly as it did before the front
+    existed. Red if the front's mere presence changed an ordinary call.
+    """
+
+    # @spec RUNNER-TOOL-ACCESS-7
+    marker = tmp_path / "written-by-an-ordinary-turn"
+    access = TurnToolAccess(CLAUDE_READONLY_TOOLS)
+
+    final, _, bodies = _run_turn(
+        tmp_path,
+        monkeypatch,
+        tool="Bash",
+        tool_input={"command": f"touch {marker}", "description": "write a file"},
+        access=access,
+        tool_access=None,
+    )
+
+    assert marker.exists(), "the ordinary Bash call did not run"
+    assert final.status is SessionStatus.DONE
+    [result] = _refusals_sent(bodies)
+    assert result.get("is_error") is not True
+    assert access.refused_call_ids == set()
+    assert _points(reader) == {("builtin", "success"): 1}
