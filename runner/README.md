@@ -105,7 +105,8 @@ turn whose `Event.tool_access` is `read-only`:
   hooks only in `hooks/hooks.json` has no runner registration at all. Those
   commands are the bundle's code, not tools the model calls: they run on a
   read-only turn as on any other, can change state the bundle keeps for later
-  turns, and cannot turn the deny into an allow.
+  turns, can start a CLI turn of their own (an `asyncRewake` hook), and cannot
+  turn the deny into an allow.
 - **RUNNER-TOOL-ACCESS-3:** The turn never ends `awaiting-approval` and its
   `final` carries no approval field. A `request_approval` or `publish_changes`
   call in it is denied like any other write and is not captured as a request.
@@ -120,7 +121,8 @@ turn whose `Event.tool_access` is `read-only`:
   CLI answers as turns of its own after the runner has moved on (a steer, a
   background task's notification), and such a turn would shift a read-only
   prompt out of its turn and past the next turn's change of access. A
-  read-only turn cannot leave such work, because it may start neither.
+  read-only turn can start neither; the work a bundle's own hook can still
+  start is kept from ever running unrestricted by RUNNER-TOOL-ACCESS-11.
 - **RUNNER-TOOL-ACCESS-5:** `GET /status` and `GET /v1/status` carry
   `"tool_access": ["read-only"]` while the session can enforce it: it was
   built with enforcement and has sent no unrestricted prompt
@@ -146,6 +148,12 @@ turn whose `Event.tool_access` is `read-only`:
 - **RUNNER-TOOL-ACCESS-10:** A read-only turn does not use up an approved
   action's one-shot boot grant. The grant stays for the next unrestricted
   turn, the only kind that may spend it.
+- **RUNNER-TOOL-ACCESS-11:** The first unrestricted prompt after any read-only
+  prompt on a session is sent on a fresh SDK session, built exactly as
+  `POST /v1/reset` builds one. Nothing a read-only prompt left in the CLI, an
+  answer it still owes or a turn a bundle hook woke, can then run under
+  unrestricted access. The read-only turns' conversation is not carried into
+  the new session; the thread's history as it was at boot is.
 
 ## Environment
 
