@@ -160,6 +160,65 @@ turn whose `Event.tool_access` is `read-only`:
   recorded in the thread's durable history, so a later boot of that thread
   replays them.
 
+## Portable assistant message groups
+
+Structured history preserves the logical assistant message that produced each
+fragment, in addition to its ordered role/content blocks (#3628). Native Claude
+replay uses the same `message.id` for fragments of one assistant message. With
+SDK 0.2.159 / CLI 2.1.281, reconstructing interleaved fragments without that
+identity can replace successful tool results with an internal missing-result
+marker. This grouping is replay metadata, never approval or tool authority.
+
+- **RUNNER-HISTORY-GROUP-1:** Capture an optional, bounded assistant group only
+  from the provider's observed `StreamEvent` `message_start.message.id`.
+  `AssistantMessage` does not expose that ID in the pinned Python SDK. The
+  adapter carries only a validated opaque identity through its internal
+  boundary, excluded from representations and telemetry; it never forwards the
+  raw event, thinking/signatures, or SDK session identity. A missing or malformed
+  message start clears previous group attribution instead of inheriting it.
+- **RUNNER-HISTORY-GROUP-2:** Persist optional `assistant_group` on runner-local
+  `ConversationMessage` assistant rows. Fragments belong to the current observed
+  start only; tool-result rows do not create or change its identity. A genuine
+  user message, steer, new turn, or different observed assistant start ends the
+  earlier attribution. An ID reused after such a boundary must not join the
+  earlier group. This adds no ACI or plugin-format field.
+- **RUNNER-HISTORY-GROUP-3:** Portable replay retains every row and content block
+  in original order, including tool IDs, arguments, success/error results, and
+  fresh user boundaries. Reconstructed native assistant envelopes use the same
+  scoped `message.id` only for fragments with proven same-group identity. No
+  inference from adjacency, result arrival, tool name, or prose may combine
+  independent messages or move a dependent call before the result it consumes.
+- **RUNNER-HISTORY-GROUP-4:** Old role/content-only records remain readable.
+  Unambiguous sequential call/result history works without a native checkpoint.
+  A legacy checkpoint can supply missing group identity only when its assistant
+  and user conversation rows match the authoritative portable prefix exactly
+  and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
+  attachment availability, other envelope fields, and extra content are never
+  imported by this recovery. If an overlapping tool-call sequence needs grouping
+  that neither portable metadata nor validated native mapping proves, fail
+  before SDK hydration with `HistoryError` identifying unprovable legacy
+  assistant grouping and the need for a fresh conversation. Never submit the
+  known corrupt replay, manufacture a result, or silently discard history.
+- **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
+  inconsistent provenance, including attribution on user rows and reuse across
+  genuine user or distinct assistant-group boundaries. Preserve group identity
+  through text reduction and removal of optional native checkpoints. Existing
+  tool pairing, suspended-call closure, whole-turn pruning, and transcript byte
+  limits retain their current behavior; metadata counts toward those limits.
+- **RUNNER-HISTORY-GROUP-6:** This boot's system prompt remains authoritative.
+  A native checkpoint with a different `prompt_snapshot` is still set aside;
+  recovering only validated historical group identity does not restore that
+  checkpoint or claim previous attachment paths exist in the fresh sandbox.
+
+The regression surface is a fresh native SDK resume after actual session
+capture: a scripted external provider emits one assistant message with
+interleaved tool fragments/results, portable persistence drops the optional
+checkpoint, and the next provider request must contain all exact successful
+results without missing-result markers. Distinct/dependent messages, a new user,
+sequential legacy history, ambiguous legacy history, and a changed current
+prompt are required secondary paths. The local fixture uses owned disposable
+resources and fake provider credentials, with no real model or approval action.
+
 ## Environment
 
 - **ACI-frozen** (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,
