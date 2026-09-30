@@ -18,6 +18,13 @@ against the same provider alarm and episode when the tools support it. Report
 another rule separately. For example, `AcmeSandboxCapacityRefused` starting at
 10:44 does not verify `acme-dev-sandbox-turn-refused` reported at 10:16.
 
+Every named alert needs its own fresh read before a reply claims its current
+state. Reading the original provider alarm does not refresh a related rule's
+state carried in a prior reply. Until that secondary rule is read again, describe
+its earlier state as historical and its current state as unverified. A collective
+claim such as "both refusal alerts are firing now" requires fresh evidence for
+both alerts; a shared symptom or prior root message does not supply it.
+
 If the prior reply omitted the exact name, or available tools cannot identify
 that alarm, state that attribution and current state remain unverified. Ask for
 the original payload or provider read instead of substituting another rule.
