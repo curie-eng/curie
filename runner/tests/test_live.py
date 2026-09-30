@@ -43,11 +43,98 @@ from curie_runner.history import (
     build_conversation_replay,
 )
 from curie_runner.session import SessionRunner
-from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, TOOL_POLICY_ENFORCEMENT, ToolPolicy
 
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 _LIVE_REQUESTED = os.environ.get("CURIE_E2E_LIVE") == "1"
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real provider refusal provenance evidence",
+)
+def test_live_policy_refusal_does_not_call_or_page_the_connector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live model calls a mounted tool; Curie's hook refuses that exact call.
+
+    This complements the deterministic stand-in model's real-CLI check: the
+    provider request and the MCP catalog here are both the real SDK path.
+    """
+
+    from curie_runner import session as session_module
+
+    calls = tmp_path / "connector-calls.txt"
+    fixture = Path(__file__).parent / "fixtures" / "mcp_tool_result_server.py"
+    observed: list[dict[str, str]] = []
+    real_record_metric = session_module.record_metric
+
+    def observe_metric(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        if name == "curie.tool.result" and attributes is not None:
+            observed.append(attributes)
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(session_module, "record_metric", observe_metric)
+    gate = ApprovalGate(
+        required=frozenset(),
+        tool_policy=ToolPolicy(enforcement=TOOL_POLICY_ENFORCEMENT, deny=["acme/read_ledger"]),
+        mcp_servers=set(),
+        connector_servers={"acme"},
+    )
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=(
+            "You are a test agent. When asked to read the ledger, call the "
+            "mcp__acme__read_ledger tool once with account `acme-test`, then stop."
+        ),
+        max_turns=3,
+        max_budget_usd=1.0,
+        resume=None,
+        hooks=build_approval_hook(gate),
+        can_use_tool=build_can_use_tool(gate),
+        mcp_servers={
+            "acme": {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(fixture)],
+                "env": {"CURIE_TEST_TOOL_RESULT_CALLS": str(calls)},
+            }
+        },
+    )
+    runner = SessionRunner(
+        session_factory=lambda: ClaudeAgentSession(options),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="live-policy-refusal",
+        session_id="session-PLACEHOLDER",
+        approval_gate=gate,
+    )
+
+    async def go() -> list[Final]:
+        await runner.start()
+        try:
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="Read the ledger now.", user="U0EXAMPLE1", ts="1")
+                )
+            ]
+            return [event for event in parse_ndjson("".join(lines)) if isinstance(event, Final)]
+        finally:
+            await runner.close()
+
+    finals = anyio.run(go)
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.DONE
+    assert not calls.exists(), "the refused call unexpectedly reached the connector"
+    assert [point["outcome"] for point in observed if point["origin"] == "connector"] == [
+        "refused"
+    ]
 
 _WORKSPACE_REQUIRED_TOOLS = frozenset(
     {"Read", "Edit", "Bash", "mcp__curie__publish_changes"}

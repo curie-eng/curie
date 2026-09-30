@@ -37,7 +37,7 @@ from aci_protocol import (
     parse_ndjson_line,
     to_ndjson_line,
 )
-from claude_agent_sdk import AssistantMessage, ResultMessage
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
@@ -320,6 +320,10 @@ class SessionRunner:
         # blocked approval-required call here, and the turn's final is flipped
         # to awaiting-approval on the same override the policy gate uses.
         self._approval_gate = approval_gate
+        # The SDK's init catalog is the evidence a CLI unknown-tool result
+        # needs before it can be separated from a connector's own error text.
+        # None means no trustworthy catalog has arrived; fail closed to error.
+        self._advertised_tools: set[str] | None = None
         # The authority-free resume marker (#544, Decision A2): 'policy' when
         # this boot is resuming from a policy-gate approval. It confers no
         # capability -- it only arms the observe-only turn-end reconciliation.
@@ -653,6 +657,7 @@ class SessionRunner:
     async def start(self) -> None:
         """Create and connect the model session (rehydrating if configured)."""
 
+        self._advertised_tools = None
         self._session = self._factory()
         await self._session.connect()
         self._started = True
@@ -686,6 +691,7 @@ class SessionRunner:
         async with self._turn_lock:
             if self._session is not None:
                 await self._session.close()
+            self._advertised_tools = None
             self._session = self._factory()
             await self._session.connect()
             self._result_pending = False
@@ -1263,6 +1269,13 @@ class SessionRunner:
                 for line in self._auth_halt_lines():
                     yield line
                 return
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                tools = message.data.get("tools")
+                self._advertised_tools = (
+                    set(tools)
+                    if isinstance(tools, list) and all(isinstance(name, str) for name in tools)
+                    else None
+                )
             history_message = model_message_to_conversation(message)
             if history_message is not None:
                 # Some harness streams echo the submitted user prompt before
@@ -1571,18 +1584,19 @@ class SessionRunner:
         ``_merge_gate_block``, where an operator interrupt outranks an approval
         halt. A result that is not an error is ``success``. An error after an
         operator stop is ``cancelled``: the CLI answers the call it cut off
-        itself. An error on the call the approval gate holds (it asked for a
-        halt and its pending record names this tool) is ``awaiting_approval``;
-        the record holds the first held call only, so another tool's failure in
-        the same message stays an error. Anything else is ``error``, a turn
+        itself. An error on a call the approval gate held is
+        ``awaiting_approval``; a policy or grant-argument refusal is ``refused``.
+        Both match the exact call ID, so another call of the same tool can still
+        be counted independently. The CLI's exact unknown-tool envelope is
+        ``unavailable`` only when its init catalog never advertised the name;
+        without that corroboration, it remains ``error``. Anything else is ``error``, a turn
         deadline included on purpose: a connector that holds a call until the
         deadline is failing.
 
         So a connector ``error`` is any is_error result on a non-platform
-        ``mcp__`` tool that the approval gate did not hold and no operator stop
-        cut off. That rarely includes a call that never reached the connector;
-        ``docs/interfaces/telemetry-otel/INTERFACE.md`` lists those cases
-        (#3489). Each one logs one WARNING naming the server and the tool,
+        ``mcp__`` tool that the gate did not hold or refuse, no operator stop
+        cut off, and the catalog did not confirm unavailable. Each connector
+        error logs one WARNING naming the server and the tool,
         because the metric may carry no identifier; the line never carries the
         call's arguments or its result. Like ``_observe_publication_calls`` it
         runs on every message and acts only on results it has not counted yet.
@@ -1590,14 +1604,24 @@ class SessionRunner:
 
         gate = self._approval_gate
         while state.tool_results_observed < len(state.tool_results):
-            tool_name, errored = state.tool_results[state.tool_results_observed]
+            call_id, tool_name, errored, unknown_marker = state.tool_results[
+                state.tool_results_observed
+            ]
             state.tool_results_observed += 1
             if not errored:
                 outcome = "success"
             elif self._interrupt_requested and not self._timeout_requested:
                 outcome = "cancelled"
-            elif gate is not None and gate.pending_halt and gate.pending_granted_tool == tool_name:
+            elif gate is not None and call_id in gate.held_call_ids:
                 outcome = "awaiting_approval"
+            elif gate is not None and call_id in gate.refused_call_ids:
+                outcome = "refused"
+            elif (
+                unknown_marker
+                and self._advertised_tools is not None
+                and tool_name not in self._advertised_tools
+            ):
+                outcome = "unavailable"
             else:
                 outcome = "error"
             origin = _tool_result_origin(tool_name)

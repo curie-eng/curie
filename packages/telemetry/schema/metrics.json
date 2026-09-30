@@ -1703,10 +1703,12 @@
           "success",
           "error",
           "awaiting_approval",
-          "cancelled"
+          "cancelled",
+          "refused",
+          "unavailable"
         ]
       },
-      "cardinality_bound": 12
+      "cardinality_bound": 18
     }
   }
 }

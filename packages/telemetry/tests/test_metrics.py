@@ -627,7 +627,7 @@ def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
     connector. Red until the outcome domain declares it and
     ``schema/metrics.json`` is regenerated. Red again on any drift: a connector
     or tool name added as an attribute (the cardinality bound would no longer
-    be twelve), an origin or outcome value dropped or renamed, or the counter
+    be eighteen), an origin or outcome value dropped or renamed, or the counter
     made non-monotonic. The alert CurieConnectorToolErrors selects on exactly
     these values.
     """
@@ -642,9 +642,16 @@ def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
             "service.name": ["curie-runner"],
             "source": ["runner"],
             "origin": ["connector", "platform", "builtin"],
-            "outcome": ["success", "error", "awaiting_approval", "cancelled"],
+            "outcome": [
+                "success",
+                "error",
+                "awaiting_approval",
+                "cancelled",
+                "refused",
+                "unavailable",
+            ],
         },
-        "cardinality_bound": 12,
+        "cardinality_bound": 18,
     }
 
 

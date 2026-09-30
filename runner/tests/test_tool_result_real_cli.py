@@ -54,6 +54,7 @@ from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from plugin_format import TOOL_POLICY_ENFORCEMENT, ToolPolicy
 
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_result_server.py"
 _METRIC = "curie.tool.result"
@@ -429,6 +430,122 @@ def test_a_call_the_approval_gate_held_counts_as_awaiting_approval_not_error(
     assert ran == []
     assert _points(reader) == {("connector", "awaiting_approval"): 1}
     assert _connector_warnings(caplog) == []
+
+
+def test_a_policy_denial_on_the_real_cli_never_counts_as_a_connector_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The CLI returns is_error for PreToolUse deny without calling the MCP server.
+
+    The SDK/CLI behavior was measured on claude-agent-sdk 0.2.159 and its
+    bundled CLI 2.1.281 (2026-09-29); this test rechecks that exact boundary.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    gate = ApprovalGate(
+        required=frozenset(),
+        tool_policy=ToolPolicy(enforcement=TOOL_POLICY_ENFORCEMENT, deny=["acme/read_ledger"]),
+        mcp_servers=set(),
+        connector_servers={"acme"},
+    )
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="read_ledger", gate=gate)
+
+    assert final.status is SessionStatus.DONE
+    assert ran == []
+    assert _points(reader) == {("connector", "refused"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_grant_argument_mismatch_on_the_real_cli_never_calls_the_connector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same real CLI synthetic result is attributed to this refused ID.
+
+    The CLI's PreToolUse deny -> is_error result behavior was measured on
+    claude-agent-sdk 0.2.159 / bundled CLI 2.1.281 (2026-09-29).
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    tool = "mcp__acme__delete_files"
+    gate = ApprovalGate(
+        required=frozenset({tool}),
+        grant_tool=tool,
+        grant_arguments={"account": "approved"},
+        connector_servers={"acme"},
+    )
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="delete_files", gate=gate)
+
+    assert final.status is SessionStatus.DONE
+    assert ran == []
+    assert _points(reader) == {("connector", "refused"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_an_unknown_mcp_tool_answered_by_the_cli_is_not_a_connector_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A name no mounted MCP server publishes never reaches a connector.
+
+    The unknown-name result must be observed from the real CLI, not supplied
+    by a fake ToolResultBlock. The stand-in provider asks for that name while
+    the stdio MCP server publishes only its fixed test catalog.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    final, ran, bodies = _run_turn(tmp_path, monkeypatch, tool="no_such_tool")
+
+    assert final.status is SessionStatus.DONE
+    assert ran == []
+    assert any(_carries_tool_result(body) for body in bodies)
+    results = [
+        block
+        for body in bodies
+        for message in body.get("messages", [])
+        if isinstance(message, dict)
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+    assert results == [
+        {
+            "type": "tool_result",
+            "content": (
+                "<tool_use_error>Error: No such tool available: "
+                "mcp__acme__no_such_tool</tool_use_error>"
+            ),
+            "is_error": True,
+            "tool_use_id": "toolu_acme01",
+        }
+    ]
+    assert _points(reader) == {("connector", "unavailable"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_connector_spoofing_the_cli_unknown_error_still_counts_as_a_connector_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The payload alone cannot distinguish a CLI error from an MCP error."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    final, ran, _ = _run_turn(tmp_path, monkeypatch, tool="spoof_unknown")
+
+    assert final.status is SessionStatus.DONE
+    assert ran == ["spoof_unknown"]
+    assert _points(reader) == {("connector", "error"): 1}
+    assert [(server, tool) for server, tool, _ in _connector_warnings(caplog)] == [
+        ("acme", "spoof_unknown")
+    ]
 
 
 def test_a_connector_answering_a_json_rpc_error_counts_as_a_connector_error(

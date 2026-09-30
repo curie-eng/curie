@@ -1053,6 +1053,59 @@ tests:
         alertname: CurieConnectorToolErrors
         exp_alerts: []
 
+  # Runner refusals and CLI unknown-tool answers never entered an MCP server.
+  # They must not make two real connector errors look like the three-error
+  # minimum. The next case checks the ratio independently.
+  - name: refused and unavailable calls do not page a healthy connector
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="refused",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Three errors and one success are a failing connector even beside ten
+  # runner/CLI refusals. Counting those refusals in the denominator would hide
+  # the real 3-of-4 error ratio.
+  - name: refused and unavailable calls do not dilute connector error ratio
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="refused",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+
   # Nor do held calls dilute the ratio: three errors and one success among the
   # connector's own answers, beside ten held calls. The ratio counts success
   # and error only, so it is 3 of 4 and fires; counting the held calls would
