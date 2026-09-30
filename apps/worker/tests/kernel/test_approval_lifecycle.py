@@ -636,6 +636,7 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
             SimpleNamespace(
                 text="Continue https://github.com/acme-corp/acme-bot",
                 user="U0REQUEST1",
+                tool_access=None,
             ),
             {},
             queued_event_id="test-event",
@@ -779,6 +780,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
         event = SimpleNamespace(
             text="Continue https://github.com/acme-corp/acme-bot",
             user="U0REQUEST1",
+            tool_access=None,
         )
 
         first = await kernel._route_and_start(
