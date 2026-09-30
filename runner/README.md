@@ -83,25 +83,37 @@ turn whose `Event.tool_access` is `read-only`:
   live MCP tool whose server declared `readOnlyHint: true` on the boot probe,
   less every tool an operator gate, a bundle approval gate or a `toolPolicy`
   `approvalRequired` pattern names. The same set built at boot feeds both the
-  classifier and this check. Curie's platform tools are not read-only,
-  including `mcp__curie__request_approval` and `mcp__curie__report_progress`,
-  which the classifier treats as idempotent.
+  classifier and this check. The MCP half is each connector's own annotation:
+  a server that marks a tool `readOnlyHint: true` has classified it
+  read-only. Curie's platform tools are not read-only, including
+  `mcp__curie__request_approval` and `mcp__curie__report_progress`, which the
+  classifier treats as idempotent.
 - **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
   The runner registers a PreToolUse callback for every tool and wraps every
   other PreToolUse callback and the permission callback, so the read-only
   decision is made first for each call: the approval gate records no pending
-  approval and spends no grant, a bundle PreToolUse command does not run, and
-  the call never reaches its tool or connector. A call whose tool name cannot
-  be read is denied. The denial does not end the turn: the model receives the
-  refusal as that call's error result and can still answer.
+  approval and spends no grant, the runner's own registration of the bundle's
+  PreToolUse commands does not run, and the call never reaches its tool or
+  connector. A deny from any callback wins, so no other callback can turn it
+  into an allow. A call whose tool name cannot be read is denied, and so is
+  every call when the decision itself fails. The denial does not end the turn:
+  the model receives the refusal as that call's error result and can still
+  answer. The CLI also runs the bundle's hook commands from the plugin on
+  their own lifecycle events (PreToolUse, UserPromptSubmit, Stop and the
+  like). Those are the bundle's code, not tools the model calls, and they run
+  on a read-only turn as on any other.
 - **RUNNER-TOOL-ACCESS-3:** The turn never ends `awaiting-approval` and its
   `final` carries no approval field. A `request_approval` or `publish_changes`
   call in it is denied like any other write and is not captured as a request.
 - **RUNNER-TOOL-ACCESS-4:** The access in force is the one sent with the most
   recent prompt. It is set immediately before the prompt is sent and stays
   until the next turn sends its own, so model activity left over from an
-  abandoned read-only turn remains read-only. A `POST /v1/steer` whose
-  `tool_access` differs from the live turn's is refused with `409`.
+  abandoned read-only turn remains read-only. A read-only turn accepts no
+  steer, and a `POST /v1/steer` whose `tool_access` differs from the live
+  turn's is refused with `409`. A session that has accepted any steer refuses
+  a later read-only event: a steer that lands as a turn ends can be answered
+  by the CLI as a turn of its own, after the runner has moved on, and that
+  leftover prompt would otherwise run under another turn's access.
 - **RUNNER-TOOL-ACCESS-5:** `GET /status` and `GET /v1/status` carry
   `"tool_access": ["read-only"]` when the session was built with enforcement,
   and `"tool_access": []` otherwise. A session without enforcement answers a
@@ -117,6 +129,13 @@ turn whose `Event.tool_access` is `read-only`:
   decision before it emulates any tool, and answers a denied call with an
   error result in place of the scripted one, so the fake tier observes what
   the real CLI does.
+- **RUNNER-TOOL-ACCESS-9:** A read-only event whose text, less leading
+  whitespace, begins with `/` is refused with a classified-failure `final`
+  before the model is asked: the CLI expands a slash command before any tool
+  call, and a bundle command can run shell with no PreToolUse event.
+- **RUNNER-TOOL-ACCESS-10:** A read-only turn does not use up an approved
+  action's one-shot boot grant. The grant stays for the next unrestricted
+  turn, the only kind that may spend it.
 
 ## Environment
 
