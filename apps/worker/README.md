@@ -75,9 +75,10 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   the status of the runner it is about to send the event to, over that
   sandbox's own authenticated route, and opens the turn only when the value is
   listed under `tool_access`. A status that answers without listing it means
-  the runner would run the turn unrestricted, so the model is never asked: the
-  reply is `This agent cannot start: its runner does not enforce read-only
-  tool access, so this turn was not run.`, and the delivery is not retried. A
+  the runner would run the turn unrestricted, or cannot enforce it on this
+  session, so the model is never asked: the reply is `This agent cannot
+  start: its runner cannot enforce read-only tool access for this turn, so
+  the turn was not run.`, and the delivery is not retried. A
   status that cannot be read opens nothing either and is retried like any turn
   the runner did not accept.
 - **WORKER-TOOL-ACCESS-3:** A restricted turn never steers a live turn. It
