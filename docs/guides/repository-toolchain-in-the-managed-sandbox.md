@@ -212,7 +212,14 @@ cd /workspace && /workspace/.venv/bin/python -m unittest discover -s tests -t . 
 ```
 
 Use the command the repository documents, not one you invented for it. That is
-also what the publication contract requires of the coder.
+also what the publication contract requires of the coder. Do not write a
+substitute test runner or shim. If the repository's checks cannot be installed
+from files already in the checkout, say that verification inside the sandbox is
+unavailable. For a factory Python change, publication is allowed only when the
+changed path selects the required Python CI job. The pull request must say that
+the sandbox check was unavailable and that CI is pending proof. The factory
+does not report success until that job runs and passes. Other changes still
+need a runnable check before publication.
 
 ### Live registry dependencies
 
@@ -310,7 +317,16 @@ the coder to identify the repository's documented check command, run it from
 `/workspace`, and report the exact command and its exit status before requesting
 publication. The tool never publishes anything itself: the platform captures a
 patch, asks for human approval in the requesting thread, and publishes from a
-separate trusted job only after that approval. Calling the tool directly grants
+separate trusted job only after that approval. Human approval is the default.
+An operator can opt one agent into automatic publication with
+`curie local publication-policy` or `curie cluster publication-policy` and
+`--policy auto`. That still records an approval, names the platform policy as
+the authorizer, and keeps every other guard. A pull request is not a merge, so
+an automatic agent still needs a protected target branch or the repository has
+no remaining human gate. The same command can require a draft pull request and
+a branch prefix. Changing the policy, including switching it back to `approve`,
+stops credential redemption for an approval the previous policy version already
+granted. An existing pull request stays. Calling the tool directly grants
 no capability — it returns an error and mutates nothing.
 
 ## 6. Bounded, truthful failures

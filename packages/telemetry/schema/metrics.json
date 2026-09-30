@@ -55,10 +55,28 @@
           "side_effect_halted",
           "idle",
           "interrupted",
-          "deadline_halted"
+          "deadline_halted",
+          "capacity_wait_expired"
         ]
       },
-      "cardinality_bound": 192
+      "cardinality_bound": 216
+    },
+    "curie.turn.refused": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Callers refused before a turn by a binding's caller list.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher"
+        ],
+        "reason": [
+          "caller_not_allowed",
+          "admission_unavailable"
+        ]
+      },
+      "cardinality_bound": 4
     },
     "curie.turn.duration": {
       "type": "histogram",
@@ -88,10 +106,73 @@
           "side_effect_halted",
           "idle",
           "interrupted",
-          "deadline_halted"
+          "deadline_halted",
+          "capacity_wait_expired"
         ]
       },
-      "cardinality_bound": 192
+      "cardinality_bound": 216
+    },
+    "curie.agent.turn.completed": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ],
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired"
+        ],
+        "agent": {
+          "kind": "bounded",
+          "ceiling": 32,
+          "reserved": [
+            "other",
+            "unbound"
+          ],
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+        }
+      },
+      "cardinality_bound": 306
+    },
+    "curie.schedule.fire": {
+      "type": "counter",
+      "unit": "{fire}",
+      "description": "Durably settled hook fires.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "trigger": [
+          "cron",
+          "bind",
+          "webhook",
+          "test"
+        ],
+        "outcome": [
+          "ran",
+          "deferred",
+          "skipped",
+          "blocked",
+          "reclaimed",
+          "failed"
+        ]
+      },
+      "cardinality_bound": 24
     },
     "curie.history.resume.cache_read": {
       "type": "histogram",
@@ -108,6 +189,28 @@
         "cache_hit": [
           "true",
           "false"
+        ]
+      },
+      "cardinality_bound": 2
+    },
+    "curie.history.persistence.failure": {
+      "type": "counter",
+      "unit": "{failure}",
+      "description": "Transcript persistence failures caused by state capacity limits.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "state-api"
+        ],
+        "outcome": [
+          "capacity"
+        ],
+        "limit": [
+          "value",
+          "namespace"
         ]
       },
       "cardinality_bound": 2
@@ -136,10 +239,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.process": {
       "type": "counter",
@@ -165,10 +269,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.settle": {
       "type": "counter",
@@ -194,10 +299,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.retry": {
       "type": "counter",
@@ -246,10 +352,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.wait.duration": {
       "type": "histogram",
@@ -275,10 +382,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.process.duration": {
       "type": "histogram",
@@ -304,10 +412,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.message.age": {
       "type": "histogram",
@@ -333,10 +442,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.pending": {
       "type": "gauge",
@@ -362,10 +472,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.lag": {
       "type": "gauge",
@@ -391,10 +502,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.queue.depth": {
       "type": "gauge",
@@ -420,10 +532,11 @@
           "pending",
           "ack",
           "retry",
-          "dead-letter"
+          "dead-letter",
+          "queued"
         ]
       },
-      "cardinality_bound": 90
+      "cardinality_bound": 105
     },
     "curie.thread.lock.wait.duration": {
       "type": "histogram",
@@ -511,7 +624,9 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -521,10 +636,20 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 126
     },
     "curie.sandbox.claim.duration": {
       "type": "histogram",
@@ -540,7 +665,9 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -550,10 +677,20 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 126
     },
     "curie.sandbox.resume.duration": {
       "type": "histogram",
@@ -569,7 +706,9 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -579,10 +718,20 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 126
     },
     "curie.sandbox.release.duration": {
       "type": "histogram",
@@ -598,7 +747,9 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -608,10 +759,20 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 126
     },
     "curie.sandbox.active": {
       "type": "gauge",
@@ -663,7 +824,9 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -673,10 +836,20 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 126
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",
@@ -693,7 +866,8 @@
           "interrupt",
           "reset",
           "status",
-          "timeout"
+          "timeout",
+          "turn-admit"
         ],
         "role": [
           "client"
@@ -705,7 +879,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 24
+      "cardinality_bound": 28
     },
     "curie.runner.rpc.result": {
       "type": "counter",
@@ -722,7 +896,8 @@
           "interrupt",
           "reset",
           "status",
-          "timeout"
+          "timeout",
+          "turn-admit"
         ],
         "role": [
           "client"
@@ -734,7 +909,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 24
+      "cardinality_bound": 28
     },
     "curie.approval.lifecycle": {
       "type": "counter",
@@ -840,6 +1015,26 @@
         ]
       },
       "cardinality_bound": 1
+    },
+    "curie.capacity.wait": {
+      "type": "gauge",
+      "unit": "{turn}",
+      "description": "Interactive turns by persisted capacity wait state.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ],
+        "state": [
+          "waiting",
+          "active",
+          "expired"
+        ]
+      },
+      "cardinality_bound": 3
     },
     "curie.reply.delivery": {
       "type": "counter",
@@ -963,9 +1158,12 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -978,15 +1176,22 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
           "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1017,11 +1222,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1029,6 +1236,31 @@
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1052,7 +1284,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3080
+      "cardinality_bound": 4560
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1074,9 +1306,12 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -1089,15 +1324,22 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
           "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1128,11 +1370,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1140,6 +1384,31 @@
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1163,7 +1432,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3080
+      "cardinality_bound": 4560
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1185,9 +1454,12 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -1200,15 +1472,22 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
           "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1239,11 +1518,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1251,6 +1532,31 @@
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
           "unmatched"
         ],
         "role": [
@@ -1267,7 +1573,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 616
+      "cardinality_bound": 912
     },
     "curie.background.loop": {
       "type": "counter",

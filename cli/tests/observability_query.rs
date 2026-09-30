@@ -227,8 +227,10 @@ fn local_and_cluster_expose_the_same_query_grammar_and_defaults() {
         let local_flags = flags(&local);
         let mut cluster_flags = flags(&cluster);
 
-        // Cluster adds only release discovery. Every query/filter/connection
-        // flag is otherwise one shared contract across the sibling tiers.
+        // Cluster adds only release discovery and the cluster-wide kube context
+        // (#2723). Every query/filter/connection flag is otherwise one shared
+        // contract across the sibling tiers.
+        cluster_flags.remove("--context");
         cluster_flags.remove("--namespace");
         cluster_flags.remove("--release");
         assert_eq!(

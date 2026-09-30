@@ -29,7 +29,7 @@
 - Create: `apps/api/alembic/versions/0030_agent_channels_multi_binding.py`
 - Modify: `apps/api/src/curie_api/models.py`
 - Test: `apps/api/tests/test_migration_0030_agent_channels_multi_binding.py`
-- Test: `apps/api/tests/test_agent_model_integration.py`
+- Test: `apps/api/tests/test_agent_override_integration.py`
 
 **Interfaces:**
 - Produces: `Agent.channels: list[AgentChannel]`, ordered by binding id for stable API serialization.
@@ -38,7 +38,7 @@
 - [ ] **Step 1: Run the fail first migration and ORM tests**
 
 <!-- doclint:ignore-line -->
-Run: `uv run pytest -q apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
+Run: `uv run pytest -q apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_override_integration.py`
 
 Expected: failure because revision `0030` does not exist and `Agent.channel` is singular.
 
@@ -55,13 +55,13 @@ channels: Mapped[list["AgentChannel"]] = relationship(
 - [ ] **Step 3: Re-run the focused tests**
 
 <!-- doclint:ignore-line -->
-Run: `uv run pytest -q apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
+Run: `uv run pytest -q apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_override_integration.py`
 
 Expected: pass.
 
 - [ ] **Step 4: Commit**
 
-Run: `git add apps/api/alembic/versions/0030_agent_channels_multi_binding.py apps/api/src/curie_api/models.py apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py && git commit -m "Allow agents to own multiple surface bindings"`
+Run: `git add apps/api/alembic/versions/0030_agent_channels_multi_binding.py apps/api/src/curie_api/models.py apps/api/tests/test_migration_0030_agent_channels_multi_binding.py apps/api/tests/test_agent_override_integration.py && git commit -m "Allow agents to own multiple surface bindings"`
 
 ### Task 2: Binding Subresource and Safe Concurrent Writes
 

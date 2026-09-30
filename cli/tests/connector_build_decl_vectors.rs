@@ -13,14 +13,15 @@
 // carries no `Connector*` `$defs` at all -- the connector structs are declared
 // in `cli/plugin-format-mirrors.json`'s `non_mirrors` array and the field
 // comparison is a no-op for them today. This file is the seam instead: it reads
-// the same five corpora the Python suite reads, so a change made in one
+// the same six corpora the Python suite reads, so a change made in one
 // language and not the other fails that language's suite.
 //
-//   tests/vectors/connector-build-decl.json    the `build:` declaration
-//   tests/vectors/connector-lock.json          connectors.lock.yaml + apply_lock
-//   tests/vectors/connector-fields.json        the exact field-name sets
-//   tests/vectors/connector-service-dns.json   object_name / service_dns
-//   tests/vectors/connector-source-digest.json source_digest_of
+//   tests/vectors/connector-build-decl.json      the `build:` declaration
+//   tests/vectors/connector-lock.json            connectors.lock.yaml + apply_lock
+//   tests/vectors/connector-fields.json          the exact field-name sets
+//   tests/vectors/connector-service-dns.json     object_name / service_dns
+//   tests/vectors/connector-source-digest.json   source_digest_of
+//   tests/vectors/connector-derived-bearer.json  derived Authorization Bearer name
 //
 // Same mechanism as `tests/vectors/approval-action-ids.json` for the
 // dispatcher-versus-CLI action ids.
@@ -287,6 +288,9 @@ const SHAPE_REFUSALS: &[&str] = &[
     "a_truncated_digest_is_refused",
     "an_uppercase_digest_is_refused",
     "a_bare_digest_is_refused_for_registry_delivery",
+    // ADR 0173: the runner entry's image AND base obey the same rule.
+    "a_tag_shaped_runner_image_is_refused",
+    "a_tag_shaped_runner_base_is_refused",
 ];
 
 #[test]
@@ -472,6 +476,46 @@ fn the_mirror_structs_carry_exactly_the_frozen_field_names() {
         connector_build::lock_entry_field_names(),
         expect("ConnectorLockEntry")
     );
+    // ADR 0173: the layered runner rides the same two files.
+    assert_eq!(
+        connector_build::connectors_file_field_names(),
+        expect("ConnectorsFile")
+    );
+    assert_eq!(
+        connector_build::runner_spec_field_names(),
+        expect("RunnerSpec")
+    );
+    assert_eq!(
+        connector_build::runner_lock_entry_field_names(),
+        expect("RunnerLockEntry")
+    );
+}
+
+#[test]
+fn the_mirror_keeps_an_empty_admits_list_apart_from_a_missing_one() {
+    // `admits: []` admits no agent and a missing list admits the deploying
+    // agent alone (ADR-0168 decision 7), so a reader that folded one into the
+    // other would change who may call the connector.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  closed:\n    image: x:1\n    admits: []\n  alone:\n    image: x:1\n",
+    )
+    .expect("both declarations parse");
+    assert_eq!(file.connectors["closed"].admits, Some(Vec::new()));
+    assert_eq!(file.connectors["alone"].admits, None);
+}
+
+#[test]
+fn the_mirror_carries_self_as_written() {
+    // `self` names the agent the bundle is deployed as. The CLI never knows
+    // that agent, so it must hand the entry on unresolved.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  grafana:\n    image: x:1\n    admits: [self, acme-ops]\n",
+    )
+    .expect("the declaration parses");
+    assert_eq!(
+        file.connectors["grafana"].admits,
+        Some(vec!["self".to_string(), "acme-ops".to_string()])
+    );
 }
 
 // ─── object_name / service_dns: the Docker network alias ─────────────────────
@@ -623,4 +667,145 @@ fn a_symlink_inside_the_context_is_neither_followed_nor_hashed() {
         connector_build::source_digest_of(&plain, &build).expect("hash the plain context"),
         "a symlink is never followed and never hashed, on both sides of the seam"
     );
+}
+
+// ─── derived Bearer name ─────────────────────────────────────────────────────
+
+const DERIVED_BEARER_KEYS: &[&str] = &["name", "why", "document", "expected_name"];
+
+#[test]
+fn derived_bearer_vector_keys_are_known() {
+    // A key added for the Python lane alone would pass vacuously here.
+    let file = vector_file("connector-derived-bearer.json");
+    let keys: BTreeSet<&str> = file
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, BTreeSet::from(["comment", "vectors"]));
+    for vector in vectors("connector-derived-bearer.json") {
+        let keys: BTreeSet<&str> = vector
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            DERIVED_BEARER_KEYS.iter().copied().collect(),
+            "{}",
+            name_of(&vector)
+        );
+    }
+}
+
+#[test]
+fn derived_bearer_name_matches_the_frozen_vector() {
+    // Cross-language pin: bearer_secret_name must agree with the renderer's
+    // derived Authorization header, including the SecretRef case that used
+    // to flatten a lone Ref into a Bearer name the renderer would not emit.
+    for vector in vectors("connector-derived-bearer.json") {
+        let document = serde_norway::to_string(&vector["document"]).expect("serialize document");
+        let parsed = connector_build::parse_connectors(&document)
+            .unwrap_or_else(|error| panic!("{} must parse, got {error}", name_of(&vector)));
+        let spec = parsed
+            .connectors
+            .get("gh")
+            .unwrap_or_else(|| panic!("{} has connector gh", name_of(&vector)));
+        let expected = vector["expected_name"].as_str().map(str::to_string);
+        assert_eq!(
+            connector_build::bearer_secret_name(spec),
+            expected,
+            "{}",
+            name_of(&vector)
+        );
+    }
+}
+
+// ─── The layered runner (ADR 0173 decisions 1 and 2) ─────────────────────────
+
+#[test]
+fn a_runner_build_block_is_read_with_its_resolved_dockerfile() {
+    // The vector corpus proves accept/reject parity; this proves the accepted
+    // block is actually carried rather than parsed and dropped, which is the
+    // failure a missing field on the mirror struct produces.
+    let file = connector_build::parse_connectors(
+        "connectors: {}\nrunner:\n  build:\n    context: runner\n    \
+         platforms: [linux/amd64, linux/arm64]\n",
+    )
+    .expect("a runner build block is a valid declaration");
+    let runner = file.runner.as_ref().expect("the runner block is carried");
+    assert_eq!(runner.build.context, "runner");
+    assert_eq!(runner.build.dockerfile, "Dockerfile", "the default applies");
+    assert_eq!(runner.build.platforms, vec!["linux/amd64", "linux/arm64"]);
+
+    let none = connector_build::parse_connectors("connectors: {}\n").expect("no runner");
+    assert!(
+        none.runner.is_none(),
+        "a bundle declaring no runner has none"
+    );
+}
+
+const RUNNER_DOCKERFILE_KEYS: &[&str] = &["name", "why", "dockerfile", "expect"];
+
+#[test]
+fn the_runner_dockerfile_base_rule_agrees_with_python_on_every_vector() {
+    // `curie build` refuses a runner Dockerfile whose first FROM is not the
+    // CURIE_RUNNER_IMAGE build argument BEFORE any docker call; the platform
+    // refuses the same file at intake (`connectors.runner_base_not_arg`). Both
+    // read tests/vectors/runner-dockerfile-base.json.
+    for vector in vectors("runner-dockerfile-base.json") {
+        let keys: BTreeSet<&str> = vector
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            RUNNER_DOCKERFILE_KEYS.iter().copied().collect(),
+            "{}",
+            name_of(&vector)
+        );
+        let body = vector["dockerfile"].as_str().expect("dockerfile");
+        let result = connector_build::check_runner_dockerfile(body);
+        match vector["expect"].as_str().expect("expect") {
+            "accept" => result.unwrap_or_else(|error| {
+                panic!("{} must be accepted, got {error:#}", name_of(&vector))
+            }),
+            "reject" => {
+                let error = result.expect_err(name_of(&vector));
+                assert!(
+                    format!("{error:#}").contains("CURIE_RUNNER_IMAGE"),
+                    "{}: the refusal must name the build argument to use, got {error:#}",
+                    name_of(&vector)
+                );
+            }
+            other => panic!("unknown expect {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_runner_lock_entry_is_read_with_both_digests() {
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let document = format!(
+        "version: 1\nconnectors: {{}}\nrunner:\n  image: ghcr.io/acme-corp/acme-bot-runner@sha256:{a}\n  \
+         base: ghcr.io/curie-eng/curie-runner@sha256:{b}\n  delivery: registry\n  \
+         platforms: [linux/amd64]\n  source_digest: sha256:{}\n",
+        "2".repeat(64)
+    );
+    let lock = connector_build::parse_lock(&document).expect("a digest-pinned runner entry");
+    let runner = lock.runner.as_ref().expect("the runner entry is carried");
+    assert_eq!(
+        runner.image,
+        format!("ghcr.io/acme-corp/acme-bot-runner@sha256:{a}")
+    );
+    assert_eq!(
+        runner.base,
+        format!("ghcr.io/curie-eng/curie-runner@sha256:{b}")
+    );
+    assert_eq!(runner.delivery, connector_build::Delivery::Registry);
 }

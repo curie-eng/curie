@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from _migration_support import run_script
 from alembic.script import ScriptDirectory
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -34,22 +35,21 @@ def _write_revision(
 
 
 def _run_gate(script_location: Path | None = None) -> subprocess.CompletedProcess[str]:
-    command = [sys.executable, str(CHECKER)]
-    if script_location is not None:
-        command.extend(["--script-location", str(script_location)])
-    return subprocess.run(
-        command,
+    args = [] if script_location is None else ["--script-location", str(script_location)]
+    return run_script(CHECKER, *args)
+
+
+def test_real_migration_tree_has_one_reported_head() -> None:
+    """The one real CLI run; every other case drives the gate in-process."""
+    expected_head = ScriptDirectory(str(ALEMBIC_TREE)).get_current_head()
+
+    result = subprocess.run(
+        [sys.executable, str(CHECKER)],
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
         text=True,
     )
-
-
-def test_real_migration_tree_has_one_reported_head() -> None:
-    expected_head = ScriptDirectory(str(ALEMBIC_TREE)).get_current_head()
-
-    result = _run_gate()
 
     assert expected_head is not None
     assert result.returncode == 0, result.stderr
@@ -208,17 +208,16 @@ def test_python_ci_job_runs_exact_gate_before_dev_stack() -> None:
     assert len(matching_steps) == 1
     assert matching_steps[0]["name"] == "Alembic revision gate"
 
-    gate_index = steps.index(matching_steps[0])
-    stack_index = next(
-        index for index, step in enumerate(steps) if step.get("name") == "Start dev stack"
-    )
-    assert gate_index < stack_index
+    # The dev stack boots only in the pytest shards, so the gate never waits on
+    # one in the required Python job.
+    assert not any(step.get("name") == "Start dev stack" for step in steps)
 
 
 def test_python_ci_runs_released_upgrade_after_stack_ready_and_before_fresh_install(
 ) -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
-    steps = workflow["jobs"]["python"]["steps"]
+    # Every pytest shard boots its own stack and runs the gate against it.
+    steps = workflow["jobs"]["python-pytest"]["steps"]
 
     checkout_steps = [
         step for step in steps if step.get("uses") == "actions/checkout@v7"

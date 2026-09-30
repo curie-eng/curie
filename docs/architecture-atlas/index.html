@@ -19,6 +19,8 @@
       --line: #2b2e34;
       --line-strong: #454952;
       --accent: #68d7ff;
+      --altitude-bot: #f0a44a;
+      --altitude-agent: #b98bff;
       --accent-soft: rgba(104, 215, 255, .12);
       --green: #43d49b;
       --green-soft: rgba(67, 212, 155, .13);
@@ -332,6 +334,16 @@
     .node-state { fill: currentColor; }
     .node.is-planned { color: var(--planned); }
     .node:not(.is-planned) { color: var(--faint); }
+    .node.altitude-bot-capability rect { fill: #221b12; stroke: var(--altitude-bot); }
+    .node.altitude-deployed-agent rect { fill: #1d1826; stroke: var(--altitude-agent); }
+    .node.altitude-bot-capability.is-planned rect, .node.altitude-deployed-agent.is-planned rect { stroke-dasharray: 6 5; }
+    .altitude-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin-top: 10px; padding: 9px 12px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; }
+    .altitude-legend .legend-title { font-family: var(--mono); font-size: 10.5px; letter-spacing: .11em; text-transform: uppercase; color: var(--faint); }
+    .altitude-legend .legend-item { display: flex; gap: 7px; align-items: center; font-size: 12px; color: var(--muted); }
+    .altitude-legend .legend-swatch { width: 13px; height: 13px; border-radius: 4px; border: 1.5px solid var(--line-strong); background: #17191e; flex: none; }
+    .altitude-legend .legend-item[data-altitude="bot-capability"] .legend-swatch { background: #221b12; border-color: var(--altitude-bot); }
+    .altitude-legend .legend-item[data-altitude="deployed-agent"] .legend-swatch { background: #1d1826; border-color: var(--altitude-agent); }
+    .altitude-legend .legend-item strong { color: var(--text); font-weight: 650; }
     .map-tooltip { position: fixed; z-index: 80; width: min(310px, calc(100vw - 24px)); padding: 11px 12px; pointer-events: none; opacity: 0; color: var(--text); background: rgba(10,11,13,.98); border: 1px solid var(--line-strong); border-radius: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.58); transform: translateY(4px); transition: opacity .12s ease, transform .12s ease; }
     .map-tooltip.is-visible { opacity: 1; transform: translateY(0); }
     .tooltip-kicker { color: var(--accent); font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
@@ -493,6 +505,7 @@
             </svg>
             <div class="mobile-flow" id="mobile-flow" aria-label="Selected flow as an ordered list"></div>
           </div>
+          <div class="altitude-legend" id="altitude-legend" aria-label="Product altitude legend"></div>
         </article>
         <aside class="inspector" id="inspector" aria-live="polite">
           <div class="inspector-empty">Select a component or seam to inspect its contract, maturity, leakage, ADRs, and evidence.</div>
@@ -906,6 +919,43 @@
         return groupForMember(id)?.id || id;
       }
 
+      const DEFAULT_ALTITUDES = [
+        { id: 'platform', label: 'Platform capability', description: 'Capabilities that remove an adoption blocker. A component with no declared altitude is read as platform.' },
+        { id: 'bot-capability', label: 'Bot capability', description: 'Bundles, evals, and operating patterns that ride the isolated runtime.' },
+        { id: 'deployed-agent', label: 'Deployed agent', description: 'One agent in an install: an identity, a bundle, and a deployment.' }
+      ];
+
+      function productAltitudes() {
+        const declared = state.data.productAltitudes;
+        return Array.isArray(declared) && declared.length ? declared : DEFAULT_ALTITUDES;
+      }
+
+      function altitudeOf(node) { return node?.altitude || 'platform'; }
+
+      function altitudeLabel(node) {
+        const id = altitudeOf(node);
+        return productAltitudes().find(item => item.id === id)?.label || id;
+      }
+
+      function renderAltitudeLegend() {
+        const legend = $('#altitude-legend');
+        if (!legend) return;
+        legend.replaceChildren();
+        legend.append(text('span', 'Product altitude', 'legend-title'));
+        productAltitudes().forEach(altitude => {
+          const item = document.createElement('span');
+          item.className = 'legend-item';
+          item.dataset.altitude = altitude.id;
+          item.title = altitude.description || '';
+          const swatch = document.createElement('span');
+          swatch.className = 'legend-swatch';
+          const label = document.createElement('span');
+          label.append(text('strong', altitude.label));
+          item.append(swatch, label);
+          legend.append(item);
+        });
+      }
+
       function nodeIsVisible(node) {
         const members = node.memberIds?.map(id => byId(state.data.nodes, id)).filter(Boolean) || [node];
         if (state.mode === 'vision') return true;
@@ -985,6 +1035,7 @@
 
       function renderMap() {
         hideMapTooltip();
+        renderAltitudeLegend();
         const svg = $('#architecture-map');
         const persistent = Array.from(svg.children).filter(child => child.tagName === 'desc');
         svg.replaceChildren(...persistent);
@@ -1054,12 +1105,12 @@
           const containsPlanned = node.memberIds?.some(id => byId(state.data.nodes, id)?.state === 'planned');
           const context = state.mode === 'delta' && node.state !== 'planned' && !containsPlanned;
           const group = svgNode('g', {
-            class: `node${node.state === 'planned' ? ' is-planned' : ''}${node.memberIds ? ' is-group' : ''}${selected ? ' is-selected' : ''}${context ? ' is-context' : ''}`,
+            class: `node altitude-${altitudeOf(node)}${node.state === 'planned' ? ' is-planned' : ''}${node.memberIds ? ' is-group' : ''}${selected ? ' is-selected' : ''}${context ? ' is-context' : ''}`,
             transform: `translate(${box.x} ${box.y})`,
             'data-node-id': node.id,
             tabindex: 0,
             role: 'button',
-            'aria-label': `${node.label}. ${node.subtitle}. ${node.state}.`
+            'aria-label': `${node.label}. ${node.subtitle}. ${node.state}. ${altitudeLabel(node)}.`
           });
           attachMapTooltip(group, 'node', node.id);
           group.append(svgNode('rect', { x: -box.w / 2, y: -box.h / 2, width: box.w, height: box.h }));
@@ -1125,7 +1176,7 @@
           const rawIds = new Set(node.memberIds || [node.id]);
           const seamIds = new Set(state.data.routes.filter(route => rawIds.has(route.from) || rawIds.has(route.to)).map(route => route.seamId));
           tooltip.append(
-            text('div', `${node.kind} · ${node.state}`, 'tooltip-kicker'),
+            text('div', `${node.kind} · ${node.state} · ${altitudeLabel(node)}`, 'tooltip-kicker'),
             text('div', node.label, 'tooltip-title'),
             text('p', node.description, 'tooltip-summary')
           );
@@ -1169,7 +1220,8 @@
       function nodeBox(node) {
         const sizes = {
           surface: [104, 40], service: [108, 40], broker: [106, 40], capability: [112, 40],
-          runtime: [104, 40], external: [96, 40], observability: [104, 40], data: [100, 40], substrate: [96, 38]
+          runtime: [104, 40], external: [96, 40], observability: [104, 40], data: [100, 40], substrate: [96, 38],
+          'bot-capability': [116, 40], 'deployed-agent': [116, 40]
         };
         const [w, h] = sizes[node.kind] || [104, 40];
         return { x: node.x * MAP_W, y: node.y * MAP_H, w, h };
@@ -1393,7 +1445,7 @@
       function nodeDetail(node, includeMapAction) {
         if (!node) return null;
         const members = node.memberIds?.map(id => byId(state.data.nodes, id)).filter(Boolean) || [];
-        const body = baseDetail(`${node.kind} · ${node.state}`, node.label, node.description);
+        const body = baseDetail(`${node.kind} · ${node.state} · ${altitudeLabel(node)}`, node.label, node.description);
         const facts = document.createElement('div');
         facts.className = 'detail-grid';
         facts.append(detailFact('Layer', node.zone), detailFact('State', node.state));

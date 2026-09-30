@@ -29,7 +29,6 @@ from curie_runner.adapter import (
 )
 from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     build_approval_gate,
     build_approval_hook,
@@ -44,6 +43,7 @@ from curie_runner.history import (
     build_conversation_replay,
 )
 from curie_runner.session import SessionRunner
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -61,8 +61,9 @@ class _LiveTranscriptStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.records)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.records.append(record)
+        return record.harness_replay is not None
 
 
 def _production_sre_source() -> Path:
@@ -446,7 +447,7 @@ def test_live_late_workspace_replacement_init_catalogue(
         _assert_production_workspace_init(init_messages[-1], bundle=bundle)
         assert len(store.records) == 2
         uses, results = _structured_tool_history(store.records[-1])
-        assert {"Read", "Edit", "Bash", PUBLISH_TOOL_NAME} <= set(uses), (
+        assert {"Read", "Edit", "Bash", PLATFORM_PUBLISH_TOOL_NAME} <= set(uses), (
             "late replacement did not execute required coding surface; "
             f"persisted tool names={sorted(uses)}, final_status={final.status.value!r}, "
             f"final_text={final.text!r}"
@@ -479,7 +480,7 @@ def test_live_late_workspace_replacement_init_catalogue(
         assert bash_use is not None, uses["Bash"]
         bash_text = _successful_tool_result_text(bash_use, results)
         assert new_sentinel in bash_text, bash_text
-        publish_use = uses[PUBLISH_TOOL_NAME][0]
+        publish_use = uses[PLATFORM_PUBLISH_TOOL_NAME][0]
         publish_input = publish_use.get("input")
         assert isinstance(publish_input, dict)
         assert publish_input.get("body") == history_marker, (
@@ -499,7 +500,7 @@ def test_live_late_workspace_replacement_init_catalogue(
         assert "an approval request has been recorded" in publish_result_text
         assert final.status is SessionStatus.AWAITING_APPROVAL
         assert final.approval_gate_kind == "permission"
-        assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+        assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     finally:
         sentinel_path.unlink(missing_ok=True)
         instruction_path.unlink(missing_ok=True)
@@ -1449,9 +1450,9 @@ def test_live_publish_with_both_gate_layers_pauses_awaiting_approval(
     assert final.type == "final"
     assert final.status is SessionStatus.AWAITING_APPROVAL
     assert final.approval_summary is not None
-    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in final.approval_summary
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title
     # A gate layer denied the call and asked the CLI to stop the turn.
     assert gate.pending_halt is True
@@ -1490,9 +1491,9 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
     assert final.status is SessionStatus.AWAITING_APPROVAL
     assert final.status is not SessionStatus.DONE
     assert final.approval_summary is not None
-    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in final.approval_summary
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title
     # Nothing in this path may claim a halt the runner never requested -- and
     # that absence is precisely what proves neither gate layer ever denied it.

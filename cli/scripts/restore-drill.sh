@@ -7,6 +7,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# util-linux flock, with its exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 INVENTORY="$REPO_ROOT/tools/restore-drill/restore_inventory.py"
 COMPOSE_FILE="$REPO_ROOT/compose.dev.yaml"
 AWS_CLI_IMAGE="amazon/aws-cli:2.32.6"
@@ -265,7 +267,7 @@ print(d)' "$1"
 }
 
 exec 9>"/tmp/curie-restore-drill.lock"
-if ! flock -n 9; then
+if ! "$GNU_PROCESS" flock -n 9; then
     echo "error: another restore drill is already running" >&2
     exit 1
 fi

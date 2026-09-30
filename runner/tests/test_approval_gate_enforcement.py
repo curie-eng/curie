@@ -75,7 +75,6 @@ from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     build_approval_gate,
@@ -88,6 +87,7 @@ from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.translate import TurnState, translate_message
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
@@ -600,6 +600,46 @@ def test_gated_turn_that_also_hit_a_model_error_ends_classified_failure() -> Non
     ), "the raw token must survive in the ErrorEvent message"
 
 
+def test_gated_turn_with_model_error_and_no_result_ends_classified_failure() -> None:
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "echo x"})],
+            model="m",
+        ),
+        AssistantMessage(content=[], model="m", error="unknown"),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    assert gate.pending_summary is not None
+    assert gate.pending_halt is True
+    assert any(
+        event.type == "error" and event.classification == "unclassified"
+        for event in events
+    )
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.AWAITING_APPROVAL
+    assert not final.approval_summary
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_a_done_gated_turn_still_flips_even_after_a_model_error_frame() -> None:
     # negative control for the guard above: the new error_classification check
     # must ride the HALT branch only. revert: apply it to the DONE branch too ->
@@ -768,6 +808,10 @@ def _options_from_boot(
     *,
     workspace_path: Path | None = None,
 ) -> Any:
+    # This suite verifies approval composition, not eligibility. Make its
+    # formerly implicit human-Slack boot explicit; default-off is pinned in
+    # test_harness_boot_wiring.py.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, workspace_path=workspace_path)
     session = runner._factory()
@@ -867,10 +911,11 @@ def test_boot_omits_request_approval_for_an_observed_read_only_bundle(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
 
+    # ``progress`` (ADR 0130) rides every non-factory session, gated or not.
     assert anyio.run(
         _mcp_tool_names,
         options.mcp_servers[APPROVAL_SERVER_NAME],
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
     assert "operations" not in options.mcp_servers  # plugin-loaded, not platform-mounted
     assert any(
         "request_approval omitted" in message
@@ -895,7 +940,7 @@ def test_boot_omits_request_approval_for_a_complete_empty_mcp_surface(
     assert anyio.run(
         _mcp_tool_names,
         options.mcp_servers[APPROVAL_SERVER_NAME],
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
 
 
 def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
@@ -929,7 +974,7 @@ def test_boot_omits_request_approval_when_permission_gates_already_exist(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
     names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
-    assert names == {"publish_changes"}
+    assert names == {"publish_changes", "progress"}
 
 
 def test_boot_omits_request_approval_for_tool_policy_approval_required(
@@ -950,7 +995,7 @@ def test_boot_omits_request_approval_for_tool_policy_approval_required(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
     names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
-    assert names == {"publish_changes"}
+    assert names == {"publish_changes", "progress"}
 
 
 def test_boot_keeps_request_approval_when_gate_is_grantable_via_policy(
@@ -1088,7 +1133,7 @@ def test_publish_only_gate_does_not_recreate_the_generic_pager(
 
     assert anyio.run(
         _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
 
 
 # --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------
@@ -1244,7 +1289,7 @@ def _publish_block(
         content=[
             ToolUseBlock(
                 id=call_id,
-                name=PUBLISH_TOOL_NAME,
+                name=PLATFORM_PUBLISH_TOOL_NAME,
                 input={"title": title, "body": body},
             )
         ],
@@ -1283,7 +1328,7 @@ def _managed_publish_gate() -> ApprovalGate:
 
     gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
     assert gate is not None
-    assert PUBLISH_TOOL_NAME in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
     return gate
 
 
@@ -1323,11 +1368,11 @@ def test_publish_call_neither_gate_layer_saw_still_pauses_awaiting_approval(
     assert final.status != SessionStatus.DONE
     assert final.approval_summary
     assert final.approval_summary.startswith(APPROVAL_SUMMARY_PREFIX)
-    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in final.approval_summary
     # The trusted provenance pair the worker branches on before it captures a
     # patch. A fallback record that stamped anything else would be inert.
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert final.approval_route is None
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "The proposed change."
@@ -1372,13 +1417,15 @@ def test_hook_recorded_publish_is_not_recorded_twice_by_the_stream(
     final = events[-1]
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Exactly one record, and it is the gate layer's own -- the observer added
     # nothing on top of it.
     assert gate.publication_title == "Hook recorded"
     assert gate.publication_body == "hook body"
     assert final.approval_summary == gate.pending_summary
-    assert gate.observe_publication({"title": "another", "body": "x"}) is False
+    assert anyio.run(
+        gate.observe_publication, "publish-2", {"title": "another", "body": "x"}
+    ) is False
     assert gate.publication_title == "Hook recorded"
     # A gate layer DID deny this call and asked the CLI to stop, which is exactly
     # what distinguishes this path from the fallback one -- and why no warning
@@ -1464,7 +1511,7 @@ def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> No
 
     gate = build_approval_gate(operator_tools=["Bash"], policy_routes={})
     assert gate is not None
-    assert PUBLISH_TOOL_NAME not in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME not in gate.required
     runner, _session = _runner_over(_publish_then_clean_done(), gate=gate)
 
     events = parse_ndjson("".join(_run_lines(runner)))
@@ -1551,7 +1598,7 @@ def test_malformed_publish_followed_by_a_valid_one_pauses_on_the_valid_record() 
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.status != SessionStatus.CLASSIFIED_FAILURE
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Exactly one record, and it is the VALID proposal -- not the malformed one,
     # which never wrote anything.
     assert gate.publication_title == "Ship changes"
@@ -1604,7 +1651,7 @@ def test_hook_recorded_publish_survives_a_later_malformed_stream_observation() -
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.status != SessionStatus.CLASSIFIED_FAILURE
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # The hook's own record, untouched by the second observation.
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "the proposal"
@@ -1629,7 +1676,7 @@ def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_th
         operator_tools=["Bash"], policy_routes={}, managed_workspace=True
     )
     assert gate is not None
-    assert gate.required == frozenset({"Bash", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Bash", PLATFORM_PUBLISH_TOOL_NAME})
     script = [
         AssistantMessage(
             content=[ToolUseBlock(id="b1", name="Bash", input={"command": "git status"})],

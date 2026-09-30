@@ -1,9 +1,9 @@
 //! Daemon-backed acceptance contract for #2530's hosted-connector start wait.
 //!
-//! This target deliberately uses the built CLI, Docker, and the task-owned local
-//! API. It has no HTTP or Docker mock. Set `CURIE_E2E_DOCKER=1` to opt into the
-//! real-process tests; the driver supplies the private daemon and, for `local`
-//! tests, may supply `CURIE_E2E_API_URL` / `CURIE_E2E_API_KEY`.
+//! This target uses the built CLI, Docker, and the local API. It has no HTTP or
+//! Docker mock. Tests are ignored by default and require `CURIE_E2E_DOCKER=1`
+//! plus explicit selection. The driver supplies the private daemon and may
+//! supply `CURIE_E2E_API_URL` / `CURIE_E2E_API_KEY` for local tests.
 //!
 //! Docker Compose documents `up --wait` as waiting for services to be running
 //! or healthy and documents `--wait-timeout` in seconds:
@@ -25,7 +25,6 @@ use serde_json::Value;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const E2E_GATE: &str = "CURIE_E2E_DOCKER";
 const E2E_API_URL: &str = "CURIE_E2E_API_URL";
 const E2E_API_KEY: &str = "CURIE_E2E_API_KEY";
 const DEFAULT_API_URL: &str = "http://localhost:28000";
@@ -249,16 +248,6 @@ impl Drop for TestScope {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-        }
-    }
-}
-
-fn docker_e2e_enabled() -> bool {
-    match env::var(E2E_GATE).as_deref() {
-        Ok("1") => true,
-        _ => {
-            eprintln!("skipping #2530 daemon test: set {E2E_GATE}=1 to opt in");
-            false
         }
     }
 }
@@ -744,19 +733,15 @@ fn run_local_failure_case(case: ConnectorCase) {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_allows_healthy_and_steady_connectors() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_skill_success_case(ConnectorCase::Healthy);
     run_skill_success_case(ConnectorCase::SteadyWithoutHealthcheck);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_accepts_first_health_at_seventy_seconds_with_an_eighty_second_timeout() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let case = ConnectorCase::HealthyAt70Seconds;
     let agent = unique_agent(&scope, case);
@@ -806,18 +791,14 @@ fn skill_up_accepts_first_health_at_seventy_seconds_with_an_eighty_second_timeou
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_refuses_an_exited_connector() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_skill_failure_case(ConnectorCase::Exits17);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_human_exit_names_the_declared_connector_and_fix() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let agent = unique_agent(&scope, ConnectorCase::Exits17);
     let connector = format!("declared-exit-key-{}", &scope.id[..8]);
@@ -831,10 +812,8 @@ fn skill_up_human_exit_names_the_declared_connector_and_fix() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_cleans_earlier_connectors_when_later_connector_exits() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let agent = unique_agent(&scope, ConnectorCase::Exits17);
     let healthy_connector = format!("a-healthy-{}", &scope.id[..8]);
@@ -878,26 +857,20 @@ fn skill_up_cleans_earlier_connectors_when_later_connector_exits() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_refuses_an_unhealthy_connector() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_skill_failure_case(ConnectorCase::Unhealthy);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_times_out_when_connector_stays_starting() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_skill_failure_case(ConnectorCase::StartingPastDeadline);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_rejects_an_invalid_connector_timeout_before_startup() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let case = ConnectorCase::Healthy;
     let agent = unique_agent(&scope, case);
@@ -932,10 +905,8 @@ fn skill_up_rejects_an_invalid_connector_timeout_before_startup() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn skill_up_without_a_hosted_connector_is_unaffected() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let agent = format!("wait-none-{}", &scope.id[..8]);
     let plugin_dir = scope.bundle(&agent, "unused", None);
@@ -1002,19 +973,15 @@ fn local_deploy_rejects_an_invalid_connector_timeout_before_api_access() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_allows_healthy_and_steady_connectors() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_local_success_case(ConnectorCase::Healthy);
     run_local_success_case(ConnectorCase::SteadyWithoutHealthcheck);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_allows_forty_steady_connectors_after_compose_wait() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let api = local_api();
     let agent = unique_agent(&scope, ConnectorCase::SteadyWithoutHealthcheck);
@@ -1047,18 +1014,14 @@ fn local_deploy_allows_forty_steady_connectors_after_compose_wait() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_refuses_an_exited_connector() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_local_failure_case(ConnectorCase::Exits17);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_human_exit_names_the_full_declared_connector_and_fix() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let api = local_api();
     let agent = format!("local-{}-{}", "a".repeat(25), &scope.id[..8]);
@@ -1078,18 +1041,14 @@ fn local_deploy_human_exit_names_the_full_declared_connector_and_fix() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_refuses_an_unhealthy_connector() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_local_failure_case(ConnectorCase::Unhealthy);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_succeeds_when_late_health_leaves_nohealth_sibling_to_verify() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let api = local_api();
     let agent = unique_agent(&scope, ConnectorCase::LateHealthy);
@@ -1131,18 +1090,14 @@ fn local_deploy_succeeds_when_late_health_leaves_nohealth_sibling_to_verify() {
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_times_out_when_connector_stays_starting() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     run_local_failure_case(ConnectorCase::StartingPastDeadline);
 }
 
 #[test]
+#[ignore = "requires CURIE_E2E_DOCKER=1 and a disposable Docker daemon"]
 fn local_deploy_uses_a_short_configured_connector_start_timeout() {
-    if !docker_e2e_enabled() {
-        return;
-    }
     let mut scope = TestScope::new();
     let api = local_api();
     let case = ConnectorCase::StartingPastDeadline;

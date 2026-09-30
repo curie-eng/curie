@@ -13,15 +13,25 @@ import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from curie_worker.bundle_store import extract_bundle
+from curie_worker.sandbox import (
+    AffinityStore,
+    ClaimView,
+    QuotaRejection,
+    SandboxSubstrate,
+    SandboxView,
+    SubstrateConfig,
+)
 from curie_worker.sandbox.docker import (
     RUNNER_CONTAINER_PORT,
     DockerError,
     DockerSandboxClient,
     RunnerHardening,
 )
+from curie_worker.sandbox.types import RouteState
 
 from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
 
@@ -37,6 +47,24 @@ def _plugin_tar_gz(wrapper: str | None) -> bytes:
         info.size = len(manifest)
         tf.addfile(info, io.BytesIO(manifest))
     return buf.getvalue()
+
+
+def test_docker_cannot_prove_kubernetes_quota_headroom() -> None:
+    client = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+    )
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "8"},
+        hard={"limits.cpu": "8"},
+    )
+
+    assert not client.quota_has_headroom(
+        rejection,
+        request_timeout_seconds=1.0,
+    )
 
 
 def test_create_claim_argv_carries_boot_env() -> None:
@@ -90,6 +118,7 @@ def test_create_claim_excludes_host_credentials_from_child_env(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -111,6 +140,23 @@ def test_create_claim_excludes_host_credentials_from_child_env(
     assert "CURIE_CREDENTIALS" in child_env_names
 
 
+def test_create_claim_forwards_the_caller_token_and_never_its_signing_key() -> None:
+    # ADR-0168 decision 7: the same split as the claim CR, on the substrate
+    # that forwards env by value.
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-caller",
+        pool="pool",
+        env={
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    forwarded = _flag_values(client.calls[0], "-e")
+    assert "CURIE_CONNECTOR_CALLER_TOKEN=cct.payload.signature" in forwarded
+    assert not [e for e in forwarded if e.startswith("CURIE_CONNECTOR_CALLER_SIGNING_KEY=")]
+
+
 def test_create_claim_preserves_declared_connector_secret() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim(
@@ -126,6 +172,63 @@ def test_create_claim_preserves_declared_connector_secret() -> None:
         entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
     }
     assert {"CURIE_CONNECTOR_SECRET_KEYS", "SLACK_BOT_TOKEN"} <= child_env_names
+
+
+def test_local_substrate_claims_runner_with_connector_secret_without_a_warm_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    pools: list[str] = []
+    original_create_claim = client.create_claim
+
+    def record_claim(
+        name: str,
+        *,
+        pool: str,
+        env: dict[str, str] | None = None,
+        labels: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        pools.append(pool)
+        original_create_claim(name, pool=pool, env=env, labels=labels, **kwargs)
+
+    monkeypatch.setattr(client, "create_claim", record_claim)
+    monkeypatch.setattr(
+        client,
+        "get_claim",
+        lambda name, *, request_timeout_seconds: ClaimView(
+            name, True, name, datetime.now(UTC), None, None, None
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "get_sandbox",
+        lambda name, *, request_timeout_seconds: SandboxView(
+            name, True, "127.0.0.1", "Running", 8080
+        ),
+    )
+    substrate = SandboxSubstrate(
+        client,
+        cast(AffinityStore, object()),
+        SubstrateConfig(namespace="default", warm_pool="curie-runner-pool"),
+    )
+    env = {
+        "CURIE_CONNECTOR_SECRET_KEYS": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "placeholder",
+    }
+
+    handle = substrate._claim_fresh(
+        "local-connector",
+        env=env,
+        state=RouteState.LIVE,
+        agent_name="sre-bot",
+        publish=False,
+    )
+
+    assert handle.sandbox_name == handle.claim_name
+    assert pools == ["curie-runner-pool"]
+    child_env = _flag_values(client.calls[0], "-e")
+    assert "GRAFANA_SERVICE_ACCOUNT_TOKEN=placeholder" in child_env
 
 
 def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential() -> None:
@@ -144,6 +247,36 @@ def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential(
     }
     assert "CURIE_CONNECTOR_SECRET_KEYS" in child_env_names
     assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
+
+
+def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> None:
+    """ADR-0168 decisions 1 and 5: each declared Slack identity's tokens reach
+    the worker as indexed `CURIE_SLACK_*__<n>` variables. The filter drops them
+    by prefix, at any index, and a connector marker cannot readmit one. The
+    non-secret declaration itself carries no token and may pass."""
+
+    tokens = {
+        "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+        "CURIE_SLACK_BOT_TOKEN__12": "placeholder",
+        "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+        "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+    }
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-slack-identities",
+        pool="pool",
+        env={
+            **tokens,
+            "CURIE_SLACK_IDENTITIES": "[]",
+            "CURIE_CONNECTOR_SECRET_KEYS": "CURIE_SLACK_BOT_TOKEN__0",
+        },
+    )
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert tokens.keys().isdisjoint(child_env_names)
+    assert "CURIE_SLACK_IDENTITIES" in child_env_names
 
 
 def test_create_claim_fetches_and_unwraps_bundle() -> None:
@@ -398,16 +531,19 @@ def test_get_sandbox_reports_published_port_and_mode() -> None:
         "inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z",
         "port": "127.0.0.1:49173\n",
     }
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "127.0.0.1"
     assert view.port == 49173
     assert view.operating_mode == "Running"
+    assert client.timeouts
+    assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
 
     client.outputs["inspect"] = "paused\t{}\t2026-08-16T12:00:00.123456789Z"
-    paused = client.get_sandbox("t1")
+    paused = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert paused is not None
     assert paused.operating_mode == "Suspended"
+    assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
 
 
 def test_get_claim_surfaces_the_container_created_at() -> None:
@@ -422,7 +558,7 @@ def test_get_claim_surfaces_the_container_created_at() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.outputs = {"inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z", "port": ""}
 
-    view = client.get_claim("t1")
+    view = client.get_claim("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.quota_rejection is None
     assert view.ready_reason is None
@@ -439,7 +575,7 @@ def test_get_claim_surfaces_the_container_created_at() -> None:
 def test_get_sandbox_none_when_container_absent() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.outputs = {"inspect": ""}  # docker inspect on a missing container
-    assert client.get_sandbox("gone") is None
+    assert client.get_sandbox("gone", request_timeout_seconds=1.0) is None
 
 
 def test_get_sandbox_treats_dead_container_as_gone() -> None:
@@ -451,7 +587,7 @@ def test_get_sandbox_treats_dead_container_as_gone() -> None:
             "inspect": f"{dead}\t{{}}\t2026-08-16T12:00:00.123456789Z",
             "port": "",
         }
-        assert client.get_sandbox("t1") is None, dead
+        assert client.get_sandbox("t1", request_timeout_seconds=1.0) is None, dead
 
 
 class _NetworkAwareDocker(DockerSandboxClient):
@@ -462,7 +598,14 @@ class _NetworkAwareDocker(DockerSandboxClient):
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._networks_json = networks_json
 
-    def _docker(self, args: list[str], *, check: bool = True) -> str:
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+        check: bool = True,
+    ) -> str:
+        assert request_timeout_seconds > 0
         if args and args[0] == "inspect":
             if any("NetworkSettings.Networks" in a for a in args):
                 return self._networks_json
@@ -482,7 +625,7 @@ def test_get_sandbox_dials_container_ip_on_shared_network() -> None:
         network="curie_default",
         networks_json='{"curie_default": {"IPAddress": "172.20.0.11"}}',
     )
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "172.20.0.11"
     assert view.port == RUNNER_CONTAINER_PORT  # not the Docker-assigned host port
@@ -498,7 +641,7 @@ def test_get_sandbox_falls_back_to_published_port_without_network_ip() -> None:
         network="curie_default",
         networks_json="{}",
     )
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "127.0.0.1"
     assert view.port == 49173
@@ -756,7 +899,14 @@ def test_ensure_image_is_best_effort_on_pull_failure(caplog) -> None:
             super().__init__(**kwargs)  # type: ignore[arg-type]
             self.calls: list[list[str]] = []
 
-        def _docker(self, args: list[str], *, check: bool = True) -> str:
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
             self.calls.append(args)
             if args[0] == "pull":
                 raise DockerError("docker pull failed (1): SENTINEL_STDERR_LEAK")
@@ -782,7 +932,14 @@ def test_ensure_image_is_best_effort_when_docker_unavailable(caplog) -> None:
             super().__init__(**kwargs)  # type: ignore[arg-type]
             self.calls: list[list[str]] = []
 
-        def _docker(self, args: list[str], *, check: bool = True) -> str:
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
             self.calls.append(args)
             if args[:2] == ["image", "inspect"]:
                 # subprocess.run(["docker", ...]) raises this when the docker
@@ -822,7 +979,10 @@ def test_missing_runner_network_error_carries_a_remediation_hint(monkeypatch) ->
         network="curie_runner",
     )
     try:
-        client._docker(["run", "--rm", "curie-runner"])
+        client._docker(
+            ["run", "--rm", "curie-runner"],
+            request_timeout_seconds=30.0,
+        )
         raise AssertionError("expected DockerError")
     except _DockerError as exc:
         assert "curie_runner" in str(exc)

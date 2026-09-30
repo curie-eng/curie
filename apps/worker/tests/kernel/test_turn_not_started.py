@@ -33,13 +33,16 @@ shape and must fail loudly rather than be collected and dropped.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
     ReplyAck,
@@ -58,6 +61,13 @@ from curie_worker.reply_sink import TargetRoute
 
 from .conftest import _failing_process_event, _pending_rows, _updates_for
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+
+_qevent = functools.partial(qevent, event_id="notice-1")
+
 DONE = SessionStatus.DONE
 
 # The same compressed lease clocks ``test_delivery_ownership.py`` uses, kept
@@ -73,23 +83,6 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": 0.3,
     "runner_total_timeout_s": 30.0,
 }
-
-
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-1",
-    event_id: str = "notice-1",
-    placeholder: str | None = "p-1",
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder=placeholder),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
 
 
 async def _settle(consumer: Consumer) -> None:
@@ -137,7 +130,12 @@ def test_a_failed_turn_edits_the_placeholder_to_the_not_started_text(make_harnes
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -172,7 +170,12 @@ def test_a_placeholderless_turn_gets_no_message_at_all(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -206,7 +209,12 @@ def test_the_notice_fires_even_under_no_edit_streaming(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness(slack_no_edit_streaming=True) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 
@@ -234,7 +242,12 @@ def test_a_failing_slack_sink_does_not_change_the_pending_outcome(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
             h.sink.fail_events.add("reply.update")
@@ -279,14 +292,19 @@ def test_a_turn_that_already_settled_keeps_its_answer(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             async def settled_then_raised(qevent: QueuedTurn, *, lease: Any = None) -> None:
                 await h.kernel._reply_for(
                     qevent, _route_from_handle(qevent), "the answer", terminal=False
                 )
-                await h.kernel._markers.mark_done(qevent.event_id)
+                await h.kernel._markers.mark_done(qevent.event_id, marker_value="1")
                 raise ConnectionError("the settle applied and lost its response")
 
             h.kernel.process_event = settled_then_raised  # type: ignore[method-assign,assignment]
@@ -329,7 +347,12 @@ def test_a_done_outbox_record_without_a_done_marker_keeps_its_answer(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 
@@ -394,7 +417,12 @@ def test_an_unreadable_terminality_check_leaves_the_placeholder_alone(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 
@@ -593,7 +621,7 @@ def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
     class _UnmappedBinding:
         """Resolves nothing, which is the polite-drop route."""
 
-        async def resolve(self, kind: str, address: str) -> None:
+        async def resolve(self, kind: str, adapter: str | None, address: str) -> None:
             return None
 
     async def go() -> None:

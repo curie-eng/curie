@@ -89,6 +89,12 @@ class PublicationPayload:
     pr_url: str | None
     title: str
     body: str
+    observed_title_sha256: str | None
+    observed_body_sha256: str | None
+    github_repository_id: int | None
+    github_pr_node_id: str | None
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,10 @@ def publication_resource_names(publication_id: uuid.UUID) -> PublicationResource
 _PUBLISH_SCRIPT = r"""#!/bin/bash
 set -euo pipefail
 umask 077
+if [[ -n "${PUBLICATION_BRANCH_PREFIX:-}" && "$BRANCH" != "${PUBLICATION_BRANCH_PREFIX}"* ]]; then
+  echo "publication branch does not carry the required prefix" >&2
+  exit 1
+fi
 
 redact() {
   # Credentials are never deliberately logged. This filter is defence in depth
@@ -199,21 +209,31 @@ if [[ "$remote_head" != "$EXPECTED_REMOTE_HEAD" ]]; then
   echo "publication branch head conflict" >&2
   exit 1
 fi
-git_with_timeout apply --check --binary "$patch_path"
-git_with_timeout apply --binary "$patch_path"
-git_with_timeout add --all
-if git_with_timeout diff --cached --quiet; then
-  echo "publication patch produced no changes" >&2
-  exit 1
+if [[ -s "$patch_path" ]]; then
+  git_with_timeout apply --check --binary "$patch_path"
+  git_with_timeout apply --binary "$patch_path"
+  git_with_timeout add --all
+  if git_with_timeout diff --cached --quiet; then
+    echo "publication patch produced no changes" >&2
+    exit 1
+  fi
+  git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
+    -m "$PR_TITLE" -m "Curie-Revision: $REVISION_ID"
+  commit_sha=$(git_with_timeout rev-parse HEAD)
+else
+  if [[ -z "$PR_NUMBER" || -z "$PR_URL" ]]; then
+    echo "metadata-only publication requires a stored pull request" >&2
+    exit 1
+  fi
+  commit_sha="$BASE_SHA"
 fi
-git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
-  -m "$PR_TITLE" -m "Curie-Revision: $REVISION_ID"
-commit_sha=$(git_with_timeout rev-parse HEAD)
 
 cat >/tmp/curie-github.py <<'PY'
 import base64
+import hashlib
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -228,7 +248,7 @@ api = f"{repo_api}/pulls"
 credential_path = Path(os.environ.get("CURIE_CREDENTIAL_PATH", "/credentials/credential"))
 facts_path = Path(os.environ.get("CURIE_PR_FACTS_PATH", "/tmp/curie-pr-facts.json"))
 phase = os.environ["CURIE_GITHUB_PHASE"]
-if phase not in {"pre-push", "post-push"}:
+if phase not in {"pre-push", "post-push", "metadata-only"}:
     raise SystemExit("invalid publication GitHub validation phase")
 expected_head = os.environ.get("CURIE_EXPECTED_HEAD", "")
 if len(expected_head) not in range(40, 65) or any(
@@ -300,6 +320,8 @@ def validate_pull(
         raise SystemExit(
             "GitHub pull request does not match the approved publication contract"
         )
+    if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true" and row.get("draft") is not True:
+        raise SystemExit("GitHub pull request is not the required draft")
     if any(
         not isinstance(actual[field], str)
         or actual[field].casefold() != expected[field].casefold()
@@ -374,19 +396,79 @@ if pr_number:
     expected_url = os.environ.get("PR_URL")
     if not expected_url:
         raise SystemExit("stored pull request URL is missing")
-    if phase == "pre-push":
+    if phase in {"pre-push", "metadata-only"}:
         repository = request("GET", repo_api)
         default_base = repository.get("default_branch")
         if not isinstance(default_base, str) or not default_base:
             raise SystemExit("GitHub repository has no default branch")
+        current_pull = request("GET", f"{api}/{pr_number}")
         url, number = validate_pull(
-            request("GET", f"{api}/{pr_number}"),
+            current_pull,
             default_base,
             require_metadata=False,
             expected_number=expected_number,
             expected_url=expected_url,
             require_merged=True,
         )
+        if phase == "metadata-only":
+            expected_repository_id = int(os.environ["EXPECTED_GITHUB_REPOSITORY_ID"])
+            expected_pr_node_id = os.environ["EXPECTED_GITHUB_PR_NODE_ID"]
+            if repository.get("id") != expected_repository_id or (
+                current_pull.get("node_id") != expected_pr_node_id
+            ):
+                raise SystemExit("stored pull request identity changed")
+            current_body = current_pull.get("body")
+            if current_body is not None and not isinstance(current_body, str):
+                raise SystemExit("GitHub pull request body is invalid")
+            current_body = current_body or ""
+            expected_title = os.environ["OBSERVED_TITLE_SHA256"]
+            expected_body = os.environ["OBSERVED_BODY_SHA256"]
+            if any(
+                len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+                for value in (expected_title, expected_body)
+            ):
+                raise SystemExit("observed pull request metadata is missing")
+            if (
+                hashlib.sha256(str(current_pull.get("title", "")).encode()).hexdigest()
+                != expected_title
+                or hashlib.sha256(current_body.encode()).hexdigest()
+                != expected_body
+            ):
+                raise SystemExit("pull request metadata changed after publication approval")
+            if (
+                current_pull.get("title") == os.environ["PR_TITLE"]
+                and current_body == os.environ["PR_BODY"]
+            ):
+                raise SystemExit("pull request metadata already matches the proposal")
+            update = {}
+            if current_pull.get("title") != os.environ["PR_TITLE"]:
+                update["title"] = os.environ["PR_TITLE"]
+            if current_body != os.environ["PR_BODY"]:
+                update["body"] = os.environ["PR_BODY"]
+            try:
+                updated_pull = request(
+                    "PATCH", f"{api}/{pr_number}", update,
+                )
+            except (HTTPError, URLError):
+                raise SystemExit("GitHub pull request metadata update was not confirmed") from None
+            validate_pull(
+                updated_pull, default_base, require_metadata=True,
+                expected_number=expected_number, expected_url=expected_url,
+                require_merged=True,
+            )
+            if updated_pull.get("node_id") != expected_pr_node_id:
+                raise SystemExit("stored pull request identity changed")
+            updated_at = updated_pull.get("updated_at")
+            try:
+                timestamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise SystemExit("GitHub pull request update time is invalid") from None
+            if timestamp.tzinfo is None:
+                raise SystemExit("GitHub pull request update time is invalid")
+            print(f"CURIE_PR_UPDATED_AT={timestamp.astimezone(UTC).isoformat()}")
+            print(f"CURIE_PR_URL={url}")
+            print(f"CURIE_PR_NUMBER={number}")
+            raise SystemExit(0)
         facts_path.write_text(json.dumps({"base": default_base, "url": url, "number": number}))
         raise SystemExit(0)
     try:
@@ -422,12 +504,15 @@ else:
     pull = existing(default_base)
     if not pull:
         try:
-            created = request("POST", api, {
+            pull_body = {
                 "title": os.environ["PR_TITLE"],
                 "head": branch,
                 "base": default_base,
                 "body": os.environ["PR_BODY"],
-            })
+            }
+            if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true":
+                pull_body["draft"] = True
+            created = request("POST", api, pull_body)
             pull = validate_pull(created, default_base, require_metadata=True)
         except (HTTPError, URLError):
             pull = existing(default_base)
@@ -438,6 +523,12 @@ print(f"CURIE_PR_URL={url}")
 print(f"CURIE_PR_NUMBER={number}")
 PY
 
+if [[ ! -s "$patch_path" ]]; then
+  CURIE_EXPECTED_HEAD="$BASE_SHA" \
+    CURIE_GITHUB_PHASE=metadata-only python /tmp/curie-github.py
+  echo "CURIE_COMMIT_SHA=$BASE_SHA"
+  exit 0
+fi
 if [[ -n "$PR_NUMBER" ]]; then
   CURIE_EXPECTED_HEAD="$EXPECTED_PRIOR_HEAD" \
     CURIE_GITHUB_PHASE=pre-push python /tmp/curie-github.py
@@ -464,6 +555,46 @@ def _owner_reference(settings: PublicationJobSettings, owner_uid: str) -> list[d
     ]
 
 
+def publication_branch_is_valid(branch: str, branch_prefix: str | None) -> bool:
+    """Accept a stored lineage branch without renaming it.
+
+    Historical branches stay under ``curie/``. A platform-named automatic
+    branch (``<prefix>publication-<hex>``) stays valid after the operator
+    clears that prefix. An optional prefix, when still recorded, must match.
+    Components that git itself rejects (``.lock``, a trailing dot, ``..``)
+    never pass.
+    """
+
+    if (
+        ".." in branch
+        or branch.startswith(("/", "."))
+        or "//" in branch
+        or branch.endswith("/")
+    ):
+        return False
+    parts = branch.split("/")
+    if any(not part or part.endswith(".lock") or part.endswith(".") for part in parts):
+        return False
+    if branch_prefix:
+        rest = branch.removeprefix(branch_prefix)
+        if not (
+            branch.startswith(branch_prefix)
+            and rest != ""
+            and re.fullmatch(r"[A-Za-z0-9._/-]+", rest) is not None
+        ):
+            return False
+    historical = re.fullmatch(r"curie/[A-Za-z0-9._/-]+", branch) is not None
+    named = (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]+", branch)
+        is not None
+    )
+    return historical or named
+
+
+def _valid_publication_branch(payload: PublicationPayload) -> bool:
+    return publication_branch_is_valid(payload.branch, payload.branch_prefix)
+
+
 def build_publication_resources(
     payload: PublicationPayload,
     *,
@@ -474,7 +605,23 @@ def build_publication_resources(
         raise PublicationResourceError(
             f"publication patch exceeds the {MAX_PATCH_BYTES} raw-byte limit"
         )
-    if not re.fullmatch(r"curie/[A-Za-z0-9._/-]+", payload.branch):
+    if not payload.patch and (payload.pr_number is None or payload.pr_url is None):
+        raise PublicationResourceError(
+            "metadata-only publication requires a stored pull request"
+        )
+    if not payload.patch and (
+        payload.observed_title_sha256 is None or payload.observed_body_sha256 is None
+    ):
+        raise PublicationResourceError("metadata-only publication requires observed metadata")
+    if not payload.patch and (
+        isinstance(payload.github_repository_id, bool)
+        or not isinstance(payload.github_repository_id, int)
+        or payload.github_repository_id <= 0
+        or not isinstance(payload.github_pr_node_id, str)
+        or not payload.github_pr_node_id.strip()
+    ):
+        raise PublicationResourceError("metadata-only publication requires stored GitHub identity")
+    if not _valid_publication_branch(payload):
         raise PublicationResourceError("publication branch is not a valid stored lineage branch")
     if re.fullmatch(r"[0-9a-f]{40,64}", payload.base_sha) is None:
         raise PublicationResourceError(
@@ -539,6 +686,12 @@ def build_publication_resources(
         "pr_url": payload.pr_url,
         "title": payload.title,
         "body": payload.body,
+        "observed_title_sha256": payload.observed_title_sha256,
+        "observed_body_sha256": payload.observed_body_sha256,
+        "github_repository_id": payload.github_repository_id,
+        "github_pr_node_id": payload.github_pr_node_id,
+        "open_as_draft": payload.open_as_draft,
+        "branch_prefix": payload.branch_prefix,
         "runner_image": settings.runner_image,
         "service_account_name": settings.service_account_name,
         "active_deadline_seconds": settings.active_deadline_seconds,
@@ -588,6 +741,18 @@ def build_publication_resources(
         {"name": "PR_URL", "value": payload.pr_url or ""},
         {"name": "PR_TITLE", "value": payload.title},
         {"name": "PR_BODY", "value": payload.body},
+        {"name": "OBSERVED_TITLE_SHA256", "value": payload.observed_title_sha256 or ""},
+        {"name": "OBSERVED_BODY_SHA256", "value": payload.observed_body_sha256 or ""},
+        {
+            "name": "EXPECTED_GITHUB_REPOSITORY_ID",
+            "value": str(payload.github_repository_id or ""),
+        },
+        {"name": "EXPECTED_GITHUB_PR_NODE_ID", "value": payload.github_pr_node_id or ""},
+        {
+            "name": "PUBLICATION_OPEN_AS_DRAFT",
+            "value": "true" if payload.open_as_draft else "false",
+        },
+        {"name": "PUBLICATION_BRANCH_PREFIX", "value": payload.branch_prefix or ""},
         {"name": "GIT_USER_NAME", "value": settings.git_user_name},
         {"name": "GIT_USER_EMAIL", "value": settings.git_user_email},
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},

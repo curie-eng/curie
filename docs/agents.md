@@ -26,6 +26,11 @@ harness, from a released binary or someone else's bundle.
   on what commands exist.** It is hidden from `--help`, and it is real.
 - `curie schema-index`: the committed, versioned JSON Schemas for every `--json`
   result, so you can check that a payload field exists before you trust it.
+  `curie schema-index curie-yaml` is the input schema for the installation file.
+- `curie apply --init`: write a starter `curie.yaml` from the binary, then
+  `curie diff --json` and `curie apply` to compare and converge. `--context`
+  and `install.context` select the kube context; `curie diff --json` reports
+  `cluster`.
 - [Repository toolchain in the managed sandbox](guides/repository-toolchain-in-the-managed-sandbox.md):
   installing a repository's dependencies and running its checks inside a
   managed sandbox. A live-registry install under the chart's fail-closed

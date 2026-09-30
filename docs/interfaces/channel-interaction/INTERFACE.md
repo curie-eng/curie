@@ -23,10 +23,14 @@ order: 5
 Agents produce a semantic `OutboundMessage`; channel adapters render it. Slack
 may use Block Kit and the terminal may use a numbered selector, but neither
 widget appears in the contract. This is the interaction half of ADR-0020.
+Deliberate progress (ADR-0130) is a second semantic object on the same line: the
+platform produces a task card and milestones, and adapters render them.
 
 The source of truth is
-`packages/channel-protocol/src/channel_protocol/models.py`; the committed JSON
-Schema is `packages/channel-protocol/schema/channel-protocol.schema.json`.
+`packages/channel-protocol/src/channel_protocol/models.py` for messages and
+`packages/channel-protocol/src/channel_protocol/progress.py` for progress; the
+committed JSON Schema is
+`packages/channel-protocol/schema/channel-protocol.schema.json`.
 
 ## Message contract
 
@@ -44,6 +48,57 @@ An optional `interaction` is one semantic intent:
 Action `label` is display text. Action `value` is the exact inbound message sent
 when selected. Values are conversation input, not trusted authorization tokens;
 the server must still authorize side effects and approvals.
+
+## Progress contract
+
+Progress is not an `OutboundMessage`. It has its own closed models, so an
+adapter never has to guess whether a message is an answer, an approval card or
+a task card, and a progress edit can never be read as a settled approval.
+
+The values are closed:
+
+- `ProgressState` is exactly `queued`, `investigating`, `awaiting-approval`,
+  `preparing-workspace`, `testing`, `publishing`, `complete`, `failed`,
+  `cancelled`. `TERMINAL_PROGRESS_STATES` holds the last three.
+- `MilestoneClass` is exactly `evidence` (intake or material evidence
+  acquired), `scope` (a material hypothesis or scope change) and
+  `verification` (a verification result). A class says why a durable
+  interruption is warranted; the classes are not a sequence.
+- A summary is a single line of 1 to 200 characters, stripped of surrounding
+  whitespace. Every Python line boundary is refused, not only `\n`. It holds
+  short task state, never reasoning, tool output, secrets or a draft answer.
+
+Three models carry them:
+
+- `ProgressCommand` is what a model submits through the platform's
+  `curie_progress` tool: `version` (`"1.0"`), `update_id`, `state`, `summary`
+  and an optional `milestone`. `update_id` is 1 to 64 characters of letters,
+  digits, `.`, `_`, `:` and `-`, starting with a letter or digit, and
+  identifies one update for idempotency. The
+  model is closed: a command naming a channel kind, channel address, reply
+  ref, endpoint, credential, adapter payload, delivery id, progress record or
+  milestone budget is refused, not ignored. It names no progress record at
+  all. The record is the running turn chain's, resolved from the authenticated
+  turn, and its `progress_id` is minted by the platform, so the command has no
+  field through which to address another turn's record. A command never
+  reaches an adapter.
+- `ProgressCard` is the semantic form of the chain's one mutable card:
+  `kind: "card"`, `state`, `summary`, `revision` (from 1, a higher revision
+  supersedes a lower one) and `terminal`. `terminal` must equal whether `state`
+  is in `TERMINAL_PROGRESS_STATES`, so an adapter in any language renders a
+  closed card without keeping its own copy of that set.
+- `ProgressMilestone` is one durable milestone reply: `kind: "milestone"`,
+  `milestone` (its class), `summary` and `ordinal`, the chain's reserved slot
+  from 1 to `MAX_PROGRESS_MILESTONES` (3). A fourth milestone cannot be
+  expressed.
+
+A card and a milestone reach adapters in the reply wire's 1.1 `progress` field,
+together with the delivery identity that makes their delivery idempotent; see
+[building-a-channel-adapter.md](../../guides/building-a-channel-adapter.md#wire-versions).
+Adapters render them: the card as one message edited in place where the channel
+can edit, kept after completion and marked with its terminal state, and a
+milestone as a new message, both through a plain-text fallback where the
+channel has nothing richer.
 
 ## ACI envelope
 
@@ -161,6 +216,18 @@ The split is the point: Block Kit lives only in the two Slack-side modules named
 above (`blocks.py` and `approval_actions.py`), the numbered selector only in
 `channel.rs`, and the agent authors none of them.
 
+The Slack renderer consumes progress; the terminal one does not. A card and a
+milestone become Block Kit in
+`apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, every text element
+`plain_text` so a model-authored summary cannot mention anyone, and
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` routes a
+progress body to them before any answer or approval path. The channel-neutral
+text for a channel with nothing richer is
+`packages/channel-protocol/src/channel_protocol/progress.py::progress_text`.
+Nothing produces a progress body yet: the worker's coordinator stores what it
+owes, and no deliverer calls an adapter with it.
+
 ## Known leakage
 
 - **The terminal renderer is a hand-written mirror, not generated.** The source of
@@ -197,6 +264,22 @@ above (`blocks.py` and `approval_actions.py`), the numbered selector only in
   does hide its compose option. But the field is dropped at the projection rather
   than deliberately declined, so the asymmetry is invisible in the code, and the
   next Slack-side interaction that wants it will find nothing to read.
+- **Progress is accepted but not rendered.** The `curie_progress` operation is
+  the runner's platform `progress` tool (`mcp__curie__progress`), and a
+  person's Slack turn carries a per-turn capability for it. The tool posts each
+  `ProgressCommand` to the API's scoped ingress
+  (`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`),
+  which resolves it to the turn chain's record by the token's subject and
+  appends it to that chain's inbox, and a per-turn pump in the kernel applies
+  it to the worker coordinator's durable store
+  (`apps/worker/src/curie_worker/progress.py::ProgressStore`). The store
+  applies the idempotency, ordering, terminal, milestone-budget and
+  delivery-identity rules ADR-0130 places on the coordinator, but with
+  rendering off nothing delivers from it. Its rules are in the worker's
+  [README](../../../apps/worker/README.md#deliberate-progress-adr-0130).
+  What the models realize on the wire is the closed shape: a command that names
+  a routing, credential, delivery or budget field is refused at validation. The
+  terminal mirror in `cli/src/channel.rs` does not model progress either.
 - **The envelope is a text-channel workaround.** ACI has no native
   semantic-message event, so the message rides inside the runner's final text as a
   fenced block. Every adapter therefore carries fence-parsing and partial-envelope
@@ -210,6 +293,6 @@ above (`blocks.py` and `approval_actions.py`), the numbered selector only in
 
 ## Cross-links
 
-- **ADR(s):** [ADR-0020](../../adr/0020-message-port-rendering-free-channel-interface.md) — the message port: a rendering-free channel interface with capability negotiation (this file is its interaction half); [ADR-0017](../../adr/0017-tri-language-contract-codegen.md) — the tri-language codegen pattern this seam's Rust mirror does **not** yet follow
+- **ADR(s):** [ADR-0020](../../adr/0020-message-port-rendering-free-channel-interface.md) — the message port: a rendering-free channel interface with capability negotiation (this file is its interaction half); [ADR-0130](../../adr/0130-deliberate-progress-is-bounded-durable-channel-state.md) — deliberate progress as bounded durable channel state, the source of the progress contract; [ADR-0017](../../adr/0017-tri-language-contract-codegen.md) — the tri-language codegen pattern this seam's Rust mirror does **not** yet follow
 - **Sibling seams:** [channel-ingress](../channel-ingress/INTERFACE.md) — the graded (`C`) ingress/egress swap story; [aci-producer](../aci-producer/INTERFACE.md) — the frozen ACI the envelope currently tunnels through
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the interaction contract is not one of the six swap-readiness Jobs; not separately graded

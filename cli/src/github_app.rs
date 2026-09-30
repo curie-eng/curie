@@ -526,13 +526,49 @@ impl ExpectedSandboxInventory {
             Some(serde_json::Value::Bool(value)) => *value,
             Some(_) => anyhow::bail!("agentSandbox.deploy in Helm values is not a boolean"),
         };
-        let mut agents = match sandbox.and_then(|value| value.get("connectorSecrets")) {
-            None | Some(serde_json::Value::Null) => Vec::new(),
-            Some(serde_json::Value::Object(values)) => values.keys().cloned().collect(),
-            Some(_) => anyhow::bail!("agentSandbox.connectorSecrets in Helm values is not a map"),
-        };
+        // Mirrors the chart's curie.agentSandboxPoolAgents: every agent keyed
+        // under connectorSecrets or registryEgress gets a per-agent template.
+        let mut agents = Vec::new();
+        for key in ["connectorSecrets", "registryEgress"] {
+            match sandbox.and_then(|value| value.get(key)) {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Object(values)) => agents.extend(values.keys().cloned()),
+                Some(_) => anyhow::bail!("agentSandbox.{key} in Helm values is not a map"),
+            }
+        }
         agents.sort();
+        agents.dedup();
         Ok(Self { deploy, agents })
+    }
+}
+
+#[cfg(test)]
+mod expected_sandbox_inventory_tests {
+    use super::ExpectedSandboxInventory;
+
+    #[test]
+    fn agents_union_connector_secrets_and_registry_egress() {
+        let values = serde_json::json!({"agentSandbox": {
+            "connectorSecrets": {"beta": {"A": "x"}, "alpha": {"A": "y"}},
+            "registryEgress": {"gamma": {}, "beta": {}}
+        }});
+        let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
+        assert!(inventory.deploy);
+        assert_eq!(inventory.agents, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn registry_egress_only_agent_is_counted() {
+        let values = serde_json::json!({"agentSandbox": {"registryEgress": {"solo": {}}}});
+        let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
+        assert_eq!(inventory.agents, vec!["solo"]);
+    }
+
+    #[test]
+    fn non_map_registry_egress_is_rejected() {
+        let values = serde_json::json!({"agentSandbox": {"registryEgress": ["solo"]}});
+        let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
+        assert!(error.to_string().contains("agentSandbox.registryEgress"));
     }
 }
 

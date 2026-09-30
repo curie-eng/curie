@@ -30,16 +30,54 @@ API server typically binds loopback, which can make it unreachable from a
 pod; if `cluster message` can't auto-detect a pod-reachable host, pass
 `--listen-host` explicitly (see `cli/README.md`).
 
+**On Apple Silicon (arm64)**, two caveats:
+
+- The AVX preflight is x86-only. `preflights.avxCheck` greps the node's
+  `/proc/cpuinfo` for the `avx` flag, which no arm64 CPU reports, so the
+  check fails on every arm64 node regardless of tool. Disable it with
+  `curie cluster up --set preflights.avxCheck.enabled=false`. The chart
+  README's other remedy for a failing AVX check -- pinning an SSE4.2-safe
+  ClickHouse tag -- is no better here: those tags predate the current
+  Langfuse migration set and cannot apply it (see
+  `charts/curie/README.md`).
+- Prefer **kind** over **minikube** when the full stack matters. On
+  minikube's docker driver, ClickHouse has been observed crash-looping
+  (`std::terminate` in `MergeTreeData::loadOutdatedDataParts`, signal 5)
+  while every other component reports healthy and `cluster up` still
+  reports success -- a silent failure. The crash did not reproduce in a
+  bare `docker run` of the same image, config, and resource limits, which
+  points at minikube's node setup rather than the chart: the same chart,
+  version, and overrides converge cleanly on kind, with real traces and
+  evals working. `cluster up` reports success either way, so after startup
+  verify the ClickHouse pod yourself (shown for the default namespace and
+  release):
+
+  ```bash
+  kubectl -n curie get pod curie-clickhouse-0
+  ```
+
+  A healthy pod is `1/1 Running` with a `RESTARTS` count that stays put --
+  re-run after a minute if in doubt. `CrashLoopBackOff`, or a `RESTARTS`
+  count that keeps climbing on minikube, is the silent failure described
+  above: recreate the cluster with kind instead.
+
 **For production**, you'll likely point at a managed or self-hosted cluster
-instead. Curie has no cluster-selection flag of its own -- every `cluster`
-command just uses whatever `kubectl` and `helm` are already pointed at, so
-switch clusters the normal `kubectl` way:
+instead. Name it on every `cluster` command with `--context` (see below), so a
+stale kubeconfig current-context cannot send a command at the wrong cluster:
 
 ```bash
-kubectl config use-context <your-production-context>
+curie cluster status --context <your-production-context>
 ```
 
 ## Installing and inspecting the Curie platform on the cluster
+
+Every `curie cluster` verb takes `--context <NAME>`. The CLI resolves the
+context once, prints `Kubernetes context: <NAME> (cluster <CLUSTER>)` on stderr,
+and pins it for every `helm` and `kubectl` call it makes, including any ambient
+`HELM_KUBECONTEXT`. Without the flag it pins the kubeconfig current-context. A
+name that is not in the kubeconfig is refused before anything runs. Pass the
+flag explicitly on a workstation whose kubeconfig also holds production
+clusters.
 
 ### Running a build from a commit, without waiting for a release
 
@@ -75,8 +113,17 @@ Two things to know:
 ### `curie apply`
 
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
-`curie.yaml` and customize it. Credential fields contain credential names, not
-secret values.
+`curie.yaml` and customize it, or write the same starter from a released binary
+with `curie apply --init`. Credential fields contain credential names, not
+secret values. `install.context` (and `curie apply --context` / `curie diff
+--context`, which win over the file) selects the kube context; `curie diff`
+prints the cluster that context names. Shared-cluster singleton opt-outs are
+modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
+/ `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls
+runner kernel isolation, not those singletons. `set:` values are always strings;
+a boolean or null is refused and the error names the empty string form, except
+for keys that have a modeled field. The input schema is
+`curie schema-index curie-yaml`.
 Before either command, provide values for `ANTHROPIC_API_KEY`,
 `SLACK_APP_TOKEN`, and `SLACK_BOT_TOKEN` in the environment or store them with
 `curie secrets set <NAME>`.
@@ -320,6 +367,14 @@ Curie prints one standard error line for every inference, including the
 equivalent override. Prepared `apply` and `diff` paths do not infer live
 cluster facts.
 
+A Helm release whose history is only `failed` (no `deployed` or `superseded`
+revision) is not an upgrade. `curie apply` and `curie cluster up` uninstall that
+record, then install. An in-flight status (`pending-install`, `pending-upgrade`,
+`unknown`) is refused at once and names `curie cluster down`. A known-good
+revision is left intact. This is the failed-first-install wedge: Helm would
+otherwise fire the pre-upgrade drain hook against Secrets revision 1 never
+created.
+
 ### `curie cluster status`
 
 ```bash
@@ -348,6 +403,22 @@ the console at this release's Curie API. `--json` also reports the current
 upgrade phase and the last known-good version.
 
 ### `curie cluster upgrade`
+
+For the 0.10.1 history capacity change, deploy the API image with the
+`X-Curie-Transcript-Max-Bytes` response header to every API pod before
+deploying the new worker or runner image. Keep the previous worker and runner
+image pins during that API rollout. Check the header on transcript GET responses
+for both an existing key and a missing key through every API pod, then roll out
+the worker and runner. The new runner requires that header at boot, so a mixed
+API rollout can refuse to start a history backed turn.
+
+For caller lists (ADR 0175, 0.11.0), upgrade the API before the dispatcher, and
+set a list only once both run this version. A dispatcher that rolls first asks an
+API that has no admission route yet; it reads FastAPI's route-miss 404 as "no
+list can exist here" and admits everyone, logging the skew once, so Slack keeps
+working through the rollout. A dispatcher from before 0.11.0 never asks at all,
+so a list is not enforced in Slack until the dispatcher is upgraded too. The
+channel port enforces a list as soon as the API runs this version.
 
 ```bash
 # release build: --chart defaults to the version-pinned release asset for --to
@@ -387,7 +458,7 @@ and runs every target check before mutation.
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
@@ -404,7 +475,9 @@ revision or a pending contract/irreversible migration without
 `--forward-only` refuses before `helm upgrade`. `--forward-only` sets
 `api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
 `migrate` phase is a resumable checkpoint boundary only; it performs no
-migration of its own.
+migration of its own. Revision 0070 is such a migration; see
+[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0070)
+before an upgrade crosses it.
 
 The redacted plan names the configuration schema version the upgrade migrates
 from and to (`config schema: <from> -> <to>`). It never carries credential
@@ -430,9 +503,12 @@ command. Success is refused unless convergence is exact and the canary
 passed. After a normal command failure, run the same command to resume only
 when cleanup successfully released ownership.
 
-This composes configuration migration (issue 2299) with the drain gate
-(issue 2010): a resume after a completed drain does not drain accepted
-work again.
+This composes configuration migration (issue 2299) with a `drain_preflight`
+phase that confirms the worker workload is reachable ahead of Apply (issue
+2830): a resume after a completed preflight does not repeat it. That phase is
+not the drain gate itself; the gate (issue 2010) is the chart's own
+pre-upgrade Helm hook Job, which runs during Apply and whose outcome the
+convergence check above reports as the drained-queue gate.
 
 After confirmation, the command claims the namespaced
 `<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
@@ -768,6 +844,556 @@ Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
 
+### Admitting a labelled GitHub issue
+
+Factory intake uses the same signed `POST /github/webhook` endpoint and is off
+until `api.githubFactoryIngressEnabled` is true (environment
+`GITHUB_FACTORY_INGRESS_ENABLED=true`). The API refuses to start with that gate
+on unless the GitHub App id and private key are set, the webhook secret is not
+the development default, `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a
+single label name, `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one
+GitHub login, and `api.githubRepoAllowlist` is non-empty.
+
+Bind the agent with a `github` channel whose address is the repository
+`owner/name`. No Slack binding is required. The configured label is only the
+initial admission convention. A later bounded execution requires a new issue
+comment that explicitly mentions that login and whose sender currently has
+write or admin permission. Ordinary comments, edits, and events sent by the
+App do not execute work. Removing that label or closing the issue cancels
+waiting work and requests termination of a running execution. Cancellation
+stays requested until the runtime reports that it stopped. An already linked
+pull request stays linked, and later publication is refused.
+
+GitHub does not retry a label delivery that failed, for example while the API
+was unreachable. The work item reconciler covers that gap: every
+`GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0 disables) it lists the
+open issues carrying the factory label on each bound repository and admits any
+that has no work item, once the label is older than
+`GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
+a delivery, including the labeling user's current write permission, and it
+never admits an issue that already has a work item, so it does not duplicate a
+delivery that arrived. A manual redelivery of the lost label after the
+reconciler admitted the issue counts as a relabel and starts a second run.
+
+Subscribe the App webhook to **Issues** and **Issue comments** in addition to
+the review subscriptions when both gates are on. Give the App **Issues: Read and write**
+so Curie can re-read the issue, keep its one status comment, and set the
+`curie-factory:*` state labels. **Metadata: Read** is already implied by repository
+installation discovery.
+
+Give the App **Checks: Read** and **Commit statuses: Read** (the factory
+preflight names whichever of those two the installation does not grant), and
+**Actions: Read**.
+The Actions permission lets repair rounds include the failing job's log tail.
+Without it, CI verdicts still use checks and commit statuses; the repair prompt
+keeps the check summary and says `Job log unavailable.` After a factory
+run publishes, it waits on the pull request's checks inside its execution
+deadline; the request completes only when CI is green. A failure resumes the
+same run to fix the code and push to the same pull request, for at most 3
+rounds, then the issue gets `Could not complete:` with the failing checks and
+what each round tried. No checks within 120 s of the push completes with a
+note only when no required check applies. A factory Python publication needs
+the selected `Python (ruff + mypy + pytest)` Actions check to run and pass;
+missing, skipped, unreadable, unrelated, or failed evidence cannot complete it.
+Checks still pending when the CI wait (by default 1200 s from the push, or the
+execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
+`api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
+1200, 1 to 10800, checked at boot) when the repository's required checks take
+longer than 20 minutes; the wait still ends at the execution deadline if that
+comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
+ends as `ci_unverified`, which is never success;
+the pull request stays open either way. The work item detail route still
+reports CI as `unavailable` / `github_forbidden` without the permission.
+
+### The default factory agent
+
+Curie ships its factory agent as the bundle in
+[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it as the
+agent `dark-factory` bound to the repository, on the default factory model
+`z-ai/glm-5.3-flash` (`agentSandbox.runner.model`). It is one agent with one skill: it reads the
+issue by link, pins the acceptance criteria, plans, writes a failing test where
+one is feasible, implements, runs the repository's own checks, reviews its diff
+against every criterion, and ends in one pull request or a stated reason. Any
+other bundle can take its place; the platform does not require this one.
+
+The bundle reads the issue through the GitHub MCP server installed by
+`examples/dark-factory/runner.Dockerfile` in a runner layer the bundle
+declares in `connectors.yaml` (ADR-0173), with its own
+`GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
+(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). The platform
+runner does not contain that server, so run
+`curie build --plugin-dir examples/dark-factory --registry <ref>` before the
+deploy; the deploy refuses the bundle until its lock records the layer. Give it a token
+limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue`
+and `github/add_issue_comment`, and the bundle's review gate hook allows that
+comment only once, to post unresolved findings after a failed or capped review,
+so the runner denies every other GitHub write tool. Open runner egress to the GitHub API
+CIDRs (`agentSandbox.connectorEgress.<agent>`), and raise
+`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to at
+least the agent's execution deadline so the deadline, not the 600 s default,
+bounds a run. For a run of up to three hours, set the agent's deadline with
+`curie cluster overrides <agent> --execution-deadline 10800` and both worker
+values to 10800; the chart raises the worker termination grace to match. Whether a run
+executes the repository's tests is the bundle's instruction. The platform does
+not check it. To let the agent install dependencies (`npm ci`, `pip install`)
+and run those checks, declare its package registry CIDRs under
+`agentSandbox.registryEgress.<agent>`. Nothing opens by default; each declaring
+agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
+since NetworkPolicy cannot name a host, list the registry CDN ranges or a
+mirror's address. When the bundle layers its own runner image
+(ADR-0173), `curie cluster deploy` sets `agentSandbox.runnerImages.<agent>` to
+the digest reference `curie build` recorded in its connectors.lock.yaml and
+replaces the agent's claimed sandboxes. Deploying a bundle with no runner entry
+clears that agent's earlier value. That agent gets its own
+SandboxTemplate rendering the digest, and the runner prewarm DaemonSet pulls it
+on every node. A tag is refused at render time.
+
+A layer only runs on the platform runner it was built on. `curie cluster deploy`
+compares the lock's `runner.base` digest with the installation's runner (the
+release's `agentSandbox.runner` digest, else its tag or the chart appVersion
+resolved in the registry) and refuses a mismatch, or a runner it cannot
+determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
+--runner-image <installed runner>`. `curie cluster upgrade` compares the current
+runner with the one the target release renders. When they differ, or either
+cannot be determined, it names every agent in `agentSandbox.runnerImages` before
+upgrading, in the plan and `--dry-run` output too, and clears those entries in
+the same `helm upgrade`. After that upgrade it deletes those agents'
+SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
+starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
+layer until their owners rebuild with `curie build` and redeploy. Both checks need
+docker buildx and registry access to resolve runner digests: without it, `curie
+cluster deploy` refuses and `curie cluster upgrade` clears every layer.
+
+For a run that can last three hours, set an illustrative $100 USD cap after
+deploying the agent:
+
+```bash
+curie cluster budget dark-factory --limit 100
+```
+
+Tune the limit to the model and expected workload. The SDK applies it to each
+session; it does not meter daily spend across runs. It does not guarantee a
+$100 bill. On OpenRouter's Anthropic Messages route, the
+[documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
+contains token usage but no billed cost field. The conclusion that the SDK
+cost used for Curie's USD cap is an estimate is an inference from those
+documented response fields, not a live billing measurement. OpenRouter reports
+cost through its separate [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+Check OpenRouter Activity or the cost of each generation for actual billing.
+The [SDK budget example](https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py)
+checks the cap after each API call, so the estimate can exceed the limit by
+one API call.
+
+### Factory work items wait for capacity
+
+Factory execution waits in PostgreSQL rather than on the runs-stream pending
+list. Admission, acquire, start, heartbeat, finish, and termination are internal
+worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
+publishes execute and terminate wakes onto `curie:runs`.
+
+The knobs are `CURIE_WORK_ITEM_*` on the API (settable through `api.extraEnv`
+until chart-owned values land):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CURIE_WORK_ITEM_RECONCILER_ENABLED` | `true` | Lifespan task off-switch |
+| `CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS` | `5` | Pass interval |
+| `CURIE_WORK_ITEM_BATCH_LIMIT` | `50` | Due rows claimed per pass |
+| `CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS` | `86400` | Waiting deadline from admission |
+| `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
+| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
+| `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
+| `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
+| `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
+| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
+| `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
+| `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
+
+There are two time bounds after start: the ExecutionRequest deadline (the
+agent's `execution_deadline_seconds`, 60 to 10800, default 1800) and the worker
+delivery budget (`worker.deliveryBudgetSeconds`, default 600, maximum 10800).
+The runner request is bounded by the smaller of the two remaining times. A
+default install therefore fails a work item at 600 s (`deadline_halted`) unless
+operators raise the delivery budget for factory agents.
+
+A work item run boots its runner with a turn budget of `worker.workItemMaxTurns`
+(default 1000), so the deadline rather than the runner's default of 20 turns
+bounds it. A run that still exhausts its turns fails as `max_turns` with
+failure class `max-turns`. An unclassified runner failure fails as
+`unclassified`.
+
+Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
+`GET /v1/internal/work-items/requests/{id}`. It is not written to the
+dead-letter graveyard.
+
+Each factory execution request owns exactly one App-authored status comment.
+The reconciler creates it on its first pass after admission and then edits it
+in place; there is no separate final comment. While the run is live the
+comment shows a checklist of the phases the agent reports through
+`report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
+`STOPPING`). Its last edit adds the result, marks the comment final, and it is
+not edited again. A comment a person deletes is re-created once on the next
+pass; unlabel the issue to stop the run instead.
+
+When publication succeeds, the result names the exact pull request
+URL. When the run cannot complete, the result starts with `Could not complete:`
+and a plain sentence for the cause. When the model provider refused the run,
+a `Provider message:` line follows with the provider's own error text, redacted
+of keys and tokens. An execute turn that ends without publishing is prompted
+once more in the same session. If it still does not publish, it ends as
+`early_stop` (it called no work tool and never reported progress) or
+`no_pull_request`, and an `Agent's last message:` block carries the agent's
+final reply, redacted and shown inside a code fence so none of it renders.
+A last `Cause:` line names the platform cause code
+(`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+`owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
+`no_pull_request`,
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
+classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
+`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+`workspace_error`, or `history_capacity`). When the cause has a runner failure
+class, the next line is `Failure class:` and that token. The same token is the
+first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
+that sees only the delivered text can tell the turn from a successful reply.
+Other escalations use that same first line with their own token
+(`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
+`approval-approvers-unverifiable`, `approval-backend-missing`,
+`publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
+`unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+A history capacity result tells the
+operator to inspect work already done and retry. A model provider that answers
+HTTP 402 or reports exhausted
+credits ends the run as `model_credit_exhausted` without retrying. A run that a
+relabel replaced ends with `Stopped: the label was added again, so a new run
+replaced this one.`, and the new run gets its own status comment. The
+work item reconciler writes the result after the terminal row and any
+publication lineage commit. A refused create or edit is recorded on the status
+row, stops further edits, and does not change the execution row.
+
+The same pass keeps one state label on the originating issue, for revisions
+too: `curie-factory:queued` while waiting, `curie-factory:running` while running
+or stopping, `curie-factory:pr-open` after a completed run, and
+`curie-factory:needs-human` after a failed or expired one. A cancelled run
+removes all four. The same pass removes a legacy `curie:queued`,
+`curie:running`, `curie:pr-open`, or `curie:needs-human` label by exact name
+whenever it sets or clears the state label, including after an upgrade.
+Curie still never touches any other label, including the factory admission
+label. An older release rolled back onto this schema does not know the new
+names, so it will not remove a `curie-factory:*` label it finds.
+
+Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
+API's public `https://` origin to embed a live SVG card in the status comment.
+GitHub's image proxy fetches it from `/v1/factory/cards/<token>.svg`, which
+takes no credential: the 64-hex token in the URL is the capability, and
+anyone holding the URL can read the repository, issue title, phases, model and
+elapsed time of that run. Leave the setting empty on private installs; the
+comment then carries the checklist and the result without an image. Waiting for approval is not an ending: the
+execution deadline stays fixed from start and covers that wait.
+
+Review feedback on a factory pull request asks for one more revision of that
+pull request. When a work item owns the PR, an `issue_comment`,
+`pull_request_review_comment` or `pull_request_review` that mentions
+`api.githubFactoryMention` goes to the factory, not to the Slack-bound review
+path. The sender must have write access now, the PR must still be open at the
+recorded head, and the delivery must come from the work item's installation.
+Each refusal is a `factory_ignored` code (`ordinary_comment`,
+`lineage_unbound`, `lineage_closed`, `installation_mismatch`,
+`sender_permission_refused`, `terminal_pull_request`, `active_request`, and
+others). An accepted mention becomes the work item's next execution request.
+The first line of that request's objective is the same-repository feedback
+URL, which keeps the existing issue, pull request, or review thread as the
+reply target.
+A revision's status comment lives where its reply lives, on the pull
+request: in the review thread for an inline comment, otherwise as a PR comment
+that links the feedback. If GitHub refuses the thread reply with 422, the
+comment is posted as a linked PR comment. Either way it is edited in place
+until the revision ends. PR review feedback reaches the factory only
+when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
+the existing review behavior.
+
+A factory run on a `github` binding emits no booting, partial, or final chat
+text. The worker acknowledges runtime output locally. The one status
+comment on a fresh issue is the run's only GitHub response, with the pull
+request URL included when publication succeeds, so a `github` binding needs no
+endpoint or adapter.
+
+### Driving the factory end to end
+
+`curie dev factory-e2e preflight` proves the signed intake loop against a real
+GitHub App and a fixture repository, on a kube context you name. It needs a
+source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
+
+1. Installs the candidate commit's published `sha-<commit>` images from that
+   commit's chart into a namespace it creates (`test-factory-<commit>` by
+   default, or `--namespace test-factory-<slug>`). If the cluster already runs
+   the agent-sandbox controller, the install is consumer mode. Without
+   `--candidate`, the candidate is the newest first-parent commit of
+   `origin/next`, within its last 30, whose images are all published. A tip
+   that CI is still building is skipped and logged, and the run is refused
+   when none of the 30 has its images. An explicit `--candidate` is used as
+   given and refused when its images are not published.
+2. Turns on factory intake, binds one agent to the fixture repository, deploys
+   the default factory bundle (`examples/dark-factory`) onto it with a
+   short-lived installation token limited to Issues: Read as the bundle's
+   GitHub credential, sets the agent's publication policy to `auto`, exposes
+   the api through a temporary cloudflared quick tunnel, and points the App
+   webhook at it with an App JWT.
+3. Resets the fixture repository by closing its issues and pull requests and
+   deleting every branch except the default. It then opens one labelled issue.
+4. Passes when GitHub's delivery log shows that the `issues.labeled` delivery
+   got HTTP 200 and `factory_admitted`, and
+   `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
+
+Before it creates its namespace, the driver removes what a crashed run on this
+machine left behind. Each namespace it creates carries its run id and a
+`curie.dev/factory-e2e-holder` annotation of `<hostname>:<pid>`. A harness
+namespace whose holder is on this host with a dead process is stale: the driver
+uninstalls its release, deletes it, its publication namespace, and its cluster
+roles, role bindings and PriorityClasses, and waits until they are gone. Each
+install creates the chart CRDs the cluster lacks itself, already carrying the
+harness owner label, before Helm runs; once every stale release is removed and
+no other harness namespace remains, the sweep deletes the CRDs carrying that
+label. A namespace held from another host, or one with no holder (written
+before holders existed), is reported in the evidence and left alone, since
+another machine may still own it; delete it by hand once you know its run
+ended.
+
+If the App webhook already points at a quick tunnel when the run starts, the
+driver probes that tunnel's health endpoint up to four times, ten seconds
+apart, and only calls it dead if every probe fails; one 200 response counts it
+alive. A live tunnel belongs to another run, so the run is refused. A dead
+tunnel is a crashed run's: the run goes ahead and its teardown leaves the
+webhook on `CURIE_FACTORY_WEBHOOK_RESTORE_URL`, or, when that is unset, parks
+it on `https://example.com/curie-factory-e2e/parked` until you set a real
+URL.
+
+`--hold` (on `preflight` and `run`) keeps a passing install up instead of
+tearing it down at once. The driver logs the kube context, namespace,
+release, local api URL, tunnel and webhook URL, fixture repository and
+factory agent, and writes them under `hold` in the evidence file straight
+away, so a second shell can read them. The api key is never printed: the
+evidence names a `0600` file in the run's private work directory that holds
+it. Every minute the driver reopens the api port-forward or the tunnel if
+either died and refreshes the bundle's installation token when it is due; a
+failed check is logged and the hold continues. Ctrl-C or
+`kill -TERM <pid>` ends the hold and runs the normal teardown, and the result
+stays `passed`. A run that fails never holds.
+
+On every exit it restores the webhook URL, resets the fixture again, stops the
+tunnel, and deletes the namespace and its publication namespace. Each undo is
+verified. The JSON evidence file (default `target/factory-e2e/<namespace>.json`)
+records the candidate commit, namespace, delivery id, WorkItem id and every
+teardown result. Teardown that cannot be verified fails the run.
+
+Every identity is an operator input. Nothing names a specific App or account:
+
+| Variable | Meaning |
+|---|---|
+| `CURIE_FACTORY_KUBE_CONTEXT` | Kube context (or `--context`); required |
+| `CURIE_FACTORY_APP_DIR` | Directory holding `app.json` (`id`, `slug`, `installation_id`, optional `repo`), `app.pem` and `webhook_secret` |
+| `CURIE_FACTORY_APP_ID`, `CURIE_FACTORY_INSTALLATION_ID` | Override `app.json` |
+| `CURIE_FACTORY_APP_PRIVATE_KEY_FILE`, `CURIE_FACTORY_WEBHOOK_SECRET_FILE` | Override the files in the App directory |
+| `CURIE_FACTORY_REPO` | Fixture repository `owner/name` |
+| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A dedicated test GitHub account with write access that opens issues, comments and moves the fixture branch (a `gh` login for the second). It must not be the operator's own account |
+| `CURIE_FACTORY_OPERATOR_LOGIN` | The operator's GitHub login, compared with the actor's (default: the login of the default `gh` account). The run is refused when they match, and refused too when neither is known, naming this variable to set |
+| `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
+| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
+| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
+| `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
+| `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
+| `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
+| `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
+| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
+| `CURIE_FACTORY_MODEL_CONTEXT_TOKENS` | The model's context window, passed to the sandbox as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 128000 for the default model, unset for any other) |
+
+The App must already be installed on the fixture repository. Adding a
+repository to an App installation is a manual step: in GitHub, open the App's
+installation settings (**Settings > Applications > Installed GitHub Apps >
+Configure** for a user, or the organization's equivalent), then pick the
+repository under **Repository access**, or choose **All repositories**. The API
+refuses this with 403 for a user token, so the tool cannot do it for you.
+Installing the App on all repositories of the fixture owner makes new fixture
+forks work with no further step.
+
+A missing input is refused, with every missing name listed, before the cluster
+or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
+preflight and then one scenario driver: `issue-to-pr`, `revision`,
+`cancel-waiting`, `cancel-running`, `quiesce` or `evaluation`. `evaluation` runs six
+labelled tickets (a correct change, a seeded failing test, an ambiguous
+request, an unavailable dependency, an execution-deadline budget, and a
+malicious instruction) on the configured model and again on
+`CURIE_FACTORY_REFERENCE_MODEL` (default `anthropic/claude-sonnet-4.5`, same
+credential), then one authorized same-PR revision and label removal of one
+waiting request and one running request. After the waiting cancellation it
+raises the sandbox pod quota to the chart default with `helm upgrade
+--reuse-values`, so the per-agent sandbox warm pool survives. A gateway model
+is not in Claude Code's model catalog, so the runner logs a
+`[claude-code:unrecognized_model]` warning. It is only a warning: the turn still
+reaches the gateway. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` to skip
+the session-title side request and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to declare the
+model's context window (`CURIE_FACTORY_MODEL_CONTEXT_TOKENS`), which silences the notice. A request that
+has not started, a delivery the tunnel rejected, or a run that escalates in
+the first few seconds is cancelled and opened again. A refusal still has to
+end as `no_pull_request` or `early_stop`, and the budget case still has to end as
+`execution_deadline`. The case is given up well before the hour-long
+never-started cap. Hidden checks run
+against each resulting pull request and are not part of the ticket. The JSON evidence
+includes the candidate commit, each verdict, configured and observed model,
+usage or an explicit unverified record, and elapsed time. The command exits
+non-zero when any of those fields is missing or any verdict is not passed.
+
+`run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
+opens the ticket (first line is the title, the rest the body) as the one
+labelled issue and waits for the marked final issue comment, even after the
+execution row and pull request are ready. It fails unless the run posted
+exactly one such comment inside the execution bound, with at most one pull
+request, no `.github/` file or credential-shaped string in the diff, and the
+default branch unmoved. `--expect pr` requires a pull request, `--expect
+comment` requires no pull request, and `--expect any` accepts either. A success
+comment must name the exact opened pull request URL anywhere in its body. A
+failure comment must contain `Could not complete:` followed by an explanation.
+Its cause must be one the run accepts: each `--expect-cause` given, or by
+default `no_pull_request` or `early_stop` for `--expect comment`, plus
+`execution_deadline` for `--expect any`. When `--expect comment` or `--expect
+any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
+must separately contain `Could not complete:` followed by its reason. The reply
+is read from the final comment's `Agent's last message:` block, and from the
+thread transcript only when the comment has none. Each `--expect-reason` must
+match that reply, ignoring case. The platform
+cause does not establish the agent's reason. Only a comment the App posted with
+this run's execution request marker counts, and more than one fails. A rename out of
+`.github/` fails like a change inside it. A known secret or credential-shaped
+string in the pull request's title, body, diff, file names, final comment, or
+agent reply fails the run. The comment, agent reply, and the pull request's
+title, body, and file names are recorded with such strings replaced by
+`[REDACTED]`.
+A pull request ending also fails unless the WorkItem row's own
+`publication_lineage_id` is set and its lineage records that pull request; the
+read route's conversation fallback does not count, so the driver reads the
+install's Postgres. Every outcome also clears the final notice's delivery
+record and waits for the reconciler to record it again: it must record the
+original comment by its marker, and the issue must still carry exactly one.
+Elapsed time runs from the request's start to the final comment.
+The evidence records the work item state and ending cause, the pull request
+and its changed files, the final comment, the agent's final transcript reply
+and its source, CI, elapsed and execution time, the configured model, and the
+model spend
+as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
+that delta includes any concurrent use of it.
+
+`run --scenario revision --issue-file <ticket.md> [--revision-file <text.md>]`
+needs the ticket's run to open a pull request. It then posts an ordinary
+comment on that pull request, which must be delivered as `factory_ignored`
+and add no request within 60 s. Next it posts a mention comment (the revision
+file's text, or by default a request for a docstring and a test, prefixed
+with `@<mention>` when absent). It passes when that delivery is
+`factory_admitted`, the revision request belongs to the same WorkItem, the
+WorkItem ends with two requests and the second `completed`, the same single
+pull request gained a commit and a new head, exactly one App reply carries the
+revision's marker and links the mention, no other App comment followed the
+ordinary one, and the default branch is unmoved. Before posting feedback, the
+driver also requires the initial run's one final issue comment to name that
+pull request.
+
+`run --scenario cancel-waiting` installs with the sandbox pod quota set to 0,
+so every sandbox claim is refused and the request waits on capacity. Once it
+shows a capacity deferral and no start, the driver removes the label. It
+passes when the `issues.unlabeled` delivery is `factory_cancelled` and the next
+read shows the request `cancelled` with cause `issue_cancelled`, never
+`running` or `cancellation_requested`, and no pull request.
+
+`run --scenario cancel-running [--issue-file <ticket.md>]` (by default a
+multi-step ticket that keeps the run busy for minutes) removes the label as
+soon as the request is `running`. It passes when the delivery is
+`factory_cancellation_requested`, the request then reads `cancelled` with
+cause `issue_cancelled` (a missed `cancellation_requested` read is covered by
+the delivery status), and after a 180 s quiet window there is no pull
+request, no WorkItem pull request, no published publication, no new branch,
+at most one terminus comment with cause `issue_cancelled`, and the default
+branch is unmoved.
+
+`revision` and `cancel-running` need `CURIE_FACTORY_MODEL_API_KEY` and refuse
+before installing without it; `cancel-waiting` runs with either model. Each
+of the three runs `curie cluster work-items <id> --json` at every state it
+judges and requires exit 0 with the api's state and request statuses, and
+requires exit 1 for an unknown id. The evidence records every id, delivery,
+comment, pull request head, status seen with its time, and CLI read.
+
+`run --scenario quiesce [--issue-file <ticket.md>]` is the live proof for
+issue #3198 that the worker upgrade quiesce marker clears after a cancelled
+`helm upgrade`. It needs `CURIE_FACTORY_MODEL_API_KEY` so the seed request
+stays `running`. Path A runs `helm upgrade --reuse-values --timeout 60s`, which
+the client cancels while the drain gate waits; the marker must stay
+`quiescing` on a lease no longer than one drain lease, `curie doctor` must
+report `marker expires in`, and a second labelled issue must stay `waiting`
+with the paused-for-upgrade status comment. The driver then SIGKILLs the drain
+process through the node's container runtime, so no SIGTERM handler can clear
+the marker, and deletes the Job. The marker must read `claims_enabled` within
+one lease plus slack, and a worker must claim the queued request. The kill needs
+ssh with passwordless sudo and `crictl` on the drain pod's node (the node name,
+or `CURIE_FACTORY_NODE_SSH_HOST`); without it the run fails rather than passing
+on SIGTERM cleanup. Path B deletes the drain Job
+while a 20 minute upgrade still waits; the marker must clear within 10 s and
+the drain pod log must say the gate was terminated. Helm treats a deleted hook
+Job as finished, so the chart's later attest hook refuses the upgrade unless
+this revision recorded a successful drain. Path B still records the helm exit
+code without judging it: this scenario proves the marker clear, and the exit
+code is evidence for that refusal rather than a pass condition here. The evidence judges
+`seed_status_before`, `baseline_state`, the `path_a_*` helm exit, elapsed,
+state and ttl fields, `doctor_worker_claims_line`, `paused_comment_found`,
+`queued_status_while_quiesced`, `path_a_clear_seconds`,
+`queued_status_after_release`, the `path_b_*` clear and
+log fields, and `final_state`.
+
+### Reading work item outcomes
+
+Operators read factory work through two read-only routes behind the platform
+API key: `GET /work-items` (optional `agent_id`, `limit` 1 to 200, default 50,
+newest update first, with a `truncated` flag) and `GET /work-items/{id}`
+(optional `agent_id`). An unknown id and an id owned by another agent return
+the same 404 body. Both responses carry `Cache-Control: no-store`.
+
+Each item carries its issue link, its pull request (from the conversation's
+publication lineage), its publication and approval status, every execution
+request, a `state` and an `actionable_cause`. The states:
+
+- `waiting`: admitted and waiting for sandbox capacity. The cause names
+  capacity deferrals and says when the waiting deadline has elapsed but the
+  reconciler has not yet expired the request.
+- `running`: started, bounded by the agent's execution deadline (default 1800 s).
+- `cancellation_requested`: termination requested (`issue_cancelled`,
+  `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
+- `cancelled`: the issue label was removed or the issue was closed. A pull
+  request already opened is kept.
+- `expired`: `capacity_wait_expired` or `execution_deadline`.
+- `failed`: the cause names the terminal cause verbatim. For
+  `deadline_halted`, raise `worker.deliveryBudgetSeconds`.
+- `awaiting_approval`: a publication approval or a tool approval on the same
+  conversation is pending.
+- `publishing`: the publication is approved and in flight.
+- `published`: a pull request is open for the work.
+- `completed_unpublished`: the run completed with no publication, or its
+  publication was denied, expired or failed.
+
+The platform never asserts correctness: every item reports
+`correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs
+to the bundle.
+
+The detail route observes CI live for the pull request head and never stores
+it. `ci.state` is `passing`, `failing`, `pending`, `none` (no check runs),
+`not_applicable` (no pull request) or `unavailable` with a fixed `reason`:
+`no_head_sha`, `app_not_configured`, `installation_refused`,
+`github_unauthorized`, `github_forbidden`,
+`github_not_found`, `github_rate_limited`, `github_error`, `timeout`,
+`malformed_response`, `too_many_check_runs` or `observation_busy` (every
+concurrent credential slot is held by an in-flight mint). The list route reports
+`ci: null` and never calls GitHub.
+
+The CLI reads the same routes: `curie cluster work-items [ID] [--agent
+NAME_OR_ID] [--json]` and `curie local work-items`. Exit codes are 0 on
+success, 1 for not found or refused, 2 for invalid input and 3 when the API
+is unreachable. The skill tier has no work items and exits 4.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two
@@ -803,6 +1429,113 @@ directory.
 This lets a developer iterate on an agent built for someone else's
 workspace with no Slack access. Full flag reference is in
 [`cli/README.md`](../cli/README.md).
+
+### What a reply says the agent changed
+
+A turn that ran a tool outside the read-only allowlist ends its reply with a
+`_What I changed:_` receipt, one line per action, each saying whether it can
+be undone ([ADR-0117](adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md)).
+How much of it the people using the install see is the chart value
+`worker.turnReceipt`
+([ADR-0180](adr/0180-the-turn-receipt-is-an-install-choice.md)):
+
+| Value | The reply ends with |
+|---|---|
+| `all` (default) | every action, each saying whether it can be undone |
+| `failures` | only the actions that reported failure, which a person should check before asking again; nothing when none failed |
+| `off` | no receipt, even when an action failed |
+
+The value changes only the reply. Every action is still recorded and readable
+through the API's `GET /actions`, and a turn that touched anything is still
+never retried automatically. It reaches the worker as `CURIE_TURN_RECEIPT`, so
+changing it rolls the workers. The chart refuses any other value at render,
+and the worker refuses one at startup.
+
+### Deliberate progress from a running turn
+
+A long task can report short progress while it runs
+([ADR-0130](adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+Nothing renders it yet: the platform records it and shows nobody, so turning
+it on later changes what people see, not what is stored.
+
+The path, and what an operator can check on each hop:
+
+1. **The capability.** For a person's Slack turn (and the approval resume of
+   one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
+   allocates a durable generation and marks it active with a five-second lease
+   on Valkey's server clock. A startup keeper renews it while the worker waits
+   for runner admission and response headers, then hands renewal to the live
+   pump when stream consumption begins. Both renew only that active, unexpired
+   generation; a missed lease cannot be revived. It mints a
+   sandbox token with scope `turn.progress`, bound to
+   `progress_id:generation`. It sends token, URL, and generation to the runner.
+   Jobs, cron and targetless hook turns, factory executions and
+   `curie cluster message` relay turns get neither the boot flag nor the
+   model-visible tool/prompt. The route record persists whether the sandbox
+   booted with the flag, and sandbox reuse compares both directions, so
+   eligibility cannot be inherited from an earlier occupant.
+   A failure between runner response headers and stream consumption stops the
+   startup keeper and closes the generation; worker cancellation still
+   propagates to the delivery owner after that close attempt finishes.
+2. **The ingress.** The runner's `progress` tool POSTs each update to the API
+   at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
+   The API accepts only a `turn.progress` token whose subject matches the path
+   and body generation, and whose generation is still active and unexpired. It rejects a
+   channel adapter's sibling `chn` token before validating the command body;
+   the platform key, another chain's token, an expired token, and a token from
+   a closed, superseded, or deadline-expired turn are also refused 401. A body
+   that is not a `ProgressCommand` plus
+   the worker-issued `generation` and runner-issued `seq` is refused 422. Each
+   token may send one update a second, with a burst of five; past that the API
+   answers 429. An accepted update is atomically appended and indexed for the
+   worker, then answered 202 (queued, not yet semantically applied).
+3. **The record.** While the turn runs, its pump applies each inbox entry to
+   the chain's durable record, which keeps its state, revision and milestone
+   reservations. A maintenance drainer owns the same durable pending-inbox
+   index, so one failed final read or a worker restart cannot orphan a 202.
+
+The fake model is network-free, including when progress headers are present.
+Use a live model or the API/worker integration fixture to exercise the ingress;
+`[fake:progress-demo]` is only a deterministic long turn for steering tests.
+
+With an integration turn, inspect the durable result with:
+
+```bash
+# the record the integration turn wrote (one per chain)
+valkey-cli -p 26379 -a valkeypass --scan --pattern 'curie:worker:progress:*'
+valkey-cli -p 26379 -a valkeypass HGETALL curie:worker:progress:<progress_id>
+```
+
+The record shows `state testing`, `revision 3` and `milestones_used 2`, and the
+Slack stub receives nothing from progress. The worker switch that will turn
+rendering on is `CURIE_PROGRESS_RENDER`; it is off, the chart does not expose
+it, and this release's worker refuses to start with it on.
+
+### Letting the agent remember facts
+
+An agent's memory tools (`remember`, `update` and `forget`, ADR-0167) are off
+by default. Turn them on per agent:
+
+```bash
+curie cluster overrides <agent> --memory-writes on
+```
+
+The setting takes effect at the agent's next sandbox boot. With it on, the
+agent keeps channel memory for each channel it works in, alongside its agent
+memory. It is also shown guidance on what to save. To read that guidance,
+replace it with a file's text, or go back to the platform default:
+
+```bash
+curie cluster memory <agent> --guidance
+curie cluster memory <agent> --guidance-from guidance.md
+curie cluster memory <agent> --reset-guidance
+```
+
+A new thread picks up changed guidance. A live thread keeps what it booted
+with. `--memory-writes off` unmounts the tools at the next boot. With writes
+off the worker gives the sandbox no channel memory at all, so channel facts are
+not loaded; agent facts already saved are still shown to the agent. Saved
+channel facts stay stored and come back if writes are turned on again.
 
 ### Connecting Slack
 
@@ -926,10 +1659,42 @@ mailAdapter:
     httpsCidrs: [203.0.113.0/24] # placeholder; replace from your provider/proxy
 ```
 
-An empty `mailAdapter.agentmail.httpsCidrs` refuses to render when the adapter is
-enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
+In the default `egressMode: cidrs`, an empty `mailAdapter.agentmail.httpsCidrs`
+refuses to render when the adapter is enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
 split default routes; surrounding whitespace and expanded IPv6 spelling do not
 bypass that gate. Use narrow current provider or controlled-proxy ranges.
+
+**`/32` pins for AgentMail will break.** `api.agentmail.to` is fronted by
+CloudFront, which moves the name between edge addresses without notice. A list of
+`/32` entries resolved at install time is correct only until the next move; after
+that every HTTPS open from the adapter pod is refused and mail stops (seen on
+2026-09-18, #2824). The same applies to any CDN-fronted API. Pick one of:
+
+- **Published ranges.** Declare the provider's published ranges instead of
+  resolved addresses. For CloudFront that is every `CLOUDFRONT` prefix in
+  <https://ip-ranges.amazonaws.com/ip-ranges.json>, which AWS keeps current;
+  re-render when that file changes. Wide, but still limited to the CDN.
+- **A controlled egress proxy** with a stable address, with
+  `agentmail.baseUrl` pointing at it.
+- **`egressMode: publicHttps`.** The policy admits TCP 443 to any public address
+  and still denies private, loopback, link-local (cloud metadata), CGNAT,
+  multicast, documentation and reserved ranges, plus anything in
+  `publicHttpsExcept`. Pod, Service and node ranges in public address space
+  (dual-stack IPv6 pod and Service CIDRs on EKS, GKE and AKS, GKE public pod
+  ranges, public node IPs) are not denied by default; list them there. The adapter then dials whatever DNS returns. This survives any CDN
+  move. The trade-off is that the credential-bearing mail pod can open HTTPS to
+  any public host, not only AgentMail. `httpsCidrs` must be empty in this mode.
+
+```yaml
+mailAdapter:
+  agentmail:
+    egressMode: publicHttps
+    publicHttpsExcept: [] # add public-space pod, Service and node ranges
+```
+
+NetworkPolicy has no FQDN peer. CNIs that add one (Cilium `toFQDNs`, Calico
+DNS policy) can express "only api.agentmail.to" directly; the chart does not
+render those CRDs, so apply one alongside the release if your CNI supports it.
 
 For a bring-your-own platform API, declare the URL and its NetworkPolicy peer
 independently; the chart cannot safely infer IP ranges from a hostname:
@@ -959,7 +1724,8 @@ mailAdapter:
 | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` | Source the scoped channel token from an operator-managed Secret instead of the chart Secret (default key `mailChannelToken`). |
 | `mailAdapter.egressSecretExistingSecret` / `egressSecretExistingSecretKey` | Source the adapter's egress credential externally (default key `mailEgressSecret`). This requires `worker.adapterCredentialsExistingSecret` to supply the paired worker map. |
 | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` | Source the AgentMail API key from an operator-managed Secret instead of the chart Secret (default key `mailAgentmailApiKey`). |
-| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. The adapter dials only addresses these CIDRs admit, pinning to `/32` entries when DNS rotates to an edge outside the list (TLS is still verified against the hostname) -- this is what kept a CDN-fronted provider from being refused when its DNS rotated (#2731). |
+| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. The adapter dials only addresses these CIDRs admit, pinning to `/32` entries when DNS rotates to an edge outside the list (TLS is still verified against the hostname) -- this is what kept a CDN-fronted provider from being refused when its DNS rotated (#2731). Resolved `/32` pins for a CDN-fronted API still break when the CDN moves; see above (#2824). Must be empty when `egressMode` is `publicHttps`. |
+| `mailAdapter.agentmail.egressMode` / `publicHttpsExcept` | `cidrs` (default) allows TCP 443 only to `httpsCidrs`. `publicHttps` allows TCP 443 to any public address with special-purpose ranges and `publicHttpsExcept` denied, trading provider-only egress for surviving CDN moves. List public-space pod, Service and node ranges in `publicHttpsExcept`. |
 | `mailAdapter.discoveryUnreadyAfterSeconds` | Continuous discovery-failure seconds after which readiness goes `503` (default `120`); liveness is unaffected. The Service still publishes the pod's address while unready, so reply/completion deliveries from the worker keep routing through a discovery outage; readiness going 503 is the operator signal, not a routing cutoff. |
 | `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
 | `mailAdapter.otelEgress.httpsCidrs` / `port` | Required narrow destination peers when the release's effective OTLP endpoint is external (`otelCollector.deploy=false` with `otelCollector.endpoint` set); the render is refused without it. `port` is optional and derives from the endpoint URL. Ignored for the in-chart collector, whose pod selector is used instead. |
@@ -1034,6 +1800,26 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### Bundles that carry their own stdio MCP servers (0.11.0)
+
+From 0.11.0 the platform runner no longer contains `mcp-server-github` or
+`slack-mcp` (#3230). The shipped `examples/dark-factory`,
+`examples/github-issues` and `examples/mean-tester` bundles now declare a
+runner layer in `connectors.yaml` that installs them. An agent already running
+one of these bundles loses its server on `curie cluster upgrade` alone, because
+the platform runner is what changes. After upgrading to 0.11.0, rebuild and
+redeploy each such agent from the updated bundle:
+
+```bash
+curie build --plugin-dir examples/dark-factory --registry <ref>
+curie cluster deploy --plugin-dir examples/dark-factory --agent <agent> ...
+```
+
+The same applies to your own bundle if it ships a `runner.Dockerfile`: declare
+`runner.build` in its `connectors.yaml`, or nothing builds it. A deploy of a
+bundle with a `runner.Dockerfile` and no `runner:` declaration prints a warning
+saying so.
+
 ### State-identity migration (Alembic revision 0037)
 
 Before upgrading to a release containing revision 0037, take a
@@ -1074,6 +1860,81 @@ For each mixed `memory=false` agent, choose shared or isolated policy and
 move/merge every general-state row into that one shape. Re-run the preflights,
 then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
 flags, state rows, the constraint, and the Alembic revision stay unchanged.
+
+### Slack route identity migration (Alembic revision 0070)
+
+Revision 0070 is a contract migration (ADR-0168 decision 3), and it ships in
+v0.11.0. It stores the identity on every Slack binding, `default` where none was
+named, and makes the binding key `(kind, address, adapter)`, so two identities
+can bind one channel. Before it changes anything it refuses, naming each row,
+while a Slack binding or an approval route's Slack notification still carries an
+`endpoint`, which is the retired custom-transport form, or while an approval
+raised through one is pending or owed its resume. Clear each of them first, on
+the release you are upgrading from:
+
+- Settle each approval it names: resolve it, or let it expire, and let its
+  resume turn finish. A resume replays the transport the approval was raised
+  through, so after the upgrade it would be dropped.
+- Clear the route on each Slack binding it names, or delete the binding. The
+  v0.10.x API accepts only a body that clears both route fields, and it ignores
+  an `adapter` query parameter:
+
+  ```bash
+  curl -X PATCH "$CURIE_API_URL/agents/<agent id>/channels?kind=slack&address=<address>" \
+    -H "X-API-Key: $CURIE_API_KEY" -H 'Content-Type: application/json' \
+    -d '{"kind": "slack", "address": "<address>", "endpoint": null, "adapter": null}'
+  ```
+
+  The upgrade then binds it as the `default` identity. Bind a named identity
+  once the upgrade has finished; v0.10.x cannot store one.
+- Drop `endpoint` and `adapter` from each Slack notification in the agent's
+  approval routes.
+
+Then upgrade from v0.10.x with
+`curie cluster upgrade --to 0.11.0 --forward-only`, or set
+`api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the schema
+check refuses the upgrade before any mutation. As with any contract, a rollback
+below v0.11.0 is refused once the migration has run.
+
+During the roll, v0.10.x pods keep serving against the migrated schema. Their
+schema check treats a revision they do not know as a compatible expand and runs
+only when an API pod starts, and the worker has none, so nothing stops them.
+Three things they do fail against it:
+
+- A v0.10.x API pod answers a Slack binding write with a 500: creating an agent
+  with a Slack channel, adding or changing a Slack binding (`surfaces --add`, or
+  a deploy that binds a channel), or moving a binding to Slack. It writes a
+  Slack binding with no identity, which 0070's check refuses.
+- A v0.10.x API pod compares a publication replay's reply adapter as stored, so
+  a replay of a publication raised before the migration, which now names
+  `default`, is refused as a conflict.
+- A v0.10.x API pod refuses a publication create whose Slack reply names
+  `default` with no endpoint, with a 422 the worker reports as an approval
+  backend error. Every Slack turn carries that shape after the migration.
+
+The window runs from the `-schema-migrate` Job to the last v0.10.x API pod
+stopping. The chart's worker upgrade drain (`worker.upgradeDrain.enabled`, on by
+default) runs before the migration and pauses worker claims until the
+post-upgrade hook, which `helm upgrade --wait` runs only after the Deployments
+have rolled. So it keeps the publication failure out of the window, and it is
+also what keeps v0.10.x workers, which resolve a turn by `(kind, address)`
+alone, from choosing between two identities bound on one channel. It does not
+cover the window when the drain is disabled, when the roll outlasts
+`worker.upgradeDrain.quiesceTtlSeconds`, or on a `helm upgrade` without
+`--wait`; in those cases hold publications and second-identity binds until the
+worker and API Deployments have rolled. The drain pauses worker claims, not API
+writes, so hold binding changes until the API Deployment has rolled either way,
+and retry any write that failed during it.
+
+A local stack runs the same schema check in its one-shot `curie-migrate`
+service, which takes no forward-only flag, so `curie local up` on a volume that
+predates 0070 fails at that service. Run `curie local up --dry-run`, with the
+flags you normally pass, to print the exact compose command it would run.
+Run that command with its trailing `up -d --wait` replaced by
+`run --rm -e CURIE_SCHEMA_FORWARD_ONLY=true curie-migrate`, then run
+`curie local up` again. If the local data is disposable, `curie local down
+--wipe` followed by `curie local up` starts from an empty database, which
+applies every migration without the flag.
 
 ### Before you upgrade, check what would be removed
 
@@ -1160,11 +2021,20 @@ re-supplied or the upgrade rotates them out from under a running database.
 
 ```bash
 helm get values <release> -n <ns> -o yaml > values.yaml
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 ```
 
-`curie cluster up` and `curie apply` do this without asking the operator to
-choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
+Set `<minimum>` from the `curie.ai/minimum-helm-timeout-seconds` annotation on
+the chart's rendered pre-upgrade drain Job, using the same chart, values file,
+and overrides as the upgrade. That annotation accounts for the effective drain
+wait, the Job's 120 second allowance, the effective worker termination grace,
+and 60 seconds for scheduling and Helm operations. The default is 2940 seconds.
+Raising `worker.deliveryBudgetSeconds` raises the effective drain wait and
+termination grace automatically, so read the annotation for the customized
+values instead of reusing the default timeout.
+
+`curie cluster up` and `curie apply` preserve values without asking the operator
+to choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
 `config.schemaVersion` on the release, run pure migrations from supported
 v0.8.x user values onto the v0.9.0 schema (legacy extraEnv entries with a
 first-class successor, external Secret references), and overlay the result so
@@ -1198,7 +2068,7 @@ helm get values <release> -n <ns> -o yaml > values.yaml
 helm list -n <ns>                       # note the revision
 
 # 3. Upgrade
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 
 # 4. Import into RustFS
 IP=$(kubectl get svc -n <ns> <release>-rustfs -o jsonpath='{.spec.clusterIP}')
@@ -1264,6 +2134,155 @@ that the entry did not record which approval it belonged to cannot be paired
 with anything. If such an approval expires, its message keeps its buttons.
 Edit or delete that Slack message by hand, or ignore it -- the approval itself
 is expired in the API either way, so a click on it cannot approve anything.
+
+## When the schema upgrade refuses over an approval's reply identity
+
+Two revisions record where an approval's reply has to go back through:
+`0022` writes `approvals.reply_kind`, and `0024` writes the `reply_adapter`
+that names the egress identity authenticating it. Both establish that from the
+bindings the installation actually has, and both **refuse** rather than guess
+when a row's identity cannot be established. An upgrade that stops here fails
+the `-schema-migrate` Job with a message naming every offending approval id.
+
+Nothing is deleted and no approval is settled to clear it. Deleting the row
+destroys the audit history, and settling one does not help anyway: neither
+preflight reads `status`. The supported recovery is a round trip.
+
+### 1. Report
+
+**Read the failed Job's log.** The refusal is self-sufficient: it lists every
+approval the migration could not reconstruct, its `reply_channel`, its status
+and why it could not be reconstructed, and then prints a declaration document
+skeleton with one entry per row, ready to fill in.
+
+```sh
+kubectl -n curie logs job/curie-schema-migrate
+```
+
+That matters rather than being a convenience. `schema_compat.json` sets the
+minimum schema the API serves to its own head, so the API that answers the
+identity report **refuses to start against a pre-head schema** -- and a blocked
+installation is on one by definition. On an installation that is *not* blocked,
+the same facts come from the CLI:
+
+```sh
+curie --json cluster approvals <agent> --report-identity > identity-report.json
+```
+
+Two things about that command line are not optional. `cluster approvals` takes
+a **required positional agent**, so the command has to name one even though this
+report is installation-wide and ignores it -- pass any existing agent. And the
+report is a payload, so it needs the global **`--json`** flag: the default human
+output summarizes the facts and does not emit a document you can feed back.
+
+The CLI wraps the report under `identity_report`, which carries `approvals`
+(one facts entry per approval) and `declarations` (the skeleton, one entry per
+row, every field but the id left for you). Lift the skeleton into the document
+the migration consumes:
+
+```sh
+jq '{declarations: .identity_report.declarations}' identity-report.json > declarations.json
+```
+
+That is the same document the failed Job prints, in the same shape.
+
+### 2. Declare
+
+Fill the skeleton in by hand. It is a statement that a human knows what the
+approval was **raised** on -- not what its address happens to be bound to now,
+which is the thing the schema already cannot tell.
+
+```json
+{
+  "declarations": [
+    {
+      "approval_id": "0f2b1d6e-...",
+      "reply_kind": "email",
+      "reply_adapter": "smtp-primary",
+      "actor": "U0OPERATOR",
+      "reason": "raised on the smtp-primary egress, retired since"
+    }
+  ]
+}
+```
+
+Every field is required. `reply_adapter` may be `null`, and only `null`, for a
+Slack row, which legitimately has no adapter. A document that is unparseable,
+missing a field, or naming an approval the migration does not report is refused
+whole: none of its declarations are applied, and the refusal names the file and
+the offending entry. A declaration for a row the migration **can** reconstruct
+is also refused -- the migration's own answer wins, because overriding
+provenance the schema can still prove is a rewrite, not a recovery.
+
+### 3. Supply it to the upgrade
+
+The document is mounted from a Secret you create, never passed as a Helm value:
+`helm get values` would keep an inline declaration in the release forever and
+re-apply it to every later upgrade, whereas a Secret can be deleted afterwards,
+which makes the grant single-use.
+
+```sh
+kubectl -n curie create secret generic curie-approval-declarations \
+  --from-file=declarations.json=./declarations.json
+```
+
+Then set `api.migrate.provenanceDeclarationsSecret=curie-approval-declarations`
+and run the upgrade. The Job mounts it read-only and reads it through
+`CURIE_APPROVAL_PROVENANCE_DECLARATIONS`. Delete the Secret and unset the value
+once the upgrade succeeds; a document left mounted that names an
+already-migrated approval produces a loud refusal on the next upgrade rather
+than silently re-applying.
+
+### 4. Read the record back
+
+Each honored declaration appends exactly one `approval_audit_entries` row, so
+the bypass is attributed and reviewable rather than silent:
+
+```sql
+SELECT approval_id, actor, reason, evidence
+FROM curie.approval_audit_entries
+WHERE action = 'provenance_declaration_honored'
+ORDER BY created_at;
+```
+
+`evidence` carries the declared kind and adapter, the revision that honored it,
+and the reason the migration could not reconstruct the row on its own.
+
+### The fence, and why your API stays up
+
+Both revisions take `curie.agent_channels` and then `curie.approvals` in ACCESS
+EXCLUSIVE for the length of their own transaction, so the preflight, the
+backfill and the constraint tightening are one unit and a binding cannot be
+re-pointed in the middle of them. A concurrent approval insert or binding write
+**blocks and then succeeds**: an in-flight turn's approval request is queued,
+never refused.
+
+The mode is the strongest one each revision needs, taken up front on purpose.
+A weaker fence would let a reader through, but the revision's own `ADD COLUMN`
+needs ACCESS EXCLUSIVE anyway, so the fence would have to be upgraded mid
+transaction -- and an ordinary resolver that reads an approval and then writes
+its decision closes that cycle, which PostgreSQL breaks by aborting one side.
+Taking the strong lock first costs concurrent reads of these two tables a brief
+wait for the migration's duration, and buys back never killing a live
+resolution.
+
+The two tables are locked one after the other, `agent_channels` first, because
+that is the order every writer touching both uses: deleting an agent removes its
+bindings and then cascades into its approvals, and publication writes the
+binding before the approval. In that order a writer cannot deadlock against the
+fence. A reader can: the approval-recovery endpoint reads `approvals` and then
+`agent_channels`, the opposite order, and no single order suits both. When a
+read and the fence do cycle, PostgreSQL detects it after `deadlock_timeout`
+(1 s by default) and aborts one side. Both outcomes are safe. An aborted
+migration has changed nothing and the migrate Job retries it (`backoffLimit: 3`);
+an aborted recovery read changed nothing and is answered with HTTP 409 and a
+plain instruction to retry, rather than a 500.
+
+If the fence cannot be taken inside `CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS`
+(`api.migrate.fenceLockTimeoutMs`, default 15000) the migration refuses
+**before mutating anything**, names the session that held the table, and the
+database is exactly as it was. Stop that writer, or raise the bound, and
+re-run.
 
 ## Which claim env reaches which sandbox container
 

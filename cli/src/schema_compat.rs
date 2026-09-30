@@ -33,6 +33,12 @@ pub struct TargetMetadata {
     pub revisions: Vec<RevisionNode>,
 }
 
+#[derive(Debug, Clone)]
+pub enum RetainedManifestIdentity {
+    Published,
+    Candidate(TargetMetadata),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingStep {
     pub revision: String,
@@ -81,6 +87,76 @@ pub fn parse_target_metadata(rendered: &str) -> Result<TargetMetadata, String> {
         "target chart did not render schema compatibility metadata (BYO api.deploy=false or missing template)"
             .into()
     }))
+}
+
+/// Classify an installed Helm manifest for an application version whose
+/// released artifact shared its version with a historical candidate.
+///
+/// Only a ConfigMap carrying the schema compatibility component label can
+/// establish candidate identity. No labeled object means the published
+/// artifact. Any uncertainty in a labeled object is an error.
+pub fn classify_retained_manifest(
+    rendered: &str,
+    expected_application_version: &str,
+) -> Result<RetainedManifestIdentity, String> {
+    let expected = crate::schema_window::normalize_app_version(expected_application_version);
+    let mut candidate: Option<TargetMetadata> = None;
+
+    for document in serde_norway::Deserializer::from_str(rendered) {
+        let value = serde_json::Value::deserialize(document)
+            .map_err(|error| format!("retained Helm manifest is invalid YAML: {error}"))?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("ConfigMap") {
+            continue;
+        }
+        if value
+            .pointer("/metadata/labels/app.kubernetes.io~1component")
+            .and_then(serde_json::Value::as_str)
+            != Some("schema-compat")
+        {
+            continue;
+        }
+
+        let data = value
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                "labeled schema compatibility ConfigMap has no data object".to_string()
+            })?;
+        let declared = data
+            .get("application-version")
+            .and_then(serde_json::Value::as_str)
+            .map(crate::schema_window::normalize_app_version)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                "labeled schema compatibility ConfigMap has no application-version".to_string()
+            })?;
+        if declared != expected {
+            return Err(format!(
+                "labeled schema compatibility ConfigMap declares application version {declared}, expected {expected}"
+            ));
+        }
+        let payload = data.get("compatibility.json").ok_or_else(|| {
+            "labeled schema compatibility ConfigMap has no compatibility.json payload".to_string()
+        })?;
+        let metadata = parse_compatibility_payload(payload)?;
+
+        if let Some(first) = &candidate {
+            if first.schema_min != metadata.schema_min || first.schema_head != metadata.schema_head
+            {
+                return Err(
+                    "labeled schema compatibility ConfigMaps declare conflicting schema ranges"
+                        .to_string(),
+                );
+            }
+        } else {
+            candidate = Some(metadata);
+        }
+    }
+
+    Ok(match candidate {
+        Some(metadata) => RetainedManifestIdentity::Candidate(metadata),
+        None => RetainedManifestIdentity::Published,
+    })
 }
 
 fn metadata_from_value(value: &serde_json::Value) -> Option<Result<TargetMetadata, String>> {

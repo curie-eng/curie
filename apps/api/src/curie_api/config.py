@@ -11,13 +11,17 @@ production deployments.
 """
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
     RUNS_STREAM_DEFAULT,
     STREAM_ENV,
+    WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,6 +60,24 @@ class Settings(BaseSettings):
             "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval_chat_attester_secret"
         ),
     )
+    # Break-glass approval recovery (#2753). OFF by default, and it is NOT a
+    # credential: there is no second secret and no new auth scheme. Enabling it
+    # widens what the EXISTING platform key can do, deliberately and
+    # installation-wide -- any platform-key holder can then reject an approval,
+    # INCLUDING one the ordinary path could have resolved perfectly well. That
+    # blast radius is accepted rather than mitigated, because a recovery
+    # authority restricted to rows some predicate calls unrecoverable is useless
+    # in exactly the situation nobody foresaw.
+    # What makes the acceptance reviewable is that every use writes its audit
+    # row in the SAME transaction as its effect, so the trail cannot be missing
+    # for an effect that landed. Leave it false except during a recovery.
+    approval_recovery_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CURIE_APPROVAL_RECOVERY_ENABLED", "approval_recovery_enabled"
+        ),
+    )
+
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
     internal_worker_token: str = Field(
@@ -131,6 +153,39 @@ class Settings(BaseSettings):
     # form a complete bootable configuration.
     github_review_ingress_enabled: bool = False
     github_review_reconciler_interval_s: float = 5.0
+    # A review can arrive before the publication records the PR's GitHub
+    # identity (#2962). Such feedback is held and replayed for this long after
+    # the lineage was created, then rejected as lineage_absent_or_ambiguous.
+    github_review_identity_hold_s: float = 900.0
+    # Factory issue intake is separately gated from push and review handling.
+    # The label is the initial admission convention. The mention is the login
+    # an authorized human must name to request another bounded execution.
+    github_factory_ingress_enabled: bool = False
+    github_factory_label: str = ""
+    github_factory_mention: str = ""
+    # A failed label delivery is never redelivered by GitHub (#3081). The work
+    # item reconciler lists labeled open issues this often and admits any with
+    # no WorkItem once its label is older than the grace, so a delivery still
+    # in flight lands first. 0 disables the listing.
+    github_factory_reconcile_interval_s: float = 300.0
+    github_factory_reconcile_grace_s: float = 300.0
+    # Public origin GitHub's image proxy fetches the live status card from
+    # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
+    # status comment still carries the checklist and the result.
+    github_factory_card_base_url: str = ""
+    # How long a published factory run waits on its pull request's CI, from the
+    # push (#3162). The execution deadline still caps it; at most 10800 s, the
+    # longest execution deadline (ADR 0171).
+    github_factory_ci_wait_s: int = Field(
+        default=1200,
+        gt=0,
+        le=10800,
+        validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+    )
+    # Public model price list the factory's per-run cost estimate reads
+    # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
+    # the estimate unset and the token counts are still stored. Empty disables.
+    factory_price_source_url: str = "https://openrouter.ai/api/v1/models"
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -208,6 +263,10 @@ class Settings(BaseSettings):
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
     worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
+    # The Helm installation the worker's upgrade quiesce marker is scoped to
+    # (#2374, mirrored from WorkerConfig.installation_id). Blank is standalone
+    # or Compose, which use the legacy release-wide key.
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
@@ -298,6 +357,96 @@ class Settings(BaseSettings):
     resume_dead_letter_stream: str = ""
     resume_dead_letter_scan_limit: int = 1000
 
+    work_item_reconciler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_ENABLED",
+            "WORK_ITEM_RECONCILER_ENABLED",
+        ),
+    )
+    work_item_reconciler_interval_seconds: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+            "WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+        ),
+    )
+    work_item_batch_limit: int = Field(
+        default=50,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_WORK_ITEM_BATCH_LIMIT", "WORK_ITEM_BATCH_LIMIT"),
+    )
+    work_item_wait_budget_seconds: int = Field(
+        default=86400,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS",
+            "WORK_ITEM_WAIT_BUDGET_SECONDS",
+        ),
+    )
+    work_item_dispatch_lease_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS",
+            "WORK_ITEM_DISPATCH_LEASE_SECONDS",
+        ),
+    )
+    work_item_acquire_lease_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+            "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        ),
+    )
+    work_item_runtime_ttl_seconds: int = Field(
+        default=45,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS",
+            "WORK_ITEM_RUNTIME_TTL_SECONDS",
+        ),
+    )
+    work_item_cancel_settle_seconds: int = Field(
+        default=120,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS",
+            "WORK_ITEM_CANCEL_SETTLE_SECONDS",
+        ),
+    )
+    work_item_backoff_base_seconds: int = Field(
+        default=10,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS",
+            "WORK_ITEM_BACKOFF_BASE_SECONDS",
+        ),
+    )
+    work_item_backoff_max_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
+            "WORK_ITEM_BACKOFF_MAX_SECONDS",
+        ),
+    )
+    work_item_terminate_retry_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS",
+            "WORK_ITEM_TERMINATE_RETRY_SECONDS",
+        ),
+    )
+    runs_consumer_group: str = Field(
+        default=WORKER_GROUP_DEFAULT,
+        min_length=1,
+        validation_alias=AliasChoices("CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"),
+    )
+
     # The Slack bot token the API uses for its OWN user-group lookups (#420),
     # rather than trusting a caller's claim about who is in a group. The same
     # token the dispatcher and worker already hold; empty is the normal state
@@ -307,6 +456,14 @@ class Settings(BaseSettings):
     # boot gate deliberately -- Slack is optional, and that resolve-time denial
     # is the enforcement.
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1), which
+    # `identities.declared_identities` checks a binding against; see
+    # `aci_protocol.slack_identities.declared_slack_identity_names` for what
+    # an empty declaration means. Reads only the chart's reserved name, like
+    # the worker and dispatcher: no bare `slack_identities` kwarg alias, or a
+    # same-named stray env var would let this service alone admit names the
+    # other two never see.
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # How long a fetched user-group member set is reused (#420).
     # usergroups.users.list is a Slack Tier 2 method (~20 req/min), so a fetch
     # per click would let a busy approval channel hit the rate limit; 60s of
@@ -324,6 +481,16 @@ class Settings(BaseSettings):
     # namespace are both bounded. Sizes are the serialized-JSON byte length.
     state_max_value_bytes: int = 64 * 1024  # 64 KiB per value
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
+    # Conversation transcripts (ADR-0170, #3070) live in their own table, capped
+    # per thread with no agent-wide total, so many threads never share a budget.
+    # The runner bounds each turn to this cap less its append reserve and
+    # compacts the thread when an append is refused. The default holds a whole
+    # factory turn (several plan-review rounds with subagent reviewer output,
+    # #3301); 64 KiB did not. Chart value api.transcriptMaxThreadBytes. A thread
+    # with no WorkItem expires after this long without an append; a WorkItem
+    # thread is deleted at its terminal.
+    transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
+    transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size
@@ -409,6 +576,84 @@ class Settings(BaseSettings):
     hook_backlog_window_s: int = 60
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = 60
+    # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
+    # the quota object renders, and leaves all four unset otherwise. A partial
+    # set is a broken install: the agent write refuses rather than skipping the
+    # check. Unset means this API has no quota to compare against.
+    sandbox_quota_requests_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_CPU", "sandbox_quota_requests_cpu"
+        ),
+    )
+    sandbox_quota_requests_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY", "sandbox_quota_requests_memory"
+        ),
+    )
+    sandbox_quota_limits_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CURIE_SANDBOX_QUOTA_LIMITS_CPU", "sandbox_quota_limits_cpu"),
+    )
+    sandbox_quota_limits_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY", "sandbox_quota_limits_memory"
+        ),
+    )
+
+    # The caller proxy every hosted connector render carries (ADR-0168
+    # decision 7): the public key the worker's signing key pairs with, the one
+    # it replaced during a rotation, and the image the proxy runs from, with
+    # the worker's pull policy and comma-separated pull secret names. An empty
+    # current key renders no proxy.
+    connector_caller_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PUBLIC_KEY", "connector_caller_public_key"
+        ),
+    )
+    connector_caller_previous_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY", "connector_caller_previous_public_key"
+        ),
+    )
+    connector_proxy_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CONNECTOR_PROXY_IMAGE", "connector_proxy_image"),
+    )
+    connector_proxy_image_pull_policy: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY", "connector_proxy_image_pull_policy"
+        ),
+    )
+    connector_proxy_image_pull_secrets: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
+        ),
+    )
+
+    def connector_proxy(self) -> ConnectorProxy | None:
+        """The proxy each hosted connector renders with, or None for none."""
+
+        current = self.connector_caller_public_key.strip()
+        if not current:
+            return None
+        previous = self.connector_caller_previous_public_key.strip()
+        return ConnectorProxy(
+            image=self.connector_proxy_image.strip(),
+            public_keys=(current, previous) if previous else (current,),
+            pull_policy=self.connector_proxy_image_pull_policy.strip() or None,
+            pull_secrets=tuple(
+                name.strip()
+                for name in self.connector_proxy_image_pull_secrets.split(",")
+                if name.strip()
+            ),
+        )
 
     def valkey_dsn(self) -> str:
         if self.valkey_url:
@@ -418,6 +663,35 @@ class Settings(BaseSettings):
         # through from_url to the pool (#2315).
         scheme = "rediss" if self.valkey_tls else "redis"
         return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+
+    def upgrade_quiesce_key(self) -> str:
+        # Mirrors WorkerConfig.upgrade_quiesce_key (#2374, #3127): one
+        # authoritative "stop taking new work" marker per Helm installation,
+        # written by the worker with the same key_prefix and installation_id.
+        # A blank installation_id (standalone or Compose) keeps the legacy
+        # release-wide key.
+        legacy_key = f"{self.worker_key_prefix}:upgrade:quiesce"
+        if not self.installation_id:
+            return legacy_key
+        return f"{legacy_key}:{self.installation_id}"
+
+    @model_validator(mode="after")
+    def _validate_connector_proxy(self) -> "Settings":
+        # At boot, not at the first render: a key the proxy cannot use would
+        # otherwise surface as a 500 on every connector deploy.
+        if (
+            self.connector_caller_previous_public_key.strip()
+            and not self.connector_caller_public_key.strip()
+        ):
+            raise ValueError(
+                "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY is set without "
+                "CURIE_CONNECTOR_CALLER_PUBLIC_KEY"
+            )
+        try:
+            self.connector_proxy()
+        except ValueError as exc:
+            raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":
@@ -451,6 +725,70 @@ class Settings(BaseSettings):
                 "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_github_factory_ingress(self) -> "Settings":
+        if not self.github_factory_ingress_enabled:
+            return self
+        from .github_review_events import valid_github_login
+
+        offenders = []
+        if not self.github_app_id.strip():
+            offenders.append("GITHUB_APP_ID")
+        if not self.github_app_private_key.strip():
+            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if (
+            not self.github_webhook_secret.strip()
+            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        ):
+            offenders.append("GITHUB_WEBHOOK_SECRET")
+        label = self.github_factory_label
+        if (
+            not label
+            or label != label.strip()
+            or len(label) > 50
+            or any(character.isspace() for character in label)
+        ):
+            offenders.append("GITHUB_FACTORY_LABEL")
+        if not valid_github_login(self.github_factory_mention):
+            offenders.append("GITHUB_FACTORY_MENTION")
+        if not self.github_repo_allowlist:
+            offenders.append("GITHUB_REPO_ALLOWLIST")
+        if offenders:
+            raise ValueError(
+                "GitHub factory ingress (GITHUB_FACTORY_INGRESS_ENABLED) requires "
+                "complete active configuration; "
+                f"set valid values for: {', '.join(offenders)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_factory_card_base_url(self) -> "Settings":
+        """Empty, or an https origin (http localhost only in dev), no query or fragment."""
+        value = self.github_factory_card_base_url.strip()
+        if value.endswith("/"):
+            value = value[:-1]
+        if value:
+            parts = urlsplit(value)
+            local_dev = (
+                self.environment.strip().lower() == "dev"
+                and parts.scheme == "http"
+                and parts.hostname in ("localhost", "127.0.0.1")
+            )
+            if (
+                not (parts.scheme == "https" or local_dev)
+                or not parts.netloc
+                or parts.query
+                or parts.fragment
+                or "?" in value
+                or "#" in value
+            ):
+                raise ValueError(
+                    "GITHUB_FACTORY_CARD_BASE_URL must be empty or an https:// URL "
+                    "with no query or fragment"
+                )
+        self.github_factory_card_base_url = value
         return self
 
     @model_validator(mode="after")

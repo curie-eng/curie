@@ -6,15 +6,19 @@ resolvable by an operator principal. Omitting the route stays fail-closed.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any
 
 from curie_api import approval_principal
 from curie_api.config import get_settings
+from curie_worker.publication_store import PostgresPublicationStore
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from apps.api.tests.test_publications import (
+    CLUSTER_MESSAGE_ADAPTER,
     REPO,
     WORKER_HEADERS,
     _create_deployment,
@@ -275,3 +279,73 @@ def test_named_unbound_publication_route_refuses_operator_without_channel_member
     )
     assert audit.status_code == 200, audit.text
     assert audit.json()[-1]["authorizer"] == "UnboundRouteBinding"
+
+
+def test_operator_principal_resolves_a_cluster_message_publication_after_card_claim(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#2757: a cluster-message card is addressable, an operator principal on an
+    explicit ``approvers.users`` route can approve it, and the reconciler can
+    then claim the publication to proceed.
+    """
+
+    client, _ = publication_stack
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    deployment = _create_deployment_with_routes(
+        client, auth_headers, route=route, users=[SUBJECT]
+    )
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(deployment["id"], dedupe_key="event-cluster-message-operator")
+    payload.update(
+        route=route,
+        reply_placeholder=reply_ref,
+        reply_endpoint=None,
+        reply_adapter=CLUSTER_MESSAGE_ADAPTER,
+    )
+    _, publication = _create_publication(client, payload)
+
+    async def claim_and_ack() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="cluster-message-operator-claim"
+        )
+        try:
+            work = await store.claim_pending_card()
+            assert work is not None
+            await store.mark_card_delivered(work.publication_id)
+            return work
+        finally:
+            await engine.dispose()
+
+    card = asyncio.run(claim_and_ack())
+    assert str(card.publication_id) == publication["id"]
+    assert card.route.adapter == CLUSTER_MESSAGE_ADAPTER
+    assert card.target.reply_ref == reply_ref
+
+    resolved = _operator_resolve(client, publication["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+    stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["status"] == "approved"
+    audit = client.get(
+        f"/approvals/{publication['approval_id']}/audit", headers=auth_headers
+    )
+    assert audit.status_code == 200, audit.text
+    assert audit.json()[0]["principal_kind"] == "operator"
+    assert audit.json()[0]["actor"] == SUBJECT
+
+    async def claim_reconcile() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="cluster-message-operator-reconcile"
+        )
+        try:
+            return await store.claim_next()
+        finally:
+            await engine.dispose()
+
+    queued = asyncio.run(claim_reconcile())
+    assert queued is not None
+    assert str(queued.publication_id) == publication["id"]

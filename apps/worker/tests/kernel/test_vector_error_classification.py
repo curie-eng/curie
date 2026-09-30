@@ -24,9 +24,12 @@ _PLATFORM = (
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
+    "max-turns",
 )
 
 
@@ -93,3 +96,9 @@ def test_mapper_matches_every_classification_vector() -> None:
         assert got != "rate_limit"
         assert got != "error_during_execution"
         assert got != "server_error"
+
+
+def test_worker_local_timeout_uncertainty_is_not_error_event_vocabulary() -> None:
+    payload = _load_payload()
+    assert "runner-timeout-unconfirmed" not in payload["platform"]
+    assert map_error_classification("runner-timeout-unconfirmed") == "unclassified"

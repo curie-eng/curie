@@ -10,16 +10,20 @@ BaseSettings refactor.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import os
 import socket
 from pathlib import Path
 from types import ModuleType
+from typing import NamedTuple
 
 import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
+from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 
 
@@ -37,114 +41,383 @@ def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
         if isinstance(alias, str):
             keys = (alias,)
         elif isinstance(alias, AliasChoices):
-            keys = tuple(
-                choice for choice in alias.choices if isinstance(choice, str)
-            )
+            keys = tuple(choice for choice in alias.choices if isinstance(choice, str))
         else:
             keys = (name.upper(),)
         for key in keys:
             monkeypatch.delenv(key, raising=False)
 
 
-# Every env var the OLD hand-rolled ``WorkerConfig.from_env`` read (on
-# ``origin/main``), paired with a distinct sentinel and the value the field
-# should hold after coercion. This is the parity oracle: the names are the exact
-# old ones, so the override test proves no name drifted and no var was dropped.
-_WORKER_OVERRIDES: dict[str, tuple[str, str, object]] = {
-    # env var name -> (field name, raw env value, expected coerced value)
-    "VALKEY_HOST": ("valkey_host", "valkey.host.example", "valkey.host.example"),
-    "VALKEY_PORT": ("valkey_port", "6380", 6380),
-    "VALKEY_PASSWORD": ("valkey_password", "vk-pass", "vk-pass"),
-    "VALKEY_DB": ("valkey_db", "7", 7),
-    "SLACK_BOT_TOKEN": ("slack_bot_token", "xoxb-sentinel", "xoxb-sentinel"),
-    "SLACK_API_BASE_URL": (
-        "slack_api_base_url",
-        "http://slack.stub:9",
-        "http://slack.stub:9",
+class _Row(NamedTuple):
+    """One hand-written env contract row for a ``WorkerConfig`` field."""
+
+    field: str
+    env: str  # the env var the field must read (its alias, or its bare name)
+    raw: str  # sentinel set under ``env``
+    expected: object  # value after coercion
+    default: object  # clean-env default (``_NO_STATIC_DEFAULT`` for factories)
+    bare: str | None = None  # a stray bare-name env var that must be IGNORED
+    bare_raw: str | None = None  # decoy set under ``bare``
+
+
+_NO_STATIC_DEFAULT = object()  # factory default; asserted separately below
+
+# The env contract, written out by hand. NEVER derive this list or its
+# expectations from ``WorkerConfig.model_fields``: the point is an independent
+# oracle, so a drifted name, alias, coercion or default fails here.
+#
+# The first block is every env var the OLD hand-rolled ``WorkerConfig.from_env``
+# read (on ``origin/main``), under its exact old name: the parity oracle proving
+# no name drifted and no var was dropped in the BaseSettings port. The later
+# blocks are knobs added after the port, each reading only its ``CURIE_*`` alias.
+#
+# The alias-read test sets EVERY row's env var AND every bare decoy at once, so
+# the raw values must be jointly valid under the cross-field validators, and each
+# row also proves its alias wins over its bare name.
+_ENV_TABLE: list[_Row] = [
+    # --- parity oracle vs the old from_env (review #178) ---
+    _Row("valkey_host", "VALKEY_HOST", "valkey.host.example", "valkey.host.example", "localhost"),
+    _Row("valkey_port", "VALKEY_PORT", "6380", 6380, 6379),
+    _Row("valkey_password", "VALKEY_PASSWORD", "vk-pass", "vk-pass", ""),
+    _Row("valkey_db", "VALKEY_DB", "7", 7, 0),
+    _Row("slack_bot_token", "SLACK_BOT_TOKEN", "xoxb-sentinel", "xoxb-sentinel", ""),
+    _Row(
+        "slack_api_base_url", "SLACK_API_BASE_URL", "http://slack.stub:9", "http://slack.stub:9", ""
     ),
-    "DATABASE_URL": (
+    _Row(
         "database_url",
+        "DATABASE_URL",
         "postgresql+asyncpg://u:p@db:5432/x",
         "postgresql+asyncpg://u:p@db:5432/x",
+        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
     ),
-    "DB_SCHEMA": ("db_schema", "myschema", "myschema"),
-    "CURIE_PLUGIN_DIR": ("bundle_plugin_dir", "/custom/bundles", "/custom/bundles"),
-    "CURIE_FAKE_MODEL": ("fake_model", "true", True),
-    # Deliberately the NON-default value: shimmer now defaults to True, so a
-    # truthy-token case would pass even if the alias were never read at all.
-    "CURIE_SHIMMER": ("shimmer", "no", False),
-    "CURIE_CREDENTIALS": ("credentials", "cred-sentinel", "cred-sentinel"),
-    "CURIE_MODEL_BASE_URL": (
-        "model_base_url",
-        "http://model.local:1",
-        "http://model.local:1",
+    _Row("db_schema", "DB_SCHEMA", "myschema", "myschema", "curie"),
+    _Row(
+        "bundle_plugin_dir",
+        "CURIE_PLUGIN_DIR",
+        "/custom/bundles",
+        "/custom/bundles",
+        "/bundles/current",
     ),
-    "CURIE_MODEL": ("model", "claude-sentinel", "claude-sentinel"),
-    "CURIE_EVAL_STREAM": ("eval_stream", "sentinel:evals", "sentinel:evals"),
-    "CURIE_EVAL_CONSUMER_GROUP": (
+    _Row("fake_model", "CURIE_FAKE_MODEL", "true", True, False),
+    # Deliberately the NON-default value: shimmer defaults to True, so a truthy
+    # token would pass even if the alias were never read at all. The True
+    # default exists so a reasoning model's pre-token silence is not
+    # indistinguishable from a wedge (#1182); it must agree with the
+    # dispatcher's default, since one env name drives both services.
+    _Row("shimmer", "CURIE_SHIMMER", "no", False, True),
+    _Row(
+        "credentials",
+        "CURIE_CREDENTIALS",
+        "cred-sentinel",
+        "cred-sentinel",
+        "",
+        bare="CREDENTIALS",
+        bare_raw="stray-creds",
+    ),
+    _Row(
+        "model_base_url", "CURIE_MODEL_BASE_URL", "http://model.local:1", "http://model.local:1", ""
+    ),
+    _Row("model", "CURIE_MODEL", "claude-sentinel", "claude-sentinel", ""),
+    _Row("eval_stream", "CURIE_EVAL_STREAM", "sentinel:evals", "sentinel:evals", "curie:evals"),
+    _Row(
         "eval_consumer_group",
+        "CURIE_EVAL_CONSUMER_GROUP",
         "sentinel-eval-workers",
         "sentinel-eval-workers",
+        "curie-eval-workers",
     ),
-    "S3_ENDPOINT_URL": ("s3_endpoint_url", "http://s3.local:2", "http://s3.local:2"),
-    "S3_ACCESS_KEY": ("s3_access_key", "ak-sentinel", "ak-sentinel"),
-    "S3_SECRET_KEY": ("s3_secret_key", "sk-sentinel", "sk-sentinel"),
-    "S3_REGION": ("s3_region", "eu-west-9", "eu-west-9"),
-    "BUNDLE_BUCKET": ("bundle_bucket", "sentinel-bundles", "sentinel-bundles"),
-    "CURIE_API_URL": (
+    _Row(
+        "s3_endpoint_url",
+        "S3_ENDPOINT_URL",
+        "http://s3.local:2",
+        "http://s3.local:2",
+        "http://localhost:29000",
+    ),
+    # S3 keys are empty by default (#1559): a baked-in dev key is still an
+    # explicit credential to boto3, so it shadows the ambient cloud identity
+    # (IRSA, instance role) the key-free BYO object-store path relies on. Do not
+    # restore the RustFS dev pair; compose supplies it via env, and these rows'
+    # sentinels stay the guard that an operator value still wins.
+    _Row("s3_access_key", "S3_ACCESS_KEY", "ak-sentinel", "ak-sentinel", ""),
+    _Row("s3_secret_key", "S3_SECRET_KEY", "sk-sentinel", "sk-sentinel", ""),
+    _Row("s3_region", "S3_REGION", "eu-west-9", "eu-west-9", "us-east-1"),
+    _Row("bundle_bucket", "BUNDLE_BUCKET", "sentinel-bundles", "sentinel-bundles", "curie-bundles"),
+    _Row(
         "api_base_url",
+        "CURIE_API_URL",
         "http://api.local:3",
         "http://api.local:3",
+        "http://localhost:8000",
     ),
-    "CURIE_API_KEY": ("api_key", "key-sentinel", "key-sentinel"),
-    "LANGFUSE_HOST": ("langfuse_host", "http://lf.local:4", "http://lf.local:4"),
-    "LANGFUSE_PUBLIC_KEY": ("langfuse_public_key", "pk-sentinel", "pk-sentinel"),
-    "LANGFUSE_SECRET_KEY": ("langfuse_secret_key", "sk-lf-sentinel", "sk-lf-sentinel"),
-    "CURIE_STREAM": ("stream", "sentinel:runs", "sentinel:runs"),
-    "CURIE_CONSUMER_GROUP": (
+    _Row(
+        "api_key",
+        "CURIE_API_KEY",
+        "key-sentinel",
+        "key-sentinel",
+        "curie-dev-key",
+        bare="API_KEY",
+        bare_raw="stray",
+    ),
+    _Row(
+        "langfuse_host",
+        "LANGFUSE_HOST",
+        "http://lf.local:4",
+        "http://lf.local:4",
+        "http://localhost:23000",
+    ),
+    _Row(
+        "langfuse_public_key",
+        "LANGFUSE_PUBLIC_KEY",
+        "pk-sentinel",
+        "pk-sentinel",
+        "pk-lf-curie-dev",
+    ),
+    _Row(
+        "langfuse_secret_key",
+        "LANGFUSE_SECRET_KEY",
+        "sk-lf-sentinel",
+        "sk-lf-sentinel",
+        "sk-lf-curie-dev",
+    ),
+    _Row("stream", "CURIE_STREAM", "sentinel:runs", "sentinel:runs", "curie:runs"),
+    _Row(
         "consumer_group",
+        "CURIE_CONSUMER_GROUP",
         "sentinel-workers",
         "sentinel-workers",
+        "curie-workers",
     ),
-    "CURIE_CONSUMER_NAME": (
+    _Row(
         "consumer_name",
+        "CURIE_CONSUMER_NAME",
         "sentinel-consumer",
         "sentinel-consumer",
+        _NO_STATIC_DEFAULT,
     ),
-    "CURIE_MAX_ATTEMPTS": ("max_attempts", "9", 9),
-}
+    _Row("max_attempts", "CURIE_MAX_ATTEMPTS", "9", 9, 3),
+    # --- operator-scoped model wire declaration (#514) ---
+    # Mirror model_base_url. Undeclared ("") is the default, so the producer
+    # emits nothing and the runner keeps its own pre-#514 defaults.
+    _Row(
+        "model_api_backend",
+        "CURIE_MODEL_API_BACKEND",
+        "messages",
+        "messages",
+        "",
+        bare="MODEL_API_BACKEND",
+        bare_raw="chat_completions",
+    ),
+    _Row(
+        "model_env_key",
+        "CURIE_MODEL_ENV_KEY",
+        '["ANTHROPIC_AUTH_TOKEN"]',
+        '["ANTHROPIC_AUTH_TOKEN"]',
+        "",
+        bare="MODEL_ENV_KEY",
+        bare_raw="STRAY_NAME",
+    ),
+    # --- runner-facing API base (#678) ---
+    # Distinct from api_base_url (the worker's self-dial URL). Undivided ("") is
+    # the default: the runner reaches the API at the worker's own URL (k8s
+    # in-cluster, single-host local).
+    _Row(
+        "runner_api_base_url",
+        "CURIE_RUNNER_API_URL",
+        "http://curie-api:8000",
+        "http://curie-api:8000",
+        "",
+        bare="RUNNER_API_BASE_URL",
+        bare_raw="http://stray:9000",
+    ),
+    # --- eval claim-creation concurrency bound (#709) ---
+    # Single-node-safe by default: claims are created one at a time.
+    _Row(
+        "eval_max_concurrent_claims",
+        "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
+        "4",
+        4,
+        1,
+        bare="EVAL_MAX_CONCURRENT_CLAIMS",
+        bare_raw="7",
+    ),
+    # --- delivery budget and ownership lease (ADR-0131, #1971) ---
+    # ADR-0131's stated initial defaults: drifting one silently changes the
+    # fence's timing on every deployment that does not override it. The chart
+    # templates these as first-class env, so a name drift means an operator's
+    # --set silently does nothing; a stray bare name must not leak into the
+    # fence's timing either. Raw values are jointly valid (90 >= 3 * 20,
+    # 10 < 90, 1860 >= 1800 + 45).
+    _Row(
+        "delivery_budget_s",
+        "CURIE_DELIVERY_BUDGET_S",
+        "1800",
+        1800.0,
+        600.0,
+        bare="DELIVERY_BUDGET_S",
+        bare_raw="1800",
+    ),
+    _Row(
+        "delivery_lease_ttl_s",
+        "CURIE_DELIVERY_LEASE_TTL_S",
+        "90",
+        90.0,
+        45.0,
+        bare="DELIVERY_LEASE_TTL_S",
+        bare_raw="1",
+    ),
+    _Row(
+        "delivery_lease_heartbeat_s",
+        "CURIE_DELIVERY_LEASE_HEARTBEAT_S",
+        "20",
+        20.0,
+        10.0,
+        bare="DELIVERY_LEASE_HEARTBEAT_S",
+        bare_raw="1",
+    ),
+    _Row(
+        "delivery_shutdown_reserve_s",
+        "CURIE_DELIVERY_SHUTDOWN_RESERVE_S",
+        "45",
+        45.0,
+        60.0,
+        bare="DELIVERY_SHUTDOWN_RESERVE_S",
+        bare_raw="0",
+    ),
+    # None means "no platform grace declared" (compose, tests) and SKIPS the
+    # grace validator rather than guessing a value for it.
+    _Row(
+        "termination_grace_period_s",
+        "CURIE_TERMINATION_GRACE_PERIOD_S",
+        "1860",
+        1860.0,
+        None,
+        bare="TERMINATION_GRACE_PERIOD_S",
+        bare_raw="5",
+    ),
+    # Bound by a validator: the default 30 < 45 satisfies the ADR's "the reclaim
+    # interval is shorter than the lease".
+    _Row("reclaim_interval_s", "CURIE_RECLAIM_INTERVAL_S", "10", 10.0, 30.0),
+    _Row("work_item_max_turns", "CURIE_WORK_ITEM_MAX_TURNS", "5", 5, 1000),
+    # The install's receipt mode (ADR-0180). The sentinel is a NON-default mode
+    # so a field that never read its alias cannot pass, and the bare decoy is a
+    # third mode so ``populate_by_name`` cannot satisfy the read either.
+    _Row(
+        "turn_receipt",
+        "CURIE_TURN_RECEIPT",
+        "failures",
+        "failures",
+        "all",
+        bare="TURN_RECEIPT",
+        bare_raw="off",
+    ),
+    # --- inbound attachment lane envelope (#2567, S4) ---
+    # Defaults are asserted AGAINST ``AttachmentLimits`` rather than literals:
+    # two independently written copies of "32 MiB" is exactly how a chart
+    # override silently stops matching the code it configures. Bare decoys stop
+    # ``populate_by_name`` from satisfying the reads. The off switch reads the
+    # same way: a drift there is an operator who sets the chart value and still
+    # gets a worker that downloads and parks every upload.
+    _Row(
+        "attachment_enabled",
+        "CURIE_ATTACHMENT_ENABLED",
+        "true",
+        True,
+        False,
+        bare="ATTACHMENT_ENABLED",
+        bare_raw="false",
+    ),
+    _Row(
+        "attachment_max_file_bytes",
+        "CURIE_ATTACHMENT_MAX_FILE_BYTES",
+        "8388608",
+        8388608,
+        AttachmentLimits().max_file_bytes,
+        bare="ATTACHMENT_MAX_FILE_BYTES",
+        bare_raw="999999",
+    ),
+    _Row(
+        "attachment_reference_ttl_seconds",
+        "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
+        "120",
+        120,
+        AttachmentLimits().reference_ttl_seconds,
+        bare="ATTACHMENT_REFERENCE_TTL_SECONDS",
+        bare_raw="999999",
+    ),
+    _Row(
+        "attachment_retention_ttl_seconds",
+        "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        "900",
+        900,
+        AttachmentLimits().retention_ttl_seconds,
+        bare="ATTACHMENT_RETENTION_TTL_SECONDS",
+        bare_raw="999999",
+    ),
+]
 
 
-def test_aliased_field_ignores_bare_field_name_env(
-    monkeypatch: pytest.MonkeyPatch,
+def _row_param(row: _Row) -> object:
+    return pytest.param(row, id=row.field)
+
+
+def test_env_table_has_one_row_per_field_and_unique_env_names() -> None:
+    """Sanity of the table itself: one row per field, and no env name reused."""
+    fields = [row.field for row in _ENV_TABLE]
+    envs = [row.env for row in _ENV_TABLE] + [r.bare for r in _ENV_TABLE if r.bare]
+    assert len(fields) == len(set(fields))
+    assert len(envs) == len(set(envs))
+
+
+@pytest.mark.parametrize("row", [_row_param(r) for r in _ENV_TABLE])
+def test_field_reads_its_env_var_over_any_bare_name(
+    monkeypatch: pytest.MonkeyPatch, row: _Row
 ) -> None:
-    """A stray bare-name env var must not leak into an aliased field."""
-    monkeypatch.setenv("API_KEY", "stray")
-    monkeypatch.setenv("CREDENTIALS", "stray-creds")
+    """Every row's env var set to its sentinel under its EXACT name is read into
+    the right field with the right coercion, and wins over a bare-name decoy.
 
-    config = WorkerConfig()
+    All rows' env vars and decoys are set together, as a real pod env would be.
+    """
+    _clear_all_config_env(monkeypatch)
+    for other in _ENV_TABLE:
+        monkeypatch.setenv(other.env, other.raw)
+        if other.bare is not None:
+            assert other.bare_raw is not None
+            monkeypatch.setenv(other.bare, other.bare_raw)
 
-    assert config.api_key == "curie-dev-key"  # the default, not "stray"
-    assert config.credentials == ""  # the default, not "stray-creds"
+    actual = getattr(WorkerConfig(), row.field)
 
-
-def test_aliased_field_reads_its_alias(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The intended CURIE_* alias is still read from the env."""
-    monkeypatch.setenv("CURIE_API_KEY", "intended")
-    monkeypatch.setenv("CURIE_CREDENTIALS", "intended-creds")
-
-    config = WorkerConfig()
-
-    assert config.api_key == "intended"
-    assert config.credentials == "intended-creds"
+    assert actual == row.expected, f"{row.env} -> {row.field}: {actual!r}"
+    # Coercion parity: ints/bools/floats must be the coerced type, not a raw str.
+    assert type(actual) is type(row.expected)
 
 
-def test_alias_wins_over_bare_field_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With both set, only the alias is read and the bare name is ignored."""
-    monkeypatch.setenv("API_KEY", "stray")
-    monkeypatch.setenv("CURIE_API_KEY", "intended")
+@pytest.mark.parametrize(
+    "row", [_row_param(r) for r in _ENV_TABLE if r.default is not _NO_STATIC_DEFAULT]
+)
+def test_field_default_in_a_clean_env(monkeypatch: pytest.MonkeyPatch, row: _Row) -> None:
+    """Config drift on a default is a silent prod break, so each is locked."""
+    _clear_all_config_env(monkeypatch)
 
-    assert WorkerConfig().api_key == "intended"
+    actual = getattr(WorkerConfig(), row.field)
+
+    assert actual == row.default
+    assert type(actual) is type(row.default)
+
+
+@pytest.mark.parametrize("row", [_row_param(r) for r in _ENV_TABLE if r.bare])
+def test_aliased_field_ignores_its_bare_field_name_env(
+    monkeypatch: pytest.MonkeyPatch, row: _Row
+) -> None:
+    """``populate_by_name`` must not make the env source fall back to the bare
+    uppercased field name: a stray generic env var in the pod env stays out."""
+    _clear_all_config_env(monkeypatch)
+    for other in _ENV_TABLE:
+        if other.bare is not None:
+            assert other.bare_raw is not None
+            monkeypatch.setenv(other.bare, other.bare_raw)
+
+    assert getattr(WorkerConfig(), row.field) == row.default
 
 
 def test_api_url_accepts_the_deprecated_base_url_alias(
@@ -169,30 +442,13 @@ def test_field_name_kwargs_still_populate() -> None:
     assert config.credentials == "c"
 
 
-def test_non_aliased_field_still_reads_plain_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fields without an alias keep reading their uppercased field name."""
-    monkeypatch.setenv("VALKEY_HOST", "valkey.internal")
-    monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+asyncpg://u:p@db:5432/curie"
-    )
-
-    config = WorkerConfig()
-
-    assert config.valkey_host == "valkey.internal"
-    assert config.database_url == "postgresql+asyncpg://u:p@db:5432/curie"
-
-
 # --- Env-var parity vs the pre-pydantic from_env (review #178) ---------------
 
 
 def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clean env: every field must equal the exact default the old from_env produced.
-
-    Comprehensive check -- every field is enumerated. Config drift on a default
-    is a silent prod break, so this locks each default to the value the
-    hand-rolled ``WorkerConfig.from_env`` (on ``origin/main``) resolved to.
+    """Clean env: fields with no _ENV_TABLE row must equal the exact default the
+    old from_env produced. Together with ``test_field_default_in_a_clean_env``
+    every field the old from_env set is locked to its old default.
     """
     _clear_all_config_env(monkeypatch)
 
@@ -206,6 +462,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Slack
     assert config.slack_bot_token == ""
     assert config.slack_api_base_url == ""
+    assert config.slack_identities == ()
     # Postgres
     assert (
         config.database_url
@@ -213,21 +470,8 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert config.db_schema == "curie"
     # Deployment-to-runtime binding
-    assert config.bundle_plugin_dir == "/bundles/current"
     assert config.default_max_usd_per_day == 10.0
     assert config.default_max_output_tokens_per_run == 100000
-    # Runner model + credentials
-    assert config.fake_model is False
-    assert config.credentials == ""
-    assert config.model_base_url == ""
-    assert config.model == ""
-    # Shimmer: on by default so a reasoning model's pre-token silence is not
-    # indistinguishable from a wedge (#1182). Must agree with the dispatcher's
-    # default -- one env name drives both services.
-    assert config.shimmer is True
-    # Stream / consumer group
-    assert config.stream == "curie:runs"
-    assert config.consumer_group == "curie-workers"
     # Read loop
     assert config.read_count == 16
     assert config.read_block_ms == 5000
@@ -236,14 +480,12 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.lock_acquire_timeout_s == 45.0
     assert config.lock_poll_interval_s == 0.02
     # Retry
-    assert config.max_attempts == 3
     assert config.retry_backoff_base_s == 1.0
     assert config.retry_backoff_max_s == 20.0
     # Markers
     assert config.idempotency_ttl_s == 86400
     # Crash recovery
     assert config.reclaim_min_idle_ms == 900000
-    assert config.reclaim_interval_s == 30.0
     assert config.dead_consumer_idle_ms == 15000
     assert config.consumer_heartbeat_ttl_ms == 15000
     assert config.consumer_capability_ttl_ms == 1800000
@@ -252,29 +494,9 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Runner HTTP timeouts
     assert config.runner_connect_timeout_s == 10.0
     assert config.runner_total_timeout_s == 600.0
-    # Eval stream
-    assert config.eval_stream == "curie:evals"
-    assert config.eval_consumer_group == "curie-eval-workers"
-    # RustFS / S3
-    assert config.s3_endpoint_url == "http://localhost:29000"
-    # Empty by default (#1559): a baked-in dev key is still an explicit credential
-    # to boto3, so it shadows the ambient cloud identity (IRSA, instance role) the
-    # key-free BYO object-store path relies on. Do not restore the RustFS dev pair
-    # here; compose supplies it via env, and the S3_ACCESS_KEY/S3_SECRET_KEY
-    # override entries above stay the guard that an operator value still wins.
-    assert config.s3_access_key == ""
-    assert config.s3_secret_key == ""
-    assert config.s3_region == "us-east-1"
-    assert config.bundle_bucket == "curie-bundles"
     # Platform API
-    assert config.api_base_url == "http://localhost:8000"
-    assert config.api_key == "curie-dev-key"
     assert config.report_max_attempts == 3
     assert config.report_backoff_base_s == 0.5
-    # Langfuse
-    assert config.langfuse_host == "http://localhost:23000"
-    assert config.langfuse_public_key == "pk-lf-curie-dev"
-    assert config.langfuse_secret_key == "sk-lf-curie-dev"
     # Key prefix
     assert config.key_prefix == "curie:worker"
 
@@ -323,75 +545,9 @@ def test_consumer_liveness_ttls_read_only_their_curie_aliases(
     assert config.consumer_capability_ttl_ms == 5001
 
 
-def test_overrides_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every env var the old from_env read, set to a sentinel under its EXACT old
-    name, must be read into the right field with the right coercion.
-
-    Proves no env-var name drifted in the BaseSettings port and no read was
-    dropped.
-    """
-    _clear_all_config_env(monkeypatch)
-    for env_var, (_field, raw, _expected) in _WORKER_OVERRIDES.items():
-        monkeypatch.setenv(env_var, raw)
-
-    config = WorkerConfig()
-
-    for env_var, (field, _raw, expected) in _WORKER_OVERRIDES.items():
-        actual = getattr(config, field)
-        assert actual == expected, f"{env_var} -> {field}: {actual!r} != {expected!r}"
-        # Coercion parity: ints/bools must be the coerced type, not a raw str.
-        assert type(actual) is type(expected), (
-            f"{env_var} -> {field}: type {type(actual)} != {type(expected)}"
-        )
-
-
 # --- Operator-scoped model wire declaration (#514) ---------------------------
 #
-# Two new fields mirroring model_base_url: they read only their CURIE_* alias
-# and default to "" (not declared). They are deliberately absent from the
-# _WORKER_OVERRIDES parity oracle above -- that dict pins the vars the old
-# hand-rolled from_env read, and these are new, not a port of anything.
-
-
-def test_model_api_backend_and_env_key_default_to_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Undeclared is the default, so the producer emits nothing and the runner
-    keeps its own pre-#514 defaults."""
-    _clear_all_config_env(monkeypatch)
-
-    config = WorkerConfig()
-
-    assert config.model_api_backend == ""
-    assert config.model_env_key == ""
-
-
-def test_worker_config_reads_model_api_backend_and_env_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_MODEL_API_BACKEND", "messages")
-    monkeypatch.setenv("CURIE_MODEL_ENV_KEY", '["ANTHROPIC_AUTH_TOKEN"]')
-
-    config = WorkerConfig()
-
-    assert config.model_api_backend == "messages"
-    assert config.model_env_key == '["ANTHROPIC_AUTH_TOKEN"]'
-
-
-def test_model_api_backend_and_env_key_ignore_bare_field_name_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Aliased like every other CURIE_* knob: a stray bare-name env var in the
-    pod env must not leak in."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("MODEL_API_BACKEND", "chat_completions")
-    monkeypatch.setenv("MODEL_ENV_KEY", "STRAY_NAME")
-
-    config = WorkerConfig()
-
-    assert config.model_api_backend == ""
-    assert config.model_env_key == ""
+# Default, alias and bare-name coverage lives in the _ENV_TABLE rows.
 
 
 def test_model_api_backend_and_env_key_populate_by_field_name() -> None:
@@ -404,46 +560,8 @@ def test_model_api_backend_and_env_key_populate_by_field_name() -> None:
 
 # --- Runner-facing API base (#678) -------------------------------------------
 #
-# A field distinct from api_base_url (the worker's self-dial URL): the API base a
-# SPAWNED RUNNER dials. Defaults to "" (undivided) and reads only its CURIE_*
-# alias. Kept out of the _WORKER_OVERRIDES parity oracle -- like the #514 fields,
-# it is new, not a port of the old hand-rolled from_env.
-
-
-def test_runner_api_base_url_defaults_to_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Undivided is the default: the runner reaches the API at the worker's own
-    self-dial URL (k8s in-cluster, single-host local)."""
-    _clear_all_config_env(monkeypatch)
-
-    config = WorkerConfig()
-
-    assert config.runner_api_base_url == ""
-
-
-def test_worker_config_reads_runner_api_base_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_RUNNER_API_URL", "http://curie-api:8000")
-
-    config = WorkerConfig()
-
-    assert config.runner_api_base_url == "http://curie-api:8000"
-
-
-def test_runner_api_base_url_ignores_bare_field_name_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Aliased like every other CURIE_* knob: a stray bare-name env var in the
-    pod env must not leak in."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("RUNNER_API_BASE_URL", "http://stray:9000")
-
-    config = WorkerConfig()
-
-    assert config.runner_api_base_url == ""
+# The API base a SPAWNED RUNNER dials, distinct from api_base_url (the worker's
+# self-dial URL). Default, alias and bare-name coverage lives in _ENV_TABLE.
 
 
 def test_runner_facing_api_base_url_falls_back_to_self_dial(
@@ -498,9 +616,7 @@ def test_curie_dead_letter_stream_reaches_the_dead_letter_field(
 
 
 @pytest.mark.parametrize("token", ["1", "true", "yes", "TRUE", "Yes", " yes "])
-def test_bool_shared_truthy_tokens(
-    monkeypatch: pytest.MonkeyPatch, token: str
-) -> None:
+def test_bool_shared_truthy_tokens(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
     """The worker truthy tokens parse to True regardless of case or surrounding space."""
     _clear_all_config_env(monkeypatch)
     monkeypatch.setenv("CURIE_SHIMMER", token)
@@ -530,44 +646,8 @@ def test_bool_worker_rejects_on_and_falsy_tokens(
 # --- Eval claim-creation concurrency bound (#709) ----------------------------
 #
 # A ceiling on eval SandboxClaims created/bound concurrently, so a single-node
-# cluster is not flooded. Defaults to 1 (sequential-with-backpressure) and reads
-# only its CURIE_* alias; kept out of the _WORKER_OVERRIDES parity oracle since
-# it is new, not a port of the old hand-rolled from_env.
-
-
-def test_eval_max_concurrent_claims_defaults_to_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Single-node-safe by default: claims are created one at a time."""
-    _clear_all_config_env(monkeypatch)
-
-    config = WorkerConfig()
-
-    assert config.eval_max_concurrent_claims == 1
-
-
-def test_worker_config_reads_eval_max_concurrent_claims(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_EVAL_MAX_CONCURRENT_CLAIMS", "4")
-
-    config = WorkerConfig()
-
-    assert config.eval_max_concurrent_claims == 4
-
-
-def test_eval_max_concurrent_claims_ignores_bare_field_name_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Aliased like every other CURIE_* knob: a stray bare-name env var must not
-    leak in."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("EVAL_MAX_CONCURRENT_CLAIMS", "7")
-
-    config = WorkerConfig()
-
-    assert config.eval_max_concurrent_claims == 1
+# cluster is not flooded. Default, alias and bare-name coverage lives in
+# _ENV_TABLE.
 
 
 def test_eval_max_concurrent_claims_rejects_zero(
@@ -595,72 +675,49 @@ def test_eval_max_concurrent_claims_rejects_zero(
 # construction bypasses the env source entirely and passed all along.
 
 
-def test_trusted_origins_parsed_from_a_bare_comma_list_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The compose.dev.yaml value: a comma list, not JSON."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv(
-        "CURIE_SLACK_TRUSTED_ORIGINS",
-        "http://localhost,http://127.0.0.1,http://host.docker.internal",
-    )
-
-    config = WorkerConfig()
-
-    assert config.slack_trusted_origins == (
-        "http://localhost",
-        "http://127.0.0.1",
-        "http://host.docker.internal",
-    )
-
-
-def test_trusted_origins_tolerates_whitespace_around_entries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv(
-        "CURIE_SLACK_TRUSTED_ORIGINS", " http://localhost:8080 , , http://a.b "
-    )
-
-    config = WorkerConfig()
-
-    assert config.slack_trusted_origins == ("http://localhost:8080", "http://a.b")
-
-
-def test_trusted_origins_empty_env_is_the_closed_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Blank means "no extra trusted origins" -- fail closed, never a boot crash."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_SLACK_TRUSTED_ORIGINS", "")
-
-    config = WorkerConfig()
-
-    assert config.slack_trusted_origins == ()
-
-
-def test_adapter_credentials_empty_env_is_an_empty_map(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same defect class: a blank ``CURIE_ADAPTER_CREDENTIALS`` is "none
-    configured" (every non-Slack egress then fails closed), not a boot crash."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", "")
-
-    config = WorkerConfig()
-
-    assert config.adapter_credentials == {}
-
-
-def test_adapter_credentials_still_parsed_from_json_env(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The compose.dev.yaml value: a comma list, not JSON.
+        pytest.param(
+            "http://localhost,http://127.0.0.1,http://host.docker.internal",
+            ("http://localhost", "http://127.0.0.1", "http://host.docker.internal"),
+            id="bare-comma-list",
+        ),
+        pytest.param(
+            " http://localhost:8080 , , http://a.b ",
+            ("http://localhost:8080", "http://a.b"),
+            id="whitespace-around-entries",
+        ),
+        # Blank means "no extra trusted origins": fail closed, never a boot crash.
+        pytest.param("", (), id="empty-is-the-closed-default"),
+    ],
+)
+def test_trusted_origins_parsed_from_raw_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: tuple[str, ...]
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", '{"acme": "s3cret"}')
+    monkeypatch.setenv("CURIE_SLACK_TRUSTED_ORIGINS", raw)
 
-    config = WorkerConfig()
+    assert WorkerConfig().slack_trusted_origins == expected
 
-    assert config.adapter_credentials == {"acme": "s3cret"}
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Same defect class: a blank CURIE_ADAPTER_CREDENTIALS is "none
+        # configured" (every non-Slack egress then fails closed), not a boot crash.
+        pytest.param("", {}, id="empty-is-an-empty-map"),
+        pytest.param('{"acme": "s3cret"}', {"acme": "s3cret"}, id="json"),
+    ],
+)
+def test_adapter_credentials_parsed_from_raw_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: dict[str, str]
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", raw)
+
+    assert WorkerConfig().adapter_credentials == expected
 
 
 def test_adapter_credentials_malformed_json_is_a_startup_error(
@@ -684,9 +741,7 @@ def _load_test_module(module_name: str, path: Path) -> ModuleType:
 
 def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
     repo_root = Path(__file__).resolve().parents[3]
-    config_text = (
-        repo_root / "apps/worker/src/curie_worker/config.py"
-    ).read_text(encoding="utf-8")
+    config_text = (repo_root / "apps/worker/src/curie_worker/config.py").read_text(encoding="utf-8")
     config_start = config_text.index("def _parse_bool")
     config_end = config_text.index("\n\nBool =", config_start)
     config_region = config_text[config_start:config_end]
@@ -787,72 +842,23 @@ def _lease_config(**overrides: object) -> WorkerConfig:
     return WorkerConfig(**values)
 
 
-def test_delivery_lease_fields_carry_the_adr_initial_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ADR-0131's stated initial values. Drifting a default here silently changes
-    the fence's timing on every deployment that does not override it."""
-    _clear_all_config_env(monkeypatch)
-
-    config = WorkerConfig()
-
-    assert config.delivery_budget_s == 600.0
-    assert config.delivery_lease_ttl_s == 45.0
-    assert config.delivery_lease_heartbeat_s == 10.0
-    assert config.delivery_shutdown_reserve_s == 60.0
-    # None means "no platform grace declared" (compose, tests) and SKIPS the
-    # grace validator rather than guessing a value for it.
-    assert config.termination_grace_period_s is None
-    # Unchanged by this train, but now bound by a validator: 30 < 45 satisfies
-    # the ADR's "the reclaim interval is shorter than the lease".
-    assert config.reclaim_interval_s == 30.0
-
-
-def test_delivery_knobs_read_their_curie_aliases(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The chart templates these five as first-class env; a name drift here means
-    an operator's --set silently does nothing."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
-    monkeypatch.setenv("CURIE_DELIVERY_LEASE_TTL_S", "90")
-    monkeypatch.setenv("CURIE_DELIVERY_LEASE_HEARTBEAT_S", "20")
-    monkeypatch.setenv("CURIE_DELIVERY_SHUTDOWN_RESERVE_S", "45")
-    monkeypatch.setenv("CURIE_TERMINATION_GRACE_PERIOD_S", "1860")
-    monkeypatch.setenv("CURIE_RECLAIM_INTERVAL_S", "10")
-
-    config = WorkerConfig()
-
-    assert config.delivery_budget_s == 1800.0
-    assert config.delivery_lease_ttl_s == 90.0
-    assert config.delivery_lease_heartbeat_s == 20.0
-    assert config.delivery_shutdown_reserve_s == 45.0
-    assert config.termination_grace_period_s == 1860.0
-    assert config.reclaim_interval_s == 10.0
-
-
-def test_runner_total_timeout_reads_the_canonical_curie_alias(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("env", "raw", "expected"),
+    [
+        pytest.param("CURIE_RUNNER_TOTAL_TIMEOUT_S", "1700", 1700.0, id="canonical"),
+        pytest.param("RUNNER_TOTAL_TIMEOUT_S", "1600", 1600.0, id="legacy"),
+    ],
+)
+def test_runner_total_timeout_reads_the_canonical_and_legacy_alias(
+    monkeypatch: pytest.MonkeyPatch, env: str, raw: str, expected: float
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "1700")
+    monkeypatch.setenv(env, raw)
     monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
 
     config = WorkerConfig()
 
-    assert config.runner_total_timeout_s == 1700.0
-
-
-def test_runner_total_timeout_keeps_the_legacy_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("RUNNER_TOTAL_TIMEOUT_S", "1600")
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
-
-    config = WorkerConfig()
-
-    assert config.runner_total_timeout_s == 1600.0
+    assert config.runner_total_timeout_s == expected
 
 
 def test_runner_total_timeout_canonical_alias_wins_over_legacy(
@@ -872,22 +878,27 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The chart and Python config accept positive timeout values, including
-    sub-minute values; only positivity and the 1800s ceiling apply here."""
+    sub-minute values; only positivity and the 10800s ceiling (#3071) apply."""
     _clear_all_config_env(monkeypatch)
 
     short = _lease_config(runner_total_timeout_s=0.5)
     maximum = _lease_config(
-        delivery_budget_s=1800.0,
-        runner_total_timeout_s=1800.0,
+        delivery_budget_s=10800.0,
+        runner_total_timeout_s=10800.0,
     )
 
     assert short.runner_total_timeout_s == 0.5
-    assert maximum.runner_total_timeout_s == 1800.0
+    assert maximum.runner_total_timeout_s == 10800.0
 
 
 @pytest.mark.parametrize(
     ("value", "error_type"),
-    [(0.0, "greater_than"), (-0.1, "greater_than"), (1800.1, "less_than_equal")],
+    [
+        (0.0, "greater_than"),
+        (-0.1, "greater_than"),
+        (10800.1, "less_than_equal"),
+        (10801.0, "less_than_equal"),
+    ],
 )
 def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     monkeypatch: pytest.MonkeyPatch,
@@ -897,11 +908,10 @@ def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValidationError) as exc_info:
-        _lease_config(delivery_budget_s=1800.0, runner_total_timeout_s=value)
+        _lease_config(delivery_budget_s=10800.0, runner_total_timeout_s=value)
 
     assert any(
-        error["loc"] == ("runner_total_timeout_s",)
-        and error["type"] == error_type
+        error["loc"] == ("runner_total_timeout_s",) and error["type"] == error_type
         for error in exc_info.value.errors()
     )
 
@@ -916,45 +926,83 @@ def test_runner_total_timeout_rejects_zero_from_the_canonical_env(
         WorkerConfig()
 
     assert any(
-        error["loc"] == ("CURIE_RUNNER_TOTAL_TIMEOUT_S",)
-        and error["type"] == "greater_than"
+        error["loc"] == ("CURIE_RUNNER_TOTAL_TIMEOUT_S",) and error["type"] == "greater_than"
         for error in exc_info.value.errors()
     )
-
-
-def test_delivery_knobs_ignore_bare_field_name_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Aliased like every other CURIE_* knob: a stray bare-name env var in the
-    pod env must not leak into the fence's timing."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("DELIVERY_BUDGET_S", "1800")
-    monkeypatch.setenv("DELIVERY_LEASE_TTL_S", "1")
-    monkeypatch.setenv("DELIVERY_LEASE_HEARTBEAT_S", "1")
-    monkeypatch.setenv("DELIVERY_SHUTDOWN_RESERVE_S", "0")
-    monkeypatch.setenv("TERMINATION_GRACE_PERIOD_S", "5")
-
-    config = WorkerConfig()
-
-    assert config.delivery_budget_s == 600.0
-    assert config.delivery_lease_ttl_s == 45.0
-    assert config.delivery_lease_heartbeat_s == 10.0
-    assert config.delivery_shutdown_reserve_s == 60.0
-    assert config.termination_grace_period_s is None
 
 
 def test_delivery_budget_accepts_the_adr_maximum_and_rejects_above_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """1800s is the ADR's stated maximum ("Operators may configure 1,800
-    seconds"). A higher value would silently require a termination grace the
-    chart schema will not accept, so it is refused here instead."""
+    """#3071 raised the maximum to 10800s (three hours) so a long factory run
+    fits one delivery. Anything above it is refused at boot."""
     _clear_all_config_env(monkeypatch)
 
-    assert _lease_config(delivery_budget_s=1800.0).delivery_budget_s == 1800.0
+    assert _lease_config(delivery_budget_s=10800.0).delivery_budget_s == 10800.0
 
     with pytest.raises(ValueError):
-        _lease_config(delivery_budget_s=1800.5)
+        _lease_config(delivery_budget_s=10801.0)
+
+
+def test_delivery_budget_maximum_is_read_from_the_canonical_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10800")
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "10800")
+
+    config = WorkerConfig()
+
+    assert config.delivery_budget_s == 10800.0
+    assert config.runner_total_timeout_s == 10800.0
+
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10801")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert any(
+        error["loc"] == ("CURIE_DELIVERY_BUDGET_S",) and error["type"] == "less_than_equal"
+        for error in exc_info.value.errors()
+    )
+
+
+def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raising both maxima must not loosen the runner <= budget relationship."""
+    _clear_all_config_env(monkeypatch)
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=10800.0)
+
+    assert "CURIE_RUNNER_TOTAL_TIMEOUT_S" in str(exc_info.value)
+    assert "CURIE_DELIVERY_BUDGET_S" in str(exc_info.value)
+
+
+def test_termination_grace_must_cover_the_raised_maximum_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared grace still has to cover budget + reserve at 10800s."""
+    _clear_all_config_env(monkeypatch)
+
+    ok = _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10860.0)
+    assert ok.termination_grace_period_s == 10860.0
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10859.0)
+    assert "CURIE_TERMINATION_GRACE_PERIOD_S" in str(exc_info.value)
+
+
+def test_work_item_max_turns_refuses_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORK_ITEM_MAX_TURNS", "0")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert any(
+        error["loc"] == ("CURIE_WORK_ITEM_MAX_TURNS",) and error["type"] == "greater_than"
+        for error in exc_info.value.errors()
+    )
 
 
 def test_delivery_budget_accepts_its_floor_and_rejects_below_it(
@@ -966,8 +1014,7 @@ def test_delivery_budget_accepts_its_floor_and_rejects_below_it(
 
     # runner_total_timeout_s must come down with it -- see the fourth validator.
     assert (
-        _lease_config(delivery_budget_s=60.0, runner_total_timeout_s=60.0).delivery_budget_s
-        == 60.0
+        _lease_config(delivery_budget_s=60.0, runner_total_timeout_s=60.0).delivery_budget_s == 60.0
     )
 
     with pytest.raises(ValueError):
@@ -1132,9 +1179,7 @@ def test_lease_expiry_idle_defaults_to_exactly_one_lease_ttl(
 
     config = WorkerConfig()
     assert config.lease_expired_idle_ms is None
-    assert config.lease_expired_idle_ms_value() == int(
-        config.delivery_lease_ttl_s * 1000
-    )
+    assert config.lease_expired_idle_ms_value() == int(config.delivery_lease_ttl_s * 1000)
     assert config.lease_expired_idle_ms_value() == 45000
 
     shorter = _lease_config(
@@ -1252,10 +1297,7 @@ def test_upgrade_drain_identity_reads_only_its_three_curie_aliases(
     assert config.installation_id == "install-env"
     assert config.upgrade_revision == 10
     assert config.upgrade_legacy_quiesce is True
-    assert (
-        config.upgrade_quiesce_key()
-        == "curie:worker:upgrade:quiesce:install-env"
-    )
+    assert config.upgrade_quiesce_key() == "curie:worker:upgrade:quiesce:install-env"
 
 
 @pytest.mark.parametrize("revision", ["nine", "9.5", "0", "-1"])
@@ -1295,49 +1337,6 @@ def test_deliberately_blank_installation_id_keeps_the_legacy_key(
 # exactly how a chart override silently stops matching the code it configures.
 
 
-def test_attachment_fields_default_to_the_lanes_own_envelope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-
-    config = WorkerConfig()
-    default = AttachmentLimits()
-
-    assert config.attachment_max_file_bytes == default.max_file_bytes
-    assert config.attachment_reference_ttl_seconds == default.reference_ttl_seconds
-    assert config.attachment_retention_ttl_seconds == default.retention_ttl_seconds
-
-
-def test_attachment_fields_read_only_their_curie_aliases(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The chart templates these as first-class env; a name drift here means an
-    operator's --set silently does nothing. The bare field names are set to
-    decoy values so ``populate_by_name`` cannot satisfy the assertions."""
-    _clear_all_config_env(monkeypatch)
-    for name in (
-        "ATTACHMENT_MAX_FILE_BYTES",
-        "ATTACHMENT_REFERENCE_TTL_SECONDS",
-        "ATTACHMENT_RETENTION_TTL_SECONDS",
-    ):
-        monkeypatch.setenv(name, "999999")
-    # The off switch reads the same way: a name drift here is an operator who
-    # sets the chart value, sees it in the pod env, and still gets a worker that
-    # downloads and parks every upload.
-    monkeypatch.setenv("ATTACHMENT_ENABLED", "false")
-    monkeypatch.setenv("CURIE_ATTACHMENT_ENABLED", "true")
-    monkeypatch.setenv("CURIE_ATTACHMENT_MAX_FILE_BYTES", "8388608")
-    monkeypatch.setenv("CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS", "120")
-    monkeypatch.setenv("CURIE_ATTACHMENT_RETENTION_TTL_SECONDS", "900")
-
-    config = WorkerConfig()
-
-    assert config.attachment_enabled is True
-    assert config.attachment_max_file_bytes == 8388608
-    assert config.attachment_reference_ttl_seconds == 120
-    assert config.attachment_retention_ttl_seconds == 900
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -1355,6 +1354,75 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
     # bounded, and a zero TTL mints a capability that is already expired.
     with pytest.raises(ValidationError):
         WorkerConfig.model_validate(overrides)
+
+
+@pytest.mark.parametrize("mode", ["all", "failures", "off"])
+def test_each_turn_receipt_mode_is_read_from_its_env(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """ADR-0180 decision 1: the install chooses one of exactly three modes."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", mode)
+
+    assert WorkerConfig().turn_receipt == mode
+
+
+def test_the_turn_receipt_defaults_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An install that sets nothing keeps ADR-0117's receipt as built."""
+
+    _clear_all_config_env(monkeypatch)
+
+    assert WorkerConfig().turn_receipt == "all"
+
+
+@pytest.mark.parametrize("raw", ["ALL", "Off", "none", "failure", "true", " off", ""])
+def test_an_unknown_turn_receipt_mode_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Not a fallback to a mode nobody chose: the worker fails at config load.
+
+    Casing and whitespace are refused rather than normalized, because the chart
+    schema admits the three lowercase spellings only, and a worker that quietly
+    accepted "Off" would read a value the chart would never render.
+    """
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_TURN_RECEIPT", raw)
+
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+
+    assert "CURIE_TURN_RECEIPT" in str(exc_info.value)
+
+
+def test_an_unknown_turn_receipt_mode_is_refused_by_field_name_too() -> None:
+    with pytest.raises(ValidationError):
+        WorkerConfig(turn_receipt="quiet")
+
+
+def test_the_chart_offers_exactly_the_turn_receipt_modes_the_worker_accepts() -> None:
+    """Two languages, one vocabulary: the chart value and the worker field.
+
+    A mode the schema admits and the worker refuses renders green and
+    crash-loops the worker; a mode the worker accepts and the schema refuses is
+    unreachable from Helm. The shipped default must agree on both sides too.
+    """
+
+    from typing import get_args
+
+    from curie_worker.receipt import TurnReceiptMode
+
+    repo_root = Path(__file__).resolve().parents[3]
+    chart = repo_root / "charts" / "curie"
+    values = yaml.safe_load((chart / "values.yaml").read_text())
+    schema = json.loads((chart / "values.schema.json").read_text())
+    offered = schema["properties"]["worker"]["properties"]["turnReceipt"]
+
+    assert offered["type"] == "string"
+    assert sorted(offered["enum"]) == sorted(get_args(TurnReceiptMode))
+    assert values["worker"]["turnReceipt"] == WorkerConfig.model_fields["turn_receipt"].default
+    assert values["worker"]["turnReceipt"] == "all"
 
 
 def test_the_chart_defaults_match_the_worker_defaults() -> None:
@@ -1392,3 +1460,153 @@ def test_the_chart_defaults_match_the_worker_defaults() -> None:
     assert chart["maxFileBytes"] == fields["attachment_max_file_bytes"].default
     assert chart["referenceTtlSeconds"] == fields["attachment_reference_ttl_seconds"].default
     assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default
+
+
+def test_a_malformed_slack_identity_declaration_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker parses `CURIE_SLACK_IDENTITIES` with the same shared parser
+    as the API and dispatcher (ADR-0168 decision 1), so a declaration the
+    chart would never render must refuse boot here too, not only at the API."""
+
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "second",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "PATH",
+                    "signing_secret_env": None,
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="CURIE_SLACK_IDENTITIES"):
+        WorkerConfig()
+
+
+# The connector caller signing key (ADR-0168 decision 7).
+
+
+def _caller_seed() -> str:
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def test_the_caller_signing_key_is_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unset is a stock install: no token is minted and the boot env is the one
+    # it had before the key existed.
+    _clear_all_config_env(monkeypatch)
+    assert WorkerConfig().connector_caller_signing_key == ""
+
+
+def test_a_whitespace_only_signing_key_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Secret value written with `echo` ends in a newline: an empty value
+    # arrives as all-newline. The boot check strips before judging "is
+    # anything configured at all", so this constructs cleanly rather than
+    # tripping ``CallerSigningKeyError`` -- the same ``.strip()`` gate minting
+    # uses (`BindingResolver.boot_env`), so the two agree on what "unset"
+    # means.
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", "\n")
+    assert WorkerConfig().connector_caller_signing_key == "\n"
+
+
+def test_the_caller_signing_key_reads_only_its_curie_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CONNECTOR_CALLER_SIGNING_KEY", _caller_seed())
+    assert WorkerConfig().connector_caller_signing_key == ""
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    assert WorkerConfig().connector_caller_signing_key == seed
+
+
+@pytest.mark.parametrize("raw", ["not base64!", base64.b64encode(b"short").decode()])
+def test_a_malformed_caller_signing_key_is_a_startup_error(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # Refusing at boot names the variable; minting at the first turn would fail
+    # every turn instead.
+    from curie_worker.config import CallerSigningKeyError
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", raw)
+    with pytest.raises(CallerSigningKeyError) as refused:
+        WorkerConfig()
+    assert "CURIE_CONNECTOR_CALLER_SIGNING_KEY" in str(refused.value)
+    assert raw not in str(refused.value)
+    assert refused.value.__cause__ is None and refused.value.__suppress_context__
+
+
+def test_the_caller_signing_key_stays_out_of_the_config_repr() -> None:
+    seed = _caller_seed()
+    config = WorkerConfig(connector_caller_signing_key=seed)
+    assert config.connector_caller_signing_key == seed
+    assert seed not in repr(config)
+
+
+def test_an_unrelated_validation_error_does_not_print_the_signing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A field-level failure only ever carries its OWN raw value, but a
+    # model-level ``@model_validator(mode="after")`` failure -- like the
+    # dead-letter-equals-stream guard below -- is handed pydantic's whole raw
+    # settings input as its error's context. With a valid signing key ALSO
+    # set, that context includes the key, and pydantic's default `str()`
+    # rendering prints it via `input_value=...`. `hide_input_in_errors`
+    # suppresses that clause from `str()`/`repr()` unconditionally, which is
+    # the only rendering anything in the worker actually prints today.
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    monkeypatch.setenv("CURIE_STREAM", "runs")
+    monkeypatch.setenv("CURIE_DEAD_LETTER_STREAM", "runs")
+
+    with pytest.raises(ValidationError) as refused:
+        WorkerConfig()
+
+    assert "CURIE_DEAD_LETTER_STREAM" in str(refused.value)
+    assert "input_value" not in str(refused.value)
+    assert seed not in str(refused.value)
+
+
+def test_quiesce_ttl_may_be_at_or_below_the_drain_wait() -> None:
+    """#3127: the marker is a renewed lease while waiting, so the roll hold no
+    longer has to outlast the drain wait; the chart caps it AT the wait."""
+    for ttl in (60.0, 30.0):
+        config = WorkerConfig(upgrade_drain_timeout_s=60.0, upgrade_quiesce_ttl_s=ttl)
+        assert config.upgrade_quiesce_ttl_s == ttl
+
+
+def test_hook_claim_lease_defaults_to_the_delivery_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cron claim outlives its turn only while the delivery could still be
+    running; past the overall budget the turn is dead by construction (#2931)."""
+    _clear_all_config_env(monkeypatch)
+    config = _lease_config(delivery_budget_s=1800.0)
+    assert config.hook_claim_lease_s is None
+    assert config.effective_hook_claim_lease_s == 1800.0
+
+
+def test_hook_claim_lease_reads_its_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_HOOK_CLAIM_LEASE_S", "7200")
+    config = _lease_config(delivery_budget_s=600.0)
+    assert config.effective_hook_claim_lease_s == 7200.0
+
+
+def test_hook_claim_lease_shorter_than_the_budget_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease shorter than the longest turn would reclaim a live run."""
+    _clear_all_config_env(monkeypatch)
+    assert _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=600.0)
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=599.0)
+    assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)

@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
 from pathlib import Path
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
-from aiohttp import web
+import pytest
+from aci_protocol import Final, SessionStatus, TextDelta
 from aiohttp.test_utils import TestServer
 from channel_protocol.reply import (
     NavAffordance,
@@ -38,6 +39,12 @@ from curie_worker.binding import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import ReplySinkRouter, TargetRoute, build_reply_sink
+
+# importlib import mode does not add the tests directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from capture_fixtures import Capture  # noqa: E402
+from queue_fixtures import qevent  # noqa: E402
 
 DONE = SessionStatus.DONE
 
@@ -61,7 +68,9 @@ class StubBinding:
         self._by_route = by_route
         self.resolve_calls: list[tuple[str, str]] = []
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
         self.resolve_calls.append((kind, address))
         return self._by_route.get((kind, address))
 
@@ -138,51 +147,6 @@ class AppendOnlyAdapter:
         return ReplyAck(ref=None)
 
 
-class _Capture:
-    """An in-process HTTP endpoint that records what reached it."""
-
-    def __init__(self) -> None:
-        self.requests: list[dict[str, str]] = []
-        self.app = web.Application()
-        self.app.add_routes([web.post("/slack/api/{method}", self._slack)])
-
-    async def _slack(self, request: web.Request) -> web.Response:
-        self.requests.append(
-            {"path": request.path, "body": await request.text()}
-        )
-        return web.json_response({"ok": True, "ts": "1720000000.000200"})
-
-    def methods(self) -> list[str]:
-        return [r["path"].rsplit("/", 1)[-1] for r in self.requests]
-
-
-def _qevent(
-    text: str,
-    *,
-    kind: str = "slack",
-    channel: str = "C1",
-    thread: str = "th-1",
-    placeholder: str = "p-1",
-    endpoint: str | None = None,
-    adapter: str | None = None,
-    event_id: str | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind=kind,
-            channel=channel,
-            placeholder=placeholder,
-            endpoint=endpoint,
-            adapter=adapter,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
 # --- T-B2: the S1 tracer ------------------------------------------------------
 
 
@@ -198,7 +162,7 @@ def test_a_turn_completes_through_an_append_only_sink(make_harness) -> None:
                 TextDelta(text="Hello "),
                 Final(text="Hello world", status=DONE),
             ]
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -224,7 +188,7 @@ def test_the_same_turn_through_the_slack_adapter_edits_exactly_one_message(
     # ONE placeholder the ingress pre-posted -- no new messages, no second
     # message id.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -237,14 +201,12 @@ def test_the_same_turn_through_the_slack_adapter_edits_exactly_one_message(
                 )
             )
             binding = StubBinding({("slack", "C1"): _resolved()})
-            async with make_harness(
-                binding=binding, sink=sink, shimmer=False
-            ) as h:
+            async with make_harness(binding=binding, sink=sink, shimmer=False) as h:
                 h.runner.default_script = [
                     TextDelta(text="Hello "),
                     Final(text="Hello world", status=DONE),
                 ]
-                await h.kernel.process_event(_qevent("hi", thread="tS1b"))
+                await h.kernel.process_event(qevent("hi", thread="tS1b"))
 
             assert set(capture.methods()) == {"chat.update"}
             assert "chat.postMessage" not in capture.methods()
@@ -275,7 +237,7 @@ def test_a_turn_completes_with_no_slack_adapter_registered(make_harness) -> None
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, sink=router) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -296,12 +258,9 @@ def test_the_kernel_source_carries_no_kind_branch() -> None:
     # regression it guards is textual: a ``kind ==`` re-appearing in the kernel
     # is the seam leaking back upward, and it would pass every behavioral test
     # that only ever exercises one kind.
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "curie_worker"
-        / "kernel.py"
-    ).read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py").read_text(
+        encoding="utf-8"
+    )
     assert "kind ==" not in source
     assert '== "slack"' not in source
 
@@ -317,14 +276,12 @@ def test_a_resolved_turn_routes_through_the_binding_rows_endpoint(make_harness) 
     # paths. Naming both here is what keeps the seam visible: a change that
     # collapses them into one source silently re-opens whichever it dropped.
     async def go() -> None:
-        resolved = _resolved(
-            endpoint="https://row.example/hook", adapter="row-adapter"
-        )
+        resolved = _resolved(endpoint="https://row.example/hook", adapter="row-adapter")
         binding = StubBinding({("email", EMAIL_ADDRESS): resolved})
         async with make_harness(binding=binding, shimmer=False) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "hi",
                     kind="email",
                     channel=EMAIL_ADDRESS,
@@ -343,37 +300,34 @@ def test_a_resolved_turn_routes_through_the_binding_rows_endpoint(make_harness) 
 # --- T-B11: navigation survives the wire --------------------------------------
 
 
-def test_an_enabled_nav_pack_reaches_the_wire_as_an_affordance(make_harness) -> None:
-    # Finding 16: revision 0 said "NavPack moves onto ReplyUpdate" while omitting
-    # it from the model list, which would have either inverted the package
-    # dependency or silently dropped navigation. The worker's sink layer maps
-    # ``NavPack`` -> ``NavAffordance``.
-    # Mutation: drop the mapping and this fails.
+@pytest.mark.parametrize(
+    ("packs", "expected"),
+    [
+        # Finding 16: revision 0 said "NavPack moves onto ReplyUpdate" while
+        # omitting it from the model list, which would have either inverted the
+        # package dependency or silently dropped navigation. The worker's sink
+        # layer maps ``NavPack`` -> ``NavAffordance``.
+        # Mutation: drop the mapping and this fails.
+        pytest.param(
+            {"nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"}},
+            NavAffordance(label="Help", command="help"),
+            id="enabled_pack_reaches_the_wire_as_an_affordance",
+        ),
+        # An agent with nav off must carry NO affordance, not an empty-labelled
+        # one. A disabled pack that still crossed as an affordance would render a
+        # dead hub button on every reply.
+        pytest.param({}, None, id="disabled_pack_puts_no_affordance_on_the_wire"),
+    ],
+)
+def test_nav_pack_maps_to_the_wire_affordance(
+    make_harness, packs: dict[str, object], expected: NavAffordance | None
+) -> None:
     async def go() -> None:
-        packs = {"nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"}}
-        binding = StubBinding({("slack", "C-bound"): _resolved(packs=packs)})
+        binding = StubBinding({("slack", "C-nav"): _resolved(packs=packs)})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="here you go", status=DONE)]
-            await h.kernel.process_event(
-                _qevent("hi", channel="C-bound", thread="tNavW")
-            )
-            assert h.sink.last_nav == NavAffordance(label="Help", command="help")
-
-    asyncio.run(go())
-
-
-def test_a_disabled_nav_pack_puts_no_affordance_on_the_wire(make_harness) -> None:
-    # The sibling half: an agent with nav off must carry NO affordance, not an
-    # empty-labelled one. A disabled pack that still crossed as an affordance
-    # would render a dead hub button on every reply.
-    async def go() -> None:
-        binding = StubBinding({("slack", "C-plain"): _resolved(packs={})})
-        async with make_harness(binding=binding) as h:
-            h.runner.default_script = [Final(text="here you go", status=DONE)]
-            await h.kernel.process_event(
-                _qevent("hi", channel="C-plain", thread="tNavOff")
-            )
-            assert h.sink.last_nav is None
+            await h.kernel.process_event(qevent("hi", channel="C-nav", thread="tNav"))
+            assert h.sink.last_nav == expected
 
     asyncio.run(go())
 
@@ -382,7 +336,7 @@ def test_the_slack_adapter_renders_the_hub_button_from_the_affordance() -> None:
     # The other end of the mapping: the affordance is not decoration on the wire,
     # it is what the Slack adapter renders the no-dead-ends hub button from.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -397,9 +351,7 @@ def test_the_slack_adapter_renders_the_hub_button_from_the_affordance() -> None:
             from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget
 
             structured = (
-                "```curie-reply\n"
-                '{"text": "here you go", "buttons": [["Details", "details"]]}\n'
-                "```"
+                '```curie-reply\n{"text": "here you go", "buttons": [["Details", "details"]]}\n```'
             )
             await sink.emit(
                 ReplyUpdate(
@@ -445,7 +397,7 @@ def test_the_already_done_skip_makes_no_sink_call(make_harness) -> None:
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -461,9 +413,7 @@ def test_the_already_done_skip_makes_no_sink_call(make_harness) -> None:
             assert h.sink.completions == []
             assert h.runner.opened == []
             # No record was written either: nothing to sweep, nothing to re-emit.
-            assert (
-                await h.async_redis.smembers(h.config.completions_pending_key()) == set()
-            )
+            assert await h.async_redis.smembers(h.config.completions_pending_key()) == set()
 
     asyncio.run(go())
 
@@ -477,7 +427,7 @@ def test_the_already_done_skip_still_lowers_the_shimmer(make_harness) -> None:
     async def go() -> None:
         binding = StubBinding({("slack", "C1"): _resolved()})
         async with make_harness(binding=binding, shimmer=True) as h:
-            ev = _qevent("hi", thread="tDoneShim")
+            ev = qevent("hi", thread="tDoneShim")
             await h.async_redis.set(h.config.done_key(ev.event_id), "1")
 
             await h.kernel.process_event(ev)
@@ -512,7 +462,7 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -558,9 +508,7 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
             # The outbox record was cleared, which only happens after a CONFIRMED
             # emit (EB-B6 step 4) -- the completion really was delivered, not just
             # queued.
-            assert (
-                await h.async_redis.smembers(h.config.completions_pending_key()) == set()
-            )
+            assert await h.async_redis.smembers(h.config.completions_pending_key()) == set()
 
     asyncio.run(go())
 
@@ -575,7 +523,7 @@ def test_a_side_effect_escalate_never_substitutes_a_route_it_was_not_given(
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -599,7 +547,7 @@ def test_the_escalation_target_names_the_turns_own_address(make_harness) -> None
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
-            ev = _qevent(
+            ev = qevent(
                 "hi",
                 kind="email",
                 channel=EMAIL_ADDRESS,
@@ -631,7 +579,7 @@ def test_json_dumps_of_a_route_is_not_on_the_wire(make_harness) -> None:
         async with make_harness(binding=binding, shimmer=False) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
             await h.kernel.process_event(
-                _qevent(
+                qevent(
                     "hi",
                     kind="email",
                     channel=EMAIL_ADDRESS,

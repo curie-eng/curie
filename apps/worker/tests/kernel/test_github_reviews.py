@@ -10,13 +10,17 @@ kernel's ordering around the real Valkey lock and real RunnerClient.
 from __future__ import annotations
 
 import asyncio
+import functools
+import sys
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from aci_protocol import (
+    ErrorEvent,
     Final,
     QueuedTurn,
     ReplyHandle,
@@ -36,6 +40,13 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workspace import WorkspaceSelectionRefused
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until  # noqa: E402
+
+_wait_until = functools.partial(wait_until, timeout=3.0)
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -105,7 +116,7 @@ def _verified(turn: QueuedTurn) -> Any:
 
 
 class ReviewBinding:
-    async def resolve(self, kind: str, channel: str) -> object:
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
         assert (kind, channel) == ("slack", CHANNEL)
         return SimpleNamespace(
             agent_id=AGENT_ID,
@@ -276,12 +287,6 @@ def _claim_matching_route(h: Any, turn: QueuedTurn) -> None:
         workspace_materialized_head=HEAD,
         publication_visible_outcome_revision=1,
     )
-
-
-async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            await asyncio.sleep(0.01)
 
 
 def test_prefix_only_impostor_is_refused_before_steer_or_model(make_harness) -> None:
@@ -516,6 +521,69 @@ def test_verified_review_posts_receipt_and_terminal_outcome_to_bare_thread(
             assert completion.target.conversation_id == THREAD
             assert completion.outcome == "delivered"
             assert h.runner.steer_headers == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_marker", "expected_outcome"),
+    [
+        pytest.param(
+            "history-persistence-error",
+            "history_capacity",
+            "escalated",
+            id="history-capacity",
+        ),
+        pytest.param(None, "1", "delivered", id="successful-review"),
+        pytest.param(
+            "model-credit-exhausted",
+            "1",
+            "escalated",
+            id="other-failure",
+        ),
+    ],
+)
+def test_verified_review_records_history_capacity_in_terminal_marker(
+    make_harness,
+    classification: str | None,
+    expected_marker: str,
+    expected_outcome: str,
+) -> None:
+    async def exercise() -> None:
+        turn = _review_turn()
+        api = ReviewPublicationApi(turn)
+        async with make_harness(
+            binding=ReviewBinding(),
+            publication_creator=api,
+            workspace_factory=ReviewWorkspace,
+        ) as h:
+            _claim_matching_route(h, turn)
+            h.runner.default_script = (
+                [Final(text="Review complete.", status=SessionStatus.DONE)]
+                if classification is None
+                else [
+                    ErrorEvent(
+                        message="conversation history capacity exceeded",
+                        classification=classification,
+                    ),
+                    Final(text="Review failed.", status=SessionStatus.CLASSIFIED_FAILURE),
+                ]
+            )
+
+            await h.kernel.process_event(turn)
+
+            assert api.verify_calls == [(turn, DEPLOYMENT_ID)]
+            assert len(api.reserve_calls) == 1
+            assert h.runner.opened == [turn.text]
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == expected_outcome
+            done_key = h.config.done_key(turn.event_id)
+            assert await h.async_redis.get(done_key) == expected_marker
+            marker_ttl = await h.async_redis.ttl(done_key)
+            if expected_marker == "history_capacity":
+                assert marker_ttl == -1
+            else:
+                assert marker_ttl > 0
 
     asyncio.run(exercise())
 

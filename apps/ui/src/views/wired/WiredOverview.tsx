@@ -1,12 +1,13 @@
 import { C } from "../../tokens";
 import { Card, SectionTitle, Button, CliHint, Dot, Notice, cliCommand } from "../../primitives";
 import { hoverBg } from "../../lib/style";
-import { formatLatency } from "../../lib/format";
+import { channelIdentityLabel, formatLatency } from "../../lib/format";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
 import { useMetricsSummary, useTraces, useAllDeployments } from "../../api/hooks";
 import { hiddenAgentIdsForEnv } from "../../state/env";
 import { ConnectSlackPanel } from "../../components/ConnectSlackPanel";
+import { AgentMetricsLine } from "./AgentMetricsLine";
 import type { AgentOut, RawTrace } from "../../api/client";
 
 // Honest post-deploy panel: the real next step, not a fictional "replied in 42ms".
@@ -192,8 +193,9 @@ function LiveOverview({ agents }: { agents: AgentOut[] }) {
             >
               <Dot color={C.success} size={8} />
               <span style={{ flex: 1, fontFamily: C.mono, fontSize: 13 }}>{a.name}</span>
+              <AgentMetricsLine agent={a} />
               <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>
-                {a.channels.map((c) => c.address).join(", ")}
+                {a.channels.map((c) => channelIdentityLabel(c)).join(", ")}
               </span>
             </button>
           ))}

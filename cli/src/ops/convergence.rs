@@ -7,8 +7,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
-use super::{plain, run_capture, CommonOpts, OpsCommand};
+use super::{plain, run_capture, CommonOpts, OpsCommand, UpInvocation};
 
 /// Which convergence property an observed issue actually disproves.
 ///
@@ -38,13 +40,16 @@ pub(super) enum Facet {
     Rollout,
 }
 
-/// The #2010 worker drain gate, by the hook names
-/// `charts/curie/templates/worker-upgrade-drain.yaml` renders (the pre-upgrade
-/// quiesce Job and its post-upgrade release). A refusal there means accepted
-/// work had not settled when the roll began, which `cluster upgrade` reports
-/// separately from every other hook.
+/// The Drain facet is the worker drain Job, its post-upgrade release, and the
+/// attest Job (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
+/// there means accepted work had not settled, or no successful drain is
+/// recorded for this revision, which `cluster upgrade` reports separately from
+/// every other hook. Schema-migrate stays [`Facet::Hook`].
 fn hook_facet(name: &str) -> Facet {
-    if name.ends_with("-upgrade-drain") || name.ends_with("-upgrade-drain-release") {
+    if name.ends_with("-upgrade-drain")
+        || name.ends_with("-upgrade-drain-release")
+        || name.ends_with("-upgrade-drain-attest")
+    {
         Facet::Drain
     } else {
         Facet::Hook
@@ -129,6 +134,34 @@ fn namespace<'a>(value: &'a Value, opts: &'a CommonOpts) -> &'a str {
         .pointer("/metadata/namespace")
         .and_then(Value::as_str)
         .unwrap_or(&opts.namespace)
+}
+
+/// Helm v3 status JSON marshals `pkg/time.Time` as RFC3339Nano; Kubernetes
+/// `creationTimestamp` is RFC3339 truncated to whole seconds. Zero-year
+/// sentinel values are missing.
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/time/time.go
+/// https://github.com/kubernetes/apimachinery/blob/v0.34.1/pkg/apis/meta/v1/time.go
+fn rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .filter(|stamp| stamp.year() > 1)
+}
+
+/// Issue #2858: a leftover hook Job from an earlier release of the same name
+/// is older than the current revision. Helm hook Jobs typically have no owner
+/// UID pointing at the current revision Secret, so creation time is the
+/// observable. Compare whole seconds so a Helm RFC3339Nano `last_deployed`
+/// cannot mark a same-second current Job stale. Unparseable timestamps fail
+/// closed and still count. Helm `last_run.phase=Failed` stays unfiltered:
+/// that is this revision's own hook record, even when a leftover Job is older.
+fn hook_job_predates_revision(job: &Value, last_deployed: Option<OffsetDateTime>) -> bool {
+    match (
+        rfc3339(text(job, "/metadata/creationTimestamp")),
+        last_deployed,
+    ) {
+        (Some(created), Some(deployed)) => created.unix_timestamp() < deployed.unix_timestamp(),
+        _ => false,
+    }
 }
 
 async fn capture(command: OpsCommand, description: &str) -> Result<String> {
@@ -328,10 +361,21 @@ fn unique_repository_identity(node: &Value, repo: &str) -> Option<String> {
     identities.next().is_none().then_some(identity)
 }
 
+/// Kubelet's nodeStatusMaxImages default. A Node.status.images list this long
+/// may have dropped any smaller image, so an absent name is unknown there.
+/// https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/
+const NODE_STATUS_MAX_IMAGES: usize = 50;
+
+fn inventory_truncated(node: &Value) -> bool {
+    array(node, "/status/images").len() >= NODE_STATUS_MAX_IMAGES
+}
+
 /// Bind a tagged request or kubelet alias to the running imageID digest.
 /// Prefer a unique digest on matching inventory entries; if those entries are
 /// digest-less, a unique same-repository digest on the node that equals the
-/// running identity. A missing name is unbound. Do not infer across repositories.
+/// running identity. A missing name is unbound unless the inventory is at the
+/// kubelet cap, where the running digest in the same repository binds it (#3352).
+/// Do not infer across repositories.
 /// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
 fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> Option<String> {
     match matching_inventory_identities(node, reference) {
@@ -341,7 +385,8 @@ fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> O
             (identity == running).then_some(identity)
         }
         Some(_) => unique_inventory_identity(node, reference),
-        None => None,
+        None => (inventory_truncated(node) && repository(running) == repository(reference))
+            .then(|| running.to_owned()),
     }
 }
 
@@ -669,6 +714,7 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         .filter(|version| *version > 0)
         .context("Helm release has no verifiable revision")?;
     let mut result = Observation::default();
+    let last_deployed = rfc3339(text(&status, "/info/last_deployed"));
     if text(&status, "/info/status") != "deployed" {
         result.issue(
             Facet::Rollout,
@@ -813,7 +859,9 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         for job in namespaces[namespace(&hook_manifest, opts)]
             .iter()
             .filter(|item| {
-                text(item, "/kind") == "Job" && text(item, "/metadata/name") == text(hook, "/name")
+                text(item, "/kind") == "Job"
+                    && text(item, "/metadata/name") == text(hook, "/name")
+                    && !hook_job_predates_revision(item, last_deployed)
             })
         {
             for condition in array(job, "/status/conditions") {
@@ -848,6 +896,7 @@ pub(super) async fn observe(opts: &CommonOpts) -> Result<Observation> {
 pub(super) async fn installation_failure(
     opts: &CommonOpts,
     original: anyhow::Error,
+    invocation: UpInvocation,
 ) -> anyhow::Error {
     if let Ok(observation) = observe(opts).await {
         if !observation.issues.is_empty() {
@@ -855,16 +904,23 @@ pub(super) async fn installation_failure(
                 "Helm installation failed; observed rollout reasons: {}",
                 observation.issues.join("; ")
             ))
-            .with_fix("run `curie cluster status`, correct the failed hook or workload and retry")
+            .with_fix(match invocation {
+                UpInvocation::ClusterUp => "run `curie cluster status`, correct the failed hook or workload and retry",
+                UpInvocation::Apply => "run `curie cluster status`, correct the failed hook or workload configuration in `curie.yaml`, and rerun `curie apply`",
+            })
             .into();
         }
     }
     original
 }
 
-pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
+pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut last_issues: Vec<String> = Vec::new();
+    let fix = match invocation {
+        UpInvocation::ClusterUp => "run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`",
+        UpInvocation::Apply => "run `curie cluster status` to inspect the failed rollout; correct the target configuration in `curie.yaml` and rerun `curie apply`",
+    };
     loop {
         let observation = tokio::time::timeout_at(deadline, observe(opts))
             .await
@@ -878,7 +934,7 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
                     "{error}; last observed rollout reasons: {}",
                     last_issues.join("; ")
                 ))
-                .with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`")
+                .with_fix(fix)
                 .into());
             }
         };
@@ -886,7 +942,12 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
             return Ok(());
         }
         if result.terminal || tokio::time::Instant::now() + Duration::from_secs(2) >= deadline {
-            return Err(crate::exit::CliError::failure(format!("target release has not converged: {}", result.issues.join("; "))).with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`").into());
+            return Err(crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                result.issues.join("; ")
+            ))
+            .with_fix(fix)
+            .into());
         }
         last_issues = result.issues;
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -899,8 +960,8 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
 /// payload, its failing phase and one fail-forward path) keeps the facts
 /// instead of losing them to `?`.
 ///
-/// Deliberately does not touch [`wait`]: `up.rs` depends on its exact failure
-/// message and its "rerun `curie cluster up`" fix string.
+/// Keeps its verdict separate from [`wait`], which renders the fix for the
+/// command that started the installation.
 ///
 /// A read that fails outright, or a rollout that never settles, comes back as a
 /// terminal observation rather than an `Err` — an unreadable cluster has not
@@ -953,5 +1014,57 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
         }
         carried = result;
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rfc3339_parses_helm_and_kubernetes_stamps() {
+        assert!(rfc3339("2026-09-21T12:00:00Z").is_some());
+        assert!(rfc3339("2026-09-21T12:00:00.123456789Z").is_some());
+        assert!(rfc3339("2026-09-21T12:00:00+00:00").is_some());
+        assert!(rfc3339("0001-01-01T00:00:00Z").is_none());
+        assert!(rfc3339("").is_none());
+    }
+
+    fn deployed(stamp: &str) -> Option<OffsetDateTime> {
+        rfc3339(stamp)
+    }
+
+    #[test]
+    fn older_job_predates_the_current_revision() {
+        let stale = json!({"metadata": {"creationTimestamp": "2026-09-21T11:53:16Z"}});
+        assert!(hook_job_predates_revision(
+            &stale,
+            deployed("2026-09-21T12:00:00Z")
+        ));
+        let current = json!({"metadata": {"creationTimestamp": "2026-09-21T12:00:01Z"}});
+        assert!(!hook_job_predates_revision(
+            &current,
+            deployed("2026-09-21T12:00:00Z")
+        ));
+        assert!(!hook_job_predates_revision(&stale, None));
+        assert!(!hook_job_predates_revision(
+            &json!({}),
+            deployed("2026-09-21T12:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn fractional_last_deployed_does_not_mark_a_same_second_job_stale() {
+        let same_second = json!({"metadata": {"creationTimestamp": "2026-09-21T12:00:00Z"}});
+        assert!(!hook_job_predates_revision(
+            &same_second,
+            deployed("2026-09-21T12:00:00.217175126Z")
+        ));
+        let previous_second = json!({"metadata": {"creationTimestamp": "2026-09-21T11:59:59Z"}});
+        assert!(hook_job_predates_revision(
+            &previous_second,
+            deployed("2026-09-21T12:00:00.217175126Z")
+        ));
     }
 }

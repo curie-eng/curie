@@ -63,6 +63,9 @@ FAKE_DSN_USERINFO = "postgresql://acme-user:fake-password@db.example.invalid/acm
 FAKE_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.FAKEFAKEFAKEFAKEFAKEFAKE00"
 FAKE_URL_WITH_TOKEN = "https://example.invalid/hook?token=" + "0000FAKEFAKEFAKEFAKE"
 FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
+FAKE_JSON_FIELD_SECRET = "0000FAKEJSONFIELDSECRET"
+FAKE_DICT_FIELD_SECRET = "0000FAKEDICTFIELDSECRET"
+FAKE_COLON_FIELD_SECRET = "0000FAKECOLONFIELDSECRET"
 FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
@@ -97,6 +100,9 @@ SECRET_LITERALS: dict[str, str] = {
     "jwt": FAKE_JWT,
     "url_secret_param": FAKE_URL_WITH_TOKEN,
     "secret_assignment": FAKE_SECRET_ASSIGNMENT,
+    "secret_json_field": FAKE_JSON_FIELD_SECRET,
+    "secret_dict_field": FAKE_DICT_FIELD_SECRET,
+    "secret_colon_field": FAKE_COLON_FIELD_SECRET,
     "home_path": FAKE_HOME_PATH,
     "channel_token": FAKE_CHANNEL_TOKEN,
     "x_api_key": FAKE_X_API_KEY_HEADER,
@@ -110,12 +116,37 @@ SECRET_LITERALS: dict[str, str] = {
 # whose redacted secret is only part of the matched value.
 _LITERAL_CARRIERS: dict[str, str] = {
     "discord_webhook_url": FAKE_DISCORD_WEBHOOK_PREFIX,
+    "secret_json_field": '{"AWS_SECRET_ACCESS_KEY": "',
+    "secret_dict_field": "{'MY_PRIVATE_KEY': '",
+    "secret_colon_field": "private_key: ",
+}
+
+_LITERAL_SUFFIXES: dict[str, str] = {
+    "secret_json_field": '", "status": "ok"}',
+    "secret_dict_field": "', 'status': 'ok'}",
+    "secret_colon_field": " status=ok",
+}
+
+_SHARED_PLACEHOLDERS: dict[str, str] = {
+    "secret_json_field": "secret_assignment",
+    "secret_dict_field": "secret_assignment",
+    "secret_colon_field": "secret_assignment",
+}
+
+_PRESERVED_CONTEXT: dict[str, str] = {
+    "secret_json_field": '"status": "ok"',
+    "secret_dict_field": "'status': 'ok'",
+    "secret_colon_field": "status=ok",
 }
 
 # One frozen vector per rule: a realistic runner output line carrying that class
 # of secret. The tripwire below binds this table to REDACTION_RULES.
 VECTORS: tuple[tuple[str, str], ...] = tuple(
-    (name, f"runner output carrying {_LITERAL_CARRIERS.get(name, '')}{literal} in context")
+    (
+        name,
+        f"runner output carrying {_LITERAL_CARRIERS.get(name, '')}{literal}"
+        f"{_LITERAL_SUFFIXES.get(name, '')} in context",
+    )
     for name, literal in SECRET_LITERALS.items()
 )
 
@@ -127,7 +158,7 @@ CASES: tuple[tuple[str, str, str], ...] = tuple(
 
 
 def _placeholder(name: str) -> str:
-    return f"[REDACTED:{name}]"
+    return f"[REDACTED:{_SHARED_PLACEHOLDERS.get(name, name)}]"
 
 
 def _log_through_stdout(*args: object) -> str:
@@ -137,6 +168,11 @@ def _log_through_stdout(*args: object) -> str:
     handler = logging.StreamHandler(stream)
     root = logging.getLogger()
     root.addHandler(handler)
+    # install_stdout_redaction() filters EVERY root handler, including pytest's
+    # own capture handlers. Restore their filters, or any later test in this
+    # process that asserts on a raw log message sees it redacted (surfaced
+    # under xdist, where file order differs from the serial run).
+    saved_filters = {item: list(item.filters) for item in root.handlers}
     try:
         install_stdout_redaction()
         logger = logging.getLogger("curie_runner.test_redact")
@@ -144,6 +180,8 @@ def _log_through_stdout(*args: object) -> str:
         logger.info(*args)
     finally:
         root.removeHandler(handler)
+        for item, filters in saved_filters.items():
+            item.filters[:] = filters
     return stream.getvalue()
 
 
@@ -206,6 +244,8 @@ def test_every_rule_is_redacted_at_every_boundary(name: str, vector: str, bounda
         out = _log_through_stdout(vector)
         assert secret not in out
         assert placeholder in out
+        if name in _PRESERVED_CONTEXT:
+            assert _PRESERVED_CONTEXT[name] in out
         return
 
     spans = _span_attributes(vector)
@@ -222,6 +262,8 @@ def test_every_rule_is_redacted_at_every_boundary(name: str, vector: str, bounda
         assert isinstance(value, str)
         assert secret not in value
         assert placeholder in value
+        if name in _PRESERVED_CONTEXT:
+            assert _PRESERVED_CONTEXT[name] in value
 
 
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
@@ -232,6 +274,8 @@ def test_every_rule_is_redacted_through_the_logging_args_path(name: str, vector:
     out = _log_through_stdout("runner emitted t=%s", vector)
     assert SECRET_LITERALS[name] not in out
     assert _placeholder(name) in out
+    if name in _PRESERVED_CONTEXT:
+        assert _PRESERVED_CONTEXT[name] in out
 
 
 def test_non_string_span_attributes_survive_redaction() -> None:

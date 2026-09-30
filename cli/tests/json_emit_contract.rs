@@ -354,6 +354,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         cases: None,
         case_ids: Vec::new(),
         channel: None,
+        agent: None,
         namespace: "curie".into(),
         release: "curie".into(),
         listen_host: None,
@@ -372,7 +373,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         concurrency: 1,
         sampling: curie::eval_sampling::SampleConfig::default(),
     };
-    let lines = eval_dry_run_lines(&opts, "weather", 3);
+    let lines = eval_dry_run_lines(&opts, "weather", 3).expect("eval dry-run plan");
     assert!(
         lines
             .iter()
@@ -795,6 +796,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         ApprovalsOutput::Pending {
             agent: "weather".to_string(),
             records: vec![record()],
+            routes: Default::default(),
             truncated: false,
         }
         .to_json(),
@@ -816,6 +818,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
                 // key by key, so a field the API carries and the CLI drops is
                 // visible in the diff rather than inferred.
                 "card_channel": "CFINANCE01",
+                "current_route_approvers": null,
             }],
             "count": 1,
             "truncated": false,
@@ -1399,6 +1402,7 @@ enum DeployTargetChannels {
 #[derive(Clone, Copy)]
 struct ClusterDeployFixture {
     all_targets: bool,
+    cron_trigger: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
@@ -1410,6 +1414,7 @@ impl Default for ClusterDeployFixture {
     fn default() -> Self {
         Self {
             all_targets: true,
+            cron_trigger: false,
             deploy_failure: DeployFixtureFailure::None,
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
@@ -1585,7 +1590,9 @@ fn deploy_api_response(
                     "manifests": manifests,
                     "owned_secret_name": owned_secret_name,
                     "owned_secret_keys": owned_secret_keys,
-                    "mcp_entries": {}
+                    "mcp_entries": {},
+                    "version_id": format!("version-{target}"),
+                    "triggers": []
                 }),
             )
         }
@@ -1643,6 +1650,34 @@ esac
     path
 }
 
+/// Every cluster deploy reads the release values to learn whether an earlier
+/// layered runner image must be cleared (#3260). The fixture release has
+/// nothing bound, which is what a fresh install answers.
+fn write_helm_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("helm");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$*" in
+  "get values "*)
+    printf '%s' '{}'
+    ;;
+  *)
+    printf 'unexpected helm invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("write helm stub");
+    let mut permissions = fs::metadata(&path)
+        .expect("read helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("make helm stub executable");
+    path
+}
+
 fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     let mut paths = vec![bin_dir.to_path_buf()];
     paths.extend(std::env::split_paths(
@@ -1654,6 +1689,23 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
 fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
+    if fixture.cron_trigger {
+        let manifest_path = plugin.path().join(".claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read scaffolded manifest"),
+        )
+        .expect("scaffolded manifest is JSON");
+        manifest["triggers"] = json!([{
+            "type": "cron",
+            "name": "acme-nightly",
+            "schedule": "0 2 * * *"
+        }]);
+        fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize cron manifest"),
+        )
+        .expect("write cron manifest");
+    }
     let dev_channel = target_config("dev", fixture.target_channels).2;
     let prod_channel = target_config("prod", fixture.target_channels).2;
     fs::write(
@@ -1666,6 +1718,7 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
 
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
+    write_helm_stub(tools.path());
     let deploy_failure = fixture.deploy_failure;
     let connectors = fixture.connectors;
     let target_channels = fixture.target_channels;
@@ -1884,6 +1937,34 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
             ]
         })
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
+    );
+}
+
+#[test]
+fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
+    // The worker scheduler fires cron triggers on cluster installs (#268), so
+    // deploy has nothing to warn about for single or all target invocations.
+    for all_targets in [false, true] {
+        let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+            all_targets,
+            cron_trigger: true,
+            ..ClusterDeployFixture::default()
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "cluster deploy failed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cron trigger") && !stderr.contains("#268"),
+            "cluster deploy must not warn about a cron trigger: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -2057,4 +2138,8 @@ fn cluster_deploy_json_single_target_shape_is_unchanged() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
+    );
 }

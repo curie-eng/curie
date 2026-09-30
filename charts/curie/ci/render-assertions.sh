@@ -46,6 +46,30 @@
 # resolve `repo:` to `:latest`, which is a different image from the
 # appVersion tag the pods run.
 #
+# Issue #2944 (dispatcher rollout overlap), Assertion 16. The dispatcher holds
+# one Socket Mode connection per Slack app token, and Slack hands each event to
+# exactly one connected client. A RollingUpdate starts the replacement pod while
+# the old one is still connected, so events are split between them and the ones
+# handed to the terminating pod are lost. The dispatcher must render
+# `strategy: Recreate` with no rollingUpdate block, and every other workload must
+# keep the strategy it rendered before the fix.
+#
+# Issue #3182 (sandbox pods preempt Langfuse, the OTel collector and the UI),
+# Assertion 8 extension. Those workloads ran at priority 0, so sandbox pods
+# preempted them and the collector's OTLP endpoint went `Connection refused`
+# mid-run. They now join the platform PriorityClass; the inventory over every
+# rendered Deployment/StatefulSet/DaemonSet is exhaustive, so a new template
+# cannot miss its class; the runner-prewarm DaemonSet is pinned classless
+# (priority 0, below curie-sandbox). Negative controls A and B prove both
+# halves can fail.
+#
+# Issue #3206, Assertion 17. With a chart-created platform PriorityClass,
+# pre-install hooks on install and pre-upgrade hooks on upgrade stay classless:
+# the class may not exist yet. Later hooks use it. An operator-provided class
+# is available to every hook. A chart-created gVisor RuntimeClass moves its
+# preflight to post-install, so that hook uses the platform class too. Negative
+# controls prove both pod spec shapes and both phase exceptions.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -518,33 +542,71 @@ if check_runner_env "$MUTANT" "mutant (CURIE_SANDBOX_ID -> CURIE_SANBOX_ID)" 2>&
 fi
 echo "  ok: misspelled runner env name is rejected (the assert can fail)"
 
-echo "=== Assertion 8: priorityClassName on every control-plane pod + the sandbox controller + the sandbox (ADR-0059 decision 5, #759, #816) ==="
+echo "=== Assertion 8: priorityClassName on every long-running platform workload + the sandbox controller + the sandbox (ADR-0059 decision 5, #759, #816, #3182) ==="
 # The control plane (worker, api, dispatcher, data tier: postgres, valkey,
 # clickhouse, rustfs) must outrank sandbox pods for node-pressure eviction, so
 # the components that supervise, drain, and reclaim a sandbox are never
-# themselves preferred for eviction over the sandboxes they manage. Render with
-# the dispatcher enabled (it needs both Slack tokens to render at all) so every
-# control-plane pod is present in one pass.
+# themselves preferred for eviction over the sandboxes they manage. The
+# vendored agent-sandbox controller (#816) is control plane too: it reconciles
+# sandbox claims/releases, so it must also outrank the sandbox pods it
+# manages. It is a static Deployment named exactly `agent-sandbox-controller`,
+# not prefixed by the chart fullname, so it needs its own exact-name key in the
+# inventory below.
 #
-# The vendored agent-sandbox controller (#816) is control plane too: it
-# reconciles sandbox claims/releases, so it must also outrank the sandbox pods
-# it manages for node-pressure eviction. It is a static Deployment named
-# exactly `agent-sandbox-controller`, not prefixed by the chart fullname, so it
-# cannot be matched by the suffix table below and needs its own exact-name
-# lookup. This is also the tripwire for the template-layer string-injection
-# anchor silently drifting on a future upstream controller bump: if the anchor
-# stops matching, the field silently stops being set, and only an assert that
-# actually reads the rendered priorityClassName back out would catch it.
+# #3182 extends the platform set to the observability and UI tier: langfuse-web,
+# langfuse-worker, the OTel collector, the UI, and (when deployed) inference and
+# the mail adapter. At priority 0 those pods were preempted by the very
+# sandboxes whose traces and metrics they carry: the v0.10.0 staging install
+# logged `Preempted by pod ...` for langfuse-web, langfuse-worker and the
+# collector, and the runners then hit `Connection refused` on
+# curie-otel-collector:4318, losing the traces of the runs that caused the
+# eviction. A sandbox that does not fit now waits for capacity instead.
+#
+# The runner-prewarm DaemonSet deliberately sets NO priorityClassName (#3182's
+# second bullet, first arm): the image-cache pod is the chart's designated
+# sacrifice, so it stays at priority 0, below curie-sandbox (100000), and a
+# full node evicts it before anything the platform needs. Giving it a class of
+# its own would also change the chart-rendered cluster-singleton inventory and
+# the CLI's cluster-up preflight; that is a separate maintainer decision, not
+# part of this fix.
+#
+# The check is an exhaustive inventory, not a spot check (#3182's third bullet):
+# EVERY rendered Deployment/StatefulSet/DaemonSet must appear in EXPECTED_PLATFORM
+# below (or be the prewarm DaemonSet) and carry the class the inventory names, so
+# a new template that forgets priorityClassName fails the render instead of
+# shipping at priority 0. Jobs and hook Pods are covered by Assertion 17
+# below. Exact (kind, name) keys, never suffix matching:
+# `curie-langfuse-worker` also ends in `-worker`, so the old suffix table would
+# have recorded the langfuse worker's pod under the `-worker` key and clobbered
+# the control-plane entry -- the same trap the controller exact-name lookup
+# already warned about.
+#
+# The render enables every first-party long-running workload that is off by
+# default (inference, mailAdapter -- the same flags the placement assertion
+# uses) plus the dispatcher (which needs both Slack tokens to render at all),
+# so the inventory is exhaustive in one pass.
+PRIO_HELM_ARGS=(
+  --set dispatcher.slack.appToken=xapp-render-assert
+  --set dispatcher.slack.botToken=xoxb-render-assert
+  --set inference.deploy=true
+  --set inference.persistence.enabled=true
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+  --set mailAdapter.persistence.existingClaim=render-assert-mail-state
+)
+
 PRIO_OUT="$(mktemp -d -p "$TMP")"
-helm template "$CHART" --output-dir "$PRIO_OUT" \
-  --set dispatcher.slack.appToken=xapp-render-assert \
-  --set dispatcher.slack.botToken=xoxb-render-assert \
-  > /dev/null
+# Release name `curie` makes every fullname-prefixed workload name exactly
+# `curie-<component>` (the fullname helper keeps a release name that contains
+# the chart name as-is), so the inventory keys below are deterministic.
+helm template curie "$CHART" --output-dir "$PRIO_OUT" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
 
 PRIO_CHECK="$TMP/check_priority_class.py"
 cat > "$PRIO_CHECK" <<'PYEOF'
-"""Assert priorityClassName on every control-plane pod template, the vendored
-agent-sandbox controller Deployment, and the sandbox pod template.
+"""Assert priorityClassName on every long-running platform workload, the vendored
+agent-sandbox controller Deployment, and the sandbox pod template; assert the
+runner-prewarm DaemonSet sets none and so stays below the sandbox class.
 
 argv: <rendered-dir> <expected-platform-name> <expected-sandbox-name>
 Exits 0 on pass, 1 naming the offending workload on failure.
@@ -556,109 +618,225 @@ import yaml
 
 rendered, platform_name, sandbox_name = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# Deployment/StatefulSet name suffix -> expected priorityClassName. The data
-# tier (postgres/valkey/clickhouse/rustfs) and the three first-party services
-# (worker, api, dispatcher) are all control plane per ADR-0059 decision 5;
-# langfuse/ui/inference/otel are deliberately out of scope (not named in the
-# decision).
-EXPECTED = {
-    "-worker": platform_name,
-    "-api": platform_name,
-    "-dispatcher": platform_name,
-    "-postgres": platform_name,
-    "-valkey": platform_name,
-    "-clickhouse": platform_name,
-    "-rustfs": platform_name,
+# Every rendered Deployment/StatefulSet/DaemonSet must be classified here (or
+# be the prewarm DaemonSet in PREWARM below) and carry the platform class. A
+# workload absent from this inventory fails the check as unclassified, so a new
+# template cannot silently ship at priority 0 (#3182). Exact (kind, name)
+# keys: `curie-langfuse-worker` also ends in `-worker`, so a suffix table would
+# clobber the control-plane entry.
+EXPECTED_PLATFORM = {
+    ("Deployment", "curie-api"),
+    ("Deployment", "curie-dispatcher"),
+    ("Deployment", "curie-worker"),
+    ("Deployment", "curie-ui"),
+    ("Deployment", "curie-inference"),
+    ("Deployment", "curie-langfuse-web"),
+    ("Deployment", "curie-langfuse-worker"),
+    ("Deployment", "curie-otel-collector"),
+    ("Deployment", "curie-mail-adapter"),
+    # Exact name, not fullname-prefixed: the vendored controller Deployment is
+    # static and unprefixed, and a loose `-controller` suffix would silently
+    # match `curie-preflight-controller` and friends.
+    ("Deployment", "agent-sandbox-controller"),
+    ("StatefulSet", "curie-postgres"),
+    ("StatefulSet", "curie-valkey"),
+    ("StatefulSet", "curie-clickhouse"),
+    ("StatefulSet", "curie-rustfs"),
 }
 
-# Exact name, not a suffix match: `agent-sandbox-controller-extensions` and
-# `release-name-curie-preflight-controller` also exist in the render, and a
-# loose `-controller` suffix would silently match the wrong object.
-CONTROLLER_NAME = "agent-sandbox-controller"
+# The one long-running workload that deliberately carries NO class: the prewarm
+# pod sleeps to pin the runner image on the node, so it is the designated
+# sacrifice -- priority 0, below curie-sandbox, evicted before anything the
+# platform needs (#3182's second bullet, first arm).
+PREWARM = ("DaemonSet", "curie-runner-prewarm")
 
-found = {}
-controller_found = None
-sandbox_found = []
+workloads = {}
+priority_classes = {}
+sandbox_templates = []
 for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
     for doc in yaml.safe_load_all(path.read_text()):
         if not isinstance(doc, dict):
             continue
         kind = doc.get("kind")
-        if kind in ("Deployment", "StatefulSet"):
-            name = doc.get("metadata", {}).get("name", "")
-            spec = (
+        name = doc.get("metadata", {}).get("name", "")
+        if kind == "PriorityClass":
+            priority_classes[name] = doc.get("value")
+        elif kind in ("Deployment", "StatefulSet", "DaemonSet"):
+            key = (kind, name)
+            if key in workloads:
+                sys.stderr.write(f"duplicate rendered workload {key!r}\n")
+                sys.exit(1)
+            workloads[key] = (
                 doc.get("spec", {})
                 .get("template", {})
                 .get("spec", {})
+                .get("priorityClassName")
             )
-            for suffix in EXPECTED:
-                if name.endswith(suffix):
-                    found[suffix] = (name, spec.get("priorityClassName"))
-            if kind == "Deployment" and name == CONTROLLER_NAME:
-                controller_found = (name, spec.get("priorityClassName"))
         elif kind == "SandboxTemplate":
             spec = doc.get("spec", {}).get("podTemplate", {}).get("spec", {})
-            sandbox_found.append((doc.get("metadata", {}).get("name", ""), spec.get("priorityClassName")))
+            sandbox_templates.append((name, spec.get("priorityClassName")))
 
-missing = sorted(set(EXPECTED) - set(found))
+expected = EXPECTED_PLATFORM | {PREWARM}
+missing = sorted(expected - set(workloads))
 if missing:
-    sys.stderr.write(f"render is missing expected control-plane workload(s): {missing}\n")
+    sys.stderr.write(f"render is missing expected long-running workload(s): {missing}\n")
+    sys.exit(1)
+
+unclassified = sorted(set(workloads) - expected)
+if unclassified:
+    for kind, name in unclassified:
+        sys.stderr.write(
+            f"{kind} '{name}' is not in the priorityClassName inventory. Every "
+            "long-running platform workload must set a priority class (#3182): "
+            "add it to EXPECTED_PLATFORM in this check (or to PREWARM if it is "
+            "deliberately the lowest).\n")
     sys.exit(1)
 
 mismatched = [
-    (suffix, name, got, EXPECTED[suffix])
-    for suffix, (name, got) in found.items()
-    if got != EXPECTED[suffix]
+    (key, got)
+    for key, got in sorted(workloads.items())
+    if key in EXPECTED_PLATFORM and got != platform_name
 ]
 if mismatched:
-    for suffix, name, got, want in mismatched:
+    for (kind, name), got in mismatched:
         sys.stderr.write(
-            f"workload '{name}' (matched by suffix '{suffix}') has "
-            f"priorityClassName={got!r}, expected {want!r}\n")
+            f"{kind} '{name}' has priorityClassName={got!r}, "
+            f"expected {platform_name!r}\n")
     sys.exit(1)
 
-if controller_found is None:
+prewarm_got = workloads[PREWARM]
+if prewarm_got is not None:
     sys.stderr.write(
-        f"found no Deployment named exactly {CONTROLLER_NAME!r} in the render; "
-        "the agent-sandbox controller priorityClassName assert would pass vacuously\n")
+        f"DaemonSet '{PREWARM[1]}' has priorityClassName={prewarm_got!r}, "
+        "expected none: the prewarm pod stays below curie-sandbox at priority 0 "
+        "(#3182); promoting it is a separate decision (cluster-singleton "
+        "inventory, CLI preflight).\n")
     sys.exit(1)
 
-controller_name, controller_got = controller_found
-if controller_got != platform_name:
-    sys.stderr.write(
-        f"controller Deployment '{controller_name}' has "
-        f"priorityClassName={controller_got!r}, expected {platform_name!r}\n")
-    sys.exit(1)
+# The unclassed prewarm sits at priority 0, so "stays below curie-sandbox" is
+# exactly "sandbox value > 0" -- with platform outranking sandbox per ADR-0059
+# decision 5. Only checkable when the chart renders the class objects
+# (create: true); a BYO-class install has no object to read.
+platform_value = priority_classes.get(platform_name)
+sandbox_value = priority_classes.get(sandbox_name)
+if platform_value is not None and sandbox_value is not None:
+    # Helm renders a large integer value as 1e+06, so parse through float.
+    if not int(float(platform_value)) > int(float(sandbox_value)) > 0:
+        sys.stderr.write(
+            "rendered PriorityClass values do not order platform > sandbox > 0 "
+            f"(platform={platform_value!r}, sandbox={sandbox_value!r}); the "
+            "unclassed prewarm pod (priority 0) must stay below curie-sandbox "
+            "(#3182)\n")
+        sys.exit(1)
 
-if not sandbox_found:
+if not sandbox_templates:
     sys.stderr.write("found no SandboxTemplate in the render; the sandbox assert would pass vacuously\n")
     sys.exit(1)
 
-sandbox_mismatched = [(n, got) for n, got in sandbox_found if got != sandbox_name]
+sandbox_mismatched = [(n, got) for n, got in sandbox_templates if got != sandbox_name]
 if sandbox_mismatched:
     for name, got in sandbox_mismatched:
         sys.stderr.write(
             f"SandboxTemplate '{name}' has priorityClassName={got!r}, expected {sandbox_name!r}\n")
     sys.exit(1)
 
-print(f"  ok: {len(found)} control-plane workloads and the agent-sandbox controller carry "
-      f"priorityClassName={platform_name!r}; SandboxTemplate carries priorityClassName={sandbox_name!r}")
+print(f"  ok: {len(EXPECTED_PLATFORM)} long-running platform workloads (including "
+      f"the agent-sandbox controller) carry priorityClassName={platform_name!r}; "
+      f"the prewarm DaemonSet sets none (priority 0, below {sandbox_name!r}); "
+      f"SandboxTemplate carries priorityClassName={sandbox_name!r}")
 PYEOF
 
 python3 "$PRIO_CHECK" "$PRIO_OUT" "curie-platform" "curie-sandbox" \
-  || fail "default render did not set the expected priorityClassName on every control-plane pod, the agent-sandbox controller, and the sandbox."
+  || fail "default render did not set the expected priorityClassName on every long-running platform workload, the agent-sandbox controller, and the sandbox."
+
+echo "=== Assertion 8 negative control A: a platform workload without a class FAILS ==="
+# Mandatory, per Assertion 7's convention: an assert that has never been shown
+# failing is not a pin. Mutate a TEMP COPY of the chart (never the real
+# template) back to the pre-#3182 shape -- the UI Deployment with no
+# priorityClassName -- and require the inventory check to reject it by name.
+PRIO_MUTANT_UI="$TMP/mutant-prio-ui"
+cp -a "$CHART" "$PRIO_MUTANT_UI"
+python3 - "$PRIO_MUTANT_UI/templates/ui.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+old = """      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+"""
+if text.count(old) != 1:
+    sys.stderr.write(
+        "negative control A could not find exactly one platform "
+        f"priorityClassName block in ui.yaml (found {text.count(old)})\n")
+    sys.exit(1)
+p.write_text(text.replace(old, "", 1))
+PYEOF
+PRIO_MUTANT_UI_RENDER="$(mktemp -d -p "$TMP")"
+helm template curie "$PRIO_MUTANT_UI" --output-dir "$PRIO_MUTANT_UI_RENDER" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
+prio_ui_negative_output=""
+if prio_ui_negative_output="$(python3 "$PRIO_CHECK" "$PRIO_MUTANT_UI_RENDER" "curie-platform" "curie-sandbox" 2>&1)"; then
+  fail "negative control A did not fire: a classless UI Deployment passed the priorityClassName inventory, so Assertion 8 is not actually pinning anything."
+fi
+if [[ "$prio_ui_negative_output" != *"curie-ui"* ]]; then
+  fail "classless-UI negative control failed unexpectedly: $prio_ui_negative_output"
+fi
+echo "  ok: a platform workload without a class is rejected by name (the assert can fail)"
+
+echo "=== Assertion 8 negative control B: an unclassified new workload FAILS ==="
+# The #3182 third bullet is forward-looking ("a new template can't miss it"),
+# so prove THAT path fires too: drop a synthetic classless Deployment into a
+# temp chart copy and require the inventory to reject it as unclassified.
+PRIO_MUTANT_NEW="$TMP/mutant-prio-new"
+cp -a "$CHART" "$PRIO_MUTANT_NEW"
+cat > "$PRIO_MUTANT_NEW/templates/render-assert-unclassified.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "curie.fullname" . }}-synthetic-unclassified
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curie
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+    spec:
+      containers:
+        - name: sleep
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+EOF
+PRIO_MUTANT_NEW_RENDER="$(mktemp -d -p "$TMP")"
+helm template curie "$PRIO_MUTANT_NEW" --output-dir "$PRIO_MUTANT_NEW_RENDER" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
+prio_new_negative_output=""
+if prio_new_negative_output="$(python3 "$PRIO_CHECK" "$PRIO_MUTANT_NEW_RENDER" "curie-platform" "curie-sandbox" 2>&1)"; then
+  fail "negative control B did not fire: an unclassified classless Deployment passed the priorityClassName inventory, so the 'a new template can't miss it' half of Assertion 8 pins nothing."
+fi
+if [[ "$prio_new_negative_output" != *"not in the priorityClassName inventory"* ]]; then
+  fail "unclassified-workload negative control failed unexpectedly: $prio_new_negative_output"
+fi
+echo "  ok: an unclassified new workload is rejected (a new template cannot miss its class)"
 
 echo "=== Assertion 9: priorityClassName names are operator-overridable (additive values, #759) ==="
 PRIO_OVERRIDE_OUT="$(mktemp -d -p "$TMP")"
-helm template "$CHART" --output-dir "$PRIO_OVERRIDE_OUT" \
-  --set dispatcher.slack.appToken=xapp-render-assert \
-  --set dispatcher.slack.botToken=xoxb-render-assert \
+# Same workload flag set as Assertion 8 so the reused checker sees the same
+# inventory; only the class names change.
+helm template curie "$CHART" --output-dir "$PRIO_OVERRIDE_OUT" \
+  "${PRIO_HELM_ARGS[@]}" \
   --set priorityClasses.platform.name=custom-platform-class \
   --set priorityClasses.sandbox.name=custom-sandbox-class \
   > /dev/null
 python3 "$PRIO_CHECK" "$PRIO_OVERRIDE_OUT" "custom-platform-class" "custom-sandbox-class" \
   || fail "overriding priorityClasses.platform.name/sandbox.name did not propagate to priorityClassName on the rendered pods."
-echo "  ok: overriding priorityClasses.platform.name/sandbox.name propagates to every control-plane pod, the agent-sandbox controller, and the sandbox"
+echo "  ok: overriding priorityClasses.platform.name/sandbox.name propagates to every long-running platform workload, the agent-sandbox controller, and the sandbox"
 
 echo "=== Assertion 10: SandboxTemplate opts the controller out of its own permissive NetworkPolicy when Rail 1 is on (#765) ==="
 # NetworkPolicy allows are additive across objects that select the same pods --
@@ -1040,8 +1218,9 @@ expected = {
     ("Job", f"{prefix}-netpol-probe"): "hooks",
     ("Job", f"{prefix}-security-probe"): "hooks",
     ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
-    # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
+    # The pre-upgrade drain gate, its attest hook, and its post-upgrade release (issue #2010).
     ("Job", f"{prefix}-upgrade-drain"): "hooks",
+    ("Job", f"{prefix}-upgrade-drain-attest"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     # The single schema upgrade phase (#2300).
     ("Job", f"{prefix}-schema-migrate"): "hooks",
@@ -1582,7 +1761,7 @@ if failures:
 print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
 PYEOF
 
-echo "=== Assertion 14: API schema-wait init waits quietly for Postgres then the upgrade phase (#2300) ==="
+echo "=== Assertion 14: API schema-wait init waits for Postgres, naming the probe error class, then the upgrade phase (#2300, #2865) ==="
 API_MIGRATE_OUT="$TMP/api_migrate"
 helm template curie "$CHART" --output-dir "$API_MIGRATE_OUT" >/dev/null
 API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
@@ -1605,9 +1784,26 @@ def fail(message):
     raise SystemExit(message)
 
 
+# The API schema-wait init and the schema-migrate Job share one Postgres
+# readiness loop; both run through this checker (#2865).
+MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
+if MODE not in {"api", "migrate"}:
+    fail(f"unknown readiness checker mode {MODE!r}")
+EXEC_VERB = "wait" if MODE == "api" else "upgrade"
+WAIT_LINE = "Waiting for Postgres readiness"
+STILL_LINE = "Still waiting for Postgres readiness"
+
+
 def migrate_container(manifest):
     matches = []
     for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
+        if MODE == "migrate":
+            if isinstance(doc, dict) and doc.get("kind") == "Job":
+                containers = doc["spec"]["template"]["spec"].get("containers", [])
+                matches.extend(
+                    item for item in containers if item.get("name") == "schema-migrate"
+                )
+            continue
         if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
             continue
         containers = (
@@ -1621,7 +1817,7 @@ def migrate_container(manifest):
         if alembic:
             fail("API init must not run a migrate container; Alembic belongs on the upgrade Job")
     if len(matches) != 1:
-        fail(f"expected exactly one schema-wait init container, found {len(matches)}")
+        fail(f"expected exactly one {MODE} readiness container, found {len(matches)}")
     return matches[0]
 
 
@@ -1635,6 +1831,8 @@ def shell_process(container):
     if process[1] != "-c":
         fail("schema-wait init container shell command must use -c")
     script = process[2]
+    if MODE == "migrate":
+        return process
     if "alembic" in script:
         fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
     wait = "exec python -m curie_api.schema_compat wait"
@@ -1653,7 +1851,7 @@ def write_program(path, text):
     path.chmod(0o755)
 
 
-def run_case(process, readiness_failures):
+def run_case(process, readiness_failures, error_class="InvalidPasswordError"):
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp)
         fake_bin = root / "bin"
@@ -1682,6 +1880,10 @@ class InvalidPasswordError(Exception):
     pass
 
 
+class TooManyConnectionsError(Exception):
+    pass
+
+
 class Connection:
     async def close(self):
         pass
@@ -1694,7 +1896,11 @@ async def connect(database_url, timeout):
     with attempts.open("a") as stream:
         stream.write(f"{count}\\n")
     if count <= int(os.environ["READINESS_FAILURES"]):
-        raise InvalidPasswordError("asyncpg-password-sentinel-must-not-leak")
+        if os.environ["READINESS_ERROR"] == "ConnectionRefusedError":
+            raise ConnectionRefusedError("asyncpg-password-sentinel-must-not-leak")
+        raise globals()[os.environ["READINESS_ERROR"]](
+            "asyncpg-password-sentinel-must-not-leak"
+        )
     return Connection()
 """
         )
@@ -1714,6 +1920,7 @@ async def connect(database_url, timeout):
                 ),
                 "READINESS_ATTEMPTS": str(attempts),
                 "READINESS_FAILURES": str(readiness_failures),
+                "READINESS_ERROR": error_class,
             }
         )
         try:
@@ -1741,7 +1948,7 @@ if ready.returncode != 0:
     fail(f"immediate readiness exited {ready.returncode}: {ready.stdout}{ready.stderr}")
 if len(ready_attempts) != 1:
     fail(f"immediate readiness ran the probe {len(ready_attempts)} times, expected once")
-if ready_calls != ["wait"]:
+if ready_calls != [EXEC_VERB]:
     fail(f"immediate readiness did not invoke schema_compat wait: {ready_calls!r}")
 
 delayed, delayed_attempts, delayed_calls = run_case(process, 2)
@@ -1749,62 +1956,78 @@ if delayed.returncode != 0:
     fail(f"delayed readiness exited {delayed.returncode}: {delayed.stdout}{delayed.stderr}")
 if len(delayed_attempts) != 3:
     fail(f"delayed readiness ran the probe {len(delayed_attempts)} times, expected three")
-if delayed_calls != ["wait"]:
+if delayed_calls != [EXEC_VERB]:
     fail(f"delayed readiness did not invoke schema_compat wait: {delayed_calls!r}")
 delayed_output = [
     line.strip()
     for line in (delayed.stdout + delayed.stderr).splitlines()
     if line.strip()
 ]
-if delayed_output != ["Waiting for Postgres readiness"]:
-    fail(f"delayed readiness must log one concise wait line: {delayed_output!r}")
+if delayed_output != [f"{WAIT_LINE}; probe error class: InvalidPasswordError"]:
+    fail(f"delayed readiness must log one concise wait line naming the error: {delayed_output!r}")
 
-exhausted, exhausted_attempts, exhausted_calls = run_case(process, 60)
-if exhausted.returncode == 0:
-    fail("readiness exhaustion must exit nonzero so the init container can restart")
-if len(exhausted_attempts) != 60:
-    fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(exhausted_attempts)}")
-if exhausted_calls:
-    fail(f"readiness exhaustion must not invoke schema wait; got {exhausted_calls!r}")
+def exhausted_output(error_class):
+    exhausted, attempts, calls = run_case(process, 60, error_class)
+    if exhausted.returncode == 0:
+        fail("readiness exhaustion must exit nonzero so the container can restart")
+    if len(attempts) != 60:
+        fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(attempts)}")
+    if calls:
+        fail(f"readiness exhaustion must not invoke schema_compat; got {calls!r}")
+    return [
+        line.strip()
+        for line in (exhausted.stdout + exhausted.stderr).splitlines()
+        if line.strip()
+    ]
 
-output_lines = [
-    line.strip()
-    for line in (exhausted.stdout + exhausted.stderr).splitlines()
-    if line.strip()
-]
-if not output_lines:
-    fail("readiness exhaustion must emit one concise terminal message")
-if len(output_lines) > 2:
-    fail(f"readiness exhaustion emitted {len(output_lines)} lines, expected at most 2")
-if output_lines[0] != "Waiting for Postgres readiness":
-    fail(f"first readiness failure must emit one concise wait message: {output_lines!r}")
-lower_output = " ".join(output_lines).lower()
-if "postgres" not in lower_output or not any(
-    word in lower_output for word in ("ready", "wait", "timeout", "unavailable")
-):
-    fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
-if "InvalidPasswordError" not in " ".join(output_lines):
-    fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
-if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
-    fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
-if any(
-    secret in lower_output
-    for secret in (
-        "example_not_a_secret",
-        "postgresql+asyncpg://",
-        "asyncpg-password-sentinel-must-not-leak",
-    )
-):
-    fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
+
+# Saturation and an unreachable store must be told apart WHILE waiting, not
+# only in the exit line a restarted container loses (#2865). One line on
+# attempt 1, one every tenth attempt, one at exit: bounded at 7 for 60.
+for error_class in ("TooManyConnectionsError", "ConnectionRefusedError", "InvalidPasswordError"):
+    output_lines = exhausted_output(error_class)
+    waiting = output_lines[:-1]
+    expected_waiting = [f"{WAIT_LINE}; probe error class: {error_class}"] + [
+        f"{STILL_LINE} after {n} of 60 attempts; probe error class: {error_class}"
+        for n in (10, 20, 30, 40, 50)
+    ]
+    if waiting != expected_waiting:
+        fail(
+            "readiness wait must name the probe error class on attempt 1 and every "
+            f"tenth attempt: {output_lines!r}"
+        )
+    final = output_lines[-1].lower()
+    if "postgres" not in final or "unavailable" not in final:
+        fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
+    if error_class not in output_lines[-1]:
+        fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
+    lower_output = " ".join(output_lines).lower()
+    if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
+        fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
+    if any(
+        secret in lower_output
+        for secret in (
+            "example_not_a_secret",
+            "postgresql+asyncpg://",
+            "asyncpg-password-sentinel-must-not-leak",
+        )
+    ):
+        fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
 
 print(
-    "  ok: immediate and delayed readiness run schema_compat wait; bounded "
-    "exhaustion stays concise, exits nonzero, and never invokes the wait"
+    f"  ok ({MODE}): immediate and delayed readiness run schema_compat {EXEC_VERB}; "
+    "the wait names the probe error class periodically, stays bounded, exits "
+    "nonzero, and never leaks credentials"
 )
 PYEOF
 
 python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
-  || fail "API migrate init command does not implement the bounded quiet readiness contract."
+  || fail "API migrate init command does not implement the bounded readiness diagnostics contract."
+
+SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
+[[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
+python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" migrate \
+  || fail "schema-migrate Job does not implement the same readiness diagnostics contract."
 
 echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
 API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
@@ -2059,5 +2282,352 @@ if [[ "$notes_image_negative_output" != *"ends in a bare colon"* ]]; then
 fi
 echo "  ok: a NOTES image interpolated from empty image.tag is rejected (the assert can fail)"
 
+echo "=== Assertion 16: the dispatcher rolls out with Recreate (issue #2944) ==="
+STRATEGY_RENDER="$TMP/strategy.yaml"
+helm template curie "$CHART" \
+  --set dispatcher.slack.appToken=xapp-render-assert \
+  --set dispatcher.slack.botToken=xoxb-render-assert \
+  >"$STRATEGY_RENDER"
+python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate and every other workload must keep its strategy (issue #2944)."
+import sys
+
+import yaml
+
+# Workload -> the strategy it renders. None means the Kubernetes default
+# (RollingUpdate for a Deployment, the controller default for the others).
+EXPECTED = {
+    ("Deployment", "curie-dispatcher"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "agent-sandbox-controller"): ("strategy", None),
+    ("Deployment", "curie-api"): ("strategy", None),
+    ("Deployment", "curie-ui"): ("strategy", None),
+    ("Deployment", "curie-worker"): ("strategy", None),
+    ("Deployment", "curie-langfuse-web"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "curie-langfuse-worker"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "curie-otel-collector"): ("strategy", {"type": "Recreate"}),
+    ("DaemonSet", "curie-runner-prewarm"): ("updateStrategy", None),
+    ("StatefulSet", "curie-clickhouse"): ("updateStrategy", None),
+    ("StatefulSet", "curie-postgres"): ("updateStrategy", None),
+    ("StatefulSet", "curie-rustfs"): ("updateStrategy", None),
+    ("StatefulSet", "curie-valkey"): ("updateStrategy", None),
+}
+seen = {}
+with open(sys.argv[1]) as fh:
+    for doc in yaml.safe_load_all(fh):
+        if isinstance(doc, dict) and doc.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+            seen[(doc["kind"], doc["metadata"]["name"])] = doc["spec"]
+errors = []
+if set(seen) != set(EXPECTED):
+    errors.append("rendered workloads %s differ from expected %s" % (sorted(seen), sorted(EXPECTED)))
+for key, (field, want) in EXPECTED.items():
+    if key in seen and seen[key].get(field) != want:
+        errors.append("%s %s: %s is %r, expected %r" % (key[0], key[1], field, seen[key].get(field), want))
+for err in errors:
+    sys.stderr.write(err + "\n")
+sys.exit(1 if errors else 0)
+PYEOF
+echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
+
+echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
+# Langfuse never deletes its S3 event-upload objects after ingest. Each trace
+# is about three inodes on the RustFS volume, and on 2026-09-21 they filled the
+# soak node's inode table while kubelet still reported DiskPressure=False. The
+# bucket init Job must install an expiration rule scoped to the events/ prefix,
+# preserve any other lifecycle rule on the bucket, and
+# langfuse.eventUpload.retentionDays=0 must remove the managed rule.
+check_event_retention() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json, re, sys, yaml
+path, want = sys.argv[1], sys.argv[2]
+script = None
+with open(path) as fh:
+    for doc in yaml.safe_load_all(fh):
+        if isinstance(doc, dict) and doc.get("kind") == "Job" and doc["metadata"]["name"].endswith("-rustfs-init"):
+            script = doc["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+if script is None:
+    sys.exit("rustfs-init Job not rendered")
+m = re.search(r"managed_rule='(.*?)'\n", script)
+if want == "none":
+    if m:
+        sys.exit("retention disabled but the managed rule still renders")
+    if "delete-bucket-lifecycle" not in script:
+        sys.exit("retentionDays=0 must remove a rule an earlier release installed")
+    sys.exit(0)
+if not m:
+    sys.exit("rustfs-init never installs a lifecycle rule on the Langfuse bucket")
+rule = json.loads(m.group(1).replace("'\"$rule_id\"'", "langfuse-event-upload-retention"))
+if rule.get("Status") != "Enabled" or rule.get("Filter") != {"Prefix": "events/"}:
+    sys.exit("lifecycle rule must be Enabled and scoped to events/, got %r" % rule)
+if rule.get("Expiration") != {"Days": int(want)}:
+    sys.exit("lifecycle rule expires after %r, expected %s days" % (rule.get("Expiration"), want))
+if 'lifecycle_bucket="langfuse"' not in script:
+    sys.exit("lifecycle rule is not applied to the Langfuse bucket")
+if "Rules[?ID!='$rule_id']" not in script:
+    sys.exit("other lifecycle rules on the bucket must be preserved")
+PYEOF
+}
+RETENTION_DEFAULT="$TMP/retention-default.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml > "$RETENTION_DEFAULT"
+check_event_retention "$RETENTION_DEFAULT" 2 || fail "default render must expire Langfuse event uploads after 2 days"
+RETENTION_SET="$TMP/retention-set.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=7 > "$RETENTION_SET"
+check_event_retention "$RETENTION_SET" 7 || fail "an explicit retentionDays must set the expiration"
+RETENTION_OFF="$TMP/retention-off.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=0 > "$RETENTION_OFF"
+check_event_retention "$RETENTION_OFF" none || fail "retentionDays=0 must render no lifecycle rule"
+echo "  ok: rustfs-init expires events/ after retentionDays (default 2), and 0 disables it"
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init command waits quietly with bounded retries before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."
+echo "=== Assertion 18: hook priority classes respect pre-install and pre-upgrade exceptions (#3206) ==="
+HOOK_PRIO_CHECK="$TMP/check_hook_priority.py"
+cat > "$HOOK_PRIO_CHECK" <<'PYEOF'
+"""Check every rendered Helm hook Job template and Pod spec by Helm phase."""
+import sys
+
+import yaml
+
+render, expected, operation, provider = sys.argv[1:]
+if operation not in ("install", "upgrade") or provider not in ("chart", "operator"):
+    sys.exit("hook priority checker needs install/upgrade and chart/operator")
+
+expected_preinstall = {
+    ("Job", "curie-preflight-avx"): {"pre-install", "pre-upgrade", "test"},
+    ("Job", "curie-preflight-gvisor"): {"pre-install", "pre-upgrade", "test"},
+    ("Job", "curie-mail-persistence-preflight"): {"pre-install", "pre-upgrade", "test"},
+}
+expected_preupgrade = {
+    **expected_preinstall,
+    ("Job", "curie-schema-migrate"): {"post-install", "pre-upgrade"},
+    ("Job", "curie-upgrade-drain"): {"pre-upgrade"},
+    ("Job", "curie-upgrade-drain-attest"): {"pre-upgrade"},
+}
+expected_grafana = {
+    ("Job", "curie-grafana-token-updater"): {"post-install", "post-upgrade"},
+    ("Job", "curie-grafana-token-cleanup"): {"pre-delete"},
+}
+counts = {"Job": 0, "Pod": 0}
+errors = []
+preinstall = {}
+preupgrade = {}
+grafana = {}
+exempt = 0
+platform_created = False
+with open(render) as stream:
+    for doc in yaml.safe_load_all(stream):
+        if not isinstance(doc, dict):
+            continue
+        metadata = doc.get("metadata") or {}
+        if doc.get("kind") == "PriorityClass" and metadata.get("name") == expected:
+            platform_created = True
+        if doc.get("kind") not in counts:
+            continue
+        hook = (metadata.get("annotations") or {}).get("helm.sh/hook")
+        if not hook:
+            continue
+        kind = doc["kind"]
+        name = metadata.get("name", "<unnamed>")
+        key = kind, name
+        phases = {phase.strip() for phase in hook.split(",")}
+        counts[kind] += 1
+        if "pre-install" in phases:
+            preinstall[key] = phases
+        if "pre-upgrade" in phases:
+            preupgrade[key] = phases
+        if key in expected_grafana:
+            grafana[key] = phases
+        spec = doc.get("spec") or {}
+        if kind == "Job":
+            spec = ((spec.get("template") or {}).get("spec") or {})
+        actual = spec.get("priorityClassName")
+        # Chart-managed class creation follows pre-install hooks. An upgrade
+        # can also begin without that class after a failed install or rename.
+        omit = provider == "chart" and (
+            (operation == "install" and "pre-install" in phases)
+            or (operation == "upgrade" and "pre-upgrade" in phases)
+        )
+        required = None if omit else expected
+        if omit:
+            exempt += 1
+        if actual != required:
+            errors.append(
+                f"hook {kind} {name} has priorityClassName={actual!r}, "
+                f"expected {required!r} for {operation} with {provider} class"
+            )
+if platform_created != (provider == "chart"):
+    errors.append(f"platform PriorityClass creation differs from {provider} mode")
+if preinstall != expected_preinstall:
+    errors.append(f"pre-install hook inventory {preinstall!r} differs from {expected_preinstall!r}")
+if preupgrade != expected_preupgrade:
+    errors.append(f"pre-upgrade hook inventory {preupgrade!r} differs from {expected_preupgrade!r}")
+if grafana != expected_grafana:
+    errors.append(f"Grafana hook inventory {grafana!r} differs from {expected_grafana!r}")
+for kind, count in counts.items():
+    if count == 0:
+        errors.append(f"render contains no Helm hook {kind}; check would pass vacuously")
+for error in errors:
+    sys.stderr.write(error + "\n")
+if errors:
+    sys.exit(1)
+print(
+    f"  ok: {counts['Job']} hook Jobs and {counts['Pod']} hook Pods checked; "
+    f"{exempt} early hooks omit the class in {operation} with {provider} class"
+)
+PYEOF
+
+HOOK_PRIO_HELM_ARGS=(
+  "${PRIO_HELM_ARGS[@]}"
+  --set security.gvisor.mode=require
+  --set grafanaConnector.enabled=true
+)
+HOOK_PRIO_DEFAULT="$TMP/hook-priority-default.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" > "$HOOK_PRIO_DEFAULT"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_DEFAULT" curie-platform install chart \
+  || fail "chart-created class install render violates the pre-install hook priority exception."
+
+HOOK_PRIO_UPGRADE="$TMP/hook-priority-upgrade.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" --is-upgrade > "$HOOK_PRIO_UPGRADE"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_UPGRADE" curie-platform upgrade chart \
+  || fail "chart-created class upgrade render violates the pre-upgrade hook priority exception."
+
+HOOK_PRIO_OPERATOR="$TMP/hook-priority-operator.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
+  --set priorityClasses.platform.create=false \
+  --set priorityClasses.platform.name=operator-platform-class \
+  > "$HOOK_PRIO_OPERATOR"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR" operator-platform-class install operator \
+  || fail "operator class install render has a hook Job or Pod without the named platform class."
+
+HOOK_PRIO_OPERATOR_UPGRADE="$TMP/hook-priority-operator-upgrade.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" --is-upgrade \
+  --set priorityClasses.platform.create=false \
+  --set priorityClasses.platform.name=operator-platform-class \
+  > "$HOOK_PRIO_OPERATOR_UPGRADE"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR_UPGRADE" operator-platform-class upgrade operator \
+  || fail "operator class upgrade render has a hook Job or Pod without the named platform class."
+
+echo "=== Assertion 18: chart-created gVisor RuntimeClass moves its hook after install ==="
+HOOK_PRIO_GVISOR_CREATED="$TMP/hook-priority-gvisor-runtime-class.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
+  --set security.gvisor.installRuntimeClass=true \
+  --set priorityClasses.platform.name=gvisor-install-platform-class \
+  > "$HOOK_PRIO_GVISOR_CREATED"
+HOOK_PRIO_GVISOR_CHECK="$TMP/check_gvisor_hook_priority.py"
+cat > "$HOOK_PRIO_GVISOR_CHECK" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as stream:
+    documents = [doc for doc in yaml.safe_load_all(stream) if isinstance(doc, dict)]
+name = "curie-preflight-gvisor"
+expected_class = "gvisor-install-platform-class"
+hooks = [
+    doc for doc in documents
+    if doc.get("kind") == "Job" and (doc.get("metadata") or {}).get("name") == name
+]
+if len(hooks) != 1:
+    sys.exit(f"expected one {name} Job, found {len(hooks)}")
+hook = hooks[0]
+phases = {
+    phase.strip()
+    for phase in ((hook.get("metadata") or {}).get("annotations") or {}).get("helm.sh/hook", "").split(",")
+}
+expected_phases = {"post-install", "post-upgrade", "test"}
+if phases != expected_phases:
+    sys.exit(f"{name} has hook phases {phases!r}, expected {expected_phases!r}")
+spec = (((hook.get("spec") or {}).get("template") or {}).get("spec") or {})
+actual_class = spec.get("priorityClassName")
+if actual_class != expected_class:
+    sys.exit(f"{name} has priorityClassName={actual_class!r}, expected {expected_class!r}")
+created = [
+    doc for doc in documents
+    if doc.get("kind") == "PriorityClass"
+    and (doc.get("metadata") or {}).get("name") == expected_class
+]
+if len(created) != 1:
+    sys.exit(f"expected one chart-created PriorityClass {expected_class}, found {len(created)}")
+print(f"  ok: {name} runs after install and uses {expected_class}")
+PYEOF
+python3 "$HOOK_PRIO_GVISOR_CHECK" "$HOOK_PRIO_GVISOR_CREATED" \
+  || fail "chart-created gVisor RuntimeClass render has an invalid preflight phase or platform class."
+
+echo "=== Assertion 18 negative controls: classless hooks and classified pre-install hook FAIL ==="
+python3 - "$HOOK_PRIO_DEFAULT" "$HOOK_PRIO_UPGRADE" "$HOOK_PRIO_OPERATOR" "$HOOK_PRIO_OPERATOR_UPGRADE" "$HOOK_PRIO_GVISOR_CREATED" "$TMP" <<'PYEOF'
+import copy
+import sys
+
+import yaml
+
+for source, label, kind, preinstall, classified, class_name, target in (
+    (sys.argv[1], "job", "Job", False, False, "curie-platform", None),
+    (sys.argv[1], "pod", "Pod", False, False, "curie-platform", None),
+    (sys.argv[1], "exempt", "Job", True, True, "curie-platform", "curie-preflight-avx"),
+    (sys.argv[2], "upgrade", "Job", False, True, "curie-platform", "curie-schema-migrate"),
+    (sys.argv[3], "operator", "Job", True, False, "operator-platform-class", "curie-preflight-avx"),
+    (sys.argv[4], "operator_upgrade", "Job", False, False, "operator-platform-class", "curie-schema-migrate"),
+    (sys.argv[5], "gvisor", "Job", False, False, "gvisor-install-platform-class", "curie-preflight-gvisor"),
+):
+    with open(source) as stream:
+        documents = list(yaml.safe_load_all(stream))
+    mutant = copy.deepcopy(documents)
+    for doc in mutant:
+        if not isinstance(doc, dict) or doc.get("kind") != kind:
+            continue
+        metadata = doc.get("metadata") or {}
+        hook = (metadata.get("annotations") or {}).get("helm.sh/hook", "")
+        if not hook or ("pre-install" in hook.split(",")) != preinstall:
+            continue
+        if target is not None and metadata.get("name") != target:
+            continue
+        spec = doc["spec"]
+        if kind == "Job":
+            spec = spec["template"]["spec"]
+        if classified:
+            if spec.get("priorityClassName") is not None:
+                sys.exit(f"expected classless early hook in {source}")
+            spec["priorityClassName"] = class_name
+        else:
+            if spec.get("priorityClassName") != class_name:
+                sys.exit(f"expected classified hook in {source}")
+            del spec["priorityClassName"]
+        with open(f"{sys.argv[6]}/hook-priority-mutant-{label}.yaml", "w") as stream:
+            yaml.safe_dump_all(mutant, stream)
+        break
+    else:
+        sys.exit(f"negative control found no eligible Helm hook {kind} for {label}")
+PYEOF
+for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
+  case "$case_name" in
+    job) expected_error="hook Job "*"has priorityClassName=None" ;;
+    pod) expected_error="hook Pod "*"has priorityClassName=None" ;;
+    exempt) expected_error="hook Job curie-preflight-avx has priorityClassName='curie-platform', expected None" ;;
+    upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName='curie-platform', expected None" ;;
+    operator) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'operator-platform-class'" ;;
+    operator_upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName=None, expected 'operator-platform-class'" ;;
+    gvisor) expected_error="curie-preflight-gvisor has priorityClassName=None, expected 'gvisor-install-platform-class'" ;;
+  esac
+  negative_output=""
+  check_operation=install
+  if [[ "$case_name" == upgrade || "$case_name" == operator_upgrade ]]; then
+    check_operation=upgrade
+  fi
+  check_provider=chart
+  check_class=curie-platform
+  if [[ "$case_name" == operator || "$case_name" == operator_upgrade ]]; then
+    check_provider=operator
+    check_class=operator-platform-class
+  fi
+  if [[ "$case_name" == gvisor ]]; then
+    if negative_output="$(python3 "$HOOK_PRIO_GVISOR_CHECK" "$TMP/hook-priority-mutant-gvisor.yaml" 2>&1)"; then
+      fail "hook gvisor negative control passed the priority class assertion."
+    fi
+  elif negative_output="$(python3 "$HOOK_PRIO_CHECK" "$TMP/hook-priority-mutant-$case_name.yaml" "$check_class" "$check_operation" "$check_provider" 2>&1)"; then
+    fail "hook $case_name negative control passed the priority class assertion."
+  fi
+  if [[ "$negative_output" != *$expected_error* ]]; then
+    fail "hook $case_name negative control failed unexpectedly: $negative_output"
+  fi
+done
+echo "  ok: classless Job and Pod hooks, classified chart-managed early hooks, classless operator-provided early hooks, and a classless gVisor post-install hook are rejected"
+
+echo
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."

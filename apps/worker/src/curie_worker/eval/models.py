@@ -159,7 +159,7 @@ class EvalCase(BaseModel):
     result instead of a red one.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
     input: str

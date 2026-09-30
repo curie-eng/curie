@@ -79,3 +79,17 @@ curie skill eval --plugin-dir examples/squawk
 The skill tier has no platform behind it, so the stack is per-session there.
 Deploy it to the local or cluster tier for the durable, agent-global stack the
 bundle is actually about.
+
+## Eval case rationale
+
+### push-acknowledges-and-says-nothing-else
+
+A non-empty message is a push, and the whole reply is the acknowledgement. Anchored at both ends on purpose: the failure this catches is not a wrong word, it is a model that answers correctly and then adds 'I've added that to the stack. Anything else?'. That extra sentence is what makes a deterministic-looking bot read as a chatbot wearing its name.
+
+### pop-answers-in-one-of-the-two-valid-shapes
+
+An empty message pops, and there are exactly two right answers: the entry, or that there is none. The grader accepts both because the stack is agent-global and durable, so what is on it depends on what was said earlier -- a case that demanded an entry would go red on a freshly deployed agent, which is not a bug in the agent. What it REJECTS is the interesting half: a bare 'Squawk!' is a well-formed push acknowledgement and a meaningless pop, and this pattern requires either a payload after the bang or the no-entry sentence, so the ack alone fails. AN EARLIER VERSION GRADED THE TRAJECTORY (tool_called on mcp__curie-state__get) on the belief that no pattern could separate those two. That was wrong, and it was also ungradeable: the falsifiability gate proves each grader can go green against a known-good ANSWER, and a text exemplar carries no tool calls, so a trajectory grader could never be proved to work at all.
+
+### whitespace-only-is-empty-and-pops
+
+Trimming decides push versus pop, so whitespace must take the pop branch. Same two accepted shapes as the case above, for the same reason. What is being asserted here is narrower: that three spaces did NOT get pushed as an entry. The failure mode is a bundle that tests `if message:` instead of `if message.strip():` and quietly accumulates blank rows.

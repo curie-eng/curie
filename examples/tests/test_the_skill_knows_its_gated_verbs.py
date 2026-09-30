@@ -1,4 +1,4 @@
-"""A bundle's skill names every gated verb the bundle ships.
+"""A bundle's skill names every gated connector verb the bundle ships.
 
 The failure this exists to stop, from the install it happened on:
 
@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 
 import pytest
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
@@ -42,6 +43,8 @@ def _gated_verbs() -> list[tuple[str, str, Path]]:
     Scoped to ``mcp__`` gates for the same reason the permission-map guard is: a
     gate on a built-in like ``Bash`` is not a capability the bundle ships, and
     demanding the skill name it would fail on a fixture with no skill at all.
+    Platform publication is runtime owned too, so its one exported live name is
+    excluded without exempting the rest of the ``mcp__curie__`` namespace.
     """
 
     found: list[tuple[str, str, Path]] = []
@@ -52,6 +55,8 @@ def _gated_verbs() -> list[tuple[str, str, Path]]:
         for gate in gates:
             name = gate.get("gate") if isinstance(gate, dict) else None
             if not name or not str(name).startswith("mcp__"):
+                continue
+            if str(name) == PLATFORM_PUBLISH_TOOL_NAME:
                 continue
             # `mcp__<server>__<tool>` -> `<tool>`
             tool = str(name).rsplit("__", 1)[-1]
@@ -64,6 +69,27 @@ def test_the_bundles_and_their_skills_are_readable() -> None:
     # A guard that silently finds nothing passes vacuously, which is the failure
     # mode of every check that reads files by glob.
     assert _gated_verbs(), "no gated verbs with skills found: check the glob"
+
+
+def test_only_runtime_owned_publication_is_excluded_from_sre_connector_verbs() -> None:
+    manifest = json.loads(
+        (EXAMPLES / "sre-bot/.claude-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    declared = {gate["gate"] for gate in manifest["approvalPolicy"]["gates"]}
+    assert PLATFORM_PUBLISH_TOOL_NAME in declared
+
+    sre_verbs = {tool for bundle, tool, _skill in _gated_verbs() if bundle == "sre-bot"}
+    assert sre_verbs == {
+        "pods_delete",
+        "pods_exec",
+        "pods_run",
+        "resources_create_or_update",
+        "resources_delete",
+        "resources_scale",
+        "upgrade_platform",
+        "upgrade_self",
+    }
+    assert "publish_changes" not in sre_verbs
 
 
 @pytest.mark.parametrize(

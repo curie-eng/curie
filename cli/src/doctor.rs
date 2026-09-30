@@ -132,6 +132,12 @@ pub struct Facts {
     /// runnable, while `model_pin_fix` keeps its own `<ns>`/`<release>`
     /// placeholders (#1950).
     pub target: Option<(String, String)>,
+    /// A validated `curie.yaml` was loaded for this doctor run, so a release
+    /// model remedy can update the declared installation and reapply it.
+    pub declared_installation: bool,
+    /// The exact observed context when it differs from the file's context.
+    /// The apply remedy passes it explicitly to address this same cluster.
+    pub apply_context: Option<String>,
     /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
     /// The credential itself is deliberately discarded during observation.
     pub model_credential_provider: Option<&'static str>,
@@ -251,6 +257,53 @@ fn ready_workload_replicas(items: &[serde_json::Value]) -> usize {
                 .unwrap_or(0) as usize
         })
         .sum()
+}
+
+/// The worker claim gate's row. Rendered even when the release is not serving:
+/// a cancelled `helm upgrade` leaves the latest revision `failed`, which is when
+/// a lingering quiesce marker most needs reporting (#3198).
+fn worker_claims_check(
+    worker_claims: &crate::worker_claims::ClaimsState,
+    namespace: &str,
+    release: &str,
+) -> Check {
+    match worker_claims {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            ok("worker-claims", "Worker claims", "claims enabled")
+        }
+        crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
+            let detail = worker_claims
+                .wait_reason()
+                .expect("a quiescing claim state has a wait reason");
+            missing(
+                "worker-claims",
+                "Worker claims",
+                detail,
+                format!(
+                    "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
+                     --namespace {namespace} --release {release}` and `{}`",
+                    targeted("status", namespace, release)
+                ),
+            )
+        }
+        crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => missing(
+            "worker-claims",
+            "Worker claims",
+            worker_claims
+                .wait_reason()
+                .expect("a metadata-free quiescing state has a wait reason"),
+            format!(
+                "wait for the current upgrade to finish, then re-run `curie doctor \
+                 --namespace {namespace} --release {release}` and `{}`",
+                targeted("status", namespace, release)
+            ),
+        ),
+        crate::worker_claims::ClaimsState::Unknown => skipped(
+            "worker-claims",
+            "Worker claims",
+            "worker claim state unknown",
+        ),
+    }
 }
 
 /// Why an Installed helm record is not serving. Only Helm's `failed` status
@@ -646,27 +699,35 @@ pub(crate) fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// The command that pins the model at the source it is actually in force from.
+/// Pin the model at the source it is actually in force from.
 ///
-/// Bare and runnable, with angle-bracket placeholders only: a fix string that
-/// names a flag which does not exist fails for whoever pastes it (#1813). Note
-/// `curie cluster up` has NO `--model` -- that flag belongs to `skill up` -- so
-/// the release default is set through `--set <key>=`, where the key is the one
-/// the release actually reads ([`ReleaseModelKey`]) rather than always
-/// `agentSandbox.runner.model`, which a local-inference install ignores. The
-/// namespace and release come from the run itself rather than defaulting to
-/// `curie/curie` (#1358 item 1).
+/// A file backed release gets the chart key under `set:` and an apply command.
+/// Direct cluster diagnosis keeps the runnable `cluster up --set` command.
+/// Both paths use the key the release actually reads ([`ReleaseModelKey`]);
+/// local inference installs ignore `agentSandbox.runner.model`. Direct cluster
+/// commands name the namespace and release diagnosed by this run (#1358).
 fn model_pin_fix(f: &Facts, source: &ModelSource) -> String {
     match source {
         ModelSource::Agent(name) => {
             format!("curie cluster overrides {name} --model <dated-snapshot-id>")
         }
         ModelSource::ReleaseDefault(key) => {
+            let key = key.chart_key();
+            if f.declared_installation {
+                let apply = match f.apply_context.as_deref() {
+                    Some(context) => {
+                        format!("curie apply --context {}", crate::ops::shell_quote(context))
+                    }
+                    None => "curie apply".to_string(),
+                };
+                return format!(
+                    "set `{key}: \"<dated-snapshot-id>\"` under `set:` in `curie.yaml`, then run `{apply}`"
+                );
+            }
             let (namespace, release) = match &f.target {
                 Some((namespace, release)) => (namespace.as_str(), release.as_str()),
                 None => ("<ns>", "<release>"),
             };
-            let key = key.chart_key();
             format!(
                 "curie cluster up --namespace {namespace} --release {release} \
                  --set {key}=<dated-snapshot-id>"
@@ -1066,47 +1127,14 @@ fn evaluate_with_worker_claims(
         ] {
             out.push(skipped(id, title, reason));
         }
+        if let Some(worker_claims) = worker_claims {
+            out.push(worker_claims_check(worker_claims, namespace, release));
+        }
         return out;
     }
 
     if let Some(worker_claims) = worker_claims {
-        out.push(match worker_claims {
-            crate::worker_claims::ClaimsState::ClaimsEnabled => {
-                ok("worker-claims", "Worker claims", "claims enabled")
-            }
-            crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
-                let detail = worker_claims
-                    .wait_reason()
-                    .expect("a quiescing claim state has a wait reason");
-                missing(
-                    "worker-claims",
-                    "Worker claims",
-                    detail,
-                    format!(
-                        "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
-                         --namespace {namespace} --release {release}` and `{}`",
-                        targeted("status", namespace, release)
-                    ),
-                )
-            }
-            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => missing(
-                "worker-claims",
-                "Worker claims",
-                worker_claims
-                    .wait_reason()
-                    .expect("a metadata-free quiescing state has a wait reason"),
-                format!(
-                    "wait for the current upgrade to finish, then re-run `curie doctor \
-                     --namespace {namespace} --release {release}` and `{}`",
-                    targeted("status", namespace, release)
-                ),
-            ),
-            crate::worker_claims::ClaimsState::Unknown => skipped(
-                "worker-claims",
-                "Worker claims",
-                "worker claim state unknown",
-            ),
-        });
+        out.push(worker_claims_check(worker_claims, namespace, release));
     }
 
     if f.mail_channels.is_empty() {
@@ -1176,7 +1204,7 @@ fn evaluate_with_worker_claims(
         (false, false) => skipped(
             "slack",
             "Slack",
-            "no tokens recorded; reachable with `curie cluster message`",
+            "no tokens recorded; reachable with `curie cluster message` and `curie cluster eval`",
         ),
     });
 
@@ -1319,7 +1347,7 @@ pub fn summary(checks: &[Check]) -> String {
     }
     if !has("slack") {
         return "Deployable to the cluster. Slack is not wired; talk to the agent with \
-                `curie cluster message`."
+                `curie cluster message` or `curie cluster eval`."
             .to_string();
     }
     if !has("clone-credential")
@@ -1557,6 +1585,56 @@ mod tests {
 
     fn find<'a>(checks: &'a [Check], id: &str) -> &'a Check {
         checks.iter().find(|c| c.id == id).expect(id)
+    }
+
+    /// #3127: the worker-claims detail names the marker's remaining TTL, so an
+    /// operator can tell a live drain from a marker about to lapse.
+    #[test]
+    fn worker_claims_detail_names_the_remaining_marker_ttl() {
+        let quiescing = crate::worker_claims::ClaimsState::Quiescing {
+            since: "2026-09-25T10:00:00+00:00".into(),
+            revision: 7,
+            ttl_seconds: Some(120),
+        };
+        let checks = evaluate_with_worker_claims(&wired(), Some(&quiescing));
+        let check = find(&checks, "worker-claims");
+        assert_eq!(check.state, State::Missing);
+        assert_eq!(
+            check.detail,
+            "waiting for upgrade revision 7 since 2026-09-25T10:00:00+00:00; \
+             marker expires in 120s"
+        );
+
+        let unavailable = crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable {
+            ttl_seconds: Some(30),
+        };
+        let checks = evaluate_with_worker_claims(&wired(), Some(&unavailable));
+        assert!(find(&checks, "worker-claims")
+            .detail
+            .contains("marker expires in 30s"));
+    }
+
+    /// #3198: a cancelled `helm upgrade` leaves the latest revision `failed`,
+    /// which is exactly when the quiesce marker matters. The worker-claims row
+    /// must still render, not be dropped with the values-backed checks.
+    #[test]
+    fn worker_claims_still_render_when_the_latest_revision_failed() {
+        let mut f = wired();
+        f.release_status = Some("failed".into());
+        let quiescing = crate::worker_claims::ClaimsState::Quiescing {
+            since: "2026-09-27T11:50:00+00:00".into(),
+            revision: 3,
+            ttl_seconds: Some(24),
+        };
+        let checks = evaluate_with_worker_claims(&f, Some(&quiescing));
+        assert_eq!(find(&checks, "release").state, State::Missing);
+        let claims = find(&checks, "worker-claims");
+        assert_eq!(claims.state, State::Missing);
+        assert!(
+            claims.detail.contains("marker expires in 24s"),
+            "the row must name the marker expiry: {}",
+            claims.detail
+        );
     }
 
     /// The one check this issue is about, pulled out of a full `evaluate`.
@@ -3136,16 +3214,6 @@ case "$*" in
 esac
 "#;
 
-    fn write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write fake cluster executable");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .expect("read fake cluster executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
-    }
-
     /// Fake `kubectl`, `helm` and `docker` on `PATH`, plus the variables their
     /// bodies read, so `gather()` can be driven all the way through its
     /// cluster reads without a cluster.
@@ -3170,9 +3238,9 @@ esac
         /// `Facts::model_release_default` is fed from.
         fn install(computed: &str) -> Self {
             let tools = tempfile::tempdir().expect("create fake cluster tool directory");
-            write_executable(&tools.path().join("docker"), "#!/bin/sh\nexit 0\n");
-            write_executable(&tools.path().join("kubectl"), KUBECTL_STUB);
-            write_executable(&tools.path().join("helm"), HELM_STUB);
+            crate::test_executable::install(&tools.path().join("docker"), "#!/bin/sh\nexit 0\n");
+            crate::test_executable::install(&tools.path().join("kubectl"), KUBECTL_STUB);
+            crate::test_executable::install(&tools.path().join("helm"), HELM_STUB);
 
             let mut entries = vec![tools.path().to_path_buf()];
             entries.extend(std::env::split_paths(
@@ -3771,33 +3839,67 @@ esac
     /// The chart template consumes the existing Secret when one is set, so that
     /// is what the report must name. Reporting both would invite an operator to
     /// "fix" an install that is already working.
+    ///
+    /// #1253: an unquoted `githubAppId: 4475970` in a values file is a live,
+    /// GitOps-common shape, and a `as_str()`-only read called that install
+    /// credential-less. The scientific-notation form is the same value.
+    ///
+    /// The empty-string filter predates the coercion widening and must survive
+    /// it: a chart default of `""` is an unset field, not a credential.
     #[test]
-    fn clone_credential_prefers_the_existing_secret_over_inline_key_material() {
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppExistingSecret": "gh-app"}})),
-            Some("github app (secret=gh-app)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": "4475970"}})),
-            Some("github app (app_id=4475970)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubToken": "ghp_PLACEHOLDER"}})),
-            Some("personal access token".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {
-                "githubAppExistingSecret": "gh-app",
-                "githubAppId": "4475970"
-            }})),
-            Some("github app (secret=gh-app)".to_string()),
-            "the Secret path is what the chart consumes, so it wins the report"
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {}})),
-            None,
-            "nothing recorded is still nothing"
-        );
+    fn clone_credential_from_values_cases() {
+        let cases = [
+            (
+                "existing_secret",
+                json!({"api": {"githubAppExistingSecret": "gh-app"}}),
+                Some("github app (secret=gh-app)"),
+            ),
+            (
+                "string_app_id",
+                json!({"api": {"githubAppId": "4475970"}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            (
+                "personal_access_token",
+                json!({"api": {"githubToken": "ghp_PLACEHOLDER"}}),
+                Some("personal access token"),
+            ),
+            // The Secret path is what the chart consumes, so it wins the report.
+            (
+                "secret_wins_over_inline_app_id",
+                json!({"api": {
+                    "githubAppExistingSecret": "gh-app",
+                    "githubAppId": "4475970"
+                }}),
+                Some("github app (secret=gh-app)"),
+            ),
+            // Nothing recorded is still nothing.
+            ("nothing_recorded", json!({"api": {}}), None),
+            (
+                "numeric_app_id",
+                json!({"api": {"githubAppId": 4475970}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            // An integral float is the same app id, not a new one.
+            (
+                "integral_float_app_id",
+                json!({"api": {"githubAppId": 4.47597e6}}),
+                Some("github app (app_id=4475970)"),
+            ),
+            // An empty app id is not a clone credential.
+            (
+                "empty_string_app_id",
+                json!({"api": {"githubAppId": ""}}),
+                None,
+            ),
+        ];
+        for (name, values, expected) in cases {
+            assert_eq!(
+                clone_credential_from_values(&values),
+                expected.map(String::from),
+                "{name}"
+            );
+        }
     }
 
     /// Names, never values (#1348). The Secret's KEY name is adjacent in the
@@ -3823,22 +3925,6 @@ esac
     }
 
     // -- D4: type-tolerant reads ---------------------------------------------
-
-    /// #1253: an unquoted `githubAppId: 4475970` in a values file is a live,
-    /// GitOps-common shape, and a `as_str()`-only read called that install
-    /// credential-less. The scientific-notation form is the same value.
-    #[test]
-    fn a_numeric_app_id_in_a_values_file_is_still_a_clone_credential() {
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": 4475970}})),
-            Some("github app (app_id=4475970)".to_string())
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": 4.47597e6}})),
-            Some("github app (app_id=4475970)".to_string()),
-            "an integral float is the same app id, not a new one"
-        );
-    }
 
     /// The issue's §4 symptom, asserted as the operator sees it: an install
     /// whose ingress is already on printed `MISS  Push delivery`, because
@@ -3949,54 +4035,27 @@ esac
 
     /// The empty-string filter predates the coercion widening and must survive
     /// it: a chart default of `""` is an unset field, not a credential.
-    #[test]
-    fn an_empty_string_value_is_still_absent() {
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": ""}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            clone_credential_from_values(&json!({"api": {"githubAppId": ""}})),
-            None,
-            "an empty app id is not a clone credential"
-        );
-    }
-
+    ///
     /// Widening string|number|bool must not become "stringify anything": an
     /// array or an object at a scalar path is a shape this reader does not
     /// understand, and rendering its debug form into a detail is how structure
     /// leaks into a report.
     #[test]
-    fn a_non_scalar_value_is_absent() {
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": ["4475970"]}}),
-                &["api", "githubAppId"]
+    fn scalar_at_absent_cases() {
+        let cases = [
+            ("empty_string", json!({"api": {"githubAppId": ""}})),
+            ("array", json!({"api": {"githubAppId": ["4475970"]}})),
+            (
+                "object",
+                json!({"api": {"githubAppId": {"value": "4475970"}}}),
             ),
-            None
-        );
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": {"value": "4475970"}}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            scalar_at(
-                &json!({"api": {"githubAppId": null}}),
-                &["api", "githubAppId"]
-            ),
-            None
-        );
-        assert_eq!(
-            scalar_at(&json!({"api": {}}), &["api", "githubAppId"]),
-            None,
-            "an absent path is absent"
-        );
+            ("null", json!({"api": {"githubAppId": null}})),
+            // An absent path is absent.
+            ("absent_path", json!({"api": {}})),
+        ];
+        for (name, values) in cases {
+            assert_eq!(scalar_at(&values, &["api", "githubAppId"]), None, "{name}");
+        }
     }
 
     // -- D5: helm-missing, could-not-answer and absent are distinguishable ----
@@ -4526,11 +4585,17 @@ esac
             c.detail
         );
         assert!(
+            c.detail.contains("cluster eval"),
+            "point at cluster eval as well: {}",
+            c.detail
+        );
+        assert!(
             c.fix.is_none(),
             "do not send the operator to mint Slack: {c:?}"
         );
         let s = summary(&checks);
         assert!(s.contains("cluster message"), "{s}");
+        assert!(s.contains("cluster eval"), "{s}");
         assert!(s.contains("Slack is not wired"), "{s}");
         assert!(
             !s.contains("no way to be reached"),
@@ -4551,49 +4616,42 @@ esac
     }
 
     /// An absent release is still unready. Optional Slack must not paper over
-    /// a platform that is not there.
+    /// a platform that is not there. helm/kubectl not answering is an
+    /// unavailable cluster API, not optional Slack. `ready` must stay false.
     #[test]
-    fn an_absent_release_stays_unready_when_slack_is_unset() {
-        let f = Facts {
-            slack_app_token: false,
-            slack_bot_token: false,
-            release: ReleaseProbe::NotInstalled,
-            ..wired()
-        };
-        let checks = evaluate(&f);
-        let out = DoctorOutput {
-            summary: summary(&checks),
-            checks,
-        };
-        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
-        assert!(
-            !out.summary.contains("cluster message"),
-            "do not point at cluster message when there is no release: {}",
-            out.summary
-        );
-    }
-
-    /// helm/kubectl not answering is an unavailable cluster API, not optional
-    /// Slack. `ready` must stay false.
-    #[test]
-    fn a_failed_release_probe_stays_unready_when_slack_is_unset() {
-        let f = Facts {
-            slack_app_token: false,
-            slack_bot_token: false,
-            release: ReleaseProbe::ProbeFailed,
-            ..wired()
-        };
-        let checks = evaluate(&f);
-        let out = DoctorOutput {
-            summary: summary(&checks),
-            checks,
-        };
-        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
-        assert!(
-            !out.summary.contains("no way to be reached"),
-            "{}",
-            out.summary
-        );
+    fn an_unserving_release_stays_unready_when_slack_is_unset() {
+        let cases = [
+            // Do not point at cluster message when there is no release.
+            (
+                "absent_release",
+                ReleaseProbe::NotInstalled,
+                "cluster message",
+            ),
+            (
+                "failed_release_probe",
+                ReleaseProbe::ProbeFailed,
+                "no way to be reached",
+            ),
+        ];
+        for (name, release, forbidden) in cases {
+            let f = Facts {
+                slack_app_token: false,
+                slack_bot_token: false,
+                release,
+                ..wired()
+            };
+            let checks = evaluate(&f);
+            let out = DoctorOutput {
+                summary: summary(&checks),
+                checks,
+            };
+            assert_eq!(
+                out.to_json()["ready"],
+                serde_json::Value::Bool(false),
+                "{name}"
+            );
+            assert!(!out.summary.contains(forbidden), "{name}: {}", out.summary);
+        }
     }
 
     // -- D6b: curie.yaml precedence ------------------------------------------
@@ -5436,12 +5494,16 @@ pub async fn doctor(
     release: &str,
     api_url: Option<&str>,
     api_key: Option<&str>,
+    declared_installation: bool,
+    apply_context: Option<&str>,
 ) -> DoctorOutput {
     let resolved = resolve_api(namespace, release, api_url, api_key).await;
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let (facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let (mut facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    facts.declared_installation = declared_installation;
+    facts.apply_context = apply_context.map(str::to_string);
     let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
     let summary = summary(&checks);
     DoctorOutput { checks, summary }

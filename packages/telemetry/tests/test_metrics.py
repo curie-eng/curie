@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+import time
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -14,11 +18,15 @@ from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from curie_telemetry import build_resource, configure_meter_provider, record_metric
-from curie_telemetry.metrics import declared_metric_manifest
+from curie_telemetry.metrics import declared_metric_manifest, reset_bounded_labels
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.metrics.export import (
+    InMemoryMetricReader,
+    PeriodicExportingMetricReader,
+)
 from opentelemetry.trace import (
     NonRecordingSpan,
     SpanContext,
@@ -28,10 +36,97 @@ from opentelemetry.trace import (
 
 _PACKAGE_ROOT = Path(__file__).parent.parent
 _MANIFEST = _PACKAGE_ROOT / "schema" / "metrics.json"
+_COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.119.0"
+_PROMETHEUS_HISTORY_METRIC = "curie_history_persistence_failure_total"
 
 
 def _read(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
+
+
+def _docker(
+    *args: str,
+    timeout: float = 30,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            ["docker", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AssertionError("docker is required for the Collector translation proof") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(f"docker {' '.join(args)} exceeded {timeout} seconds") from exc
+    if check:
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+    return completed
+
+
+def _published_port(container_id: str, container_port: int) -> int:
+    mappings = _docker("port", container_id, f"{container_port}/tcp").stdout.splitlines()
+    assert len(mappings) == 1, mappings
+    host, separator, port = mappings[0].rpartition(":")
+    assert separator and host == "127.0.0.1", mappings[0]
+    return int(port)
+
+
+def _history_prometheus_values(payload: str) -> tuple[set[str], dict[str, float]]:
+    history_names = set(re.findall(r"\bcurie_history_[a-zA-Z0-9_:]+", payload))
+    assert history_names <= {_PROMETHEUS_HISTORY_METRIC}, history_names
+
+    values: dict[str, float] = {}
+    prefix = f"{_PROMETHEUS_HISTORY_METRIC}{{"
+    for line in payload.splitlines():
+        if not line.startswith(prefix):
+            continue
+        sample, raw_value, *_ = line.split()
+        raw_labels = sample[len(prefix) : -1]
+        labels = {
+            key: json.loads(f'"{value}"')
+            for key, value in re.findall(
+                r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"', raw_labels
+            )
+        }
+        assert labels.get("service_name") == "curie-api", labels
+        assert labels.get("source") == "state-api", labels
+        assert labels.get("outcome") == "capacity", labels
+        limit = labels.get("limit")
+        assert limit is not None and limit in {"value", "namespace"}, labels
+        assert limit not in values, labels
+        values[limit] = float(raw_value)
+    return history_names, values
+
+
+def _wait_for_history_prometheus_values(
+    url: str,
+    container_id: str,
+    expected: dict[str, float],
+    *,
+    timeout: float = 20,
+) -> str:
+    deadline = time.monotonic() + timeout
+    last_error = "not attempted"
+    last_payload = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310
+                last_payload = response.read().decode()
+            _, values = _history_prometheus_values(last_payload)
+            if values == expected:
+                return last_payload
+            last_error = f"last values were {values!r}"
+        except OSError as exc:
+            last_error = str(exc)
+        time.sleep(0.2)
+    logs = _docker("logs", container_id, timeout=10, check=False)
+    raise AssertionError(
+        f"Collector did not expose {expected!r}: {last_error}\n"
+        f"{logs.stdout}{logs.stderr}\n{last_payload}"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -69,10 +164,59 @@ def test_every_metric_declares_a_finite_cardinality_contract() -> None:
         calculated_bound = 1
         for key, domain in attributes.items():
             assert isinstance(key, str) and key
-            assert isinstance(domain, list) and domain
-            assert len(domain) == len(set(domain))
-            calculated_bound *= len(domain)
+            if isinstance(domain, dict):
+                assert domain["kind"] == "bounded"
+                assert isinstance(domain["ceiling"], int) and domain["ceiling"] >= 1
+                reserved = domain["reserved"]
+                assert isinstance(reserved, list) and reserved
+                assert len(reserved) == len(set(reserved))
+                assert domain["overflow"] in reserved
+                assert isinstance(domain.get("pattern"), str) and domain["pattern"]
+                calculated_bound *= domain["ceiling"] + len(reserved)
+            else:
+                assert isinstance(domain, list) and domain
+                assert len(domain) == len(set(domain))
+                calculated_bound *= len(domain)
         assert definition["cardinality_bound"] == calculated_bound, name
+
+
+def test_schedule_fire_counter_has_closed_run_outcome_and_trigger_domains() -> None:
+    definition = _read(_MANIFEST)["metrics"]["curie.schedule.fire"]
+    assert definition["type"] == "counter"
+    assert definition["monotonic"] is True
+    domains = definition["attributes"]
+    assert domains["service.name"] == ["curie-worker"]
+    assert set(domains["outcome"]) == {
+        "ran", "deferred", "skipped", "blocked", "reclaimed", "failed"
+    }
+    assert set(domains["trigger"]) == {"cron", "bind", "webhook", "test"}
+    assert set(domains) == {"service.name", "outcome", "trigger"}
+    assert definition["cardinality_bound"] == len(domains["outcome"]) * 4
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"agent.id": "agent-example"},
+        {"name": "nightly"},
+        {"slot_utc": "2026-09-22T03:00:00Z"},
+        {"outcome": "admitted"},
+        {"trigger": "other"},
+    ],
+)
+def test_schedule_fire_rejects_identity_and_uncommitted_labels(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    extra: dict[str, str],
+) -> None:
+    del metrics
+    attributes = {
+        "service.name": "curie-worker",
+        "outcome": "ran",
+        "trigger": "cron",
+        **extra,
+    }
+    with pytest.raises(ValueError, match="undeclared attribute|outside its declared domain"):
+        record_metric("curie.schedule.fire", attributes=attributes)
 
 
 def test_sandbox_inventory_uses_one_aggregate_series_per_instrument() -> None:
@@ -200,6 +344,203 @@ def test_history_resume_cache_read_is_declared_and_rejects_unbounded_attributes(
         )
 
 
+def test_history_persistence_failure_is_exactly_two_closed_series(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    provider, reader = metrics
+    manifest = _read(_MANIFEST)["metrics"]["curie.history.persistence.failure"]
+    assert manifest == {
+        "type": "counter",
+        "unit": "{failure}",
+        "description": "Transcript persistence failures caused by state capacity limits.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-api"],
+            "source": ["state-api"],
+            "outcome": ["capacity"],
+            "limit": ["value", "namespace"],
+        },
+        "cardinality_bound": 2,
+    }
+
+    for limit in ("value", "namespace"):
+        record_metric(
+            "curie.history.persistence.failure",
+            attributes={
+                "service.name": "curie-api",
+                "source": "state-api",
+                "outcome": "capacity",
+                "limit": limit,
+            },
+        )
+    assert provider.force_flush(timeout_millis=5000)
+    series = _exported_series(reader)["curie.history.persistence.failure"]
+    assert series == {
+        tuple(
+            sorted(
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": limit,
+                }.items()
+            )
+        )
+        for limit in ("value", "namespace")
+    }
+
+
+def test_history_persistence_failure_exports_exact_prometheus_series(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    tmp_path: Path,
+) -> None:
+    module_provider, _ = metrics
+    config = tmp_path / "collector.yaml"
+    config.write_text(
+        """receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+service:
+  telemetry:
+    logs:
+      level: error
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
+""",
+        encoding="utf-8",
+    )
+
+    container_id: str | None = None
+    provider: MeterProvider | None = None
+    created = _docker(
+        "create",
+        "--pull=never",
+        "--publish",
+        "127.0.0.1::4318",
+        "--publish",
+        "127.0.0.1::8889",
+        "--volume",
+        f"{config.resolve()}:/etc/otel/collector-config.yaml:ro",
+        _COLLECTOR_IMAGE,
+        "--config=/etc/otel/collector-config.yaml",
+    )
+    container_id = created.stdout.strip()
+
+    try:
+        assert re.fullmatch(r"[0-9a-f]{64}", container_id), created.stdout
+        _docker("start", container_id)
+        otlp_port = _published_port(container_id, 4318)
+        prometheus_port = _published_port(container_id, 8889)
+        prometheus_url = f"http://127.0.0.1:{prometheus_port}/metrics"
+        _wait_for_history_prometheus_values(prometheus_url, container_id, {})
+
+        reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(
+                endpoint=f"http://127.0.0.1:{otlp_port}/v1/metrics",
+                timeout=5,
+            ),
+            export_interval_millis=60_000,
+            export_timeout_millis=5_000,
+        )
+        provider = MeterProvider(
+            metric_readers=[reader],
+            resource=build_resource(
+                "curie-api",
+                service_version="0.7.0",
+                service_instance_id="acme-api-prometheus-name",
+                deployment_environment="test",
+            ),
+            shutdown_on_exit=False,
+        )
+        configure_meter_provider(provider)
+        attributes = {
+            "service.name": "curie-api",
+            "source": "state-api",
+            "outcome": "capacity",
+        }
+        for limit in ("value", "namespace"):
+            record_metric(
+                "curie.history.persistence.failure",
+                0,
+                attributes={**attributes, "limit": limit},
+            )
+        assert provider.force_flush(timeout_millis=10_000)
+        initial = _wait_for_history_prometheus_values(
+            prometheus_url,
+            container_id,
+            {"value": 0.0, "namespace": 0.0},
+        )
+        names, values = _history_prometheus_values(initial)
+        assert names == {_PROMETHEUS_HISTORY_METRIC}
+        assert values == {"value": 0.0, "namespace": 0.0}
+
+        for limit, increment in (("value", 4), ("namespace", 2)):
+            record_metric(
+                "curie.history.persistence.failure",
+                increment,
+                attributes={**attributes, "limit": limit},
+            )
+        assert provider.force_flush(timeout_millis=10_000)
+        incremented = _wait_for_history_prometheus_values(
+            prometheus_url,
+            container_id,
+            {"value": 4.0, "namespace": 2.0},
+        )
+        names, values = _history_prometheus_values(incremented)
+        assert names == {_PROMETHEUS_HISTORY_METRIC}
+        assert values == {"value": 4.0, "namespace": 2.0}
+    finally:
+        try:
+            if provider is not None:
+                provider.shutdown(timeout_millis=5_000)
+        finally:
+            try:
+                configure_meter_provider(module_provider)
+            finally:
+                if container_id is not None:
+                    removed = _docker("rm", "--force", container_id, check=False)
+                    assert removed.returncode == 0, removed.stderr or removed.stdout
+
+
+@pytest.mark.parametrize(
+    ("attributes", "match"),
+    [
+        ({"agent.id": "agent-example"}, "undeclared attribute"),
+        ({"exception": "ValueError"}, "undeclared attribute"),
+        ({"url": "https://example.com/private"}, "undeclared attribute"),
+        ({"status_text": "payload too large"}, "undeclared attribute"),
+        ({"outcome": "failure"}, "outside its declared domain"),
+        ({"limit": "thread"}, "outside its declared domain"),
+    ],
+)
+def test_history_persistence_failure_rejects_unbounded_labels(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    attributes: dict[str, str],
+    match: str,
+) -> None:
+    del metrics
+    expected = {
+        "service.name": "curie-api",
+        "source": "state-api",
+        "outcome": "capacity",
+        "limit": "value",
+    }
+    expected.update(attributes)
+    with pytest.raises(ValueError, match=match):
+        record_metric("curie.history.persistence.failure", attributes=expected)
+
+
 def test_deadline_halted_is_a_declared_terminal_turn_outcome(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
@@ -223,8 +564,9 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         assert "deadline_halted" in outcomes
         for sibling in ("budget_halted", "interrupted", "side_effect_halted"):
             assert sibling in outcomes
+        assert "capacity_wait_expired" in outcomes
         assert "fenced_out" not in outcomes
-        assert manifest[name]["cardinality_bound"] == 192
+        assert manifest[name]["cardinality_bound"] == 216
 
 
 def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
@@ -282,6 +624,55 @@ def test_supervised_restart_metric_rejects_undeclared_operation_by_execution(
                 "outcome": "crash",
             },
         )
+
+
+def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2952: one agent label, capped. The 33rd distinct slug shares ``other``.
+
+    Calls the real recorder. A non-slug never becomes its own series.
+    """
+
+    provider, reader = metrics
+    reset_bounded_labels()
+    base = {
+        "service.name": "curie-worker",
+        "source": "worker",
+        "outcome": "done",
+    }
+    # Non-slugs and the reserved labels must not consume a ceiling slot.
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "not a slug"},
+    )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "unbound"},
+    )
+    for index in range(32):
+        record_metric(
+            "curie.agent.turn.completed",
+            attributes={**base, "agent": f"acme-{index}"},
+        )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "acme-overflow"},
+    )
+    assert provider.force_flush(timeout_millis=5000)
+    labels = {
+        dict(point)["agent"]
+        for point in _exported_series(reader)["curie.agent.turn.completed"]
+    }
+    assert "acme-0" in labels
+    assert "acme-31" in labels
+    assert "acme-overflow" not in labels
+    assert "other" in labels
+    assert "unbound" in labels
+    assert "not a slug" not in labels
+    manifest = declared_metric_manifest()["metrics"]["curie.agent.turn.completed"]
+    assert manifest["attributes"]["agent"]["ceiling"] == 32
+    assert manifest["cardinality_bound"] == 9 * (32 + 2)
 
 
 def test_record_metric_still_rejects_unknown_turn_outcome(

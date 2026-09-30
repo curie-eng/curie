@@ -115,6 +115,13 @@ selector_kind=
 rust_target=
 rust_test=
 case "$selector" in
+  cli/tests/local/test_*.py::*)
+    selector_file=${selector%%::*}
+    if [[ ! "$selector" =~ ^cli/tests/local/test_[A-Za-z0-9_-]+\.py::([A-Za-z_][A-Za-z0-9_]*::)*test[A-Za-z0-9_]*(\[[A-Za-z0-9_.-]+\])?$ ]]; then
+      fail "unsupported selector: $selector"
+    fi
+    selector_kind=python
+    ;;
   apps/*/tests/*.py::* | packages/*/tests/*.py::* | runner/tests/*.py::*)
     selector_file=${selector%%::*}
     if [[ "$selector" == "$selector_file" || -z "${selector#*::}" ]]; then

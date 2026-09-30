@@ -195,7 +195,7 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   not added to `StreamBroker`. The independent marker protocol is what lets
   prompt recovery protect a live consumer whose `XINFO` idle time is high while
   retaining a 900-second fallback for a pre-marker peer.
-- **The API both writes the runs stream and reads the graveyard outside the ports.**
+- **The API reads and writes the runs stream and reads the graveyard outside the ports.**
   Correcting an earlier claim that the API's redis only backs the kill-switch /
   eval-queue: two off-port `curie:runs` writers sit in the API. The approval-resume
   path enqueues resume turns via `ResumeQueue`
@@ -206,15 +206,22 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   (`apps/api/src/curie_api/delivery.py::enqueue_owned`), used by
   `apps/api/src/curie_api/routers/channels.py` and
   `apps/api/src/curie_api/routers/hooks.py`. Both are an `xadd` (the latter inside
-  EVAL Lua) that bypasses the dispatcher's `StreamPublisher` port entirely. The API also *reads* the worker's
-  `<stream>:dead` graveyard directly, with `xrevrange`/`xrange` on its own raw client:
+  EVAL Lua) that bypasses the dispatcher's `StreamPublisher` port entirely. The hooks
+  router also reads one exact `curie:runs` entry with `xrange` when a delivery claim
+  already holds a stream id
+  (`apps/api/src/curie_api/routers/hooks.py::_landed_conversation_id`). The API also
+  *reads* the worker's `<stream>:dead` graveyard directly, with `xrevrange`/`xrange`
+  on its own raw client:
   `apps/api/src/curie_api/graveyardwatcher.py::GraveyardWatcher` (`xrevrange` to seed the
   cursor in `seed_cursor`, `xrange` to scan in `scan_once`) and
   `apps/api/src/curie_api/resumequeue.py::ResumeQueue.read_dead_letter` (`xrevrange`),
   whose rows the #532 backstop
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler.reopen_dead_lettered_resumes`)
-  consumes. `GraveyardWatcher` and `ResumeQueue.read_dead_letter` may each see
-  both graveyard row families. The watcher alerts on every row but always
+  consumes, plus
+  `apps/api/src/curie_api/github_review_terminal.py::read_review_dead_letter` (`xrange`).
+  `GraveyardWatcher` and `ResumeQueue.read_dead_letter` may each see both
+  graveyard row families. The GitHub review reader considers only stream consumer rows
+  whose original id and payload match the review turn. The watcher alerts on every row but always
   projects the stream-consumer metadata fields `dl_original_id`,
   `dl_delivery_count`, `dl_reason`, and `dl_dead_lettered_at`, using `?` when a
   field is absent; it does not report completion `event_id` or `dl_source`.
@@ -224,7 +231,8 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
   broker must additionally account for the off-port completion-outbox writer,
   the two off-port `curie:runs` writers (`ResumeQueue.enqueue` and
-  `enqueue_owned`), and these two API-side readers. The worker's
+  `enqueue_owned`), the hooks router's direct runs-stream read, and these three
+  API-side graveyard readers. The worker's
   `apps/worker/src/curie_worker/completion_health.py::_recent_terminal_count`
   also reads the graveyard off-port (`xrevrange`, bounded by
   `apps/worker/src/curie_worker/config.py::WorkerConfig.completion_sweep_batch`,

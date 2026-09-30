@@ -71,6 +71,20 @@ generic endpoints as a plugin API:
   an authenticated request to a caller-selected endpoint. Raw broker produce
   access remains first-party only: it could mint a turn or forge its author
   without the ingress API's authentication and dedupe.
+- **A 403 from `POST /channels/turns` with `{"detail": "caller_not_allowed"}`
+  is final, for every adapter.** After the token is verified and before anything
+  is claimed or queued, the API runs the binding's caller list (ADR 0175,
+  `apps/api/src/curie_api/admission.py::admit`) against the turn's `author`, and
+  answers 403 with exactly that `detail` code when the list does not admit it.
+  The adapter settles that delivery without a turn and never retries it, and it
+  sends nothing back to the sender, since a polite refusal tells a stranger the
+  bot exists. Any other 403 (a proxy or firewall in front of the API, or any
+  other check) is NOT a refusal and stays retryable, like 401, 429, 202 and 5xx:
+  settling it would drop real traffic for good. The code is frozen in
+  `tests/vectors/channel-port-refusal.json`. An adapter that retries every error
+  retries the refusal forever;
+  `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.post_turn`
+  is the worked example of settling on the code and only on it.
 - **Binding and reply-route facts are server controlled.** A binding is the
   neutral `{kind, address}` pair (`ChannelBinding`) on `AgentChannel`; its write
   form also records the paired `endpoint` and `adapter` facts an operator sets at
@@ -87,6 +101,19 @@ generic endpoints as a plugin API:
   rendering and transport contract, never a trust boundary: approvals still
   resolve through the API authorizer, and an adapter holds its own channel
   credential rather than platform model credentials.
+- **The reply wire is versioned per body.** Version 1.0
+  (`packages/channel-protocol/src/channel_protocol/reply.py::REPLY_WIRE_VERSION`)
+  is every form an adapter handles today. Version 1.1
+  (`packages/channel-protocol/src/channel_protocol/reply.py::PROGRESS_REPLY_WIRE_VERSION`,
+  ADR-0130) adds an outbound `delivery_id` and a `progress` payload to
+  `reply.update` and `reply.post`. A body is 1.1 exactly when it carries
+  `delivery_id`, so a 1.0 adapter still decodes every body except progress and
+  a delivery-identified post or edit. The reply models are closed, so a 1.0
+  adapter refuses a 1.1 body, and the worker counts that refusal as a delivery
+  failure like any other status at or above 400. The outbound `delivery_id` is
+  the platform's idempotency key for one post or edit. It is unrelated to the
+  inbound `delivery_id` an adapter sends to `POST /channels/turns`, which names
+  the adapter's own upstream message.
 - **A four-rung promotion ladder remains before a port is pluggable.** An
   `INTERFACE.md` documents the line; a contract package makes the line a schema;
   a conformance suite is something a third party runs against its own adapter;
@@ -139,10 +166,15 @@ The deployed-adapter lifecycle remains unbuilt:
   (`runner/src/curie_runner/harness/registry.py::ENTRY_POINT_GROUP`); no
   `curie.<port>` sibling group exists for the narrow in-process exception; and
 - `packages/channel-protocol` provides neutral reply DTOs — `OutboundMessage`
-  (`packages/channel-protocol/src/channel_protocol/models.py::OutboundMessage`)
-  and `ChannelCapabilities`
+  (`packages/channel-protocol/src/channel_protocol/models.py::OutboundMessage`),
+  `ChannelCapabilities`
   (`packages/channel-protocol/src/channel_protocol/models.py::ChannelCapabilities`)
-  — but there is no adapter conformance kit.
+  and the progress payloads
+  (`packages/channel-protocol/src/channel_protocol/progress.py::ProgressCard`,
+  `packages/channel-protocol/src/channel_protocol/progress.py::ProgressMilestone`)
+  — and a reply-wire corpus of 1.0, 1.1 and refused bodies
+  (`packages/channel-protocol/schema/reply-wire.corpus.json`) an adapter can
+  decode in its own tests, but there is no adapter conformance kit.
 
 The generic edges are necessary seam evidence, not second-implementation proof.
 A real, independently supported adapter must use the whole ingress, egress,
@@ -171,12 +203,38 @@ service is material:
   `AgentChannel`, and the channel router validates a scoped token against that
   binding's row id and generation before it enqueues a turn. The route facts
   (`endpoint`, `adapter`) come from the binding row rather than ingress input.
-- **The interactivity return path has no scoped adapter credential.** Approval
-  resolution sits behind the platform-wide key, and the scoped token minted for
-  the sandbox is deliberately rejected everywhere but the state router. A
-  scoped adapter credential for that return path remains a prerequisite of a
-  third-party adapter rather than a follow-up to the first-party HTTP-edge
-  adapters already shipped.
+- **Fixed (#2806, ADR-0154): the interactivity return path has a scoped adapter
+  credential.** `apps/api/src/curie_api/adapter_principal.py` mints an `adp`
+  credential carrying only `channels:token`, `approvals:read`, and
+  `approvals:resolve` for the binding ids it serves. The approval boundary now
+  recognizes the `adapter` kind
+  (`apps/api/src/curie_api/authorizer.py::PrincipalKind`). It no longer needs
+  the platform-wide key at runtime for the return path. No Slack approver set
+  admits an adapter, since only the Slack dispatcher vouches for a Slack ID
+  ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding).
+- **Fixed ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)): an approval is answered where it was asked.** An adapter
+  is served the approvals whose card went to one of its own bindings, and a
+  card shown on its channel is answered by the requester alone
+  (`apps/api/src/curie_api/approvers.py::RequesterOnly`). The platform half
+  needs nothing new on the wire: the worker already posts the card into the
+  thread as a `ReplyPost` carrying a `ConfirmIntent` with the approval id, and
+  settles it on resume with a `ReplyUpdate` carrying `settled`. An adapter that
+  takes approvals owes the rest: render the intent for its channel (for email,
+  "Reply with APPROVE or REJECT on the first line"), return a `ReplyAck.ref`
+  for the card so the worker can settle it, keep a random single-use reference
+  per approval, and accept a reply as an answer only when it passes the
+  adapter's sender checks, carries a live reference issued to that sender, was
+  not sent automatically, and has one decision word on the first line above
+  any quote. It then calls resolve with its credential and the sender as the
+  actor, never starts a turn from an answer, and on the settled update sends
+  one short follow-up and spends the reference. Until an adapter does this,
+  its approvals still only expire.
+- **No adapter declares the reply-wire version it decodes.** The manifest that
+  would carry an adapter's targeted contract version is unbuilt, so the
+  platform cannot tell an adapter that decodes 1.1 from one that decodes only
+  1.0. Nothing sends 1.1 yet. The change that first sends progress to a
+  non-Slack route has to supply that declaration, or keep progress off routes
+  whose adapter has not shipped progress handling, before it does.
 - **Packaging, installation, discovery, lifecycle, and conformance remain
   unbuilt.** A binding's configured route is not an adapter registry or an
   install experience, and the generic HTTP edges do not establish a supported
@@ -193,4 +251,4 @@ service is material:
 - **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
 - **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded
-- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary
+- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0130](../../adr/0130-deliberate-progress-is-bounded-durable-channel-state.md), the reply wire's 1.1 delivery identity and progress payload; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary; [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), the approval an adapter carries back from its own channel

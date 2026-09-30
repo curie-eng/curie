@@ -91,7 +91,7 @@
 //! // curie::local
 //! /// The plan `local down` runs: the label-scoped reap, plus the staged tree
 //! /// when the directory it ran from holds one.
-//! pub fn connector_teardown_plan_for_down(cwd: &Path) -> Vec<ConnectorTeardownStep>;
+//! pub fn connector_teardown_plan_for_down(cwd: &Path, project: &str) -> Vec<ConnectorTeardownStep>;
 //!
 //! // curie::state::RunnerState
 //! pub connector_containers: Vec<String>,
@@ -845,7 +845,7 @@ async fn local_down_wipes_the_staged_tree_of_the_bundle_it_was_run_from() {
         .expect("stage the credential");
     let root = connector_secrets_root(dir.path());
 
-    let steps = connector_teardown_plan_for_down(dir.path());
+    let steps = connector_teardown_plan_for_down(dir.path(), curie::local::COMPOSE_PROJECT);
     assert_eq!(
         steps.len(),
         2,
@@ -877,7 +877,7 @@ async fn local_down_wipes_the_staged_tree_of_the_bundle_it_was_run_from() {
 #[test]
 fn local_down_plans_no_wipe_without_a_staged_tree() {
     let dir = TempDir::new().expect("a directory that is not a staged bundle");
-    let steps = connector_teardown_plan_for_down(dir.path());
+    let steps = connector_teardown_plan_for_down(dir.path(), curie::local::COMPOSE_PROJECT);
     assert_eq!(steps.len(), 1, "{steps:?}");
     assert!(
         matches!(steps[0], ConnectorTeardownStep::ReapLabeled(_)),
@@ -917,6 +917,7 @@ fn overlay_fixture(agent: &str, plugin_dir: &Path) -> Value {
     let mut lock = ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors: BTreeMap::new(),
+        ..Default::default()
     };
     for (name, image) in [("kubernetes", TEMPO_IMAGE), ("k8s-write", WRITE_IMAGE)] {
         lock.connectors.insert(
@@ -1208,10 +1209,17 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
     let lock = ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors: BTreeMap::new(),
+        ..Default::default()
     };
-    let error = curie::commands::bring_up_local(dir.path(), &lock, &scope("sre-bot"), "curie")
-        .await
-        .expect_err("a declared secret with no value must refuse the bring-up");
+    let error = curie::commands::bring_up_local(
+        dir.path(),
+        &curie::connector_build::load(dir.path()).unwrap(),
+        &lock,
+        &scope("sre-bot"),
+        "curie",
+    )
+    .await
+    .expect_err("a declared secret with no value must refuse the bring-up");
 
     let message = format!("{error:#}");
     assert!(

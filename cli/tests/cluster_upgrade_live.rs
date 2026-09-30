@@ -580,7 +580,7 @@ fn applied_checkpoint(drain_completed: bool) -> Value {
         &[
             "plan",
             "validate",
-            "drain",
+            "drain_preflight",
             "checkpoint",
             "migrate",
             "apply",
@@ -870,7 +870,7 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
         .unwrap_or_else(|| panic!("cold dry-run has no Helm plan line: {plan:?}"));
     assert_eq!(
         helm_line,
-        format!("helm upgrade rel {target} -n ns --wait --timeout 15m"),
+        format!("helm upgrade rel {target} -n ns --wait --timeout 15m -f <retained-values>"),
         "the downloaded archive is a local chart at Apply, so the cold plan must omit --version"
     );
     assert!(
@@ -969,8 +969,9 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
     );
     assert!(
         plan.iter().filter_map(Value::as_str).any(|line| {
-            line == format!("helm upgrade rel {target} -n ns --wait --timeout 15m")
-                && !line.contains("--version")
+            line == format!(
+                "helm upgrade rel {target} -n ns --wait --timeout 2940s -f <retained-values>"
+            ) && !line.contains("--version")
         }),
         "cached plan must use the exact local-archive command head: {plan:?}"
     );
@@ -995,8 +996,8 @@ fn release_channel_cold_dry_run_still_reports_config_conflict() {
         &["--dry-run"],
     );
     assert!(
-        output.status.success(),
-        "dry-run reports refusals in its plan: {} / {}",
+        !output.status.success(),
+        "a refusing dry-run reports the refusal in its plan and fails (#2862): {} / {}",
         stdout(&output),
         stderr(&output)
     );
@@ -1037,8 +1038,8 @@ fn explicit_missing_chart_refuses_without_becoming_pending_release_download() {
     let missing = missing.to_string_lossy().into_owned();
     let output = fixture.run_with("schema-compatible", "0.9.0", &missing, &["--dry-run"]);
     assert!(
-        output.status.success(),
-        "dry-run refusal belongs in the plan"
+        !output.status.success(),
+        "dry-run refusal belongs in the plan and fails the dry run (#2862)"
     );
     let plan = json(&output)["plan"].to_string();
     assert!(
@@ -2218,9 +2219,9 @@ fn failed_hook_fails_convergence() {
 // (`charts/curie/templates/worker-upgrade-drain.yaml`) that fires during Apply,
 // which is why the Drain phase cannot see its verdict and Converge can.
 //
-// `queues_drained` binds to that one hook by name; `hooks_healthy` covers every
-// other hook. Both branches are reachable, so this test is a fixture and its
-// own mutation control.
+// `queues_drained` binds to the drain Job and the attest Job by name;
+// `hooks_healthy` covers every other hook. Both branches are reachable, so
+// this test is a fixture and its own mutation control.
 #[test]
 fn failed_drain_hook_is_the_only_source_of_queues_drained() {
     // The gate refused: accepted work was still in flight when the roll began.
@@ -2244,6 +2245,20 @@ fn failed_drain_hook_is_the_only_source_of_queues_drained() {
     );
     assert_eq!(control["convergence"]["exact"], true, "{control}");
     assert_eq!(control["status"], "succeeded", "{control}");
+}
+
+// The attest Job is the other Drain facet. A failed attest hook must refuse
+// `queues_drained` the same way the drain Job does, without flipping
+// `hooks_healthy`.
+#[test]
+fn failed_attest_hook_refuses_queues_drained() {
+    let gate = Fixture::new(None);
+    let output = gate.local("failed-attest-hook");
+    let refused = json(&output);
+    observed_for_real(&gate);
+    only_false(&refused, &["queues_drained"]);
+    assert_eq!(refused["status"], "failed", "{refused}");
+    assert_eq!(refused["phase"], "converge", "{refused}");
 }
 
 // T6 (cont.) -- the two paths that reach Converge with the Drain PHASE
@@ -2272,14 +2287,14 @@ fn skipped_drain_phases_still_report_drained_queues() {
         fresh.argv()
     );
 
-    // Same-version rerun: Drain/Checkpoint/Migrate/Apply are all skipped.
+    // Same-version rerun: DrainPreflight/Checkpoint/Migrate/Apply are all skipped.
     let same = Fixture::new(None);
     let output = same.local("resumed-applied");
     let rerun = json(&output);
     assert_eq!(rerun["unchanged"], true, "{rerun}");
     assert_eq!(
         rerun["convergence"]["queues_drained"], true,
-        "a same-version rerun skips Drain but is not undrained: {rerun}"
+        "a same-version rerun skips DrainPreflight but is not undrained: {rerun}"
     );
     assert_eq!(rerun["convergence"]["exact"], true, "{rerun}");
     assert_eq!(rerun["status"], "succeeded", "{rerun}");
@@ -2303,12 +2318,17 @@ fn skipped_drain_phases_still_report_drained_queues() {
     }
 }
 
-// T20 -- #2639: live Drain must return the worker Deployment probe, not a
-// hardcoded success. A non-NotFound probe failure that stays pending through
-// the phase budget fails Drain, keeps the previous version serving, and never
-// issues helm upgrade.
+// T20 -- #2639: live DrainPreflight must return the worker Deployment probe,
+// not a hardcoded success. A non-NotFound probe failure that stays pending
+// through the phase budget fails the preflight, keeps the previous version
+// serving, and never issues helm upgrade.
+//
+// #2830: the phase's own name and its refusal text must not claim it observed
+// a drain -- it only confirmed the worker Deployment was unreachable. The
+// real #2010 drain gate is the chart's pre-upgrade Helm hook Job, not this
+// probe.
 #[test]
-fn undrained_deploy_fails_drain_before_mutation() {
+fn undrained_deploy_fails_drain_preflight_before_mutation() {
     let fixture = Fixture::new(None);
     let output = fixture.local_env(
         "undrained-deploy",
@@ -2316,24 +2336,28 @@ fn undrained_deploy_fails_drain_before_mutation() {
     );
     let json = json(&output);
     assert_eq!(json["status"], "failed", "{json}");
-    assert_eq!(json["phase"], "drain", "{json}");
+    assert_eq!(json["phase"], "drain_preflight", "{json}");
     assert_eq!(json["previous_serving"], true, "{json}");
     assert!(
         fixture.helm_upgrades().is_empty(),
-        "Drain refusal must precede mutation: {:?}",
+        "DrainPreflight refusal must precede mutation: {:?}",
         fixture.argv()
     );
     assert!(
         fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
-        "Drain must probe the worker Deployment: {:?}",
+        "DrainPreflight must probe the worker Deployment: {:?}",
         fixture.argv()
     );
     let reason = json["fail_forward"]["reason"]
         .as_str()
         .unwrap_or_else(|| panic!("no fail_forward reason: {json}"));
     assert!(
-        reason.contains("in flight") || reason.contains("drain"),
-        "fail-forward must mention in-flight work or drain: {reason}"
+        reason.contains("reachable"),
+        "fail-forward must describe the unreachable worker probe: {reason}"
+    );
+    assert!(
+        !reason.contains("in flight"),
+        "fail-forward must not claim it observed in-flight delivery work it never watched: {reason}"
     );
 }
 
@@ -2541,7 +2565,10 @@ fn resumed_upgrade_remigrates_its_own_output_without_change() {
     );
 
     // Resume with Apply still outstanding, so the second run re-reads and
-    // re-migrates the retained (already migrated) overlay.
+    // re-migrates the retained (already migrated) overlay. This deliberately
+    // seeds the pre-#2830 `"drain"` phase name (rather than the current
+    // `"drain_preflight"`) so a full resume through the real binary also pins
+    // that a checkpoint an older binary wrote still resumes correctly.
     fixture.seed_checkpoint(&checkpoint_through(
         &["plan", "validate", "drain", "checkpoint", "migrate"],
         true,
@@ -2790,16 +2817,15 @@ fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
             mutator.argv(),
             stderr(&output)
         );
-        // `--install`/`-f` are runtime-state tails; the planned line is the
-        // fixed head, and it must match that head exactly.
-        let head: Vec<String> = upgrades[0]
-            .iter()
-            .take(line.split(' ').count())
-            .cloned()
-            .collect();
+        // #2863: the planned line is the whole command. Only the `-f`
+        // tempfile path differs, and the plan names it by placeholder.
+        let mut executed = upgrades[0].clone();
+        if let Some(at) = executed.iter().position(|arg| arg == "-f") {
+            executed[at + 1] = "<retained-values>".into();
+        }
         assert_eq!(
             line,
-            head.join(" "),
+            executed.join(" "),
             "planned line must be the executed command: {:?}",
             upgrades[0]
         );
@@ -2808,6 +2834,88 @@ fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
             pinned,
             chart.starts_with("oci://"),
             "--version must show exactly when passed: {line}"
+        );
+    }
+}
+
+#[test]
+fn raised_drain_budget_uses_exact_overlay_in_plan_and_apply() {
+    let overlay = r#"{"worker":{"upgradeDrain":{"timeoutSeconds":2000},"terminationGracePeriodSeconds":4000}}"#;
+    let planned = Fixture::new(Some(overlay));
+    let dry = planned.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(dry.status.success(), "{}", visible(&dry));
+    let plan = json(&dry)["plan"].as_array().unwrap().clone();
+    let line = plan
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|line| line.starts_with("helm upgrade "))
+        .expect("Helm plan line");
+    assert!(line.contains("--timeout 6180s"), "{line}");
+    assert_eq!(planned.helm_upgrades().len(), 0);
+
+    let applied = Fixture::new(Some(overlay));
+    let output = applied.run("healthy", "0.9.0", "charts/curie");
+    assert!(output.status.success(), "{}", visible(&output));
+    let upgrades = applied.helm_upgrades();
+    assert_eq!(upgrades.len(), 1, "{:?}", applied.argv());
+    let mut executed = upgrades[0].clone();
+    let values_at = executed.iter().position(|arg| arg == "-f").unwrap();
+    executed[values_at + 1] = "<retained-values>".into();
+    assert_eq!(executed.join(" "), line);
+    assert_eq!(
+        fs::read_to_string(applied.0.path().join("render-values-1.json")).unwrap(),
+        applied.values(1),
+        "the timeout render and Apply must use the same migrated overlay"
+    );
+    assert!(
+        applied.argv().iter().any(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("template")
+                && call.iter().any(|arg| arg == "--is-upgrade")
+                && !call.iter().any(|arg| arg == "--show-only")
+        }),
+        "the timeout must come from a full upgrade render: {:?}",
+        applied.argv()
+    );
+}
+
+#[test]
+fn absent_drain_job_keeps_the_helm_timeout_floor() {
+    for overlay in [
+        r#"{"worker":{"deploy":false}}"#,
+        r#"{"worker":{"upgradeDrain":{"enabled":false}}}"#,
+    ] {
+        let fixture = Fixture::new(Some(overlay));
+        let output = fixture.run("healthy", "0.9.0", "charts/curie");
+        assert!(output.status.success(), "{}", visible(&output));
+        let upgrades = fixture.helm_upgrades();
+        assert_eq!(upgrades.len(), 1, "{:?}", fixture.argv());
+        assert!(upgrades[0]
+            .windows(2)
+            .any(|pair| pair == ["--timeout", "15m"]));
+    }
+}
+
+#[test]
+fn malformed_drain_timeout_metadata_refuses_before_apply() {
+    for scenario in [
+        "drain-annotation-missing",
+        "drain-annotation-invalid",
+        "drain-render-fails",
+    ] {
+        let fixture = Fixture::new(None);
+        let output = fixture.run(scenario, "0.9.0", "charts/curie");
+        assert!(!output.status.success(), "{scenario}: {}", visible(&output));
+        assert!(
+            fixture.helm_upgrades().is_empty(),
+            "{scenario}: {:?}",
+            fixture.argv()
+        );
+        assert!(
+            visible(&output).contains("target upgrade drain Job")
+                || visible(&output).contains("could not render target Helm timeout metadata"),
+            "{scenario}: {}",
+            visible(&output)
         );
     }
 }
@@ -3108,4 +3216,427 @@ fn fail_at_plan_on_owned_namespace_fails_before_helm() {
         "owned FAIL_AT=plan must not call helm upgrade: {:?}",
         fixture.argv()
     );
+}
+
+// T#2741 -- boolean-shaped string scalars must survive the retained-values
+// round trip.
+//
+// Mechanism: Helm parses values with Go's go-yaml, which is YAML **1.1**, where
+// the bare tokens `off`/`on`/`yes`/`no`/`y`/`n`/`true`/`false` are booleans.
+// `serde_norway` emits YAML **1.2**, where only `true`/`false` are, so it writes
+// the JSON string "off" as the bare scalar `off`. Helm then reads a BOOLEAN
+// false. An install carrying `security.gvisor.mode: "off"` silently flips on
+// upgrade and the absent `gvisor` RuntimeClass becomes required.
+//
+// The assertion therefore has to be made on the emitted BYTES with YAML 1.1
+// eyes: re-parsing with `serde_norway` (YAML 1.2) would hand the string back and
+// prove nothing.
+
+/// The YAML 1.1 boolean tokens that YAML 1.2 does NOT share. `true`/`false` are
+/// deliberately absent: both versions read them as booleans, so a bare `true` is
+/// a correct emission for a genuine boolean, not a leak. Helm's go-yaml also
+/// accepts the capitalised and all-caps spellings, which `to_lowercase` folds in.
+const YAML11_ONLY_BOOLEAN_WORDS: [&str; 6] = ["y", "yes", "n", "no", "on", "off"];
+
+/// The retained overlay used by every #2741 test: one boolean-shaped string at
+/// each of three nesting depths, so a fix that only special-cases the known
+/// gvisor key does not pass.
+fn boolean_shaped_retained() -> String {
+    serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "security": {"gvisor": {"mode": "off"}},
+        "api": {"logStructured": "yes"},
+        "uiFlag": "n",
+    })
+    .to_string()
+}
+
+/// Lines of a block-style YAML document whose scalar value is an UNQUOTED YAML
+/// 1.1 boolean token. Non-empty means Helm would read a boolean where the
+/// operator wrote a string.
+///
+/// Block style only, which is what `serde_norway::to_string` emits; a flow-style
+/// emitter would need this widened rather than weakened.
+fn unquoted_yaml11_booleans(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter(|line| {
+            let Some((key, value)) = line.split_once(": ") else {
+                return false;
+            };
+            if key.trim_start().starts_with('#') {
+                return false;
+            }
+            let value = value.trim();
+            YAML11_ONLY_BOOLEAN_WORDS.contains(&value.to_lowercase().as_str())
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+/// #2741 -- the ordinary retained-values path. `retained_overlay()` re-serializes
+/// with `serde_norway::to_string` (YAML 1.2), so the strings "off", "yes" and "n"
+/// reach Helm's YAML 1.1 parser as bare booleans.
+#[test]
+fn boolean_shaped_retained_strings_stay_strings_in_the_apply_overlay() {
+    let fixture = Fixture::new(Some(&boolean_shaped_retained()));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "nothing was applied: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    assert!(
+        unquoted_yaml11_booleans(&raw).is_empty(),
+        "Helm parses YAML 1.1, so these bare scalars become booleans: {:?}\n{raw}",
+        unquoted_yaml11_booleans(&raw)
+    );
+    let values = values_doc(&raw);
+    for (pointer, expected) in [
+        ("/security/gvisor/mode", "off"),
+        ("/api/logStructured", "yes"),
+        ("/uiFlag", "n"),
+    ] {
+        assert_eq!(
+            values.pointer(pointer),
+            Some(&Value::String(expected.into())),
+            "{pointer} must still be the string {expected:?}: {raw}"
+        );
+    }
+}
+
+/// #2741 -- the `--forward-only` path re-serializes through a SECOND
+/// `serde_norway::to_string` site (`merge_forward_only()`), so it needs its own
+/// coverage. The paired assertion is the control: a genuine boolean
+/// (`api.migrate.forwardOnly`) must stay a boolean, so the fix cannot be
+/// "quote everything".
+#[test]
+fn forward_only_overlay_preserves_boolean_shaped_strings_and_real_booleans() {
+    let fixture = Fixture::new(Some(&boolean_shaped_retained()));
+    let output = fixture.run_with(
+        "schema-contract",
+        "0.9.0",
+        "charts/curie",
+        &["--forward-only"],
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "--forward-only must reach helm upgrade: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    assert!(
+        unquoted_yaml11_booleans(&raw).is_empty(),
+        "forward-only overlay leaks YAML 1.1 booleans: {:?}\n{raw}",
+        unquoted_yaml11_booleans(&raw)
+    );
+    let values = values_doc(&raw);
+    assert_eq!(
+        values.pointer("/security/gvisor/mode"),
+        Some(&Value::String("off".into())),
+        "the forward-only path must keep the string \"off\": {raw}"
+    );
+    assert_eq!(
+        values.pointer("/api/migrate/forwardOnly"),
+        Some(&Value::Bool(true)),
+        "a real boolean must stay a boolean, not be stringified: {raw}"
+    );
+}
+
+/// #2741 -- the negative control. Quoting is not allowed to be blanket: genuine
+/// booleans, integers and nulls in the retained values must reach Helm with
+/// their own YAML 1.2/1.1-agreeing types.
+#[test]
+fn genuine_scalar_types_are_not_coerced_to_strings() {
+    let retained = serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "ui": {"deploy": false},
+        "worker": {"runnerTotalTimeoutSeconds": 120, "replicas": 3},
+        "api": {"nodeSelector": null},
+    })
+    .to_string();
+    let fixture = Fixture::new(Some(&retained));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "nothing was applied: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values = values_doc(&raw);
+    assert_eq!(
+        values.pointer("/ui/deploy"),
+        Some(&Value::Bool(false)),
+        "a genuine boolean must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/worker/runnerTotalTimeoutSeconds"),
+        Some(&serde_json::json!(120)),
+        "a genuine integer must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/worker/replicas"),
+        Some(&serde_json::json!(3)),
+        "a genuine integer must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/api/nodeSelector"),
+        Some(&Value::Null),
+        "a genuine null must not become a string: {raw}"
+    );
+}
+
+fn retained_dotted_maps_and_scalars() -> String {
+    serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "security": {
+            "otelCollectorNetworkPolicy": {
+                "metricsIngress": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": "observability"
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": "prometheus"
+                        }
+                    }
+                }]
+            }
+        },
+        "independentLabels": {
+            "app.kubernetes.io/name": "retained",
+            "example.com/tier": "metrics"
+        },
+        "ordinary": {
+            "mode": "off",
+            "affirmative": "yes",
+            "short": "n",
+            "numeric": "00123",
+            "enabled": true,
+            "replicas": 3
+        }
+    })
+    .to_string()
+}
+
+fn assert_retained_dotted_maps_and_scalars(values: &Value) {
+    let expected = serde_json::json!({
+        "metricsIngress": [{
+            "namespaceSelector": {
+                "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                }
+            },
+            "podSelector": {
+                "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                }
+            }
+        }],
+        "independentLabels": {
+            "app.kubernetes.io/name": "retained",
+            "example.com/tier": "metrics"
+        },
+        "ordinary": {
+            "mode": "off",
+            "affirmative": "yes",
+            "short": "n",
+            "numeric": "00123",
+            "enabled": true,
+            "replicas": 3
+        }
+    });
+    assert_eq!(
+        values.pointer("/security/otelCollectorNetworkPolicy/metricsIngress"),
+        expected.pointer("/metricsIngress"),
+        "nested array label maps changed: {values}"
+    );
+    assert_eq!(
+        values.pointer("/independentLabels"),
+        expected.pointer("/independentLabels"),
+        "independent dotted label map changed: {values}"
+    );
+    assert_eq!(
+        values.pointer("/ordinary"),
+        expected.pointer("/ordinary"),
+        "ordinary scalar types changed: {values}"
+    );
+}
+
+#[test]
+fn retained_dotted_maps_and_scalars_stay_exact_in_normal_upgrade_json() {
+    let fixture = Fixture::new(Some(&retained_dotted_maps_and_scalars()));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "normal upgrade did not reach Helm: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("normal retained overlay is not JSON ({error}): {raw}"));
+    assert_retained_dotted_maps_and_scalars(&values);
+}
+
+#[test]
+fn retained_dotted_maps_and_scalars_stay_exact_in_forward_only_upgrade_json() {
+    let fixture = Fixture::new(Some(&retained_dotted_maps_and_scalars()));
+    let output = fixture.run_with(
+        "schema-contract",
+        "0.9.0",
+        "charts/curie",
+        &["--forward-only"],
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "forward only upgrade did not reach Helm: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!("forward only retained overlay is not JSON ({error}): {raw}")
+    });
+    assert_retained_dotted_maps_and_scalars(&values);
+    assert_eq!(
+        values.pointer("/api/migrate/forwardOnly"),
+        Some(&Value::Bool(true)),
+        "forward only control must stay a boolean: {values}"
+    );
+}
+
+/// Every call that writes: Helm apply or rollback, and any kubectl create,
+/// patch, apply, replace or delete.
+fn mutating_calls(fixture: &Fixture) -> Vec<Vec<String>> {
+    fixture
+        .argv()
+        .into_iter()
+        .filter(|call| {
+            match (
+                call.first().map(String::as_str),
+                call.get(1).map(String::as_str),
+            ) {
+                (Some("helm"), Some(verb)) => {
+                    matches!(verb, "upgrade" | "install" | "rollback" | "uninstall")
+                }
+                (Some("kubectl"), Some(verb)) => {
+                    matches!(verb, "create" | "patch" | "apply" | "replace" | "delete")
+                }
+                _ => false,
+            }
+        })
+        .collect()
+}
+
+/// #2862: a dry run that ends in a Validate refusal exits with the same
+/// nonzero class as the identical real run, and issues no mutating call.
+/// Covers the chart identity refusal and the schema graph refusal.
+#[test]
+fn dry_run_refusal_exits_like_the_real_run_without_mutating() {
+    for (scenario, needle) in [
+        ("local-chart-mismatch", "declares version"),
+        ("schema-incompatible", "refusal at validate"),
+    ] {
+        let dry = Fixture::new(None);
+        let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
+        assert!(
+            !output.status.success(),
+            "{scenario}: a refusing dry run must exit nonzero: {}",
+            visible(&output)
+        );
+        assert!(
+            visible(&output).contains(needle),
+            "{scenario}: the refusal must stay visible: {}",
+            visible(&output)
+        );
+        assert!(
+            mutating_calls(&dry).is_empty(),
+            "{scenario}: a dry run must not mutate: {:?}",
+            dry.argv()
+        );
+
+        let real = Fixture::new(None);
+        let real_output = real.run(scenario, "0.9.0", "charts/curie");
+        assert!(
+            !real_output.status.success(),
+            "{scenario}: real run refuses"
+        );
+        assert_eq!(
+            output.status.code(),
+            real_output.status.code(),
+            "{scenario}: dry run and real run must share an exit class"
+        );
+        assert!(real.helm_upgrades().is_empty(), "{scenario}");
+    }
+}
+
+/// #2862 negative control: a plan with no refusal still succeeds and still
+/// mutates nothing.
+#[test]
+fn valid_dry_run_succeeds_without_mutating() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with("schema-compatible", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert!(!visible(&output).contains("refusal at validate"));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+}
+
+/// #2863: the apply line a dry run prints is the argv the real run executes,
+/// with only the retained values tempfile path replaced by a placeholder. The
+/// overlay's contents never reach the plan.
+#[test]
+fn printed_apply_line_matches_executed_helm_argv() {
+    let overlay = r#"{"worker":{"replicas":2},"marker":"overlay-value-must-not-print"}"#;
+    for (scenario, install) in [("schema-compatible", false), ("fresh-install", true)] {
+        let dry = Fixture::new(Some(overlay));
+        let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
+        assert!(output.status.success(), "{scenario}: {}", visible(&output));
+        assert!(
+            !visible(&output).contains("overlay-value-must-not-print"),
+            "{scenario}: values contents must not be printed: {}",
+            visible(&output)
+        );
+        let printed: Vec<String> = json(&output)["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|line| line.starts_with("helm upgrade "))
+            .unwrap_or_else(|| panic!("{scenario}: no apply line: {}", visible(&output)))
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+
+        let real = Fixture::new(Some(overlay));
+        let real_output = real.run(scenario, "0.9.0", "charts/curie");
+        let upgrades = real.helm_upgrades();
+        assert_eq!(upgrades.len(), 1, "{scenario}: {}", visible(&real_output));
+        let mut executed = upgrades[0].clone();
+        let values_at = executed
+            .iter()
+            .position(|arg| arg == "-f")
+            .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
+        executed[values_at + 1] = "<retained-values>".into();
+
+        assert_eq!(
+            printed, executed,
+            "{scenario}: printed plan drifted from apply"
+        );
+        assert_eq!(
+            printed.iter().any(|arg| arg == "--install"),
+            install,
+            "{scenario}: --install only for a first install: {printed:?}"
+        );
+    }
 }

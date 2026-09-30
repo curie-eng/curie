@@ -83,14 +83,11 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   its `SKILL.md` frontmatter uses `allowed-tools` (never `tools`) and its
   `.mcp.json` servers each define `command` or `url` (as strings). The spec's
   `evals` reuse the frozen `evals::EvalCase` type directly (not a hand-mirror), so a
-  spec-authored eval suite cannot drift from the shape `skill eval` loads. Because
-  the spec's `evals` ARE the frozen eval-case shape reused verbatim, unknown keys
-  inside an eval case are ignored exactly as the platform's worker `EvalSuite`
-  ignores them (pydantic default `extra="ignore"`, `ConfigDict(frozen=True)`) --
-  this is intentional PARITY with the platform grader, not an oversight, so do NOT
-  add `deny_unknown_fields` to the eval structs (it would make `skill eval` stricter
-  than the platform and break parity). The spec's OWN top-level fields stay strict
-  (`deny_unknown_fields` on `AgentSpec`/`SkillSpec`).
+  spec-authored eval suite cannot drift from the shape `skill eval` loads. Unknown
+  keys inside an eval case are rejected by both loaders, so an unsupported tier
+  label or a spelling error cannot be silently dropped. `EvalSuite` and `Grader`
+  remain tolerant because only case keys are closed. The spec's own top level
+  fields stay strict (`deny_unknown_fields` on `AgentSpec`/`SkillSpec`).
 - **The `evals/cases.json` seed and `skill eval` loader hand-mirror the frozen
   eval-case schema.** The `curie init` seed (`scaffold::eval_cases`) and the
   `skill eval` loader (`evals::EvalSuite`/`load_suite`) mirror the frozen

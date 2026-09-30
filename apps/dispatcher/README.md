@@ -55,6 +55,46 @@ never subscribed to; a redelivery whose dedupe key is already claimed; and a but
 with nowhere to reply — an App Home or modal click, which carries no channel and no
 message.
 
+Also refused, after all of the above and before the dedupe claim: a caller the
+binding's list does not admit (ADR 0175). A binding may carry a list of who may talk to
+the bot through it. On a mention, a direct message or a button click that would start a
+turn, the dispatcher asks the platform API (`POST /channels/admission`, platform key)
+with the sender's id (plus the bot id when a bot sent it) or the clicking user's id. A
+refused caller gets no placeholder and no reply; the drop is logged as
+`caller_not_allowed` at DEBUG, because a busy shared channel can refuse most of its
+messages, and every refusal is still counted on the `curie.turn.refused` metric.
+Approval-card clicks never start a turn and are not asked. The trusted-bot allowlist below
+still runs first, and a bot it admits must also be on the binding's list, if there is one.
+
+How answers are cached, and so how fast a change applies:
+
+- Answers are cached per route (the channel plus the Slack identity). A route with no list
+  is cached as open to everyone; a route with a list caches each caller's answer.
+- Every answer also says whether any binding on the install carries a list. While that is
+  fresh and says none does, no route is asked about at all.
+- An answer counts for `CURIE_ADMISSION_CACHE_TTL_SECONDS` (30 seconds), which is how long a
+  list change takes to apply in Slack while the API is up.
+- While the API cannot answer, an expired answer still counts until it is
+  `CURIE_ADMISSION_STALE_SECONDS` old (5 minutes), the install-wide "no list anywhere"
+  answer included. **So a list someone just added can take up to 5 minutes, not 30
+  seconds, to protect a route if the API goes down right after it is set:** the route's
+  last answer was "open", and that answer stands through the stale window.
+- With nothing usable cached the caller is refused as `admission_unavailable`, logged at
+  INFO, so that reason means an outage rather than a list typo. After a failed call, the
+  dispatcher answers from its cache for 5 seconds before asking again, so a hung API holds
+  one Bolt listener worker per 5 seconds rather than all five.
+- Answers are kept in Valkey under `CURIE_ADMISSION_CACHE_PREFIX` as well as in memory, so a
+  dispatcher that restarts during an API outage keeps what the previous process learned.
+  Every key expires with the stale window.
+- Concurrent questions about one route share one API call.
+
+**Upgrade the API before the dispatcher.** An API from before ADR 0175 answers
+`POST /channels/admission` with FastAPI's route-miss 404; such an API has no caller lists,
+so the dispatcher admits everyone (logged once) until the API is upgraded. A dispatcher
+from before ADR 0175 never asks at all, so a list set on the API is not enforced in Slack
+until the dispatcher is upgraded too. A single `helm upgrade` rolls both; set a list only
+once both run this version.
+
 Every refusal these handlers make on the message lanes is logged at INFO with its
 enumerated reason and rationale (the full list is `relevance.DROP_RATIONALES`), so an
 operator chasing a message that produced no turn can grep the dispatcher log for
@@ -88,6 +128,23 @@ installation: allowlisting such a bot removes the cross-installation loop guard
 for that pair. All unlisted bot/channel pairs retain the default refusal.
 Remove the pair and restart the dispatcher to revoke threaded admission.
 
+An installation's own identities need no pair. When several Slack identities
+are declared, preflight asks `auth.test` for each one's bot id and bot user,
+and every identity's app admits the others' threaded mentions. A turn one of
+them wrote carries that identity's bot user as its author, from `auth.test`,
+not from the event, and the worker rate limits the exchange (ADR-0168
+decision 6): 5 sibling-written turns per session key and 5 openings per
+ordered identity pair, both in a 600 s window. An orchestrator bot fanning
+work out to a sibling across more than 5 threads in ten minutes is cut off
+past the fifth, with the placeholder edited to a notice that names nobody
+("Stopped here: the bots in this installation have messaged each other too
+often. A person can pick this up."). An identity whose `auth.test` did not
+answer at boot is not admitted this way. The bot user this section admits the
+turn under is also what the turn carries as its author downstream: an
+approval a sibling's turn raises shows that bot user as "Requested by" on the
+card, and the agent sees it as the turn's `user` -- the same identity the
+worker's rate limit reads off the turn, not the event's own `user`.
+
 Compose forwards this variable in both dev and generated release stacks. Helm
 operators should prefer the first-class `dispatcher.threadedBotAllowlist` chart
 value; `dispatcher.extraEnv` still works as well. Runtime Slack proof requires
@@ -107,7 +164,7 @@ parenthetical is what the Slack adapter maps onto each one:
 | `conversation_id` | canonical thread/conversation key (the thread ts) |
 | `author` | who authored the message (the Slack user id) |
 | `text` | message text |
-| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter currently supplies the ts of its already posted placeholder. |
+| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter always supplies the ts of its already posted placeholder. The worker currently rejects targetless execution. |
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
@@ -141,6 +198,42 @@ fresh connection; `request_stop` (wired to SIGINT/SIGTERM) closes the current
 connection and exits the loop without reconnecting. The Socket Mode adapter
 (`app.SocketModeConnection`) is the thin production `Connection`.
 
+## One app per identity
+
+The dispatcher runs one Bolt app per Slack identity the chart declares
+(`CURIE_SLACK_IDENTITIES`, ADR-0168 decisions 1 and 2), each with its own Web
+client, Socket Mode connection and supervisor, all feeding the one stream. With
+no declaration it runs `default` alone, from the `SLACK_*` variables, exactly as
+before. Several dispatcher replicas serving one identity remain out of scope
+(#2248).
+
+A turn carries the identity of the app it arrived on, never a field of the
+delivery. Every identity, `default` included, mints its name in
+`reply_handle.adapter`, and every identity but `default` has its deliveries
+claimed under `<slack id>:<identity>`. The enqueue log line names both: the existing
+`identity=` field is the release identity, unchanged, and a new
+`slack_identity=` field is the identity whose app the delivery arrived on.
+Every placeholder, card stamp, ephemeral and dialog is made with the token of
+the app the delivery arrived on, which for a card click is the app that posted
+the card.
+
+A named identity's app connects and preflights like any other, and a binding
+naming it routes its turns.
+
+Preflight runs per identity. An identity with a blank token, a missing
+`channels:read` scope, or one the shared preflight deadline left unattempted is
+logged at ERROR by name and does not connect; the others do. The pod refuses to
+boot only when no identity passes. After boot, an identity that loses its
+connection reconnects with its own backoff while the others keep serving, and
+the heartbeat stays fresh: one identity can be down while the pod is healthy.
+Each identity adds its own threads and websocket: on slack_bolt 1.30.0 and
+slack_sdk 3.44.1, up to 5 Bolt listener workers, up to 10 Socket Mode message
+workers, 3 Socket Mode client threads and a supervisor thread; the chart's
+dispatcher requests and limits are sized for one app, so measure before
+declaring many.
+A cron-hook agent's approval destinations are not preflighted under `default`,
+since a cron trigger is not carried by the projection preflight reads.
+
 ## Config surface (env vars)
 
 Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSettings`).
@@ -150,6 +243,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `SLACK_APP_TOKEN` | "" | app-level token (`xapp-...`), Socket Mode |
 | `SLACK_BOT_TOKEN` | "" | bot token (`xoxb-...`), Web API |
 | `SLACK_SIGNING_SECRET` | "" | optional; unused in Socket Mode, kept for Bolt App construction |
+| `CURIE_SLACK_IDENTITIES` | unset | JSON naming each declared Slack identity and the env vars holding its tokens (ADR-0168 decision 1); unset means the one app, `default`. The dispatcher connects one Bolt app per declared identity (see *One app per identity*) |
 | `VALKEY_HOST` | `localhost` | Valkey host (in-cluster: `valkey`) |
 | `VALKEY_PORT` | `6379` | Valkey port (compose maps it to `26379` on the host) |
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
@@ -163,10 +257,13 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_BACKOFF_INITIAL_SECONDS` | `1.0` | first reconnect backoff |
 | `CURIE_BACKOFF_MAX_SECONDS` | `30.0` | backoff cap |
 | `CURIE_BACKOFF_MULTIPLIER` | `2.0` | backoff growth factor |
-| `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
-| `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; sent for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
+| `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks and to ask whether a caller may start a turn (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
+| `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; authenticates the caller-list question (`POST /channels/admission`), and is sent with approval clicks for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
 | `CURIE_APPROVAL_CHAT_ATTESTER_SECRET` | `curie-dev-approval-chat-attester` | independent HMAC secret shared only with the API; signs short-lived, approval-bound `chat` principals. Must be nonblank and must not equal `CURIE_API_KEY`. |
 | `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | API-health budget, followed by a fresh same-size discovery-and-Slack budget; the Helm chart supplies 120 seconds while a directly run dispatcher keeps this 30-second default; must be positive |
+| `CURIE_ADMISSION_CACHE_TTL_SECONDS` | `30.0` | how long a caller-list answer from the platform API counts (ADR 0175), and so how long a list change takes to apply in Slack; must be positive and finite |
+| `CURIE_ADMISSION_STALE_SECONDS` | `300.0` | how old an expired caller-list answer may be and still count while the API cannot answer; past it, with nothing cached, the caller is refused. Must be finite and at least the TTL |
+| `CURIE_ADMISSION_CACHE_PREFIX` | `curie:admission:` | Valkey key prefix for the persisted caller-list answers, so a restarted dispatcher keeps them; change it only when two installs share one Valkey |
 
 ### Boot preflights
 

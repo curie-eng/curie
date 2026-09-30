@@ -43,13 +43,13 @@ def verify_platform_key(x_api_key: str | None) -> bool:
 #: read it and injected script cannot exfiltrate the credential it authenticates
 #: with. Defined here rather than in the router because this module is what
 #: verifies it, and a router importing down into auth is the right direction.
-SESSION_COOKIE = "curie_console_session"
+SESSION_COOKIE = "__Host-curie_console_session"
 
 
 async def require_api_key(
     request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
-    curie_console_session: Annotated[str | None, Cookie()] = None,
+    curie_console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
 ) -> None:
     """Gate every router on the platform key or a live console session.
 

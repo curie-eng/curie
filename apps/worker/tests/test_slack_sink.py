@@ -19,16 +19,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
+from pathlib import Path
 
 import aiohttp
 import pytest
 from channel_protocol import (
     MESSAGE_VERSION,
+    TERMINAL_PROGRESS_STATES,
     Action,
     ConfirmIntent,
+    MilestoneClass,
     OutboundMessage,
+    ProgressCard,
+    ProgressMilestone,
+    ProgressState,
 )
 from channel_protocol.reply import (
+    PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
     ReplyPost,
     ReplyTarget,
@@ -820,6 +828,88 @@ def test_update_message_renders_the_resolved_card_from_the_outcome() -> None:
     assert "U7" in rendered
 
 
+def _settle(message: OutboundMessage, settled: SettledOutcome | None) -> dict[str, object]:
+    """Emit one settle update through the real adapter and capture its chat_update."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    captured: dict[str, object] = {}
+
+    async def _fake_update(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    sink._client_for(None).chat_update = _fake_update  # type: ignore[method-assign]
+    asyncio.run(
+        sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=_target(ts="9.9"),
+                message=message,
+                settled=settled,
+            ),
+            route=TargetRoute(),
+        )
+    )
+    return captured
+
+
+def test_a_resolved_card_shows_the_decision_time_the_kernel_carried() -> None:
+    """ADR-0179 decision 1: the kernel says when, as data; this adapter shows it.
+
+    The instant rides the settle message's ``Decided`` field, and the adapter
+    renders it as Slack's date token on the verdict line (``<!date^unix^...|...>``,
+    mrkdwn only: https://docs.slack.dev/messaging/formatting-message-text).
+    """
+
+    from curie_worker.approvals import decided_field
+
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+    captured = _settle(
+        OutboundMessage(
+            version=MESSAGE_VERSION, text="Discount ACME", fields=[decided_field(decided)]
+        ),
+        SettledOutcome(requested_by="U9", decision="rejected", resolver="U7", note=None),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Rejected"  # type: ignore[index]
+    assert blocks[1]["text"]["text"] == "Discount ACME"  # type: ignore[index]
+    assert blocks[-1]["elements"][0]["text"] == (  # type: ignore[index]
+        "Rejected by <@U7> on "
+        "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
+    )
+
+
+def test_a_settle_without_a_decision_time_keeps_the_bare_verdict() -> None:
+    """The negative: no field, no time, and nothing invented in its place."""
+
+    captured = _settle(
+        OutboundMessage(version=MESSAGE_VERSION, text="Discount ACME"),
+        SettledOutcome(requested_by="U9", decision="approved", resolver="U7", note=None),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Approved"  # type: ignore[index]
+    assert blocks[-1]["elements"][0]["text"] == "Approved by <@U7>"  # type: ignore[index]
+
+
+def test_an_expired_card_is_headed_expired_and_names_its_requester() -> None:
+    """ADR-0179 decision 1 for the expiry form, which only the worker renders."""
+
+    captured = _settle(
+        OutboundMessage(version=MESSAGE_VERSION, text="Discount ACME"),
+        SettledOutcome(requested_by="U9"),
+    )
+
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert blocks[0]["text"]["text"] == "Expired"  # type: ignore[index]
+    assert "Requested by <@U9>" in str(blocks)
+    assert all(b.get("type") != "actions" for b in blocks)  # type: ignore[union-attr]
+
+
 def test_best_effort_still_falls_back_to_default_when_present() -> None:
     # #530 stays byte-for-byte: with a distinct default configured, a dead per-turn
     # endpoint on a resume turn STILL falls back to the default transport. The new
@@ -915,3 +1005,457 @@ async def test_a_hook_conversation_id_does_not_thread_an_approval_card() -> None
     )
 
     assert seen["thread_ts"] is None, seen
+
+
+# MEASURED 2026-09-25 against api.slack.com with a bot token, from a 0.9.2
+# worker pod: chat.update accepted 4,000 ASCII characters and refused 4,001 with
+# msg_too_long, and refused 4,000 characters that included the multi-byte "•"
+# and "—" a receipt uses. chat.postMessage accepted 40,001. The edit limit is
+# 4,000 bytes of UTF-8, and it is the one a streamed reply meets (#3064).
+_EDIT_LIMIT_BYTES = 4000
+
+
+def _captured_update(text: str) -> str:
+    sink = SlackReplyAdapter("xoxb-test")
+    captured: dict[str, str] = {}
+
+    async def _fake_chat_update(*, channel: str, ts: str, text: str) -> None:
+        captured["text"] = text
+
+    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
+    asyncio.run(_update(sink, text=text))
+    return captured["text"]
+
+
+def test_an_edit_over_slacks_limit_is_cut_to_fit_and_says_so() -> None:
+    # Before #3064 the whole edit went out, Slack refused it, and the turn was
+    # lost and escalated as a worker restart. A cut reply still reaches the thread.
+    sent = _captured_update("A long report line.\n" * 600)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long report line.")
+    assert sent.rstrip().endswith("(Cut here: Slack refuses a longer edit.)_")
+
+
+def test_a_long_edit_keeps_the_action_receipt_with_the_answer() -> None:
+    receipt = "_What I changed:_\n• 25 Bash calls; changes not described"
+    sent = _captured_update("A long report line.\n" * 600 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long report line.")
+    assert "(Cut here: Slack refuses a longer edit.)_" in sent
+    assert sent.endswith(receipt)
+
+
+def test_an_oversized_receipt_stays_in_the_long_edit_with_an_omission_notice() -> None:
+    receipt = "_What I changed:_\n" + ("• " + "é" * 300 + "\n") * 10
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long answer.")
+    assert "_What I changed:_" in sent
+    assert sent.endswith("more receipt details omitted")
+
+
+def test_a_late_failed_action_is_kept_in_a_long_slack_reply() -> None:
+    from curie_worker.receipt import render_receipt
+
+    actions = [
+        {
+            "tool": f"tool_{i}",
+            "status": "succeeded" if i < 9 else "failed",
+            "undoable": False,
+            "result": {"summary": ("late failure " if i == 9 else f"action {i} ") + "é" * 160},
+            "detail": "é" * 160,
+        }
+        for i in range(10)
+    ]
+    receipt = render_receipt(actions)
+    assert receipt is not None
+
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert "_What I changed:_" in sent
+    assert "late failure" in sent
+    assert "failed" in sent
+    assert "more receipt details omitted" not in sent
+
+
+def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
+    line = "• called `a_tool` — non-idempotent tool completed\n"
+    text = line * 78  # 3,900 characters: under the limit counted as characters
+    assert len(text) < _EDIT_LIMIT_BYTES < len(text.encode("utf-8"))
+
+    sent = _captured_update(text)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+
+
+def test_an_edit_within_the_limit_is_sent_unchanged() -> None:
+    text = "x" * _EDIT_LIMIT_BYTES
+    assert _captured_update(text) == text
+
+
+# --- Deliberate progress (ADR-0130): the Slack adapter path ------------------
+#
+# A progress body is its own branch of ``emit``, taken before the answer path,
+# the placeholder, and the approval card's settle path. The prefixes asserted
+# here are read from the frozen vector, not imported, so these cases pin the
+# wire the CLI stub reads rather than whatever the builders happen to export.
+# Slack documents ``client_msg_id`` on chat.postMessage as the duplicate key the
+# approval card already relies on. The live proof records that a second post
+# under the same key answers with the first post's ts; these unit cases also pin
+# that an API error still raises for retry rather than being swallowed.
+
+_PROGRESS_VECTOR = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests" / "vectors" / "progress-blocks.json").read_text(
+        encoding="utf-8"
+    )
+)
+_CARD_PREFIX = _PROGRESS_VECTOR["card_block_id_prefix"]
+_MILESTONE_PREFIX = _PROGRESS_VECTOR["milestone_block_id_prefix"]
+_CARD_DELIVERY = "00000000-0000-4000-8000-000000000001"
+_MILESTONE_DELIVERY = "00000000-0000-4000-8000-000000000005"
+_EDIT_DELIVERY = "00000000-0000-4000-8000-000000000002"
+_THREAD = "1720000000.000100"
+
+
+def _progress_card(
+    state: ProgressState = ProgressState.INVESTIGATING,
+    *,
+    summary: str = "Reading the deploy log",
+    revision: int = 1,
+) -> ProgressCard:
+    return ProgressCard(
+        kind="card",
+        state=state,
+        summary=summary,
+        revision=revision,
+        terminal=state in TERMINAL_PROGRESS_STATES,
+    )
+
+
+def _progress_post(
+    progress: ProgressCard | ProgressMilestone,
+    *,
+    delivery_id: str = _CARD_DELIVERY,
+    thread: str | None = _THREAD,
+) -> ReplyPost:
+    return ReplyPost(
+        version=PROGRESS_REPLY_WIRE_VERSION,
+        event="reply.post",
+        target=ReplyTarget(
+            kind="slack", address="C0EXAMPLE1", conversation_id=thread, reply_ref="1.1"
+        ),
+        message=OutboundMessage(version=MESSAGE_VERSION, text=progress.summary),
+        requested_by="U0EXAMPLE1",
+        delivery_id=delivery_id,
+        progress=progress,
+    )
+
+
+def _progress_edit(card: ProgressCard, *, card_ref: str | None = "9.9") -> ReplyUpdate:
+    return ReplyUpdate(
+        version=PROGRESS_REPLY_WIRE_VERSION,
+        event="reply.update",
+        target=ReplyTarget(
+            kind="slack", address="C0EXAMPLE1", conversation_id=_THREAD, reply_ref=card_ref
+        ),
+        delivery_id=_EDIT_DELIVERY,
+        progress=card,
+    )
+
+
+class _SlackRecorder:
+    """Every chat call the adapter makes, in order, answered like Slack would."""
+
+    def __init__(self, sink: SlackReplyAdapter, *, post_ts: str = "9.9") -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self._post_ts = post_ts
+        client = sink._client_for(None)
+        client.chat_postMessage = self._post  # type: ignore[method-assign]
+        client.chat_update = self._update  # type: ignore[method-assign]
+
+    async def _post(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("chat.postMessage", kwargs))
+        return {"ok": True, "ts": self._post_ts}
+
+    async def _update(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("chat.update", kwargs))
+        return {"ok": True, "ts": kwargs.get("ts")}
+
+    def only(self, method: str) -> dict[str, object]:
+        matching = [kwargs for name, kwargs in self.calls if name == method]
+        assert len(matching) == 1, self.calls
+        return matching[0]
+
+
+def _block_ids(kwargs: dict[str, object]) -> list[str]:
+    blocks = kwargs.get("blocks")
+    assert isinstance(blocks, list), kwargs
+    return [str(block["block_id"]) for block in blocks]
+
+
+def _block_texts(kwargs: dict[str, object]) -> list[str]:
+    blocks = kwargs.get("blocks")
+    assert isinstance(blocks, list), kwargs
+    found: list[str] = []
+    for block in blocks:
+        for item in [block.get("text"), *block.get("elements", [])]:
+            if isinstance(item, dict) and "text" in item:
+                found.append(str(item["text"]))
+    return found
+
+
+def test_a_progress_card_post_is_a_threaded_card_keyed_by_its_delivery_id() -> None:
+    """@spec ADR-0130 d4: the first revision is a new post, and delivery_id is its key."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink, post_ts="1720000000.000400")
+
+    ack = asyncio.run(sink.emit(_progress_post(_progress_card()), route=TargetRoute()))
+
+    assert ack.ref == "1720000000.000400"
+    post = slack.only("chat.postMessage")
+    assert [name for name, _ in slack.calls] == ["chat.postMessage"]
+    assert post["channel"] == "C0EXAMPLE1"
+    assert post["thread_ts"] == _THREAD
+    assert post["client_msg_id"] == _CARD_DELIVERY
+    assert all(block_id.startswith(_CARD_PREFIX) for block_id in _block_ids(post))
+    assert "Reading the deploy log" in _block_texts(post)
+
+
+def test_a_milestone_post_carries_its_own_delivery_id_and_milestone_blocks() -> None:
+    """@spec ADR-0130 d3: a milestone is a new durable message, never an edit."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink, post_ts="1720000000.000500")
+    milestone = ProgressMilestone(
+        kind="milestone",
+        milestone=MilestoneClass.VERIFICATION,
+        summary="All 212 importer tests pass",
+        ordinal=3,
+    )
+
+    ack = asyncio.run(
+        sink.emit(
+            _progress_post(milestone, delivery_id=_MILESTONE_DELIVERY), route=TargetRoute()
+        )
+    )
+
+    assert ack.ref == "1720000000.000500"
+    post = slack.only("chat.postMessage")
+    assert post["client_msg_id"] == _MILESTONE_DELIVERY
+    assert post["thread_ts"] == _THREAD
+    assert all(block_id.startswith(_MILESTONE_PREFIX) for block_id in _block_ids(post))
+    assert "All 212 importer tests pass" in _block_texts(post)
+
+
+def test_a_progress_edit_rewrites_the_card_and_never_the_answer() -> None:
+    """@spec ADR-0130 d5: a card edit carries no answer text, so it must not be one.
+
+    The branch it replaces sent ``chat.update`` with an empty text and no
+    blocks, which would have blanked the card.
+    """
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+    card = _progress_card(ProgressState.TESTING, summary="Running the suite", revision=3)
+
+    ack = asyncio.run(sink.emit(_progress_edit(card), route=TargetRoute()))
+
+    assert ack.ref == "9.9"
+    assert [name for name, _ in slack.calls] == ["chat.update"]
+    edit = slack.only("chat.update")
+    assert edit["ts"] == "9.9"
+    assert edit["text"], "the card edit must carry its text fallback"
+    assert "Running the suite" in str(edit["text"])
+    assert all(block_id.startswith(_CARD_PREFIX) for block_id in _block_ids(edit))
+    assert "Running the suite" in _block_texts(edit)
+    # Nothing from the approval card's settled render.
+    assert not any("expired" in text.lower() for text in _block_texts(edit))
+
+
+def test_a_terminal_card_edit_leaves_a_visibly_closed_card() -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+    card = _progress_card(ProgressState.FAILED, summary="Sandbox lost", revision=4)
+
+    asyncio.run(sink.emit(_progress_edit(card), route=TargetRoute()))
+
+    texts = _block_texts(slack.only("chat.update"))
+    assert texts[0] == "Task failed"
+    assert "closed" in texts[-1].lower()
+
+
+def test_a_progress_edit_without_a_card_ref_is_refused_and_posts_nothing() -> None:
+    """A null ref names no card. Posting would make a second one."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+
+    with pytest.raises(ValueError, match="card"):
+        asyncio.run(
+            sink.emit(
+                _progress_edit(_progress_card(revision=2), card_ref=None), route=TargetRoute()
+            )
+        )
+
+    assert slack.calls == []
+
+
+def test_a_progress_card_summary_pings_nobody() -> None:
+    """@spec ADR-0130 d5: blocks are plain_text; the parsed fallback is escaped."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+    card = _progress_card(summary="<!channel> ping <@U0EXAMPLE1>")
+
+    asyncio.run(sink.emit(_progress_post(card), route=TargetRoute()))
+
+    post = slack.only("chat.postMessage")
+    assert "<!channel>" not in str(post["text"])
+    assert "<@U0EXAMPLE1>" not in str(post["text"])
+    blocks = post["blocks"]
+    assert isinstance(blocks, list)
+    assert "mrkdwn" not in json.dumps(blocks)
+    assert "<!channel> ping <@U0EXAMPLE1>" in _block_texts(post)
+
+
+def test_a_rejected_progress_edit_falls_back_to_text_and_clears_the_old_blocks() -> None:
+    """chat.update keeps a message's previous blocks when the call omits them.
+
+    So a text-only retry must send an empty list, or the stale card stays on
+    screen. https://docs.slack.dev/reference/methods/chat.update/ ("blocks").
+    """
+
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def _fake_update(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        if kwargs.get("blocks"):
+            raise SlackApiError("invalid_blocks", {"ok": False, "error": "invalid_blocks"})
+        return {"ok": True}
+
+    sink._client_for(None).chat_update = _fake_update  # type: ignore[method-assign]
+
+    asyncio.run(sink.emit(_progress_edit(_progress_card(revision=2)), route=TargetRoute()))
+
+    assert len(calls) == 2
+    assert calls[1]["blocks"] == []
+    assert "Reading the deploy log" in str(calls[1]["text"])
+
+
+def test_a_failed_progress_post_raises_for_a_retry_under_the_same_key() -> None:
+    """A Slack API error is propagated rather than guessed into a delivered post.
+
+    It propagates, the outbox keeps the delivery, and every attempt the adapter
+    made carried the same ``client_msg_id``.
+    """
+
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def _fake_post(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        raise SlackApiError("refused", {"ok": False, "error": "unmeasured_duplicate_answer"})
+
+    sink._client_for(None).chat_postMessage = _fake_post  # type: ignore[method-assign]
+
+    with pytest.raises(SlackApiError):
+        asyncio.run(sink.emit(_progress_post(_progress_card()), route=TargetRoute()))
+
+    assert calls
+    assert {call["client_msg_id"] for call in calls} == {_CARD_DELIVERY}
+
+
+def test_a_placeholderless_answer_post_passes_its_delivery_id() -> None:
+    """@spec ADR-0130 d4: every create that carries a delivery_id is keyed by it."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+
+    ack = asyncio.run(
+        sink.emit(
+            ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=ReplyTarget(
+                    kind="slack", address="C0EXAMPLE1", conversation_id=_THREAD, reply_ref=None
+                ),
+                text="what I found",
+                delivery_id="00000000-0000-4000-8000-000000000009",
+            ),
+            route=TargetRoute(),
+        )
+    )
+
+    assert ack.ref == "9.9"
+    assert slack.only("chat.postMessage")["client_msg_id"] == (
+        "00000000-0000-4000-8000-000000000009"
+    )
+
+
+def test_a_placeholderless_answer_post_without_a_delivery_id_sends_no_key() -> None:
+    """The 1.0 body keeps its old shape: no key is invented for it."""
+
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+
+    asyncio.run(_hook_update(sink, conversation=_THREAD))
+
+    assert slack.only("chat.postMessage")["client_msg_id"] is None
+
+
+def test_a_plain_platform_post_passes_its_delivery_id() -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+
+    asyncio.run(
+        sink.emit(
+            ReplyPost(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.post",
+                target=_target(ts=None, thread=_THREAD),
+                message=OutboundMessage(version=MESSAGE_VERSION, text="a notice"),
+                requested_by="U0EXAMPLE1",
+                delivery_id="00000000-0000-4000-8000-00000000000a",
+            ),
+            route=TargetRoute(),
+        )
+    )
+
+    assert slack.only("chat.postMessage")["client_msg_id"] == (
+        "00000000-0000-4000-8000-00000000000a"
+    )
+
+
+def test_a_reply_wire_1_1_approval_uses_its_delivery_id_as_slack_key() -> None:
+    """@spec ADR-0130 d4: the wire operation identity keys every 1.1 create.
+
+    The approval id remains in the structured button value for resolution; it
+    does not replace the post's distinct delivery identity.
+    """
+
+    approval_id = "00000000-0000-4000-8000-00000000a001"
+    delivery_id = "00000000-0000-4000-8000-000000000008"
+    sink = SlackReplyAdapter("xoxb-test")
+    slack = _SlackRecorder(sink)
+
+    asyncio.run(
+        sink.emit(
+            ReplyPost(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.post",
+                target=_target(ts=None, thread=_THREAD),
+                message=_approval_message(approval_id, "Deploy acme-bot to production?"),
+                requested_by="U0EXAMPLE1",
+                delivery_id=delivery_id,
+            ),
+            route=TargetRoute(),
+        )
+    )
+
+    assert slack.only("chat.postMessage")["client_msg_id"] == delivery_id

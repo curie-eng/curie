@@ -7,9 +7,11 @@
 
 mod support;
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::io::{Cursor, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -28,6 +30,8 @@ const REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS: &str =
     r#"{"mediaType":"application/vnd.oci.image.index.v1+json"}"#;
 const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
 const VERSION_ID: &str = "00000000-0000-0000-0000-000000000002";
+const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
+const DEFAULT_APPROVER: &str = "U0EXAMPLE1";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -40,7 +44,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_example_stub(dir: &Path, name: &str, body: &str) {
     let reads = include_str!("data/converged-installation-read.sh");
     let body = if name == "helm" {
         // Preserve this installer's existing Grafana status/migration replies.
@@ -54,14 +58,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -85,6 +82,7 @@ struct Fixture {
     api: MockServer,
     registry: MockServer,
     registry_endpoint: String,
+    agent_state: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
 }
 
 impl Fixture {
@@ -112,7 +110,7 @@ impl Fixture {
         fs::create_dir(&applied_dir).expect("create applied-file capture directory");
         fs::create_dir(&helm_values_dir).expect("create helm-values capture directory");
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -198,7 +196,7 @@ case " $* " in
         printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"grafana"},"data":{"admin-user":"bWlncmF0ZWQtYWRtaW4=","admin-password":"cHc="}}'
         exit 0
         ;;
-    *" wait "*" secret/sre-bot-kubernetes-token "*)
+    *" wait "*" secret/sre-bot-kubernetes-token "*|*" wait "*" secret/sre-bot-upgrader-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success|read-failure) exit 0 ;;
             timeout)
@@ -207,7 +205,7 @@ case " $* " in
                 ;;
         esac
         ;;
-    *" get secret sre-bot-kubernetes-token "*)
+    *" get secret sre-bot-kubernetes-token "*|*" get secret sre-bot-upgrader-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success)
                 printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"enp6enp6enp6enp6"}}'
@@ -274,7 +272,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -339,20 +337,43 @@ if [ "$1" = "upgrade" ] && [ "$2" != "--install" ]; then
     exit 0
 fi
 
+if [ "$1" = "history" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+fi
+
 printf 'unexpected helm invocation: %s\n' "$*" >&2
 exit 64
 "#,
         );
 
-        let api = serve(
-            move |request| match (request.method.as_str(), request.path.as_str()) {
-                ("GET", "/agents") => Response::json(200, "[]"),
-                ("POST", "/agents") => Response::json(
-                    201,
-                    &format!(
-                        r##"{{"id":"{AGENT_ID}","name":"sre-bot","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-08-21T00:00:00Z","memory":false}}"##
-                    ),
-                ),
+        // `resolve_agent` (cli/src/api.rs) re-lists `GET /agents` on every
+        // call -- including the one `deploy_with_commit_sha` performs after
+        // `bind_sre_approvals_route`'s PATCH -- so the fake keeps the created
+        // agent's state (namely `approval_routes`) in this cell rather than
+        // replying with the same fixed, routeless JSON every time. `None`
+        // means "not created yet", matching `GET /agents` => `[]`.
+        let agent_state: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fixture_agent_state = std::sync::Arc::clone(&agent_state);
+        let api = serve(move |request| {
+            let mut agent_state = agent_state.lock().unwrap();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/agents") => match agent_state.as_ref() {
+                    Some(agent) => Response::json(200, &json!([agent]).to_string()),
+                    None => Response::json(200, "[]"),
+                },
+                ("POST", "/agents") => {
+                    let agent = json!({
+                        "id": AGENT_ID,
+                        "name": "sre-bot",
+                        "channels": [{"kind": "slack", "address": "#local-dev"}],
+                        "created_at": "2026-08-21T00:00:00Z",
+                        "memory": false,
+                    });
+                    *agent_state = Some(agent.clone());
+                    Response::json(201, &agent.to_string())
+                }
                 ("POST", path) if path == format!("/agents/{AGENT_ID}/versions") => Response::json(
                     201,
                     &format!(
@@ -382,12 +403,69 @@ exit 64
                 {
                     Response::json(
                         200,
-                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}}}"#,
+                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}},"version_id":"00000000-0000-0000-0000-000000000002","triggers":[]}"#,
                     )
                 }
+                ("POST", path) if path == format!("/agents/{AGENT_ID}/channels") => {
+                    // `add_agent_channel` (cli/src/api.rs) adds a Slack channel
+                    // binding when `--slack-channel` names one the resolved
+                    // agent does not already answer on (ADR-0118). Append it to
+                    // the recorded state and return the updated agent so the
+                    // deploy's next `resolve_agent` lookup sees it too.
+                    let mut agent = agent_state.clone().unwrap_or_else(|| {
+                        json!({
+                            "id": AGENT_ID,
+                            "name": "sre-bot",
+                            "channels": [{"kind": "slack", "address": "#local-dev"}],
+                            "created_at": "2026-08-21T00:00:00Z",
+                            "memory": false,
+                        })
+                    });
+                    if let Ok(body) = serde_json::from_slice::<Value>(&request.body) {
+                        if let (Some(kind), Some(address)) = (
+                            body.get("kind").and_then(Value::as_str),
+                            body.get("address").and_then(Value::as_str),
+                        ) {
+                            agent["channels"]
+                                .as_array_mut()
+                                .expect("agent channels must be an array")
+                                .push(json!({"kind": kind, "address": address}));
+                        }
+                    }
+                    *agent_state = Some(agent.clone());
+                    Response::json(200, &agent.to_string())
+                }
+                ("PATCH", path) if path == format!("/agents/{AGENT_ID}") => {
+                    // `set_approval_routes` (cli/src/api.rs) PATCHes
+                    // `{"approval_routes": {...}}` and decodes the response as
+                    // `Agent`. `ApprovalRouteBindingWrite` and
+                    // `ApprovalRouteBindingResponse` share the same field names
+                    // on the wire (resolution/notification/approvers), so the
+                    // request body's `approval_routes` value can be echoed back
+                    // verbatim as the response's `approval_routes`. The updated
+                    // agent is written back into `agent_state` so the next `GET
+                    // /agents` (the deploy step's own `resolve_agent` lookup)
+                    // sees the bound routes instead of a fresh, routeless agent.
+                    let routes = serde_json::from_slice::<Value>(&request.body)
+                        .ok()
+                        .and_then(|body| body.get("approval_routes").cloned())
+                        .unwrap_or_else(|| json!({}));
+                    let mut agent = agent_state.clone().unwrap_or_else(|| {
+                        json!({
+                            "id": AGENT_ID,
+                            "name": "sre-bot",
+                            "channels": [{"kind": "slack", "address": "#local-dev"}],
+                            "created_at": "2026-08-21T00:00:00Z",
+                            "memory": false,
+                        })
+                    });
+                    agent["approval_routes"] = routes;
+                    *agent_state = Some(agent.clone());
+                    Response::json(200, &agent.to_string())
+                }
                 _ => Response::json(500, r#"{"error":"unexpected API request"}"#),
-            },
-        );
+            }
+        });
         let registry = serve(|request| {
             if request.path.starts_with("/failure/") {
                 return Response::json(503, r#"{"error":"registry unavailable"}"#);
@@ -450,7 +528,22 @@ exit 64
             api,
             registry,
             registry_endpoint,
+            agent_state: fixture_agent_state,
         }
+    }
+
+    /// Seed the fake API with an already-created `sre-bot` agent carrying
+    /// `approval_routes`, as a rerun against a configured install would see.
+    fn with_existing_agent_routes(self, routes: Value) -> Self {
+        *self.agent_state.lock().unwrap() = Some(json!({
+            "id": AGENT_ID,
+            "name": "sre-bot",
+            "channels": [{"kind": "slack", "address": "#local-dev"}],
+            "created_at": "2026-08-21T00:00:00Z",
+            "memory": false,
+            "approval_routes": routes,
+        }));
+        self
     }
 
     fn with_grafana_secret_mode(mut self, mode: &'static str) -> Self {
@@ -483,6 +576,21 @@ exit 64
     }
 
     fn run_from(&self, extra: &[&str], current_dir: &Path, release_cache: Option<&Path>) -> Output {
+        let mut args = vec!["--approvers", DEFAULT_APPROVER];
+        args.extend_from_slice(extra);
+        self.run_from_args(&args, current_dir, release_cache)
+    }
+
+    fn run_without_default_approver(&self, extra: &[&str]) -> Output {
+        self.run_from_args(extra, &repo_root(), None)
+    }
+
+    fn run_from_args(
+        &self,
+        extra: &[&str],
+        current_dir: &Path,
+        release_cache: Option<&Path>,
+    ) -> Output {
         let mut paths = vec![self.bin_dir.clone()];
         if let Some(current) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&current));
@@ -515,6 +623,12 @@ exit 64
             .env("CURIE_TEST_CONNECTOR_STDIN", &self.connector_stdin)
             .env("CURIE_TEST_APPLIED_DIR", &self.applied_dir)
             .env("CURIE_TEST_HELM_VALUES_DIR", &self.helm_values_dir)
+            // The installer reads CURIE_CREDENTIALS from the secret store too
+            // (#2920); never let the host's store decide the model.
+            .env(
+                "CURIE_CONFIG_DIR",
+                self.helm_values_dir.join("curie-config"),
+            )
             .env("CURIE_TEST_NODES_JSON", &self.nodes)
             .env("CURIE_TEST_PODS_JSON", &self.pods)
             .env("CURIE_TEST_NODES_MODE", self.nodes_mode)
@@ -831,7 +945,18 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
             "the install surface must expose targeting flag {required}: {text}"
         );
     }
+    assert!(
+        text.contains("--approvers"),
+        "the install surface must expose --approvers as its single approval input: {text}"
+    );
+    let usage = text.split("Options:").next().unwrap_or(&text);
+    assert!(
+        usage.contains("--approvers <USER_IDS>"),
+        "the usage line must mark --approvers as required: {text}"
+    );
     for forbidden in [
+        "--route-approvers",
+        "--routes-from",
         "--values",
         "--file",
         "--api-key",
@@ -1378,9 +1503,21 @@ fn successful_install_uploads_the_pinned_upstream_kubernetes_connector_and_tool_
         plugin.get("toolPolicy").is_some(),
         "the tri-state Kubernetes policy must reach the deployed bundle"
     );
+    // approvalPolicy is never removed (it always carries the always-present
+    // Kubernetes mutation gates, routed to sre-approvals); only the
+    // self-upgrade gates come and go with the self-upgrade connector.
+    let gates = plugin["approvalPolicy"]["gates"]
+        .as_array()
+        .expect("approvalPolicy.gates must be present");
     assert!(
-        plugin.get("approvalPolicy").is_none(),
-        "self-upgrade gates must be stripped when the connector is not installed"
+        !gates.is_empty(),
+        "the always-present Kubernetes mutation gates must reach the deployed bundle"
+    );
+    assert!(
+        !gates.iter().any(|gate| gate["gate"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("mcp__self-upgrade__"))),
+        "self-upgrade gates must be stripped when the connector is not installed: {gates:?}"
     );
 
     let registry = fixture.registry.recorded();
@@ -1396,6 +1533,73 @@ fn successful_install_uploads_the_pinned_upstream_kubernetes_connector_and_tool_
         "the removed writer image must never be resolved: {registry:?}"
     );
 }
+
+#[test]
+fn publication_gate_survives_both_embedded_installer_modes_with_operator_approvers() {
+    for platform_upgrade in [false, true] {
+        let fixture = full_install_fixture();
+        let mut args = vec!["--approvers", "U0EXAMPLE1"];
+        if platform_upgrade {
+            args.push("--platform-upgrade");
+        }
+        let output = fixture.run(&args);
+        let text = shown(&output);
+        assert!(
+            output.status.success(),
+            "install with platform_upgrade={platform_upgrade} must complete: {text}"
+        );
+
+        let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
+            &fixture,
+            ".claude-plugin/plugin.json",
+        ))
+        .expect("uploaded plugin manifest must remain valid JSON");
+        let gates = plugin["approvalPolicy"]["gates"]
+            .as_array()
+            .expect("uploaded approvalPolicy.gates must be present");
+        let publication_gates: Vec<&Value> = gates
+            .iter()
+            .filter(|gate| gate["gate"] == PLATFORM_PUBLISH_GATE)
+            .collect();
+        assert_eq!(
+            publication_gates.len(),
+            1,
+            "the uploaded bundle must preserve one exact publication gate: {gates:?}"
+        );
+        assert_eq!(
+            publication_gates[0],
+            &json!({
+                "gate": PLATFORM_PUBLISH_GATE,
+                "route": "sre-approvals",
+            }),
+            "the uploaded bundle must preserve one exact publication route in both installer modes: {gates:?}"
+        );
+        assert_eq!(
+            gates
+                .iter()
+                .any(|gate| gate["gate"] == "mcp__self-upgrade__upgrade_platform"),
+            platform_upgrade,
+            "the two iterations must exercise different self upgrade modes: {gates:?}"
+        );
+
+        let route_write = fixture
+            .api
+            .recorded()
+            .into_iter()
+            .find(|request| {
+                request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+            })
+            .expect("install must bind sre-approvals before uploading the bundle");
+        let route_body: Value = serde_json::from_slice(&route_write.body)
+            .expect("approval route request must remain valid JSON");
+        assert_eq!(
+            route_body["approval_routes"]["sre-approvals"]["approvers"]["users"],
+            json!(["U0EXAMPLE1"]),
+            "the publication route must be resolvable by the explicit operator user"
+        );
+    }
+}
+
 #[test]
 fn install_records_the_current_commit_sha_on_the_created_version() {
     let fixture = Fixture::with_modes(
@@ -1494,6 +1698,80 @@ fn released_binary_path_uses_cached_chart_and_embedded_assets_outside_checkout()
     assert!(
         !uploaded_bundle_file(&fixture, "connectors.yaml").is_empty(),
         "the binary must deploy its embedded SRE bot bundle outside the checkout"
+    );
+}
+
+#[test]
+fn recorded_model_credential_refusal_names_the_credential_to_export() {
+    const MODEL_CREDENTIAL: &str = "fixture_model_credential_value";
+
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_helm_values(json!({
+        "agentSandbox": {"runner": {"credentials": MODEL_CREDENTIAL}}
+    }));
+    let output = fixture.run(&[]);
+    let text = shown(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a recorded model credential must be a usage refusal: {text}"
+    );
+    for consequence in [
+        "would clear it",
+        "fakeModel default",
+        "pods stay Ready",
+        "turns still answer",
+    ] {
+        assert!(
+            text.contains(consequence),
+            "refusal must retain consequence `{consequence}`: {text}"
+        );
+    }
+
+    let guidance = text.to_ascii_lowercase();
+    // #2920: the installer declares CURIE_CREDENTIALS when it is exported, so
+    // the way through is to export it and re-run, not a second command after.
+    let export = guidance
+        .find("export curie_credentials")
+        .unwrap_or_else(|| panic!("refusal must name the credential to export: {text}"));
+    assert!(
+        guidance[export..].contains("re-running"),
+        "refusal must say exporting it and re-running keeps the credential: {text}"
+    );
+    for stale_advice in ["preserve it first", "helm get values", "helm upgrade"] {
+        assert!(
+            !guidance.contains(stale_advice),
+            "refusal must not prescribe the ineffective recovery `{stale_advice}`: {text}"
+        );
+    }
+
+    let helm_calls = fixture.helm_calls();
+    assert!(
+        helm_calls.iter().all(|call| {
+            !call.starts_with("upgrade --install curie ") && !call.starts_with("upgrade curie ")
+        }),
+        "refusal must precede every Curie platform upgrade: {helm_calls:?}"
+    );
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "refusal must precede every Curie platform API call"
+    );
+    let observable = format!(
+        "{text}\n{:?}\n{:?}\n{:?}",
+        fixture.helm_calls(),
+        fixture.kubectl_calls(),
+        fixture.actions(),
+    );
+    assert!(
+        !observable.contains(MODEL_CREDENTIAL),
+        "the recorded model credential must not reach output or command logs"
     );
 }
 
@@ -2736,5 +3014,331 @@ fn default_install_applies_one_identity_with_a_fixed_demo_namespace_ceiling() {
     assert!(
         !access.contains("sre-bot-writer") && !access.contains("sre-bot-scaler"),
         "removed bespoke identities must not survive in rendered RBAC: {access}"
+    );
+}
+
+fn approvers_dry_run_plan(fixture: &Fixture, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["--dry-run", "--json"];
+    args.extend_from_slice(extra);
+    let output = fixture.run_without_default_approver(&args);
+    let text = shown(&output);
+    assert!(output.status.success(), "dry run must succeed: {text}");
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("dry run stdout must be one JSON object: {error}; {text}"));
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "dry run must not mutate the platform API"
+    );
+    document["plan"]
+        .as_array()
+        .expect("dry run object must carry its ordered plan")
+        .iter()
+        .map(|line| line.as_str().expect("plan entries are strings").to_string())
+        .collect()
+}
+
+fn route_binding_line(lines: &[String]) -> (usize, String) {
+    lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| {
+            line.contains("sre-approvals") && line.to_ascii_lowercase().contains("bind")
+        })
+        .map(|(index, line)| (index, line.clone()))
+        .unwrap_or_else(|| panic!("dry run plan must bind route sre-approvals: {lines:?}"))
+}
+
+#[test]
+fn dry_run_plans_the_sre_approvals_binding_with_comma_separated_approvers_before_deploy() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let lines = approvers_dry_run_plan(
+        &fixture,
+        &[
+            "--slack-channel",
+            "C0EXAMPLE1",
+            "--approvers",
+            "U0EXAMPLE1,U0EXAMPLE2",
+        ],
+    );
+    let (bind, line) = route_binding_line(&lines);
+    for user in ["U0EXAMPLE1", "U0EXAMPLE2"] {
+        assert!(
+            line.contains(user),
+            "binding line must name approver {user}: {line}"
+        );
+    }
+    let deploy = lines
+        .iter()
+        .position(|line| line.contains("deploy") && line.contains("sre-bot"))
+        .unwrap_or_else(|| panic!("plan must contain SRE bot bundle deployment: {lines:?}"));
+    assert!(
+        bind < deploy,
+        "the route must be bound before the deploy that refuses unbound routes: {lines:?}"
+    );
+    let plan = lines.join("\n");
+    assert!(
+        !plan.contains("--route-approvers sre-approvals=users:"),
+        "an install that binds approvers must not warn that they are missing: {lines:?}"
+    );
+}
+
+#[test]
+fn repeated_approvers_flags_accumulate_into_one_binding() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let lines = approvers_dry_run_plan(
+        &fixture,
+        &[
+            "--approvers",
+            "U0EXAMPLE2,U0EXAMPLE1",
+            "--approvers",
+            "U0EXAMPLE2,U0EXAMPLE3",
+        ],
+    );
+    let (_, line) = route_binding_line(&lines);
+    assert!(
+        line.contains("approvers users U0EXAMPLE2,U0EXAMPLE1,U0EXAMPLE3"),
+        "the binding must preserve first occurrence order and remove duplicates: {line}"
+    );
+}
+
+#[test]
+fn missing_approvers_is_refused_by_clap_before_all_external_activity() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run_without_default_approver(&[]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "omitting approvers must be a Clap usage error: {text}"
+    );
+    assert!(
+        text.contains("required") && text.contains("--approvers <USER_IDS>"),
+        "the refusal must name the missing required flag: {text}"
+    );
+    assert!(fixture.kubectl_calls().is_empty(), "no kubectl activity");
+    assert!(fixture.helm_calls().is_empty(), "no Helm activity");
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "no platform API activity"
+    );
+    assert!(
+        fixture.registry.recorded().is_empty(),
+        "no registry activity"
+    );
+}
+
+#[test]
+fn blank_approver_ids_are_refused_before_any_cluster_mutation() {
+    for bad in ["", "   ", "U0AAA,", "U0AAA, ,U0BBB"] {
+        let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+        let output = fixture.run_without_default_approver(&["--approvers", bad]);
+        let text = shown(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "blank approver id {bad:?} must be a usage error: {text}"
+        );
+        assert!(
+            text.contains("--approvers"),
+            "the refusal must name the offending flag: {text}"
+        );
+        assert!(
+            !text.contains("unexpected argument"),
+            "the refusal must come from approver validation, not an unknown flag: {text}"
+        );
+        assert!(fixture.api.recorded().is_empty(), "no API call for {bad:?}");
+        assert!(
+            !fixture
+                .helm_calls()
+                .iter()
+                .any(|call| call.starts_with("upgrade") || call.starts_with("install")),
+            "no Helm mutation for {bad:?}"
+        );
+        assert!(
+            !fixture
+                .kubectl_calls()
+                .iter()
+                .any(|call| call.contains("apply") || call.contains("create")),
+            "no kubectl mutation for {bad:?}"
+        );
+    }
+}
+
+fn full_install_fixture() -> Fixture {
+    Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+}
+
+#[test]
+fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1"]},
+        },
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1", "U0EXAMPLE2"]},
+        },
+    }));
+    let install_args = ["--slack-channel", "C0EXAMPLE2", "--approvers", "U0EXAMPLE2"];
+    let output = fixture.run_without_default_approver(&install_args);
+    let text = shown(&output);
+    assert!(output.status.success(), "rerun must complete: {text}");
+
+    let requests = fixture.api.recorded();
+    let route_writes: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+        })
+        .collect();
+    assert_eq!(
+        route_writes.len(),
+        1,
+        "rerun must send one route PATCH: {requests:?}"
+    );
+    let route_write_index = requests
+        .iter()
+        .position(|request| {
+            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+        })
+        .expect("rerun must send a route PATCH");
+    let deployment_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .expect("rerun must deploy the bundle");
+    assert!(
+        route_write_index < deployment_index,
+        "the route PATCH must precede deployment: {requests:?}"
+    );
+    let body: Value = serde_json::from_slice(&requests[route_write_index].body)
+        .expect("route PATCH body must remain valid JSON");
+    assert_eq!(
+        body["approval_routes"],
+        json!({
+            "deploys": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"users": ["U0EXAMPLE1"]},
+            },
+            "sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE2"]},
+            },
+        }),
+        "the managed route must move and narrow without changing other routes"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line == "rebound approval route sre-approvals on agent sre-bot: resolution \
+                     C0EXAMPLE2; approvers users U0EXAMPLE2"
+        }),
+        "a changed binding must be reported with its new channel and users: {text}"
+    );
+    let first_request_count = requests.len();
+    let second_output = fixture.run_without_default_approver(&install_args);
+    let second_text = shown(&second_output);
+    assert!(
+        second_output.status.success(),
+        "identical rerun must complete: {second_text}"
+    );
+    let all_requests = fixture.api.recorded();
+    let second_requests = &all_requests[first_request_count..];
+    assert!(
+        !second_requests
+            .iter()
+            .any(|request| request.method == "PATCH"),
+        "identical rerun must send no additional route PATCH: {second_requests:?}"
+    );
+    assert_eq!(
+        second_requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/deployments")
+            .count(),
+        1,
+        "identical rerun must deploy once without rebinding: {second_requests:?}"
+    );
+    assert!(
+        !second_text.contains("bound approval route sre-approvals")
+            && !second_text.contains("rebound approval route sre-approvals"),
+        "identical rerun must not claim a bind or rebound: {second_text}"
+    );
+}
+
+#[test]
+fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "notification": {"kind": "slack", "address": "C0EXAMPLE2"},
+        },
+    }));
+    let output = fixture.run_without_default_approver(&["--approvers", "U0EXAMPLE1"]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a route write that drops a notification must be refused: {text}"
+    );
+    assert!(
+        text.contains("route(s) deploys carry a notification target"),
+        "the refusal must name the route whose notification would be dropped: {text}"
+    );
+    let requests = fixture.api.recorded();
+    assert!(
+        !requests.iter().any(|request| request.method == "PATCH"),
+        "no route write may be sent: {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == "POST" && request.path == "/deployments"),
+        "nothing may be deployed: {requests:?}"
+    );
+}
+
+#[test]
+fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_write() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "notification": {"kind": "slack", "address": "C0EXAMPLE2"},
+        },
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approvers": {"users": ["U0EXAMPLE2"]},
+        },
+    }));
+    let output = fixture.run_without_default_approver(&[
+        "--slack-channel",
+        "C0EXAMPLE2",
+        "--approvers",
+        "U0EXAMPLE2",
+    ]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "an already-bound route needs no write: {text}"
+    );
+    let requests = fixture.api.recorded();
+    assert!(
+        !requests.iter().any(|request| request.method == "PATCH"),
+        "no route write may be sent when nothing changes: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.method == "POST" && request.path == "/deployments"),
+        "the bundle must still deploy: {requests:?}"
+    );
+    assert!(
+        !text.contains("bound approval route sre-approvals")
+            && !text.contains("rebound approval route sre-approvals"),
+        "an identical rerun must not claim a bind or rebound: {text}"
     );
 }

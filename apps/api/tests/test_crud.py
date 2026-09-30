@@ -4,6 +4,7 @@ create agent -> create version -> deploy to dev -> list/get, the B1 done-when.
 """
 
 import asyncio
+import uuid
 from typing import Any
 
 from curie_api.config import get_settings
@@ -30,7 +31,7 @@ def test_full_round_trip(
     # create agent
     resp = client.post(
         "/agents",
-        json={"name": "triage-bot", "channel": {"kind": "slack", "address": "C0TRIAGE01"}},
+        json={"name": "triage-bot", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text
@@ -74,7 +75,9 @@ def test_full_round_trip(
 
     got_agent = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert got_agent.status_code == 200
-    assert got_agent.json()["channels"] == [{"kind": "slack", "address": "C0TRIAGE01"}]
+    assert got_agent.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
+    ]
 
     listed_versions = client.get(
         f"/agents/{agent_id}/versions", headers=auth_headers
@@ -293,23 +296,27 @@ def test_update_channel_binding_moves_the_channel(
     # driven here through HTTP because that is where the round trip is real.
     agent = client.post(
         "/agents",
-        json={"name": "mover", "channel": {"kind": "slack", "address": "C000000OLD"}},
+        json={"name": "mover", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
         headers=auth_headers,
     ).json()
     agent_id = agent["id"]
 
     resp = client.patch(
         f"/agents/{agent_id}/channels",
-        params={"kind": "slack", "address": "C000000OLD"},
-        json={"kind": "slack", "address": "C000000NEW"},
+        params={"kind": "slack", "address": "C0EXAMPLE1"},
+        json={"kind": "slack", "address": "C0EXAMPLE2"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
+    assert resp.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default", "allowed_callers": None}
+    ]
 
     # The change is persisted, not just echoed back.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default", "allowed_callers": None}
+    ]
 
 
 def test_add_channel_binding_appends_and_leaves_the_first_alone(
@@ -321,7 +328,7 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
     # #38's shadow state reached through the very verb meant to prevent it.
     agent = client.post(
         "/agents",
-        json={"name": "adder", "channel": {"kind": "slack", "address": "C0000ADD01"}},
+        json={"name": "adder", "channel": {"kind": "slack", "address": "C0EXAMPLE0"}},
         headers=auth_headers,
     ).json()
 
@@ -334,8 +341,8 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0000ADD01"},
-        {"kind": "slack", "address": "C0EXAMPLE1"},
+        {"kind": "slack", "address": "C0EXAMPLE0", "adapter": "default", "allowed_callers": None},
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None},
     ]
 
 
@@ -348,13 +355,13 @@ def test_delete_channel_binding_removes_only_the_named_row(
     # against every future agent.
     agent = client.post(
         "/agents",
-        json={"name": "remover", "channel": {"kind": "slack", "address": "C0000DEL01"}},
+        json={"name": "remover", "channel": {"kind": "slack", "address": "C0EXAMPLE3"}},
         headers=auth_headers,
     ).json()
     assert (
         client.post(
             f"/agents/{agent['id']}/channels",
-            json={"kind": "slack", "address": "C0000DEL02"},
+            json={"kind": "slack", "address": "C0EXAMPLE4"},
             headers=auth_headers,
         ).status_code
         == 201
@@ -363,13 +370,15 @@ def test_delete_channel_binding_removes_only_the_named_row(
     removed = client.request(
         "DELETE",
         f"/agents/{agent['id']}/channels",
-        params={"kind": "slack", "address": "C0000DEL02"},
+        params={"kind": "slack", "address": "C0EXAMPLE4"},
         headers=auth_headers,
     )
     assert removed.status_code == 204, removed.text
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C0000DEL01"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE3", "adapter": "default", "allowed_callers": None}
+    ]
     assert (
         _count(
             "SELECT count(*) FROM curie.agent_channels WHERE agent_id = :aid",
@@ -380,7 +389,7 @@ def test_delete_channel_binding_removes_only_the_named_row(
 
     reused = client.post(
         "/agents",
-        json={"name": "reuses", "channel": {"kind": "slack", "address": "C0000DEL02"}},
+        json={"name": "reuses", "channel": {"kind": "slack", "address": "C0EXAMPLE4"}},
         headers=auth_headers,
     )
     assert reused.status_code == 201, reused.text
@@ -391,14 +400,16 @@ def test_patch_agent_omitted_field_is_noop(
 ) -> None:
     agent = client.post(
         "/agents",
-        json={"name": "stable", "channel": {"kind": "slack", "address": "C0000KEEP1"}},
+        json={"name": "stable", "channel": {"kind": "slack", "address": "C0EXAMPLE5"}},
         headers=auth_headers,
     ).json()
     resp = client.patch(
         f"/agents/{agent['id']}", json={}, headers=auth_headers
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channels"] == [{"kind": "slack", "address": "C0000KEEP1"}]
+    assert resp.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE5", "adapter": "default", "allowed_callers": None}
+    ]
 
 
 def test_create_agent_rejects_non_id_channel(
@@ -428,14 +439,14 @@ def test_binding_writes_reject_a_non_id_channel(
     # PATCH validated would persist a dead binding through the other door.
     agent = client.post(
         "/agents",
-        json={"name": "patch-bad", "channel": {"kind": "slack", "address": "C000GOOD01"}},
+        json={"name": "patch-bad", "channel": {"kind": "slack", "address": "C0EXAMPLE6"}},
         headers=auth_headers,
     ).json()
     agent_id = agent["id"]
 
     moved = client.patch(
         f"/agents/{agent_id}/channels",
-        params={"kind": "slack", "address": "C000GOOD01"},
+        params={"kind": "slack", "address": "C0EXAMPLE6"},
         json={"kind": "slack", "address": "general"},
         headers=auth_headers,
     )
@@ -452,7 +463,9 @@ def test_binding_writes_reject_a_non_id_channel(
 
     # The rejected writes left the original channel intact, and added nothing.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C000GOOD01"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE6", "adapter": "default", "allowed_callers": None}
+    ]
 
 
 def test_patch_missing_agent_returns_404(
@@ -537,6 +550,122 @@ def test_delete_agent_removes_it_and_cascades_versions(
         )
         == 0
     )
+
+
+def test_delete_agent_removes_work_requests_and_internal_lineage_without_github(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: Any,
+) -> None:
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "published-work-agent",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "fixture"},
+        headers=auth_headers,
+    ).json()
+    deployment = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version["id"],
+            "environment": "dev",
+        },
+        headers=auth_headers,
+    ).json()
+    lineage_id, work_item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.thread_publication_lineages "
+                        "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                        "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
+                        "latest_revision) VALUES "
+                        "(:id, :agent, :deployment, :conversation, :repo, :base_sha, "
+                        ":branch, 123, :pr_url, :head_sha, 'open', 1, 1)"
+                    ),
+                    {
+                        "id": lineage_id,
+                        "agent": agent_id,
+                        "deployment": deployment["id"],
+                        "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                        "repo": "acme-corp/acme-bot",
+                        "base_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "branch": f"curie/publication-{lineage_id.hex}",
+                        "pr_url": "https://github.com/acme-corp/acme-bot/pull/123",
+                        "head_sha": "1123456789abcdef0123456789abcdef01234567",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.work_items "
+                        "(id, github_repository_id, github_issue_number, "
+                        "github_installation_id, agent_id, repo_full_name, "
+                        "conversation_id, publication_lineage_id, version, "
+                        "next_sequence) VALUES "
+                        "(:id, 101, 2573, 202, :agent, :repo, :conversation, "
+                        ":lineage, 2, 2)"
+                    ),
+                    {
+                        "id": work_item_id,
+                        "agent": agent_id,
+                        "repo": "acme-corp/acme-bot",
+                        "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                        "lineage": lineage_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.execution_requests "
+                        "(id, work_item_id, sequence, status, wait_deadline, version) "
+                        "VALUES (:id, :work_item, 1, 'waiting', "
+                        "clock_timestamp() + interval '1 hour', 1)"
+                    ),
+                    {"id": request_id, "work_item": work_item_id},
+                )
+                await conn.execute(
+                    text("UPDATE curie.deployments SET status = 'stopped' WHERE id = :id"),
+                    {"id": deployment["id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+
+    def refuse_github(*_args: Any, **_kwargs: Any) -> str:
+        raise AssertionError("agent deletion attempted a GitHub operation")
+
+    monkeypatch.setattr(
+        "curie_api.github_app.GitHubCredentials.token_for", refuse_github
+    )
+    response = client.delete(f"/agents/{agent_id}", headers=auth_headers)
+    assert response.status_code == 204
+    assert response.content == b""
+
+    for query, row_id in (
+        ("SELECT count(*) FROM curie.agents WHERE id = :aid", agent_id),
+        ("SELECT count(*) FROM curie.agent_versions WHERE id = :aid", version["id"]),
+        ("SELECT count(*) FROM curie.deployments WHERE id = :aid", deployment["id"]),
+        (
+            "SELECT count(*) FROM curie.thread_publication_lineages WHERE id = :aid",
+            lineage_id,
+        ),
+        ("SELECT count(*) FROM curie.work_items WHERE id = :aid", work_item_id),
+        ("SELECT count(*) FROM curie.execution_requests WHERE id = :aid", request_id),
+    ):
+        assert _count(query, str(row_id)) == 0
 
 
 def test_delete_agent_with_active_deployment_returns_409(

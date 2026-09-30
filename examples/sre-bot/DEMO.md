@@ -5,8 +5,8 @@ an approved write, and a coding-agent pull request. Pair this with
 [README.md](README.md) for the bundle itself and
 [docs/approvals.md](../../docs/approvals.md) for how a paused turn resumes.
 
-Every command below is meant to run against a fresh `curie cluster up`
-install. Doclint resolves those invocations against
+Every command below is meant to run against a cluster with no existing Curie
+release. Doclint resolves those invocations against
 `cli/command-manifest.json`, so a renamed or dropped flag fails CI instead of
 shipping a dead runbook. Replace `@acme-bot`, `C0EXAMPLE1`, and
 `acme-corp/acme-bot` with the bot, channel, and throwaway repository you
@@ -36,21 +36,43 @@ before.
 
 ## Fresh install
 
-Export tokens from the environment. Do not put them on the command line.
+The commands below use the current Kubernetes context and the installer
+defaults: the curie release in the curie namespace and the observability
+stack in the observability namespace. A stock kind cluster provides a default
+storage class, so each retained volume uses that class without an override.
+
+Enter the model credential without echoing it, then install the SRE bot. The
+installer records the credential in the release, opens egress to the provider
+its prefix names, installs the observability stack and Kubernetes identity,
+binds the approval route, and deploys the bundle. The workspace repository
+stays allowlisted for both selection and publication.
 
 ```bash
+read -rsp 'Model credential: ' CURIE_CREDENTIALS
+printf '\n'
 export CURIE_CREDENTIALS
+curie example sre-bot install --observability --dry-run \
+  --workspace-repo acme-corp/acme-bot \
+  --slack-channel C0EXAMPLE1 --approvers U0EXAMPLE1
+curie example sre-bot install --observability \
+  --workspace-repo acme-corp/acme-bot \
+  --slack-channel C0EXAMPLE1 --approvers U0EXAMPLE1
+```
+
+If the selected release already records a model credential and
+`CURIE_CREDENTIALS` is not exported, the installer refuses before platform
+mutation because its declarative platform step would clear that credential and
+restore the fake model default.
+
+Slack and the GitHub App are optional integrations. Export their values from a
+secure source, then connect them after the install succeeds. Do not put
+tokens or the private key directly on the command line.
+
+```bash
 export SLACK_APP_TOKEN
 export SLACK_BOT_TOKEN
 export CURIE_GITHUB_APP_ID
 export CURIE_GITHUB_APP_PRIVATE_KEY
-```
-
-Inspect the cluster plan, then install with the allowlist already set:
-
-```bash
-curie cluster up --dry-run --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
-curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
 curie cluster comms --slack
 curie cluster github-app --app-id "$CURIE_GITHUB_APP_ID" --private-key "$CURIE_GITHUB_APP_PRIVATE_KEY"
 ```
@@ -59,12 +81,15 @@ If the App private key already lives in a Secret you manage, use
 `curie cluster github-app --app-id "$CURIE_GITHUB_APP_ID" --existing-secret my-github-app`
 instead of `--private-key`.
 
-Install the SRE bot (observability stack, Kubernetes identity, kubeconfig,
-bundle) and name `--workspace` on a follow-up deploy:
+The fresh installer command above creates the observability stack, Kubernetes
+identity, kubeconfig, and bundle. It requires `--workspace-repo` and
+`--approvers`; the latter binds named Slack users to approve Kubernetes gates,
+including with `curie cluster approvals sre-bot --resolve`. The command above
+binds `U0EXAMPLE1` and enables that user to resolve approvals from the CLI.
+Name `--workspace` on a followup deploy so the demo matches the documented
+command surface.
 
 ```bash
-curie example sre-bot install --observability --dry-run --slack-channel C0EXAMPLE1
-curie example sre-bot install --observability --slack-channel C0EXAMPLE1
 curie cluster deploy --plugin-dir examples/sre-bot --workspace --slack-channel C0EXAMPLE1
 ```
 
@@ -103,6 +128,8 @@ kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   patch deployments -n sre-demo
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+  patch pods -n sre-demo
+kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   patch deployments --namespace=curie
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   get secrets --all-namespaces
@@ -110,7 +137,8 @@ kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   create rolebindings -n sre-demo
 ```
 
-Expect yes, yes, no, no, no. A yes on platform-namespace patch or Secret read
+Expect yes, yes, yes, no, no, no. Pod patch is what server-side apply needs
+for an approved `resources_create_or_update` of a Pod. A yes on platform-namespace patch or Secret read
 means the identity is too wide; stop and fix RBAC before scenario 2.
 
 ## How to read each scenario

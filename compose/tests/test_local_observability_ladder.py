@@ -212,8 +212,9 @@ def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     # The sink has to exist before `local up`, because service startup telemetry
     # and the ingress root are part of the proof. The query belongs after the
     # real turn finalized, not beside static compose/config assertions.
-    local_up = 'local up -f "$REPO_ROOT/compose.dev.yaml" --build'
+    local_up = "local_compose_cli_args local up"
     assert local_up in rung, "the local rung must build the current compose source"
+    assert "--build" in rung, "the local rung must still pass --build"
     assert rung.index("start_local_otel_sink") < rung.index(local_up)
     assert rung.index("assert_local_otel_healthy_turn") > rung.index(
         'assert_finalized_reply "local"'
@@ -232,6 +233,149 @@ def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
         assert any(name.startswith("file/") for name in exporters), (
             f"the {signal} sink pipeline must retain queryable records, got {exporters}"
         )
+
+
+def _start_sink_with_stub_docker(
+    tmp_path: Path, *, first_run_error: str | None
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run the real start_local_otel_sink against a recording docker stub."""
+
+    function = _shell_function(LADDER_PATH.read_text(), "start_local_otel_sink")
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    runs = tmp_path / "docker-runs"
+    docker = stubs / "docker"
+    docker.write_text(
+        """#!/bin/bash
+case "$1 $2" in
+    "ps -q"|"rm -f"|"logs "*) exit 0 ;;
+    "network inspect")
+        [[ "${4:-}" == "--format" ]] && echo 172.30.0.1
+        exit 0
+        ;;
+    "run -d")
+        printf '%s\\n' "$*" >> "$STUB_RUNS"
+        host_port="$(printf '%s\\n' "$*" \\
+            | sed -nE 's/.*-p 0\\.0\\.0\\.0:([0-9]*):4318.*/\\1/p')"
+        # The first port tried stays taken, as a port another container
+        # holds would, so only a fresh choice per attempt can start.
+        if [[ -n "$STUB_FIRST_RUN_ERROR" ]]; then
+            [[ -s "$STUB_TAKEN" ]] || printf '%s' "$host_port" > "$STUB_TAKEN"
+            if [[ "$host_port" == "$(cat "$STUB_TAKEN")" ]]; then
+                echo "docker: Error response from daemon: $STUB_FIRST_RUN_ERROR" >&2
+                exit 125
+            fi
+        fi
+        echo stub-sink-id
+        exit 0
+        ;;
+    "port "*)
+        case "$3" in
+            4318/tcp)
+                host_port="$(tail -n 1 "$STUB_RUNS" \\
+                    | sed -nE 's/.*-p 0\\.0\\.0\\.0:([0-9]*):4318.*/\\1/p')"
+                echo "0.0.0.0:$host_port"
+                ;;
+            13133/tcp) echo 127.0.0.1:41001 ;;
+            8888/tcp) echo 127.0.0.1:41002 ;;
+        esac
+        exit 0
+        ;;
+esac
+echo "unexpected docker $*" >&2
+exit 97
+"""
+    )
+    curl = stubs / "curl"
+    curl.write_text("#!/bin/sh\nexit 0\n")
+    for stub in (docker, curl):
+        stub.chmod(0o700)
+    script = f"""set -euo pipefail
+unset STUB_STATE
+REPO_ROOT="$1"
+WORKDIR="$2"
+COMPOSE_PROJECT=curie
+LOCAL_OTEL_SINK_NAME=curie-ladder-otel-sink-test
+LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_SINK_ACTIVE=0
+LOCAL_OTEL_ENDPOINT=""
+LOCAL_OTEL_METRICS_ENDPOINT=""
+assert_local_otel_zero_export_control() {{ :; }}
+{function}
+start_local_otel_sink
+printf 'endpoint=%s\\n' "$LOCAL_OTEL_ENDPOINT"
+printf 'bridge=%s\\n' "$OTEL_EXPORTER_OTLP_ENDPOINT"
+printf 'worker=%s\\n' "$CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(REPO_ROOT), str(tmp_path)],
+        env={
+            **os.environ,
+            "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
+            "STUB_RUNS": str(runs),
+            "STUB_TAKEN": str(tmp_path / "taken-port"),
+            "STUB_FIRST_RUN_ERROR": first_run_error or "",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, runs.read_text().splitlines() if runs.exists() else []
+
+
+def _published_otlp_host_port(run: str) -> str:
+    published = [
+        spec for spec in re.findall(r"-p (\S+)", run) if spec.endswith(":4318")
+    ]
+    assert len(published) == 1, f"the sink must publish OTLP once: {run}"
+    return published[0].split(":")[1]
+
+
+def test_local_sink_names_its_otlp_host_port(tmp_path: Path) -> None:
+    """Every stack container dials the sink at gateway:host-port.
+
+    Docker Desktop refuses a host port Docker allocated (``-p ip::4318``) from
+    inside its VM, at 127.0.0.1 and at every bridge gateway alike, while the
+    Mac reaches it; a host port the caller names is reachable from both
+    bridge and host-network containers there, as on Linux.
+    """
+
+    result, runs = _start_sink_with_stub_docker(tmp_path, first_run_error=None)
+    assert len(runs) == 1, result.stderr
+    host_port = _published_otlp_host_port(runs[0])
+    assert host_port.isdigit() and 0 < int(host_port) < 65536, (
+        f"the sink's OTLP host port must be chosen, not Docker-allocated: {runs[0]}"
+    )
+    assert result.returncode == 0, result.stderr
+    endpoint = f"http://172.30.0.1:{host_port}"
+    assert f"endpoint={endpoint}" in result.stdout
+    assert f"bridge={endpoint}" in result.stdout
+    assert f"worker={endpoint}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "collision",
+    [
+        "Bind for 0.0.0.0:41999 failed: port is already allocated",
+        "ports are not available: exposing port TCP 0.0.0.0:41999 -> "
+        "127.0.0.1:0: listen tcp4 0.0.0.0:41999: bind: address already in use",
+    ],
+)
+def test_local_sink_retries_a_chosen_port_that_is_taken(
+    tmp_path: Path, collision: str
+) -> None:
+    """A chosen port can be taken by a container or by a host process."""
+
+    result, runs = _start_sink_with_stub_docker(tmp_path, first_run_error=collision)
+    assert len(runs) >= 2, f"a taken port must be retried, not fatal: {result.stderr}"
+    taken = _published_otlp_host_port(runs[0])
+    host_port = _published_otlp_host_port(runs[-1])
+    assert host_port.isdigit() and host_port != taken, (
+        f"each attempt must choose its port afresh, not retry {taken}: {runs}"
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"endpoint=http://172.30.0.1:{host_port}" in result.stdout
 
 
 def test_local_sink_assertion_proves_causality_correlation_and_bounded_metrics() -> None:
@@ -449,12 +593,15 @@ def test_inject_local_runner_failure_blanks_live_credentials_and_reaps(
     """Execute the real inject/restore helpers against a stub docker."""
 
     source = LADDER_PATH.read_text()
-    script = _shell_function(source, "container_env_value")
+    script = _shell_function(source, "ladder_compose")
+    script += _shell_function(source, "container_env_value")
     script += _shell_function(source, "reap_local_runner_sandboxes")
     script += _shell_function(source, "inject_local_runner_failure")
     script += _shell_function(source, "restore_local_runner_health")
     script += """
 REPO_ROOT="$1"
+COMPOSE_PROJECT=curie
+COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
 SANDBOX_LABEL="curietech.ai/managed-by=curie-sandbox-substrate"
 LOCAL_OTEL_ENDPOINT="http://otel.example:4318"
 LIVE=1
@@ -659,6 +806,10 @@ def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport(
         "operation",
         "observation_count",
         "observation_type",
+        # Langfuse renames a tool observation to the tool, so the tool identity is
+        # the only evidence that a specific tool ran. A built-in or connector tool
+        # name is not caller data.
+        "tool_name",
         "approval_decision",
     ):
         assert allowed in sanitizer, f"sanitized evidence omits safe field {allowed!r}"
@@ -719,6 +870,7 @@ def test_product_evidence_sanitizer_and_failure_paths_never_dump_private_json(
         "operation",
         "observation_count",
         "observation_type",
+        "tool_name",
         "approval_decision",
     }
     combined_output = result.stdout + result.stderr
@@ -887,7 +1039,7 @@ def test_approval_seed_background_message_is_owned_by_global_cleanup() -> None:
     assert "APPROVAL_SEED_MESSAGE_PID=$!" in approval
     assert "stop_approval_seed_message terminate || true" in trap
     assert trap.index("stop_approval_seed_message terminate || true") < trap.index(
-        '"$BIN" local down'
+        "local_compose_cli_args local down"
     ), "the background Slack stub must stop before its stack is torn down"
     assert approval.count("stop_approval_seed_message terminate || true") == 2
     assert "stop_approval_seed_message || code=$?" in approval
@@ -944,9 +1096,10 @@ def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() ->
         "export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" in restore
     )
     assert (
-        "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"
+        'export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$PRODUCT_COLLECTOR_WORKER_ENDPOINT"'
         in restore
     )
+    assert "http://127.0.0.1:24318" in source
     assert "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in restore
     assert "unset OTEL_EXPORTER_OTLP_ENDPOINT" not in restore
     for protocol in ("http/protobuf", "otel-collector:4318"):
@@ -1123,6 +1276,7 @@ REPO_ROOT="$2"
 FAILURE="$3"
 BIN=true
 LAST_ORDINARY_TRACE_ID=cccccccccccccccccccccccccccccccc
+ladder_compose() { docker compose "$@"; }
 sleep() { :; }
 docker() {
     if [[ "$1" == logs ]]; then

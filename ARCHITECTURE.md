@@ -30,12 +30,16 @@ detail, and documentation drift on one version-selectable system diagram.
 ## Table of contents
 
 - [Clause status](#clause-status)
+  - [Local to production parity](#local-to-production-parity)
+  - [Git flow deploy](#git-flow-deploy)
+  - [Eval gate](#eval-gate)
 - [Overview](#overview)
 - [Component map](#component-map)
   - [Adopted, not built](#adopted-not-built)
 - [Handling a Slack mention (message flow)](#handling-a-slack-mention-message-flow)
   - [The four kernel invariants](#the-four-kernel-invariants)
   - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
+  - [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)
 - [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
 - [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
   - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
@@ -103,7 +107,7 @@ on 2026-08-20.
 | One server side grader implementation exists | RESERVED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/models.py` each implement graders. Shared schema and vectors limit drift but do not create one implementation. |
 | Fake models cannot produce a quality pass | ENFORCED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/runner.py` return `PLUMBING_OK` before grading with a fake model. `apps/worker/src/curie_worker/eval/stream.py`, `cli/tests/fake_tier_plumbing.rs`, and worker tests pin the tri state. |
 | Skill, local, and local release grade failures are fatal | ENFORCED | `cli/src/commands.rs` exits 1 for a failed case. `cli/scripts/e2e-ladder.sh` runs skill, local, and local release evals under `set -e`; the associated nightly jobs therefore fail on those grades. |
-| Cluster answer quality failure is fatal | VALIDATED-ONLY | The `rung_cluster` path in `cli/scripts/e2e-ladder.sh` runs live `cluster eval --json` but captures a failure and reports it without failing the rung, citing issue #1603. `examples/weather/evals/cases.json` records why the regex cannot prove forecast provenance. Cluster plumbing remains fatal, answer quality does not. |
+| Cluster answer quality failure is fatal | VALIDATED-ONLY | The `rung_cluster` path in `cli/scripts/e2e-ladder.sh` runs live `cluster eval --json` but captures a failure and reports it without failing the rung, citing issue #1603. The current grader cannot prove forecast provenance. Cluster plumbing remains fatal, answer quality does not. |
 | Cluster workers receive eval reporting environment | ENFORCED | On `next`, `charts/curie/templates/worker.yaml` supplies `CURIE_API_URL`, `CURIE_API_KEY`, and three `LANGFUSE_*` values. `charts/curie/ci/worker-eval-wiring-assertions.sh`, run as `helm render assertions (worker eval wiring)` in `.github/workflows/helm-ci.yaml`, requires one correctly sourced entry with default and connector enabled renders. Issue #1452 and PR #1486 fixed only these five worker reporting environment entries on `next`, not the broader installed cluster gate. |
 | A semantic provenance grader exists | RESERVED | Neither Python nor Rust defines `GraderKind.verifier`. Issue #1603 names it as the prerequisite for a meaningful fatal cluster weather grade; the current exact, contains, regex, and `tool_called` kinds cannot prove source provenance. |
 | A worker consumes, records, and reports an eval | VALIDATED-ONLY | `apps/worker/src/curie_worker/run.py` always supervises `EvalStreamConsumer`. `apps/worker/tests/eval/test_stream.py::test_seam_full_consume_eval_report_cycle` drives Valkey, RustFS bundle load, runner grade, Langfuse record, API report, and acknowledgement, but uses `MockTransport` for the API report hop. It validates the sequence, not the real report route. |
@@ -272,13 +276,19 @@ sequenceDiagram
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
-        W->>R: POST /v1/event {message}
+        W->>V: allocate and activate durable progress generation
+        W->>R: POST /v1/event {message} (+ progress URL, token, generation headers on a person's turn)
     else turn already live for this thread
         W->>R: POST /v1/steer {text}
         Note over W,R: 409 if the turn finished first (finish race), worker opens a fresh turn on the same idle sandbox
     end
 
     R->>A: model call (streaming)
+    opt the model calls mcp__curie__progress on a turn holding a capability
+        R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token + generation)
+        P->>V: validate active generation; XADD inbox + SADD pending index atomically
+        W->>V: live pump or maintenance drainer applies inbox (rendering off, no outbox enqueue)
+    end
     R-->>W: NDJSON: text_delta*, tool notes*, final
     R--)O: gen_ai spans (agent.run root + generation/tool sibling intervals)
 
@@ -377,6 +387,38 @@ Three properties keep an approval from becoming a standing permission:
 - Membership for "who may approve" resolves in the API, never in the sandbox (ADR-0034).
 - The resumed sandbox boots with a scoped state token rather than the platform key (ADR-0033).
 - The post-approval allowance is one-shot and bound to the granting agent (ADR-0035), so an approval cannot be replayed into a standing permission.
+
+### Deliberate progress (ADR 0130)
+
+A long turn can report short task state while it runs
+([ADR-0130](docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+The report never rides the ACI stream: tool notes stay internal telemetry, and
+the frozen ACI is unchanged. Instead the kernel boots only an eligible human
+Slack thread (or its approval resume) with a direct runner eligibility fact, so
+other sessions mount neither the tool nor its prompt. It durably allocates and
+activates a monotonically increasing chain generation with a short renewable
+server-time lease, then sends a `turn.progress` sandbox token bound to
+`progress_id:generation`, the
+generation, and the URL as runner control headers on `POST /v1/event`. A
+startup keeper renews the active generation while the worker waits for the
+runner's response headers; the stream pump takes over renewal before the
+startup keeper stops. Every exit before that handoff stops the keeper and
+attempts to close the generation before re-propagating owner cancellation
+([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
+The runner's platform `progress` tool posts each command to the API with it
+([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).
+The API verifies the token and renewable active-generation lease, rate limits it, and atomically
+appends the command to the chain's inbox stream and durable pending-inbox index
+([`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`](apps/api/src/curie_api/routers/turn_progress.py)).
+While the kernel consumes the turn, a per-turn pump applies the inbox to the
+chain's durable record. The maintenance loop drains the same pending-inbox
+index after a crash, cancellation, timeout, or transient final read
+([`apps/worker/src/curie_worker/turn_progress.py::ProgressPump`](apps/worker/src/curie_worker/turn_progress.py),
+[`apps/worker/src/curie_worker/progress.py::ProgressStore`](apps/worker/src/curie_worker/progress.py)),
+which owns the ordering, idempotency, terminal and milestone-budget rules.
+Rendering is off: nothing reaches an adapter yet. The worker README's
+[Deliberate progress](apps/worker/README.md#deliberate-progress-adr-0130)
+section holds the rules.
 
 ## Pushing agent versions with git (deploy flow)
 
@@ -727,9 +769,10 @@ ladder; see the workflow file for the complete, current list. Notable ones:
 
 - `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
 - `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
-- `images`, `worker-local-image`, `dispatcher-image-smoke`, `mail-adapter-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+- `ci-images`, `images`, `dispatcher-image-smoke`, `mail-adapter-image-smoke`, `ui-image-smoke` — the **image build gates**. `ci-images` builds every image CI runs (api, dispatcher, worker, ui, runner, mail-adapter, the worker-local overlay, and a Postgres fixture) once per run and uploads each as an artifact; every smoke and ladder job loads those archives instead of rebuilding. `images` cross-builds the two example connectors for both architectures. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
 - `eval-falsifiability`, `commit-messages` (no AI attribution)
 - `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
+- `e2e-cluster-chart-regressions` — the Langfuse Postgres readiness, connector readiness, and runner BYO egress proofs on their own Calico kind cluster, in parallel with the cluster rung and on the same cluster tier; `e2e-cluster-rollout-recovery` — the rollout-free first invocation and dead-consumer recovery proof, on pushes and dispatches (including the nightly kind dispatch on `next`), never on pull requests
 
 **Release** ([`.github/workflows/release.yaml`](.github/workflows/release.yaml))
 publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,mail-adapter,worker,ui}` as

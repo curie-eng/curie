@@ -22,30 +22,12 @@ from curie_runner.memory import (
     merge_provenance,
     resolve_memory,
 )
+from runner_state_fake import CappedCasState
 
 
-def _fake_state_app() -> tuple[web.Application, list]:
-    """A minimal fake of the state API's log key at /agents/A/state/memory/log."""
-    log: list = []
-    app = web.Application()
-
-    async def get_log(request: web.Request) -> web.Response:
-        if not log:
-            return web.json_response({"detail": "not found"}, status=404)
-        return web.json_response(
-            {"namespace": "memory", "key": "log", "value": list(log), "version": len(log)}
-        )
-
-    async def append_log(request: web.Request) -> web.Response:
-        body = await request.json()
-        log.append(body["item"])
-        return web.json_response(
-            {"namespace": "memory", "key": "log", "value": list(log), "version": len(log)}
-        )
-
-    app.router.add_get("/agents/A/state/memory/log", get_log)
-    app.router.add_post("/agents/A/state/memory/log/append", append_log)
-    return app, log
+def _memory_log_state() -> CappedCasState:
+    """The state API's memory log key; it advertises no transcript cap."""
+    return CappedCasState(key="/agents/A/state/memory/log", advertise_cap=False)
 
 
 def test_record_and_provenance_round_trip() -> None:
@@ -173,7 +155,7 @@ def test_preamble_mixed_operator_then_learned() -> None:
 
 
 def test_state_store_load_empty_is_empty() -> None:
-    app, _ = _fake_state_app()
+    app = _memory_log_state().app()
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -185,7 +167,8 @@ def test_state_store_load_empty_is_empty() -> None:
 
 
 def test_state_store_append_then_load_round_trip() -> None:
-    app, log = _fake_state_app()
+    state = _memory_log_state()
+    app = state.app()
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -204,7 +187,7 @@ def test_state_store_append_then_load_round_trip() -> None:
             assert loaded == [rec]
             # The provenance survived the persist/load round-trip.
             assert loaded[0].provenance.source_trace_ids == ("trace-x",)
-            assert len(log) == 1
+            assert len(state.value or []) == 1
 
     anyio.run(go)
 
@@ -362,20 +345,10 @@ def test_null_store_replace_is_noop() -> None:
 
 
 def test_state_store_replace_puts_log() -> None:
-    put_bodies: list = []
-    app = web.Application()
-
-    async def put_log(request: web.Request) -> web.Response:
-        body = await request.json()
-        put_bodies.append(body)
-        return web.json_response(
-            {"namespace": "memory", "key": "log", "value": body["value"], "version": 2}
-        )
-
-    app.router.add_put("/agents/A/state/memory/log", put_log)
+    state = _memory_log_state()
 
     async def go() -> None:
-        async with TestServer(app) as server:
+        async with TestServer(state.app()) as server:
             url = str(server.make_url("/agents/A/state/memory"))
             store = StateApiMemoryStore(url, token="k")
             await store.replace(
@@ -383,6 +356,7 @@ def test_state_store_replace_puts_log() -> None:
             )
 
     anyio.run(go)
+    put_bodies = [body for method, body, _status in state.requests if method == "PUT"]
     assert len(put_bodies) == 1
     assert put_bodies[0]["value"][0]["content"] == "compacted"
 

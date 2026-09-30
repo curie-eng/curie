@@ -64,3 +64,38 @@ def test_orphaned_parent_is_promoted_to_root() -> None:
     ]
     tree = build_tree(observations)
     assert [n.id for n in tree] == ["a"]
+
+
+def _tool_observation(obs_id: str, bag: dict[str, object]) -> dict[str, object]:
+    base: dict[str, object] = {
+        "id": obs_id,
+        "type": "SPAN",
+        "name": "execute_tool",
+        "parentObservationId": None,
+    }
+    base.update(bag)
+    return base
+
+
+def test_execute_tool_node_exposes_the_tool_name() -> None:
+    # The trace gate must be able to assert WHICH tool ran, not merely that some
+    # tool ran, so the tool name is surfaced from every nesting shape Langfuse
+    # uses for OTel span attributes.
+    observations = [
+        _tool_observation("top", {"gen_ai.tool.name": "Bash"}),
+        _tool_observation("meta", {"metadata": {"gen_ai.tool.name": "Bash"}}),
+        _tool_observation(
+            "meta-attrs",
+            {"metadata": {"attributes": {"gen_ai.tool.name": "Bash"}}},
+        ),
+    ]
+
+    tree = build_tree(observations)
+
+    assert [n.toolName for n in tree] == ["Bash", "Bash", "Bash"]
+
+
+def test_observation_without_the_attribute_exposes_no_tool_name() -> None:
+    tree = build_tree([_tool_observation("bare", {})])
+
+    assert tree[0].toolName is None

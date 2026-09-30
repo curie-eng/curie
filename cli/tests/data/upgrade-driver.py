@@ -78,11 +78,13 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     document, so a re-read anywhere after Validate is visible
 #   failed_hook       ""                    both pre-upgrade hooks succeed
 #                     "upgrade-drain"       the #2010 drain gate Job fails
+#                     "upgrade-drain-attest" the attest Job fails
 #                     "schema-migrate"      a NON-drain pre-upgrade hook fails
 #                     Ruling 13: `queues_drained` binds to the upgrade-drain
-#                     hook alone and `hooks_healthy` to every other hook, so the
-#                     two are only provably distinct if the fixture can fail
-#                     either one while the other stays healthy.
+#                     hook and the upgrade-drain-attest hook. `hooks_healthy`
+#                     binds to every other hook, so the facets are only
+#                     provably distinct if the fixture can fail one of those
+#                     drain hooks while the other hooks stay healthy.
 #   selector_drift    live workload selector differs from the target manifest
 #   terminal          stamp ProgressDeadlineExceeded so an observer stops at
 #                     once instead of retrying to its 300s deadline. This is a
@@ -159,6 +161,8 @@ BASE = {
     "alembic_current": "0043 (head)",
     "alembic_fail": False,
     "compat_metadata": None,
+    "drain_annotation": "auto",
+    "drain_render_fails": False,
 }
 
 SCENARIOS = {
@@ -198,6 +202,7 @@ SCENARIOS = {
     # pre-upgrade hook that fires during Apply, so Converge is the only phase
     # that can see its verdict.
     "failed-drain-hook": {"failed_hook": "upgrade-drain"},
+    "failed-attest-hook": {"failed_hook": "upgrade-drain-attest"},
     "selector-drift": {"selector_drift": True, "terminal": True},
     # `observedGeneration` lags `generation`: the controller has not yet acted
     # on the target spec. Images, replicas, hooks and selectors all agree, so
@@ -220,6 +225,9 @@ SCENARIOS = {
     "values-read-fails": {"values_fail": True},
     # A second `helm get values` would return a different document.
     "values-drift": {"values_drift": True},
+    "drain-annotation-missing": {"drain_annotation": None},
+    "drain-annotation-invalid": {"drain_annotation": "many"},
+    "drain-render-fails": {"drain_render_fails": True},
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"checkpoint_patch_fails": "always"},
@@ -541,11 +549,11 @@ pod = {
     },
 }
 
-# Both pre-upgrade hooks the chart installs, by their real rendered names
+# The pre-upgrade hooks the chart installs, by their real rendered names
 # (`charts/curie/templates/worker-upgrade-drain.yaml` and `schema-migrate.yaml`).
-# Both are always present; only `failed_hook` decides which one refused. A
-# fixture that published just one hook could not tell the drain facet apart
-# from the general hook facet.
+# The drain Job, the attest Job, and schema-migrate are always present; only
+# `failed_hook` decides which one refused. A fixture that published just one
+# hook could not tell the drain facet apart from the general hook facet.
 # The two documents the `values-drift` scenario serves, distinguished by an
 # extraEnv entry the migration carries through untouched. Only the FIRST is a
 # legitimate input: it is what Validate read and migrated.
@@ -560,6 +568,7 @@ DRIFTED_VALUES = {
 
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
+    "upgrade-drain-attest": f"{RELEASE}-upgrade-drain-attest",
     "schema-migrate": f"{RELEASE}-schema-migrate",
 }
 
@@ -593,6 +602,9 @@ if program == "helm":
     # Helm v3.20 removes rel.Chart before serializing status and keeps the
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
+    if args[0] == "history":
+        print("Error: release: not found", file=sys.stderr)
+        sys.exit(1)
     if args[0] == "status":
         if "json" in args:
             emit(
@@ -692,6 +704,41 @@ if program == "helm":
                 )
             )
             sys.exit(0)
+        if show_only is None:
+            if scenario["drain_render_fails"]:
+                print("Error: target render failed", file=sys.stderr)
+                sys.exit(1)
+            values_file = flag_value("-f")
+            values = json.loads(Path(values_file).read_text()) if values_file else {}
+            if values_file:
+                capture("render-values", ".json", values_file)
+            worker = values.get("worker", {})
+            if (
+                worker.get("deploy", True) is False
+                or worker.get("upgradeDrain", {}).get("enabled", True) is False
+            ):
+                emit({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "no-drain"}})
+            budget = int(worker.get("deliveryBudgetSeconds", 600)) + int(
+                worker.get("deliveryShutdownReserveSeconds", 60)
+            )
+            drain = max(int(worker.get("upgradeDrain", {}).get("timeoutSeconds", 900)), budget)
+            grace = max(int(worker.get("terminationGracePeriodSeconds", 1860)), budget)
+            minimum = str(drain + 120 + grace + 60)
+            annotation = scenario["drain_annotation"]
+            if annotation == "auto":
+                annotation = minimum
+            annotations = {"helm.sh/hook": "pre-upgrade"}
+            if annotation is not None:
+                annotations["curie.ai/minimum-helm-timeout-seconds"] = annotation
+            emit({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {
+                    "name": f"{RELEASE}-upgrade-drain",
+                    "labels": {"app.kubernetes.io/component": "upgrade-drain"},
+                    "annotations": annotations,
+                },
+            })
         print(
             f"Error: could not find template {show_only or '<template>'} in chart",
             file=sys.stderr,

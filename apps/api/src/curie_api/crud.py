@@ -3,16 +3,19 @@
 import hashlib
 import secrets
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from channel_protocol import scoped_conversation_id
-from sqlalchemy import delete, func, select, update
+from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
+from sqlalchemy import delete, func, literal, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
+from .approvers import card_on_requesting_surface
 from .config import get_settings
 from .models import (
     ActionAuditEntry,
@@ -28,13 +31,26 @@ from .models import (
     CredentialRedemptionAuditEntry,
     Deployment,
     Environment,
+    ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
     ThreadWorkspace,
+    WorkItem,
 )
 from .publication_authority import VerifiedPublicationIdentity
+from .publication_policy import (
+    PLATFORM_ACTOR,
+    PLATFORM_AUTHORIZER,
+    POLICY_AUTO,
+    POLICY_IDENTITY,
+    PublicationPolicyConflict,
+    publication_branch_name,
+    publication_row_prefix,
+)
+from .resumequeue import parse_resume_event_id
 from .schemas import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -49,9 +65,29 @@ from .schemas import (
     SourceBindingConfig,
     VersionCreate,
 )
+from .threadkeys import (
+    fence_key_forms,
+    legacy_producer_thread_key,
+    route_thread_key_matches,
+    thread_key_forms,
+)
 from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
+
+
+class AmbiguousRoute(RuntimeError):
+    """Raised when an omitted non-Slack adapter selects several routes on one
+    pair, which migration 0070's triple key allows. Never resolved by picking
+    one: every caller answers it.
+    """
+
+
+class RoutelessPairShared(RuntimeError):
+    """A route-less non-Slack binding and another agent's route on one pair.
+
+    Raised by `refuse_routeless_pair_sharing`; its message is the 409 detail.
+    """
 
 
 class PublicationReplayConflict(RuntimeError):
@@ -96,7 +132,7 @@ async def _adopt_publication_replay(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else legacy_producer_thread_key(
             data.reply_kind,
             data.reply_channel,
             data.conversation_id,
@@ -109,19 +145,28 @@ async def _adopt_publication_replay(
         or approval.reply_channel != data.reply_channel
         or approval.reply_placeholder != data.reply_placeholder
         or approval.reply_endpoint != data.reply_endpoint
-        or approval.reply_adapter != data.reply_adapter
+        or route_identity(approval.reply_kind, approval.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
         or publication.patch_bytes != patch
         or publication.changed_paths != data.changed_paths
+        or publication.observed_title_sha256
+        != (
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        )
+        or publication.observed_body_sha256 != data.observed_body_sha256
         or publication.title != (data.title or data.summary)
         or publication.body != (data.body or "Approved platform publication.")
         or publication.reply_kind != data.reply_kind
         or publication.reply_channel != data.reply_channel
         or publication.reply_placeholder != data.reply_placeholder
         or publication.reply_endpoint != data.reply_endpoint
-        or publication.reply_adapter != data.reply_adapter
+        or route_identity(publication.reply_kind, publication.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
@@ -215,10 +260,10 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # collision on either rolls BOTH back, and no agent is ever left behind
         # bound to nothing (#38's silent-shadow state).
         # `endpoint`/`adapter` are the server-controlled reply route (ADR-0096
-        # phase 2): both NULL for `slack` and for a binding whose route is
-        # configured later, both set together otherwise. The write schema has
-        # already refused a half-configured pair, and
-        # `agent_channels_route_pair_ck` refuses one from an out-of-band writer.
+        # phase 2): for `slack` the identity alone (ADR-0168 decision 3), for
+        # any other kind both NULL until configured or both set together. The
+        # write schema has already refused any other shape, and
+        # `agent_channels_route_ck` refuses one from an out-of-band writer.
         # A create binds exactly ONE channel (ADR-0118 keeps the create
         # singular); the rest arrive through `add_channel_binding`.
         channels=[
@@ -245,6 +290,9 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         source_bindings=_stored_source_bindings(data.source_bindings),
         secrets=data.secrets,
         memory=data.memory,
+        publication_policy=data.publication_policy,
+        publication_draft=data.publication_draft,
+        publication_branch_prefix=data.publication_branch_prefix,
     )
     session.add(agent)
     return await refresh_with_channels(session, agent)
@@ -301,6 +349,7 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # match the FK ondelete=CASCADE already declared on every child table. Bundle
     # objects in RustFS are intentionally left in place (out of scope).
     await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
+    await session.execute(delete(WorkItem).where(WorkItem.agent_id == agent_id))
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))
@@ -308,7 +357,10 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
 
 
 async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentChannel]:
-    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, ordered as it reads.
+    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, in route order.
+
+    Ordered by the whole route `(kind, adapter, address)` (ADR-0168 decision
+    3), so the lock order stays total when several identities share a pair.
 
     Every mutating binding handler opens with this, and then picks its target
     out of the returned list rather than issuing a second, unlocked query --
@@ -337,28 +389,190 @@ async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> lis
     result = await session.scalars(
         select(AgentChannel)
         .where(AgentChannel.agent_id == agent_id)
-        .order_by(AgentChannel.kind, AgentChannel.address)
+        .order_by(AgentChannel.kind, AgentChannel.adapter, AgentChannel.address)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     return list(result)
 
 
-async def agent_id_for_pair(session: AsyncSession, kind: str, address: str) -> uuid.UUID | None:
-    """Which agent holds this `(kind, address)` pair, if any.
+async def agent_id_for_route(
+    session: AsyncSession, kind: str, adapter: str | None, address: str
+) -> uuid.UUID | None:
+    """Which agent holds this ROUTE -- `(kind, adapter, address)` -- if any.
 
-    Named rather than inlined at its one call site: it answers the question a
+    Named rather than inlined at its call sites: it answers the question a
     binding write's 409 has to answer accurately -- is the duplicate THIS
     agent's or another's -- and an inline `select` there reads as an incidental
-    query the next reader deletes.
+    query the next reader deletes. Replaces `agent_id_for_pair` (ADR-0168
+    decision 3): the pair alone no longer names the row uniquely once several
+    identities can share one `(kind, address)`.
+
+    Selects the rows on `(kind, address)` and narrows to `adapter`'s RESOLVED
+    identity through `route_identity`, the one rule every reader compares
+    identities by. `agent_channels_route_key` holds at most one row per
+    resolved route, so the first match is the only one.
     """
 
-    owner: uuid.UUID | None = await session.scalar(
-        select(AgentChannel.agent_id).where(
+    wanted = route_identity(kind, adapter)
+    result = await session.execute(
+        select(AgentChannel.agent_id, AgentChannel.adapter).where(
             AgentChannel.kind == kind, AgentChannel.address == address
         )
     )
-    return owner
+    for owner_id, stored_adapter in result.all():
+        if route_identity(kind, stored_adapter) == wanted:
+            owner: uuid.UUID = owner_id
+            return owner
+    return None
+
+
+def _pair_lock_keys(kind: str, address: str) -> tuple[int, int]:
+    digest = hashlib.sha256(f"curie-route-pair:{kind}:{address}".encode()).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+async def refuse_routeless_pair_sharing(
+    session: AsyncSession,
+    agent_id: uuid.UUID | None,
+    kind: str,
+    address: str,
+    adapter: str | None,
+) -> None:
+    """Refuse a non-Slack route that would share its pair with a route-less row
+    of ANOTHER agent (ADR-0168 decision 3).
+
+    A route-less binding's turn names no adapter, and an omitted non-Slack
+    adapter selects every route on the pair, so a route-less row beside another
+    agent's route makes that turn's agent a guess, which is #38's misroute.
+    `agent_channels_route_key` cannot say this: under NULLS NOT DISTINCT a
+    NULL adapter and a named one are different keys. So the write paths keep
+    0023's exclusivity for the route-less case, in both orders. Two named
+    adapters on one pair stay legal, and `agent_id`'s own rows are not
+    counted: one agent's rows are one deployment, and the per-agent readers
+    already answer their ambiguity. Slack never stores a NULL adapter.
+
+    Takes a transaction-scoped advisory lock on the pair first, so two writers
+    racing onto one pair from opposite sides serialize and the second sees the
+    first's committed row. The caller holds it to its commit. Raises
+    `RoutelessPairShared`.
+    """
+
+    if kind == SLACK_KIND:
+        return
+    classid, objid = _pair_lock_keys(kind, address)
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
+        {"classid": classid, "objid": objid},
+    )
+    others = select(AgentChannel.id).where(
+        AgentChannel.kind == kind, AgentChannel.address == address
+    )
+    if agent_id is not None:
+        others = others.where(AgentChannel.agent_id != agent_id)
+    if adapter is None:
+        routed = await session.scalar(others.where(AgentChannel.adapter.is_not(None)).limit(1))
+        if routed is not None:
+            raise RoutelessPairShared(
+                f"another agent holds a route on {kind}:{address}; a binding with no "
+                "adapter answers every route on that pair, so it would take that agent's "
+                "turns. Bind this one with its own endpoint and adapter, move or delete "
+                "the other agent, or pick another address"
+            )
+        return
+    routeless = await session.scalar(others.where(AgentChannel.adapter.is_(None)).limit(1))
+    if routeless is not None:
+        raise RoutelessPairShared(
+            f"another agent is bound to {kind}:{address} with no adapter, which answers "
+            "every route on that pair; give that binding its own endpoint and adapter "
+            "first, move or delete the other agent, or pick another address"
+        )
+
+
+async def agent_holds_channel_pair(
+    session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
+) -> bool:
+    """Does THIS agent hold a row on `(kind, address)`, under any identity?
+
+    State is scoped to the agent across its identities, and
+    `agent_channels_route_key` lets two agents hold one pair under two
+    identities, so "who holds the pair" has no single answer. This asks the
+    narrower thing every caller here needs, filtered on `agent_id` in the
+    query itself.
+    """
+
+    held = await session.scalar(
+        select(AgentChannel.id)
+        .where(
+            AgentChannel.agent_id == agent_id,
+            AgentChannel.kind == kind,
+            AgentChannel.address == address,
+        )
+        .limit(1)
+    )
+    return held is not None
+
+
+def matching_bindings(
+    bindings: list[AgentChannel], kind: str, address: str, adapter: str | None
+) -> list[AgentChannel]:
+    """The rows in ``bindings`` that `(kind, address, adapter)` selects.
+
+    A thin, name-preserving wrapper over `aci_protocol.turn.matching_routes`
+    (ADR-0168 decision 3), the one matching rule shared by every reader that
+    has to answer "is this the same route" -- whether it already holds the
+    candidate rows (`routers/hooks.py`'s preloaded `agent.channels`,
+    `routers/agents.py`'s locked per-agent set) or fetches them fresh
+    (`binding_for_route`, below).
+    """
+
+    return matching_routes(bindings, kind, address, adapter)
+
+
+async def binding_for_route(
+    session: AsyncSession,
+    kind: str,
+    adapter: str | None,
+    address: str,
+    *,
+    agent_id: uuid.UUID | None = None,
+    for_update: bool = False,
+) -> AgentChannel | None:
+    """The single binding row the route `(kind, adapter, address)` names, or None.
+
+    Narrows in SQL to the resolved identity whenever there is one (every Slack
+    route; a non-Slack route that names its adapter) and, with `agent_id`, to
+    that agent -- so `for_update` locks only the named route. The shared rule
+    (`matching_bindings`) still runs over the result, so this function and
+    every in-memory caller of it agree on what counts as the same route.
+    Raises `AmbiguousRoute` when an omitted non-Slack adapter still selects
+    several rows; every caller answers that explicitly (ADR-0168 decision 3).
+
+    `for_update` takes the same row lock `lock_agent_bindings` takes, with
+    `populate_existing` for the same reason: a caller already holding this row
+    in its identity map (loaded for an earlier check) must see the fresh,
+    locked version rather than a stale one from before a concurrent winner's
+    commit.
+    """
+
+    stmt = select(AgentChannel).where(AgentChannel.kind == kind, AgentChannel.address == address)
+    wanted = route_identity(kind, adapter)
+    if wanted is not None:
+        stmt = stmt.where(AgentChannel.adapter == wanted)
+    if agent_id is not None:
+        stmt = stmt.where(AgentChannel.agent_id == agent_id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    rows = list(await session.scalars(stmt))
+    matches = matching_bindings(rows, kind, address, adapter)
+    if len(matches) > 1:
+        raise AmbiguousRoute(
+            f"{len(matches)} routes are bound to {kind}:{address}; pass adapter to name one"
+        )
+    return matches[0] if matches else None
 
 
 async def update_channel_binding(
@@ -368,34 +582,51 @@ async def update_channel_binding(
 
     Mutated IN PLACE rather than replaced: assigning a fresh row would make the
     insert of the replacement race the delete of the original inside one flush,
-    tripping `agent_channels_kind_address_key` on a move that is perfectly
-    legal.
+    tripping `agent_channels_route_key` on a move that is perfectly legal.
 
     That in-place mutation is exactly why `generation` exists (ADR-0096 D5): the
     row id is a stable identity, so a credential minted against this binding
     before the move stays pointed at the row afterwards and would follow it to
     its NEW owner. The generation is what makes the rebind observable to that
-    credential. It is bumped UNCONDITIONALLY on any binding write, including one
-    whose values are identical -- an operator re-asserting a binding is the "I
-    think something is wrong with this route" gesture that should invalidate
-    outstanding credentials, and guarding the bump on a value change would leave
-    that case silently valid. `POST /channels/token` is the sibling bump: a
-    remint increments the same counter so rotation revokes (#2379).
+    credential. It is bumped UNCONDITIONALLY on every write to the ROUTE through
+    this function, including one whose values are identical -- an operator
+    re-asserting a binding is the "I think something is wrong with this route"
+    gesture that should invalidate outstanding credentials, and guarding the
+    bump on a value change would leave that case silently valid. `POST
+    /channels/token` is the sibling bump: a remint increments the same counter
+    so rotation revokes (#2379). Not every binding write bumps it: editing the
+    caller list (`set_allowed_callers`) deliberately does not (ADR 0175
+    decision 4).
 
     FLUSHES rather than commits, so the caller can run it inside a SAVEPOINT:
     the unique violation this raises has to be recoverable without discarding
     the outer transaction's `FOR UPDATE` locks.
     """
 
+    previous_kind = binding.kind
     binding.kind = channel.kind
     binding.address = channel.address
     # The reply route moves WITH the pair (ADR-0096 phase 2): a move that
     # re-points the pair and leaves the old endpoint/adapter behind would send
     # the new route's replies to the previous adapter, authenticated as it. This
     # is also the cutover's step 10 -- bind first, move the route in later.
-    if "endpoint" in channel.model_fields_set:
+    # Omitting both route fields preserves the stored route only within one
+    # kind: `agent_channels_route_ck` gives Slack and every other kind different
+    # route shapes, so a move across that line takes the new kind's.
+    endpoint_sent = "endpoint" in channel.model_fields_set
+    adapter_sent = "adapter" in channel.model_fields_set
+    if endpoint_sent:
         binding.endpoint = channel.endpoint
         binding.adapter = channel.adapter
+    elif channel.kind == SLACK_KIND and (adapter_sent or previous_kind != SLACK_KIND):
+        # A Slack route is its identity with no endpoint (ADR-0168 decision 3):
+        # naming one, or arriving from another kind, takes that shape.
+        binding.adapter = channel.adapter
+        binding.endpoint = None
+    elif previous_kind == SLACK_KIND and channel.kind != SLACK_KIND:
+        # A Slack identity is no route for another kind: route-less until set.
+        binding.adapter = None
+        binding.endpoint = None
     binding.generation += 1
     await session.flush()
     return binding
@@ -435,6 +666,42 @@ async def delete_channel_binding(session: AsyncSession, binding: AgentChannel) -
     await session.flush()
 
 
+async def any_binding_restricted(session: AsyncSession) -> bool:
+    """Whether any binding on this install carries a caller list (ADR 0175).
+
+    The install-wide half of the admission answer. One `EXISTS` over a
+    nullable column: a binding table holds a handful of rows per agent, so the
+    scan costs less than the round trip that carries it.
+    """
+
+    found = await session.scalar(
+        select(AgentChannel.id).where(AgentChannel.allowed_callers.is_not(None)).limit(1)
+    )
+    return found is not None
+
+
+async def set_allowed_callers(
+    session: AsyncSession, binding: AgentChannel, allowed_callers: list[str] | None
+) -> AgentChannel:
+    """Replace ONE binding's caller list, leaving its generation alone (ADR 0175).
+
+    The one writer of `allowed_callers`. Who may use a route is a separate
+    question from the route itself (decision 4), so this does not bump
+    `generation`: an adapter's `chn` token is issued for a generation (#2379),
+    and revoking it on every list edit would take an inbox offline each time an
+    operator adds a person. The caller has already validated the list against
+    the binding's kind (`schemas.validate_allowed_callers`) under the binding
+    lock, so this only stores it.
+
+    Flushes rather than commits, like the other binding writers, so the caller
+    decides when the transaction ends.
+    """
+
+    binding.allowed_callers = allowed_callers
+    await session.flush()
+    return binding
+
+
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:
     agent.model = model
     await session.commit()
@@ -449,6 +716,70 @@ async def update_agent_thinking(session: AsyncSession, agent: Agent, thinking: s
     return agent
 
 
+async def update_agent_execution_deadline(
+    session: AsyncSession, agent: Agent, seconds: int | None
+) -> Agent:
+    agent.execution_deadline_seconds = seconds
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_runner_resources(
+    session: AsyncSession, agent: Agent, resources: dict[str, Any] | None
+) -> Agent:
+    agent.runner_resources = resources
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_publication_policy(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    policy: str | None,
+    draft: bool | None,
+    branch_prefix: str | None,
+    prefix_sent: bool,
+) -> Agent:
+    """Apply one operator publication-policy write and bump the version once.
+
+    A request that names a field but does not change its stored value does not
+    bump the version, so a repeated PATCH cannot revoke an in-flight approval.
+    """
+
+    values: dict[str, Any] = {}
+    if policy is not None and policy != agent.publication_policy:
+        values["publication_policy"] = policy
+    if draft is not None and draft != agent.publication_draft:
+        values["publication_draft"] = draft
+    if prefix_sent and branch_prefix != agent.publication_branch_prefix:
+        values["publication_branch_prefix"] = branch_prefix
+    if not values:
+        return agent
+    expected_version = agent.publication_policy_version
+    values["publication_policy_version"] = expected_version + 1
+    # The version predicate is the compare-and-set. Two writers that read the
+    # same version cannot both commit, so a publication created under the
+    # winning version is revoked when the loser retries and bumps again.
+    updated_version = await session.scalar(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            Agent.publication_policy_version == expected_version,
+        )
+        .values(**values)
+        .returning(Agent.publication_policy_version)
+    )
+    if updated_version is None:
+        await session.rollback()
+        raise PublicationPolicyConflict("publication policy version changed; retry the read")
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool) -> Agent:
     """Set whether this agent's bindings share one workflow-state namespace
     (#1525 follow-up). Flipping it changes nothing already stored -- a row
@@ -457,6 +788,18 @@ async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool)
     migration of past ones."""
 
     agent.memory = memory
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_memory_writes(
+    session: AsyncSession, agent: Agent, memory_writes: bool
+) -> Agent:
+    """Set whether the runner mounts its memory tools for this agent (#1461).
+    Takes effect at the next sandbox boot; stored facts are untouched."""
+
+    agent.memory_writes = memory_writes
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -828,11 +1171,127 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 # -- approvals (#244, ADR-0010) -------------------------------------------------
 
 
+_ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+async def _work_item_for_thread(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> WorkItem | None:
+    """This agent's work item on this thread, under its key or its pre-identity
+    key (ADR-0168 decision 4).
+
+    Unguarded (`fence_key_forms`, not `thread_key_forms`): both callers are a
+    REFUSAL already scoped to `agent_id`, where over-matching is the safe
+    direction, and the guard would fail open the moment the binding that
+    proved the old key is gone -- exactly when a cancelled legacy work item
+    still has to fence credential redemption.
+    """
+
+    for form in fence_key_forms(conversation_id):
+        work_item: WorkItem | None = await session.scalar(
+            select(WorkItem)
+            .where(WorkItem.agent_id == agent_id, WorkItem.conversation_id == form)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        if work_item is not None:
+            return work_item
+    return None
+
+
+async def publication_cancellation_conflict(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> PublicationLineageConflict | None:
+    """Refuse credential redemption after the owning work item is cancelled.
+
+    A running request may still publish. Cancellation of the work item, or an
+    active request already in ``cancellation_requested``, may not.
+    """
+
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
+    )
+    if work_item is None:
+        return None
+    if work_item.cancelled_at is not None:
+        return PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    active = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status == "cancellation_requested",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if active is None:
+        return None
+    return PublicationLineageConflict(
+        "publication.work_item_cancelled",
+        "this conversation's work item is cancelled",
+    )
+
+
+async def _refuse_fenced_work_item(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    request_id: uuid.UUID | None,
+    runtime_epoch: int | None,
+) -> ExecutionRequest | None:
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
+    )
+    if work_item is None:
+        return None
+    if work_item.cancelled_at is not None:
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    active = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status.in_(_ACTIVE_WORK_ITEM_STATUSES),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if active is None:
+        return None
+    if active.status == "cancellation_requested":
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    # A resumed approval turn does not carry the execute event id. The only
+    # running request for this conversation owns the publication.
+    if request_id is None and runtime_epoch is None:
+        return active
+    if active.status == "running" and (
+        request_id != active.id or runtime_epoch != active.runtime_epoch
+    ):
+        raise PublicationLineageConflict(
+            "publication.work_item_stale_owner",
+            "the publication is not owned by the running work item request",
+        )
+    return active
+
+
 async def create_publication(
     session: AsyncSession,
     data: PublicationCreate,
     *,
     patch: bytes,
+    metadata_check: Callable[[], Awaitable[None]],
     traceparent: str | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
@@ -846,11 +1305,17 @@ async def create_publication(
     if existing is not None:
         await session.refresh(existing, ["lineage"])
         return existing, False
+    await metadata_check()
+    if bool(patch) != bool(data.changed_paths):
+        raise PublicationLineageConflict(
+            "publication.invalid_snapshot",
+            "publication patch and changed paths must both be present or both be empty",
+        )
 
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else legacy_producer_thread_key(
             data.reply_kind,
             data.reply_channel,
             data.conversation_id,
@@ -861,7 +1326,18 @@ async def create_publication(
         data,
         conversation_id=workspace_conversation_id,
     )
+    agent = await get_agent(session, deployment.agent_id)
+    if agent is None:
+        raise LookupError("agent not found")
+    auto = agent.publication_policy == POLICY_AUTO
 
+    owned_request = await _refuse_fenced_work_item(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        request_id=data.work_item_request_id,
+        runtime_epoch=data.work_item_runtime_epoch,
+    )
     lineage = await _get_thread_publication_lineage(
         session,
         agent_id=deployment.agent_id,
@@ -869,6 +1345,11 @@ async def create_publication(
         repo_full_name=thread_workspace.repo_full_name,
         for_update=True,
     )
+    if not patch and (lineage is None or lineage.pr_number is None):
+        raise PublicationLineageConflict(
+            "publication.metadata_requires_pull",
+            "a metadata-only revision requires an existing pull request",
+        )
     reservation: PublicationReviewReservation | None = None
     if lineage is None:
         if data.review_origin_key is not None:
@@ -876,18 +1357,23 @@ async def create_publication(
                 "publication.review_ineligible",
                 "review origin has no existing lineage",
             )
-        binding = await session.scalar(
-            select(AgentChannel)
-            .where(
-                AgentChannel.agent_id == deployment.agent_id,
-                AgentChannel.kind == data.reply_kind,
-                AgentChannel.address == data.reply_channel,
+        # The route this publication replies through, scoped to its agent: one
+        # agent can hold one channel under several identities (ADR-0168
+        # decision 3), and the lineage must capture the one it was raised
+        # under, never whichever row sorted first.
+        try:
+            binding = await binding_for_route(
+                session,
+                data.reply_kind,
+                data.reply_adapter,
+                data.reply_channel,
+                agent_id=deployment.agent_id,
+                for_update=True,
             )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        if binding is not None and (
-            binding.endpoint != data.reply_endpoint or binding.adapter != data.reply_adapter
+        except AmbiguousRoute:
+            binding = None
+        if binding is not None and not _binding_route_matches(
+            data, data.reply_kind, binding.endpoint, binding.adapter
         ):
             binding = None
         lineage_id = uuid.uuid4()
@@ -898,7 +1384,11 @@ async def create_publication(
             conversation_id=workspace_conversation_id,
             repo_full_name=thread_workspace.repo_full_name,
             base_sha=data.base_sha,
-            branch=f"curie/publication-{lineage_id.hex}",
+            branch=publication_branch_name(
+                lineage_id.hex,
+                prefix=agent.publication_branch_prefix,
+                auto=auto,
+            ),
             status="open",
             version=1,
             latest_revision=1,
@@ -981,8 +1471,9 @@ async def create_publication(
             if (
                 data.reply_kind != review_binding.kind
                 or data.reply_channel != review_binding.address
-                or data.reply_endpoint != review_binding.endpoint
-                or data.reply_adapter != review_binding.adapter
+                or not _binding_route_matches(
+                    data, review_binding.kind, review_binding.endpoint, review_binding.adapter
+                )
                 or (data.reply_conversation_id or data.conversation_id)
                 != lineage.reply_conversation_id
             ):
@@ -1004,13 +1495,25 @@ async def create_publication(
         lineage.latest_revision = revision_number
         lineage.updated_at = func.now()
 
+    if (
+        auto
+        and agent.publication_branch_prefix
+        and not lineage.branch.startswith(agent.publication_branch_prefix)
+    ):
+        raise PublicationLineageConflict(
+            "publication.branch_prefix",
+            "the publication branch does not carry the operator branch prefix",
+        )
+
     expected_prior_head = lineage.head_sha or lineage.base_sha
     expires_at = None
     if data.expires_in_seconds is not None:
         expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
             seconds=data.expires_in_seconds
         )
+    resolved_at = datetime.now(UTC).replace(tzinfo=None) if auto else None
     approval = Approval(
+        id=uuid.uuid4(),
         agent_id=deployment.agent_id,
         conversation_id=data.reply_conversation_id or data.conversation_id,
         author=data.author,
@@ -1028,6 +1531,17 @@ async def create_publication(
         granted_tool="mcp__curie__publish_changes",
         purpose="publication",
         expires_at=expires_at,
+        status=ApprovalStatus.approved if auto else ApprovalStatus.pending,
+        resolved_by=PLATFORM_ACTOR if auto else None,
+        resolution_note=(
+            f"authorized by {POLICY_IDENTITY} version {agent.publication_policy_version}"
+            if auto
+            else None
+        ),
+        resolved_at=resolved_at,
+        resumed_at=resolved_at,
+        policy_identity=POLICY_IDENTITY if auto else None,
+        policy_version=agent.publication_policy_version if auto else None,
     )
     session.add(approval)
     publication = Publication(
@@ -1039,11 +1553,24 @@ async def create_publication(
         revision_number=revision_number,
         expected_prior_head=expected_prior_head,
         repo_full_name=thread_workspace.repo_full_name,
-        status="pending",
+        status="approved" if auto else "pending",
+        open_as_draft=bool(auto and agent.publication_draft),
+        branch_prefix=publication_row_prefix(
+            lineage.branch,
+            operator_prefix=agent.publication_branch_prefix,
+            auto=auto,
+        ),
+        approval_card_reported_at=resolved_at,
         version=1,
         base_sha=data.base_sha,
         patch_bytes=patch,
         changed_paths=data.changed_paths,
+        observed_title_sha256=(
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        ),
+        observed_body_sha256=data.observed_body_sha256,
         title=data.title or data.summary,
         body=data.body or "Approved platform publication.",
         reply_kind=data.reply_kind,
@@ -1052,7 +1579,31 @@ async def create_publication(
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
     )
+    if owned_request is not None:
+        publication.execution_request_id = owned_request.id
     session.add(publication)
+    if auto:
+        session.add(
+            ApprovalAuditEntry(
+                approval_id=approval.id,
+                action="resolved",
+                actor=PLATFORM_ACTOR,
+                actor_channel=None,
+                principal_kind="platform",
+                authenticated=True,
+                decision=ApprovalStatus.approved,
+                authorizer=PLATFORM_AUTHORIZER,
+                authorized=True,
+                reason=approval.resolution_note,
+                evidence={
+                    "policy_identity": POLICY_IDENTITY,
+                    "policy_version": agent.publication_policy_version,
+                    "agent_id": str(agent.id),
+                    "publication_draft": bool(agent.publication_draft),
+                    "publication_branch_prefix": agent.publication_branch_prefix,
+                },
+            )
+        )
     try:
         await session.commit()
     except IntegrityError as exc:
@@ -1070,6 +1621,75 @@ async def create_publication(
     await session.refresh(publication)
     await session.refresh(publication, ["lineage"])
     return publication, True
+
+
+def _binding_route_matches(
+    data: PublicationCreate, kind: str, endpoint: str | None, adapter: str | None
+) -> bool:
+    """Whether a stored binding route is the one a publication's reply names.
+
+    The built-in cluster-message relay is not a configurable route: the channel
+    API reserves its adapter, so the binding it replies for is one with no
+    route of its own (#2789) -- no endpoint, and the identity an omitted
+    adapter resolves to, which on Slack is 'default' (ADR-0168 decision 3).
+    Any configured route is compared through `route_identity`, not the raw
+    column, so a handle that names no identity and a stored `'default'` match.
+    """
+
+    if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+        return endpoint is None and route_identity(kind, adapter) == route_identity(kind, None)
+    return endpoint == data.reply_endpoint and route_identity(kind, adapter) == route_identity(
+        data.reply_kind, data.reply_adapter
+    )
+
+
+async def _bind_running_work_item_lineage(
+    session: AsyncSession,
+    *,
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    identity: VerifiedPublicationIdentity | None,
+) -> None:
+    """Bind only the running request that created the successful publication."""
+
+    if publication.execution_request_id is None:
+        return
+    request_owns_item = (
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.id == publication.execution_request_id,
+            ExecutionRequest.work_item_id == WorkItem.id,
+            ExecutionRequest.status == "running",
+        )
+        .exists()
+    )
+    predicates: list[ColumnElement[bool]] = [
+        WorkItem.agent_id == lineage.agent_id,
+        WorkItem.conversation_id.in_(
+            await thread_key_forms(session, lineage.agent_id, lineage.conversation_id)
+        ),
+        func.lower(WorkItem.repo_full_name) == lineage.repo_full_name.casefold(),
+        WorkItem.cancelled_at.is_(None),
+        WorkItem.publication_lineage_id.is_(None),
+        request_owns_item,
+    ]
+    repository_id = identity.repository_id if identity is not None else lineage.github_repository_id
+    installation_id = (
+        identity.installation_id if identity is not None else lineage.github_installation_id
+    )
+    if repository_id is not None:
+        predicates.append(WorkItem.github_repository_id == repository_id)
+    if installation_id is not None:
+        predicates.append(WorkItem.github_installation_id == installation_id)
+    await session.execute(
+        update(WorkItem)
+        .where(*predicates)
+        .values(
+            publication_lineage_id=lineage.id,
+            version=WorkItem.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
 
 
 async def get_publication(session: AsyncSession, publication_id: uuid.UUID) -> Publication | None:
@@ -1349,6 +1969,74 @@ async def mark_publication_lineage_terminal(
     return refreshed
 
 
+def publication_lineage_outcome_conflict(
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    data: PublicationLineageAdvance,
+) -> PublicationLineageConflict | None:
+    """Preconditions one revision outcome must meet before it may claim a lineage.
+
+    Pure, so the route can reject a stale outcome before it contacts GitHub and
+    the advancing writer can repeat the same verdict under its row locks. The
+    order is load bearing and carried over unchanged. Which check fires first
+    decides which conflict code the caller sees, and the worker branches on it.
+    """
+
+    if lineage.status != "open":
+        return PublicationLineageConflict(
+            "publication.lineage_terminal",
+            "the pull request for this thread is merged or closed; start a new thread",
+        )
+    if publication.revision_number != lineage.latest_revision:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision is not the current thread lineage revision",
+        )
+    # Case insensitive on both sides: `_validated_pr_url` in the worker accepts
+    # GitHub's own spelling of the repository and preserves it, so a repository
+    # whose GitHub casing differs from `repo_full_name` publishes fine and must
+    # not then take a stable refusal here.
+    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    if data.pr_url.casefold() != canonical.casefold():
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity does not match the publication repository",
+        )
+    if lineage.pr_number is not None and (
+        lineage.pr_number != data.pr_number
+        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
+    ):
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity no longer matches the stored thread lineage",
+        )
+    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage version or expected head is stale",
+        )
+    if (
+        publication.version != data.expected_publication_version
+        or publication.lease_owner != data.lease_owner
+    ):
+        return PublicationLineageConflict(
+            "publication.lease_lost",
+            "publication lease is no longer held by this worker",
+        )
+    if publication.status not in ("approved", "launching", "running"):
+        return PublicationLineageConflict(
+            "publication.revision_not_approved",
+            "publication revision must be approved before advancing its lineage",
+        )
+    needs_metadata_timestamp = data.state == "open" and not publication.patch_bytes
+    if needs_metadata_timestamp != (data.metadata_updated_at is not None):
+        return PublicationLineageConflict(
+            "publication.metadata_timestamp_invalid",
+            "a GitHub update time is required only for metadata only success",
+        )
+    return None
+
+
 async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
@@ -1371,6 +2059,13 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication has no thread pull request lineage",
         )
+    if publication.execution_request_id is not None:
+        await session.scalar(
+            select(WorkItem.id)
+            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+            .where(ExecutionRequest.id == publication.execution_request_id)
+            .with_for_update(of=WorkItem)
+        )
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
         .where(ThreadPublicationLineage.id == publication.lineage_id)
@@ -1382,50 +2077,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    if lineage.status != "open":
-        raise PublicationLineageConflict(
-            "publication.lineage_terminal",
-            "the pull request for this thread is merged or closed; start a new thread",
-        )
-    if publication.revision_number != lineage.latest_revision:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "publication revision is not the current thread lineage revision",
-        )
-    # GitHub repository owner and name are case-insensitive; the worker and the
-    # identity verifier already compare them with casefold.
-    expected_url = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
-    if data.pr_url.casefold() != expected_url.casefold():
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity does not match the publication repository",
-        )
-    if lineage.pr_number is not None and (
-        lineage.pr_number != data.pr_number
-        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
-    ):
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity no longer matches the stored thread lineage",
-        )
-    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request lineage version or expected head is stale",
-        )
-    if (
-        publication.version != data.expected_publication_version
-        or publication.lease_owner != data.lease_owner
-    ):
-        raise PublicationLineageConflict(
-            "publication.lease_lost",
-            "publication lease is no longer held by this worker",
-        )
-    if publication.status not in ("approved", "launching", "running"):
-        raise PublicationLineageConflict(
-            "publication.revision_not_approved",
-            "publication revision must be approved before advancing its lineage",
-        )
+    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    if conflict is not None:
+        raise conflict
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
@@ -1450,7 +2104,7 @@ async def advance_publication_lineage(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
             )
-        await _require_current_lineage_workspace(
+        await require_current_lineage_workspace(
             session,
             lineage,
             conflict_code="publication.lineage_stale",
@@ -1512,6 +2166,7 @@ async def advance_publication_lineage(
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
+        "metadata_updated_at": data.metadata_updated_at,
         # Success replaces an earlier attempt's error, as the worker CAS did.
         "error": None,
     }
@@ -1535,6 +2190,13 @@ async def advance_publication_lineage(
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "publication revision changed before its lineage could advance",
+        )
+    if not terminal_state:
+        await _bind_running_work_item_lineage(
+            session,
+            publication=publication,
+            lineage=lineage,
+            identity=identity,
         )
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)
@@ -1734,6 +2396,7 @@ async def create_approval(
         card_channel=data.card_channel,
         gate_kind=data.gate_kind,
         granted_tool=data.granted_tool,
+        granted_arguments=data.granted_arguments,
         expires_at=expires_at,
     )
     session.add(approval)
@@ -1792,6 +2455,187 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
     return result
 
 
+# How far back the re-raise guard walks a chain of platform-authored resume
+# turns. A chain is one approval per hop, so this is far past any real run; it
+# only bounds the walk against a corrupt row whose dedupe_key loops.
+_RERAISE_CHAIN_LIMIT = 64
+
+
+def _same_approval(prior: Approval, data: "ApprovalRequest") -> bool:
+    """Whether ``data`` asks for the same human decision ``prior`` recorded (#2885).
+
+    Same agent, same thread, same manifest route, and the same gate: a policy
+    gate, or a permission gate on the same denied tool. The summary is left out
+    on purpose. It is model-authored free text, so keying on it would let a
+    reworded retry through, and a reworded retry is exactly the failure this
+    guard exists for. ``route=""`` reads as routeless, matching
+    ``get_approval_route_binding``.
+    """
+
+    return (
+        prior.agent_id == data.agent_id
+        and prior.conversation_id == data.conversation_id
+        and (prior.route or None) == (data.route or None)
+        and prior.gate_kind == data.gate_kind
+        and prior.granted_tool == data.granted_tool
+    )
+
+
+async def find_rejected_reraise(session: AsyncSession, data: "ApprovalRequest") -> Approval | None:
+    """The rejected approval ``data`` would re-raise with nobody asking, or None.
+
+    The worker stamps each request with the event id of the turn that raised
+    it, and a resume turn's event id is ``resume_event_id(<approval id>)``. So
+    a request whose ``dedupe_key`` parses as a resume id was raised by a turn
+    the platform authored, not one a person typed, and following those ids
+    back walks every approval raised since the last turn a person started.
+    If any of them was rejected and is the same approval (``_same_approval``),
+    this request is the agent asking again on its own, and that rejected
+    record is returned. A request raised from a person's turn (any other
+    event id) ends the walk at once: a person asking is the explicit ask.
+
+    Reads only; the caller decides the response and writes the audit row.
+    """
+
+    seen: set[uuid.UUID] = set()
+    dedupe_key = data.dedupe_key
+    for _ in range(_RERAISE_CHAIN_LIMIT):
+        prior_id = parse_resume_event_id(dedupe_key)
+        if prior_id is None or prior_id in seen:
+            return None
+        seen.add(prior_id)
+        prior = await session.get(Approval, prior_id)
+        if prior is None:
+            return None
+        if prior.status == ApprovalStatus.rejected and _same_approval(prior, data):
+            return prior
+        dedupe_key = prior.dedupe_key
+    return None
+
+
+# Per served agent: its approval route map, read fresh, and the adapter's
+# bindings that belong to that agent, each as its (kind, address, identity)
+# route (ADR-0168 decision 3), identity normalized by ``route_identity``.
+_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str, str | None]]]]
+
+
+async def _adapter_served_targets(
+    session: AsyncSession, bindings: frozenset[uuid.UUID]
+) -> _ServedTargets:
+    """What an adapter serving ``bindings`` can reach, keyed by agent id.
+
+    Read fresh on every call, like ``get_approval_route_binding``: a binding
+    deleted or a route re-pointed after the credential was issued narrows what
+    the adapter sees immediately.
+
+    Holds a binding row of ANY kind, Slack included: an adapter principal
+    (ADR-0154) is scoped to the binding ROW id its token claims, not to a
+    kind that can authenticate HTTP egress, so a principal may legitimately
+    serve a Slack binding (``test_adapter_principal.py``'s own default
+    fixture is one).
+    """
+
+    if not bindings:
+        return {}
+    rows = await session.execute(
+        select(
+            AgentChannel.agent_id,
+            AgentChannel.kind,
+            AgentChannel.address,
+            AgentChannel.adapter,
+            Agent.approval_routes,
+        )
+        .join(Agent, Agent.id == AgentChannel.agent_id)
+        .where(AgentChannel.id.in_(bindings))
+    )
+    pairs: dict[uuid.UUID, set[tuple[str, str, str | None]]] = {}
+    routes: dict[uuid.UUID, Any] = {}
+    for agent_id, kind, address, adapter, approval_routes in rows:
+        pairs.setdefault(agent_id, set()).add((kind, address, route_identity(kind, adapter)))
+        routes[agent_id] = approval_routes
+    return {agent_id: (routes[agent_id], frozenset(p)) for agent_id, p in pairs.items()}
+
+
+def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
+    """THE served predicate (ADR-0154, ADR-0177), shared by the list and the resolver.
+
+    An approval is served when its card went to one of the adapter's bindings
+    ON THE SAME AGENT, routed or not (ADR-0177 decision 4). Two ways a card
+    gets there:
+
+    - It was shown in the conversation that asked: a routeless approval, or a
+      route in ``requesting_surface`` mode (``approvers.card_on_requesting_surface``).
+      Then the asking route, ``(reply_kind, reply_channel, reply_adapter)``,
+      must be one of the adapter's bindings. The adapter identity is part of
+      the match: two adapters may bind one ``(kind, address)`` pair on the
+      same agent (ADR-0168 decision 3), and only the one that showed the card
+      may answer it. The record stores that route, and it is a fact about the
+      original turn that no later rebinding rewrites.
+    - Its route names a fixed target, the recorded card is at that target, and
+      the target's ``(kind, address)`` is one of the adapter's bindings.
+
+    An approval with no agent, or a route whose resolution is missing or
+    malformed, is served by no adapter: fail closed.
+    """
+
+    if approval.agent_id is None:
+        return False
+    target = targets.get(approval.agent_id)
+    if target is None:
+        return False
+    approval_routes, pairs = target
+    binding = (
+        approval_routes.get(approval.route)
+        if approval.route and isinstance(approval_routes, dict)
+        else None
+    )
+    if card_on_requesting_surface(approval, binding):
+        asking = (
+            approval.reply_kind,
+            approval.reply_channel,
+            route_identity(approval.reply_kind, approval.reply_adapter),
+        )
+        return asking in pairs
+    if not approval.route or not isinstance(binding, dict):
+        return False
+    resolution = binding.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    kind, address = resolution.get("kind"), resolution.get("address")
+    if not isinstance(kind, str) or not isinstance(address, str):
+        return False
+    # The card must actually be there: a route re-pointed after the ask does
+    # not hand the pending approval to whoever serves the new target.
+    if (approval.card_channel or approval.reply_channel) != address:
+        return False
+    # Fixed targets are Slack only, and no Slack approver set admits an
+    # adapter, so this match grants listing, never an answer.
+    return any((k, a) == (kind, address) for k, a, _ in pairs)
+
+
+async def approval_served_by(
+    session: AsyncSession, approval: Approval, bindings: frozenset[uuid.UUID]
+) -> bool:
+    """Whether an adapter serving ``bindings`` may see and resolve ``approval``."""
+
+    return _approval_served(approval, await _adapter_served_targets(session, bindings))
+
+
+async def existing_channel_binding_ids(
+    session: AsyncSession, binding_ids: frozenset[uuid.UUID]
+) -> frozenset[uuid.UUID]:
+    """The subset of ``binding_ids`` that still name an ``agent_channels`` row."""
+
+    if not binding_ids:
+        return frozenset()
+    result = await session.scalars(select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids)))
+    return frozenset(result)
+
+
+# Rows read per round when an adapter's approval list is filtered in Python.
+_SERVED_LIST_BATCH = 1000
+
+
 async def list_approvals(
     session: AsyncSession,
     *,
@@ -1799,16 +2643,55 @@ async def list_approvals(
     agent_id: uuid.UUID | None = None,
     conversation_id: str | None = None,
     limit: int = 50,
+    served_by: frozenset[uuid.UUID] | None = None,
 ) -> list[Approval]:
-    stmt = select(Approval).order_by(Approval.created_at.desc()).limit(limit)
+    """Newest first. ``served_by`` (an adapter principal's bindings) narrows the
+    result to approvals that adapter serves, BEFORE ``limit`` applies, so an
+    adapter never gets a short page because unserved rows took the slots."""
+
+    stmt = select(Approval).order_by(Approval.created_at.desc())
     if status is not None:
         stmt = stmt.where(Approval.status == status)
     if agent_id is not None:
         stmt = stmt.where(Approval.agent_id == agent_id)
     if conversation_id is not None:
         stmt = stmt.where(Approval.conversation_id == conversation_id)
-    result = await session.scalars(stmt)
-    return list(result)
+    if served_by is None:
+        result = await session.scalars(stmt.limit(limit))
+        return list(result)
+    targets = await _adapter_served_targets(session, served_by)
+    if not targets:
+        return []
+    # Narrow in SQL to the served agents' rows, routed or not (ADR-0177). A
+    # routeless row is served only through its asking pair, so rows asked on a
+    # binding this adapter does not serve are dropped in SQL too. The rest of
+    # the match (the adapter identity, the route map's resolution) stays in
+    # Python, so read in keyset batches until the page is full: a batch of
+    # unserved rows can never shorten the page or hide an older served row.
+    asking_pairs = {(kind, address) for _, pairs in targets.values() for kind, address, _ in pairs}
+    stmt = stmt.where(
+        Approval.agent_id.in_(targets),
+        or_(
+            Approval.route.is_not(None),
+            tuple_(Approval.reply_kind, Approval.reply_channel).in_(asking_pairs),
+        ),
+    ).order_by(Approval.id.desc())
+    batch_size = max(limit, _SERVED_LIST_BATCH)
+    served: list[Approval] = []
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while len(served) < limit:
+        page = stmt
+        if cursor is not None:
+            page = page.where(
+                tuple_(Approval.created_at, Approval.id)
+                < tuple_(literal(cursor[0]), literal(cursor[1]))
+            )
+        batch = list(await session.scalars(page.limit(batch_size)))
+        served.extend(a for a in batch if _approval_served(a, targets))
+        if len(batch) < batch_size:
+            break
+        cursor = (batch[-1].created_at, batch[-1].id)
+    return served[:limit]
 
 
 async def pending_approval_inventory(
@@ -1850,6 +2733,16 @@ async def claim_approval_resolution(
     # Publication outcomes are reported by the platform worker, never by a
     # resumed model turn. Mark the approval as owing no wake in the same CAS.
     publication = await get_publication_by_approval(session, approval_id)
+    if (
+        publication is not None
+        and publication.execution_request_id is not None
+        and decision == ApprovalStatus.approved
+    ):
+        owning = await session.get(ExecutionRequest, publication.execution_request_id)
+        if owning is None or owning.status != "running":
+            decision = ApprovalStatus.rejected
+            values["status"] = decision
+            values["resolution_note"] = "the factory run already ended"
     if publication is not None:
         values["resumed_at"] = func.now()
 
@@ -2105,11 +2998,14 @@ async def append_approval_audit(
     evidence: dict[str, Any] | None = None,
     principal_kind: str | None = None,
     authenticated: bool = False,
+    principal_subject: str | None = None,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
     ``evidence`` (#420) is the membership snapshot the authorizer decided on;
-    None for writers that made no membership decision.
+    None for writers that made no membership decision. ``principal_subject``
+    names the adapter that transported an ``adapter`` principal's decision
+    (ADR-0154); None for every other kind.
     """
 
     entry = ApprovalAuditEntry(
@@ -2119,6 +3015,7 @@ async def append_approval_audit(
         actor_channel=actor_channel,
         principal_kind=principal_kind,
         authenticated=authenticated,
+        principal_subject=principal_subject,
         decision=decision,
         authorizer=authorizer,
         authorized=authorized,
@@ -2129,6 +3026,197 @@ async def append_approval_audit(
     await session.commit()
     await session.refresh(entry)
     return entry
+
+
+# --- break-glass recovery (#2753) --------------------------------------------
+#
+# ONE transaction, ONE commit, per operation. ``claim_approval_resolution``
+# commits internally, and so does ``append_approval_audit``; composing the two
+# leaves a crash window in which the status flipped and the audit row that
+# explains it never existed. For a path whose whole justification is that every
+# use is reviewable afterwards, that window is the failure, so recovery does
+# the compare-and-set and the audit append inside a single ``session.begin()``
+# block instead of calling either.
+#
+# Idempotency is keyed on that audit row, not on a column: the caller's
+# ``recovery_key`` is recorded in the row's evidence, and because the row
+# commits with the CAS, a key with no row means no effect landed.
+#
+# The audit row is built from the module-level ``ApprovalAuditEntry``, exactly
+# as ``append_approval_audit`` does. That is deliberate and load-bearing: the
+# seam between the CAS and the audit append has to be the same one the existing
+# writer exposes, so a test can interrupt precisely there. A Core ``insert()``
+# here would move the seam.
+
+#: Everything the caller must supply about WHO acted. Recovery takes its actor
+#: from the ADR-0106 operator principal for attribution only; no membership is
+#: consulted and nothing widens.
+_RECOVERY_AUTHORIZER = "approval_recovery"
+
+
+class PublicationSettlementConflict(Exception):
+    """The recovered approval's publication moved under the recovery.
+
+    Raised INSIDE the recovery transaction so the whole administrative act --
+    the approval CAS, the publication settlement and the audit row -- rolls back
+    together. A recovery that settled the approval and left the publication
+    pending would be exactly the stranded effect this path exists to remove.
+    """
+
+
+async def reread_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
+    """Read an approval back from the database, not from the identity map.
+
+    An ORM-enabled Core UPDATE expires the columns it touched on any instance
+    already in the session, so a plain ``session.get`` hands back an object
+    whose next attribute access is a lazy load -- which under the async session
+    is a ``MissingGreenlet``, not a refresh. ``claim_approval_resolution``
+    refreshes for the same reason.
+    """
+
+    approval = await session.get(Approval, approval_id)
+    if approval is not None:
+        await session.refresh(approval)
+    return approval
+
+
+#: The audit model as the replay lookup reads it. A separate name on purpose:
+#: ``recover_approval_atomic`` builds its row from the module-level
+#: ``ApprovalAuditEntry`` so a test can interrupt exactly between the CAS and
+#: the audit append, and the lookup must not be caught by that interruption.
+_RecoveryAuditEntry = ApprovalAuditEntry
+
+#: The audit action every administrative recovery writes. Its evidence carries
+#: the caller's ``recovery_key``, which is what a replay is matched on.
+RECOVERY_AUDIT_ACTION = "administratively_recovered"
+
+
+async def find_recovery_audit(
+    session: AsyncSession, recovery_key: str
+) -> ApprovalAuditEntry | None:
+    """The recovery audit row recorded under ``recovery_key``, on any approval.
+
+    A key names one administrative act installation-wide, so the lookup is not
+    scoped to an approval: the caller compares the row's ``approval_id`` to tell
+    a replay from a key reused for a different approval.
+    """
+
+    result = await session.execute(
+        select(_RecoveryAuditEntry)
+        .where(
+            _RecoveryAuditEntry.action == RECOVERY_AUDIT_ACTION,
+            _RecoveryAuditEntry.evidence["recovery_key"].astext == recovery_key,
+        )
+        .order_by(_RecoveryAuditEntry.created_at)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def recover_approval_atomic(
+    session: AsyncSession,
+    approval_id: uuid.UUID,
+    *,
+    reason: str,
+    recovery_key: str,
+    actor: str,
+    actor_channel: str | None,
+    principal_kind: str | None,
+    facts: list[str],
+) -> Approval | None:
+    """Administratively settle a pending approval as ``rejected``, atomically.
+
+    The CAS is guarded on ``status = 'pending'`` exactly as the ordinary
+    resolve-once claim is, so an approval is settled at most once. Returns None
+    when the CAS matched nothing; the caller looks the key up with
+    ``find_recovery_audit`` to tell a replay (return the recorded outcome) from
+    a genuine conflict.
+
+    ``facts`` are the reporter's OBSERVATIONS, recorded as evidence. They state
+    what was seen about the row. They never assert that the ordinary path was
+    unavailable -- nothing here is in a position to know that.
+    """
+
+    recovered: uuid.UUID | None
+    async with session.begin():
+        # The associated publication, read inside the SAME transaction that
+        # settles the approval. ``claim_approval_resolution`` settles it too,
+        # but it commits internally, so it cannot be reused here: composing it
+        # would put the publication's fate in a second transaction and reopen
+        # the crash window this whole function exists to close.
+        publication = await get_publication_by_approval(session, approval_id)
+        values: dict[str, Any] = {
+            "status": ApprovalStatus.rejected,
+            "resolved_by": actor,
+            "resolution_note": reason,
+            "resolved_at": func.now(),
+        }
+        if publication is not None:
+            # A publication outcome is reported by the platform worker through
+            # the stored reply route, never by a resumed model turn. Mark the
+            # wake as owing nothing in the same CAS, exactly as the ordinary
+            # resolve path does, so the reconciler never picks the row up for a
+            # resume the router deliberately does not enqueue.
+            values["resumed_at"] = func.now()
+        result = await session.execute(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.status == ApprovalStatus.pending,
+            )
+            .values(**values)
+            .returning(Approval.id)
+        )
+        recovered = result.scalar_one_or_none()
+        if recovered is None:
+            return None
+        if publication is not None:
+            # The same denial the ordinary reject performs, under the same
+            # version check: status denied, the patch dropped, the terminal
+            # instant recorded. Without it the recovered approval is settled and
+            # its publication waits forever -- the expiry sweeper no longer
+            # selects a rejected approval, and no resume is enqueued to repair
+            # it, so nothing else in the system would ever touch it again.
+            changed = await session.execute(
+                update(Publication)
+                .where(
+                    Publication.id == publication.id,
+                    Publication.status == "pending",
+                    Publication.version == publication.version,
+                )
+                .values(
+                    status="denied",
+                    version=Publication.version + 1,
+                    updated_at=func.now(),
+                    terminal_at=func.now(),
+                    patch_bytes=None,
+                )
+                .returning(Publication.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                raise PublicationSettlementConflict(
+                    "the approval's publication is no longer pending at the "
+                    "version this recovery read; nothing was changed"
+                )
+        entry = ApprovalAuditEntry(
+            approval_id=approval_id,
+            action=RECOVERY_AUDIT_ACTION,
+            actor=actor,
+            actor_channel=actor_channel,
+            principal_kind=principal_kind,
+            authenticated=True,
+            decision=ApprovalStatus.rejected,
+            authorizer=_RECOVERY_AUTHORIZER,
+            authorized=True,
+            reason=reason,
+            evidence={
+                "kind": "administrative_recovery",
+                "recovery_key": recovery_key,
+                "facts": facts,
+            },
+        )
+        session.add(entry)
+    return await reread_approval(session, approval_id)
 
 
 async def list_approval_audit(
@@ -2300,7 +3388,7 @@ async def revoke_console_session(
     return row
 
 
-async def _require_current_lineage_workspace(
+async def require_current_lineage_workspace(
     session: AsyncSession,
     lineage: ThreadPublicationLineage,
     *,
@@ -2327,9 +3415,7 @@ async def _require_current_lineage_workspace(
     if (
         workspace is None
         or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or not repository_is_allowed(
-            lineage.repo_full_name, get_settings().github_repo_allowlist
-        )
+        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
         or deployment is None
         or deployment.agent_id != lineage.agent_id
         or deployment.status != "active"
@@ -2355,7 +3441,7 @@ async def _require_review_binding(
         if lineage.binding_id
         else None
     )
-    await _require_current_lineage_workspace(
+    await require_current_lineage_workspace(
         session,
         lineage,
         conflict_code="publication.review_ineligible",
@@ -2366,8 +3452,13 @@ async def _require_review_binding(
         or binding.agent_id != lineage.agent_id
         or binding.generation != lineage.binding_generation
         or not lineage.reply_conversation_id
-        or scoped_conversation_id(binding.kind, binding.address, lineage.reply_conversation_id)
-        != lineage.conversation_id
+        or not route_thread_key_matches(
+            binding.kind,
+            binding.adapter,
+            binding.address,
+            lineage.reply_conversation_id,
+            lineage.conversation_id,
+        )
     ):
         raise PublicationLineageConflict(
             "publication.review_ineligible",

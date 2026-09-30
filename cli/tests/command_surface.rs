@@ -111,6 +111,14 @@ fn apply_help_references_shipped_curie_yaml_example() {
         text.contains("examples/curie.yaml"),
         "apply help must reference the shipped example\n{text}"
     );
+    assert!(
+        text.contains("--init"),
+        "apply help must offer a released-binary starter\n{text}"
+    );
+    assert!(
+        text.contains("--context"),
+        "apply help must offer --context\n{text}"
+    );
 }
 
 #[test]
@@ -302,24 +310,6 @@ fn process_dev_help_lists_the_plugin_compat_gate() {
     assert!(
         help_lists_subcommand(&text, "plugin-compat"),
         "missing plugin-compat\n{text}"
-    );
-}
-
-/// `curie dev sre-demo-e2e` is the operator-facing name of the #2246 nightly
-/// SRE demo assertions. If the verb stops being reachable, the workflow still
-/// calls the script but nobody can run the skip/prereq check locally.
-#[test]
-fn process_dev_help_lists_sre_demo_e2e() {
-    let output = run_help(&["dev"]);
-    assert!(
-        output.status.success(),
-        "expected success for dev help\n{}",
-        output_text(&output)
-    );
-    let text = output_text(&output);
-    assert!(
-        help_lists_subcommand(&text, "sre-demo-e2e"),
-        "missing sre-demo-e2e\n{text}"
     );
 }
 
@@ -840,8 +830,8 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
     // --dry-run) but DIVERGE intentionally on the cluster side (#524): cluster
     // adds --namespace/--release to discover the release's connection. So the
     // cluster flag set must be a strict superset of the local one, differing only
-    // by those two discovery flags -- a flag added to local can still never be
-    // silently dropped from cluster.
+    // by those two discovery flags plus the cluster-wide --context (#2723) -- a
+    // flag added to local can still never be silently dropped from cluster.
     for verb in ["versions", "memory", "approvals"] {
         let local = help_flags(&["local", verb]);
         let cluster = help_flags(&["cluster", verb]);
@@ -852,10 +842,12 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
             );
         }
         let extra: Vec<_> = cluster.iter().filter(|f| !local.contains(*f)).collect();
+        let mut extra: Vec<&str> = extra.iter().map(|f| f.as_str()).collect();
+        extra.sort_unstable();
         assert_eq!(
-            extra.len(),
-            2,
-            "cluster {verb} should add exactly --namespace/--release; got extras {extra:?}"
+            extra,
+            ["--context", "--namespace", "--release"],
+            "cluster {verb} should add exactly --context/--namespace/--release"
         );
     }
 }
@@ -973,5 +965,67 @@ fn retired_hint_returns_none_for_valid_starts_help_and_message_bodies() {
 
     for argv in cases.iter().copied() {
         assert_hint_none(argv);
+    }
+}
+
+fn collect_command_paths(node: &serde_json::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
+    for sub in node["subcommands"].as_array().into_iter().flatten() {
+        let mut path = prefix.to_vec();
+        path.push(sub["name"].as_str().expect("subcommand name").to_owned());
+        out.push(path.clone());
+        collect_command_paths(sub, &path, out);
+    }
+}
+
+/// #2982: `--help` must never print the value of `CURIE_API_KEY`. Every
+/// command path is swept, so a new API key argument declared with `env` but
+/// without `hide_env_values` fails here instead of leaking the platform key.
+#[test]
+fn help_never_discloses_the_curie_api_key_value() {
+    const SENTINEL: &str = "sentinel-api-key-2982-do-not-print";
+    let mut paths = Vec::new();
+    collect_command_paths(&live_command_manifest(), &[], &mut paths);
+    assert!(
+        paths.iter().any(|p| p == &["local", "message"])
+            && paths.iter().any(|p| p == &["cluster", "message"])
+            && paths.iter().any(|p| p == &["doctor"]),
+        "manifest walk lost the #2982 commands: {paths:?}"
+    );
+
+    let mut leaks = Vec::new();
+    for path in &paths {
+        let output = Command::new(bin())
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL)
+            .output()
+            .expect("run curie --help");
+        let text = output_text(&output);
+        if text.contains(SENTINEL) {
+            leaks.push(path.join(" "));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "--help printed CURIE_API_KEY for: {leaks:?}"
+    );
+
+    for path in [
+        &["local", "message"][..],
+        &["cluster", "message"],
+        &["doctor"],
+    ] {
+        let mut command = Command::new(bin());
+        command
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL);
+        let output = command.output().expect("run curie --help");
+        let text = output_text(&output);
+        assert!(output.status.success(), "{path:?} --help failed\n{text}");
+        assert!(
+            text.contains("--api-key") && text.contains("CURIE_API_KEY"),
+            "{path:?} help lost the --api-key flag or its env name\n{text}"
+        );
     }
 }

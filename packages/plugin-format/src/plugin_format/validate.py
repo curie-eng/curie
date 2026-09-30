@@ -8,14 +8,17 @@ errors instead of raising, so the caller can surface every problem at once.
 import json
 import re
 from collections.abc import Callable, Mapping
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from . import connector_lock
 from .approval_policy import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
@@ -29,8 +32,14 @@ from .connector_lock import (
     source_digest_of,
     validate_connector_lock,
 )
-from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
-from .deploy_targets import validate_deploy_targets
+from .connectors import (
+    CONNECTORS_FILE,
+    RESERVED_CONNECTOR_NAMES,
+    ConnectorsFile,
+    validate_connectors,
+)
+from .connectors import _is_valid_name as _is_valid_connector_name
+from .deploy_targets import DeployTargetsFile, validate_deploy_targets
 from .gate_summary import check_gate_summary_template
 from .manifest import resolve_manifest
 from .models import (
@@ -69,6 +78,9 @@ _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_TZDATA_ZONES = frozenset(
+    files("tzdata").joinpath("zones").read_text(encoding="utf-8").splitlines()
+)
 
 
 class ValidationIssue(BaseModel):
@@ -215,8 +227,50 @@ def _validate_deploy_targets(root: Path, c: _Collector) -> None:
     except (OSError, yaml.YAMLError) as exc:
         c.error("deploy.unreadable", f"{DEPLOY_FILE}: {exc}", DEPLOY_FILE)
         return
-    for code, message in validate_deploy_targets(data)[1]:
+    parsed, errors = validate_deploy_targets(data)
+    for code, message in errors:
         c.error(code, message, DEPLOY_FILE)
+    # `parsed` is None whenever any target error was reported. When the file
+    # still has the right shape, re-read the model so the cross-check below is
+    # reported in the same pass instead of after the author fixes the rest.
+    if parsed is None and not {code for code, _ in errors} & _DEPLOY_SHAPE_ERRORS:
+        parsed = DeployTargetsFile.model_validate(data)
+    if parsed is not None:
+        _reject_unknown_target_connectors(root, parsed, c)
+
+
+# The deploy.yaml codes after which no model exists to cross-check.
+_DEPLOY_SHAPE_ERRORS = frozenset({"deploy.not_object", "deploy.invalid"})
+
+
+def _reject_unknown_target_connectors(
+    root: Path, targets: DeployTargetsFile, c: _Collector
+) -> None:
+    """Refuse a target connector allowlist entry the bundle does not declare.
+
+    Here rather than in ``validate_deploy_targets`` because it needs both files.
+    An absent ``connectors.yaml`` declares nothing. A present one that did not
+    validate is skipped: ``_validate_connectors`` has reported it, and calling
+    every entry unknown would point the author at the wrong file.
+    """
+
+    if (root / CONNECTORS_FILE).is_file():
+        declared_file = _read_connectors(root)
+        if declared_file is None:
+            return
+        declared = set(declared_file.connectors)
+    else:
+        declared = set()
+    for name, target in targets.targets.items():
+        for connector in dict.fromkeys(target.connectors or ()):
+            # A malformed name already has `deploy.bad_connector_name`.
+            if connector not in declared and _is_valid_connector_name(connector):
+                c.error(
+                    "deploy.unknown_connector",
+                    f"targets.{name}: connectors lists `{connector}`, which "
+                    f"{CONNECTORS_FILE} does not declare",
+                    DEPLOY_FILE,
+                )
 
 
 def _validate_connectors(root: Path, c: _Collector) -> None:
@@ -363,6 +417,9 @@ def _validate_connector_lock(root: Path, c: _Collector) -> None:
                 CONNECTOR_LOCK_FILE,
             )
 
+    if declared.runner is not None and not _validate_runner_lock(root, declared, lock, c):
+        complete = False
+
     if complete and lock is not None:
         # The last rule the model cannot express: an image that is not a digest
         # of its delivery's shape. `apply_lock` owns that refusal, so intake
@@ -371,8 +428,72 @@ def _validate_connector_lock(root: Path, c: _Collector) -> None:
         # connector can never render must not be stored.
         try:
             connector_lock.apply_lock(declared, lock, portable=False)
+            connector_lock.resolve_runner_image(declared, lock, portable=False)
         except ValueError as exc:
             c.error("connectors.lock_invalid", f"{CONNECTOR_LOCK_FILE}: {exc}", CONNECTOR_LOCK_FILE)
+
+
+def _validate_runner_lock(
+    root: Path, declared: ConnectorsFile, lock: ConnectorLockFile | None, c: _Collector
+) -> bool:
+    """The runner layer's intake rules (ADR 0173); True when all of them pass.
+
+    The same containment, presence and freshness rules a built connector gets,
+    plus the base-as-argument rule on its Dockerfile.
+    """
+
+    runner = declared.runner
+    assert runner is not None
+    build = runner.build
+    try:
+        context = resolve_context(root, build.context)
+    except ValueError as exc:
+        c.error("connectors.build_context_escapes", f"runner: {exc}", CONNECTORS_FILE)
+        return False
+    if not context.is_dir():
+        c.error(
+            "connectors.build_context_missing",
+            f"runner: `build.context` is {build.context!r}, which this bundle does not "
+            "contain, so there is nothing to build or to hash. Add the runner build context "
+            "to the bundle or correct the path.",
+            CONNECTORS_FILE,
+        )
+        return False
+    ok = True
+    dockerfile = context / build.dockerfile
+    try:
+        text = dockerfile.read_text(encoding="utf-8") if dockerfile.is_file() else None
+    except OSError:
+        text = None
+    refusal = (
+        connector_lock.check_runner_dockerfile(text)
+        if text is not None
+        else f"the runner Dockerfile {build.dockerfile!r} is missing from the build context, "
+        f"so nothing can declare `ARG {connector_lock.RUNNER_BASE_ARG}`"
+    )
+    if refusal is not None:
+        ok = False
+        c.error("connectors.runner_base_not_arg", f"runner: {refusal}", CONNECTORS_FILE)
+    entry = lock.runner if lock is not None else None
+    if entry is None:
+        c.error(
+            "connectors.lock_missing",
+            f"runner: {CONNECTORS_FILE} declares a runner layer but {CONNECTOR_LOCK_FILE} "
+            "has no runner entry for it, so nothing pins what would be deployed. Run "
+            "`curie build --plugin-dir <dir>` and commit the lock it writes.",
+            CONNECTOR_LOCK_FILE,
+        )
+        return False
+    if source_digest_of(context, build) != entry.source_digest:
+        c.error(
+            "connectors.lock_stale",
+            f"runner: {CONNECTOR_LOCK_FILE} records a runner source digest that no longer "
+            "matches this bundle's runner build input, so the recorded image was built from "
+            "something else. Rebuild it with `curie build --plugin-dir <dir>`.",
+            CONNECTOR_LOCK_FILE,
+        )
+        return False
+    return ok
 
 
 def _reject_connector_name_collisions(root: Path, parsed: ConnectorsFile, c: _Collector) -> None:
@@ -809,13 +930,148 @@ def _validate_hooks(root: Path, manifest: PluginManifest, c: _Collector) -> None
                     )
 
 
+_MONTH_NAMES: dict[str, int] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_DOW_NAMES: dict[str, int] = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+# minute, hour, day of month, month, day of week. Names only on the last two.
+_CRON_FIELDS: tuple[tuple[int, int, Mapping[str, int] | None], ...] = (
+    (0, 59, None),
+    (0, 23, None),
+    (1, 31, None),
+    (1, 12, _MONTH_NAMES),
+    (0, 7, _DOW_NAMES),
+)
+_CRON_PART_RE = re.compile(
+    r"^(?:\*|(?P<start>[A-Za-z]+|[0-9]+)(?:-(?P<end>[A-Za-z]+|[0-9]+))?)(?:/(?P<step>[0-9]+))?$"
+)
+
+
+def _stripped(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _cron_bound(token: str, low: int, high: int, names: Mapping[str, int] | None) -> int | None:
+    if token.isdigit():
+        # Cron fields are at most two digits. A longer digit string is not a
+        # field, and int() raises ValueError past the interpreter digit cap.
+        if len(token) > 4:
+            return None
+        try:
+            value = int(token)
+        except ValueError:
+            return None
+    elif names is None:
+        return None
+    else:
+        found = names.get(token.lower())
+        if found is None:
+            return None
+        value = found
+    if value < low or value > high:
+        return None
+    return value
+
+
+def _cron_part_ok(part: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+    match = _CRON_PART_RE.fullmatch(part)
+    if match is None:
+        return False
+    step_text = match.group("step")
+    if step_text is not None:
+        if len(step_text) > 4:
+            return False
+        try:
+            step = int(step_text)
+        except ValueError:
+            return False
+        if step < 1:
+            return False
+    start_text = match.group("start")
+    if start_text is None:
+        return True
+    start = _cron_bound(start_text, low, high, names)
+    if start is None:
+        return False
+    end_text = match.group("end")
+    if end_text is None:
+        return True
+    end = _cron_bound(end_text, low, high, names)
+    return end is not None and start <= end
+
+
+def _cron_field_ok(field: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+    # Reject empty fields and leading, trailing, or doubled commas before parts.
+    if not field or field.startswith(",") or field.endswith(",") or ",," in field:
+        return False
+    return all(_cron_part_ok(part, low, high, names) for part in field.split(","))
+
+
+def _five_field_cron(expression: str) -> bool:
+    """True when ``expression`` is five cron fields, not an alias or quartz form."""
+
+    fields = expression.split()
+    if len(fields) != len(_CRON_FIELDS):
+        return False
+    return all(
+        _cron_field_ok(field, low, high, names)
+        for field, (low, high, names) in zip(fields, _CRON_FIELDS, strict=True)
+    )
+
+
+def _target_acceptable(value: object) -> bool:
+    """A nonblank channel address string."""
+
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _iana_timezone(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if value not in _TZDATA_ZONES:
+        return False
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
 def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
     """Validate the manifest ``triggers`` declarations (deploy-time gate, #273).
 
-    ``triggers`` is a list of ``{type, ...}``. ``type`` must be a known kind
-    (``cron``/``webhook``); a ``cron`` trigger requires a non-empty ``schedule``
-    and a ``webhook`` trigger a non-empty ``path``. Malformed declarations are
-    rejected at deploy so an agent's non-chat wake-ups fail loudly before ship.
+    ``triggers`` is a list of ``{type, ...}``. ``type`` is ``cron`` or
+    ``webhook``. A ``cron`` trigger needs a non-empty ``name``, a non-empty
+    ``prompt``, and a five-field ``schedule`` (ADR-0099). ``timezone`` is an
+    IANA name and is legal only with a non-empty schedule; a missing key means
+    UTC and is not written back. ``target``, when present, is a nonblank
+    channel address string.
+    ``schedule`` on any other known type is forbidden. A ``webhook`` still needs
+    a non-empty ``path``. Presence is raw key membership, so an explicit JSON
+    null is present. The parsed model collapses an omitted key and null to
+    ``None``. One trigger may emit more than one code. Names are unique after
+    strip, case-sensitive, and a blank name is not a duplicate.
     """
 
     declared = manifest.triggers
@@ -832,6 +1088,7 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
             c.error("triggers.invalid", issue, "plugin.json (triggers)")
         return
 
+    seen_names: set[str] = set()
     for i, trigger in enumerate(parsed):
         loc = f"plugin.json (triggers[{i}])"
         if trigger.type not in _TRIGGER_TYPES:
@@ -841,18 +1098,78 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                 loc,
             )
             continue
-        if trigger.type == "cron" and not (trigger.schedule and trigger.schedule.strip()):
+        raw_item = declared[i]
+        if not isinstance(raw_item, dict):
+            c.error("triggers.invalid", "each trigger must be an object", loc)
+            continue
+        # Key presence is membership on the original object. Explicit JSON null
+        # is present; the model collapses that and an omitted key to None.
+        schedule_text = _stripped(trigger.schedule)
+        name_text = _stripped(trigger.name)
+        if trigger.type != "cron" and "schedule" in raw_item:
             c.error(
-                "triggers.cron_missing_schedule",
-                "a 'cron' trigger must define a non-empty 'schedule'",
+                "triggers.schedule_forbidden",
+                f"a {trigger.type!r} trigger must not define a 'schedule'",
                 loc,
             )
-        if trigger.type == "webhook" and not (trigger.path and trigger.path.strip()):
+        if "timezone" in raw_item and not schedule_text:
+            c.error(
+                "triggers.timezone_without_schedule",
+                "a 'timezone' requires a non-empty 'schedule'",
+                loc,
+            )
+        if trigger.type == "cron":
+            if not schedule_text:
+                c.error(
+                    "triggers.cron_missing_schedule",
+                    "a 'cron' trigger must define a non-empty 'schedule'",
+                    loc,
+                )
+            elif not _five_field_cron(schedule_text):
+                c.error(
+                    "triggers.cron_invalid_schedule",
+                    "a 'cron' trigger 'schedule' must be a five-field cron expression",
+                    loc,
+                )
+            if not name_text:
+                c.error(
+                    "triggers.cron_missing_name",
+                    "a 'cron' trigger must define a non-empty 'name'",
+                    loc,
+                )
+            if not _stripped(trigger.prompt):
+                c.error(
+                    "triggers.cron_missing_prompt",
+                    "a 'cron' trigger must define a non-empty 'prompt'",
+                    loc,
+                )
+            if "timezone" in raw_item and schedule_text and not _iana_timezone(trigger.timezone):
+                c.error(
+                    "triggers.timezone_invalid",
+                    "a 'cron' trigger 'timezone' must be an IANA time zone name",
+                    loc,
+                )
+        if "target" in raw_item and not _target_acceptable(trigger.target):
+            c.error(
+                "triggers.target_invalid",
+                "a trigger 'target', when set, must be a nonblank channel address string",
+                loc,
+            )
+        if trigger.type == "webhook" and not _stripped(trigger.path):
             c.error(
                 "triggers.webhook_missing_path",
                 "a 'webhook' trigger must define a non-empty 'path'",
                 loc,
             )
+        if name_text:
+            if name_text in seen_names:
+                c.error(
+                    "triggers.duplicate_name",
+                    f"trigger 'name' {name_text!r} duplicates an earlier trigger 'name'",
+                    loc,
+                )
+            else:
+                seen_names.add(name_text)
 
 
 def _validate_approval_policy(
@@ -944,6 +1261,11 @@ def _validate_approval_policy(
             if summary_err is not None:
                 c.error("approval_policy.summary_invalid", summary_err, loc)
         if expected_prefixes is None or not stripped_gate.startswith("mcp__"):
+            continue
+        # The platform publication tool is mounted by the runner, not declared
+        # by the bundle; accept its exact live name only, so a misspelled
+        # platform tool is still refused (#2776).
+        if stripped_gate == PLATFORM_PUBLISH_TOOL_NAME:
             continue
 
         # A live tool name needs a non-empty tool suffix after the matched
@@ -1136,6 +1458,24 @@ def _validate_tool_policy(
             server = literal_server_segment(pattern)
             if server is None or server in expected_servers:
                 continue
+            # Same error, better message, and NOTHING new is rejected here
+            # (#2286). The branch sits INSIDE the undeclared case on purpose: a
+            # reserved name is only reserved against connectors.yaml, so a
+            # bundle may legally declare a plugin-mounted mcpServers entry
+            # called `curie`, whose live names carry the plugin infix and stay
+            # fully inside policy scope. That bundle passes the guard above and
+            # never reaches this line. What lands here is the dead end: a
+            # pattern naming a server the bundle does not declare and, because
+            # the platform owns the name, cannot declare as a connector either.
+            # The generic advice would send that author in a circle, telling
+            # them to declare exactly what `connectors.reserved_name` refuses.
+            if server in RESERVED_CONNECTOR_NAMES:
+                c.error(
+                    "tool_policy.platform_server",
+                    _platform_tool_policy_server_message(pattern, server),
+                    f"plugin.json (toolPolicy.{collection}[{i}])",
+                )
+                continue
             c.error(
                 "tool_policy.unknown_server",
                 _unknown_tool_policy_server_message(pattern, server, expected_servers),
@@ -1185,6 +1525,39 @@ def _tool_policy_invalid_messages(exc: ValidationError) -> list[str]:
         )
 
     return _explain(exc, rewrite=rewrite)
+
+
+def _platform_tool_policy_server_message(pattern: str, server: str) -> str:
+    """Message for a pattern naming one of Curie's own platform servers (#2286).
+
+    Deliberately NOT a variant of the unknown-server advice. That advice ends in
+    "declare the server", which is the one fix this author is forbidden to
+    apply: ``connectors.reserved_name`` refuses the very declaration it asks
+    for, so the author fixes the typo, re-runs the build, and gets a different
+    error pointing back at the first. Both halves have to be said here, where
+    the author is still looking: the pattern cannot be made live, and the thing
+    it was reaching for was never in danger.
+
+    The reserved set is imported rather than retyped for the #453/#544 reason:
+    a second copy of a name list owned by a different module is how a validator
+    and the thing it validates drift into disagreeing.
+    """
+
+    return (
+        f"tool pattern {pattern!r} names {server!r}, which is one of Curie's own "
+        "platform owned MCP servers (the approval server and the durable state "
+        "server). Those servers are mounted by the platform, not by a bundle, and "
+        "they are outside toolPolicy scope entirely: a bundle policy neither grants "
+        "nor removes the platform paths they carry (approval, publication and "
+        "channel memory). Whether one of those paths is mounted at all is the "
+        "platform's decision and not this policy's -- channel memory needs a state "
+        "URL, and the generic approval pager is omitted when a permission gate "
+        "already pages. This pattern is therefore inert at "
+        "runtime and the bundle does not declare a server by that name, so remove "
+        "it. If you meant one of your own MCP servers, give it a different name and "
+        f"add it to the manifest's mcpServers map, because {CONNECTORS_FILE} reserves "
+        f"{server!r} for the platform."
+    )
 
 
 def _unknown_tool_policy_server_message(

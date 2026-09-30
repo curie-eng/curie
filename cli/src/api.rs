@@ -72,6 +72,23 @@ pub(crate) struct ClusterMessageReplyEvent {
     pub(crate) status: Option<String>,
     #[serde(default)]
     pub(crate) outcome: Option<String>,
+    /// Reply wire 1.1's progress payload (ADR-0130), a card or a milestone.
+    /// Present, the event is never the turn's reply.
+    #[serde(default)]
+    pub(crate) progress: Option<ClusterMessageProgress>,
+}
+
+/// The fields of a relayed progress card or milestone the CLI shows as a
+/// status line. Tolerant like the event: a field it does not read is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageProgress {
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) milestone: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: String,
 }
 
 /// The channel used when an agent is first created if `--slack-channel` is
@@ -79,6 +96,13 @@ pub(crate) struct ClusterMessageReplyEvent {
 /// satisfy the platform API's channel-ID validation (`^[CDG][A-Z0-9]{7,}$`),
 /// so this is a valid Slack channel-ID shape, not a `#name`.
 pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
+
+/// @spec ADR-0168 d8. What an absent `identity` means on a target the API
+/// resolved: the API predates this decision, and every target it knows is on
+/// the default.
+fn default_identity() -> String {
+    DEFAULT_SLACK_IDENTITY.to_string()
+}
 
 /// Kubernetes objects the API derived from a version's `connectors.yaml`.
 ///
@@ -91,6 +115,13 @@ pub struct ResolvedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
+    /// @spec ADR-0168 d8. The identity the binding speaks through.
+    #[serde(default = "default_identity")]
+    pub identity: String,
+    /// @spec ADR-0168 d8. The connectors the bound agent runs; `None` is
+    /// every declared one.
+    #[serde(default)]
+    pub connectors: Option<Vec<String>>,
 }
 
 /// One environment whose pushes a repository can no longer route (#1221).
@@ -140,6 +171,13 @@ pub struct NamedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
+    /// @spec ADR-0168 d8. The identity the binding speaks through.
+    #[serde(default = "default_identity")]
+    pub identity: String,
+    /// @spec ADR-0168 d8. The connectors the bound agent runs; `None` is
+    /// every declared one.
+    #[serde(default)]
+    pub connectors: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -162,6 +200,10 @@ pub struct ConnectorManifests {
     pub owned_secret_keys: Vec<String>,
     #[serde(default)]
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The version whose bundle was read. Required on the wire.
+    pub version_id: String,
+    /// plugin.json triggers as stored. Required on the wire, even when empty.
+    pub triggers: Vec<serde_json::Value>,
 }
 
 /// One of an agent's channel bindings (ADR-0118, #1525): `kind` names the
@@ -173,16 +215,56 @@ pub struct ConnectorManifests {
 /// address-shape rule (#1914): an upgraded install can hold an address the write
 /// path would now refuse, and the CLI has to be able to PRINT that value rather
 /// than fail to parse the agent it belongs to.
+///
+/// `adapter` is the identity this binding speaks through (ADR-0168 decision 3):
+/// a Slack binding stored with none reads back `"default"`, a non-Slack binding
+/// reads its adapter slug or `null` when no route is configured. `#[serde(default)]`
+/// keeps a platform that predates the field parsing to `None`.
+///
+/// `allowed_callers` is who may talk to the bot through this binding (ADR 0175):
+/// `None` means everyone, which is also what a platform that predates the field
+/// reads as. Skipped when serializing a `None`, so no request built from this
+/// struct can send a key the binding write models refuse.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
     pub address: String,
+    #[serde(default)]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+}
+
+/// The identity every Slack binding had before ADR-0168: the installation's one
+/// Slack app (ADR-0168 decision 1), and what an omitted Slack adapter means.
+pub const DEFAULT_SLACK_IDENTITY: &str = "default";
+
+impl ChannelBinding {
+    /// `adapter`, unless it is the default Slack identity.
+    ///
+    /// That one value is what an omitted Slack adapter already means
+    /// (`aci_protocol.turn.route_identity`), so display stays silent about it
+    /// and a request leaves it out: an API that predates ADR-0168 decision 3
+    /// refuses an `adapter` it has no field for. Only Slack has a default
+    /// identity, so a non-Slack slug that happens to read "default" is kept.
+    pub fn named_adapter(&self) -> Option<&str> {
+        self.adapter
+            .as_deref()
+            .filter(|adapter| !(self.kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub name: String,
+    /// Hook name to conversation partition pointer. The operator CLI reads
+    /// these maps and sends replacements through the existing agent PATCH.
+    #[serde(default)]
+    pub hook_partitions: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Hook name to allowlisted workload mapping.
+    #[serde(default)]
+    pub source_bindings: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Every channel this agent answers on, ordered by `(kind, address)`
     /// server-side. One or more (ADR-0118): the API refuses to remove the last
     /// one, because an agent bound to nothing is deployed and answers nowhere.
@@ -217,12 +299,81 @@ pub struct Agent {
     /// explicit null clears it.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Per-agent execution deadline in seconds for factory work items (#3071),
+    /// 60 to 10800. `None` means the 1800 s default. Same three-way PATCH
+    /// semantics as `model`.
+    #[serde(default)]
+    pub execution_deadline_seconds: Option<u32>,
+    /// Per-agent runner cpu, memory, and ephemeral-storage (#3209). `None`
+    /// means the chart block. Same three-way PATCH semantics as `model`.
+    #[serde(default)]
+    pub runner_resources: Option<serde_json::Value>,
     /// Whether this agent's bindings share one workflow-state namespace
     /// (`true`) or each get their own (`false`, the default) (#1525 follow-up,
     /// ADR-0118). Cardinality alone opts an agent into multiple surfaces; this
     /// is the separate, explicit toggle for whether those surfaces share
     /// cross-turn state.
     pub memory: bool,
+    /// Whether the runner mounts its remember/update/forget memory tools for
+    /// this agent (#1461). Defaulted so a platform older than the field reads
+    /// as off, which is what it does.
+    #[serde(default)]
+    pub memory_writes: bool,
+    /// Who resolves publication approval. Missing responses stay on human approval.
+    #[serde(default = "default_publication_policy")]
+    pub publication_policy: String,
+    #[serde(default = "default_publication_policy_version")]
+    pub publication_policy_version: i64,
+    #[serde(default)]
+    pub publication_draft: bool,
+    #[serde(default)]
+    pub publication_branch_prefix: Option<String>,
+}
+
+/// An operator authored hook configuration file. Absent maps are omitted from
+/// PATCH so changing one map leaves the other untouched. An empty map clears
+/// that map. The API remains the authority for pointer and name validation.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfigInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_partitions: Option<std::collections::BTreeMap<String, HookPartitionInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_bindings: Option<std::collections::BTreeMap<String, SourceBindingInput>>,
+}
+
+impl HookConfigInput {
+    pub fn is_empty(&self) -> bool {
+        self.hook_partitions.is_none() && self.source_bindings.is_none()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HookPartitionInput {
+    pointer: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceBindingInput {
+    workload_pointer: String,
+    map: std::collections::BTreeMap<String, SourceBindingEntryInput>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceBindingEntryInput {
+    repository: String,
+    revision: String,
+}
+
+fn default_publication_policy() -> String {
+    "approve".to_string()
+}
+
+fn default_publication_policy_version() -> i64 {
+    1
 }
 
 /// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
@@ -233,19 +384,45 @@ pub struct Agent {
 /// PATCH graph below.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalRouteBindingResponse {
-    pub resolution: ApprovalResolutionTargetResponse,
+    pub resolution: ApprovalResolutionResponse,
     #[serde(default)]
     pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
 }
 
-/// Interactive target returned by the API. The current resolver supports Slack
-/// only, but response decoding stays tolerant of a future server extension.
+/// Where a route's card goes, as the API returns it: a fixed channel, or the
+/// conversation that asked (ADR-0177). Untagged, so each form decodes from its
+/// own keys; the fixed form is tried first.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApprovalResolutionResponse {
+    Fixed(ApprovalResolutionTargetResponse),
+    RequestingSurface(RequestingSurfaceTargetResponse),
+}
+
+impl ApprovalResolutionResponse {
+    /// One human-readable phrase naming where the card goes.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Fixed(target) => format!("{}:{}", target.kind, target.address),
+            Self::RequestingSurface(target) => target.mode.clone(),
+        }
+    }
+}
+
+/// Fixed interactive target returned by the API. The current resolver supports
+/// Slack only, but response decoding stays tolerant of a future server extension.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalResolutionTargetResponse {
     pub kind: String,
     pub address: String,
+}
+
+/// The `{"mode": "requesting_surface"}` resolution as the API returns it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RequestingSurfaceTargetResponse {
+    pub mode: String,
 }
 
 /// Text-only notification target returned by the API. Endpoint and adapter are
@@ -292,21 +469,66 @@ pub struct ApprovalApprovers {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRouteBindingWrite {
-    pub resolution: ApprovalResolutionTargetWrite,
+    pub resolution: ApprovalResolutionWrite,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
 }
 
-/// Slack-only interactive resolution target. `kind` is kept explicit as the
-/// future extension point, while command validation currently refuses anything
+/// Where a route's card goes, as an operator writes it: a fixed Slack channel,
+/// or `{"mode": "requesting_surface"}` for the conversation that asked
+/// (ADR-0177). Both variants refuse unknown keys, so a mix of the two forms
+/// matches neither and is refused rather than read as one of them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApprovalResolutionWrite {
+    Fixed(ApprovalResolutionTargetWrite),
+    RequestingSurface(RequestingSurfaceTargetWrite),
+}
+
+impl ApprovalResolutionWrite {
+    /// A fixed Slack channel target, the form `--route-resolution` writes.
+    pub fn slack(channel: &str) -> Self {
+        Self::Fixed(ApprovalResolutionTargetWrite {
+            kind: "slack".to_string(),
+            address: channel.to_string(),
+        })
+    }
+}
+
+impl From<ApprovalResolutionResponse> for ApprovalResolutionWrite {
+    fn from(response: ApprovalResolutionResponse) -> Self {
+        match response {
+            ApprovalResolutionResponse::Fixed(target) => {
+                Self::Fixed(ApprovalResolutionTargetWrite {
+                    kind: target.kind,
+                    address: target.address,
+                })
+            }
+            ApprovalResolutionResponse::RequestingSurface(target) => {
+                Self::RequestingSurface(RequestingSurfaceTargetWrite { mode: target.mode })
+            }
+        }
+    }
+}
+
+/// Slack-only fixed resolution target. `kind` is kept explicit as the future
+/// extension point, while command validation currently refuses anything
 /// except `slack`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalResolutionTargetWrite {
     pub kind: String,
     pub address: String,
+}
+
+/// `{"mode": "requesting_surface"}`: show the card in the conversation that
+/// asked. Command validation refuses any other mode value.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestingSurfaceTargetWrite {
+    pub mode: String,
 }
 
 /// Optional notification target with write-only transport routing.
@@ -326,7 +548,7 @@ pub struct NotificationTargetWrite {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBindingInput {
-    pub resolution: ApprovalResolutionTargetWrite,
+    pub resolution: ApprovalResolutionWrite,
     #[serde(default)]
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
@@ -392,6 +614,25 @@ pub struct ApprovalRecord {
     pub card_channel: Option<String>,
 }
 
+/// The RECORDED outcome of one administrative recovery: the body of `POST
+/// /approvals/{id}/recover` (`ApprovalRecoveryOut`, #2753).
+///
+/// Deliberately NOT [`ApprovalRecord`]. The recovery route answers with the
+/// administrative outcome read back off the row -- `approval_id` (not `id`),
+/// the recovery key, the operator's reason and the actor -- and carries none of
+/// the conversation fields an ordinary approval record requires. Decoding the
+/// wrong model here failed AFTER the mutation had already committed, telling
+/// the operator a landed recovery had failed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalRecoveryOutcome {
+    pub approval_id: String,
+    pub status: String,
+    pub recovery_key: Option<String>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+    pub recovered_at: Option<String>,
+}
+
 /// What a deploy did with the agent's Slack channel, for the summary printout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelOutcome {
@@ -437,6 +678,54 @@ pub struct Version {
     pub bundle_ref: Option<String>,
 }
 
+/// One cron hook on an in-force deployment (`ScheduleHookOut`, #2933).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleHook {
+    pub name: String,
+    pub trigger: String,
+    pub schedule: String,
+    pub zone: String,
+    pub last_fire_at: Option<String>,
+    pub last_outcome: Option<String>,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleControl {
+    pub agent: String,
+    pub name: String,
+    pub paused: bool,
+}
+
+/// Scheduled hooks for one agent (`AgentSchedulesOut`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentSchedules {
+    pub agent: String,
+    pub agent_id: String,
+    pub bundle_error: Option<String>,
+    pub hooks: Vec<ScheduleHook>,
+}
+
+/// `GET /schedules` (`ScheduleListOut`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleList {
+    pub schedules: Vec<AgentSchedules>,
+}
+
+/// One test-fire run record (`HookFireOut`, #2932).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct HookFireRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub agent: String,
+    pub name: String,
+    pub trigger: String,
+    pub slot_utc: String,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MemoryProvenance {
@@ -458,6 +747,15 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
+/// text the runner shows beside its memory tools, and whether it is the
+/// platform `default` or `operator`-set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryGuidance {
+    pub text: String,
+    pub source: String,
 }
 
 /// One row returned by `GET /langfuse/traces`.
@@ -487,6 +785,13 @@ pub struct ObservationNode {
     pub start_time: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Langfuse renames a tool observation to the tool itself, so the API hoists
+    /// `gen_ai.tool.name` here; dropping it would strip the only tool identity.
+    // Skipped when absent so the CLI reproduces the API payload exactly rather
+    // than inventing a null key: a released CLI talks to whatever API version is
+    // deployed, and an older one omits this field entirely.
+    #[serde(rename = "toolName", default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     #[serde(rename = "usageDetails", default)]
     pub usage_details: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
@@ -772,6 +1077,88 @@ pub fn is_agent_lookup_not_found(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<AgentLookupNotFound>().is_some())
+}
+
+/// `GET /work-items` answer (`WorkItemOutcomeList`, #2577).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemList {
+    pub items: Vec<WorkItemOutcome>,
+    pub limit: u64,
+    pub truncated: bool,
+}
+
+/// One factory work item outcome (`WorkItemOutcomeOut`, #2577). `state` and
+/// `actionable_cause` are API-derived strings the CLI renders verbatim.
+/// Unknown API fields are dropped on decode, so the `--json` envelope cannot
+/// grow a field the committed schema does not name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemOutcome {
+    pub id: String,
+    pub agent_id: String,
+    pub repo_full_name: String,
+    pub github_issue_number: u64,
+    pub issue_url: String,
+    pub cancelled_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state: String,
+    pub actionable_cause: String,
+    pub objective: Option<String>,
+    pub objective_truncated: bool,
+    pub requester: Option<String>,
+    pub pr: Option<WorkItemPr>,
+    pub publication: Option<WorkItemPublication>,
+    pub correctness: WorkItemCorrectness,
+    pub ci: Option<WorkItemCi>,
+    pub requests: Vec<WorkItemRequest>,
+}
+
+/// `WorkItemPrOut`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemPr {
+    pub number: u64,
+    pub url: String,
+    pub status: String,
+}
+
+/// `WorkItemPublicationOut`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemPublication {
+    pub status: String,
+    pub revision_number: Option<u64>,
+    pub approval_status: Option<String>,
+}
+
+/// `WorkItemCorrectnessOut`: the platform never asserts correctness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCorrectness {
+    pub asserted: bool,
+    pub owner: String,
+}
+
+/// `WorkItemCiOut`: live CI for the published head (detail only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCi {
+    pub state: String,
+    pub reason: Option<String>,
+    pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
+}
+
+/// `WorkItemRequestOut`: one execution request of a work item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRequest {
+    pub sequence: u64,
+    pub status: String,
+    pub created_at: String,
+    pub wait_deadline: Option<String>,
+    pub started_at: Option<String>,
+    pub execution_deadline: Option<String>,
+    pub terminal_at: Option<String>,
+    pub terminal_cause: Option<String>,
+    pub termination_observation: Option<String>,
+    pub capacity_deferrals: u64,
+    pub last_deferral_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1297,15 +1684,56 @@ fn agent_create_body(
     name: &str,
     slack_channel: &str,
     repo_full_name: Option<&str>,
+    identity: Option<&str>,
 ) -> serde_json::Value {
-    let mut body = json!({
-        "name": name,
-        "channel": {"kind": "slack", "address": slack_channel},
-    });
+    let mut channel = json!({"kind": "slack", "address": slack_channel});
+    // @spec ADR-0168 d8: only a named identity travels; the default is omitted,
+    // exactly as every create sent it before the identity existed.
+    if let Some(identity) = named_identity("slack", identity) {
+        channel["adapter"] = json!(identity);
+    }
+    let mut body = json!({"name": name, "channel": channel});
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
     }
     body
+}
+
+/// `adapter` as a request names it, with the default Slack identity dropped,
+/// the same reading [`ChannelBinding::named_adapter`] gives a stored binding.
+/// @spec ADR-0168 d8
+fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
+    adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
+}
+
+/// A binding write the platform refused over the identity it names.
+///
+/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
+/// identity, for instance), so it is carried verbatim rather than restated.
+fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| match &value["detail"] {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| item["msg"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    crate::exit::CliError::usage(format!(
+        "the platform refused the {kind} binding on {address} under identity `{identity}`: {detail}"
+    ))
+    .with_fix(
+        "deploy under the installation's default identity (drop --identity, or `identity:` from \
+         the deploy.yaml target), or declare the identity in the chart if the platform says it \
+         is not declared",
+    )
+    .into()
 }
 
 /// The `PATCH /agents/{id}` body for the fields deploy reconciles. Pure so the
@@ -1325,9 +1753,15 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
     body
 }
 
-/// The `POST /agents/{id}/channels` body: the binding PAIR and nothing else.
-/// Pure so the shape is testable without a live API. The kind is never
-/// inferred -- a channel-neutral binding carries it explicitly.
+/// The `POST /agents/{id}/channels` body: the binding PAIR, plus the identity
+/// it speaks through. Pure so the shape is testable without a live API. The
+/// kind is never inferred -- a channel-neutral binding carries it explicitly.
+///
+/// `adapter` alone names a Slack identity (ADR-0168 decision 3); a non-Slack
+/// route sends `endpoint` and `adapter` together. `ChannelChange::resolve`
+/// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
+/// before this function ever sees the arguments, and clap's `--endpoint`
+/// `requires` `--adapter` covers the other direction.
 fn add_channel_body(
     kind: &str,
     address: &str,
@@ -1335,10 +1769,30 @@ fn add_channel_body(
     adapter: Option<&str>,
 ) -> serde_json::Value {
     let mut body = json!({"kind": kind, "address": address});
-    if let (Some(endpoint), Some(adapter)) = (endpoint, adapter) {
+    if let Some(endpoint) = endpoint {
         body["endpoint"] = json!(endpoint);
+    }
+    if let Some(adapter) = adapter {
         body["adapter"] = json!(adapter);
     }
+    body
+}
+
+/// The `POST /channels/token` body. Pure so the shape is testable without a
+/// live API. `adapter` travels only when the caller knows it (ADR-0168
+/// decision 3); an absent key resolves the same way the platform did before
+/// the identity existed.
+fn mint_channel_token_body(
+    kind: &str,
+    address: &str,
+    adapter: Option<&str>,
+    ttl_s: i64,
+) -> serde_json::Value {
+    let mut body = json!({"kind": kind, "address": address});
+    if let Some(adapter) = adapter {
+        body["adapter"] = json!(adapter);
+    }
+    body["ttl_s"] = json!(ttl_s);
     body
 }
 
@@ -1540,6 +1994,25 @@ impl ApiClient {
             .context("decoding agent list")
     }
 
+    /// Deliberate operator read of the derived hook signing secret. Keep the
+    /// response body out of errors and debug output.
+    pub async fn hook_secret(&self, agent_id: &str) -> Result<String> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/hook-secret", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hook-secret",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "reading hook secret")
+            .await?
+            .json()
+            .await
+            .context("decoding hook secret response")?;
+        required_response_string(&body, "secret", "hook secret response")
+    }
+
     /// Poll one opaque disconnected cluster-message reply bucket.
     ///
     /// `reply_ref` is a UUID rather than an arbitrary string so caller input can
@@ -1725,8 +2198,9 @@ impl ApiClient {
         name: &str,
         slack_channel: &str,
         repo_full_name: Option<&str>,
+        identity: Option<&str>,
     ) -> Result<Agent> {
-        let body = agent_create_body(name, slack_channel, repo_full_name);
+        let body = agent_create_body(name, slack_channel, repo_full_name, identity);
         let resp = self
             .send_request(
                 self.http
@@ -1736,6 +2210,12 @@ impl ApiClient {
                 "POST /agents",
             )
             .await?;
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            if let Some(identity) = named_identity("slack", identity) {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal("slack", slack_channel, identity, &body));
+            }
+        }
         Self::expect_ok(resp, "creating the agent")
             .await?
             .json()
@@ -1752,7 +2232,7 @@ impl ApiClient {
         {
             return Ok(existing);
         }
-        self.create_agent(name, slack_channel, None).await
+        self.create_agent(name, slack_channel, None, None).await
     }
 
     /// `PATCH /agents/{id}` with a body the caller already built (see
@@ -1796,12 +2276,12 @@ impl ApiClient {
     /// Add one channel binding: `POST /agents/{id}/channels` (201 with the
     /// agent as stored).
     ///
-    /// A 409 is AMBIGUOUS: the pair's uniqueness is platform-wide, so the
+    /// A 409 is AMBIGUOUS: the route's uniqueness is platform-wide, so the
     /// conflict may be another agent holding it (a real error) or this very
-    /// agent, when a concurrent deploy won the race to add the same pair. This
+    /// agent, when a concurrent deploy won the race to add the same route. This
     /// is ensure-bound, a statement about the END STATE, so the conflict is
     /// rechecked against a fresh read and answered as success only when this
-    /// agent now owns the pair.
+    /// agent now owns the route.
     pub async fn add_agent_channel(
         &self,
         agent_id: &str,
@@ -1810,6 +2290,7 @@ impl ApiClient {
         endpoint: Option<&str>,
         adapter: Option<&str>,
     ) -> Result<Agent> {
+        let wanted = named_identity(kind, adapter);
         let resp = self
             .http
             .post(format!("{}/agents/{agent_id}/channels", self.base_url))
@@ -1818,6 +2299,12 @@ impl ApiClient {
             .send()
             .await
             .context("POST /agents/{id}/channels")?;
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY && endpoint.is_none() {
+            if let Some(identity) = wanted.filter(|_| kind == "slack") {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal(kind, address, identity, &body));
+            }
+        }
         if resp.status() == reqwest::StatusCode::CONFLICT {
             let conflict = Self::expect_ok(resp, "adding the channel binding")
                 .await
@@ -1826,7 +2313,7 @@ impl ApiClient {
             if agent
                 .channels
                 .iter()
-                .any(|b| b.kind == kind && b.address == address)
+                .any(|b| b.kind == kind && b.address == address && b.named_adapter() == wanted)
             {
                 return Ok(agent);
             }
@@ -1843,6 +2330,10 @@ impl ApiClient {
     /// (204, no body). The PAIR travels, never the address alone: on a
     /// multi-binding agent an address-only removal would drop the wrong row.
     ///
+    /// `adapter`, when given, selects which identity's binding to drop
+    /// (ADR-0168 decision 3); omitted keeps today's selection, the default
+    /// Slack identity or the pair's single non-Slack row.
+    ///
     /// The API refuses to remove an agent's LAST binding with a 409, which
     /// [`Self::expect_ok`] surfaces with the reason intact.
     pub async fn remove_agent_channel(
@@ -1850,11 +2341,16 @@ impl ApiClient {
         agent_id: &str,
         kind: &str,
         address: &str,
+        adapter: Option<&str>,
     ) -> Result<()> {
+        let mut query = vec![("kind", kind), ("address", address)];
+        if let Some(adapter) = adapter {
+            query.push(("adapter", adapter));
+        }
         let resp = self
             .http
             .delete(format!("{}/agents/{agent_id}/channels", self.base_url))
-            .query(&[("kind", kind), ("address", address)])
+            .query(&query)
             .header("X-API-Key", &self.api_key)
             .send()
             .await
@@ -1863,7 +2359,51 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Set or clear one binding's caller list:
+    /// `PUT /agents/{id}/channels/callers?kind=&address=[&adapter=]` (ADR 0175).
+    ///
+    /// `callers` of `None` sends an explicit JSON `null`, which clears the list
+    /// so everyone may talk to the bot again; a list replaces the stored one
+    /// whole. The API checks the entries against the binding's kind and answers
+    /// the agent as stored, so the caller reports what took rather than what it
+    /// sent. This write does not bump the binding generation, so it never
+    /// revokes an adapter's channel token.
+    pub async fn set_channel_callers(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+        adapter: Option<&str>,
+        callers: Option<&[String]>,
+    ) -> Result<Agent> {
+        let mut query = vec![("kind", kind), ("address", address)];
+        if let Some(adapter) = adapter {
+            query.push(("adapter", adapter));
+        }
+        let resp = self
+            .http
+            .put(format!(
+                "{}/agents/{agent_id}/channels/callers",
+                self.base_url
+            ))
+            .query(&query)
+            .header("X-API-Key", &self.api_key)
+            .json(&serde_json::json!({ "allowed_callers": callers }))
+            .send()
+            .await
+            .context("PUT /agents/{id}/channels/callers")?;
+        Self::expect_ok(resp, "setting the surface's caller list")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent after the caller list write")
+    }
+
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
+    ///
+    /// `adapter`, when known, is the identity the resolved binding speaks
+    /// through (ADR-0168 decision 3); omitted resolves as the platform did
+    /// before the identity existed.
     ///
     /// Returns the token string. Callers must not print it; decode `exp` from
     /// the `chn.` payload instead. An empty token is refused so a success
@@ -1872,17 +2412,14 @@ impl ApiClient {
         &self,
         kind: &str,
         address: &str,
+        adapter: Option<&str>,
         ttl_s: i64,
     ) -> Result<String> {
         let resp = self
             .http
             .post(format!("{}/channels/token", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({
-                "kind": kind,
-                "address": address,
-                "ttl_s": ttl_s,
-            }))
+            .json(&mint_channel_token_body(kind, address, adapter, ttl_s))
             .send()
             .await
             .context("POST /channels/token")?;
@@ -1923,6 +2460,17 @@ impl ApiClient {
             .context("decoding updated agent")
     }
 
+    /// [`Self::resolve_agent_as`] under the default identity.
+    pub async fn resolve_agent(
+        &self,
+        name: &str,
+        slack_channel: Option<&str>,
+        repo_full_name: Option<&str>,
+    ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
+        self.resolve_agent_as(name, slack_channel, repo_full_name, None)
+            .await
+    }
+
     /// Find the agent by name (or create it), reconciling its Slack channel and
     /// its repo binding with an explicitly-passed `--slack-channel`/`--repo`.
     ///
@@ -1936,15 +2484,20 @@ impl ApiClient {
     ///
     /// Public so the command layer can judge the resolved agent (approval-route
     /// pre-check, #2448) before any version is created.
-    pub async fn resolve_agent(
+    ///
+    /// `identity` names the binding's identity (ADR-0168 decision 8); the
+    /// default is written exactly as before.
+    pub async fn resolve_agent_as(
         &self,
         name: &str,
         slack_channel: Option<&str>,
         repo_full_name: Option<&str>,
+        identity: Option<&str>,
     ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
         if let Some(repo_full_name) = repo_full_name {
             validate_repo_full_name(repo_full_name)?;
         }
+        let identity = named_identity("slack", identity);
 
         let existing = self
             .list_agents()
@@ -1963,10 +2516,9 @@ impl ApiClient {
                 // address it already answers on is nothing to do; anything else
                 // is added beside what is there, never on top of it.
                 let channel_add = slack_channel.filter(|c| {
-                    !agent
-                        .channels
-                        .iter()
-                        .any(|b| b.kind == "slack" && b.address == **c)
+                    !agent.channels.iter().any(|b| {
+                        b.kind == "slack" && b.address == **c && b.named_adapter() == identity
+                    })
                 });
                 let current_repo = agent.repo_full_name.as_deref();
                 let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
@@ -1993,7 +2545,7 @@ impl ApiClient {
                 // with no channel does not.
                 let agent = match channel_add {
                     Some(address) => {
-                        self.add_agent_channel(&agent.id, "slack", address, None, None)
+                        self.add_agent_channel(&agent.id, "slack", address, None, identity)
                             .await?
                     }
                     None => agent,
@@ -2033,7 +2585,9 @@ impl ApiClient {
             }
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
-                let agent = self.create_agent(name, channel, repo_full_name).await?;
+                let agent = self
+                    .create_agent(name, channel, repo_full_name, identity)
+                    .await?;
                 // `AgentCreate` still carries the singular channel, so a created
                 // agent holds exactly the one binding it was created with.
                 let outcome = ChannelOutcome::Created(
@@ -2595,6 +3149,92 @@ impl ApiClient {
             .context("decoding version list")
     }
 
+    /// Cron hooks on in-force deployments: `GET /schedules`.
+    pub async fn list_schedules(&self, agent: Option<&str>) -> Result<ScheduleList> {
+        let mut request = self
+            .http
+            .get(format!("{}/schedules", self.base_url))
+            .header("X-API-Key", &self.api_key);
+        if let Some(agent) = agent {
+            request = request.query(&[("agent", agent)]);
+        }
+        let resp = self.send_request(request, "GET /schedules").await?;
+        Self::expect_ok(resp, "listing schedules")
+            .await?
+            .json()
+            .await
+            .context("decoding schedule list")
+    }
+
+    pub async fn control_schedule(
+        &self,
+        agent: &str,
+        name: &str,
+        pause: bool,
+    ) -> Result<ScheduleControl> {
+        let action = if pause { "pause" } else { "resume" };
+        let mut url = reqwest::Url::parse(&format!("{}/schedules", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("schedule URL cannot hold path segments"))?
+            .push(agent)
+            .push(name)
+            .push(action);
+        let request = self.http.post(url).header("X-API-Key", &self.api_key);
+        let response = self
+            .send_request(request, "POST /schedules control")
+            .await?;
+        Self::expect_ok(response, "changing schedule control")
+            .await?
+            .json()
+            .await
+            .context("decoding schedule control")
+    }
+
+    /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
+    pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent}/hooks/{name}/fire",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{agent}/hooks/{name}/fire",
+            )
+            .await?;
+        Self::expect_ok(resp, "firing hook")
+            .await?
+            .json()
+            .await
+            .context("decoding hook fire")
+    }
+
+    /// Read one hook run: `GET /agents/{agent}/hooks/{name}/runs/{id}`.
+    pub async fn get_hook_run(
+        &self,
+        agent: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{agent}/hooks/{name}/runs/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading hook run")
+            .await?
+            .json()
+            .await
+            .context("decoding hook run")
+    }
+
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.
     pub async fn list_memory(&self, agent_id: &str) -> Result<Vec<MemoryEntry>> {
         let resp = self
@@ -2628,6 +3268,161 @@ impl ApiClient {
             .json()
             .await
             .context("decoding created memory entry")
+    }
+
+    /// The agent's effective memory guidance: `GET /agents/{id}/memory/guidance`.
+    pub async fn get_memory_guidance(&self, agent_id: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding memory guidance")
+    }
+
+    /// Store operator memory guidance: `PUT /agents/{id}/memory/guidance`.
+    /// Returns the effective guidance as the API stored it.
+    pub async fn put_memory_guidance(&self, agent_id: &str, text: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "text": text })),
+                "PUT /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "storing memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding stored memory guidance")
+    }
+
+    /// Remove operator memory guidance: `DELETE /agents/{id}/memory/guidance`.
+    pub async fn delete_memory_guidance(&self, agent_id: &str) -> Result<()> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "removing memory guidance").await?;
+        Ok(())
+    }
+
+    /// The server's max page for `GET /work-items` (`limit` maximum 200 in
+    /// `apps/api/openapi.json`), requested explicitly so a truncated answer is
+    /// the API's `truncated` flag, never a silent default page.
+    pub const WORK_ITEMS_LIST_LIMIT: u32 = 200;
+
+    /// Factory work item outcomes: `GET /work-items` (#2577). The API derives
+    /// `state` and `actionable_cause`; this client only carries them.
+    pub async fn list_work_items(
+        &self,
+        agent_id: Option<&str>,
+        limit: u32,
+    ) -> Result<WorkItemList> {
+        let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/work-items", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /work-items",
+            )
+            .await?;
+        Self::expect_work_items_ok(resp, "listing work items", "agent not found")
+            .await?
+            .json()
+            .await
+            .context("decoding work items")
+    }
+
+    /// One factory work item outcome: `GET /work-items/{id}` (#2577), with
+    /// live CI for the published head. `agent_id` scopes the lookup, so an id
+    /// from another agent answers 404.
+    pub async fn get_work_item(
+        &self,
+        work_item_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<WorkItemOutcome> {
+        let query: Vec<(&str, &str)> = agent_id.map(|id| ("agent_id", id)).into_iter().collect();
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/work-items/{work_item_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /work-items/{id}",
+            )
+            .await?;
+        Self::expect_work_items_ok(resp, "reading the work item", "work item not found")
+            .await?
+            .json()
+            .await
+            .context("decoding the work item")
+    }
+
+    /// Status classes for the work item reads (ADR 0021/0041): 404 is a
+    /// failure (exit 1), 5xx transient (exit 3), 401/403 a failure carrying the
+    /// API key fix, 400/422 usage (exit 2). Bodies are not echoed on auth
+    /// failures so nothing credential-shaped reaches the terminal.
+    async fn expect_work_items_ok(
+        resp: reqwest::Response,
+        what: &str,
+        not_found: &str,
+    ) -> Result<reqwest::Response> {
+        use reqwest::StatusCode;
+        let status = resp.status();
+        let error = match status {
+            StatusCode::NOT_FOUND => crate::exit::CliError::failure(format!("{what}: {not_found}"))
+                .with_fix("run `work-items` without an id to list the known work items"),
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                crate::exit::CliError::transient(format!("{what} failed with {status}"))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                crate::exit::CliError::failure(format!("{what} failed with {status}"))
+                    .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API")
+            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let body = resp.text().await.unwrap_or_default();
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("pass a work item id and --agent as UUIDs or a known agent name")
+            }
+            _ => return Self::expect_ok(resp, what).await,
+        };
+        Err(anyhow::Error::from(error))
     }
 
     /// The pending approval records for an agent: `GET /approvals?status_filter=
@@ -2723,6 +3518,67 @@ impl ApiClient {
             .json()
             .await
             .context("decoding resolved approval")
+    }
+
+    /// The installation-wide approval identity report: `GET
+    /// /approvals/identity-report` (#2753).
+    ///
+    /// A pure read of FACTS about approval rows whose card or reply identity
+    /// cannot be reconstructed, plus the declaration skeleton an operator fills
+    /// in. Deliberately decoded as an untyped `Value` and forwarded verbatim:
+    /// the report is diagnostic evidence an operator acts on, so a field this
+    /// CLI does not know about must still reach the terminal rather than be
+    /// dropped by a hand-mirrored struct.
+    pub async fn approval_identity_report(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/approvals/identity-report", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /approvals/identity-report",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the approval identity report")
+            .await?
+            .json()
+            .await
+            .context("decoding the approval identity report")
+    }
+
+    /// Administratively reject one approval under the installation-wide
+    /// recovery grant: `POST /approvals/{id}/recover` (#2753).
+    ///
+    /// Authorization is the platform key; the operator principal carries
+    /// ATTRIBUTION for the audit row only, exactly as it does for
+    /// [`Self::resolve_approval`]. `recovery_key` is the CALLER's idempotency
+    /// key and is sent unmodified, so a retry of the identical argv is absorbed
+    /// by the server rather than becoming a second administrative act.
+    pub async fn recover_approval(
+        &self,
+        approval_id: &str,
+        reason: &str,
+        recovery_key: &str,
+        principal_token: &str,
+    ) -> Result<ApprovalRecoveryOutcome> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/approvals/{approval_id}/recover", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json(&json!({
+                        "disposition": "rejected",
+                        "reason": reason,
+                        "recovery_key": recovery_key,
+                    })),
+                "POST /approvals/{id}/recover",
+            )
+            .await?;
+        Self::expect_ok(resp, "recovering approval")
+            .await?
+            .json()
+            .await
+            .context("decoding the recorded recovery outcome")
     }
 
     /// Mint a reusable operator approval principal under the platform key.
@@ -2978,7 +3834,8 @@ impl ApiClient {
 mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
-        prevalidate_series_span, validate_allowlist_entry, MAX_OBSERVABILITY_METRIC_POINTS,
+        mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
+        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3118,10 +3975,6 @@ mod tests {
         let error = prevalidate_series_span("hour", Some("1970-01-01T00:00:00Z"), None)
             .expect_err("a start of 1970 with no end exceeds the cap against now");
         assert!(error.to_string().contains("now"));
-        assert_eq!(
-            MAX_OBSERVABILITY_METRIC_POINTS, 1000,
-            "the pre-dispatch guard and the post-dispatch bound share one cap"
-        );
     }
 
     #[test]
@@ -3138,7 +3991,7 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = agent_create_body("bot", "C123", None);
+        let body = agent_create_body("bot", "C123", None, None);
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
         assert_eq!(body["channel"]["address"], "C123");
@@ -3149,7 +4002,7 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = agent_create_body("bot", "C123", Some("acme/bundle"));
+        let body = agent_create_body("bot", "C123", Some("acme/bundle"), None);
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 
@@ -3211,6 +4064,130 @@ mod tests {
             add_channel_body("email", "ops@example.com", None, None),
             serde_json::json!({"kind": "email", "address": "ops@example.com"})
         );
+    }
+
+    #[test]
+    fn add_channel_body_carries_a_bare_slack_identity() {
+        // ADR-0168 decision 3: a Slack identity travels alone, with no
+        // endpoint -- Slack is an in-process ingress, so it has nothing to
+        // configure a transport for.
+        assert_eq!(
+            add_channel_body("slack", "C0EXAMPLE1", None, Some("default")),
+            serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"})
+        );
+    }
+
+    #[test]
+    fn add_channel_body_sends_a_non_slack_route_whole() {
+        // A non-Slack route's endpoint and adapter travel together.
+        assert_eq!(
+            add_channel_body(
+                "discord",
+                "111111111111111111",
+                Some("https://discord-adapter.example.com/replies"),
+                Some("discord-main"),
+            ),
+            serde_json::json!({
+                "kind": "discord",
+                "address": "111111111111111111",
+                "endpoint": "https://discord-adapter.example.com/replies",
+                "adapter": "discord-main",
+            })
+        );
+    }
+
+    #[test]
+    fn channel_binding_without_adapter_deserializes_to_none() {
+        // A platform release that predates ADR-0168 decision 3 never sent the
+        // key at all; `#[serde(default)]` must still parse that row.
+        let binding: ChannelBinding =
+            serde_json::from_str(r#"{"kind":"slack","address":"C0EXAMPLE1"}"#)
+                .expect("an old-shape binding must still deserialize");
+        assert_eq!(binding.adapter, None);
+    }
+
+    #[test]
+    fn mint_token_body_carries_the_adapter_when_known() {
+        assert_eq!(
+            mint_channel_token_body("slack", "C0EXAMPLE1", Some("second"), 3600),
+            serde_json::json!({
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "adapter": "second",
+                "ttl_s": 3600,
+            })
+        );
+    }
+
+    #[test]
+    fn named_adapter_drops_only_the_default_slack_identity() {
+        let binding = |kind: &str, adapter: Option<&str>| ChannelBinding {
+            kind: kind.into(),
+            address: "C0EXAMPLE1".into(),
+            adapter: adapter.map(str::to_string),
+            allowed_callers: None,
+        };
+        assert_eq!(binding("slack", Some("default")).named_adapter(), None);
+        assert_eq!(
+            binding("slack", Some("second")).named_adapter(),
+            Some("second")
+        );
+        assert_eq!(binding("slack", None).named_adapter(), None);
+        // "default" names an identity only on Slack; elsewhere it is a slug.
+        assert_eq!(
+            binding("email", Some("default")).named_adapter(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn mint_token_body_omits_the_adapter_when_unknown() {
+        // Omission resolves the way the platform did before the identity
+        // existed (ADR-0168 decision 3).
+        assert_eq!(
+            mint_channel_token_body("email", "ops@example.com", None, 3600),
+            serde_json::json!({"kind": "email", "address": "ops@example.com", "ttl_s": 3600})
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_resolved_target_from_an_older_api_means_default_and_every_connector() {
+        let target: ResolvedTarget =
+            serde_json::from_str(r#"{"agent":"acme-bot","env":"prod","slack_channel":null}"#)
+                .expect("an API without the fields still decodes");
+        assert_eq!(target.identity, DEFAULT_SLACK_IDENTITY);
+        assert_eq!(target.connectors, None);
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_resolved_target_carries_the_identity_and_the_allowlist() {
+        let target: ResolvedTarget = serde_json::from_str(
+            r#"{"agent":"acme-bot","env":"prod","slack_channel":null,
+                "identity":"ops-bot","connectors":["grafana"]}"#,
+        )
+        .unwrap();
+        assert_eq!(target.identity, "ops-bot");
+        assert_eq!(target.connectors, Some(vec!["grafana".to_string()]));
+        let empty: ResolvedTarget =
+            serde_json::from_str(r#"{"env":"dev","identity":"default","connectors":[]}"#).unwrap();
+        assert_eq!(empty.connectors, Some(Vec::new()));
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_listed_target_decodes_the_same_two_fields() {
+        let listed: ListedTargets = serde_json::from_str(
+            r#"{"targets":[{"name":"dev","agent":"a","env":"dev","slack_channel":null},
+                           {"name":"prod","agent":"b","env":"prod","slack_channel":null,
+                            "identity":"ops-bot","connectors":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.targets[0].identity, DEFAULT_SLACK_IDENTITY);
+        assert_eq!(listed.targets[0].connectors, None);
+        assert_eq!(listed.targets[1].identity, "ops-bot");
+        assert_eq!(listed.targets[1].connectors, Some(Vec::new()));
     }
 
     #[test]

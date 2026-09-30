@@ -61,14 +61,64 @@ Set `base=next` when your worktree targets `next`.
 (
   set -e
   base=${base:-main}
-  export COMPOSE_PROJECT_NAME=curie-implement-baseline
-  exec 9>/tmp/curie-implement-baseline.lock
+  if [[ -n "${COMPOSE_FILE:-}" && -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    echo "Set COMPOSE_PROJECT_NAME with a custom COMPOSE_FILE" >&2
+    exit 2
+  fi
+  if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    export COMPOSE_PROJECT_NAME=curie-implement-baseline
+    baseline_default=1
+  else
+    baseline_default=0
+  fi
+  compose_base="$PWD/compose.dev.yaml"
+  compose_file_list=${COMPOSE_FILE:-$compose_base}
+  IFS=: read -r -a compose_files <<< "$compose_file_list"
+  compose=(docker compose -p "$COMPOSE_PROJECT_NAME")
+  for compose_file in "${compose_files[@]}"; do
+    [[ "$compose_file" = /* && -f "$compose_file" ]] || {
+      echo "COMPOSE_FILE must contain existing absolute paths" >&2
+      exit 2
+    }
+    compose+=(-f "$compose_file")
+  done
+  if (( baseline_default )); then
+    baseline_lock=/tmp/curie-implement-baseline.lock
+  else
+    [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || {
+      echo "COMPOSE_PROJECT_NAME is not safe for a lock path" >&2
+      exit 2
+    }
+    baseline_lock="/tmp/curie-implement-${COMPOSE_PROJECT_NAME}.lock"
+    : "${CURIE_RELEASED_UPGRADE_POSTGRES_HOST:?set the isolated Postgres host}"
+    : "${CURIE_RELEASED_UPGRADE_POSTGRES_PORT:?set the isolated Postgres port}"
+    export CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT="$COMPOSE_PROJECT_NAME"
+    export CURIE_RELEASED_UPGRADE_COMPOSE_FILES="$compose_file_list"
+    export CURIE_RELEASED_UPGRADE_INTEGRATION=1
+    export TEST_DATABASE_URL="postgresql+asyncpg://postgres:postgres@${CURIE_RELEASED_UPGRADE_POSTGRES_HOST}:${CURIE_RELEASED_UPGRADE_POSTGRES_PORT}/postgres"
+    export DATABASE_URL="$TEST_DATABASE_URL"
+  fi
+  export TEST_VALKEY_HOST=${TEST_VALKEY_HOST:-127.0.0.1}
+  export TEST_VALKEY_PORT=${TEST_VALKEY_PORT:-26379}
+  export VALKEY_HOST="$TEST_VALKEY_HOST"
+  export VALKEY_PORT="$TEST_VALKEY_PORT"
+  export TEST_S3_ENDPOINT_URL=${TEST_S3_ENDPOINT_URL:-http://127.0.0.1:29000}
+  export S3_ENDPOINT_URL="$TEST_S3_ENDPOINT_URL"
+  export TEST_LANGFUSE_HOST=${TEST_LANGFUSE_HOST:-${LANGFUSE_HOST:-http://127.0.0.1:23000}}
+  export LANGFUSE_HOST="$TEST_LANGFUSE_HOST"
+  export TEST_OTEL_COLLECTOR_ENDPOINT=${TEST_OTEL_COLLECTOR_ENDPOINT:-http://127.0.0.1:24318/v1/traces}
+  langfuse_health_url="$TEST_LANGFUSE_HOST/api/public/health"
+  exec 9>"$baseline_lock"
   if ! flock -n 9; then
     echo "Another local Python CI baseline is already running"
     exit 1
   fi
   wire_lock=$(mktemp /tmp/curie-implement-baseline-wire.lock.XXXXXX)
-  trap 'docker compose --profile full -f compose.dev.yaml down -v; rm -f "$wire_lock"' EXIT
+  cleanup() {
+    "${compose[@]}" --profile full down -v
+    rm -f "$wire_lock"
+  }
+  trap cleanup EXIT
   uv lock --check
   uv sync
   uv run python scripts/check-alembic-revisions.py
@@ -78,20 +128,20 @@ Set `base=next` when your worktree targets `next`.
   uv run lint-imports
   bash scripts/check-docs.sh
   bash scripts/check-wire-tolerance.sh
-  docker compose -f compose.dev.yaml up -d \
+  "${compose[@]}" up -d \
     postgres valkey clickhouse rustfs rustfs-init \
     langfuse-web langfuse-worker otel-collector
-  docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
+  "${compose[@]}" up -d --wait --wait-timeout 300 \
     postgres valkey clickhouse rustfs \
     langfuse-web langfuse-worker otel-collector
   for i in $(seq 1 60); do
-    if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
+    if curl -fsS "$langfuse_health_url" >/dev/null 2>&1; then
       break
     fi
     sleep 3
   done
-  curl -fsS http://localhost:23000/api/public/health >/dev/null
-git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
+  curl -fsS "$langfuse_health_url" >/dev/null
+  git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
   uv run python scripts/check-released-upgrade.py --self-test
   uv run python scripts/check-released-upgrade.py
   (cd apps/api && uv run alembic upgrade head)
@@ -133,9 +183,7 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    choose unused custom ports and retry allocation on a bind collision, or let
    Docker allocate ports and discover them with `docker compose port` before
    starting consumers. Do not assume an unused port probe reserves the port.
-   For example, this override replaces only the Postgres and Valkey bindings;
-   extend it to RustFS, Langfuse, ClickHouse, OTel, API, UI and any other enabled
-   service with published ports:
+   For a full Python baseline, replace every published backing service port:
 
    ```yaml
    services:
@@ -143,6 +191,14 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
        ports: !override ["127.0.0.1:35432:5432"]
      valkey:
        ports: !override ["127.0.0.1:36379:6379"]
+     clickhouse:
+       ports: !override ["127.0.0.1:38123:8123", "127.0.0.1:39009:9000"]
+     rustfs:
+       ports: !override ["127.0.0.1:39000:9000", "127.0.0.1:39001:9001"]
+     langfuse-web:
+       ports: !override ["127.0.0.1:33000:3000"]
+     otel-collector:
+       ports: !override ["127.0.0.1:34317:4317", "127.0.0.1:34318:4318", "127.0.0.1:38888:8888"]
    networks:
      curie_runner:
        name: "${COMPOSE_PROJECT_NAME}_runner"
@@ -163,22 +219,62 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    runner network. Shell exports do not replace literal Compose environment
    entries. Use private image tags and staging paths when building or running
    workers; preserve the worker's identical host/container staging mount path.
-4. Run the baseline checks above against these resources, replacing its project,
-   lock path, Compose invocations and health URL consistently. Keep all checks
-   and assertions. Record the resolved endpoints, candidate identity and exact
-   commands in the run evidence, without credential values. Check for hardcoded
-   endpoints before running each test or helper; environment variables do not
-   override literals. In particular, `scripts/check-released-upgrade.py` embeds
-   port 25432, and CLI local lifecycle, connector and ladder paths have shared
-   names or ports. Do not assume `COMPOSE_PROJECT_NAME` makes those paths private.
-5. If a required command cannot target private resources without changing its
-   behavior or assertions, run independent work first and reserve a bounded
-   exclusive verification window for that command. Use the shared baseline
-   lock for default port checks, recheck ownership after acquiring it, and never
-   stop another job's stack. Do not silently replace a required ladder with
-   focused tests, weaken a gate, or count a modified test as the original proof.
-   Only report an occupancy blocker after identifying the exact unredirectable
-   command and why neither isolation nor a bounded exclusive window is possible.
+4. Export the full isolated contract before the baseline. The baseline consumes
+   `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`, keeps the default shared lock only
+   when it selected the default project itself, and uses a project scoped lock
+   for every caller supplied project. It passes the same Compose files and
+   project to the upgrade gate through
+   `CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT` and
+   `CURIE_RELEASED_UPGRADE_COMPOSE_FILES`; supply the matching loopback
+   `CURIE_RELEASED_UPGRADE_POSTGRES_HOST` and
+   `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
+   `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
+   `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
+   runtime consumer variables and the Langfuse health URL from those values.
+   For example:
+
+   ```bash
+   export COMPOSE_PROJECT_NAME=curie-check-2751-a
+   export COMPOSE_FILE="$PWD/compose.dev.yaml:$PWD/.projects/2751/compose.yaml"
+   export CURIE_RELEASED_UPGRADE_POSTGRES_HOST=127.0.0.1
+   export CURIE_RELEASED_UPGRADE_POSTGRES_PORT=35432
+   export TEST_VALKEY_PORT=36379
+   export TEST_S3_ENDPOINT_URL=http://127.0.0.1:39000
+   export TEST_LANGFUSE_HOST=http://127.0.0.1:33000
+   export TEST_OTEL_COLLECTOR_ENDPOINT=http://127.0.0.1:34318/v1/traces
+   ```
+
+   Record resolved mappings, candidate identity, and exact commands without
+   credential values. The gate rejects incomplete or mismatched configuration
+   before database mutation. Keep all baseline assertions unchanged.
+5. Do not silently replace a required ladder with focused tests or weaken a
+   gate. Preserve other jobs and run each cleanup with its exact Compose array.
+   The Python baseline, released upgrade gate, CLI local lifecycle, connectors,
+   and E2E ladder all consume the same isolation contract: `COMPOSE_PROJECT_NAME`,
+   ordered `COMPOSE_FILE` (candidate `compose.dev.yaml` then a private override),
+   and matching host endpoints. Do not force project `curie` or a single
+   `compose.dev.yaml` when those values are set. Example local CLI / ladder run:
+
+   ```bash
+   export COMPOSE_PROJECT_NAME=curie-check-2780-a
+   export COMPOSE_FILE="$PWD/compose.dev.yaml:$PWD/.projects/2780/compose.yaml"
+   export CURIE_API_URL=http://127.0.0.1:38000
+   export VALKEY_HOST=127.0.0.1 VALKEY_PORT=36379
+   export S3_ENDPOINT_URL=http://127.0.0.1:39000
+   export CURIE_DOCKER_NETWORK=curie-check-2780-a_runner
+   export CURIE_LOCAL_STUB_PORT=18155
+   export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
+   export CURIE_LOCAL_STAGING_DIR=/tmp/curie-bundles-2780-a
+   export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
+   export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
+   export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics
+   curie local up --build
+   CURIE_E2E_TIERS=local curie dev e2e-ladder
+   curie local down
+   ```
+
+   Incomplete isolation is a usage error. Teardown uses the same project, files,
+   and labels; never a global `curie*` name sweep.
 6. Install cleanup before startup and remove only this execution's containers,
    networks, volumes and spawned runners. Identify resources by the project
    label and recorded container IDs, never a global `curie*` name sweep. On a
@@ -243,11 +339,21 @@ pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
 A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `runner/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
 `curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
+The `cli/tests/local/test_*.py::test...` selector is the local tier. Its test
+must start the actual isolated local services it owns. The verifier invokes the
+selector twice in separate pytest processes, so each baseline and reversed
+invocation must begin from fresh state, register cleanup before startup, and
+verify cleanup before it finishes. Unavailable Docker, ports, binaries, or
+services are errors, never skips or green results. Put prerequisite checks,
+service startup, and cleanup verification in pytest fixture setup or teardown
+so environmental failures are reported as errors, which the verifier refuses.
+Only product behavior assertions belong in the test body.
 A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
 or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
 the declaration, but a selector supplied voluntarily on any PR is still verified.
-The pin's tier is derived from the selector's location (unit tests, `charts/curie/ci/*`,
-`test_live.py`), not from prose. A pin below the closed issue's `found:unit` /
+The pin's tier is derived from the selector's location (unit tests,
+`cli/tests/local/test_*.py` local tests, `charts/curie/ci/*` cluster checks,
+and other `test_live.py` live tests), not from prose. A pin below the closed issue's `found:unit` /
 `found:local` / `found:cluster` / `found:live` label fails unless the body also carries
 `Fix pin waiver: <reason>`.
 Assertions about an external API or SDK's shape or auth must be grounded in
@@ -468,6 +574,13 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- worker vs CLI progress block ids -- the Slack progress card and milestone
+  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
+  edit from the turn's answer, can't share code across Python/Rust, so they are
+  frozen together in `tests/vectors/progress-blocks.json`.
+  [vector: `tests/vectors/progress-blocks.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
@@ -479,6 +592,11 @@ as a whole; remembered only):
   cannot share code, so they are frozen together in
   `tests/vectors/approval-ownership.json`.
   [vector: `tests/vectors/approval-ownership.json`]
+- API vs worker approval re-raise refusal code -- the 409 code
+  (`apps/api/src/curie_api/routers/approvals.py`) and the worker's refusal
+  match (`apps/worker/src/curie_worker/approvals.py`) cannot share code, so
+  they are frozen together in `tests/vectors/approval-reraise-refusal.json`.
+  [vector: `tests/vectors/approval-reraise-refusal.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
@@ -492,6 +610,14 @@ as a whole; remembered only):
   cannot share code across Python/Rust, so they are frozen together in
   `tests/vectors/eval-memory-isolation.json`.
   [vector: `tests/vectors/eval-memory-isolation.json`]
+- worker vs API workspace-selection refusal codes -- the 409 `detail.code`
+  values the API's selection router emits
+  (`apps/api/src/curie_api/routers/workspaces.py`) and the worker's prose map
+  (`_SELECTION_REFUSAL_MESSAGES` in `apps/worker/src/curie_worker/workspace.py`)
+  cannot share code because the worker does not import the API package at
+  runtime; the worker maps each code to its own prose and treats an unmapped
+  code as an invalid refusal response (#2684).
+  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
@@ -510,6 +636,24 @@ as a whole; remembered only):
 - CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
 - deploy-time validators vs the runtime loaders that re-parse the same value
   (share normalization code). [convention]
+- worker caller-token minter vs connector proxy verifier -- `mint`
+  (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
+  and the proxy may not import the worker, so both read one frozen corpus; the
+  CLI derives its generated public keys against the same seeds.
+  [vector: `tests/vectors/connector-caller-token.json`]
+- connector proxy refusal vs runner diagnosis -- the proxy's refusal body
+  (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
+  `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
+  ship in different images, so they are frozen together.
+  [vector: `tests/vectors/connector-caller-refusal.json`]
+- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
+  runner control headers and `turn.progress` token scope the worker mints
+  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
+  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
+  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
+  and the worker's pump reads, cross three images, so they are frozen together.
+  [vector: `tests/vectors/turn-progress-capability.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
@@ -707,15 +851,6 @@ and the role is what selects your base.
 | --- | --- |
 | General bug fix, security fix, or change shared by both lines | `main` |
 | Feature for the next feature release, or a bug unique to that unreleased work | `next` |
-
-The GitHub milestone-to-train mapping that CI enforces lives in
-[`tools/fix-pin-ci/milestone-trains.json`](tools/fix-pin-ci/milestone-trains.json).
-Each milestone is explicitly classified there: `patch` entries map to `main`
-and `feature` entries map to `next`. The version number's shape does not select
-the branch independently of that mapping. A pull request that closes an issue
-whose milestone belongs to the other train fails, and a pull request that closes
-a `bug` issue with no milestone fails. The check reuses the existing fix-pin gate
-rather than adding a second workflow.
 
 Create a short lived `task/<short-description>` branch from the selected base:
 

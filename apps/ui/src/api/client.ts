@@ -12,17 +12,21 @@ export interface AppConfig {
 
 // A channel-neutral binding: an agent binds one or more channels (ADR-0118),
 // so the wire carries a list, ordered `(kind, address)` server-side. `kind`
-// selects which address shape applies; `address` is the channel-kind identifier
-// the worker resolves against. Non-Slack reply routing is supplied only on the
-// write shape below.
+// selects which address shape applies; `address` is the channel-kind
+// identifier the worker resolves against; `adapter` names the bot identity the
+// route answers as (ADR-0168 decision 3) -- a Slack binding with no stored
+// identity reads back "default", and a non-Slack binding reads its adapter,
+// or null. Non-Slack reply routing is supplied only on the write shape below.
 export interface ChannelBinding {
   kind: string;
   address: string;
+  adapter?: string | null;
 }
 
 // Reply routing is accepted on writes but deliberately never returned by the
 // API. Keeping the write shape separate prevents a refetch from being mistaken
-// for a source of adapter credentials.
+// for a source of adapter credentials: the identity (`adapter`) comes back on
+// every read; the endpoint never does.
 export interface ChannelBindingWrite extends ChannelBinding {
   endpoint?: string;
   adapter?: string;
@@ -314,6 +318,9 @@ export interface MetricsSummary {
   tokens: number;
   cost_usd: number;
   error_rate: number;
+  // False when a run used a model with no Langfuse price row: cost_usd is then
+  // 0 because the cost is unknown, not because the run was free.
+  cost_known?: boolean;
 }
 
 export interface MetricPoint {
@@ -439,6 +446,100 @@ export async function getAgents(): Promise<AgentOut[]> {
   return jsonOrThrow<AgentOut[]>(resp);
 }
 
+// ---- Work items (#2577): factory outcomes for a GitHub-issue-driven agent ----
+
+export type WorkItemState =
+  | "queued"
+  | "waiting"
+  | "running"
+  | "cancellation_requested"
+  | "cancelled"
+  | "awaiting_approval"
+  | "publishing"
+  | "published"
+  | "failed"
+  | "expired"
+  | "completed_unpublished";
+
+export interface WorkItemPr {
+  number: number;
+  url: string;
+  status: string;
+}
+
+export interface WorkItemPublication {
+  status: string;
+  revision_number: number | null;
+  approval_status: string | null;
+}
+
+// The console never re-derives correctness from the diff; it renders exactly
+// what the API asserts (currently always unasserted, owned by the bundle).
+export interface WorkItemCorrectness {
+  asserted: boolean;
+  owner: string;
+}
+
+export interface WorkItemCi {
+  state: string;
+  reason: string | null;
+  head_sha: string | null;
+  observed_at: string | null;
+}
+
+export interface WorkItemRequest {
+  sequence: number;
+  status: string;
+  created_at: string;
+  wait_deadline: string | null;
+  started_at: string | null;
+  execution_deadline: string | null;
+  terminal_at: string | null;
+  terminal_cause: string | null;
+  termination_observation: string | null;
+  capacity_deferrals: number;
+  last_deferral_reason: string | null;
+}
+
+export interface WorkItemOutcome {
+  id: string;
+  agent_id: string;
+  repo_full_name: string;
+  github_issue_number: number;
+  issue_url: string;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  objective: string | null;
+  objective_truncated: boolean;
+  requester: string | null;
+  state: WorkItemState;
+  actionable_cause: string;
+  pr: WorkItemPr | null;
+  publication: WorkItemPublication | null;
+  correctness: WorkItemCorrectness;
+  // null on the list response; present (possibly null-fielded) on the detail
+  // fetch, since CI status is a per-item lookup the list endpoint skips.
+  ci: WorkItemCi | null;
+  requests: WorkItemRequest[];
+}
+
+export interface WorkItemsList {
+  items: WorkItemOutcome[];
+  limit: number;
+  truncated: boolean;
+}
+
+export async function listWorkItems(params: { agentId?: string } = {}): Promise<WorkItemsList> {
+  const resp = await fetch(url(`/work-items${query({ agent_id: params.agentId })}`), { headers: headers() });
+  return jsonOrThrow<WorkItemsList>(resp);
+}
+
+export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
+  const resp = await fetch(url(`/work-items/${encodeURIComponent(id)}`), { headers: headers() });
+  return jsonOrThrow<WorkItemOutcome>(resp);
+}
+
 // The open /config endpoint (no API key required) carries the configurable
 // org/workspace name the shared chrome renders.
 export async function getConfig(): Promise<AppConfig> {
@@ -472,15 +573,26 @@ export async function updateAgent(
 // Move one surface binding to a new kind/address (ADR-0118). The pair being
 // moved is named by `selector` (its CURRENT kind/address) and rides in the
 // query string, never the body, so it can never be confused with `next`, the
-// replacement value. Reply route fields are write only and omitted here, which
-// tells the API to preserve them. Returns the updated agent.
+// replacement value. `selector.adapter` selects the IDENTITY the pair is
+// bound under (ADR-0168 decision 3) and is sent only when it is not null --
+// omitting it is what keeps this working against an API that predates the
+// ADR and has no such query parameter, and "default" is a real, sendable
+// value equivalent to omitting it. Reply route fields are write only and
+// omitted here, which tells the API to preserve them. Returns the updated
+// agent.
 export async function patchAgentChannel(
   agentId: string,
   selector: ChannelBinding,
   next: ChannelBinding,
 ): Promise<AgentOut> {
   const resp = await fetch(
-    url(`/agents/${agentId}/channels${query({ kind: selector.kind, address: selector.address })}`),
+    url(
+      `/agents/${agentId}/channels${query({
+        kind: selector.kind,
+        address: selector.address,
+        adapter: selector.adapter ?? undefined,
+      })}`,
+    ),
     {
       method: "PATCH",
       headers: headers({ "Content-Type": "application/json" }),
@@ -502,12 +614,22 @@ export async function addAgentSurface(
   return jsonOrThrow<AgentOut>(resp);
 }
 
+// Unbind one surface. `surface.adapter` selects the IDENTITY the pair is
+// bound under (ADR-0168 decision 3), on the same terms as `patchAgentChannel`
+// above: sent only when not null, so this still works against an API that
+// predates the ADR.
 export async function removeAgentSurface(
   agentId: string,
   surface: ChannelBinding,
 ): Promise<void> {
   const resp = await fetch(
-    url(`/agents/${agentId}/channels${query({ kind: surface.kind, address: surface.address })}`),
+    url(
+      `/agents/${agentId}/channels${query({
+        kind: surface.kind,
+        address: surface.address,
+        adapter: surface.adapter ?? undefined,
+      })}`,
+    ),
     { method: "DELETE", headers: headers() },
   );
   if (resp.ok) return;
@@ -801,7 +923,9 @@ export interface ApprovalAudit {
   actor_channel: string | null;
   // Proof attached to the derived actor (ADR-0106). Historical rows retain a
   // null kind and authenticated=false rather than being retroactively trusted.
-  principal_kind: "chat" | "console" | "operator" | null;
+  principal_kind: "chat" | "console" | "operator" | "adapter" | "platform" | null;
+  // The adapter that carried the decision (ADR-0154); null for other kinds.
+  principal_subject: string | null;
   authenticated: boolean;
   decision: string;
   authorizer: string;

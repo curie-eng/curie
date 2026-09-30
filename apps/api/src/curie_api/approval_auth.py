@@ -1,29 +1,53 @@
-"""Authentication boundary for approval resolvers (ADR-0106, #1531)."""
+"""Authentication boundary for approval resolvers (ADR-0106, #1531).
+
+A channel adapter principal (ADR-0154, #2806) is the one resolver credential
+that is not itself the human: it transports a decision on behalf of a sender it
+authenticated at ingress, named in ``X-Curie-Approval-Actor``. The adapter's
+subject is kept beside that actor so the audit row names both.
+"""
 
 from __future__ import annotations
 
 import hmac
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
-from fastapi import Cookie, Depends, Header, HTTPException, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 
-from . import approval_principal, crud
-from .auth import SESSION_COOKIE
+from . import adapter_principal, approval_principal, crud
+from .auth import SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
-#: One definition, not two. Two branches independently spelled this literal --
-#: here for the approval principal, and in `auth` for the dependency that reads
-#: the cookie -- and they agree only by luck. `auth` is the one that verifies it
-#: and imports nothing but `config`, so pointing this at it costs no import
-#: cycle; the reverse would pull `crud` in eagerly and undo the lazy import
-#: `require_api_key` relies on.
+ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
+APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
 CONSOLE_SESSION_COOKIE = SESSION_COOKIE
+_SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
-AuthenticatedPrincipalKind = Literal["chat", "console", "operator"]
+AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter"]
+
+
+def set_console_session_cookie(response: Response, token: str) -> None:
+    """Set the host-only console session cookie.
+
+    ``SameSite=Strict`` stays. It does not stop a same-site cross-origin form,
+    which is why the cookie-only origin check in ``require_approval_principal``
+    exists.
+    """
+
+    response.set_cookie(
+        CONSOLE_SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
 
 
 @dataclass(frozen=True)
@@ -33,6 +57,11 @@ class AuthenticatedApprovalPrincipal:
     subject: str
     kind: AuthenticatedPrincipalKind
     actor_channel: str | None
+    # Set only for kind "adapter": the adapter that transported the decision
+    # (``subject`` is then the sender it authenticated) and the binding rows it
+    # serves, which scope the approvals it may resolve.
+    adapter: str | None = None
+    adapter_bindings: frozenset[uuid.UUID] = frozenset()
 
 
 def _unauthorized(detail: str = "missing or invalid approval principal") -> HTTPException:
@@ -64,28 +93,125 @@ async def authenticate_console_session(
     )
 
 
+def _origin_key(scheme: str, host: str, port: int | None) -> tuple[str, str, int | None] | None:
+    normalized_scheme = scheme.strip().lower()
+    normalized_host = host.strip().lower()
+    if not normalized_scheme or not normalized_host:
+        return None
+    if port == _DEFAULT_ORIGIN_PORTS.get(normalized_scheme):
+        port = None
+    return (normalized_scheme, normalized_host, port)
+
+
+def _origin_from_absolute(value: str) -> tuple[str, str, int | None] | None:
+    raw = value.strip()
+    if not raw or raw == "null":
+        return None
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or parts.hostname is None or parts.hostname == "":
+        return None
+    return _origin_key(parts.scheme, parts.hostname, port)
+
+
+def _expected_console_origin(request: Request) -> tuple[str, str, int | None] | None:
+    # Host comes from the request the API actually received. Forwarded-host
+    # headers are not consulted: the shipped UI proxy does not set them, and a
+    # caller who can set them must not be able to aim the check at their own origin.
+    try:
+        port = request.url.port
+    except ValueError:
+        return None
+    if not request.url.scheme or request.url.hostname is None:
+        return None
+    return _origin_key(request.url.scheme, request.url.hostname, port)
+
+
+def _same_console_host(
+    claimed: tuple[str, str, int | None] | None,
+    expected: tuple[str, str, int | None] | None,
+) -> bool:
+    """True when host and port match.
+
+    Scheme is not compared. The UI proxy connects to the API over HTTP while
+    the browser's Origin uses the external scheme (HTTPS once the console is
+    served securely). A different host is still rejected, which is the
+    same-site sibling this check exists to stop.
+    """
+
+    if claimed is None or expected is None:
+        return False
+    return claimed[1:] == expected[1:]
+
+
+def _claimed_console_origin(request: Request) -> tuple[str, str, int | None] | None:
+    """Origin wins over Referer. A present Origin is never replaced by Referer."""
+
+    if "origin" in request.headers:
+        raw = request.headers["origin"].strip()
+    elif "referer" in request.headers:
+        raw = request.headers["referer"].strip()
+    else:
+        return None
+    if not raw or raw == "null":
+        return None
+    return _origin_from_absolute(raw)
+
+
+def _console_origin_rejected() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="console session origin rejected",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def require_approval_principal(
     approval_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     x_curie_approval_principal: Annotated[
         str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
     ] = None,
     console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
+    x_curie_adapter_principal: Annotated[
+        str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
+    ] = None,
+    x_curie_approval_actor: Annotated[str | None, Header(alias=APPROVAL_ACTOR_HEADER)] = None,
 ) -> AuthenticatedApprovalPrincipal:
     """Authenticate exactly one resolver credential for ``approval_id``.
 
     The platform key is intentionally absent: it administers principal
-    issuance but is not itself a human identity.  A principal header and a
-    console cookie together are ambiguous and fail closed rather than choosing
-    one by precedence.
+    issuance but is not itself a human identity.  Any two of a principal
+    header, a console cookie and an adapter credential together are ambiguous
+    and fail closed rather than choosing one by precedence.
+
+    When the console cookie is the only credential on an unsafe method, the
+    browser origin must match this request before the session is looked up.
+    Header principals are not origin checked.
     """
 
     has_token = x_curie_approval_principal is not None
     has_cookie = console_session is not None
-    if has_token and has_cookie:
+    has_adapter = x_curie_adapter_principal is not None
+    presented = sum((has_token, has_cookie, has_adapter))
+    if presented > 1:
         raise _unauthorized("ambiguous approval principal credentials")
-    if not has_token and not has_cookie:
+    if presented == 0:
         raise _unauthorized()
+
+    if has_cookie and request.method.upper() not in _SAFE_ORIGIN_METHODS:
+        if not _same_console_host(
+            _claimed_console_origin(request), _expected_console_origin(request)
+        ):
+            raise _console_origin_rejected()
+
+    if has_adapter:
+        assert x_curie_adapter_principal is not None
+        return _authenticate_adapter(x_curie_adapter_principal, x_curie_approval_actor)
 
     if has_cookie:
         principal = await authenticate_console_session(session, console_session)
@@ -123,6 +249,88 @@ async def require_approval_principal(
         kind=claims.kind,
         actor_channel=claims.actor_channel,
     )
+
+
+def _authenticate_adapter(token: str, actor: str | None) -> AuthenticatedApprovalPrincipal:
+    """The adapter principal, with the sender it vouches for as the actor.
+
+    The actor is required: an adapter is the transport of a decision, not its
+    author, so a resolution with no named sender has no one to judge. The
+    sender carries no channel evidence, which is why the authorizer admits an
+    adapter only on explicit-user routes.
+    """
+
+    claims = adapter_principal.verify(
+        token, get_settings().api_key, scope=adapter_principal.SCOPE_APPROVALS_RESOLVE
+    )
+    if claims is None or actor is None or not actor.strip():
+        raise _unauthorized()
+    stripped_actor = actor.strip()
+    return AuthenticatedApprovalPrincipal(
+        subject=stripped_actor,
+        kind="adapter",
+        actor_channel=None,
+        adapter=claims.subject,
+        adapter_bindings=claims.bindings,
+    )
+
+
+def platform_key_or_adapter(
+    scope: str,
+) -> Callable[..., Awaitable[adapter_principal.AdapterClaims | None]]:
+    """A dependency accepting the platform key OR an adapter credential with
+    ``scope`` (ADR-0154), returning the adapter's claims or None for the key.
+
+    Exactly one credential: both together are ambiguous and fail closed, as
+    the resolver's credentials do. The platform-key half is ``require_api_key``
+    unchanged, detail string included.
+    """
+
+    async def dependency(
+        request: Request,
+        x_api_key: Annotated[str | None, Header()] = None,
+        x_curie_adapter_principal: Annotated[
+            str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
+        ] = None,
+    ) -> adapter_principal.AdapterClaims | None:
+        if x_curie_adapter_principal is None:
+            await require_api_key(request, x_api_key, None)
+            return None
+        if x_api_key is not None:
+            raise _unauthorized("ambiguous credentials")
+        claims = adapter_principal.verify(
+            x_curie_adapter_principal, get_settings().api_key, scope=scope
+        )
+        if claims is None:
+            raise _unauthorized("missing or invalid adapter principal")
+        return claims
+
+    return dependency
+
+
+async def require_adapter_principal(
+    x_api_key: Annotated[str | None, Header()] = None,
+    x_curie_adapter_principal: Annotated[
+        str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
+    ] = None,
+) -> adapter_principal.AdapterClaims:
+    """The adapter credential alone, for self-rotation. The platform key is not
+    accepted: it issues adapter credentials, it does not renew one. Presenting
+    both together is ambiguous and fails closed, matching the other adapter
+    and resolver dependencies."""
+
+    if x_curie_adapter_principal is None:
+        raise _unauthorized("missing or invalid adapter principal")
+    if x_api_key is not None:
+        raise _unauthorized("ambiguous credentials")
+    claims = adapter_principal.verify(
+        x_curie_adapter_principal,
+        get_settings().api_key,
+        scope=adapter_principal.SCOPE_APPROVALS_READ,
+    )
+    if claims is None:
+        raise _unauthorized("missing or invalid adapter principal")
+    return claims
 
 
 ApprovalPrincipalDep = Annotated[

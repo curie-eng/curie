@@ -5,7 +5,9 @@ throwaway database per run); name and repo_full_name are unique columns, so a
 collision must surface as a caller conflict, not an opaque server error.
 
 An agent's channel binding is the neutral `{kind, address}` object of ADR-0096
-(#1459). Cardinality stopped being 1:1 in ADR-0118 (#1525), which amends
+(#1459); the read side also carries `adapter`, the route's identity, since
+ADR-0168 decision 3. Cardinality stopped being 1:1 in ADR-0118 (#1525), which
+amends
 ADR-0089's "one agent still binds one channel" clause: a create still supplies
 exactly ONE binding through the singular `channel` key, reads carry a
 `channels` LIST ordered by `(kind, address)`, and every binding after the first
@@ -23,6 +25,8 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
+from curie_api.schemas import AgentCreate, AgentUpdate
+from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
@@ -39,9 +43,25 @@ INVALID_REPOSITORIES: list[dict[str, Any]] = REPO_FULL_NAME_CORPUS["invalid"]
 
 
 def _slack(address: str) -> dict[str, str]:
-    """The Slack-kind binding literal, so a shape change lands in one place."""
+    """The Slack-kind binding WRITE literal, so a shape change lands in one place.
+
+    Also valid input to `ApprovalResolutionTarget` (plain `ChannelBinding`,
+    which forbids extra keys), which is why this stays the two-key shape
+    rather than growing `adapter`: see `_slack_out` for the `AgentOut.channels`
+    read shape (approval routes' `resolution`/`notification` read through
+    `ApprovalTargetOut`, which does not carry `adapter` -- `_slack` alone
+    covers those).
+    """
 
     return {"kind": "slack", "address": address}
+
+
+def _slack_out(address: str) -> dict[str, str | None]:
+    """The Slack-kind `AgentOut.channels` READ shape: an omitted write stores
+    and reads back the default identity by name (ADR-0168 decision 3), with no
+    caller restriction by default."""
+
+    return {"kind": "slack", "address": address, "adapter": "default", "allowed_callers": None}
 
 
 def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
@@ -327,54 +347,17 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
         channel={"kind": "webhook", "address": "acme-room-7"},
     )
     assert created.status_code == 201, created.text
-    assert created.json()["channels"] == [{"kind": "webhook", "address": "acme-room-7"}]
+    assert created.json()["channels"] == [
+        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
+    ]
 
     fetched = client.get(f"/agents/{created.json()['id']}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     bindings = fetched.json()["channels"]
     assert isinstance(bindings, list), bindings
-    assert bindings == [{"kind": "webhook", "address": "acme-room-7"}]
-
-
-def test_a_plural_channels_payload_is_rejected(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """CREATE binds exactly one channel, even under ADR-0118.
-
-    Plural bindings arrive through `POST /agents/{id}/channels`, never through
-    the create body: a create that names `channels` is not a partially-honored
-    request, it is a caller describing a shape this endpoint has never had, and
-    accepting it silently would create an agent with no binding at all -- which
-    looks deployed and answers nothing, #38's exact failure mode.
-
-    The guidance is asserted, not just the 422, and it is what changed with
-    ADR-0118: the message must now point at the subresource, because "send the
-    singular key instead" is only half the answer for an operator who genuinely
-    wants two bindings and would otherwise read the 422 as a flat refusal.
-
-    Two payloads, because they fail for different reasons: the first omits the
-    required `channel` entirely, the second sends a list where an object belongs.
-    """
-
-    plural = _create(
-        client,
-        auth_headers,
-        name="plural-agent",
-        channels=[{"kind": "slack", "address": "C0EXAMPLE1"}],
-    )
-    assert plural.status_code == 422, plural.text
-    # The new guidance: not "the plural surface does not exist" (it does now),
-    # but "not on create -- bind one here and add the rest over there".
-    assert "/channels" in plural.text, plural.text
-    assert "channels is not an agent field" in plural.text, plural.text
-
-    listed = _create(
-        client,
-        auth_headers,
-        name="listed-agent",
-        channel=[{"kind": "slack", "address": "C0EXAMPLE2"}],
-    )
-    assert listed.status_code == 422, listed.text
+    assert bindings == [
+        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
+    ]
 
 
 def test_the_slack_address_shape_check_survives_the_rename(
@@ -387,9 +370,11 @@ def test_the_slack_address_shape_check_survives_the_rename(
     forgot to keep Slack's arm re-opens #143 while the status code stays green.
     """
 
-    ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0123ABCD"))
+    ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0EXAMPLE1"))
     assert ok.status_code == 201, ok.text
-    assert ok.json()["channels"] == [{"kind": "slack", "address": "C0123ABCD"}]
+    assert ok.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
+    ]
 
     bad = _create(client, auth_headers, name="slack-bad", channel=_slack("#general"))
     assert bad.status_code == 422, bad.text
@@ -432,7 +417,9 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
         channel={"kind": "email", "address": "C0EXAMPLE1"},
     )
     assert other_kind.status_code == 201, other_kind.text
-    assert other_kind.json()["channels"] == [{"kind": "email", "address": "C0EXAMPLE1"}]
+    assert other_kind.json()["channels"] == [
+        {"kind": "email", "address": "C0EXAMPLE1", "adapter": None, "allowed_callers": None}
+    ]
 
     # And the pair itself is still identity: the SAME pair still conflicts, with
     # the guidance that names the fix (#38's error map), not a bare 500.
@@ -481,7 +468,9 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
         headers=auth_headers,
     )
     assert moved.status_code == 200, moved.text
-    assert moved.json()["channels"] == [{"kind": "webhook", "address": "moved-here"}]
+    assert moved.json()["channels"] == [
+        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
+    ]
 
     # The move REPLACED the binding; the old address is now free for another
     # agent. If the PATCH had appended, this create would collide.
@@ -489,7 +478,9 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
     assert reuse.status_code == 201, reuse.text
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert fetched.json()["channels"] == [{"kind": "webhook", "address": "moved-here"}]
+    assert fetched.json()["channels"] == [
+        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
+    ]
 
 
 def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
@@ -578,7 +569,7 @@ def test_an_explicit_null_channel_is_rejected_on_patch(
         f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
     )
     assert untouched.status_code == 200, untouched.text
-    assert untouched.json()["channels"] == [_slack("C0EXAMPLE1")]
+    assert untouched.json()["channels"] == [_slack_out("C0EXAMPLE1")]
 
 
 def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
@@ -613,8 +604,7 @@ def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
     # And the refusal was total: nothing moved, so a caller cannot read the
     # response as "partially applied" either.
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channels"] == [_slack("C0EXAMPLE1")]
-
+    assert after.json()["channels"] == [_slack_out("C0EXAMPLE1")]
 
 def test_a_singular_channel_patch_is_rejected_not_silently_ignored(
     client: Any, auth_headers: dict[str, str], clean_db: None
@@ -650,32 +640,78 @@ def test_a_singular_channel_patch_is_rejected_not_silently_ignored(
     assert "/channels" in body, body
 
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channels"] == [_slack("C0EXAMPLE1")]
+    assert after.json()["channels"] == [_slack_out("C0EXAMPLE1")]
 
 
-def test_a_legacy_slack_channel_create_is_rejected(
-    client: Any, auth_headers: dict[str, str], clean_db: None
+@pytest.mark.parametrize(
+    ("model", "payload", "guidance"),
+    [
+        # A create naming `channels` omits the required `channel` entirely, and
+        # the refusal must point at the subresource (ADR-0118), not just refuse.
+        pytest.param(
+            AgentCreate,
+            {"name": "plural-agent", "channels": [_slack("C0EXAMPLE1")]},
+            ("/channels", "channels is not an agent field"),
+            id="create-plural-channels",
+        ),
+        # A list where the single binding object belongs.
+        pytest.param(
+            AgentCreate,
+            {"name": "listed-agent", "channel": [_slack("C0EXAMPLE2")]},
+            (),
+            id="create-channel-as-list",
+        ),
+        pytest.param(
+            AgentCreate,
+            {"name": "legacy-create", "slack_channel": "C0EXAMPLE1"},
+            (),
+            id="create-slack-channel-instead",
+        ),
+        # The dangerous one: without the refusal this is a clean create with the
+        # legacy key silently dropped.
+        pytest.param(
+            AgentCreate,
+            {
+                "name": "legacy-both",
+                "channel": _slack("C0EXAMPLE2"),
+                "slack_channel": "C0EXAMPLE3",
+            },
+            (),
+            id="create-slack-channel-alongside",
+        ),
+        # Edge case E1: refused as a retired key rather than as a null, since
+        # there is no default binding a null could clear back to.
+        pytest.param(AgentUpdate, {"channel": None}, (), id="update-null-channel"),
+        pytest.param(AgentUpdate, {"slack_channel": "C0EXAMPLE2"}, (), id="update-slack-channel"),
+        pytest.param(
+            AgentUpdate,
+            {"channel": _slack("C0EXAMPLE2")},
+            ("channel is no longer an agent field", "/channels"),
+            id="update-singular-channel",
+        ),
+    ],
+)
+def test_a_retired_binding_shape_is_rejected_by_the_schema(
+    model: type[AgentCreate] | type[AgentUpdate],
+    payload: dict[str, Any],
+    guidance: tuple[str, ...],
 ) -> None:
-    """Create is fenced identically to PATCH (#143's posture).
+    """Every retired or never-existing binding shape fails validation loudly.
 
-    The second case is the dangerous one and the reason this is not just a
-    missing-required-field test: `channel` present AND `slack_channel` present
-    would otherwise be a clean 201 with the legacy key silently dropped. An
-    operator migrating a manifest half-way gets an agent bound to whichever key
-    the API happened to prefer, with no signal about which one lost.
+    Pydantic's default `extra="ignore"` would parse each of these into a model
+    with the binding silently absent, so a PATCH would return 200 having changed
+    nothing (#38's silent misroute) and a create would bind whichever key won.
+    The refusal lives in the schema's `mode="before"` validators, so it is
+    asserted there; `test_a_singular_channel_patch_is_rejected_not_silently_ignored`
+    proves the API wires it as a 422 that mutates nothing. Where the refusal
+    carries guidance, the guidance is asserted, not just the rejection.
     """
 
-    instead = _create(client, auth_headers, name="legacy-create", slack_channel="C0EXAMPLE1")
-    assert instead.status_code == 422, instead.text
-
-    alongside = _create(
-        client,
-        auth_headers,
-        name="legacy-both",
-        channel=_slack("C0EXAMPLE2"),
-        slack_channel="C0EXAMPLE3",
-    )
-    assert alongside.status_code == 422, alongside.text
+    with pytest.raises(ValidationError) as excinfo:
+        model.model_validate(payload)
+    messages = " ".join(err["msg"] for err in excinfo.value.errors())
+    for fragment in guidance:
+        assert fragment in messages, messages
 
 
 def test_the_published_agent_update_has_no_channel_property_at_all() -> None:
@@ -695,8 +731,9 @@ def test_the_published_agent_update_has_no_channel_property_at_all() -> None:
     that never existed.
 
     A structural assertion on the JSON is the right shape ONLY here, where the
-    published document is itself the deliverable. Everything else in this file
-    asserts through HTTP.
+    published document is itself the deliverable. The schema-validation
+    matrices assert on the request models, each paired with an HTTP test that
+    proves the API wires the model; everything else asserts through HTTP.
     """
 
     schemas = json.loads(OPENAPI.read_text(encoding="utf-8"))["components"]["schemas"]
@@ -755,7 +792,7 @@ def test_the_binding_serializes_on_every_read_endpoint(
 
     created = _create(client, auth_headers, name="reader-a", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
-    assert created.json()["channels"] == [_slack("C0EXAMPLE1")]
+    assert created.json()["channels"] == [_slack_out("C0EXAMPLE1")]
     agent_id = created.json()["id"]
 
     # A second binding, because the plural relationship is a DIFFERENT loading
@@ -769,12 +806,12 @@ def test_the_binding_serializes_on_every_read_endpoint(
     listed = client.get("/agents", headers=auth_headers)
     assert listed.status_code == 200, listed.text
     assert [a["channels"] for a in listed.json()] == [
-        [_slack("C0EXAMPLE1"), _slack("C0EXAMPLE2")]
+        [_slack_out("C0EXAMPLE1"), _slack_out("C0EXAMPLE2")]
     ]
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channels"] == [_slack("C0EXAMPLE1"), _slack("C0EXAMPLE2")]
+    assert fetched.json()["channels"] == [_slack_out("C0EXAMPLE1"), _slack_out("C0EXAMPLE2")]
 
 
 def test_listing_agents_does_not_issue_a_query_per_agent(
@@ -920,104 +957,275 @@ def test_agent_approval_routes_round_trip(
     assert cleared.json()["approval_routes"] is None
 
 
+_ROUTE_AGENT: dict[str, Any] = {"name": "routed-agent", "channel": _slack("C0EXAMPLE0")}
+
+
+def _managers(binding: dict[str, Any]) -> dict[str, Any]:
+    return {"managers": binding}
+
+
+def _with_approvers(approvers: dict[str, Any]) -> dict[str, Any]:
+    return _managers({"resolution": _slack("C0EXAMPLE1"), "approvers": approvers})
+
+
 @pytest.mark.parametrize(
-    ("case", "binding", "reason"),
+    ("model", "routes", "reason"),
     [
-        ("missing-resolution", {}, "field required"),
-        ("retired-channel", {"channel": "C0EXAMPLE1"}, "extra inputs are not permitted"),
-        (
-            "non-slack-resolution",
-            {"resolution": {"kind": "email", "address": "human@example.com"}},
+        # Authority/transport violations, each with its reason.
+        pytest.param(AgentCreate, _managers({}), "field required", id="create-missing-resolution"),
+        pytest.param(
+            AgentCreate,
+            _managers({"channel": "C0EXAMPLE1"}),
+            "extra inputs are not permitted",
+            id="create-retired-channel",
+        ),
+        pytest.param(
+            AgentCreate,
+            _managers({"resolution": {"kind": "email", "address": "human@example.com"}}),
             "input should be 'slack'",
+            id="create-non-slack-resolution",
         ),
-        (
-            "notification-without-transport",
-            {
-                "resolution": _slack("C0EXAMPLE1"),
-                "notification": {"kind": "email", "address": "human@example.com"},
-            },
+        pytest.param(
+            AgentCreate,
+            _managers(
+                {
+                    "resolution": _slack("C0EXAMPLE1"),
+                    "notification": {"kind": "email", "address": "human@example.com"},
+                }
+            ),
             "requires both endpoint and adapter",
+            id="create-notification-without-transport",
         ),
-        (
-            "notification-without-adapter",
-            {
-                "resolution": _slack("C0EXAMPLE1"),
-                "notification": {
-                    "kind": "email",
-                    "address": "human@example.com",
-                    "endpoint": "https://adapter.example.com/replies",
-                },
-            },
+        pytest.param(
+            AgentCreate,
+            _managers(
+                {
+                    "resolution": _slack("C0EXAMPLE1"),
+                    "notification": {
+                        "kind": "email",
+                        "address": "human@example.com",
+                        "endpoint": "https://adapter.example.com/replies",
+                    },
+                }
+            ),
             "half-configured",
+            id="create-notification-without-adapter",
         ),
-        (
-            "notification-without-endpoint",
-            {
-                "resolution": _slack("C0EXAMPLE1"),
-                "notification": {
-                    "kind": "email",
-                    "address": "human@example.com",
-                    "adapter": "mail",
-                },
-            },
+        pytest.param(
+            AgentCreate,
+            _managers(
+                {
+                    "resolution": _slack("C0EXAMPLE1"),
+                    "notification": {
+                        "kind": "email",
+                        "address": "human@example.com",
+                        "adapter": "mail",
+                    },
+                }
+            ),
             "half-configured",
+            id="create-notification-without-endpoint",
         ),
-        (
-            "duplicate-target",
-            {
-                "resolution": _slack("C0EXAMPLE1"),
-                "notification": _slack("C0EXAMPLE1"),
-            },
+        pytest.param(
+            AgentCreate,
+            _managers({"resolution": _slack("C0EXAMPLE1"), "notification": _slack("C0EXAMPLE1")}),
             "approval notification must differ",
+            id="create-duplicate-target",
+        ),
+        # The migration-only cutover stays fail closed on PATCH as well.
+        pytest.param(AgentUpdate, _managers({}), "field required", id="update-missing-resolution"),
+        pytest.param(
+            AgentUpdate,
+            _managers({"channel": "C0EXAMPLE1"}),
+            "extra inputs are not permitted",
+            id="update-retired-channel",
+        ),
+        # A resolution target must carry a Slack channel ID, not a #name; route
+        # names must be non-empty.
+        pytest.param(
+            AgentCreate,
+            _managers({"resolution": _slack("#managers")}),
+            None,
+            id="create-resolution-channel-name",
+        ),
+        pytest.param(
+            AgentCreate,
+            {" ": {"resolution": _slack("C0EXAMPLE1")}},
+            None,
+            id="create-blank-route-name",
+        ),
+        # #420: every way an approvers block can be meaningless. `{}` restricts
+        # nothing; `users: []` would mean "nobody may approve", which as silent
+        # config could only ever expire; a @handle or bare name never resolves
+        # (#143); and a C-prefixed channel ID is not a usergroup ID.
+        pytest.param(AgentCreate, _with_approvers({}), None, id="create-approvers-empty"),
+        pytest.param(
+            AgentCreate, _with_approvers({"users": []}), None, id="create-approvers-users-empty"
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"group": "@managers"}),
+            None,
+            id="create-approvers-group-handle",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"group": "managers"}),
+            None,
+            id="create-approvers-group-name",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"group": "C000000C9"}),
+            None,
+            id="create-approvers-group-channel-id",
+        ),
+        pytest.param(
+            AgentCreate, _with_approvers({"group": ""}), None, id="create-approvers-group-blank"
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"users": ["not-a-user"]}),
+            None,
+            id="create-approvers-users-name",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"users": ["@brian"]}),
+            None,
+            id="create-approvers-users-handle",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"users": ["U000000U3", "nope"]}),
+            None,
+            id="create-approvers-users-one-bad",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"users": [""]}),
+            None,
+            id="create-approvers-users-blank",
+        ),
+        # A typo in an optional key is a rejection, not a silently narrower-looking
+        # binding: an ignored key falls the route back to channel membership and
+        # widens the approver set the operator meant to narrow.
+        pytest.param(
+            AgentCreate,
+            _managers({"resolution": _slack("C0EXAMPLE1"), "approver": {"users": ["U000000U1"]}}),
+            None,
+            id="create-unknown-key-approver",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"user": ["U000000U1"]}),
+            None,
+            id="create-unknown-key-approvers-user",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"groups": "S000000G1"}),
+            None,
+            id="create-unknown-key-approvers-groups",
+        ),
+        pytest.param(
+            AgentCreate,
+            _with_approvers({"users": ["U000000U1"], "unknown": "x"}),
+            None,
+            id="create-unknown-key-approvers-extra",
+        ),
+        pytest.param(
+            AgentCreate,
+            _managers({"resolution": {"kind": "slack", "address": "C0EXAMPLE1", "unknown": "x"}}),
+            None,
+            id="create-unknown-key-resolution",
+        ),
+        pytest.param(
+            AgentCreate,
+            _managers(
+                {
+                    "resolution": _slack("C0EXAMPLE1"),
+                    "notification": {
+                        "kind": "slack",
+                        "address": "C0EXAMPLE2",
+                        "interaction": "confirm",
+                    },
+                }
+            ),
+            None,
+            id="create-unknown-key-notification",
+        ),
+        # #143's posture: create and PATCH validate identically.
+        pytest.param(
+            AgentUpdate,
+            _managers({"resolution": _slack("C0EXAMPLE1"), "approver": {"users": ["U000000U1"]}}),
+            None,
+            id="update-unknown-key-approver",
+        ),
+        pytest.param(
+            AgentUpdate,
+            _with_approvers({"users": ["U000000U1"], "extra": 1}),
+            None,
+            id="update-unknown-key-approvers-extra",
+        ),
+        pytest.param(
+            AgentUpdate,
+            _with_approvers({"users": []}),
+            None,
+            id="update-approvers-users-empty",
         ),
     ],
 )
-def test_approval_route_create_rejects_invalid_split_bindings(
-    case: str,
-    binding: dict[str, Any],
-    reason: str,
-    client: Any,
-    auth_headers: dict[str, str],
-    clean_db: None,
+def test_an_invalid_approval_route_is_rejected_by_the_schema(
+    model: type[AgentCreate] | type[AgentUpdate],
+    routes: dict[str, Any],
+    reason: str | None,
 ) -> None:
-    """Every authority/transport violation is a reasoned 422 at the write gate."""
+    """Every invalid route binding fails validation, with its reason where one
+    is pinned, and the failure is attributed to `approval_routes` rather than
+    to some other field of the payload."""
 
-    response = client.post(
+    payload = {"approval_routes": routes}
+    if model is AgentCreate:
+        payload = {**_ROUTE_AGENT, **payload}
+    with pytest.raises(ValidationError) as excinfo:
+        model.model_validate(payload)
+    errors = excinfo.value.errors()
+    assert all(err["loc"][0] == "approval_routes" for err in errors), errors
+    if reason is not None:
+        messages = " ".join(err["msg"] for err in errors).lower()
+        assert reason in messages, messages
+
+
+def test_approval_route_validation_is_wired_on_create_and_patch(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The schema matrix above only counts if the API validates through it, so
+    one case per write verb is driven through HTTP and must be a reasoned 422."""
+
+    created = client.post(
         "/agents",
         json={
-            "name": f"invalid-route-{case}",
+            "name": "invalid-route-duplicate-target",
             "channel": _slack("C0EXAMPLE0"),
-            "approval_routes": {"managers": binding},
+            "approval_routes": _managers(
+                {"resolution": _slack("C0EXAMPLE1"), "notification": _slack("C0EXAMPLE1")}
+            ),
         },
         headers=auth_headers,
     )
-    assert response.status_code == 422, f"{binding!r} was accepted: {response.text}"
-    assert reason in response.text.lower(), response.text
+    assert created.status_code == 422, created.text
+    assert "approval notification must differ" in created.text.lower(), created.text
 
-
-def test_approval_route_patch_rejects_missing_or_retired_resolution(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """The migration-only cutover remains fail closed on PATCH as well as create."""
-
-    seed = _create(
-        client,
-        auth_headers,
-        name="strict-route-patch",
-        channel=_slack("C0EXAMPLE0"),
-    )
+    seed = _create(client, auth_headers, name="strict-route-patch", channel=_slack("C0EXAMPLE0"))
     assert seed.status_code == 201, seed.text
-    for binding, reason in (
-        ({}, "field required"),
-        ({"channel": "C0EXAMPLE1"}, "extra inputs are not permitted"),
-    ):
-        patched = client.patch(
-            f"/agents/{seed.json()['id']}",
-            json={"approval_routes": {"managers": binding}},
-            headers=auth_headers,
-        )
-        assert patched.status_code == 422, f"{binding!r} was accepted: {patched.text}"
-        assert reason in patched.text.lower(), patched.text
+    patched = client.patch(
+        f"/agents/{seed.json()['id']}",
+        json={"approval_routes": _managers({})},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 422, patched.text
+    assert "field required" in patched.text.lower(), patched.text
 
 
 def test_nested_notification_nulls_are_not_persisted(
@@ -1141,27 +1349,6 @@ def test_malformed_stored_route_addresses_remain_readable_for_repair(
     assert listed_agent["approval_routes"] == public_routes
 
 
-def test_agent_approval_routes_rejects_bad_bindings(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    # A resolution target must carry a Slack channel ID, not a #name; route
-    # names must be non-empty.
-    for routes in (
-        {"managers": {"resolution": _slack("#managers")}},
-        {" ": {"resolution": _slack("C0EXAMPLE1")}},
-    ):
-        resp = client.post(
-            "/agents",
-            json={
-                "name": f"bad-routes-{list(routes)[0].strip() or 'blank'}",
-                "channel": {"kind": "slack", "address": "C000000R05"},
-                "approval_routes": routes,
-            },
-            headers=auth_headers,
-        )
-        assert resp.status_code == 422, resp.text
-
-
 # --- #420: the approvers block on a route binding ------------------------------
 #
 # `approvers` is the WHO, sitting alongside the binding's `resolution` (the WHERE).
@@ -1255,161 +1442,6 @@ def test_agent_approval_routes_accepts_both_users_and_group(
         "group": "S000000G2",
         "users": ["U000000U2"],
     }
-
-
-def test_agent_approval_routes_rejects_bad_approvers(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """Every way an approvers block can be meaningless is a clear 422 on write,
-    never a silently-unenforceable binding:
-
-    - `{}`: declares an approvers block that restricts nothing.
-    - `users: []`: neither "unset" (omit the key) nor "nobody may approve" --
-      the latter as silent config is a footgun, since the approval could then
-      only ever expire.
-    - a `@handle` or bare name where an ID belongs: never resolves (#143).
-    - a channel ID where a usergroup ID belongs: the S-prefix is the whole
-      distinction, and a C-prefixed value would look plausible in a config file.
-    """
-
-    bad_approvers = [
-        {},
-        {"users": []},
-        {"group": "@managers"},
-        {"group": "managers"},
-        {"group": "C000000C9"},
-        {"group": ""},
-        {"users": ["not-a-user"]},
-        {"users": ["@brian"]},
-        {"users": ["U000000U3", "nope"]},
-        {"users": [""]},
-    ]
-    for index, approvers in enumerate(bad_approvers):
-        resp = client.post(
-            "/agents",
-            json={
-                "name": f"bad-approvers-{index}",
-                "channel": {"kind": "slack", "address": "C000000C01"},
-                "approval_routes": {
-                    "managers": {
-                        "resolution": _slack("C0EXAMPLE1"),
-                        "approvers": approvers,
-                    }
-                },
-            },
-            headers=auth_headers,
-        )
-        assert resp.status_code == 422, f"{approvers!r} was accepted: {resp.text}"
-
-
-def test_agent_approval_routes_rejects_unknown_keys(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """A typo in an optional key is a 422, not a silently narrower-looking
-    binding.
-
-    Ignoring the extra key is the one config error the fail-closed doctrine
-    would otherwise miss: nothing was "declared", so the route falls back to
-    channel membership and every member of the (deliberately broad) card channel
-    becomes an approver, while the operator believes they narrowed authority to
-    the users they listed.
-    """
-
-    bad_bindings = [
-        # `approver`, missing the `s`: the whole approvers block disappears.
-        {"resolution": _slack("C0EXAMPLE1"), "approver": {"users": ["U000000U1"]}},
-        # A typo inside the approvers block: `user` instead of `users` leaves a
-        # group-only spec, or nothing at all.
-        {"resolution": _slack("C0EXAMPLE1"), "approvers": {"user": ["U000000U1"]}},
-        {"resolution": _slack("C0EXAMPLE1"), "approvers": {"groups": "S000000G1"}},
-        {
-            "resolution": _slack("C0EXAMPLE1"),
-            "approvers": {"users": ["U000000U1"], "unknown": "x"},
-        },
-        {
-            "resolution": {
-                "kind": "slack",
-                "address": "C0EXAMPLE1",
-                "unknown": "x",
-            }
-        },
-        {
-            "resolution": _slack("C0EXAMPLE1"),
-            "notification": {
-                "kind": "slack",
-                "address": "C0EXAMPLE2",
-                "interaction": "confirm",
-            },
-        },
-    ]
-    for index, binding in enumerate(bad_bindings):
-        resp = client.post(
-            "/agents",
-            json={
-                "name": f"unknown-key-{index}",
-                "channel": {"kind": "slack", "address": "C000000E01"},
-                "approval_routes": {"managers": binding},
-            },
-            headers=auth_headers,
-        )
-        assert resp.status_code == 422, f"{binding!r} was accepted: {resp.text}"
-
-
-def test_agent_approval_routes_patch_rejects_unknown_keys(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """#143's posture: create and PATCH validate identically, so a typo'd key
-    cannot be smuggled in through the update path either."""
-
-    created = client.post(
-        "/agents",
-        json={"name": "patch-unknown-key-agent", "channel": _slack("C000000F01")},
-        headers=auth_headers,
-    )
-    assert created.status_code == 201, created.text
-    agent_id = created.json()["id"]
-
-    for binding in (
-        {"resolution": _slack("C0EXAMPLE1"), "approver": {"users": ["U000000U1"]}},
-        {
-            "resolution": _slack("C0EXAMPLE1"),
-            "approvers": {"users": ["U000000U1"], "extra": 1},
-        },
-    ):
-        patched = client.patch(
-            f"/agents/{agent_id}",
-            json={"approval_routes": {"managers": binding}},
-            headers=auth_headers,
-        )
-        assert patched.status_code == 422, f"{binding!r} was accepted: {patched.text}"
-
-
-def test_agent_approval_routes_patch_rejects_bad_approvers(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """#143's posture: create and PATCH validate identically, so a bad binding
-    cannot be smuggled in through the update path."""
-
-    created = client.post(
-        "/agents",
-        json={"name": "patch-approvers-agent", "channel": _slack("C000000D01")},
-        headers=auth_headers,
-    )
-    assert created.status_code == 201, created.text
-
-    patched = client.patch(
-        f"/agents/{created.json()['id']}",
-        json={
-            "approval_routes": {
-                "managers": {
-                    "resolution": _slack("C0EXAMPLE1"),
-                    "approvers": {"users": []},
-                }
-            }
-        },
-        headers=auth_headers,
-    )
-    assert patched.status_code == 422, patched.text
 
 
 def test_agent_secrets_round_trip_exposes_names_only(
@@ -1617,3 +1649,23 @@ def test_an_agent_name_that_only_looks_like_the_join_still_creates(
     ok = _create(client, auth_headers, name=name, channel=_slack("C0EXAMPLE2"))
     assert ok.status_code == 201, ok.text
     assert ok.json()["name"] == name
+
+
+# --- `self` is reserved as an agent name (ADR-0168 decision 7) --------------
+#
+# `admits` uses the reserved entry `self` to mean the agent a bundle is
+# deployed as, and both other name-shape gates already refuse a target
+# genuinely named that: `deploy.yaml`'s `target.agent`
+# (`deploy.bad_agent_name`) and the CLI's per-agent secret binding. `POST
+# /agents` is the remaining hole -- `AgentCreate.name` reached the database
+# with no check for the sentinel -- and it is the same write seam #1446 closed
+# for the `-mcp-` join.
+
+
+def test_agent_name_self_is_422(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    bad = _create(client, auth_headers, name="self", channel=_slack("C0EXAMPLE3"))
+    assert bad.status_code == 422, bad.text
+    assert any("name" in err["loc"] for err in bad.json()["detail"]), bad.text
+    assert "reserved" in bad.text, bad.text

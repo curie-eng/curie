@@ -10,7 +10,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -23,6 +23,9 @@ from curie_api.routers.state import (
     _namespace_lock_key,
 )
 from curie_api.sandbox_token import mint
+from curie_telemetry import build_resource, configure_meter_provider
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import make_url
 from sqlalchemy.exc import IntegrityError
 
@@ -31,15 +34,61 @@ _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
 _PAST = 1000000000  # 2001, expired at test time
 
 
-def _agent(client: Any, headers: dict[str, str]) -> str:
+def _agent(
+    client: Any,
+    headers: dict[str, str],
+    *,
+    address: str = "C000000S01",
+    name: str = "state-agent",
+) -> str:
     resp = client.post(
         "/agents",
-        json={"name": "state-agent", "channel": {"kind": "slack", "address": "C000000S01"}},
+        json={"name": name, "channel": {"kind": "slack", "address": address}},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
     agent_id: str = resp.json()["id"]
     return agent_id
+
+
+@pytest.fixture
+def history_failure_metrics(
+    client: Any,
+) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-capacity-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _history_failure_points(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> list[tuple[int, dict[str, str]]]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    assert data is not None
+    return [
+        (int(point.value), dict(point.attributes))
+        for resource_metrics in data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        if metric.name == "curie.history.persistence.failure"
+        for point in metric.data.data_points
+    ]
 
 
 def test_state_router_accepts_a_scoped_token_for_the_path_agent(
@@ -172,6 +221,36 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
             == 403
         )
         assert client.delete(f"/agents/{aid}/state/{ns}/k", headers=headers).status_code == 403
+
+
+def test_app_scoped_token_is_refused_on_binding_scoped_memory(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #1461: channel memory lives at /state/bindings/<kind>/<address>/memory and
+    # holds facts the prompt treats as remembered. The bundle's narrow state.app
+    # token must be fenced off it exactly as off agent memory, on every verb,
+    # while the broad state token (the runner's memory token) still reaches it.
+    aid = _agent(client, auth_headers)
+    app = mint(get_settings().api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
+    broad = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE)
+    base = f"/agents/{aid}/state/bindings/slack/C000000S01/memory"
+    fact = f"{base}/fact-{'a' * 32}"
+    headers = {"X-API-Key": app}
+
+    put = client.put(fact, json={"value": {"statement": "x"}}, headers=headers)
+    assert put.status_code == 403, put.text
+    assert "reserved" in put.text
+    assert client.get(fact, headers=headers).status_code == 403
+    assert client.get(base, headers=headers).status_code == 403
+    assert (
+        client.post(f"{base}/log/append", json={"item": 1}, headers=headers).status_code
+        == 403
+    )
+    assert client.delete(fact, headers=headers).status_code == 403
+
+    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": broad})
+    assert ok.status_code == 200, ok.text
+    assert client.get(fact, headers={"X-API-Key": broad}).status_code == 200
 
 
 def test_namespace_enumeration_hides_reserved_from_the_app_token(
@@ -412,6 +491,239 @@ def test_namespace_over_the_per_namespace_cap_is_rejected(
         # Second key pushes the namespace total (~116 bytes) over the 100 cap.
         b = client.put(f"{base}/b", json={"value": {"s": "x" * 50}}, headers=auth_headers)
         assert b.status_code == 413, b.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_transcript_get_advertises_configured_cap_even_when_key_is_missing(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/factory-3211"
+    settings = get_settings()
+    settings.transcript_max_thread_bytes = 128 * 1024
+    try:
+        missing = client.get(url, headers=auth_headers)
+        assert missing.status_code == 404, missing.text
+        assert missing.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+
+        scoped_url = (
+            f"/agents/{aid}/state/bindings/slack/C000000S01/transcript/factory-3211"
+        )
+        scoped_missing = client.get(scoped_url, headers=auth_headers)
+        assert scoped_missing.status_code == 404, scoped_missing.text
+        assert scoped_missing.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+
+        created = client.post(
+            f"{url}/append", json={"item": {"user": "issue", "assistant": "done"}},
+            headers=auth_headers,
+        )
+        assert created.status_code == 200, created.text
+        present = client.get(url, headers=auth_headers)
+        assert present.status_code == 200, present.text
+        assert present.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+        assert present.json()["value"] == [{"user": "issue", "assistant": "done"}]
+
+        scoped_created = client.post(
+            f"{scoped_url}/append",
+            json={"item": {"user": "scoped issue", "assistant": "scoped answer"}},
+            headers=auth_headers,
+        )
+        assert scoped_created.status_code == 200, scoped_created.text
+        scoped_present = client.get(scoped_url, headers=auth_headers)
+        assert scoped_present.status_code == 200, scoped_present.text
+        assert scoped_present.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+        assert scoped_present.json()["value"] == [
+            {"user": "scoped issue", "assistant": "scoped answer"}
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_transcript_value_cap_records_once_without_mutating_the_log(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-value/append"
+    seed = {"kind": "message", "text": "seed"}
+    settings = get_settings()
+    settings.transcript_max_thread_bytes = _json_size([seed])
+    try:
+        initial = client.post(url, json={"item": seed}, headers=auth_headers)
+        assert initial.status_code == 200, initial.text
+
+        refused = client.post(
+            url,
+            json={"item": {"kind": "message", "text": "x" * 200}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+
+        stored = client.get(url.removesuffix("/append"), headers=auth_headers)
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["value"] == [seed]
+        assert stored.json()["version"] == initial.json()["version"]
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_many_threads_for_one_agent_all_persist_and_resume_past_the_old_namespace_cap(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """ADR-0170 (#3070): transcripts are capped per thread, never per agent.
+
+    Before the move every thread shared the agent's 1 MiB transcript namespace,
+    so a factory agent failed every new run once about 30 issues filled it. Here
+    one agent writes threads whose total is well past that old cap, each close to
+    its own per-thread cap, and every thread still appends and reads back.
+    """
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    thread_cap = settings.transcript_max_thread_bytes
+    old_namespace_cap = settings.state_max_namespace_bytes
+    turn = {"role": "assistant", "content": "x" * (thread_cap // 4)}
+    threads = [f"issue-{n}" for n in range(24)]
+
+    written: dict[str, Any] = {}
+    for thread in threads:
+        url = f"/agents/{aid}/state/transcript/{thread}"
+        for _ in range(3):
+            appended = client.post(f"{url}/append", json={"item": turn}, headers=auth_headers)
+            assert appended.status_code == 200, appended.text
+        written[thread] = appended.json()["value"]
+
+    total = sum(_json_size(value) for value in written.values())
+    assert total > old_namespace_cap, (total, old_namespace_cap)
+    for thread, value in written.items():
+        url = f"/agents/{aid}/state/transcript/{thread}"
+        resumed = client.get(url, headers=auth_headers)
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["value"] == value
+        assert resumed.json()["version"] == 3
+    # No thread lives in the capped state store any more.
+    listed = client.get(f"/agents/{aid}/state/transcript", headers=auth_headers).json()
+    assert {row["key"] for row in listed} == set(threads)
+    assert _history_failure_points(history_failure_metrics) == []
+
+
+def test_one_thread_over_its_cap_is_refused_without_touching_its_siblings(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    settings.transcript_max_thread_bytes = 200
+    base = f"/agents/{aid}/state/transcript"
+    try:
+        sibling = client.post(
+            f"{base}/thread-sibling/append",
+            json={"item": {"text": "s" * 100}},
+            headers=auth_headers,
+        )
+        assert sibling.status_code == 200, sibling.text
+        runaway = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"text": "r" * 100}},
+            headers=auth_headers,
+        )
+        assert runaway.status_code == 200, runaway.text
+        refused = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"text": "r" * 100}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        assert "per-thread" in refused.json()["detail"]
+        grown = client.post(
+            f"{base}/thread-new/append",
+            json={"item": {"text": "n" * 100}},
+            headers=auth_headers,
+        )
+        assert grown.status_code == 200, grown.text
+        assert client.get(f"{base}/thread-sibling", headers=auth_headers).json()[
+            "value"
+        ] == sibling.json()["value"]
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_expired_idle_transcript_reads_as_absent_and_is_swept(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """ADR-0170: a thread with no WorkItem expires after its idle window."""
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/transcript"
+    settings = get_settings()
+    settings.transcript_idle_ttl_seconds = 0
+    try:
+        stale = client.post(
+            f"{base}/thread-idle/append", json={"item": {"text": "old"}}, headers=auth_headers
+        )
+        assert stale.status_code == 200, stale.text
+    finally:
+        get_settings.cache_clear()
+    assert client.get(f"{base}/thread-idle", headers=auth_headers).status_code == 404
+    assert client.get(base, headers=auth_headers).json() == []
+
+    fresh = client.post(
+        f"{base}/thread-live/append", json={"item": {"text": "new"}}, headers=auth_headers
+    )
+    assert fresh.status_code == 200, fresh.text
+    restarted = client.post(
+        f"{base}/thread-idle/append", json={"item": {"text": "again"}}, headers=auth_headers
+    )
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["value"] == [{"text": "again"}]
+    assert restarted.json()["version"] == 1
+
+
+def test_non_transcript_capacity_refusal_records_no_history_failure(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    settings.state_max_value_bytes = 10
+    try:
+        refused = client.post(
+            f"/agents/{aid}/state/audit/log/append",
+            json={"item": {"text": "x" * 100}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        assert _history_failure_points(history_failure_metrics) == []
     finally:
         get_settings.cache_clear()
 
@@ -1206,6 +1518,141 @@ def test_binding_scoped_route_404s_for_a_pair_that_is_not_this_agents(
     assert "binding" in resp.text.lower()
 
 
+_TWO_IDENTITIES = json.dumps(
+    [
+        {
+            "name": "default",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "signing_secret_env": "SLACK_SIGNING_SECRET",
+        },
+        {
+            "name": "second",
+            "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+            "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+            "signing_secret_env": None,
+        },
+    ]
+)
+
+
+@pytest.fixture
+def seed_named_identity_binding(
+    client: Any, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[str, str, str], None]]:
+    """Bind a Slack channel under a named identity through the API (ADR-0168
+    decision 3)."""
+
+    monkeypatch.setenv("CURIE_SLACK_IDENTITIES", _TWO_IDENTITIES)
+    get_settings.cache_clear()
+
+    def _seed(agent_id: str, address: str, adapter: str) -> None:
+        resp = client.post(
+            f"/agents/{agent_id}/channels",
+            json={"kind": "slack", "address": address, "adapter": adapter},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    yield _seed
+    get_settings.cache_clear()
+
+
+def test_binding_scoped_state_reaches_a_binding_held_only_under_a_named_identity(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """An agent's rows on one pair share one binding-state scope whichever
+    identity holds them. Before this, `_binding_scope` resolved the pair
+    through the default identity alone (#3147), so an agent bound on a pair
+    ONLY under a named identity got a 404 from every one of its own
+    `/state/bindings/...` routes."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE10")
+    seed_named_identity_binding(aid, "C0EXAMPLE11", "second")
+
+    url = f"/agents/{aid}/state/bindings/slack/C0EXAMPLE11/ns/k"
+    put = client.put(url, json={"value": "named-identity"}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+    got = client.get(url, headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["value"] == "named-identity"
+
+
+def test_binding_scoped_route_admits_this_agent_regardless_of_row_order(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Distinguishes a check that names an arbitrary holder of the pair from
+    one that asks whether THIS agent holds a row on it. Agent B holds the
+    pair under the default identity, inserted FIRST; agent A holds the SAME
+    pair under a named identity, inserted second. A picking the pair's first
+    row would answer B for A's own request, so both agents must reach their
+    own binding state, regardless of which was inserted first."""
+    address = "C0EXAMPLE20"
+    b = _agent(client, auth_headers, address=address, name="agent-b-default")
+    a = _agent(client, auth_headers, address="C0EXAMPLE21", name="agent-a-named")
+    seed_named_identity_binding(a, address, "second")
+
+    a_url = f"/agents/{a}/state/bindings/slack/{address}/ns/k"
+    put_a = client.put(a_url, json={"value": "agent-a"}, headers=auth_headers)
+    assert put_a.status_code == 200, put_a.text
+    got_a = client.get(a_url, headers=auth_headers)
+    assert got_a.status_code == 200, got_a.text
+    assert got_a.json()["value"] == "agent-a"
+
+    b_url = f"/agents/{b}/state/bindings/slack/{address}/ns/k"
+    put_b = client.put(b_url, json={"value": "agent-b"}, headers=auth_headers)
+    assert put_b.status_code == 200, put_b.text
+    got_b = client.get(b_url, headers=auth_headers)
+    assert got_b.status_code == 200, got_b.text
+    assert got_b.json()["value"] == "agent-b"
+
+
+def test_binding_scoped_route_404s_when_this_agents_binding_on_the_address_is_a_different_kind(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Widening the check to any identity must not widen it to any kind: a
+    kind-blind existence check would let this agent's binding under a
+    DIFFERENT kind admit a Slack query for the same address string."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE12")
+    other_kind = client.post(
+        f"/agents/{aid}/channels",
+        json={"kind": "webhook", "address": "C0EXAMPLE13"},
+        headers=auth_headers,
+    )
+    assert other_kind.status_code == 201, other_kind.text
+
+    resp = client.get(
+        f"/agents/{aid}/state/bindings/slack/C0EXAMPLE13/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+def test_binding_scoped_route_404s_when_only_another_agent_holds_the_pair(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Widening the check across identities must not widen it across agents
+    -- another agent's binding on this pair, held under a named identity,
+    still does not admit a different agent."""
+    owner = _agent(client, auth_headers, address="C0EXAMPLE14", name="pair-owner")
+    seed_named_identity_binding(owner, "C0EXAMPLE15", "second")
+
+    other = _agent(client, auth_headers, address="C0EXAMPLE16", name="not-the-owner")
+    resp = client.get(
+        f"/agents/{other}/state/bindings/slack/C0EXAMPLE15/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
 def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_route(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -1222,3 +1669,370 @@ def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_r
     put = client.put(url, json={"value": {"n": 1}}, headers=headers)
     assert put.status_code == 200, put.text
     assert client.get(url, headers=headers).json()["value"] == {"n": 1}
+
+
+def test_value_cap_refusal_names_the_key_over_the_limit(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: a transcript key is a thread key, so naming the key names the
+    # thread an operator must recover.
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    settings.transcript_max_thread_bytes = 50
+    try:
+        refused = client.post(
+            f"/agents/{aid}/state/transcript/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "x" * 200}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        assert "'thread-runaway'" in refused.json()["detail"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_namespace_cap_refusal_names_the_largest_thread_not_the_caller(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: one runaway key fills a namespace and a small sibling's append is
+    # refused. The refusal must name the runaway key, which is the one to export
+    # and delete, not only the caller. Transcripts no longer share a namespace
+    # (ADR-0170), so this now guards general state.
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/audit"
+    settings = get_settings()
+    settings.state_max_value_bytes = 10_000
+    settings.state_max_namespace_bytes = 400
+    try:
+        runaway = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "r" * 300}},
+            headers=auth_headers,
+        )
+        assert runaway.status_code == 200, runaway.text
+        small = client.post(
+            f"{base}/thread-small/append",
+            json={"item": {"kind": "message", "text": "s" * 20}},
+            headers=auth_headers,
+        )
+        assert small.status_code == 200, small.text
+
+        refused = client.post(
+            f"{base}/thread-small/append",
+            json={"item": {"kind": "message", "text": "s" * 80}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        detail = refused.json()["detail"]
+        assert "'thread-runaway'" in detail
+        assert "largest key" in detail
+
+        # Negative control: when the caller's own key is the largest, the
+        # refusal names the caller rather than an innocent sibling.
+        refused_self = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "r" * 80}},
+            headers=auth_headers,
+        )
+        assert refused_self.status_code == 413, refused_self.text
+        assert "largest key 'thread-runaway'" in refused_self.json()["detail"]
+        assert "'thread-small'" not in refused_self.json()["detail"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_delete_with_expected_version_refuses_a_row_that_moved(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: the documented capacity recovery exports a transcript, then
+    # deletes it. A DELETE carrying the exported version must refuse when a
+    # turn appended in between, so the recovery never destroys history it did
+    # not export.
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-recover"
+    first = client.post(
+        f"{url}/append", json={"item": {"kind": "message", "text": "one"}},
+        headers=auth_headers,
+    )
+    assert first.status_code == 200, first.text
+    exported_version = client.get(url, headers=auth_headers).json()["version"]
+    moved = client.post(
+        f"{url}/append", json={"item": {"kind": "message", "text": "two"}},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 200, moved.text
+
+    stale = client.delete(
+        url, params={"expected_version": exported_version}, headers=auth_headers
+    )
+    assert stale.status_code == 409, stale.text
+    kept = client.get(url, headers=auth_headers)
+    assert kept.status_code == 200
+    assert len(kept.json()["value"]) == 2
+
+    current = kept.json()["version"]
+    ok = client.delete(url, params={"expected_version": current}, headers=auth_headers)
+    assert ok.status_code == 204, ok.text
+    assert client.get(url, headers=auth_headers).status_code == 404
+
+    # A versioned delete of a row that no longer exists is a conflict, not a
+    # silent success: the exported version is not what is stored.
+    gone = client.delete(url, params={"expected_version": current}, headers=auth_headers)
+    assert gone.status_code == 409, gone.text
+    # The unversioned delete keeps its idempotent 204.
+    assert client.delete(url, headers=auth_headers).status_code == 204
+
+
+def test_binding_scoped_delete_honors_expected_version(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820 sibling path: the binding-scoped DELETE shares the versioned
+    # recovery, so a stale version never removes that partition's row.
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/bindings/slack/C000000S01/transcript/thread-b"
+    first = client.put(url, json={"value": [1]}, headers=auth_headers)
+    assert first.status_code == 200, first.text
+    moved = client.put(url, json={"value": [1, 2]}, headers=auth_headers)
+    assert moved.status_code == 200, moved.text
+
+    stale = client.delete(
+        url, params={"expected_version": first.json()["version"]}, headers=auth_headers
+    )
+    assert stale.status_code == 409, stale.text
+    assert client.get(url, headers=auth_headers).json()["value"] == [1, 2]
+
+    ok = client.delete(
+        url, params={"expected_version": moved.json()["version"]}, headers=auth_headers
+    )
+    assert ok.status_code == 204, ok.text
+    assert client.get(url, headers=auth_headers).status_code == 404
+
+
+def _hold_row_lock_then_append(
+    aid: str,
+    key: str,
+    item: Any,
+    locked: threading.Event,
+    release: threading.Event,
+    errors: list[Exception],
+) -> None:
+    """A concurrent append from an outside session (#2927).
+
+    Takes the transcript row lock exactly as an append does (SELECT ... FOR UPDATE),
+    signals, waits for the test's go-ahead, then appends `item` and bumps the
+    version before committing.
+    """
+
+    async def hold() -> None:
+        connection = await asyncpg.connect(_asyncpg_dsn())
+        try:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT id, value
+                    FROM curie.thread_transcripts
+                    WHERE agent_id = $1 AND binding_scope IS NULL
+                      AND thread_key = $2
+                    FOR UPDATE
+                    """,
+                    uuid.UUID(aid),
+                    key,
+                )
+                assert row is not None
+                locked.set()
+                await asyncio.to_thread(release.wait, 10)
+                await connection.execute(
+                    """
+                    UPDATE curie.thread_transcripts
+                    SET value = $2::jsonb, version = version + 1
+                    WHERE id = $1
+                    """,
+                    row["id"],
+                    json.dumps([*json.loads(row["value"]), item]),
+                )
+        finally:
+            await connection.close()
+
+    try:
+        asyncio.run(hold())
+    except Exception as error:
+        errors.append(error)
+        locked.set()
+
+
+def test_cas_put_behind_a_locked_concurrent_append_is_409_and_keeps_the_append(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#2927: capacity compaction rewrites a transcript with a CAS PUT.
+
+    The PUT read version N; a concurrent append holds the row lock and commits
+    N+1. The PUT must see N+1 under the same row lock and refuse with 409. Before
+    the fix the PUT's plain read raced the lock, passed the version check on the
+    stale N, then waited on the row and overwrote the committed append.
+    """
+    aid = _agent(client, auth_headers)
+    key = "thread-cas-2927"
+    url = f"/agents/{aid}/state/transcript/{key}"
+    seeded = client.post(
+        f"{url}/append", json={"item": {"text": "one"}}, headers=auth_headers
+    )
+    assert seeded.status_code == 200, seeded.text
+    read_version = client.get(url, headers=auth_headers).json()["version"]
+
+    locked = threading.Event()
+    release = threading.Event()
+    errors: list[Exception] = []
+    holder = threading.Thread(
+        target=_hold_row_lock_then_append,
+        args=(aid, key, {"text": "two"}, locked, release, errors),
+        daemon=True,
+    )
+    holder.start()
+    try:
+        assert locked.wait(timeout=10), "row lock was not taken"
+        assert not errors, errors
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            put = executor.submit(
+                client.put,
+                url,
+                json={"value": [{"text": "compacted"}], "expected_version": read_version},
+                headers=auth_headers,
+            )
+            try:
+                # The PUT is observed waiting on the append's row lock before the
+                # append is allowed to commit: the interleaving is not timed.
+                asyncio.run(_wait_for_blocked_state_requests(1, [put]))
+            finally:
+                release.set()
+            outcome = _request_result_or_exception(put)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert not holder.is_alive(), "concurrent append did not finish"
+    assert not errors, errors
+    assert not isinstance(outcome, Exception), repr(outcome)
+    assert outcome.status_code == 409, outcome.text
+    stored = client.get(url, headers=auth_headers).json()
+    assert stored["value"] == [{"text": "one"}, {"text": "two"}]
+    assert stored["version"] == read_version + 1
+
+
+def test_append_reserve_refusal_is_413_unchanged_and_not_a_persistence_failure(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2927: `reserve_bytes` keeps headroom for the worker's publication append.
+
+    An append that would leave fewer than `reserve_bytes` free under the value
+    cap is refused atomically with 413 and leaves the log as it was. That refusal
+    is the runner's compaction trigger, not a persistence failure, so it does not
+    count toward curie.history.persistence.failure. The same append without a
+    reserve still succeeds, and a real over-the-cap append still counts.
+    """
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-reserve/append"
+    seed = {"kind": "message", "text": "seed"}
+    item = {"kind": "message", "text": "x" * 100}
+    settings = get_settings()
+    # After appending `item` exactly 50 bytes remain free under the cap.
+    settings.transcript_max_thread_bytes = _json_size([seed, item]) + 50
+    try:
+        initial = client.post(url, json={"item": seed}, headers=auth_headers)
+        assert initial.status_code == 200, initial.text
+
+        reserved = client.post(
+            url, json={"item": item, "reserve_bytes": 51}, headers=auth_headers
+        )
+        assert reserved.status_code == 413, reserved.text
+        assert "reserve" in reserved.json()["detail"]
+        stored = client.get(url.removesuffix("/append"), headers=auth_headers).json()
+        assert stored["value"] == [seed]
+        assert stored["version"] == initial.json()["version"]
+        assert _history_failure_points(history_failure_metrics) == []
+
+        plain = client.post(url, json={"item": item}, headers=auth_headers)
+        assert plain.status_code == 200, plain.text
+        assert plain.json()["value"] == [seed, item]
+        assert _history_failure_points(history_failure_metrics) == []
+
+        over_cap = client.post(
+            url,
+            json={"item": {"kind": "message", "text": "y" * 200}, "reserve_bytes": 51},
+            headers=auth_headers,
+        )
+        assert over_cap.status_code == 413, over_cap.text
+        assert client.get(
+            url.removesuffix("/append"), headers=auth_headers
+        ).json()["value"] == [seed, item]
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def _transcript_storage(aid: str) -> tuple[list[tuple[str, Any, int]], list[str]]:
+    async def read() -> tuple[list[tuple[str, Any, int]], list[str]]:
+        connection = await asyncpg.connect(_asyncpg_dsn())
+        try:
+            transcripts = await connection.fetch(
+                "SELECT thread_key, value::text AS value, version "
+                "FROM curie.thread_transcripts WHERE agent_id = $1 ORDER BY thread_key",
+                uuid.UUID(aid),
+            )
+            legacy = await connection.fetch(
+                "SELECT key FROM curie.workflow_state_entries "
+                "WHERE agent_id = $1 AND namespace = 'transcript' ORDER BY key",
+                uuid.UUID(aid),
+            )
+            return (
+                [
+                    (row["thread_key"], json.loads(row["value"]), row["version"])
+                    for row in transcripts
+                ],
+                [row["key"] for row in legacy],
+            )
+        finally:
+            await connection.close()
+
+    return asyncio.run(read())
+
+
+def test_runtime_reads_lists_and_appends_from_the_transcript_table(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/transcript"
+    first = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "first"}}, headers=auth_headers
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "second"}}, headers=auth_headers
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["version"] == first.json()["version"] + 1
+    expected = [{"text": "first"}, {"text": "second"}]
+    assert second.json()["value"] == expected
+
+    read = client.get(f"{base}/thread-one", headers=auth_headers)
+    assert read.status_code == 200, read.text
+    assert read.json()["value"] == expected
+    assert read.json()["version"] == second.json()["version"]
+    listed = client.get(base, headers=auth_headers)
+    assert listed.status_code == 200, listed.text
+    assert {row["key"] for row in listed.json()} == {"thread-one"}
+    transcripts, legacy = _transcript_storage(aid)
+    assert transcripts == [("thread-one", expected, second.json()["version"])]
+    assert legacy == []

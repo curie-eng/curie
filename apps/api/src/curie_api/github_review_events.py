@@ -23,6 +23,26 @@ _LOGIN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 _MAX_FEEDBACK_LENGTH = 65536
 
 
+def valid_github_login(value: str) -> bool:
+    """True when value is one GitHub login the review sender check accepts."""
+
+    return _LOGIN.fullmatch(value) is not None
+
+
+def human_sender(value: Any) -> tuple[int, str]:
+    """The review ingress human-sender check, shared with factory intake."""
+
+    return _human(value)
+
+
+def payload_object(value: Any, code: str) -> dict[str, Any]:
+    return _object(value, code)
+
+
+def positive_identifier(value: Any, code: str, maximum: int = 2**63 - 1) -> int:
+    return _positive(value, code, maximum)
+
+
 class FeedbackIgnored(ValueError):
     """An observable refusal code that never includes webhook/model contents."""
 
@@ -33,6 +53,17 @@ class FeedbackIgnored(ValueError):
 
 class FeedbackUnavailable(FeedbackIgnored):
     """Current authority could not be read; retry without executing a turn."""
+
+
+class FeedbackHeld(FeedbackIgnored):
+    """The PR's lineage exists but has not yet recorded GitHub identity (#2962).
+
+    The caller holds the normalized feedback and replays it; GitHub never
+    redelivers a failed webhook, so neither a refusal nor a 503 is safe here.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("lineage_identity_pending")
 
 
 @dataclass(frozen=True)
@@ -149,7 +180,10 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
     # CONTRIBUTOR is only a claim here. The shared truth verifier additionally
     # requires current App-proven write/admin permission before admitting it.
     if not isinstance(association, str) or association not in {
-        "OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"
+        "OWNER",
+        "MEMBER",
+        "COLLABORATOR",
+        "CONTRIBUTOR",
     }:
         raise FeedbackIgnored("unauthorized_association")
     feedback_id = _positive(feedback.get("id"), "invalid_feedback")

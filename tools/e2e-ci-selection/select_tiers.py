@@ -20,6 +20,9 @@ OUTPUT_KEYS = {
     "cluster": "cluster",
     "released-upgrade": "released_upgrade",
 }
+# Jobs behind these tiers each boot a kind cluster. Callers omit them when
+# the run should not pay for that.
+KIND_TIERS = frozenset({"cluster", "released-upgrade"})
 
 
 class RegistryError(ValueError):
@@ -103,14 +106,24 @@ def _matches_prefix(path: str, prefix: str) -> bool:
 # Fail-closed pytest set. ignored_prefixes may skip compose+pytest, but never
 # for these Python or runtime paths even when a more-specific ignore exists
 # (packages/test-support, apps/dispatcher, apps/ui).
-MUST_RUN_PYTEST_EXACT = frozenset({"uv.lock", "pyproject.toml"})
+MUST_RUN_PYTEST_EXACT = frozenset(
+    {
+        "uv.lock",
+        "pyproject.toml",
+        ".github/e2e-selection.yaml",
+    }
+)
 MUST_RUN_PYTEST_PREFIXES = (
     "packages",
     "apps",
     "runner",
     "examples/tests",
     "cli",
+    "tools",
+    "release",
+    ".github/workflows",
 )
+IMAGE_LOCKFILES = frozenset({"uv.lock", "pyproject.toml"})
 
 
 def _is_must_run_pytest(path: str) -> bool:
@@ -129,6 +142,32 @@ def _needs_pytest(registry: Registry, paths: list[str]) -> bool:
         if not any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
             return True
     return False
+
+
+def _needs_images(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    for path in paths:
+        name = path.rsplit("/", 1)[-1]
+        if path in IMAGE_LOCKFILES or name in IMAGE_LOCKFILES:
+            return True
+        if "Dockerfile" in name or name.endswith(".dockerfile"):
+            return True
+    return False
+
+
+RUNTIME_ASSERTION_DIR = "charts/curie/ci/runtime"
+
+
+def _is_runtime_assertion(path: str) -> bool:
+    parent, _, name = path.rpartition("/")
+    return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
+
+
+def _needs_cli_release(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    return any(path == "cli" or path.startswith("cli/") for path in paths)
 
 
 def _load_registry(path: Path) -> Registry:
@@ -194,11 +233,22 @@ def _changed_paths(base: str, head: str) -> list[str]:
     return [line for line in completed.stdout.splitlines() if line]
 
 
-def _render(selected: set[str], pytest_needed: bool) -> str:
+def _render(
+    selected: set[str],
+    pytest_needed: bool,
+    images_needed: bool,
+    cli_release_needed: bool,
+    released_upgrade_full: bool,
+) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append(f"images={'true' if images_needed else 'false'}")
+    lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
+    lines.append(
+        f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -209,6 +259,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
+    parser.add_argument(
+        "--omit-kind",
+        action="store_true",
+        help="Drop the cluster and released-upgrade tiers.",
+    )
     return parser
 
 
@@ -216,11 +271,14 @@ def _run() -> None:
     args = _parser().parse_args()
     registry = _load_registry(args.registry)
 
+    paths: list[str] = []
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
         selected = set(TIERS)
         pytest_needed = True
+        images_needed = True
+        cli_release_needed = True
     else:
         if args.path and (args.base or args.head):
             raise RegistryError("paths cannot be combined with revisions")
@@ -232,12 +290,35 @@ def _run() -> None:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
         pytest_needed = _needs_pytest(registry, paths)
+        images_needed = _needs_images(paths)
+        cli_release_needed = _needs_cli_release(paths)
+
+    if args.omit_kind:
+        selected.difference_update(KIND_TIERS)
+        # An added or changed cluster runtime assertion must run on the enforcing
+        # cluster rung before `E2E required` can pass (#3391), so omitting kind
+        # never drops the tier that proves it.
+        if any(_is_runtime_assertion(path) for path in paths):
+            selected.add("cluster")
+
+    # A pull request that selects released-upgrade runs one upgrade matrix
+    # smoke shard. The full matrix and the released chart upgrade jobs run only
+    # on pushes and dispatches (the nightly), which are the --push runs.
+    released_upgrade_full = args.push and "released-upgrade" in selected
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         raise RegistryError("GITHUB_OUTPUT is required")
     with Path(output_path).open("a", encoding="utf-8") as stream:
-        stream.write(_render(selected, pytest_needed))
+        stream.write(
+            _render(
+                selected,
+                pytest_needed,
+                images_needed,
+                cli_release_needed,
+                released_upgrade_full,
+            )
+        )
 
 
 def main() -> int:

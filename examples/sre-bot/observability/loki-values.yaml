@@ -79,7 +79,6 @@ singleBinary:
   persistence:
     enabled: true
     size: 10Gi
-    storageClass: local-path
   resources:
     requests:
       cpu: 100m

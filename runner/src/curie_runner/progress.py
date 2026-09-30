@@ -1,0 +1,432 @@
+"""The platform ``report_progress`` tool for the live factory status card (#3077).
+
+A bundle declares its phases in ``progress/phases.json``. The worker injects a
+request-bound progress URL and token into a factory execution's boot env. With
+both present the runner mounts ``report_progress`` on the ``curie`` server; the
+tool validates the model's phase and round against the declaration, adds the
+runner's own activity counters, and POSTs the report. A progress failure is a
+tool error the model can ignore; it never fails the turn.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import anyio
+from aci_protocol import BootEnv
+from claude_agent_sdk import SdkMcpTool, tool
+
+logger = logging.getLogger(__name__)
+
+# Named from the one BootEnv declaration (#488, ADR-0049) rather than retyped
+# literals, so a rename on the kernel side cannot silently drop the feature.
+PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
+PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
+PROGRESS_FILE = Path("progress") / "phases.json"
+PROGRESS_TOOL = "report_progress"
+
+_PHASE_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_MAX_PHASES = 12
+_MAX_LOOPS = 4
+_MAX_STAGES = 12
+_MAX_LABEL = 40
+_MAX_CAP = 5
+_MAX_NOTE = 280
+_TIMEOUT_SECONDS = 10.0
+VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
+_VERIFICATION_TIMEOUT_SECONDS = 600.0
+_SERVICE_FAILURE = re.compile(
+    r"(?:connection refused|could not connect|cannot connect|connection reset|"
+    r"connection error|no route to host|temporary failure in name resolution|"
+    r"service unavailable|failed to connect)",
+    re.IGNORECASE,
+)
+_KNOWN_SERVICE_MARKERS: dict[str, tuple[str, ...]] = {
+    "docker": ("docker daemon", "docker.sock", "docker service"),
+    "postgres": ("postgres", "postgresql", ":5432"),
+    "valkey": ("valkey", "redis", ":6379"),
+    "clickhouse": ("clickhouse", ":8123"),
+    "rustfs": ("rustfs", "s3 endpoint"),
+    "langfuse": ("langfuse", ":3000", ":23000"),
+}
+_MISSING_BINARY_NAMES = r"(uv|pytest|python3?|docker)"
+_MISSING_BINARY_PATTERNS = (
+    re.compile(
+        r"^(?:[^\n]{0,40}: )?(?:command not found|failed to spawn):?\s*"
+        rf"['`\"]?{_MISSING_BINARY_NAMES}\b",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(
+        r"^(?:[^\n]{0,40}: )?"
+        rf"{_MISSING_BINARY_NAMES}:?\s*(?:command not found|not found)\b",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+)
+
+_DESCRIPTION = (
+    "Report the phase you are starting now. Call it at the start of every phase "
+    "your skill names, with round for looped phases. Reporting never changes what "
+    "you are allowed to do."
+)
+
+
+def factory_progress_requested(env: Mapping[str, str]) -> bool:
+    """Whether boot carries any factory-progress signal, even an incomplete one."""
+
+    return bool(env.get(PROGRESS_URL_ENV) or env.get(PROGRESS_TOKEN_ENV))
+
+
+def _validate(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) - {"phases", "loops", "stages", "reviewer_model"}:
+        raise ValueError("phases.json must be an object with phases and optional layout")
+    phases = raw.get("phases")
+    if not isinstance(phases, list) or not 1 <= len(phases) <= _MAX_PHASES:
+        raise ValueError(f"phases must list 1 to {_MAX_PHASES} entries")
+    ids: list[str] = []
+    clean_phases: list[dict[str, str]] = []
+    for phase in phases:
+        if not isinstance(phase, dict) or set(phase) != {"id", "label"}:
+            raise ValueError("each phase needs exactly id and label")
+        pid, label = phase["id"], phase["label"]
+        if not isinstance(pid, str) or not _PHASE_ID.match(pid):
+            raise ValueError(f"invalid phase id {pid!r}")
+        if pid in ids:
+            raise ValueError(f"duplicate phase id {pid!r}")
+        if not isinstance(label, str) or not 1 <= len(label) <= _MAX_LABEL:
+            raise ValueError(f"phase {pid!r} label must be 1 to {_MAX_LABEL} chars")
+        ids.append(pid)
+        clean_phases.append({"id": pid, "label": label})
+    loops = raw.get("loops", [])
+    if not isinstance(loops, list) or len(loops) > _MAX_LOOPS:
+        raise ValueError(f"loops must list 0 to {_MAX_LOOPS} entries")
+    clean_loops: list[dict[str, Any]] = []
+    for loop in loops:
+        if not isinstance(loop, dict) or set(loop) != {"start", "review", "cap"}:
+            raise ValueError("each loop needs exactly start, review and cap")
+        start, review, cap = loop["start"], loop["review"], loop["cap"]
+        if start not in ids or review not in ids:
+            raise ValueError("loop start and review must be declared phases")
+        if ids.index(start) >= ids.index(review):
+            raise ValueError("loop start must precede its review")
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= _MAX_CAP:
+            raise ValueError(f"loop cap must be 1 to {_MAX_CAP}")
+        clean_loops.append({"start": start, "review": review, "cap": cap})
+    declaration: dict[str, Any] = {"phases": clean_phases, "loops": clean_loops}
+    if "stages" in raw:
+        stages = raw["stages"]
+        if not isinstance(stages, list) or not 1 <= len(stages) <= _MAX_STAGES:
+            raise ValueError(f"stages must list 1 to {_MAX_STAGES} entries")
+        stage_ids: set[str] = set()
+        grouped: list[str] = []
+        clean_stages: list[dict[str, Any]] = []
+        for stage in stages:
+            if not isinstance(stage, dict) or set(stage) != {"id", "label", "phases"}:
+                raise ValueError("each stage needs exactly id, label and phases")
+            sid, label, phase_ids = stage["id"], stage["label"], stage["phases"]
+            if not isinstance(sid, str) or not _PHASE_ID.fullmatch(sid) or sid in stage_ids:
+                raise ValueError(f"invalid or duplicate stage id {sid!r}")
+            if not isinstance(label, str) or not 1 <= len(label) <= _MAX_LABEL:
+                raise ValueError(f"stage {sid!r} label must be 1 to {_MAX_LABEL} chars")
+            if (
+                not isinstance(phase_ids, list)
+                or not 1 <= len(phase_ids) <= _MAX_PHASES
+                or any(not isinstance(pid, str) for pid in phase_ids)
+            ):
+                raise ValueError(f"stage {sid!r} needs declared phase ids")
+            stage_ids.add(sid)
+            grouped.extend(phase_ids)
+            clean_stages.append({"id": sid, "label": label, "phases": phase_ids})
+        if grouped != ids:
+            raise ValueError("stages must cover each declared phase once in order")
+        declaration["stages"] = clean_stages
+    if "reviewer_model" in raw:
+        reviewer_model = raw["reviewer_model"]
+        if (
+            not isinstance(reviewer_model, str)
+            or not reviewer_model.strip()
+            or len(reviewer_model) > 120
+        ):
+            raise ValueError("reviewer_model must be a nonempty string of at most 120 chars")
+        declaration["reviewer_model"] = reviewer_model
+    return declaration
+
+
+def load_phase_declaration(plugin_dir: Path) -> dict[str, Any] | None:
+    """Read ``<plugin_dir>/progress/phases.json``; None when absent.
+
+    Raises ``ValueError`` for a malformed file, with the wire contract's limits.
+    """
+
+    path = plugin_dir / PROGRESS_FILE
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable {PROGRESS_FILE}: {exc}") from exc
+    return _validate(raw)
+
+
+class ProgressActivity:
+    """The runner's own activity counters, carried on every report."""
+
+    def __init__(self) -> None:
+        self.model: str | None = None
+        self.turns = 0
+        self.tool_calls = 0
+        self.last_tool: str | None = None
+
+    def observe_tool(self, name: str) -> None:
+        self.tool_calls += 1
+        if name.startswith("mcp__"):
+            name = name.split("__", 2)[-1]
+        self.last_tool = name
+
+    def observe_assistant_message(self) -> None:
+        self.turns += 1
+
+    def as_wire(self) -> dict[str, Any]:
+        wire: dict[str, Any] = {"turns": self.turns, "tool_calls": self.tool_calls}
+        if self.model:
+            wire["model"] = self.model[:120]
+        if self.last_tool:
+            wire["last_tool"] = self.last_tool[:120]
+        return wire
+
+
+class ProgressClient:
+    """POSTs reports to the api. The token rides ``X-API-Key`` and is never logged."""
+
+    def __init__(self, url: str, token: str) -> None:
+        self._url = url
+        self._token = token
+
+    async def post(self, body: dict[str, Any]) -> int | None:
+        """Return the final HTTP status, or None after a transport failure.
+
+        One retry on a transport error or a 5xx.
+        """
+
+        status: int | None = None
+        timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
+        for _attempt in range(2):
+            try:
+                async with (
+                    aiohttp.ClientSession(timeout=timeout) as session,
+                    session.post(
+                        self._url, json=body, headers={"X-API-Key": self._token}
+                    ) as response,
+                ):
+                    status = response.status
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                logger.warning("progress report transport failure: %s", type(exc).__name__)
+                status = None
+                continue
+            if status < 500:
+                return status
+        return status
+
+
+def _subprocess_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _verification_failures(output: str) -> tuple[list[str], list[str]]:
+    """Extract only known missing tools and named service failures from output."""
+
+    missing = sorted(
+        {
+            match.group(1).lower()
+            for pattern in _MISSING_BINARY_PATTERNS
+            for match in pattern.finditer(output)
+        }
+    )
+    blocked: set[str] = set()
+    for line in output.splitlines():
+        if not _SERVICE_FAILURE.search(line):
+            continue
+        lowered = line.casefold()
+        for service, markers in _KNOWN_SERVICE_MARKERS.items():
+            if any(marker in lowered for marker in markers):
+                blocked.add(service)
+    return missing, sorted(blocked)
+
+
+async def preflight_workspace_verification(workspace: Path, url: str, token: str) -> dict[str, Any]:
+    """Run and report the documented focused check without installing tools.
+
+    The command is bounded and runs in the mounted checkout. ``UV_OFFLINE`` and
+    ``UV_NO_SYNC`` prevent package or interpreter downloads and environment
+    synchronization. The report describes this execution only; a successful
+    result does not certify later edits.
+    """
+
+    executable = shutil.which("uv")
+    record: dict[str, Any] = {
+        "command": VERIFICATION_COMMAND,
+        "outcome": "unavailable",
+        "exit_status": None,
+        "missing_binaries": [],
+        "blocked_services": [],
+    }
+    failure_reason: str | None = None
+    if executable is None:
+        record["missing_binaries"] = ["uv"]
+    else:
+        env = dict(os.environ)
+        env["UV_OFFLINE"] = "1"
+        env["UV_NO_SYNC"] = "1"
+        env["UV_LOCKED"] = "1"
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(
+                    ["uv", "run", "pytest", "runner/tests", "-q"],
+                    cwd=workspace,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=_VERIFICATION_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = "\n".join((_subprocess_text(exc.stdout), _subprocess_text(exc.stderr)))
+            missing, blocked = _verification_failures(output)
+            record["missing_binaries"] = missing
+            record["blocked_services"] = blocked
+            if not (missing or blocked):
+                record["outcome"] = "failed"
+                record["exit_status"] = 124
+                failure_reason = (
+                    f"command timed out after {_VERIFICATION_TIMEOUT_SECONDS:g} seconds"
+                )
+        except OSError as exc:
+            # ``which`` and process creation can race if the image is changing.
+            # Do not expose arbitrary exception text in the progress record.
+            missing_uv = (
+                isinstance(exc, FileNotFoundError) and Path(str(exc.filename or "")).name == "uv"
+            )
+            if missing_uv:
+                record["missing_binaries"] = ["uv"]
+            else:
+                record["outcome"] = "failed"
+                record["exit_status"] = 126 if isinstance(exc, PermissionError) else 125
+                failure_reason = f"command could not start ({type(exc).__name__})"
+            logger.warning(
+                "verification command could not start error_class=%s",
+                type(exc).__name__,
+            )
+        else:
+            output = f"{result.stdout}\n{result.stderr}"
+            missing, blocked = _verification_failures(output)
+            record["missing_binaries"] = missing
+            record["blocked_services"] = blocked
+            if result.returncode == 0:
+                record["outcome"] = "passed"
+                record["exit_status"] = 0
+                record["missing_binaries"] = []
+                record["blocked_services"] = []
+            elif missing or blocked:
+                record["outcome"] = "unavailable"
+            else:
+                record["outcome"] = "failed"
+                record["exit_status"] = result.returncode
+
+    client = ProgressClient(f"{url.rstrip('/')}/verification", token)
+    status = await client.post(record.copy())
+    record["report_status"] = status
+    if failure_reason is not None:
+        record["failure_reason"] = failure_reason
+    if status != 201:
+        logger.warning("verification preflight report was not accepted status=%s", status)
+        raise RuntimeError("verification preflight report was not accepted")
+    return record
+
+
+def _error(text: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def build_progress_tool(
+    declaration: dict[str, Any], client: ProgressClient, activity: ProgressActivity
+) -> SdkMcpTool[Any]:
+    """The SDK tool ``report_progress``, closed over the declaration."""
+
+    ids = [phase["id"] for phase in declaration["phases"]]
+    caps: dict[str, int] = {}
+    for loop in declaration.get("loops", []):
+        caps[loop["start"]] = loop["cap"]
+        caps[loop["review"]] = loop["cap"]
+    schema = {
+        "type": "object",
+        "properties": {
+            "phase": {"type": "string", "enum": ids},
+            "note": {"type": "string", "maxLength": _MAX_NOTE},
+            "round": {"type": "integer", "minimum": 1, "maximum": _MAX_CAP},
+        },
+        "required": ["phase"],
+    }
+
+    @tool(PROGRESS_TOOL, _DESCRIPTION, schema)
+    async def report_progress(args: dict[str, Any]) -> dict[str, Any]:
+        raw_phase = args.get("phase")
+        if not isinstance(raw_phase, str) or raw_phase not in ids:
+            return _error(f"Unknown phase {raw_phase!r}. Valid phases: {', '.join(ids)}.")
+        phase = raw_phase
+        body: dict[str, Any] = {"phase": phase}
+        note = args.get("note")
+        if isinstance(note, str) and note.strip():
+            body["note"] = note.strip()[:_MAX_NOTE]
+        loop_round = args.get("round")
+        if loop_round is not None:
+            cap = caps.get(phase)
+            if cap is None:
+                return _error(f"Phase {phase} is not looped; omit round.")
+            if (
+                isinstance(loop_round, bool)
+                or not isinstance(loop_round, int)
+                or not (1 <= loop_round <= cap)
+            ):
+                return _error(f"round for {phase} must be 1 to {cap}.")
+            body["round"] = loop_round
+        body["declaration"] = declaration
+        body["activity"] = activity.as_wire()
+        status = await client.post(body)
+        if status == 201:
+            return {"content": [{"type": "text", "text": f"recorded {phase}"}]}
+        detail = f"status {status}" if status is not None else "the api was unreachable"
+        return _error(
+            f"Progress was not recorded ({detail}). Continue the work; progress never "
+            "blocks the run."
+        )
+
+    return report_progress
+
+
+def resolve_progress(
+    env: Mapping[str, str], plugin_dir: Path
+) -> tuple[ProgressClient, dict[str, Any]] | None:
+    """A client and declaration when both env vars and a phase file are present.
+
+    Raises ``ValueError`` for a malformed phase file.
+    """
+
+    url = env.get(PROGRESS_URL_ENV)
+    token = env.get(PROGRESS_TOKEN_ENV)
+    if not url or not token:
+        return None
+    declaration = load_phase_declaration(plugin_dir)
+    if declaration is None:
+        return None
+    return ProgressClient(url, token), declaration

@@ -8,18 +8,24 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from aci_protocol.turn import route_identity
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.exceptions import RequestValidationError
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
+from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
+from pydantic import BaseModel
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud, deploy
+from .. import bundles, crud, deploy, hook_signing
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..models import Agent, AgentChannel
+from ..publication_policy import PublicationPolicyConflict
+from ..runner_resources import RunnerResourcesError, quota_refusal
 from ..schemas import (
     AgentCreate,
     AgentOut,
@@ -28,13 +34,19 @@ from ..schemas import (
     BundleFiles,
     ChannelBindingPatch,
     ChannelBindingWrite,
+    ChannelCallersWrite,
     ConnectorManifests,
     VersionCreate,
     VersionOut,
     enforce_behavior_packs_size,
+    validate_allowed_callers,
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
+
+
+class HookSecretOut(BaseModel):
+    secret: str
 
 # Postgres SQLSTATE for a unique_violation. asyncpg exposes it (and the
 # violated constraint's name) as plain attributes on the wrapped driver
@@ -63,17 +75,24 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
     # (ADR-0096 phase 2). Without this the create succeeded and the second agent
     # was silently shadowed by the resolver at runtime. Stated without the word
     # "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
-    # belong to every channel kind.
+    # belong to every channel kind. 0070 replaced this key; kept for its wording
+    # on a database that still has it.
     "agent_channels_kind_address_key": (
         "another agent is already bound to that channel kind and address; one "
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
+    # Migration 0070's key: the route is the triple (ADR-0168 decision 3).
+    "agent_channels_route_key": (
+        "another agent is already bound to that channel kind and address under that "
+        "identity; one agent per route (bind another identity, move or delete the "
+        "other agent, or pick another address)"
+    ),
     # No entry for `agent_channels_agent_id_key`: migration 0030 drops that
     # constraint (ADR-0118), so its message can never fire again, and it said
     # the opposite of what this API now does. A dead entry is worse than none --
-    # it reads as a protection. The pair constraint above is the ONLY binding
-    # conflict left.
+    # it reads as a protection. The route keys above are the only binding
+    # conflicts left.
 }
 
 
@@ -97,17 +116,20 @@ def _driver_diag(exc: IntegrityError, attr: str) -> str | None:
 
 
 def classify_integrity_error(exc: IntegrityError) -> tuple[int, str] | None:
-    """Map a real unique-constraint violation to a `(409, message)` conflict.
+    """Map a caller-caused constraint violation to a `(status, message)` pair.
 
-    Only a genuine unique_violation (SQLSTATE 23505) is a caller conflict; a
-    NOT NULL or FK violation is a server fault and must surface as a 500, so
-    this returns `None` for those (the caller re-raises). The human message is
+    A genuine unique_violation (SQLSTATE 23505) is a caller conflict (409). A
+    NOT NULL, FK or check violation is a server fault and must surface as a
+    500, so this returns `None` for those (the caller re-raises): the write
+    schemas refuse every shape `agent_channels_route_ck` covers before the
+    database sees it. The human message is
     chosen by the violated constraint's name from asyncpg's structured fields,
     not by substring-matching the stringified driver error.
     """
-    if _driver_diag(exc, "sqlstate") != _UNIQUE_VIOLATION:
-        return None
+    sqlstate = _driver_diag(exc, "sqlstate")
     constraint_name = _driver_diag(exc, "constraint_name")
+    if sqlstate != _UNIQUE_VIOLATION:
+        return None
     message = "agent violates a uniqueness constraint"
     if constraint_name is not None:
         message = _UNIQUE_CONSTRAINT_MESSAGES.get(constraint_name, message)
@@ -124,7 +146,13 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
     # is a genuine server fault -- re-raise it so it surfaces as a 500.
     try:
+        await crud.refuse_routeless_pair_sharing(
+            session, None, data.channel.kind, data.channel.address, data.channel.adapter
+        )
         agent = await crud.create_agent(session, data)
+    except crud.RoutelessPairShared as exc:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntegrityError as exc:
         await session.rollback()
         classified = classify_integrity_error(exc)
@@ -147,6 +175,23 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return AgentOut.model_validate(agent)
+
+
+@router.get("/{agent_id}/hook-secret", response_model=HookSecretOut)
+async def get_hook_secret(
+    agent_id: uuid.UUID, session: SessionDep, response: Response
+) -> HookSecretOut:
+    agent = await crud.get_agent(session, agent_id)
+    if agent is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    response.headers["Cache-Control"] = "no-store"
+    return HookSecretOut(
+        secret=hook_signing.derive(
+            get_settings().api_key,
+            agent_id=str(agent.id),
+            generation=agent.hook_generation,
+        )
+    )
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
@@ -196,6 +241,23 @@ async def update_agent(
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             except deploy.ApprovalRoutesUnbound as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    # Same preflight shape (#3209). The helpers below each commit on their own,
+    # so a quota refusal after `model` or `thinking` would persist those fields
+    # on a request this handler answered 422.
+    if "runner_resources" in data.model_fields_set and data.runner_resources is not None:
+        settings = get_settings()
+        try:
+            refusal = quota_refusal(
+                data.runner_resources,
+                requests_cpu=settings.sandbox_quota_requests_cpu,
+                requests_memory=settings.sandbox_quota_requests_memory,
+                limits_cpu=settings.sandbox_quota_limits_cpu,
+                limits_memory=settings.sandbox_quota_limits_memory,
+            )
+        except RunnerResourcesError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        if refusal is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
     # Presence, not truthiness (#1310). `is not None` conflates "the client did
     # not mention this field" with "the client explicitly sent null", so setting
     # either override used to be a one-way door: nothing could put it back to the
@@ -208,12 +270,22 @@ async def update_agent(
         agent = await crud.update_agent_model(session, agent, data.model)
     if "thinking" in sent:
         agent = await crud.update_agent_thinking(session, agent, data.thinking)
+    if "execution_deadline_seconds" in sent:
+        agent = await crud.update_agent_execution_deadline(
+            session, agent, data.execution_deadline_seconds
+        )
+    if "runner_resources" in sent:
+        # Quota was judged above, before any field committed. Null clears.
+        agent = await crud.update_agent_runner_resources(session, agent, data.runner_resources)
     if data.memory is not None:
         # Omitted leaves it unchanged; unlike `model`/`thinking` there is no
         # separate "platform default" a null would clear back to, so this
         # follows the plain-None-check siblings below rather than the
         # model_fields_set pair above.
         agent = await crud.update_agent_memory(session, agent, data.memory)
+    if data.memory_writes is not None:
+        # Same plain-None rule as `memory`: omitted (or null) is unchanged.
+        agent = await crud.update_agent_memory_writes(session, agent, data.memory_writes)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
@@ -242,6 +314,30 @@ async def update_agent(
         agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
     if data.source_bindings is not None:
         agent = await crud.update_agent_source_bindings(session, agent, data.source_bindings)
+    if (
+        "publication_policy" in sent
+        or "publication_draft" in sent
+        or "publication_branch_prefix" in sent
+    ):
+        try:
+            agent = await crud.update_agent_publication_policy(
+                session,
+                agent,
+                policy=data.publication_policy if "publication_policy" in sent else None,
+                draft=data.publication_draft if "publication_draft" in sent else None,
+                branch_prefix=(
+                    data.publication_branch_prefix if "publication_branch_prefix" in sent else None
+                ),
+                prefix_sent="publication_branch_prefix" in sent,
+            )
+        except PublicationPolicyConflict as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "publication.policy_version_conflict",
+                    "message": "publication policy version changed; retry the read",
+                },
+            ) from exc
     return AgentOut.model_validate(agent)
 
 
@@ -264,13 +360,14 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
 
 # --- the channel-binding subresource (ADR-0118, #1525) ------------------------
 #
-# One agent holds one or more `(kind, address)` bindings, so add, move and
-# remove are three verbs here instead of one overloaded `AgentUpdate.channel`
-# field, each with exactly one meaning. The pair selects the binding on PATCH
-# and DELETE, passed as QUERY parameters: it is the routing key every other
-# layer already uses (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`)
-# and an `address` is opaque per kind, so a `/` in one would have to survive as
-# `%2F` in a path segment -- a proxy hazard the query string does not have.
+# One agent holds one or more `(kind, address, adapter)` bindings, so add, move
+# and remove are three verbs here instead of one overloaded
+# `AgentUpdate.channel` field, each with exactly one meaning. The route selects
+# the binding on PATCH and DELETE, passed as QUERY parameters: it is the
+# routing key every other layer already uses (`binding._RESOLVE_SQL` narrowed
+# by `matching_routes`, `agent_channels_route_key`) and an `address` is opaque
+# per kind, so a `/` in one would have to survive as `%2F` in a path segment --
+# a proxy hazard the query string does not have.
 
 
 async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
@@ -280,42 +377,74 @@ async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
     return agent
 
 
-def _binding_for(bindings: list[AgentChannel], kind: str, address: str) -> AgentChannel:
-    """Pick the pair's row out of THIS agent's locked set, or 404.
+def _binding_for(
+    bindings: list[AgentChannel], kind: str, address: str, adapter: str | None
+) -> AgentChannel:
+    """Pick the route's row out of THIS agent's locked set, or 404 or 409.
+
+    The matching RULE lives in `crud.matching_bindings`, shared with every
+    other reader of a route including `add_agent_channel`'s idempotence check
+    below, so the two surfaces here agree on what counts as "the same
+    binding". `agent_channels_route_key` lets several routes share one pair,
+    so an omitted non-Slack adapter can select more than one row: the 409
+    below, never a pick.
 
     Selecting from the locked list rather than issuing a second, unlocked query
     is what makes the lock load-bearing. It is also the authorization boundary:
-    a pair belonging to a DIFFERENT agent names no row here, so it reads as 404
-    rather than becoming a cross-agent write the caller sees a 200 for.
+    a route belonging to a DIFFERENT agent names no row here, so it reads as
+    404 rather than becoming a cross-agent write the caller sees a 200 for.
     """
 
-    for binding in bindings:
-        if binding.kind == kind and binding.address == address:
-            return binding
+    matches = crud.matching_bindings(bindings, kind, address, adapter)
+    if len(matches) > 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"several identities are bound to {kind}:{address}; pass adapter to name one",
+        )
+    if matches:
+        return matches[0]
+    if adapter is not None:
+        # Names the identity that found nothing, not only the pair, so a
+        # caller who passed the right pair but the wrong identity does not
+        # read the same 404 as one who mistyped the address itself.
+        identity = route_identity(kind, adapter)
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"this agent has no {kind}:{address} binding as {identity!r}",
+        )
     raise HTTPException(
         status.HTTP_404_NOT_FOUND,
         f"this agent has no {kind}:{address} binding",
     )
 
 
-def _conflict_message(owner: uuid.UUID | None, agent_id: uuid.UUID, kind: str, address: str) -> str:
-    """The 409 sentence for a taken pair, accurate about WHO holds it.
+def _conflict_message(
+    route_owner: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    kind: str,
+    adapter: str | None,
+    address: str,
+) -> str:
+    """The 409 sentence for a taken route, accurate about WHO holds it.
 
     The generic map message says "another agent is already bound", which is
-    false -- and actively misleading -- when the duplicate is this agent's own:
-    it sends an operator looking for an agent that does not exist, and the CLI's
-    ensure-bound recheck cannot tell a satisfied desired state from a real
-    collision. A `None` owner means the winning row was deleted between the
-    failed insert and this lookup; the pair is free again, and the generic
-    sentence is the safe answer since either way the caller retries.
+    false -- and actively misleading -- when the duplicate is this agent's
+    own: `route_owner == agent_id` means the EXACT route this write asked for
+    (kind, resolved identity, address) already exists. Otherwise (None, or
+    naming a different agent) the generic map message: None means the
+    winning row was deleted between the failed insert and this lookup -- the
+    route is free again -- and the generic sentence is the safe answer
+    either way, since the caller retries.
     """
 
-    if owner is not None and owner == agent_id:
+    if route_owner is not None and route_owner == agent_id:
+        identity = route_identity(kind, adapter)
+        route = f"{kind}:{identity}:{address}" if identity is not None else f"{kind}:{address}"
         return (
-            f"this agent is already bound to {kind}:{address}; the binding you "
+            f"this agent is already bound to {route}; the binding you "
             "asked for already exists, so nothing was changed"
         )
-    return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_kind_address_key"]
+    return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_route_key"]
 
 
 # Postgres SQLSTATE for `deadlock_detected`. asyncpg surfaces it as `sqlstate`
@@ -324,7 +453,7 @@ def _conflict_message(owner: uuid.UUID | None, agent_id: uuid.UUID, kind: str, a
 _DEADLOCK_DETECTED = "40P01"
 
 # The 409 a broken deadlock earns. Deliberately the same STATUS as a taken
-# pair: from the caller's side both mean "the binding set moved under you, the
+# route: from the caller's side both mean "the binding set moved under you, the
 # write did not land, retry" -- and a deadlock victim is the one caller for
 # whom a retry is near-certain to succeed, since its opponent has by then
 # committed. Left as a 500 it reads as a server fault and an operator stops
@@ -346,12 +475,12 @@ def _is_deadlock(exc: DBAPIError) -> bool:
 async def _deadlock_as_conflict() -> AsyncIterator[None]:
     """Turn a broken lock cycle into a retryable 409 instead of a 500.
 
-    `lock_agent_bindings` locks ONE agent's rows, but a `(kind, address)` pair
-    is globally unique: two callers swapping their agents' pairs in opposite
-    directions each hold their own agent's rows and then wait on the other's
-    uncommitted index entry. That is a genuine cycle, Postgres aborts one side
-    with `40P01`, and without this the victim gets an unexplained 500 for a
-    race it can simply retry.
+    `lock_agent_bindings` locks ONE agent's rows, but a route is globally
+    unique (`agent_channels_route_key`): two callers swapping their agents'
+    routes in opposite directions each hold their own agent's rows and then
+    wait on the other's uncommitted index entry. That is a genuine cycle,
+    Postgres aborts one side with `40P01`, and without this the victim gets an
+    unexplained 500 for a race it can simply retry.
 
     Wraps the WHOLE handler body rather than the savepoint alone: the cycle can
     close on the locking read, on the flush, or on the commit, and all three are
@@ -380,22 +509,22 @@ async def _raise_binding_conflict(
     that may have moved again; no rollback would leave the session failed and
     answer 500 `PendingRollbackError` on the lookup itself.
 
-    A non-unique violation (NOT NULL, FK) is a server fault, so it is re-raised
-    rather than dressed up as a conflict.
+    A non-unique violation (NOT NULL, FK, check) is a server fault, so it is
+    re-raised rather than dressed up as a conflict.
     """
 
     if classify_integrity_error(exc) is None:
         raise exc
-    owner = await crud.agent_id_for_pair(session, channel.kind, channel.address)
+    route_owner = await crud.agent_id_for_route(
+        session, channel.kind, channel.adapter, channel.address
+    )
     raise HTTPException(
         status.HTTP_409_CONFLICT,
-        _conflict_message(owner, agent_id, channel.kind, channel.address),
+        _conflict_message(route_owner, agent_id, channel.kind, channel.adapter, channel.address),
     ) from exc
 
 
-@router.post(
-    "/{agent_id}/channels", response_model=AgentOut, status_code=status.HTTP_201_CREATED
-)
+@router.post("/{agent_id}/channels", response_model=AgentOut, status_code=status.HTTP_201_CREATED)
 async def add_agent_channel(
     agent_id: uuid.UUID, data: ChannelBindingWrite, session: SessionDep
 ) -> AgentOut:
@@ -407,22 +536,31 @@ async def add_agent_channel(
         # serializes this add against a concurrent move or delete of the same
         # agent's bindings, which is what keeps the last-binding guard sound.
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        if any(
-            binding.kind == data.kind and binding.address == data.address
-            for binding in bindings
-        ):
+        # A re-POST of a route this agent already holds is an idempotent
+        # success that changes nothing. `crud.matching_bindings` is the same
+        # rule `_binding_for` selects by, so "the same binding" means the same
+        # thing to add, move and delete. A POST naming another identity or
+        # adapter on a pair this agent holds is a second route
+        # (`agent_channels_route_key` is the triple), and is inserted.
+        if crud.matching_bindings(bindings, data.kind, data.address, data.adapter):
             return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.add_channel_binding(session, agent_id, data)
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, data.kind, data.address, data.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             if classify_integrity_error(exc) is None:
                 raise
-            # Two concurrent idempotent adds can both observe the pair absent;
+            # Two concurrent idempotent adds can both observe the route absent;
             # the winner inserts and the loser reaches the unique constraint.
             # Once the savepoint has rolled back, treat that winner as the same
-            # successful desired state when it belongs to this agent.
-            owner = await crud.agent_id_for_pair(session, data.kind, data.address)
+            # successful desired state when it belongs to this agent. Asked of
+            # the ROUTE, the key the violated constraint enforces.
+            owner = await crud.agent_id_for_route(session, data.kind, data.adapter, data.address)
             if owner == agent_id:
                 return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
             await _raise_binding_conflict(exc, session, agent_id, data)
@@ -436,9 +574,14 @@ async def move_agent_channel(
     address: str,
     data: ChannelBindingPatch,
     session: SessionDep,
+    adapter: str | None = None,
     expected_generation: int | None = None,
 ) -> AgentOut:
-    """Move (or re-assert) the binding the `(kind, address)` pair names.
+    """Move (or re-assert) the binding the `(kind, adapter, address)` route names.
+
+    `adapter` selects the IDENTITY (ADR-0168 decision 3): omitted, it means
+    Slack's default identity, and for any other kind it selects the only row
+    on `(kind, address)` -- see `_binding_for`.
 
     `expected_generation` is an OPTIONAL compare-and-set, in the shape
     `routers/state.py` uses for its versioned rows, so the two CAS surfaces read
@@ -451,29 +594,101 @@ async def move_agent_channel(
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        binding = _binding_for(bindings, kind, address)
+        binding = _binding_for(bindings, kind, address, adapter)
         if expected_generation is not None and expected_generation != binding.generation:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"generation mismatch: expected {expected_generation}, "
-                f"stored {binding.generation}",
+                f"generation mismatch: expected {expected_generation}, stored {binding.generation}",
+            )
+        if binding.allowed_callers is not None and data.kind != binding.kind:
+            # ADR 0175: the list's entries were checked against THIS kind's id
+            # shape (a Slack user id is not an email address), so carrying it
+            # onto another kind would store ids the new kind can never match
+            # and silently lock everyone out. Refused rather than cleared, so
+            # dropping the protection is always a deliberate write.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{kind}:{address} carries a caller list checked for kind {kind!r}; "
+                "moving it to another kind would keep ids that kind cannot match. "
+                "Clear the list with PUT /agents/{agent_id}/channels/callers "
+                "(allowed_callers: null) first, then move the binding and set a "
+                "new list.",
             )
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.update_channel_binding(session, binding, data)
+                # The moved row's route, not the request's: an omitted route
+                # keeps the stored one within a kind.
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, binding.kind, binding.address, binding.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
-            # The same recovery as the add: a move onto a pair another agent (or
+            # The same recovery as the add: a move onto a route another agent (or
             # this one) already holds raises the identical violation and needs the
             # identical owner recheck, inside the same still-live transaction.
             await _raise_binding_conflict(exc, session, agent_id, data)
         return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
 
 
+@router.put("/{agent_id}/channels/callers", response_model=AgentOut)
+async def set_agent_channel_callers(
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    data: ChannelCallersWrite,
+    session: SessionDep,
+    adapter: str | None = None,
+) -> AgentOut:
+    """Set or clear who may talk to the bot through one binding (ADR 0175).
+
+    The route is selected exactly as the move and delete endpoints select it:
+    `(kind, address)` as query parameters plus the optional `adapter` identity
+    (ADR-0168 decision 3). `allowed_callers: null` clears the list so everyone
+    may talk to the bot again; a list replaces the stored one whole.
+
+    Its own endpoint, apart from `PATCH /agents/{agent_id}/channels`, because
+    that write bumps the binding's generation and so revokes the adapter's
+    token (#2379). Who may use a route is a separate question from the route
+    itself (decision 4), so this write leaves the generation alone and an
+    inbox keeps receiving mail while its list is edited.
+
+    The entries are checked against the SELECTED binding's kind, under the same
+    per-agent lock every binding write takes, so a concurrent move cannot
+    change the kind between the check and the store. A refused list is a 422
+    in FastAPI's own shape, like any other body error.
+    """
+
+    async with _deadlock_as_conflict():
+        agent = await _agent_or_404(session, agent_id)
+        bindings = await crud.lock_agent_bindings(session, agent_id)
+        binding = _binding_for(bindings, kind, address, adapter)
+        try:
+            stored = validate_allowed_callers(binding.kind, data.allowed_callers)
+        except ValueError as exc:
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body", "allowed_callers"),
+                        "msg": f"Value error, {exc}",
+                        "input": data.allowed_callers,
+                    }
+                ]
+            ) from exc
+        await crud.set_allowed_callers(session, binding, stored)
+        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+
+
 @router.delete("/{agent_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_agent_channel(
-    agent_id: uuid.UUID, kind: str, address: str, session: SessionDep
+    agent_id: uuid.UUID, kind: str, address: str, session: SessionDep, adapter: str | None = None
 ) -> None:
-    """Unbind the pair, unless it is this agent's last binding.
+    """Unbind the route, unless it is this agent's last binding.
+
+    `adapter` selects the IDENTITY (ADR-0168 decision 3), the same as on the
+    move endpoint above -- see `_binding_for`.
 
     The last one is refused: an agent with zero bindings is deployed,
     healthy-looking and unable to receive a turn -- #38's silent-shadow state,
@@ -485,7 +700,7 @@ async def remove_agent_channel(
     async with _deadlock_as_conflict():
         await _agent_or_404(session, agent_id)
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        binding = _binding_for(bindings, kind, address)
+        binding = _binding_for(bindings, kind, address, adapter)
         if len(bindings) <= 1:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -599,6 +814,12 @@ async def read_version_connectors(
                 # operator to the API logs instead of to `curie build
                 # --plugin-dir <dir> --registry <ref>`, which the message names.
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            # @spec ADR-0168 d8: the agent's targets decide which connectors
+            # run, and every consumer of this route applies and prunes it.
+            declared = restrict_connectors(
+                declared,
+                connectors_for_agent(bundles.read_deploy_targets(Path(tmp)), agent_name),
+            )
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"
@@ -610,6 +831,9 @@ async def read_version_connectors(
                     namespace=namespace,
                     app_name=app_name,
                     secret_name=secret_name,
+                    # ADR-0168 decision 7: every hosted connector this install
+                    # renders gets the caller proxy once a key is configured.
+                    proxy=settings.connector_proxy(),
                 ),
                 mcp_entries=bundles.connector_mcp_entries(
                     declared, release=release, agent=agent_name, namespace=namespace
@@ -619,6 +843,8 @@ async def read_version_connectors(
                 # secretKeyRef, and resolving it would defeat the point (#1163).
                 owned_secret_name=secret_name,
                 owned_secret_keys=bundles.owned_secret_keys(declared),
+                version_id=version.id,
+                triggers=bundles.read_manifest_triggers(Path(tmp)),
             )
 
     # `object_name` fails closed on an agent name that forges its `-mcp-` join

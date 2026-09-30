@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import signal
+import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -22,28 +23,39 @@ from typing import Any, TypedDict
 import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from . import __version__
 from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
-from .attachments import AttachmentCoordinator, AttachmentLimits, SlackFileClient
+from .attachments import (
+    AttachmentCoordinator,
+    AttachmentLimits,
+    SlackFileClient,
+)
 from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
+from .cron_loop import BundleTriggerSource, CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
+from .hook_runs import HookRunRecorder
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
+from .progress import ProgressStore
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
@@ -68,8 +80,12 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .sibling_turns import build_sibling_limit
+from .slack_tokens import slack_bot_tokens
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
+from .workitem_dispatch import WorkItemDispatchClient
+from .workitem_orphans import WorkItemOrphanSweeper
 from .workspace import (
     SubprocessCommands,
     WorkspaceClaimCoordinator,
@@ -96,6 +112,7 @@ class Runtime:
     # disposal site alongside the other long-lived transports.
     sink: ReplySinkRouter
     async_redis: AsyncRedis
+    pressure_async_redis: AsyncRedis
     eval_redis: AsyncRedis
     eval_http: httpx.AsyncClient
     engine: AsyncEngine
@@ -107,7 +124,12 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    # The cron scheduler (#268). Always built by ``build``; optional only so a
+    # Runtime constructed elsewhere need not name it.
+    cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None when the worker has no internal token and so no WorkItem client.
+    orphan_sweeper: WorkItemOrphanSweeper | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -136,6 +158,10 @@ _MAX_TUNABLE_SECONDS = 31_536_000
 # reaches the consumers. Cutting it short only leaves some legacy refs behind,
 # and those lapse with their own TTL.
 _CARD_MIGRATION_BUDGET_S = 30.0
+
+# The boot orphan sweep (#3076) runs before the heartbeat too, so it is bounded
+# the same way. A cut short sweep is finished by the supervised loop.
+_ORPHAN_SWEEP_BUDGET_S = 30.0
 
 
 def _bounded_seconds(
@@ -188,6 +214,10 @@ def _bounded_seconds(
     return value
 
 
+def _agent_names(env: Mapping[str, str], key: str) -> frozenset[str]:
+    return frozenset(name.strip() for name in env.get(key, "").split(",") if name.strip())
+
+
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # claim_timeout is overridable so a slow cluster can raise it; when unset the
     # authoritative default lives in SubstrateConfig. Keep any override below the
@@ -212,6 +242,8 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
+        agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
+        connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
     )
@@ -327,10 +359,18 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
+    pressure_async_redis: AsyncRedis = AsyncRedis(
+        **config.valkey_client_kwargs(),
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=Retry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     sub_config = _substrate_config(env)
     substrate = SandboxSubstrate(
         _sandbox_client(config, env, sub_config),
-        AffinityStore(sync_redis),
+        AffinityStore(sync_redis, pressure_client=pressure_async_redis),
         sub_config,
     )
     runner = RunnerClient(
@@ -394,16 +434,35 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
     # through a short-lived one-object presigned URL redeemed by the sandbox's
     # attachments-init container.
+    #
+    # Each Slack identity's bot token, read once from this process's env
+    # (ADR-0168 decision 5), so the lane and the sink serve the same set.
+    slack_tokens = slack_bot_tokens(config, environ=env)
     attachments = (
         AttachmentCoordinator(
-            files=SlackFileClient(
-                token=config.slack_bot_token,
-                read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+            # The lane is on when any identity holds a token, so `default`'s
+            # may be blank here; `_files_for` refuses that identity before any
+            # fetch rather than this module standing in a broken port for it.
+            files=(
+                SlackFileClient(
+                    token=config.slack_bot_token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.slack_bot_token
+                else None
             ),
+            identity_files={
+                name: SlackFileClient(
+                    token=token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                for name, token in slack_tokens.items()
+                if name != DEFAULT_IDENTITY
+            },
             objects=workspace_objects,
             limits=_attachment_limits(config),
         )
-        if config.attachment_enabled and config.slack_bot_token
+        if config.attachment_enabled and any(slack_tokens.values())
         else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
@@ -423,8 +482,23 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         api_key=config.api_key,
         client=eval_http,
     )
-    sink = build_reply_sink(config)
+    sink = build_reply_sink(config, slack_tokens=slack_tokens)
+    # ADR-0168 decision 6. None unless a sibling identity can exist here, so a
+    # stock install asks no auth.test, reads no binding and makes no Valkey
+    # call for it.
+    sibling_limit = build_sibling_limit(
+        config, async_redis, slack_tokens=slack_tokens, channel=binding
+    )
     card_store = ApprovalCardStore(async_redis, config)
+    work_items = (
+        WorkItemDispatchClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        if config.internal_worker_token
+        else None
+    )
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
@@ -441,6 +515,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
                 group=config.consumer_group,
             ),
             dead_owner_proof_s=config.consumer_heartbeat_ttl_ms / 1000.0,
+        ),
+        pressure_lock=ThreadLock(
+            pressure_async_redis,
+            ttl_ms=config.lock_ttl_ms,
+            acquire_timeout_s=0.1,
+            poll_interval_s=0.02,
+            owner=None,
         ),
         markers=Markers(async_redis, config),
         config=config,
@@ -463,8 +544,14 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
+        hook_runs=HookRunRecorder(engine),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
+        work_items=work_items,
+        sibling_limit=sibling_limit,
+        # Deliberate progress (ADR 0130): the durable record a person's turn
+        # reports on, the one the maintenance tick sweeps.
+        progress=ProgressStore(async_redis, config),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
@@ -531,11 +618,45 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         runner=runner,
         sink=sink,
         async_redis=async_redis,
+        pressure_async_redis=pressure_async_redis,
         eval_redis=eval_redis,
         eval_http=eval_http,
         engine=engine,
         card_store=card_store,
+        orphan_sweeper=(
+            WorkItemOrphanSweeper(
+                work_items,
+                ThreadLockOwnerLiveness(
+                    ConsumerLivenessStore(async_redis),
+                    stream=config.stream,
+                    group=config.consumer_group,
+                ).is_alive,
+                self_name=config.consumer_name,
+                locally_owned=kernel.owns_work_item,
+                absence_proof_s=config.consumer_heartbeat_ttl_ms / 1000,
+                interval_s=config.work_item_orphan_sweep_interval_s,
+            )
+            if work_items is not None
+            else None
+        ),
         connector_loop=_build_connector_loop(config, engine),
+        cron_loop=CronSchedulerLoop(
+            engine=engine,
+            redis=async_redis,
+            source=BundleTriggerSource(
+                BundleStore(config),
+                max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+                max_compression_ratio=config.bundle_max_compression_ratio,
+                max_members=config.bundle_max_members,
+            ),
+            is_killed=killswitch.is_killed,
+            db_schema=config.db_schema,
+            stream=config.stream,
+            interval_seconds=config.cron_tick_interval_s,
+            claim_lease_s=config.effective_hook_claim_lease_s,
+            default_max_usd_per_day=config.default_max_usd_per_day,
+            default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
+        ),
         publication_loop=publication_loop,
     )
 
@@ -547,6 +668,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "evals",
         "heartbeat",
         "connectors",
+        "cron",
         "publications",
     }
 )
@@ -567,6 +689,50 @@ def _restart_delay_s(
     # Clamp the exponent so a long streak cannot overflow the float math.
     exponent = min(consecutive_failures - 1, 62)
     return min(base_s * float(2**exponent), max_s)
+
+
+# How long after boot a dependency that is not reachable yet is expected rather
+# than a fault (#3079). On a fresh install postgres, Valkey and the object store
+# come up alongside the worker; for this window a supervised task that fails on
+# them logs a one-line warning and retries instead of a full traceback.
+_BOOT_GRACE_S = 120.0
+
+# Object-store error codes a fresh install returns until its bucket is created.
+_NOT_READY_S3_CODES = frozenset({"NoSuchBucket"})
+
+
+def _is_dependency_not_ready(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything in its cause chain) means a dependency is
+    not reachable or not provisioned yet, rather than a bug in the task."""
+
+    import redis.exceptions
+    import sqlalchemy.exc
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        # Network failures only: a PermissionError or FileNotFoundError is a
+        # local fault, not a dependency warming up.
+        if isinstance(
+            current,
+            socket.gaierror
+            | ConnectionError
+            | TimeoutError
+            | redis.exceptions.ConnectionError
+            | redis.exceptions.TimeoutError
+            | sqlalchemy.exc.OperationalError
+            | sqlalchemy.exc.InterfaceError,
+        ):
+            return True
+        # botocore's ClientError, matched by shape so boto3 stays a lazy import.
+        response = getattr(current, "response", None)
+        if isinstance(response, dict):
+            code = response.get("Error", {}).get("Code")
+            if code in _NOT_READY_S3_CODES:
+                return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _record_supervised(name: str, outcome: str) -> None:
@@ -593,6 +759,7 @@ async def _supervise(
     max_restart_backoff_s: float = 60.0,
     max_consecutive_failures: int = 10,
     failure_reset_s: float = 300.0,
+    boot_grace_s: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Run a worker task, restarting it if it crashes, until shutdown is requested.
@@ -616,12 +783,18 @@ async def _supervise(
     alert is what surfaces the parked task. ``max_consecutive_failures <= 0``
     disables the give-up.
 
+    For the first ``boot_grace_s`` after the supervisor starts, a crash caused by
+    a dependency that is not ready yet (see ``_is_dependency_not_ready``) logs a
+    one-line warning with the retry delay instead of a traceback (#3079). Any
+    other crash, and any crash after that window, logs the full traceback.
+
     ``factory`` is a thunk (e.g. a bound ``run`` method) so each restart gets a
     fresh coroutine; ``run()`` is re-entrant (group creation is BUSYGROUP-safe).
     Unknown task names map to catalog ``other`` so a test or new loop cannot
     crash the supervisor by emitting an undeclared operation.
     """
     consecutive_failures = 0
+    booted = clock()
     while not shutdown.is_set():
         started = clock()
         try:
@@ -650,15 +823,25 @@ async def _supervise(
                 base_s=restart_backoff_s,
                 max_s=max_restart_backoff_s,
             )
-            logger.exception(
-                "worker task %s crashed; restarting in %.1fs (consecutive "
-                "failure %d) cause=%s: %s",
-                name,
-                delay_s,
-                consecutive_failures,
-                type(exc).__name__,
-                exc,
-            )
+            if clock() - booted < boot_grace_s and _is_dependency_not_ready(exc):
+                logger.warning(
+                    "worker task %s is waiting for a dependency that is not ready "
+                    "yet; retrying in %.1fs (expected during startup) cause=%s: %s",
+                    name,
+                    delay_s,
+                    type(exc).__name__,
+                    " ".join(str(exc).split()),
+                )
+            else:
+                logger.exception(
+                    "worker task %s crashed; restarting in %.1fs (consecutive "
+                    "failure %d) cause=%s: %s",
+                    name,
+                    delay_s,
+                    consecutive_failures,
+                    type(exc).__name__,
+                    exc,
+                )
             _record_supervised(name, "restart")
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=delay_s)
@@ -671,6 +854,7 @@ class _SupervisePolicy(TypedDict):
     max_restart_backoff_s: float
     max_consecutive_failures: int
     failure_reset_s: float
+    boot_grace_s: float
 
 
 def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
@@ -681,6 +865,7 @@ def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
         "max_restart_backoff_s": config.supervise_restart_backoff_max_s,
         "max_consecutive_failures": config.supervise_max_consecutive_failures,
         "failure_reset_s": config.supervise_failure_reset_s,
+        "boot_grace_s": _BOOT_GRACE_S,
     }
 
 
@@ -837,8 +1022,34 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             "cut short; any legacy ref it did not reach simply lapses with its TTL",
             _CARD_MIGRATION_BUDGET_S,
         )
-    except Exception:
-        logger.exception("legacy approval card migration failed; continuing boot")
+    except Exception as exc:
+        if _is_dependency_not_ready(exc):
+            logger.warning(
+                "legacy approval card migration skipped: a dependency is not ready "
+                "yet (expected during startup) cause=%s: %s",
+                type(exc).__name__,
+                " ".join(str(exc).split()),
+            )
+        else:
+            logger.exception("legacy approval card migration failed; continuing boot")
+    # One boot sweep before any consumer reads: a run this process's previous
+    # incarnation owned is an orphan now (#3076). Swallowed like the migration.
+    sweeper = rt.orphan_sweeper
+    if sweeper is not None:
+        try:
+            await asyncio.wait_for(sweeper.sweep(), timeout=_ORPHAN_SWEEP_BUDGET_S)
+        except TimeoutError:
+            logger.warning("work-item orphan boot sweep exceeded its budget; the loop resumes it")
+        except Exception as exc:
+            if _is_dependency_not_ready(exc):
+                logger.warning(
+                    "work-item orphan boot sweep deferred to its loop: a dependency "
+                    "is not ready yet (expected during startup) cause=%s: %s",
+                    type(exc).__name__,
+                    " ".join(str(exc).split()),
+                )
+            else:
+                logger.exception("work-item orphan boot sweep failed; continuing boot")
     policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
@@ -868,6 +1079,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             *(
                 [
                     _supervise(
+                        "cron",
+                        lambda: rt.cron_loop.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if rt.cron_loop is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
                         "publications",
                         lambda: rt.publication_loop.run_forever(shutdown),  # type: ignore[union-attr]
                         shutdown,
@@ -877,6 +1100,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                     if getattr(rt, "publication_loop", None) is not None
                 else []
             ),
+            *(
+                [
+                    _supervise(
+                        "work-item-orphans",
+                        lambda: sweeper.run_forever(shutdown),
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if sweeper is not None
+                else []
+            ),
             return_exceptions=True,
         )
     finally:
@@ -884,6 +1119,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         await rt.sink.aclose()
         await rt.eval_http.aclose()
         await rt.async_redis.aclose()
+        await rt.pressure_async_redis.aclose()
         await rt.eval_redis.aclose()
         await rt.engine.dispose()
     logging.getLogger("curie_worker").info("worker stopped")

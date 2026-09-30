@@ -33,14 +33,47 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   platform key. `POST /channels/token` bumps that generation on every mint so a
   remint revokes the previous token (#2379). It is a SIBLING credential, never a
   widening of the sandbox token: the two verify against different modules and
-  neither authenticates as the other. `POST /channels/token` (the mint) stays
-  platform-key-only, and a `chn` token is refused on every other router,
-  `/approvals/{id}/resolve` included. Extending it further still takes a new ADR.
+  neither authenticates as the other. A `chn` token never mints, and it is
+  refused on every other router, `/approvals/{id}/resolve` included. Extending
+  it further still takes a new ADR.
+- **A channel adapter is a principal (ADR-0154, #2806), the THIRD exception.**
+  An `adp` credential (`adapter_principal.py`, header
+  `X-Curie-Adapter-Principal`), issued by the platform key at
+  `POST /approvals/principals/adapter` and self-rotated at `.../rotate`, is
+  accepted by exactly three routes, each checking its binding set:
+  `POST /channels/token` (only for a binding it serves; else 403),
+  `GET /approvals` (filtered to approvals it serves) and
+  `/approvals/{id}/resolve` (with `X-Curie-Approval-Actor`; unserved is 404).
+  Served is ONE predicate, `crud._approval_served`, for both. Presenting it
+  with the platform key or another resolver credential is 401, never a
+  precedence choice. The resolver kinds are `chat`, `console`, `operator` and
+  `adapter`; `operator` resolves only explicit-user routes, and no Slack approver
+  set admits `adapter`, since only the dispatcher vouches for a Slack ID
+  (ADR-0177's separate finding).
+- **Who may start a turn is decided in ONE function (ADR 0175, #3241).**
+  `admission.admit` answers for a binding's optional `allowed_callers` list, and
+  both entry points call it: `POST /channels/turns` after token verification and
+  before any claim (403 with `detail: caller_not_allowed`, frozen in
+  `tests/vectors/channel-port-refusal.json`), and the platform-key-only
+  `POST /channels/admission` the dispatcher asks. Do not compare caller ids
+  anywhere else. The list is written only by
+  `PUT /agents/{agent_id}/channels/callers`, which does NOT bump the binding
+  generation, so editing it never revokes an adapter's `chn` token.
 - **The GitHub webhook is authenticated differently, on purpose.** `/github/webhook`
   verifies the HMAC signature GitHub sends (`x-hub-signature-256` against
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an
   `X-API-Key` header. It lives outside the `require_api_key` dependency
   deliberately (`routers/github.py`); do not add the API-key dependency to it.
+- **Publication comparison is a scoped credential exception (ADR 0174).**
+  `POST /publications/precheck` accepts only the API issued `ppc` capability
+  in `X-Curie-Publication-Precheck`. Its sole scope is `publication.precheck`.
+  The worker mints it through `POST /v1/internal/publications/precheck/context`
+  using its internal worker credential. Mint and comparison verify the running
+  WorkItem request, runtime epoch, lease, deadline and lineage before and after
+  the provider read. Comparison reads one current pull request and writes only
+  its shared Valkey attempt budget. It cannot create publication or approval
+  state or redeem repository credentials. State and other scoped credentials
+  do not authorize comparison, and `ppc` authorizes no other route.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow

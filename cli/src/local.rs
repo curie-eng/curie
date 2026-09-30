@@ -6,6 +6,7 @@
 //! (or the `--dry-run` printer) consumes it, so argv construction stays
 //! unit-testable with no Docker daemon.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 
@@ -18,10 +19,81 @@ use crate::ops::{plain, require_on_path, run_capture, run_step, CmdArg, OpsComma
 /// Dev-channel local-candidate filename probed by the artifact resolver.
 pub const DEFAULT_COMPOSE_FILE: &str = "compose.dev.yaml";
 
-/// The compose project every local-tier command pins, injected as
-/// `COMPOSE_PROJECT_NAME`. Named once so the connector overlay joins the same
-/// project (and therefore the same `curie_runner` network) the stack runs under.
+/// The default compose project when the caller supplies no isolation contract.
+/// Every local compose child still passes `-p` this value rather than deriving
+/// the project from the working-directory basename.
 pub const COMPOSE_PROJECT: &str = "curie";
+
+/// Default named runner network in `compose.dev.yaml`. Isolation remaps it to
+/// `{project}_runner`.
+pub const DEFAULT_DOCKER_NETWORK: &str = "curie_runner";
+
+/// Default host:container staging path the host-network worker bind-mounts.
+pub const DEFAULT_STAGING_DIR: &str = "/tmp/curie-bundles";
+
+/// Default published Postgres host port in `compose.dev.yaml`.
+pub const DEFAULT_POSTGRES_PORT: u16 = 25432;
+
+/// Isolation is all-or-nothing. These names must be set together whenever the
+/// caller selects a custom project or extra compose files.
+const ISOLATION_ENV: &[&str] = &[
+    "CURIE_API_URL",
+    "VALKEY_HOST",
+    "VALKEY_PORT",
+    "S3_ENDPOINT_URL",
+    "CURIE_DOCKER_NETWORK",
+    "CURIE_LOCAL_STUB_PORT",
+    "CURIE_LOCAL_POSTGRES_HOST",
+    "CURIE_LOCAL_POSTGRES_PORT",
+    "CURIE_LOCAL_STAGING_DIR",
+    "CURIE_LOCAL_IMAGE_TAG",
+];
+
+/// One explicit resource configuration for every local CLI consumer (#2780).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalResources {
+    pub project: String,
+    pub compose_files: Vec<String>,
+    pub api_url: String,
+    pub valkey_host: String,
+    pub valkey_port: u16,
+    pub postgres_host: String,
+    pub postgres_port: u16,
+    pub s3_endpoint: String,
+    pub docker_network: String,
+    pub stub_port: u16,
+    pub staging_dir: String,
+    pub image_tag: String,
+}
+
+impl LocalResources {
+    /// Shared default stack: project `curie`, one compose file, published ports.
+    pub fn shared_default(compose_file: impl Into<String>) -> Self {
+        Self {
+            project: COMPOSE_PROJECT.to_string(),
+            compose_files: vec![compose_file.into()],
+            api_url: crate::message::DEFAULT_LOCAL_API_URL.to_string(),
+            valkey_host: "localhost".to_string(),
+            valkey_port: crate::message::DEFAULT_LOCAL_VALKEY_PORT,
+            postgres_host: "localhost".to_string(),
+            postgres_port: DEFAULT_POSTGRES_PORT,
+            s3_endpoint: "http://localhost:29000".to_string(),
+            docker_network: DEFAULT_DOCKER_NETWORK.to_string(),
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
+            staging_dir: DEFAULT_STAGING_DIR.to_string(),
+            image_tag: "dev".to_string(),
+        }
+    }
+
+    pub fn isolated(&self) -> bool {
+        self.project != COMPOSE_PROJECT || self.compose_files.len() > 1
+    }
+}
+
+/// Resolve isolation from the process environment, or the shared default stack.
+pub fn current_resources() -> Result<LocalResources> {
+    resolve_local_resources(None, Vec::new(), DEFAULT_COMPOSE_FILE.to_string(), false)
+}
 
 /// The Docker volume holding this tier's Ollama model cache: compose's
 /// `ollama_data` under the pinned `curie` project name that `up_command`
@@ -61,6 +133,28 @@ const ENDPOINTS: &[(&str, &str, bool)] = &[
     ("OTel gRPC", "localhost:24317", false),
     ("OTel HTTP", "localhost:24318", false),
 ];
+
+fn advertised_endpoints(resources: &LocalResources, minimal: bool) -> Vec<(String, String)> {
+    if !resources.isolated() {
+        return ENDPOINTS
+            .iter()
+            .filter(|(_, _, is_core)| !minimal || *is_core)
+            .map(|(label, url, _)| ((*label).to_string(), (*url).to_string()))
+            .collect();
+    }
+    vec![
+        ("Curie API".into(), resources.api_url.clone()),
+        (
+            "Postgres".into(),
+            format!("{}:{}", resources.postgres_host, resources.postgres_port),
+        ),
+        (
+            "Valkey".into(),
+            format!("{}:{}", resources.valkey_host, resources.valkey_port),
+        ),
+        ("RustFS S3".into(), resources.s3_endpoint.clone()),
+    ]
+}
 
 /// Credential env vars the compose stack forwards from the shell (bare names in
 /// `compose.dev.yaml`). Any one set non-empty makes `local up` go live, matching
@@ -230,7 +324,8 @@ pub fn load_env_file_up_plan(
 
 /// Flags shared by every `local` verb.
 pub struct LocalOpts {
-    pub file: String,
+    /// Selected compose project, ordered compose files, and matching endpoints.
+    pub resources: LocalResources,
     pub dry_run: bool,
     pub minimal: bool,
     pub local_model: Option<String>,
@@ -269,6 +364,318 @@ pub struct LocalOpts {
     pub stack_image_env: Vec<(String, String)>,
 }
 
+impl LocalOpts {
+    pub fn for_file(file: impl Into<String>) -> Self {
+        Self {
+            resources: LocalResources::shared_default(file),
+            dry_run: false,
+            minimal: false,
+            local_model: None,
+            slack: false,
+            model_mode: ModelMode::DefaultFake,
+            env_file: None,
+            pull_model: false,
+            build: None,
+            stack_image_env: Vec::new(),
+        }
+    }
+
+    pub fn project(&self) -> &str {
+        &self.resources.project
+    }
+
+    pub fn files(&self) -> &[String] {
+        &self.resources.compose_files
+    }
+
+    pub fn file(&self) -> &str {
+        self.resources
+            .compose_files
+            .first()
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_COMPOSE_FILE)
+    }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn isolation_usage(missing: &[String]) -> anyhow::Error {
+    crate::exit::CliError::usage(format!(
+        "custom Compose project, ordered compose files, and matching host endpoints must be set all together; incomplete isolation is missing {}",
+        missing.join(", ")
+    ))
+    .with_fix(
+        "set COMPOSE_PROJECT_NAME with COMPOSE_FILE (base compose.dev.yaml then an override) \
+         and the matching CURIE_API_URL, VALKEY_HOST, VALKEY_PORT, S3_ENDPOINT_URL, \
+         CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_POSTGRES_HOST, \
+         CURIE_LOCAL_POSTGRES_PORT, CURIE_LOCAL_STAGING_DIR, and CURIE_LOCAL_IMAGE_TAG",
+    )
+    .into()
+}
+
+/// Resolve the one local resource configuration from CLI flags and env.
+pub fn resolve_local_resources(
+    project_flag: Option<String>,
+    file_flags: Vec<String>,
+    default_file: String,
+    build: bool,
+) -> Result<LocalResources> {
+    let compose_file_env = env_nonempty("COMPOSE_FILE");
+    let project_env = env_nonempty("COMPOSE_PROJECT_NAME");
+    if compose_file_env.is_some() && project_flag.is_none() && project_env.is_none() {
+        return Err(
+            crate::exit::CliError::usage("COMPOSE_FILE requires COMPOSE_PROJECT_NAME")
+                .with_fix("export COMPOSE_PROJECT_NAME with COMPOSE_FILE, or pass --project")
+                .into(),
+        );
+    }
+
+    let mut files = file_flags;
+    if files.is_empty() {
+        if let Some(value) = compose_file_env {
+            files = value
+                .split(':')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect();
+        }
+    }
+    let project = project_flag.or(project_env);
+    let isolated = project.as_deref().is_some_and(|p| p != COMPOSE_PROJECT) || files.len() > 1;
+
+    if !isolated {
+        let file = files.into_iter().next().unwrap_or(default_file);
+        return Ok(LocalResources::shared_default(file));
+    }
+
+    let project = project.ok_or_else(|| isolation_usage(&["COMPOSE_PROJECT_NAME".into()]))?;
+    if !project
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        || !project
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(crate::exit::CliError::usage(
+            "COMPOSE_PROJECT_NAME must be a nonempty lowercase Compose project name",
+        )
+        .into());
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    if files.len() < 2 {
+        missing.push("ordered compose files (base then override)".into());
+    }
+    let values: Vec<(&str, Option<String>)> = ISOLATION_ENV
+        .iter()
+        .map(|name| (*name, env_nonempty(name)))
+        .collect();
+    for (name, value) in &values {
+        if value.is_none() {
+            missing.push((*name).to_string());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(isolation_usage(&missing));
+    }
+
+    for path in &files {
+        let p = std::path::Path::new(path);
+        if !p.is_absolute() {
+            return Err(crate::exit::CliError::usage(
+                "isolated COMPOSE_FILE paths must be existing absolute compose files",
+            )
+            .into());
+        }
+        if !p.is_file() {
+            return Err(crate::exit::CliError::usage(format!(
+                "isolated compose file does not exist: {path}"
+            ))
+            .into());
+        }
+    }
+    if build {
+        let base = std::path::Path::new(&files[0]);
+        let canonical = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(DEFAULT_COMPOSE_FILE))
+            .and_then(|path| path.canonicalize().ok());
+        let base_canonical = base.canonicalize().ok();
+        if canonical.is_none() || base_canonical != canonical {
+            return Err(crate::exit::CliError::usage(
+                "--build isolation requires this checkout's compose.dev.yaml as the first compose file",
+            )
+            .with_fix("pass -f $PWD/compose.dev.yaml -f /abs/path/override.yaml")
+            .into());
+        }
+    }
+
+    let get = |name: &str| -> String {
+        values
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, v)| v.clone())
+            .expect("isolation env present after missing check")
+    };
+
+    let resources = LocalResources {
+        project: project.clone(),
+        compose_files: files.clone(),
+        api_url: get("CURIE_API_URL"),
+        valkey_host: get("VALKEY_HOST"),
+        valkey_port: get("VALKEY_PORT")
+            .parse()
+            .map_err(|_| crate::exit::CliError::usage("VALKEY_PORT must be a TCP port"))?,
+        postgres_host: get("CURIE_LOCAL_POSTGRES_HOST"),
+        postgres_port: get("CURIE_LOCAL_POSTGRES_PORT").parse().map_err(|_| {
+            crate::exit::CliError::usage("CURIE_LOCAL_POSTGRES_PORT must be a TCP port")
+        })?,
+        s3_endpoint: get("S3_ENDPOINT_URL"),
+        docker_network: get("CURIE_DOCKER_NETWORK"),
+        stub_port: get("CURIE_LOCAL_STUB_PORT").parse().map_err(|_| {
+            crate::exit::CliError::usage("CURIE_LOCAL_STUB_PORT must be a TCP port")
+        })?,
+        staging_dir: get("CURIE_LOCAL_STAGING_DIR"),
+        image_tag: get("CURIE_LOCAL_IMAGE_TAG"),
+    };
+    validate_isolated_override(&resources, build)?;
+    let _ = values;
+    Ok(resources)
+}
+
+fn merged_compose_config(resources: &LocalResources, build: bool) -> Result<serde_json::Value> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.arg("compose")
+        .arg("--profile")
+        .arg("full")
+        .arg("-p")
+        .arg(&resources.project);
+    for file in &resources.compose_files {
+        cmd.arg("-f").arg(file);
+    }
+    cmd.args(["config", "--format", "json"]);
+    cmd.env("COMPOSE_PROJECT_NAME", &resources.project);
+    cmd.env("CURIE_DOCKER_NETWORK", &resources.docker_network);
+    if build {
+        cmd.env("CURIE_BASE_TAG", &resources.image_tag);
+        for image in source_images_for(false) {
+            if let Some(name) = image.env {
+                cmd.env(name, source_image_ref(image.image, &resources.image_tag));
+            }
+        }
+    }
+    let output = cmd.output().map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "isolated compose config could not run docker compose: {err}"
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::exit::CliError::usage(format!(
+            "isolated docker compose config failed: {}",
+            stderr.trim()
+        ))
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "isolated docker compose config was not JSON: {err}"
+        ))
+        .into()
+    })
+}
+
+fn service_environment(config: &serde_json::Value, service: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let env = &config["services"][service]["environment"];
+    if let Some(obj) = env.as_object() {
+        for (key, value) in obj {
+            let rendered = match value {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::Bool(flag) => flag.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            map.insert(key.clone(), rendered);
+        }
+    } else if let Some(entries) = env.as_array() {
+        for item in entries {
+            if let Some(entry) = item.as_str() {
+                if let Some((key, value)) = entry.split_once('=') {
+                    map.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result<()> {
+    let config = merged_compose_config(resources, build)?;
+    let worker = service_environment(&config, "curie-worker");
+    let required = [
+        (
+            "DATABASE_URL",
+            format!("{}:{}", resources.postgres_host, resources.postgres_port),
+        ),
+        ("VALKEY_HOST", resources.valkey_host.clone()),
+        ("VALKEY_PORT", resources.valkey_port.to_string()),
+        ("S3_ENDPOINT_URL", resources.s3_endpoint.clone()),
+        ("CURIE_API_URL", resources.api_url.clone()),
+        ("CURIE_DOCKER_NETWORK", resources.docker_network.clone()),
+        ("TMPDIR", resources.staging_dir.clone()),
+        ("SLACK_API_BASE_URL", format!(":{}", resources.stub_port)),
+    ];
+    for (key, needle) in required {
+        let value = worker.get(key).map(String::as_str).unwrap_or("");
+        if !value.contains(&needle) {
+            return Err(crate::exit::CliError::usage(format!(
+                "isolated override does not rebind host-network worker {key} to {needle}; \
+                 a ports-only override leaves the worker on the shared stack"
+            ))
+            .with_fix(
+                "override curie-worker environment (DATABASE_URL, VALKEY_HOST, VALKEY_PORT, \
+                 S3_ENDPOINT_URL, CURIE_API_URL, SLACK_API_BASE_URL, TMPDIR, CURIE_DOCKER_NETWORK) \
+                 and the identical host:container staging mount",
+            )
+            .into());
+        }
+    }
+    let network_name = config["networks"]["curie_runner"]["name"]
+        .as_str()
+        .unwrap_or("");
+    if network_name != resources.docker_network {
+        return Err(crate::exit::CliError::usage(format!(
+            "isolated override does not name the runner network {}; resolved name is {network_name}",
+            resources.docker_network
+        ))
+        .with_fix("set networks.curie_runner.name to ${COMPOSE_PROJECT_NAME}_runner")
+        .into());
+    }
+    if build {
+        for service in [
+            "curie-api",
+            "curie-worker",
+            "curie-dispatcher",
+            "curie-runner",
+            "curie-ui",
+        ] {
+            let image = config["services"][service]["image"].as_str().unwrap_or("");
+            if image.contains("ghcr.io/curie-eng/") && !image.contains(&resources.image_tag) {
+                return Err(crate::exit::CliError::usage(format!(
+                    "isolated override pins {service} to {image} and would disconnect --build from the candidate"
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether the compose file THIS run resolved substitutes the tags `--build`
 /// writes (#1926). Produced by [`ensure_build_reaches_the_stack`] and carried
 /// on [`LocalOpts::build`].
@@ -292,9 +699,10 @@ pub const SOURCE_IMAGE_TAG: &str = "dev";
 /// The ghcr ref `--build` writes and the stack runs, for one published image.
 ///
 /// Named once so `build_source_images` and `compose_model_env` cannot drift:
-/// the tag a `--build` stack runs is the tag it just built (#1931).
-pub fn source_image_ref(image: &str) -> String {
-    image_ref(image, SOURCE_IMAGE_TAG)
+/// the tag a `--build` stack runs is the tag it just built (#1931). Isolation
+/// passes `LocalResources.image_tag`; the default path passes [`SOURCE_IMAGE_TAG`].
+pub fn source_image_ref(image: &str, tag: &str) -> String {
+    image_ref(image, tag)
 }
 
 /// The ghcr ref for one published image at an arbitrary tag.
@@ -474,7 +882,7 @@ pub fn image_tag(image: &str) -> Option<&str> {
 /// matches nothing here and compose's published defaults stand, as they should.
 /// Newest first, which is `docker ps`'s own ordering, so a superseded container
 /// left behind by an earlier run never outvotes the current one.
-fn api_ps_command() -> OpsCommand {
+fn api_ps_command(project: &str) -> OpsCommand {
     OpsCommand::new(
         "docker",
         vec![
@@ -482,6 +890,8 @@ fn api_ps_command() -> OpsCommand {
             plain("-a"),
             plain("--filter"),
             plain("label=com.docker.compose.service=curie-api"),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
             plain("--format"),
             plain("{{.Names}}"),
         ],
@@ -531,12 +941,12 @@ pub async fn image_present(image: &str) -> bool {
     image_present_with(image, &mut capture).await
 }
 
-async fn running_stack_tag_with<F, Fut>(capture: &mut F) -> Option<String>
+async fn running_stack_tag_with<F, Fut>(capture: &mut F, project: &str) -> Option<String>
 where
     F: FnMut(OpsCommand) -> Fut,
     Fut: Future<Output = Result<(bool, String, String)>>,
 {
-    let (ok, stdout, _) = capture(api_ps_command()).await.ok()?;
+    let (ok, stdout, _) = capture(api_ps_command(project)).await.ok()?;
     if !ok {
         return None;
     }
@@ -559,17 +969,21 @@ where
 ///
 /// Best-effort throughout: any unreadable step returns None and compose's
 /// defaults stand, which is the behaviour that existed before #1915.
-pub async fn running_stack_tag() -> Option<String> {
+pub async fn running_stack_tag(project: &str) -> Option<String> {
     let mut capture = |command: OpsCommand| async move { run_capture(&command).await };
-    running_stack_tag_with(&mut capture).await
+    running_stack_tag_with(&mut capture, project).await
 }
 
-async fn running_stack_image_with<F, Fut>(image: &str, capture: &mut F) -> Option<String>
+async fn running_stack_image_with<F, Fut>(
+    image: &str,
+    capture: &mut F,
+    project: &str,
+) -> Option<String>
 where
     F: FnMut(OpsCommand) -> Fut,
     Fut: Future<Output = Result<(bool, String, String)>>,
 {
-    let tag = running_stack_tag_with(capture).await?;
+    let tag = running_stack_tag_with(capture, project).await?;
     let candidate = image_ref(image, &tag);
     image_present_with(&candidate, capture)
         .await
@@ -578,9 +992,9 @@ where
 
 /// Resolve `image` at the running local stack's tag when that candidate exists.
 /// Best-effort: any unreadable probe leaves compose's own default in force.
-pub(crate) async fn running_stack_image(image: &str) -> Option<String> {
+pub(crate) async fn running_stack_image(image: &str, project: &str) -> Option<String> {
     let mut capture = |command: OpsCommand| async move { run_capture(&command).await };
-    running_stack_image_with(image, &mut capture).await
+    running_stack_image_with(image, &mut capture, project).await
 }
 
 /// The compose env pinning every image to `tag`, given which of the per-image
@@ -628,7 +1042,7 @@ pub async fn resolve_stack_image_env(o: &mut LocalOpts) {
     if o.build.is_some() {
         return;
     }
-    let Some(tag) = running_stack_tag().await else {
+    let Some(tag) = running_stack_tag(o.project()).await else {
         return;
     };
     let mut present = Vec::new();
@@ -678,9 +1092,25 @@ pub struct LocalRebuildOpts {
 // Command builders (pure; unit-tested below)
 // ---------------------------------------------------------------------------
 
-/// `docker compose -f <file> <tail...>`.
-fn compose(file: &str, tail: &[&str]) -> OpsCommand {
-    let mut args = vec![plain("compose"), plain("-f"), plain(file)];
+/// `-p <project> -f <file>...` shared by every compose child.
+fn compose_project_file_args(project: &str, files: &[String]) -> Vec<CmdArg> {
+    let mut args = vec![plain("-p"), plain(project)];
+    let files = if files.is_empty() {
+        vec![DEFAULT_COMPOSE_FILE.to_string()]
+    } else {
+        files.to_vec()
+    };
+    for file in files {
+        args.push(plain("-f"));
+        args.push(plain(file));
+    }
+    args
+}
+
+/// `docker compose -p <project> -f <file>... <tail...>`.
+fn compose(project: &str, files: &[String], tail: &[&str]) -> OpsCommand {
+    let mut args = vec![plain("compose")];
+    args.extend(compose_project_file_args(project, files));
     for t in tail {
         args.push(plain(*t));
     }
@@ -723,11 +1153,10 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
             // Spawned runners join the dedicated, data-tier-free runner network
             // (#631). ollama is multi-homed onto it, so `--local-model` resolves
             // `ollama` by name without exposing postgres/valkey/rustfs.
-            ("CURIE_DOCKER_NETWORK".into(), "curie_runner".into()),
-            // Pin the compose project name so the default network is always
-            // `curie_default`, regardless of the working-directory basename
-            // (which is what compose otherwise derives the project name from).
-            ("COMPOSE_PROJECT_NAME".into(), COMPOSE_PROJECT.into()),
+            (
+                "CURIE_DOCKER_NETWORK".into(),
+                o.resources.docker_network.clone(),
+            ),
         ]
     } else {
         // Delegate to `fake_model_env_override`, which discriminates on
@@ -747,6 +1176,13 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
     // above, not inside it, because the `--local-model` arm does not fall
     // through to the else: `--minimal --local-model` needs suppressing too.
     env.extend(otel_endpoint_env_override(o.minimal));
+    env.push(("COMPOSE_PROJECT_NAME".into(), o.resources.project.clone()));
+    if !env.iter().any(|(k, _)| k == "CURIE_DOCKER_NETWORK") {
+        env.push((
+            "CURIE_DOCKER_NETWORK".into(),
+            o.resources.docker_network.clone(),
+        ));
+    }
     // #1915: point every published image at what `--build` just built. Set here
     // rather than in `up` so `--dry-run` shows it, and so the one variable drives
     // api, migrate, worker, ui and dispatcher uniformly -- which is why the two
@@ -757,10 +1193,13 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
         // Named outright rather than derived: CURIE_BASE_TAG means "the platform
         // images this caller built", and CI sets it while building only those
         // two, so anything else reading it goes looking for a tag nothing built.
-        env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
+        env.push(("CURIE_BASE_TAG".into(), o.resources.image_tag.clone()));
         for image in source_images(o) {
             if let Some(name) = image.env {
-                env.push((name.into(), source_image_ref(image.image)));
+                env.push((
+                    name.into(),
+                    source_image_ref(image.image, &o.resources.image_tag),
+                ));
             }
         }
     } else {
@@ -776,13 +1215,8 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
 
 fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
     let mut args = compose_profile_args(o);
-    args.extend([
-        plain("-f"),
-        plain(&o.file),
-        plain("up"),
-        plain("-d"),
-        plain("--wait"),
-    ]);
+    args.extend(compose_project_file_args(o.project(), o.files()));
+    args.extend([plain("up"), plain("-d"), plain("--wait")]);
     // #1915: `curie-worker` is a compose-built OVERLAY over the published base.
     // Rebuilding the base is not enough -- without this, compose reuses the
     // overlay it baked over the PREVIOUS base, so the stack runs yesterday's
@@ -814,9 +1248,8 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
 /// code change before recreating.
 pub fn rebuild_command(o: &LocalOpts, service: &str, model: Option<&str>) -> OpsCommand {
     let mut args = compose_profile_args(o);
+    args.extend(compose_project_file_args(o.project(), o.files()));
     args.extend([
-        plain("-f"),
-        plain(&o.file),
         plain("up"),
         plain("-d"),
         plain("--build"),
@@ -852,7 +1285,11 @@ pub fn down_command(o: &LocalDownOpts) -> OpsCommand {
         args.push(plain("--profile"));
         args.push(plain(*p));
     }
-    args.extend([plain("-f"), plain(&o.common.file), plain("down")]);
+    args.extend(compose_project_file_args(
+        o.common.project(),
+        o.common.files(),
+    ));
+    args.push(plain("down"));
     if o.wipe {
         args.push(plain("-v"));
     }
@@ -861,7 +1298,7 @@ pub fn down_command(o: &LocalDownOpts) -> OpsCommand {
 
 /// `docker compose -f <file> ps`.
 pub fn status_command(o: &LocalOpts) -> OpsCommand {
-    compose(&o.file, &["ps"])
+    compose(o.project(), o.files(), &["ps"])
 }
 
 /// Whether the URL points at the default local deploy API.
@@ -985,9 +1422,14 @@ impl crate::ui::CliOutput for LocalUpOutput {
                     ui.note("Slack dispatcher started (Socket Mode; no host port).");
                 }
                 ui.note("Drive the local product loop (no Slack, no Kubernetes):");
-                ui.note(
-                    "  curie local deploy --plugin-dir <dir> --slack-channel <C...> --api-url http://localhost:28000",
-                );
+                let api = endpoints
+                    .iter()
+                    .find(|(name, _)| name == "Curie API")
+                    .map(|(_, url)| url.as_str())
+                    .unwrap_or(crate::message::DEFAULT_LOCAL_API_URL);
+                ui.note(&format!(
+                    "  curie local deploy --plugin-dir <dir> --slack-channel <C...> --api-url {api}",
+                ));
                 ui.note("  curie local message \"<your question>\"");
             }
         }
@@ -1082,24 +1524,24 @@ async fn build_source_images(o: &LocalOpts, reach: BuildReach) -> Result<()> {
          source; a release binary runs the published images and has nothing to build.",
     )?;
     let images = source_images(o);
+    let tag = o.resources.image_tag.as_str();
     ui.note(&format!(
-        "building {} image(s) from {} as :{SOURCE_IMAGE_TAG}",
+        "building {} image(s) from {} as :{tag}",
         images.len(),
         root.display()
     ));
     for image in &images {
-        let tag = source_image_ref(image.image);
-        crate::commands::build_image(image.dockerfile, &tag).await?;
+        let ref_ = source_image_ref(image.image, tag);
+        crate::commands::build_image(image.dockerfile, &ref_).await?;
     }
     match reach {
         BuildReach::Substitutes => ui.success(&format!(
-            "built {} image(s) as :{SOURCE_IMAGE_TAG}; the stack below runs them",
+            "built {} image(s) as :{tag}; the stack below runs them",
             images.len()
         )),
-        BuildReach::Unconfirmed => ui.success(&format!(
-            "built {} image(s) as :{SOURCE_IMAGE_TAG}",
-            images.len()
-        )),
+        BuildReach::Unconfirmed => {
+            ui.success(&format!("built {} image(s) as :{tag}", images.len()))
+        }
     }
     Ok(())
 }
@@ -1135,7 +1577,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
         if !o.pull_model {
             docker::preflight_local_model(
                 crate::commands::DEFAULT_OLLAMA_IMAGE,
-                COMPOSE_OLLAMA_VOLUME,
+                &format!("{}_ollama_data", o.project()),
                 model,
                 &format!("curie local up --local-model {model} --pull-model"),
             )
@@ -1159,13 +1601,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
             ),
         }
     }
-    let endpoints = ENDPOINTS
-        .iter()
-        // Under `--minimal` only the `core` services started, so advertise only
-        // their endpoints; the `full`-only URLs would 404.
-        .filter(|(_, _, is_core)| !o.minimal || *is_core)
-        .map(|(label, url, _)| (label.to_string(), url.to_string()))
-        .collect();
+    let endpoints = advertised_endpoints(&o.resources, o.minimal);
     Ok(LocalUpOutput::Up {
         endpoints,
         slack: o.slack,
@@ -1304,7 +1740,7 @@ pub async fn status(o: LocalOpts) -> Result<LocalStatusOutput> {
     // the additive diagnosis on stderr so LocalStatusOutput remains unchanged.
     let (status_read, claim_state) = tokio::join!(
         run_capture(&cmd),
-        crate::worker_claims::observe_local(&o.file),
+        crate::worker_claims::observe_local(o.project(), o.files()),
     );
     let (ok, out, err) = status_read?;
     ui.note(&claim_state.status_diagnosis());
@@ -1390,27 +1826,31 @@ impl crate::ui::CliOutput for LocalDownOutput {
 /// tree. Accepted, because guessing at another bundle is worse than missing one
 /// -- the containers holding the credentials are reaped either way, and a `down`
 /// or `deploy` from the bundle's own directory clears the tree.
-pub fn connector_teardown_plan_for_down(cwd: &Path) -> Vec<docker::ConnectorTeardownStep> {
+pub fn connector_teardown_plan_for_down(
+    cwd: &Path,
+    project: &str,
+) -> Vec<docker::ConnectorTeardownStep> {
     let staged = crate::connector_build::connector_secrets_root(cwd).is_dir();
-    docker::connector_teardown_plan(COMPOSE_PROJECT, None, staged.then_some(cwd))
+    docker::connector_teardown_plan(project, None, staged.then_some(cwd))
 }
 
 pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     let ui = crate::ui::ui();
     let cmd = down_command(&o);
     let cwd = std::env::current_dir().context("resolving the current directory")?;
-    let teardown = connector_teardown_plan_for_down(&cwd);
+    let teardown = connector_teardown_plan_for_down(&cwd, o.common.project());
     if o.common.dry_run {
         let mut lines = vec![
             cmd.display(),
             format!(
-                "docker rm -f $(docker ps -a --filter label={} -q)",
-                docker::SANDBOX_LABEL
+                "docker rm -f $(docker ps -a --filter label={} --filter network={} -q)",
+                docker::SANDBOX_LABEL,
+                o.common.resources.docker_network
             ),
             format!(
                 "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
                 docker::CONNECTOR_COMPONENT_LABEL,
-                docker::connector_project_label(COMPOSE_PROJECT)
+                docker::connector_project_label(o.common.project())
             ),
         ];
         // A removal of files on disk must not be a surprise the plan omitted.
@@ -1424,12 +1864,12 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     if o.wipe {
         ui.warn(&format!(
             "this destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, RustFS, Valkey data)",
-            o.common.file
+            o.common.file()
         ));
         if !o.yes
             && !crate::ops::confirm(&format!(
                 "This destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, RustFS, Valkey data). Continue? [y/N] ",
-                o.common.file
+                o.common.file()
             ))?
         {
             return Ok(LocalDownOutput::Aborted);
@@ -1450,7 +1890,11 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     for problem in docker::run_connector_teardown(&teardown).await {
         ui.warn(&problem);
     }
-    let report = docker::reap_labeled(docker::SANDBOX_LABEL).await;
+    let report = docker::reap_filtered(&[
+        ("label", docker::SANDBOX_LABEL),
+        ("network", o.common.resources.docker_network.as_str()),
+    ])
+    .await;
     if let Some(err) = report.error {
         // The stack stopped, but the runner reap did not complete cleanly. Fail
         // loudly rather than report success with orphaned containers still
@@ -1613,33 +2057,13 @@ mod tests {
     }
 
     fn opts(file: &str) -> LocalOpts {
-        LocalOpts {
-            file: file.into(),
-            dry_run: false,
-            minimal: false,
-            local_model: None,
-            pull_model: false,
-            slack: false,
-            model_mode: ModelMode::DefaultFake,
-            env_file: None,
-            build: None,
-            stack_image_env: Vec::new(),
-        }
+        LocalOpts::for_file(file)
     }
 
     fn opts_with_local_model(file: &str, model: &str) -> LocalOpts {
-        LocalOpts {
-            file: file.into(),
-            dry_run: false,
-            minimal: false,
-            local_model: Some(model.into()),
-            pull_model: false,
-            slack: false,
-            model_mode: ModelMode::DefaultFake,
-            env_file: None,
-            build: None,
-            stack_image_env: Vec::new(),
-        }
+        let mut o = LocalOpts::for_file(file);
+        o.local_model = Some(model.into());
+        o
     }
 
     /// Every `--profile` token `up` can emit across all flag combinations,
@@ -1676,7 +2100,23 @@ mod tests {
         let cmd = up_command(&opts(DEFAULT_COMPOSE_FILE));
         assert_eq!(
             cmd.display(),
-            "docker compose --profile full -f compose.dev.yaml up -d --wait"
+            "COMPOSE_PROJECT_NAME=curie CURIE_DOCKER_NETWORK=curie_runner docker compose --profile full -p curie -f compose.dev.yaml up -d --wait"
+        );
+    }
+
+    #[test]
+    fn up_command_always_pins_compose_project() {
+        let cmd = up_command(&opts(DEFAULT_COMPOSE_FILE));
+        let display = cmd.display();
+        assert!(
+            display.contains("-p curie"),
+            "every local up must pass -p curie rather than deriving the project from cwd: {display}"
+        );
+        assert!(
+            cmd.env
+                .contains(&(String::from("COMPOSE_PROJECT_NAME"), String::from("curie"))),
+            "every local up must inject COMPOSE_PROJECT_NAME=curie; env={:?}",
+            cmd.env
         );
     }
 
@@ -1888,7 +2328,9 @@ mod tests {
         o.stack_image_env = derived.clone();
 
         let comms = |disconnect: bool| crate::comms::LocalCommsOpts {
-            file: DEFAULT_COMPOSE_FILE.into(),
+            project: COMPOSE_PROJECT.into(),
+            files: vec![DEFAULT_COMPOSE_FILE.into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: if disconnect {
                 String::new()
@@ -1969,7 +2411,17 @@ mod tests {
     #[test]
     fn rebuild_command_default_fake_injects_nothing() {
         let cmd = rebuild_command(&opts(DEFAULT_COMPOSE_FILE), "curie-worker", None);
-        assert!(cmd.env.is_empty(), "env={:?}", cmd.env);
+        assert!(
+            !cmd.env.iter().any(|(k, _)| k == "CURIE_FAKE_MODEL"),
+            "default-fake must not inject CURIE_FAKE_MODEL; env={:?}",
+            cmd.env
+        );
+        assert!(
+            cmd.env
+                .contains(&(String::from("COMPOSE_PROJECT_NAME"), String::from("curie"))),
+            "env={:?}",
+            cmd.env
+        );
     }
 
     #[test]
@@ -2285,7 +2737,7 @@ mod tests {
         let cmd = up_command(&opts);
         assert_eq!(
             cmd.display(),
-            "docker compose --profile full --profile slack -f compose.dev.yaml up -d --wait"
+            "COMPOSE_PROJECT_NAME=curie CURIE_DOCKER_NETWORK=curie_runner docker compose --profile full --profile slack -p curie -f compose.dev.yaml up -d --wait"
         );
     }
 
@@ -2320,7 +2772,7 @@ mod tests {
         // profile starts no collector); `display` renders env before the program.
         assert_eq!(
             cmd.display(),
-            "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
+            "COMPOSE_PROJECT_NAME=curie CURIE_DOCKER_NETWORK=curie_runner CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -p curie -f compose.dev.yaml up -d --wait"
         );
     }
 
@@ -2344,7 +2796,10 @@ mod tests {
     #[test]
     fn status_runs_ps() {
         let cmd = status_command(&opts(DEFAULT_COMPOSE_FILE));
-        assert_eq!(cmd.display(), "docker compose -f compose.dev.yaml ps");
+        assert_eq!(
+            cmd.display(),
+            "docker compose -p curie -f compose.dev.yaml ps"
+        );
     }
 
     #[test]
@@ -2456,7 +2911,7 @@ mod tests {
             &docker,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CURIE_TEST_DOCKER_LOG\"\n\
              case \"$*\" in\n\
-               'ps -a --filter label=com.docker.compose.service=curie-api --format {{.Names}}')\n\
+               'ps -a --filter label=com.docker.compose.service=curie-api --filter label=com.docker.compose.project=curie --format {{.Names}}')\n\
                  echo curie-curie-api-1; exit 0;;\n\
                'inspect --format {{ .Config.Image }} curie-curie-api-1')\n\
                  echo ghcr.io/curie-eng/curie-api:dev; exit 0;;\n\
@@ -2531,7 +2986,7 @@ mod tests {
     async fn running_stack_image_uses_the_api_tag_and_checks_the_candidate() {
         let mut expected = std::collections::VecDeque::from([
             (
-                "docker ps -a --filter label=com.docker.compose.service=curie-api --format '{{.Names}}'",
+                "docker ps -a --filter label=com.docker.compose.service=curie-api --filter label=com.docker.compose.project=curie --format '{{.Names}}'",
                 Ok::<_, anyhow::Error>((true, "curie-curie-api-1\n".into(), String::new())),
             ),
             (
@@ -2561,7 +3016,8 @@ mod tests {
             })
         };
 
-        let image = running_stack_image_with("curie-dispatcher", &mut capture).await;
+        let image =
+            running_stack_image_with("curie-dispatcher", &mut capture, COMPOSE_PROJECT).await;
 
         assert_eq!(
             image.as_deref(),
@@ -2571,7 +3027,7 @@ mod tests {
         assert_eq!(
             issued,
             [
-                "docker ps -a --filter label=com.docker.compose.service=curie-api --format '{{.Names}}'",
+                "docker ps -a --filter label=com.docker.compose.service=curie-api --filter label=com.docker.compose.project=curie --format '{{.Names}}'",
                 "docker inspect --format '{{ .Config.Image }}' curie-curie-api-1",
                 "docker image inspect --format '{{ .Id }}' ghcr.io/curie-eng/curie-dispatcher:dev",
             ]
@@ -2589,7 +3045,9 @@ mod tests {
                             .expect("resolver issued an unexpected docker probe"),
                     )
                 };
-                let result = running_stack_image_with("curie-dispatcher", &mut capture).await;
+                let result =
+                    running_stack_image_with("curie-dispatcher", &mut capture, COMPOSE_PROJECT)
+                        .await;
                 assert!(
                     replies.is_empty(),
                     "resolver skipped an expected docker probe"
@@ -2814,7 +3272,7 @@ mod tests {
         });
         assert_eq!(
             cmd.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.dev.yaml down"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.dev.yaml down"
         );
     }
 
@@ -2827,7 +3285,7 @@ mod tests {
         });
         assert_eq!(
             cmd.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.dev.yaml down -v"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.dev.yaml down -v"
         );
     }
 
@@ -2876,7 +3334,7 @@ mod tests {
         });
         assert_eq!(
             down.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.other.yaml down -v"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.other.yaml down -v"
         );
     }
 
@@ -3310,7 +3768,7 @@ mod tests {
         assert!(
             display.contains(&format!(
                 "CURIE_RUNNER_IMAGE={}",
-                source_image_ref("curie-runner")
+                source_image_ref("curie-runner", SOURCE_IMAGE_TAG)
             )),
             "got: {display}"
         );

@@ -1,0 +1,194 @@
+# SKETCH of the control Draft ADR-0141 proposes.
+#
+# Do not kubectl apply this file. The ADR is Draft and does not authorize
+# implementation. `curie example sre-bot install --platform-upgrade` does not
+# apply it. Applying it from this branch would be implementing a Draft.
+#
+# When ADR-0141 is Accepted, this policy is the realizing path: a request
+# authenticated as sre-bot-upgrader may create a Job only when that Job is a
+# verbatim instantiation of a CronJob the same identity may already get.
+# ServiceAccount-choice-only is not sufficient (see the ADR).
+#
+# Requires Kubernetes 1.30+ with ValidatingAdmissionPolicy enabled. CHANGE ME
+# the namespace in the username and in each paramRef to the namespace the
+# Curie release, the two CronJobs, and sre-bot-upgrader actually live in.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: curie-upgrade-job-template-pin
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: batch/v1
+    kind: CronJob
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+  matchConditions:
+    - name: from-connector-upgrader
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:curie:sre-bot-upgrader"
+  variables:
+    - name: pod
+      expression: object.spec.template.spec
+    - name: template
+      expression: params.spec.jobTemplate.spec.template.spec
+    - name: podSA
+      expression: >-
+        (has(variables.pod.serviceAccountName) &&
+         variables.pod.serviceAccountName != "")
+          ? variables.pod.serviceAccountName : "default"
+    - name: templateSA
+      expression: >-
+        (has(variables.template.serviceAccountName) &&
+         variables.template.serviceAccountName != "")
+          ? variables.template.serviceAccountName : "default"
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        object.metadata.labels["curie.dev/self-upgrade-of"] == params.metadata.name
+      message: >-
+        Job must be labeled curie.dev/self-upgrade-of=<CronJob name> for the
+        CronJob this binding pins.
+    - expression: variables.podSA == variables.templateSA
+      message: >-
+        Job pod ServiceAccount must equal the CronJob template's ServiceAccount
+        (missing or empty means default).
+    - expression: >-
+        size(variables.pod.containers) == size(variables.template.containers) &&
+        variables.pod.containers.all(c,
+          variables.template.containers.exists(t,
+            t.name == c.name &&
+            t.image == c.image &&
+            t.command == c.command &&
+            ((!has(c.args) && !has(t.args)) || c.args == t.args) &&
+            ((!has(c.env) && !has(t.env)) || c.env == t.env) &&
+            ((!has(c.envFrom) && !has(t.envFrom)) || c.envFrom == t.envFrom) &&
+            ((!has(c.volumeMounts) && !has(t.volumeMounts)) || c.volumeMounts == t.volumeMounts)
+          )
+        )
+      message: >-
+        Job containers (name, image, command, args, env, envFrom, volumeMounts)
+        must equal the CronJob template.
+    - expression: >-
+        (!has(variables.pod.initContainers) || size(variables.pod.initContainers) == 0) &&
+        (!has(variables.template.initContainers) || size(variables.template.initContainers) == 0)
+      message: Job may not add initContainers the CronJob template does not have.
+    - expression: >-
+        (!has(variables.pod.volumes) && !has(variables.template.volumes)) ||
+        (
+          has(variables.pod.volumes) && has(variables.template.volumes) &&
+          size(variables.pod.volumes) == size(variables.template.volumes) &&
+          variables.pod.volumes.all(v,
+            !has(v.hostPath) &&
+            !has(v.secret) &&
+            !has(v.persistentVolumeClaim) &&
+            !has(v.nfs) &&
+            !has(v.iscsi) &&
+            !has(v.flexVolume) &&
+            !has(v.csi) &&
+            variables.template.volumes.exists(t,
+              t.name == v.name &&
+              ((!has(v.configMap) && !has(t.configMap)) ||
+                v.configMap.name == t.configMap.name) &&
+              has(v.emptyDir) == has(t.emptyDir)
+            )
+          )
+        )
+      message: >-
+        Job volumes must equal the CronJob template; hostPath, Secret, PVC,
+        NFS, iSCSI, flexVolume, and CSI sources are refused.
+    - expression: >-
+        (has(variables.pod.hostNetwork) && variables.pod.hostNetwork) ==
+        (has(variables.template.hostNetwork) && variables.template.hostNetwork) &&
+        (has(variables.pod.hostPID) && variables.pod.hostPID) ==
+        (has(variables.template.hostPID) && variables.template.hostPID) &&
+        (has(variables.pod.hostIPC) && variables.pod.hostIPC) ==
+        (has(variables.template.hostIPC) && variables.template.hostIPC)
+      message: Job may not enable hostNetwork, hostPID, or hostIPC.
+    - expression: >-
+        variables.pod.containers.all(c,
+          !(has(c.securityContext) &&
+            has(c.securityContext.privileged) &&
+            c.securityContext.privileged) &&
+          !(has(c.securityContext) &&
+            has(c.securityContext.allowPrivilegeEscalation) &&
+            c.securityContext.allowPrivilegeEscalation)
+        )
+      message: Job containers may not set privileged or allowPrivilegeEscalation.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: curie-upgrade-job-template-pin-platform
+spec:
+  policyName: curie-upgrade-job-template-pin
+  validationActions: [Deny]
+  paramRef:
+    name: platform-upgrade
+    # CHANGE ME: the namespace the Curie release runs in.
+    namespace: curie
+    parameterNotFoundAction: Deny
+  matchResources:
+    objectSelector:
+      matchLabels:
+        curie.dev/self-upgrade-of: platform-upgrade
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: curie-upgrade-job-template-pin-self
+spec:
+  policyName: curie-upgrade-job-template-pin
+  validationActions: [Deny]
+  paramRef:
+    name: sre-bot-self-upgrade
+    # CHANGE ME: the namespace the Curie release runs in.
+    namespace: curie
+    parameterNotFoundAction: Deny
+  matchResources:
+    objectSelector:
+      matchLabels:
+        curie.dev/self-upgrade-of: sre-bot-self-upgrade
+---
+# Jobs this identity creates without one of the two labels never hit the
+# template-pin bindings, so they would otherwise be admitted. Deny them.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: curie-upgrade-job-label-required
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+  matchConditions:
+    - name: from-connector-upgrader
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:curie:sre-bot-upgrader"
+    - name: unlabeled-or-unknown-cronjob
+      expression: >-
+        !has(object.metadata.labels) ||
+        !("curie.dev/self-upgrade-of" in object.metadata.labels) ||
+        !(object.metadata.labels["curie.dev/self-upgrade-of"] in
+          ["platform-upgrade", "sre-bot-self-upgrade"])
+  validations:
+    - expression: "false"
+      message: >-
+        sre-bot-upgrader may create a Job only when it is labeled as
+        instantiating platform-upgrade or sre-bot-self-upgrade.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: curie-upgrade-job-label-required
+spec:
+  policyName: curie-upgrade-job-label-required
+  validationActions: [Deny]

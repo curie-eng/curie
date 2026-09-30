@@ -57,27 +57,43 @@ class HistoryError(RuntimeError):
     """A history reference could not be resolved or dereferenced."""
 
 
+class HistoryAppendError(HistoryError):
+    """The state API refused a transcript append."""
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__(status)
+
+
+class HistoryCapacityError(HistoryAppendError):
+    """The state API refused a transcript append because a byte cap was reached.
+
+    ``detail`` names the cap and the turn's size when the runner itself refused
+    a turn that cannot be bounded (#3301), so the run's failure says why.
+    """
+
+    def __init__(self, status: int, detail: str | None = None) -> None:
+        super().__init__(status)
+        self.detail = detail
+
+
+class HistoryConflictError(HistoryAppendError):
+    """A compaction rewrite lost its compare-and-set race to a concurrent write."""
+
+
 class StructuredReplayUnsupported(HistoryError):
     """The selected harness cannot consume a recovered structured prefix."""
 
 
 JsonContent = str | list[dict[str, Any]]
 
-# The state API caps one JSON value at 64 KiB. Transcript appends store a JSON
-# array, so a turn must fit with that array's brackets rather than merely fit as
-# a standalone object. Accumulated-log compaction is a separate concern: this
-# bound prevents a single large first turn from being rejected before any
-# durable conversation exists.
-HISTORY_VALUE_MAX_BYTES = 65_536
+# Headroom every runner transcript write leaves free under the value cap (#2927).
+# The worker appends a publication outcome to the same key without a reserve;
+# that record's text is capped near 2000 characters, so one always fits.
+HISTORY_APPEND_RESERVE_BYTES = 8_192
 
-_STRUCTURAL_BLOCK_FIELDS = {
-    "type",
-    "id",
-    "tool_use_id",
-    "name",
-    "is_error",
-}
-
+# Compare-and-set attempts for one capacity compaction before giving up.
+_COMPACTION_ATTEMPTS = 3
 
 def _json_copy(value: JsonContent) -> JsonContent:
     """Return a detached JSON-safe copy of message content."""
@@ -283,7 +299,7 @@ class TurnRecord:
 def _state_value_size(record: Mapping[str, Any]) -> int:
     """Return the state API's encoded size for a one-record transcript."""
 
-    return len(json.dumps([record], separators=(",", ":")).encode("utf-8"))
+    return _value_size([record])
 
 
 def _digest_marker(value: str) -> str:
@@ -295,75 +311,48 @@ def _digest_marker(value: str) -> str:
     )
 
 
-def _collect_text_payloads(
-    value: Any,
+def _add_text_payload(
+    value: str,
     *,
     path: tuple[str | int, ...],
     priority: int,
     candidates: dict[str, tuple[int, list[tuple[str | int, ...]]]],
 ) -> None:
-    """Collect replaceable string leaves without touching structural fields."""
+    """Index one explicitly allowed text value, without walking provider objects."""
 
-    if isinstance(value, str):
-        existing = candidates.get(value)
-        if existing is None:
-            candidates[value] = (priority, [path])
-        else:
-            existing_priority, paths = existing
-            paths.append(path)
-            candidates[value] = (min(existing_priority, priority), paths)
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _collect_text_payloads(
-                item,
-                path=(*path, index),
-                priority=priority,
-                candidates=candidates,
-            )
-        return
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            _collect_text_payloads(
-                item,
-                path=(*path, str(key)),
-                priority=priority,
-                candidates=candidates,
-            )
+    existing = candidates.get(value)
+    if existing is None:
+        candidates[value] = (priority, [path])
+    else:
+        existing_priority, paths = existing
+        paths.append(path)
+        candidates[value] = (min(existing_priority, priority), paths)
 
 
 def _turn_text_payloads(
     record: dict[str, Any],
+    *,
+    tool_results_only: bool,
 ) -> dict[str, tuple[int, list[tuple[str | int, ...]]]]:
     """Index portable text by reduction priority and stable object path."""
 
     candidates: dict[str, tuple[int, list[tuple[str | int, ...]]]] = {}
 
-    # The legacy pair mirrors the structured messages. Grouping by value means
-    # both projections receive the same marker if either copy must be bounded.
-    for field in ("user", "assistant"):
-        value = record.get(field)
-        if isinstance(value, str):
-            _collect_text_payloads(
-                value,
-                path=(field,),
-                priority=3,
-                candidates=candidates,
-            )
-
-    approval = record.get("approval")
-    if isinstance(approval, Mapping) and isinstance(approval.get("summary"), str):
-        _collect_text_payloads(
-            approval["summary"],
-            path=("approval", "summary"),
-            priority=2,
-            candidates=candidates,
-        )
-
     messages = record.get("messages")
     if not isinstance(messages, list):
         return candidates
+    first_user = next(
+        (i for i, message in enumerate(messages) if message["role"] == "user"), None
+    )
+    final_assistant = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"),
+        None,
+    )
+    # Keep both legacy projections and the full boundary messages exact. Text
+    # elsewhere may share their value without making these paths replaceable.
     for message_index, message in enumerate(messages):
+        if message_index in (first_user, final_assistant):
+            continue
         if not isinstance(message, Mapping):
             continue
         content = message.get("content")
@@ -373,12 +362,13 @@ def _turn_text_payloads(
             "content",
         )
         if isinstance(content, str):
-            _collect_text_payloads(
-                content,
-                path=content_path,
-                priority=3,
-                candidates=candidates,
-            )
+            if not tool_results_only:
+                _add_text_payload(
+                    content,
+                    path=content_path,
+                    priority=3,
+                    candidates=candidates,
+                )
             continue
         if not isinstance(content, list):
             continue
@@ -388,31 +378,37 @@ def _turn_text_payloads(
             block_path = (*content_path, block_index)
             block_type = block.get("type")
             if block_type == "tool_result" and "content" in block:
-                _collect_text_payloads(
-                    block["content"],
-                    path=(*block_path, "content"),
-                    priority=0,
-                    candidates=candidates,
-                )
-            elif block_type == "text" and "text" in block:
-                _collect_text_payloads(
+                if tool_results_only:
+                    result_content = block["content"]
+                    if isinstance(result_content, str):
+                        _add_text_payload(
+                            result_content,
+                            path=(*block_path, "content"),
+                            priority=0,
+                            candidates=candidates,
+                        )
+                    elif isinstance(result_content, list):
+                        for nested_index, nested in enumerate(result_content):
+                            if (
+                                isinstance(nested, Mapping)
+                                and nested.get("type") == "text"
+                                and isinstance(nested.get("text"), str)
+                            ):
+                                _add_text_payload(
+                                    nested["text"],
+                                    path=(*block_path, "content", nested_index, "text"),
+                                    priority=0,
+                                    candidates=candidates,
+                                )
+            elif (
+                not tool_results_only
+                and block_type == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                _add_text_payload(
                     block["text"],
                     path=(*block_path, "text"),
                     priority=1,
-                    candidates=candidates,
-                )
-
-            for key, item in block.items():
-                if key in _STRUCTURAL_BLOCK_FIELDS:
-                    continue
-                if block_type == "tool_result" and key == "content":
-                    continue
-                if block_type == "text" and key == "text":
-                    continue
-                _collect_text_payloads(
-                    item,
-                    path=(*block_path, str(key)),
-                    priority=2,
                     candidates=candidates,
                 )
     return candidates
@@ -427,17 +423,132 @@ def _replace_path(
     target[path[-1]] = replacement
 
 
+def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str, Any]:
+    """Omit oldest complete tool exchanges without splitting a message group."""
+
+    messages = raw["messages"]
+    uses: dict[str, list[tuple[int, int]]] = {}
+    results: dict[str, list[tuple[int, int]]] = {}
+    protected: set[int] = set()
+    for message_index, message in enumerate(messages):
+        content = message["content"]
+        if not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            block_type = block.get("type")
+            if block_type not in ("tool_use", "tool_result"):
+                continue
+            is_use = block_type == "tool_use"
+            identifier = block.get("id" if is_use else "tool_use_id")
+            expected_role = "assistant" if is_use else "user"
+            if not isinstance(identifier, str) or message["role"] != expected_role:
+                protected.add(message_index)
+                continue
+            positions = uses if is_use else results
+            positions.setdefault(identifier, []).append((message_index, block_index))
+
+    # Calls sharing an assistant or result message form one group. Keeping an
+    # unmatched call protects its whole group, including pending approval data.
+    neighbors: dict[int, set[int]] = {}
+    for identifier in uses.keys() | results.keys():
+        calls = uses.get(identifier, [])
+        replies = results.get(identifier, [])
+        if len(calls) != 1 or len(replies) != 1 or calls[0][0] >= replies[0][0]:
+            protected.update(index for index, _block in [*calls, *replies])
+            continue
+        call_index, reply_index = calls[0][0], replies[0][0]
+        neighbors.setdefault(call_index, set()).add(reply_index)
+        neighbors.setdefault(reply_index, set()).add(call_index)
+
+    first_user = next(
+        (i for i, message in enumerate(messages) if message["role"] == "user"), None
+    )
+    if first_user is not None:
+        protected.add(first_user)
+    final_assistant = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"),
+        None,
+    )
+    if final_assistant is not None:
+        protected.add(final_assistant)
+    groups: list[set[int]] = []
+    visited: set[int] = set()
+    for index in sorted(neighbors):
+        if index in visited:
+            continue
+        pending = [index]
+        group: set[int] = set()
+        while pending:
+            member = pending.pop()
+            if member in group:
+                continue
+            group.add(member)
+            pending.extend(neighbors[member] - group)
+        visited.update(group)
+        groups.append(group)
+
+    removed: set[int] = set()
+    candidate = raw
+    # Keep the most recent exchange even when it is complete. Earlier groups
+    # remain in their original order, and only empty messages are discarded.
+    for group in groups[:-1]:
+        if group & protected:
+            continue
+        removed.update(group)
+        omitted: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        marker_content: list[dict[str, Any]] | None = None
+        call_count = 0
+        for index, message in enumerate(messages):
+            if index not in removed:
+                kept.append(message)
+                continue
+            content = message["content"]
+            retained_blocks: list[dict[str, Any]] = []
+            omitted_blocks: list[dict[str, Any]] = []
+            for block in content:
+                if block.get("type") in (
+                    "tool_use", "tool_result", "thinking", "redacted_thinking"
+                ):
+                    omitted_blocks.append(block)
+                    call_count += block.get("type") == "tool_use"
+                else:
+                    retained_blocks.append(block)
+            omitted.append({"role": message["role"], "content": omitted_blocks})
+            if marker_content is None:
+                marker_content = retained_blocks
+                kept.append({"role": message["role"], "content": retained_blocks})
+            elif retained_blocks:
+                kept.append({"role": message["role"], "content": retained_blocks})
+        digest = hashlib.sha256(
+            json.dumps(omitted, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        assert marker_content is not None
+        marker_content.insert(
+            0,
+            {
+                "type": "text",
+                "text": f"[history tool groups omitted; count={call_count}; sha256={digest}]",
+            },
+        )
+        candidate = {**raw, "messages": kept}
+        if _state_value_size(candidate) <= max_value_bytes:
+            return candidate
+    return candidate
+
+
 def bound_turn_record(
-    record: TurnRecord, *, max_value_bytes: int = HISTORY_VALUE_MAX_BYTES
+    record: TurnRecord, *, max_value_bytes: int
 ) -> TurnRecord:
     """Bound one turn for a whole state value without losing message order.
 
     Native harness replay is discarded first because portable messages are the
-    authority across sandbox replacement. If that is insufficient, textual
-    payloads are replaced with deterministic digest and byte-count markers:
-    tool results first, then assistant text and other content, while role,
-    message, and block order remain intact. If that irreducible structure alone
-    exceeds the cap, fail before the transcript store sees an append.
+    authority across sandbox replacement. Then tool result text is replaced with
+    deterministic digest and byte count markers, followed by summarizing older
+    complete tool exchanges while keeping the most recent exchange and pending
+    calls. Other safe text is reduced last. The first user, final assistant,
+    legacy projections and retained opaque provider blocks remain exact. If the
+    remaining structure exceeds the cap, fail before append.
     """
 
     if max_value_bytes <= 0:
@@ -451,34 +562,41 @@ def bound_turn_record(
     if _state_value_size(raw) <= max_value_bytes:
         return TurnRecord.from_dict(raw)
 
-    candidates = _turn_text_payloads(raw)
-    ordered: list[tuple[int, int, str, str, list[tuple[str | int, ...]]]] = []
-    for original, (priority, paths) in candidates.items():
-        marker = _digest_marker(original)
-        original_size = len(json.dumps(original).encode("utf-8"))
-        marker_size = len(json.dumps(marker).encode("utf-8"))
-        savings = (original_size - marker_size) * len(paths)
-        if savings > 0:
-            ordered.append(
-                (
-                    priority,
-                    -savings,
-                    hashlib.sha256(original.encode("utf-8")).hexdigest(),
-                    marker,
-                    paths,
-                )
-            )
+    for tool_results_only in (True, False):
+        if not tool_results_only:
+            raw = _compact_tool_groups(raw, max_value_bytes)
+            if _state_value_size(raw) <= max_value_bytes:
+                return TurnRecord.from_dict(raw)
 
-    for _priority, _negative_savings, _digest, marker, paths in sorted(ordered):
-        for path in paths:
-            _replace_path(raw, path, marker)
-        if _state_value_size(raw) <= max_value_bytes:
-            return TurnRecord.from_dict(raw)
+        candidates = _turn_text_payloads(raw, tool_results_only=tool_results_only)
+        ordered: list[tuple[int, int, str, str, list[tuple[str | int, ...]]]] = []
+        for original, (priority, paths) in candidates.items():
+            marker = _digest_marker(original)
+            original_size = len(json.dumps(original).encode("utf-8"))
+            marker_size = len(json.dumps(marker).encode("utf-8"))
+            savings = (original_size - marker_size) * len(paths)
+            if savings > 0:
+                ordered.append(
+                    (
+                        priority,
+                        -savings,
+                        hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                        marker,
+                        paths,
+                    )
+                )
+
+        for _priority, _negative_savings, _digest, marker, paths in sorted(ordered):
+            for path in paths:
+                _replace_path(raw, path, marker)
+            if _state_value_size(raw) <= max_value_bytes:
+                return TurnRecord.from_dict(raw)
 
     irreducible_size = _state_value_size(raw)
     raise HistoryError(
-        "history turn cannot fit without dropping portable message roles or order: "
-        f"minimum value is {irreducible_size} bytes, cap is {max_value_bytes} bytes"
+        f"history turn cannot fit: one turn is {irreducible_size} bytes after compaction, over the "
+        f"{max_value_bytes}-byte turn bound of the per-thread transcript cap "
+        "(raise api.transcriptMaxThreadBytes)"
     )
 
 
@@ -619,15 +737,16 @@ class TranscriptStore(Protocol):
 
     Deliberately narrow -- no query language and no in-place rewrite. A concrete
     store dereferences a ``history_ref`` to a durable, rehydratable backing that
-    lives outside the sandbox; compaction is itself an append-only summary.
+    lives outside the sandbox; replay compaction is itself an append-only
+    summary. Only a store with a byte cap rewrites, and only at that cap (#2927).
     """
 
     async def load(self) -> list[HistoryRecord]:
         """Return prior turns, oldest first (empty when none)."""
         ...
 
-    async def append(self, record: HistoryRecord) -> None:
-        """Durably append one turn; it must survive an unplanned restart."""
+    async def append(self, record: HistoryRecord) -> bool:
+        """Append durably and report whether native replay was retained."""
         ...
 
 
@@ -641,8 +760,28 @@ class NullTranscriptStore:
     async def load(self) -> list[HistoryRecord]:
         return []
 
-    async def append(self, record: HistoryRecord) -> None:  # noqa: ARG002 - null sink
+    async def append(self, record: HistoryRecord) -> bool:  # noqa: ARG002 - null sink
+        return False
+
+    async def compact(self) -> None:
+        """Nothing is stored, so there is nothing to compact."""
         return None
+
+
+def _parse_records(value: Sequence[Any]) -> list[HistoryRecord]:
+    """Parse a stored transcript array into history records, oldest first."""
+
+    records: list[HistoryRecord] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HistoryError("invalid transcript record: expected a JSON object")
+        if item.get("type") == "summary":
+            records.append(SummaryRecord.from_dict(item))
+        elif "user" in item:
+            records.append(TurnRecord.from_dict(item))
+        else:
+            raise HistoryError("invalid transcript record: unknown record shape")
+    return records
 
 
 class StateApiTranscriptStore:
@@ -653,56 +792,151 @@ class StateApiTranscriptStore:
     key; append is a POST to the key's ``/append`` endpoint. The state API
     enforces the size caps and the Postgres JSONB backing gives durability across
     an unplanned restart for free.
+
+    Every append asks the API to keep ``HISTORY_APPEND_RESERVE_BYTES`` free under
+    the value cap (#2927). When a turn append is refused at that bound, the store
+    rewrites the key with a compare-and-set PUT to ``compact_transcript_value`` of
+    the fresh value plus the turn. ``compact`` does the same for boot against the
+    value its last ``load`` saw.
     """
 
     def __init__(self, key_url: str, token: str | None) -> None:
         # Normalize to no trailing slash so the /append URL composes cleanly.
         self._key_url = key_url.rstrip("/")
         self._token = token
+        self._max_value_bytes: int | None = None
+        # The raw value and version the last load() saw, for boot compaction.
+        self._snapshot: tuple[list[Any], int] | None = None
 
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self._token} if self._token else {}
 
-    async def load(self) -> list[HistoryRecord]:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(self._key_url, headers=self._headers()) as resp:
-                if resp.status == 404:
-                    # No transcript written yet -- a fresh thread, not an error.
-                    return []
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise HistoryError(f"history load failed: {resp.status} {body[:200]}")
-                payload = await resp.json()
+    async def _fetch(self, session: aiohttp.ClientSession) -> tuple[list[Any], int] | None:
+        self._max_value_bytes = None
+        async with session.get(self._key_url, headers=self._headers()) as resp:
+            if resp.status not in (200, 404):
+                raise HistoryError(resp.status)
+            advertised_cap = resp.headers.get("X-Curie-Transcript-Max-Bytes")
+            try:
+                cap = int(advertised_cap) if advertised_cap is not None else 0
+            except ValueError:
+                raise HistoryError("invalid transcript capacity header") from None
+            if advertised_cap != str(cap) or cap <= HISTORY_APPEND_RESERVE_BYTES:
+                raise HistoryError("invalid transcript capacity header")
+            self._max_value_bytes = cap
+            if resp.status == 404:
+                # No transcript written yet -- a fresh thread, not an error.
+                return None
+            payload = await resp.json()
         value = payload.get("value")
         if not isinstance(value, list):
             raise HistoryError("transcript log is not a JSON array")
-        records: list[HistoryRecord] = []
-        for item in value:
-            if not isinstance(item, Mapping):
-                raise HistoryError("invalid transcript record: expected a JSON object")
-            if item.get("type") == "summary":
-                records.append(SummaryRecord.from_dict(item))
-            elif "user" in item:
-                records.append(TurnRecord.from_dict(item))
-            else:
-                raise HistoryError("invalid transcript record: unknown record shape")
-        return records
+        return value, int(payload.get("version", 0))
 
-    async def append(self, record: HistoryRecord) -> None:
-        timeout = aiohttp.ClientTimeout(total=15)
-        body = json.dumps({"item": record.to_dict()})
+    async def _post(self, session: aiohttp.ClientSession, item: dict[str, Any]) -> int:
+        body = json.dumps({"item": item, "reserve_bytes": HISTORY_APPEND_RESERVE_BYTES})
         headers = {**self._headers(), "Content-Type": "application/json"}
+        async with session.post(f"{self._key_url}/append", data=body, headers=headers) as resp:
+            return resp.status
+
+    async def _put(
+        self, session: aiohttp.ClientSession, value: list[dict[str, Any]], version: int
+    ) -> int:
+        body = json.dumps({"value": value, "expected_version": version})
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        async with session.put(self._key_url, data=body, headers=headers) as resp:
+            return resp.status
+
+    async def load(self) -> list[HistoryRecord]:
+        timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{self._key_url}/append", data=body, headers=headers
-            ) as resp:
-                if resp.status not in (200, 201):
-                    text = await resp.text()
-                    raise HistoryError(f"history append failed: {resp.status} {text[:200]}")
+            self._snapshot = await self._fetch(session)
+        if self._snapshot is None:
+            return []
+        return _parse_records(self._snapshot[0])
+
+    async def append(self, record: HistoryRecord) -> bool:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if self._max_value_bytes is None:
+                await self._fetch(session)
+            assert self._max_value_bytes is not None
+            if isinstance(record, TurnRecord):
+                # A lone turn leaves the reserve even on a fresh transcript.
+                try:
+                    record = bound_turn_record(
+                        record,
+                        max_value_bytes=self._max_value_bytes - HISTORY_APPEND_RESERVE_BYTES,
+                    )
+                except HistoryError as exc:
+                    raise HistoryCapacityError(413, str(exc)) from None
+            item = record.to_dict()
+            status = await self._post(session, item)
+            if status in (200, 201):
+                return isinstance(record, TurnRecord) and record.harness_replay is not None
+            if status != 413:
+                raise HistoryAppendError(status)
+            if isinstance(record, SummaryRecord):
+                # Boot owns summary capacity: it compacts against what it loaded.
+                raise HistoryCapacityError(status)
+            for _attempt in range(_COMPACTION_ATTEMPTS):
+                snapshot = await self._fetch(session)
+                if snapshot is None:
+                    # The turn was bounded to leave the reserve, so a refusal on
+                    # an empty key is the cap itself, not something to compact.
+                    raise HistoryCapacityError(413)
+                value, version = snapshot
+                assert self._max_value_bytes is not None
+                status = await self._put(
+                    session,
+                    compact_transcript_value(
+                        [*value, item],
+                        max_value_bytes=self._max_value_bytes,
+                        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+                    ),
+                    version,
+                )
+                if status in (200, 201):
+                    # Capacity compaction always drops the latest native replay.
+                    return False
+                if status == 409:
+                    continue
+                if status == 413:
+                    raise HistoryCapacityError(status)
+                raise HistoryAppendError(status)
+        raise HistoryAppendError(409)
+
+    async def compact(self) -> None:
+        """Rewrite the value the last ``load`` saw, compare-and-set on its version.
+
+        A write since that load is a ``HistoryConflictError``: the caller reloads
+        rather than compacting (or summarizing) a stale view over it.
+        """
+
+        if self._snapshot is None or self._max_value_bytes is None:
+            raise HistoryError("no loaded transcript to compact")
+        value, version = self._snapshot
+        compacted = compact_transcript_value(
+            value,
+            max_value_bytes=self._max_value_bytes,
+            reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+        )
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            status = await self._put(session, compacted, version)
+        self._snapshot = None
+        if status in (200, 201):
+            return
+        if status == 409:
+            raise HistoryConflictError(status)
+        if status == 413:
+            raise HistoryCapacityError(status)
+        raise HistoryAppendError(status)
 
 
-def resolve_history(history_ref: str | None, env: Mapping[str, str]) -> TranscriptStore:
+def resolve_history(
+    history_ref: str | None, env: Mapping[str, str]
+) -> NullTranscriptStore | StateApiTranscriptStore:
     """Resolve ``CURIE_HISTORY_REF`` to a concrete ``TranscriptStore`` at boot.
 
     An absent ref yields the ``NullTranscriptStore`` (history is optional). An
@@ -741,6 +975,11 @@ def _fold_harness_replay(turns: Sequence[TurnRecord]) -> HarnessReplayState | No
     for turn in turns:
         state = turn.harness_replay
         if state is None:
+            # A missing delta leaves a gap in every earlier checkpoint. Only a
+            # later complete checkpoint can make native replay eligible.
+            harness = None
+            entries = []
+            checkpoint_seen = False
             continue
         if state.kind == "checkpoint":
             harness = state.harness
@@ -810,12 +1049,19 @@ def _make_summary(
     content = "\n\n".join(sections)
     # The summary is written once at this explicit boundary. Bounding it here is
     # stable: later appends never rewrite it; only a later compaction creates a
-    # new record. The digest keeps omitted material falsifiable.
+    # new record. The digest keeps omitted material falsifiable. When the content
+    # overflows the budget, keep the most recent bytes (the marker first, then the
+    # UTF-8-safe suffix that fits) rather than the oldest: the newest compacted
+    # material -- e.g. a just-recorded publication outcome -- must survive even
+    # once the prior summary has saturated the budget.
     budget = max(512, (max_bytes // 2) if max_bytes is not None else 8_000)
     encoded = content.encode("utf-8")
     if len(encoded) > budget:
-        prefix = encoded[: max(0, budget - 96)].decode("utf-8", errors="ignore")
-        content = f"{prefix}\n\n[older detail summarized; digest={digest}]"
+        marker = f"[older detail summarized; digest={digest}]\n\n"
+        marker_bytes = marker.encode("utf-8")
+        suffix_budget = max(0, budget - len(marker_bytes))
+        suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore") if suffix_budget else ""
+        content = f"{marker}{suffix}"
     source_turns = (prior.source_turns if prior is not None else 0) + len(compacted)
     through_ts = compacted[-1].ts if compacted else (prior.through_ts if prior else "")
     return SummaryRecord(
@@ -875,7 +1121,10 @@ def build_conversation_replay(
 
     over_turns = max_turns is not None and len(active_turns) > max_turns
     over_bytes = max_bytes is not None and _replay_bytes(current_messages) > max_bytes
-    if not over_turns and not over_bytes:
+    # A summary needs at least one turn to compact and one to keep (#2927). With
+    # one active turn it would compact nothing and re-embed that turn in its
+    # tail, doubling the stored transcript, so that replay stays plain.
+    if (not over_turns and not over_bytes) or len(active_turns) <= 1:
         # A summary changes the portable prefix. Native state from its embedded
         # tail still represents the pre-summary conversation and is unusable;
         # only a post-summary turn's fresh checkpoint may restore that shape.
@@ -890,8 +1139,6 @@ def build_conversation_replay(
             None,
         )
 
-    if not active_turns:
-        return ConversationReplay(), None
     keep_count = max(
         1,
         min(len(active_turns), (max_turns or len(active_turns)) // 2),
@@ -930,6 +1177,82 @@ def build_conversation_replay(
 # ordinary appends never move or rewrite the already-cached prefix.
 DEFAULT_REPLAY_MAX_TURNS = 40
 DEFAULT_REPLAY_MAX_BYTES = 16_000
+
+
+def _value_size(value: Sequence[Any]) -> int:
+    return len(json.dumps(list(value), separators=(",", ":")).encode("utf-8"))
+
+
+def compact_transcript_value(
+    value: Sequence[Any],
+    *,
+    max_value_bytes: int,
+    reserve_bytes: int,
+) -> list[dict[str, Any]]:
+    """Rewrite a stored transcript array to fit the cap with the reserve free (#2927).
+
+    Items carrying ``publication_id`` are the worker's idempotency markers and
+    are kept verbatim, first; replay ignores records before the latest summary.
+    Every active turn but the latest is folded into one new summary, and the
+    latest turn is kept without native replay state, bounded to what is left.
+    Tool output and turn detail beyond the summary line are what is lost. A
+    result that still cannot fit is a ``HistoryCapacityError``.
+    """
+
+    limit = max_value_bytes - reserve_bytes
+    markers = [
+        dict(item) for item in value if isinstance(item, Mapping) and "publication_id" in item
+    ]
+    # Parse the full value, publication markers included: each marker also
+    # carries a plain "user"/"assistant" pair, so it parses as an ordinary
+    # TurnRecord and takes its original position among the active turns. Its
+    # raw dict (with publication_id) still lands in ``markers`` above and is
+    # kept verbatim in the rewritten prefix for the worker's idempotency scan;
+    # this parse additionally lets its outcome text reach the new summary (or
+    # the kept tail) instead of being dropped from replay (#2927).
+    records = _parse_records(value)
+    latest_summary: SummaryRecord | None = None
+    latest_summary_index = -1
+    for index, record in enumerate(records):
+        if isinstance(record, SummaryRecord):
+            latest_summary = record
+            latest_summary_index = index
+    active_turns = [
+        *(latest_summary.tail if latest_summary is not None else ()),
+        *(
+            record
+            for record in records[latest_summary_index + 1 :]
+            if isinstance(record, TurnRecord)
+        ),
+    ]
+
+    prefix: list[dict[str, Any]] = list(markers)
+    if active_turns[:-1] or latest_summary is not None:
+        prefix.append(
+            _make_summary(
+                latest_summary,
+                active_turns[:-1],
+                (),
+                max_bytes=DEFAULT_REPLAY_MAX_BYTES,
+            ).to_dict()
+        )
+    compacted = list(prefix)
+    if active_turns:
+        # Joining the kept turn to a non-empty prefix costs one comma and drops
+        # the kept turn's own array brackets from the one-record bound.
+        budget = limit - (_value_size(prefix) - 1 if prefix else 0)
+        if budget <= 2:
+            raise HistoryCapacityError(413)
+        try:
+            kept = bound_turn_record(
+                replace(active_turns[-1], harness_replay=None), max_value_bytes=budget
+            )
+        except HistoryError:
+            raise HistoryCapacityError(413) from None
+        compacted.append(kept.to_dict())
+    if _value_size(compacted) > limit:
+        raise HistoryCapacityError(413)
+    return compacted
 
 
 def utcnow_iso() -> str:

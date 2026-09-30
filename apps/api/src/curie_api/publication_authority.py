@@ -5,7 +5,7 @@ from a repository name that may have been deleted and recreated meanwhile.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from starlette.concurrency import run_in_threadpool
@@ -19,6 +19,14 @@ from .schemas import PublicationLineageAdvance
 
 class AuthorityRefused(RuntimeError):
     """Fresh provider identity disagrees with the exact publication outcome."""
+
+
+class PublicationRemoteTerminal(AuthorityRefused):
+    """Provider truth says this pull request is already merged or closed."""
+
+    def __init__(self, state: Literal["merged", "closed"]) -> None:
+        super().__init__(f"publication pull request is already {state}")
+        self.state = state
 
 
 class AuthorityUnavailable(RuntimeError):
@@ -87,8 +95,16 @@ def validated_identity(
     remote_state = pull_request.get("state")
     if not isinstance(merged, bool) or remote_state not in {"open", "closed"}:
         raise AuthorityRefused("publication GitHub state was refused")
+    # Order matters. GitHub never reports a merged pull request as open, so that
+    # pair is a corrupt payload rather than a terminal pull request and keeps the
+    # plain refusal. Only a genuinely terminal answer to an "open" outcome is
+    # refined, so the worker can terminalize the lineage instead of retrying.
+    if merged and remote_state != "closed":
+        raise AuthorityRefused("publication GitHub state was refused")
     actual_state = "merged" if merged else remote_state
-    if actual_state != state or (merged and remote_state != "closed"):
+    if actual_state != state:
+        if state == "open" and actual_state in {"merged", "closed"}:
+            raise PublicationRemoteTerminal("merged" if merged else "closed")
         raise AuthorityRefused("publication GitHub state was refused")
     base_ref = base.get("ref")
     if not isinstance(base_ref, str) or not base_ref or len(base_ref) > 1024:

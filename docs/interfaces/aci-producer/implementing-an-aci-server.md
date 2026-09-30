@@ -17,8 +17,9 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes six POST
-routes and streams NDJSON back:
+An ACI server is an **HTTP process** inside the sandbox that exposes seven POST
+routes and streams NDJSON back. Those seven plus the bearer-gated `GET /v1/status`
+described below are its eight authenticated control routes:
 
 | Route | Purpose |
 | --- | --- |
@@ -28,11 +29,17 @@ routes and streams NDJSON back:
 | `POST /v1/reset` | Discard the conversation and start a fresh model session, so the next turn cannot answer from earlier history; return `409` while a turn is active. No body, no wire frame (#550). |
 | `POST /v1/snapshot` | Capture a bounded, credential-free snapshot of the managed repository workspace for the authenticated worker; return `409` when the session has no managed workspace. |
 | `POST /v1/timeout` | Stop the exact open turn named by the event response epoch. This runner-private control route is authenticated; a server omitting the epoch response header is simply not notified, and worker timeout classification remains unaffected. |
+| `POST /v1/turn-admit` | Grant or deny the exact waiting turn epoch. This runner-private control route is authenticated and does not change the ACI wire frames. |
+| `GET /v1/status` | Return session status plus the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`, `cwd`) and `history_durable` for the worker's replacement-authority check. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
 and `GET /status` (session status + readiness). The chart's readiness probe hits
-`/healthz` with no auth header, so keep those two open even when the POST routes
+`/healthz` with no auth header, so keep those two open even when the control routes
 are token-gated.
+
+The seventh authenticated control route is `GET /v1/status`. It returns session status,
+the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
+`cwd`), and `history_durable` for the worker's replacement-authority check.
 
 `/v1/reset` is the odd one out and is easy to skip: it carries no ACI frame, so
 it is a runner control route rather than part of the frozen wire union. It is
@@ -58,8 +65,9 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
 - `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
-  session_id?, history_ref?}`. The optional fields are nullable strings; either
-  may be omitted independently.
+  session_id?, history_ref?, publication_context?}`. The session and history
+  fields are nullable strings. The platform may attach a publication context
+  to a managed factory turn; other producers omit it.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
@@ -75,7 +83,7 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   made and once when its result arrives, joined on `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.4.6`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.5.3`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under
@@ -191,10 +199,13 @@ Route contract to honor:
   servers omitting the response header are simply not notified, and worker timeout
   classification remains unaffected.
 - **`/healthz`**, **`/status`**: always-open GETs; `/status` returns
-  `{status, ready, turn_active}`.
+  `{status, ready, turn_active, history_durable}`.
+- **`/v1/status`**: bearer-authenticated GET returning the same session status plus
+  `session_id`, `sandbox_id`, `managed_workspace`, and `cwd`; the worker uses that
+  credential-free attestation to establish replacement authority.
 - **Auth (optional):** when a bearer token is configured, require
-  `Authorization: Bearer <token>` on the POST routes only, compared with a
-  constant-time check; leave the GETs open for the probe.
+  `Authorization: Bearer <token>` on all seven control routes, compared with a
+  constant-time check; leave `/healthz` and `/status` open for the probe.
 
 Map any decode/validation error on a POST body to a **400** so a malformed frame
 is a clean client error, not a 500.
@@ -250,6 +261,8 @@ You have a conformant ACI server when:
 - [ ] `POST /v1/snapshot` returns the bounded managed-workspace snapshot, or 409
       when the session has no managed workspace.
 - [ ] `GET /healthz` and `GET /status` are open and unauthenticated.
+- [ ] `GET /v1/status` is bearer-authenticated and returns the boot attestation plus
+      `history_durable`.
 - [ ] `SessionConfig.from_env()` is honored and the `CURIE_PLUGIN_DIR` bundle is
       loaded.
 

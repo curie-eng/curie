@@ -29,6 +29,14 @@ class SpanAttributeKey(StrEnum):
     USAGE_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
     TOOL_NAME = "gen_ai.tool.name"
     OPERATION_NAME = "gen_ai.operation.name"
+    # #3128: generation input and output, redacted then clipped. Never tool
+    # arguments or tool results. Langfuse maps these to observation input/output.
+    OBSERVATION_INPUT = "langfuse.observation.input"
+    OBSERVATION_OUTPUT = "langfuse.observation.output"
+    # #3128: "turn" when a result-only provider's ResultMessage total is stamped
+    # on the final generation; "unrecorded" on the root when no generation was
+    # active to carry it. Absent means per-generation usage.
+    USAGE_SCOPE = "curie.usage.scope"
     PHASE = "curie.phase"
     PHASE_START_KIND = "curie.phase.start_kind"
     PHASE_END_KIND = "curie.phase.end_kind"

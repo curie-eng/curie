@@ -20,28 +20,21 @@
 //! ingress-only advice and the assertion below fails. Do not "clean this up"
 //! by importing the delivery module -- that would unpin the fix.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write stub executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read stub metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make stub executable");
-}
 
 /// A serving `curie/curie` release with **no ingress, no NodePort** and a
 /// computed `api.commitPollIntervalSeconds` of `0` -- the exact symptom shape
 /// reported in #2496. The interval lives in `helm get values --all` (COMPUTED)
 /// because a supplied read cannot tell "off" from "never set" (#1950).
 fn install_private_cluster_stubs(tools: &Path) {
-    write_executable(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
-    write_executable(
+    test_executable::install(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
+    test_executable::install(
         tools.join("kubectl").as_path(),
         r#"#!/bin/sh
 case "$*" in
@@ -57,7 +50,7 @@ esac
 exit 0
 "#,
     );
-    write_executable(
+    test_executable::install(
         tools.join("helm").as_path(),
         r#"#!/bin/sh
 case "$*" in

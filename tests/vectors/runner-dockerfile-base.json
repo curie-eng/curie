@@ -1,0 +1,65 @@
+{
+  "comment": "Single source of truth for ADR 0173's base-as-argument rule on a bundle's runner Dockerfile. The bundle layers on the platform runner, and `curie build` pins that base to a digest and passes it as `--build-arg CURIE_RUNNER_IMAGE=<repo@sha256:...>`. That only works if the first FROM IS that argument: a first FROM naming a literal image builds on whatever the tag points at today and records a base the image was not built from. Read by packages/plugin-format/tests/test_connector_lock.py (connector_lock.check_runner_dockerfile, which returns an error message or None) and cli/tests/connector_build_decl_vectors.rs (connector_build::check_runner_dockerfile, which returns Result<()>). Each vector carries `name`, `why`, `dockerfile` (the file body) and `expect` (\"accept\" or \"reject\"). Both lanes reject unknown keys inside a vector.",
+  "vectors": [
+    {
+      "name": "braced_argument_is_accepted",
+      "why": "The documented form.",
+      "dockerfile": "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+      "expect": "accept"
+    },
+    {
+      "name": "unbraced_argument_is_accepted",
+      "why": "Docker treats `$NAME` and `${NAME}` identically; refusing one is a false positive.",
+      "dockerfile": "ARG CURIE_RUNNER_IMAGE\nFROM $CURIE_RUNNER_IMAGE\nRUN pip install acme-tools\n",
+      "expect": "accept"
+    },
+    {
+      "name": "a_named_stage_is_accepted",
+      "why": "`AS name` names the stage and does not change the base.",
+      "dockerfile": "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE} AS runtime\nRUN pip install acme-tools\n",
+      "expect": "accept"
+    },
+    {
+      "name": "comments_and_blank_lines_before_arg_are_accepted",
+      "why": "A header comment is ordinary Dockerfile style; the rule reads instructions, not lines.",
+      "dockerfile": "# syntax=docker/dockerfile:1\n# acme runner layer\n\nARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+      "expect": "accept"
+    },
+    {
+      "name": "a_literal_tag_is_rejected",
+      "why": "The case the rule exists for: the build uses whatever the tag names today and the recorded base is a lie.",
+      "dockerfile": "FROM ghcr.io/curie-eng/curie-runner:0.10.0\nRUN pip install acme-tools\n",
+      "expect": "reject"
+    },
+    {
+      "name": "a_literal_digest_is_rejected",
+      "why": "Pinned, but not to what `curie build` resolved and records; the lock's base would still describe a different image.",
+      "dockerfile": "FROM ghcr.io/curie-eng/curie-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000\n",
+      "expect": "reject"
+    },
+    {
+      "name": "the_argument_without_its_arg_declaration_is_rejected",
+      "why": "Without `ARG CURIE_RUNNER_IMAGE` before the first FROM the reference expands to empty and the build fails inside docker with a message about the daemon rather than the bundle.",
+      "dockerfile": "FROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+      "expect": "reject"
+    },
+    {
+      "name": "a_different_argument_name_is_rejected",
+      "why": "`curie build` passes exactly CURIE_RUNNER_IMAGE; any other name is never set and the base is whatever the ARG default says.",
+      "dockerfile": "ARG BASE=ghcr.io/curie-eng/curie-runner:0.10.0\nFROM ${BASE}\n",
+      "expect": "reject"
+    },
+    {
+      "name": "a_literal_first_stage_before_the_argument_is_rejected",
+      "why": "The FIRST FROM is the one checked. A multi-stage file whose first stage is a literal image puts an unpinned base into the build.",
+      "dockerfile": "ARG CURIE_RUNNER_IMAGE\nFROM python:3.13-slim AS tools\nFROM ${CURIE_RUNNER_IMAGE}\n",
+      "expect": "reject"
+    },
+    {
+      "name": "a_file_with_no_from_is_rejected",
+      "why": "Nothing to layer on.",
+      "dockerfile": "ARG CURIE_RUNNER_IMAGE\nRUN true\n",
+      "expect": "reject"
+    }
+  ]
+}

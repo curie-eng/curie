@@ -1,0 +1,31 @@
+# The narrowest grant that lets the connector keep its own credential alive:
+# patch on exactly one Secret. Applied by hand BEFORE the bundle, because the
+# bundle format has no place for it (measured: this is deployment state that
+# exists only in the cluster).
+#
+# The connector Deployment declares no serviceAccountName, so it runs as
+# `default`, and binding to `default` grants this patch to every pod in the
+# namespace that runs as `default`. `connectors.yaml` exposes no field for a
+# dedicated ServiceAccount today.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: stubfin-connector-token
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["stubfin-credentials"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stubfin-connector-token
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: stubfin-connector-token
+subjects:
+  - kind: ServiceAccount
+    name: default
