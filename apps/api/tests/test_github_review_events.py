@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 import httpx
 import pytest
+from aci_protocol import parse_queued_turn
 from channel_protocol import scoped_conversation_id
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -2586,6 +2587,61 @@ def test_forged_slack_principal_on_queued_github_feedback_is_refused_by_actual_a
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "feedback_turn_mismatch"
     assert valkey.xlen(stream) == 1
+
+
+def _verify_stored_feedback(client: TestClient, truth: GitHubTruth, turn: dict) -> httpx.Response:
+    deployment_id = review_rows("SELECT deployment_id FROM curie.thread_publication_lineages")[0][
+        "deployment_id"
+    ]
+    return client.post(
+        f"/v1/internal/github/reviews/{truth.feedback.event_id}/verify",
+        json={"turn": turn, "deployment_id": str(deployment_id)},
+        headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
+    )
+
+
+def test_a_feedback_turn_stored_before_tool_access_existed_still_verifies(review_stack) -> None:
+    """TOOL-ACCESS-7: a row an older API stored has no ``tool_access`` key.
+
+    The worker decodes that turn off the stream and sends back its own dump,
+    which now carries ``"tool_access": null``. Comparing raw JSON would refuse
+    every turn in flight across the upgrade as ``feedback_turn_mismatch``.
+    """
+
+    # @spec TOOL-ACCESS-7
+    client, truth, valkey, _stream = review_stack
+    assert post_review(client, truth).json()["status"] == "feedback_queued"
+    review_rows(
+        "UPDATE curie.github_review_feedback SET turn = (turn::jsonb - 'tool_access')::json"
+    )
+    [stored] = review_rows("SELECT turn FROM curie.github_review_feedback")
+    assert "tool_access" not in stored["turn"]
+    turn = parse_queued_turn(json.dumps(stored["turn"])).model_dump(mode="json")
+    assert turn["tool_access"] is None
+
+    response = _verify_stored_feedback(client, truth, turn)
+
+    assert response.status_code == 200, response.text
+
+
+def test_the_verify_route_tolerates_a_turn_field_this_api_does_not_model(review_stack) -> None:
+    """TOOL-ACCESS-7: a newer worker's turn carries a key this API predates.
+
+    The route decodes the body the way every other wire consumer does, so the
+    key is ignored rather than answered 422, and the rest still has to match.
+    """
+
+    # @spec TOOL-ACCESS-7
+    client, truth, valkey, stream = review_stack
+    assert post_review(client, truth).json()["status"] == "feedback_queued"
+    turn = json.loads(valkey.xrange(stream)[0][1]["payload"])
+
+    response = _verify_stored_feedback(client, truth, {**turn, "a_later_field": "x"})
+    assert response.status_code == 200, response.text
+
+    changed = _verify_stored_feedback(client, truth, {**turn, "text": "a different comment"})
+    assert changed.status_code == 409, changed.text
+    assert changed.json()["detail"]["code"] == "feedback_turn_mismatch"
 
 
 @pytest.mark.parametrize("action", ["edited", "deleted"])

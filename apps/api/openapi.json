@@ -5792,7 +5792,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.",
         "properties": {
           "attachments": {
             "default": [],
@@ -5845,6 +5845,16 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -6942,6 +6952,14 @@
         },
         "title": "TipsPackConfig",
         "type": "object"
+      },
+      "ToolAccess": {
+        "description": "Which tools one turn may execute (TOOL-ACCESS-1, TOOL-ACCESS-3).\n\nCarried as ``QueuedTurn.tool_access`` and ``Event.tool_access``. Null means\nthe turn runs exactly as it always has. On a server that advertises it\nunder ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), ``READ_ONLY`` restricts\nthe turn to tools the server explicitly classifies as read-only, denies\nevery other tool before it executes, and never requests an approval. A\nworker or server that does not implement the contract decodes the value and\ndrops it (TOOL-ACCESS-6).\n\nAn enum, not free text (TOOL-ACCESS-2): an unknown value is refused on the\nwire, never read as null, because reading it as null would run a restricted\nturn unrestricted. A second value is a breaking change, decided on its own.",
+        "enum": [
+          "read-only"
+        ],
+        "title": "ToolAccess",
+        "type": "string"
       },
       "TraceTree": {
         "description": "A trace plus its reconstructed observation tree.",
