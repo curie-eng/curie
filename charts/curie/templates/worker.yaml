@@ -272,7 +272,7 @@ spec:
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_PROTECTED_PATHS
-              value: {{ join "," (.Values.worker.publication.protectedPaths | default list) | quote }}
+              value: {{ .Values.worker.publication.protectedPaths | default list | toJson | quote }}
             - name: CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS
               value: {{ .Values.worker.publication.resultMaxAttempts | quote }}
             - name: CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS

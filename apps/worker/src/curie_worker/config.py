@@ -132,6 +132,37 @@ def _parse_trusted_origins(value: object) -> object:
 TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 
+
+def _parse_publication_protected_paths(value: object) -> object:
+    """Parse ``CURIE_PUBLICATION_PROTECTED_PATHS`` as a JSON array of strings.
+
+    A comma-separated string is rejected. A path may itself contain a comma, and
+    splitting on that comma would protect different paths from the ones the
+    operator listed.
+    """
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings"
+            ) from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError("CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings")
+        return tuple(parsed)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(part) for part in value)
+    return value
+
+
+PublicationProtectedPaths = Annotated[
+    tuple[str, ...], NoDecode, BeforeValidator(_parse_publication_protected_paths)
+]
+
 # Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
 # three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
 # chart schema carries the same maximum.
@@ -1070,7 +1101,7 @@ class WorkerConfig(BaseSettings):
     # Repository-relative paths publication refuses in addition to `.github/`.
     # An entry matches that path and anything under it. The whole `.github/`
     # tree is refused even when this list is empty.
-    publication_protected_paths: CommaSeparatedNames = Field(
+    publication_protected_paths: PublicationProtectedPaths = Field(
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
     )

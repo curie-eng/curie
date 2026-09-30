@@ -315,10 +315,28 @@ def test_hidden_github_metadata_is_refused_by_name(tmp_path: Path) -> None:
 
 
 def test_worker_config_reads_repository_relative_protected_paths(monkeypatch: Any) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
     monkeypatch.delenv("CURIE_PUBLICATION_PROTECTED_PATHS", raising=False)
     assert WorkerConfig().publication_protected_paths == ()
+    monkeypatch.setenv(
+        "CURIE_PUBLICATION_PROTECTED_PATHS",
+        '["scripts/release.sh", "build", "scripts/release,prod.sh"]',
+    )
+    assert WorkerConfig().publication_protected_paths == (
+        "scripts/release.sh",
+        "build",
+        "scripts/release,prod.sh",
+    )
+    assert (
+        validation.publication_path_refusal(
+            "scripts/release,prod.sh",
+            WorkerConfig().publication_protected_paths,
+        )
+        == validation.OPERATOR_PROTECTED_REFUSAL
+    )
     monkeypatch.setenv("CURIE_PUBLICATION_PROTECTED_PATHS", "scripts/release.sh, build")
-    assert WorkerConfig().publication_protected_paths == ("scripts/release.sh", "build")
-    monkeypatch.setenv("CURIE_PUBLICATION_PROTECTED_PATHS", "scripts/../secret")
+    with pytest.raises(ValidationError, match="JSON array"):
+        WorkerConfig()
+    monkeypatch.setenv("CURIE_PUBLICATION_PROTECTED_PATHS", '["scripts/../secret"]')
     with pytest.raises(ValidationError, match="repository-relative"):
         WorkerConfig()
