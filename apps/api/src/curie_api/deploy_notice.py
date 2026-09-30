@@ -229,7 +229,9 @@ class DeployNoticeQueue:
         await session.execute(
             select(
                 func.pg_advisory_xact_lock(
-                    func.hashtextextended(f"curie:deploy-notice\0{self._stream}\0{repo_key}", 0)
+                    func.hashtextextended(
+                        json.dumps(["curie:deploy-notice", self._stream, repo_key]), 0
+                    )
                 )
             )
         )
