@@ -583,3 +583,72 @@ def test_hooks_declared_as_a_file_path_still_deny(tmp_path: Path) -> None:
     plugin_dir = _bundle(tmp_path, "hooks/hooks.json")
     out = _call(_callback_for(plugin_dir))
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_build_runner_records_every_runner_side_deny_in_the_session_ledger(
+    tmp_path, monkeypatch
+) -> None:
+    """#3580: the session's own ledger is the one its registered denials write.
+
+    The bundle command, the connector exclusion and the session runner must
+    share one ledger, or the runner counts a denial its hooks recorded
+    somewhere it never reads. Each callback is taken from the SDK options
+    ``build_runner`` hands the real CLI, fronted as the CLI receives it.
+    """
+
+    monkeypatch.delenv(PROGRESS_URL_ENV, raising=False)
+    monkeypatch.delenv(PROGRESS_TOKEN_ENV, raising=False)
+    plugin_dir = _bundle(
+        tmp_path,
+        {
+            "PreToolUse": [
+                {
+                    "matcher": "mcp__acme__read_ledger",
+                    "hooks": [{"type": "command", "command": "echo closed >&2; exit 2"}],
+                }
+            ]
+        },
+    )
+    config = RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": plugin_dir,
+            "CURIE_SESSION_ID": "s-refusal-ledger",
+            "CURIE_SANDBOX_ID": "b-refusal-ledger",
+            "CURIE_BUDGET": '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}',
+        }
+    )
+    runner = build_runner(
+        config,
+        mcp_capability=McpToolCapabilityProbe(
+            complete=True,
+            has_potential_write_tool=False,
+            tool_count=0,
+            connector_failures=(_GITHUB_FAILURE,),
+        ),
+    )
+    options = runner._factory()._options
+    assert options.hooks is not None
+    matchers = options.hooks["PreToolUse"]
+    (bundle_matcher,) = [m for m in matchers if m.matcher == "mcp__acme__read_ledger"]
+    front, exclusion = [m for m in matchers if m.matcher is None]
+    assert front.hooks[0].__qualname__ == "front_pre_tool_use_hooks.<locals>.front"
+
+    guarded = anyio.run(
+        bundle_matcher.hooks[0],
+        {"tool_name": "mcp__acme__read_ledger", "tool_input": {}},
+        "toolu_guarded",
+        None,
+    )
+    excluded = anyio.run(
+        exclusion.hooks[0],
+        {"tool_name": _GATED, "tool_input": {}},
+        "toolu_excluded",
+        None,
+    )
+
+    assert guarded["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert excluded["hookSpecificOutput"]["permissionDecision"] == "deny"
+    ledger = runner._refusal_ledger
+    assert ledger is not None
+    assert ledger.refused_call_ids == {"toolu_guarded"}
+    assert ledger.unavailable_call_ids == {"toolu_excluded"}
