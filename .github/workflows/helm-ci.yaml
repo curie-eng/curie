@@ -508,6 +508,10 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/api-ingress-assertions.sh
+          helm template ingress-schema charts/curie \
+            --set api.ingress.enabled=true --set api.ingress.host=api.example.com \
+            -s templates/api-ingress.yaml \
+            | kubeconform -strict -summary -kubernetes-version "$KUBE_VERSION"
 
       # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
       # as digits (a float renders as "4.47597e+06" and 401s every call), and a
@@ -517,6 +521,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/github-app-credential-assertions.sh
+          python3 charts/curie/ci/test_api_identity_assertions.py
 
       # Prove GitHub review ingress stays off by default, renders explicit
       # operator values, rejects invalid types/cadences, and reserves both env
