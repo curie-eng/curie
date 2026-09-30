@@ -109,8 +109,10 @@ channel ref is minted, so only agent facts are loaded. When
 (`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The
 tools take `memory: agent|channel`; the author is the turn's sender, never a
 tool argument. A write the state API refuses at its cap is reported to the model
-as refused. The tools are exempt from bundle toolPolicy by published name, and
-the worker leaves them out of change receipts.
+as refused. So is a `remember` into a memory that already holds 200 facts, the
+most boot loads, so no fact silently leaves the prompt; `update` and `forget`
+still work there. The tools are exempt from bundle toolPolicy by published
+name, and the worker leaves them out of change receipts.
 
 ## Known leakage
 

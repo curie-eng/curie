@@ -93,16 +93,17 @@ class FactNotFound(MemoryFactsError):
 
 
 class MemoryFull(MemoryFactsError):
-    """The state API refused the write at one of its size caps (a 413).
+    """A write was refused because the memory, or this one fact, is too big.
 
-    ``limit`` says which: ``"value"`` when this one fact is over the per-value
-    cap, ``"namespace"`` when the memory as a whole is at its cap. Only the
-    second means the memory is full.
+    ``limit`` says which: ``"value"`` when this one fact is over the state API's
+    per-value cap, ``"namespace"`` when the memory as a whole is at the state
+    API's cap (both a 413), and ``"facts"`` when the memory already holds
+    ``MAX_FACTS_PER_MEMORY`` facts, the most boot shows the agent (#3624).
     """
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, limit: str | None = None) -> None:
         super().__init__(detail)
-        self.limit = "value" if "per-value" in detail else "namespace"
+        self.limit = limit or ("value" if "per-value" in detail else "namespace")
 
 
 @dataclass(frozen=True)
@@ -182,8 +183,8 @@ class MemoryFactsStore:
     def _key_url(self, key: str) -> str:
         return f"{self._base}/{quote(key, safe='')}"
 
-    async def list(self) -> list[Fact]:
-        """Every fact in the namespace, newest first. Reserved keys are skipped."""
+    async def _entries(self) -> list[Any]:
+        """The namespace's raw ``{key, value}`` entries; empty when it does not exist."""
 
         async with (
             aiohttp.ClientSession(timeout=_TIMEOUT) as session,
@@ -196,8 +197,13 @@ class MemoryFactsStore:
             payload = await resp.json()
         if not isinstance(payload, list):
             raise MemoryFactsError("memory list is not a JSON array")
+        return payload
+
+    async def list(self) -> list[Fact]:
+        """Every fact in the namespace, newest first. Reserved keys are skipped."""
+
         facts: list[Fact] = []
-        for entry in payload:
+        for entry in await self._entries():
             if not isinstance(entry, Mapping):
                 continue
             fact = _parse_fact(str(entry.get("key") or ""), entry.get("value"))
@@ -253,8 +259,29 @@ class MemoryFactsStore:
         """Store a new fact under a freshly minted id and return the id.
 
         Never replaces a fact: every call mints its own ``fact-<uuid4>`` key.
+        Refused with ``MemoryFull`` (``limit == "facts"``), writing nothing, when
+        the memory already holds ``MAX_FACTS_PER_MEMORY`` facts: boot shows the
+        agent only that many, so one more would silently push the oldest out of
+        the prompt (#3624). Only ``fact-*`` keys count; ``log`` and ``guidance``
+        do not.
+
+        Two concurrent saves can both pass this check at one below the limit
+        and land one over it. That is accepted rather than locked against: boot
+        still caps at the limit and says how many facts it left out.
         """
 
+        held = sum(
+            1
+            for entry in await self._entries()
+            if isinstance(entry, Mapping)
+            and str(entry.get("key") or "").startswith(FACT_KEY_PREFIX)
+        )
+        if held >= MAX_FACTS_PER_MEMORY:
+            raise MemoryFull(
+                f"it holds {held} facts, the most the agent can be shown "
+                f"({MAX_FACTS_PER_MEMORY}); update or forget an existing fact to make room",
+                limit="facts",
+            )
         fact_id = f"{FACT_KEY_PREFIX}{uuid.uuid4().hex}"
         await self._put(fact_id, _fact_value(statement, author, session_id))
         return fact_id

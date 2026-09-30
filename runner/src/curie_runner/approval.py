@@ -600,6 +600,8 @@ def build_memory_tools(
                 f"Refused: that fact is too large to store as one {memory} memory entry "
                 f"({exc}). Nothing was saved; state it more briefly."
             )
+        if isinstance(exc, MemoryFull) and exc.limit == "facts":
+            return _approval_error(f"Refused: {memory} memory is full: {exc}. Nothing was saved.")
         if isinstance(exc, MemoryFull):
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
