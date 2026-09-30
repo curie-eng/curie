@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 
 import pytest
 import redis
@@ -46,13 +47,17 @@ def _post(
     signature: str | None = None,
 ) -> Response:
     secret = derive(get_settings().api_key, agent_id=agent_id, generation=0)
-    signed = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    timestamp = str(int(time.time()))
+    # Match the accepted replay-bound hook wire contract independently of sign().
+    material = f"{timestamp}.policy-delivery.".encode() + body
+    signed = "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
     return client.post(
         f"/hooks/{agent_id}/issues",
         params={} if access is None else {"tool_access": access},
         content=body,
         headers={
             "Content-Type": "application/json",
+            "X-Curie-Timestamp": timestamp,
             "X-Curie-Signature-256": signed if signature is None else signature,
             "X-Curie-Delivery-Id": "policy-delivery",
         },
