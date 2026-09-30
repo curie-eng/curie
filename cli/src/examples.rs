@@ -3550,6 +3550,42 @@ mod tests {
     }
 
     #[test]
+    fn log_runtime_counts_nodes_behind_transient_condition_taints() {
+        // The node lifecycle controller and the cloud controller add these
+        // taints while a node is unhealthy or starting, then remove them. A
+        // DaemonSet pod lands there afterwards, so the node's runtime counts.
+        // https://kubernetes.io/docs/reference/labels-annotations-taints/
+        for key in [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+            "node.kubernetes.io/network-unavailable",
+            "node.cloudprovider.kubernetes.io/uninitialized",
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [
+                    {
+                        "metadata": {"name": "worker"},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                    },
+                    {
+                        "metadata": {"name": "recovering-docker"},
+                        "spec": {"taints": [
+                            {"key": key, "effect": "NoSchedule"},
+                            {"key": key, "effect": "NoExecute"}
+                        ]},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                    }
+                ]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("recovering-docker"), "{key}: {error}");
+        }
+    }
+
+    #[test]
     fn log_runtime_refuses_when_no_nodes_are_eligible_for_alloy() {
         let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
             "items": [{

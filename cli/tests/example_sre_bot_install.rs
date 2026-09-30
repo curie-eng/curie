@@ -1230,6 +1230,51 @@ fn not_ready_docker_node_prevents_cri_alloy_install() {
 }
 
 #[test]
+fn not_ready_docker_node_with_its_condition_taints_prevents_cri_alloy_install() {
+    // A real NotReady node carries node.kubernetes.io/not-ready as both
+    // NoSchedule (taint by condition) and NoExecute (taint based eviction).
+    // A DaemonSet tolerates only the NoExecute half, so Alloy is not placed
+    // there now, but the taints lift when the node recovers and Alloy then
+    // runs on it with whatever parser this install rendered.
+    // https://kubernetes.io/docs/reference/labels-annotations-taints/#node-kubernetes-io-not-ready
+    // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/#taints-and-tolerations
+    let mut not_ready = node_with_runtime("node-not-ready", false, "docker://24.0.0", false);
+    not_ready["spec"]["taints"] = json!([
+        {"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
+        {"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"}
+    ]);
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-ready", true, "containerd://1.7.0", false),
+            not_ready,
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("node-ready") && stderr.contains("node-not-ready"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty(), "Helm was mutated");
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|call| call.contains("apply -f -")),
+        "Grafana Secret was mutated"
+    );
+}
+
+#[test]
 fn provision_observability_refuses_mixed_runtime_before_mutation() {
     let fixture = Fixture::with_modes(
         nodes(vec![
@@ -3485,7 +3530,7 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
     );
     assert_eq!(
         prometheus_values.matches("namespace=\"soak-obs\"").count(),
-        9,
+        12,
         "all Alloy alert matchers must use the selected namespace: {prometheus_values}"
     );
     assert!(

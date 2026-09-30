@@ -3664,3 +3664,88 @@ tests:
       - eval_time: 30m
         alertname: CurieAlloyLogDeliveryStopped
         exp_alerts: []
+
+  # Both per-pod Alloy rules need up == 1, so an Alloy pod Prometheus cannot
+  # scrape (up 0) or never sees leaves them silent while it ships nothing.
+  # kube-state-metrics says how many Alloy pods the DaemonSet wants; paging on
+  # fewer scrapeable pods than that closes the gap.
+  - name: an unscrapeable Alloy pod pages though the per-pod rules cannot see it
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '2x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-a",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-b",node="node-b"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-a
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: no scrapeable Alloy pod at all pages
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '1x25'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
+
+  - name: every wanted Alloy pod scraped stays quiet, other DaemonSets and namespaces aside
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '2x25'
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy-other"}'
+        values: '5x25'
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="elsewhere",daemonset="alloy"}'
+        values: '3x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-a",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-b",node="node-b"}'
+        values: '1x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts: []
