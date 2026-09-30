@@ -1640,10 +1640,9 @@ curie cluster memory <agent> --reset-guidance
 ```
 
 A new thread picks up changed guidance. A live thread keeps what it booted
-with. `--memory-writes off` unmounts the tools at the next boot. With writes
-off the worker gives the sandbox no channel memory at all, so channel facts are
-not loaded; agent facts already saved are still shown to the agent. Saved
-channel facts stay stored and come back if writes are turned on again.
+with. `--memory-writes off` unmounts the tools and drops the guidance at the
+next boot. It stops saving only: facts already saved, in agent memory and in
+each channel's memory, are still shown to the agent.
 
 ### Connecting Slack
 

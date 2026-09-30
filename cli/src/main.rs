@@ -2317,7 +2317,8 @@ enum LocalAction {
         #[arg(long)]
         clear_runner_resources: bool,
         /// Turn the agent's remember/update/forget memory tools on or off
-        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
@@ -3286,7 +3287,8 @@ enum ClusterAction {
         #[arg(long)]
         clear_runner_resources: bool,
         /// Turn the agent's remember/update/forget memory tools on or off
-        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         #[command(flatten)]

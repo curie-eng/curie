@@ -49,8 +49,9 @@ class RunnerConfig:
     connector_namespace: str | None
     history_ref: str | None
     # This turn's channel memory (#1461, ADR-0167): the binding-scoped memory
-    # namespace URL. The worker sets it only when memory writes are on and the
-    # turn has a binding; its presence mounts the remember/update/forget tools.
+    # namespace URL. The worker sets it whenever the turn has a binding, so the
+    # channel's facts load whether memory writes are on or off (#3621). Whether
+    # the remember/update/forget tools mount is ``memory_writes_on`` below.
     channel_memory_ref: str | None
     # Tool names whose calls require human approval (#245, ADR-0010). The
     # runner intercepts these proactively via the SDK can_use_tool callback
@@ -104,6 +105,22 @@ class RunnerConfig:
     # The caller token this sandbox presents to its hosted connectors
     # (ADR-0168 decision 7), or None when the worker minted none.
     connector_caller_token: str | None = None
+    # The operator's memory-writes switch as the worker sent it (#3659):
+    # True or False explicitly alongside a channel ref, None from an older
+    # worker that sent no flag and only ever sent the ref with writes on.
+    memory_writes: bool | None = None
+
+    @property
+    def memory_writes_on(self) -> bool:
+        """Whether this turn may save channel memory (#3621).
+
+        An explicit flag decides. Without one (an older worker), a channel ref
+        alone means writes on, which is what that worker meant by sending it.
+        """
+
+        if self.memory_writes is not None:
+            return self.memory_writes
+        return bool(self.channel_memory_ref)
 
     @property
     def ceiling(self) -> int:
@@ -175,4 +192,5 @@ class RunnerConfig:
             history_max_bytes=boot.history_max_bytes,
             disallowed_tools=disallowed_tools,
             connector_caller_token=boot.connector_caller_token,
+            memory_writes=boot.memory_writes,
         )

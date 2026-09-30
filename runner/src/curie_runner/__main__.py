@@ -605,13 +605,14 @@ def build_runner(
         )
         else None
     )
-    # The memory tools (#1461, ADR-0167) mount iff the worker set a channel
-    # memory ref (the operator's memory-writes switch as the sandbox sees it)
-    # AND a memory token to write with, and only on the real-model path, which
-    # is the only path that mounts platform MCP servers at all. The toolPolicy
-    # exemption below reads this same flag, so the claim matches the mount.
-    # The guidance block rides with the tools and only with them; the facts
-    # block does not, because reading memory needs no switch.
+    # The memory tools (#1461, ADR-0167) mount iff memory writes are on (the
+    # worker's explicit flag, or a bare channel ref from an older worker; see
+    # RunnerConfig.memory_writes_on, #3621), the worker set a channel memory
+    # ref AND a memory token to write with, and only on the real-model path,
+    # which is the only path that mounts platform MCP servers at all. The
+    # toolPolicy exemption below reads this same flag, so the claim matches
+    # the mount. The guidance block rides with the tools and only with them;
+    # the facts block does not, because reading memory needs no switch.
     memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
     channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
     if config.channel_memory_ref and channel_facts_store is None:
@@ -619,7 +620,10 @@ def build_runner(
     if config.channel_memory_ref and memory_token is None:
         logger.warning("memory tools not mounted: no memory token")
     memory_tools_mounted = (
-        channel_facts_store is not None and memory_token is not None and not fake_model
+        config.memory_writes_on
+        and channel_facts_store is not None
+        and memory_token is not None
+        and not fake_model
     )
     memory_turn = MemoryTurn() if memory_tools_mounted else None
     system_prompt = _compose_system_prompt(
@@ -1108,9 +1112,13 @@ async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | No
         if channel_store is not None:
             channel_facts = await read("channel facts", channel_store.list) or []
 
+    # Channel facts load whenever there is a channel store; the guidance is
+    # about the writing tools, so it is read only when writes are on (#3621).
+    writes_on = config.memory_writes_on
+
     async def load_guidance() -> None:
         nonlocal guidance
-        if agent_store is not None and channel_store is not None:
+        if writes_on and agent_store is not None and channel_store is not None:
             guidance = await read("guidance", agent_store.guidance)
 
     async with anyio.create_task_group() as tg:
@@ -1119,9 +1127,9 @@ async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | No
         tg.start_soon(load_guidance)
     # Counts and the guidance source only: never statements, authors or the
     # guidance text. Counts are what the prompt shows, after the per-memory cap.
-    # "none" mirrors build_runner's mount rule as far as boot can see it (a
-    # channel store and a memory token).
-    if channel_store is None or not token:
+    # "none" mirrors build_runner's mount rule as far as boot can see it
+    # (writes on, a channel store and a memory token).
+    if not writes_on or channel_store is None or not token:
         guidance_source = "none"
     else:
         guidance_source = "operator" if guidance is not None else "default"
