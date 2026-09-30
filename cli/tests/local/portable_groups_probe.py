@@ -10,7 +10,7 @@ from claude_agent_sdk import ToolResultBlock, UserMessage
 from claude_agent_sdk._cli_version import __cli_version__
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
-from curie_runner.history import ConversationMessage, HistoryError, TurnRecord
+from curie_runner.history import ConversationMessage, TurnRecord
 from curie_runner.mcp_tool_capability import _probe_server_once
 from curie_runner.session import SessionRunner
 
@@ -153,15 +153,23 @@ async def main():
             ]
         )
     await replay(ordered, "ordered")
+    # RUNNER-HISTORY-GROUP-4: the same capture without its groups is never
+    # submitted as corrupt interleaving; its turn replays as visible text.
     stripped = tuple(ConversationMessage(role=m.role, content=m.content) for m in record.messages)
-    try:
-        build_structured_resume(
-            stripped, curie_session_id="acme-no-groups", cwd="/tmp", system_prompt=PROMPT
+    resume = build_structured_resume(
+        stripped, curie_session_id="acme-no-groups", cwd="/tmp", system_prompt=PROMPT
+    )
+    entries = await resume.session_store.load(resume.session_key)
+    output["stripped_rows"] = len(entries)
+    output["stripped_tool_rows"] = sum(
+        1
+        for entry in entries
+        if isinstance(entry["message"]["content"], list)
+        and any(
+            block.get("type") in ("tool_use", "tool_result")
+            for block in entry["message"]["content"]
         )
-    except HistoryError as exc:
-        output["stripped_refusal"] = str(exc)
-    else:
-        output["stripped_refusal"] = None
+    )
     ROOT.joinpath("proof.json").write_text(json.dumps(output))
 
 
