@@ -24,6 +24,76 @@ permissions:
   contents: read
 
 jobs:
+  action-pins:
+    name: Action SHA pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Require third party action SHA pins and version comments
+        run: |
+          uv run --no-project --with pyyaml==6.0.3 python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          def uses_nodes(node, seen):
+              if id(node) in seen:
+                  return
+              seen.add(id(node))
+              if isinstance(node, yaml.MappingNode):
+                  for key, value in node.value:
+                      if isinstance(key, yaml.ScalarNode) and key.value == "uses":
+                          yield value
+                  children = (value for key, value in node.value)
+              elif isinstance(node, yaml.SequenceNode):
+                  children = iter(node.value)
+              else:
+                  children = ()
+              for child in children:
+                  yield from uses_nodes(child, seen)
+
+          errors = []
+          checked = 0
+          directory = Path(".github/workflows")
+          for path in sorted((*directory.glob("*.yaml"), *directory.glob("*.yml"))):
+              source = path.read_text()
+              # Token gaps contain comments, unlike quoted scalars containing '#'.
+              # YAML nodes also cover quoted keys, flow mappings, and aliases.
+              comments = {}
+              previous = 0
+              for token in yaml.scan(source):
+                  gap = source[previous:token.start_mark.index]
+                  for match in re.finditer(r"#[^\n]*", gap):
+                      position = previous + match.start()
+                      comments[source.count("\n", 0, position)] = match.group()
+                  previous = token.end_mark.index
+              root = yaml.compose(source, Loader=yaml.SafeLoader)
+              for node in uses_nodes(root, set()):
+                  line = node.start_mark.line + 1
+                  if not isinstance(node, yaml.ScalarNode):
+                      errors.append((path, line, "uses must be a scalar action reference"))
+                      continue
+                  value = node.value
+                  # Local actions use this repository's checked out code.
+                  if not value.startswith(("actions/", "./")):
+                      checked += 1
+                      if not re.fullmatch(r"[^/\s@]+/[^\s@]+@[0-9a-fA-F]{40}", value):
+                          errors.append((path, line, "third party action requires a full 40 hex commit SHA"))
+                      comment = comments.get(node.end_mark.line, "")
+                      if not re.search(r"#\s*v[0-9]+(?:\.[0-9]+)*\b", comment):
+                          errors.append((path, line, "third party action requires a version comment on its uses line"))
+          for path, line, message in errors:
+              print(f"::error file={path},line={line}::{message}")
+          if errors:
+              raise SystemExit(1)
+          print(f"Verified {checked} third party action references")
+          PY
+
   # The suite runs as parallel shards, each on its own runner with its own dev
   # stack; the required `Python (ruff + mypy + pytest)` job below runs the static
   # gates and then aggregates the shard results. One -n 4 job was 13.5 minutes
@@ -366,7 +436,7 @@ jobs:
       # so a run recompiles only what changed, not the whole dependency tree from
       # scratch (the dominant cost of this job).
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             cli
@@ -484,7 +554,7 @@ jobs:
       # One cache shared by the three partitions; only the first saves it so
       # the jobs do not race to upload identical entries.
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
           shared-key: rust-test
@@ -570,7 +640,7 @@ jobs:
       - name: Toolchain
         run: rustc --version
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
       - name: Release build
@@ -604,7 +674,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
       # rustup for the std/core rlibs, zig for the C toolchain and the glibc
@@ -701,7 +771,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
       - name: Add target
@@ -1840,7 +1910,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -1894,7 +1964,7 @@ jobs:
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -1913,7 +1983,7 @@ jobs:
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2122,7 +2192,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
       # The fixture image delays Postgres for the Langfuse startup regression.
@@ -2157,7 +2227,7 @@ jobs:
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2176,7 +2246,7 @@ jobs:
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2304,7 +2374,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -2358,7 +2428,7 @@ jobs:
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2377,7 +2447,7 @@ jobs:
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
