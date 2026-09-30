@@ -1926,6 +1926,122 @@ def test_claimed_card_then_expired_waits_for_adoption_without_status_overwrite(
     ) == [{"status": "expired"}]
 
 
+def test_publication_resolved_before_card_registration_settles_the_card_once(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#3637 on the publication card outbox: the result waits for registration.
+
+    The outbox also posts its card and only then registers it. A verdict that
+    lands while Slack holds the post cannot strand a live card here, because the
+    card is settled by the result delivery, and the result is not claimable until
+    the card is reported, which follows registration. The real store, API and
+    card memory are exercised; only the Slack transport is a barrier.
+
+    THE MUTATION THIS CATCHES: letting a terminal result claim while its card is
+    still being delivered settles nothing and leaves the card live.
+    """
+
+    from channel_protocol.reply import ReplyAck, ReplyPost, ReplyUpdate
+    from curie_worker.approval_cards import ApprovalCardStore
+    from curie_worker.config import WorkerConfig
+    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="resolve-before-card")
+    )
+    approval_id = publication["approval_id"]
+    card_ts = "1700000000.000900"
+
+    class HeldCardSink:
+        """Slack, with the card post's acknowledgement held until released."""
+
+        def __init__(self) -> None:
+            self.posting = asyncio.Event()
+            self.release = asyncio.Event()
+            self.events: list[Any] = []
+
+        async def emit(
+            self, event: Any, *, route: Any, best_effort_unreachable: bool = False
+        ) -> ReplyAck:
+            if isinstance(event, ReplyPost):
+                self.posting.set()
+                await self.release.wait()
+                self.events.append(event)
+                return ReplyAck(ref=card_ts)
+            self.events.append(event)
+            return ReplyAck(ref=event.target.reply_ref)
+
+    class Transcript:
+        async def record_result(self, *_args: Any) -> None:
+            return None
+
+    async def exercise() -> tuple[list[Any], Any, list[bool]]:
+        engine = create_async_engine(get_settings().database_url)
+        valkey = aioredis.from_url(get_settings().valkey_dsn())
+        sink = HeldCardSink()
+        cards = ApprovalCardStore(valkey, WorkerConfig())
+        reconciler = PublicationReconciler(
+            store=PostgresPublicationStore(
+                engine,
+                schema="curie",
+                lease_owner="resolve-before-card",
+                result_max_attempts=2,
+            ),
+            credentials=None,
+            cluster=None,
+            github=None,
+            lineage=None,
+            replies=sink,
+            job_settings=None,  # type: ignore[arg-type]
+            card_store=cards,
+            transcript=Transcript(),
+        )
+        try:
+            delivering = asyncio.create_task(reconciler.deliver_pending_card())
+            await asyncio.wait_for(sink.posting.wait(), timeout=5.0)
+            rejected = _resolve(
+                client, auth_headers, approval_id, decision="rejected", note="not now"
+            )
+            assert rejected.status_code == 200, rejected.text
+            # The verdict is durable, but the card is not yet registered.
+            waited = [await reconciler.deliver_pending_result()]
+            assert await cards.read(approval_id) is None
+
+            sink.release.set()
+            assert await asyncio.wait_for(delivering, timeout=5.0) is True
+            waited.append(await reconciler.deliver_pending_result())
+            waited.append(await reconciler.deliver_pending_result())
+            return sink.events, await cards.read(approval_id), waited
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    events, remaining, waited = asyncio.run(exercise())
+    assert waited == [False, True, False]
+    settled = [
+        event
+        for event in events
+        if isinstance(event, ReplyUpdate) and event.settled is not None
+    ]
+    assert len(settled) == 1
+    assert settled[0].target.reply_ref == card_ts
+    assert settled[0].settled.decision == "rejected"
+    assert settled[0].settled.resolver == "U0REQUEST1"
+    assert settled[0].settled.note == "not now"
+    assert remaining is None
+    assert _rows(
+        "SELECT status, approval_card_reported_at IS NOT NULL AS card_reported, "
+        "result_reported_at IS NOT NULL AS result_reported "
+        "FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    ) == [{"status": "denied", "card_reported": True, "result_reported": True}]
+
+
 def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
