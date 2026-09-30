@@ -122,34 +122,71 @@ class _GrantSpender(Protocol):
     def spend(self, jti: str, ttl: int) -> bool: ...
 
 
+def _resp(*parts: str) -> bytes:
+    encoded = [part.encode("utf-8") for part in parts]
+    head = f"*{len(encoded)}\r\n".encode("ascii")
+    body = b"".join(f"${len(part)}\r\n".encode("ascii") + part + b"\r\n" for part in encoded)
+    return head + body
+
+
+def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
+    """SET key 1 NX EX ttl over the Redis wire. True only when this call stored it.
+
+    The proxy package cannot import the redis client. A missing store, a TLS
+    failure, or any reply other than ``+OK`` is a failed spend.
+    """
+
+    import socket
+    import ssl
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host or parsed.scheme not in {"redis", "rediss"}:
+        return False
+    port = parsed.port or 6379
+    password = unquote(parsed.password) if parsed.password else ""
+    database = (parsed.path or "/0").lstrip("/") or "0"
+    raw = socket.create_connection((host, port), timeout=2)
+    try:
+        conn: socket.socket = raw
+        if parsed.scheme == "rediss":
+            conn = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+
+        def reply() -> bytes:
+            line = b""
+            while not line.endswith(b"\r\n"):
+                chunk = conn.recv(1)
+                if not chunk:
+                    raise OSError("the grant store closed the connection")
+                line += chunk
+            return line[:-2]
+
+        def command(*parts: str) -> bytes:
+            conn.sendall(_resp(*parts))
+            return reply()
+
+        if password and command("AUTH", password) != b"+OK":
+            return False
+        if database != "0" and command("SELECT", database) != b"+OK":
+            return False
+        return command("SET", key, "1", "NX", "EX", str(ttl)) == b"+OK"
+    finally:
+        raw.close()
+
+
 class _ValkeyGrantStore:
-    """SET ``connector-grant:<jti>`` NX EX. Redis is imported on the first spend."""
+    """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
 
     def __init__(self, url: str) -> None:
         self._url = url
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            import redis
-        except Exception:
-            logger.warning("connector grant store is unreachable")
-            return False
-        try:
-            client = redis.Redis.from_url(self._url)
-        except Exception:
-            logger.warning("connector grant store is unreachable")
-            return False
-        try:
-            stored = client.set(f"connector-grant:{jti}", "1", nx=True, ex=ttl)
+            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
         except Exception:
             logger.warning("connector grant spend failed")
             return False
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
-        return bool(stored)
 
 
 def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
