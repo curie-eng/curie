@@ -580,8 +580,10 @@ What I changed: nothing.
   start. An exact provider read can establish current state at its read time;
   the reported startsAt alone cannot.
 
-  If the prior reply is missing the exact alarm name, the original payload is
-  unavailable, or the tools cannot prove the mapping, attribution and current
+  A complete retained identity tuple plus a fresh exact provider read can
+  establish current state even when the original raw payload is unavailable.
+  If the prior reply is missing the exact alarm name and the original payload
+  cannot supply it, or the tools cannot prove the mapping, attribution and current
   state remain unverified. Do not substitute a related rule. Say which identity
   field or provider read is missing and request the original payload or a read
   of that exact provider alarm. A retained fingerprint without the alarm name
