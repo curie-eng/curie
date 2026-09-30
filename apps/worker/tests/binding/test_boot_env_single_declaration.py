@@ -334,6 +334,16 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # One-shot connector grant. The worker writes it beside BootEnv on an
+        # approved resume. The runner (connectors.py) reads it and adds the
+        # header only when it is set. It is not a BootEnv field: the caller
+        # token contract stays unchanged.
+        "CURIE_CONNECTOR_TOOL_GRANT",
+        # The connector proxy process, not the sandbox. The API render writes
+        # these onto the proxy container.
+        "CURIE_CALLER_PROXY_GATED_TOOLS",
+        "CURIE_CALLER_PROXY_CONNECTOR",
+        "CURIE_CALLER_PROXY_GRANT_STORE",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.

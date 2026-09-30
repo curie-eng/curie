@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection, MutableMapping
+from collections.abc import Collection, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +70,11 @@ logger = logging.getLogger(__name__)
 # the env name before a shell or hook can read the token.
 CALLER_HEADER = "X-Curie-Caller"
 _CALLER_PLACEHOLDER = f"${{{BootEnv.env_key('connector_caller_token')}}}"
+# Not a BootEnv field. The worker writes this after render_worker, and only a
+# boot that actually holds a grant puts the placeholder on a hosted entry.
+GRANT_HEADER = "X-Curie-Connector-Grant"
+_GRANT_ENV = "CURIE_CONNECTOR_TOOL_GRANT"
+_GRANT_PLACEHOLDER = "${CURIE_CONNECTOR_TOOL_GRANT}"
 
 
 def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
@@ -138,6 +143,7 @@ def derive_mcp_servers(
     agent: str | None,
     namespace: str | None,
     caller_header: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The MCP server entries for this bundle's declared connectors.
 
@@ -218,14 +224,17 @@ def derive_mcp_servers(
     # Only a Service Curie created gets the token. The scope-less branch above
     # returns first, so a fallback URL never sees it, and a remote connector is
     # somebody else's server.
+    grant_value = ""
+    if env is not None:
+        grant_value = str(env.get(_GRANT_ENV, "")).strip()
     if caller_header:
         for name, spec in declared.connectors.items():
             if spec.is_hosted:
                 entry = entries[name]
-                entries[name] = {
-                    **entry,
-                    "headers": {**entry.get("headers", {}), CALLER_HEADER: _CALLER_PLACEHOLDER},
-                }
+                headers = {**entry.get("headers", {}), CALLER_HEADER: _CALLER_PLACEHOLDER}
+                if grant_value:
+                    headers[GRANT_HEADER] = _GRANT_PLACEHOLDER
+                entries[name] = {**entry, "headers": headers}
     return entries
 
 

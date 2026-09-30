@@ -235,6 +235,10 @@ def test_a_resolved_build_renders_where_an_unresolved_one_raises() -> None:
         connector="k8s-write",
         spec=resolved.connectors["k8s-write"],
         secret_name="acme-rel-acme-bot-connector-secrets",
+        proxy=connector_render.ConnectorProxy(
+            image="ghcr.io/curie-eng/curie-worker:0.0.0",
+            public_keys=("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",),
+        ),
     )
     deployment = next(o for o in objects if o["kind"] == "Deployment")
     container = deployment["spec"]["template"]["spec"]["containers"][0]

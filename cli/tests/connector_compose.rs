@@ -49,6 +49,7 @@
 //!     identity: &ConnectorScope,
 //!     project: &str,
 //!     plugin_dir: &Path,
+//!     caller_public_key: Option<&str>,
 //! ) -> anyhow::Result<serde_json::Value>;
 //! /// Resolved secret values handed to the compose child's environment only,
 //! /// where the overlay's `${NAME}` references expand from; the file on disk
@@ -78,6 +79,7 @@
 //!         project: &str,
 //!         plugin_dir: &Path,
 //!         secret_values: &BTreeMap<String, String>,
+//!         caller_public_key: Option<&str>,
 //!     ) -> anyhow::Result<Self>;
 //!     pub fn run_args(&self) -> Vec<String>;
 //! }
@@ -207,6 +209,7 @@ fn start_spec(
         "curie-skill-abc123",
         plugin_dir,
         secret_values,
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .unwrap_or_else(|error| panic!("start spec for {connector}: {error:#}"))
 }
@@ -559,6 +562,7 @@ fn an_out_of_band_secret_reference_fails_closed_with_all_three_alternatives() {
         "curie-skill-abc123",
         dir.path(),
         &BTreeMap::new(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect_err("a SecretRef has no local-daemon equivalent");
 
@@ -933,7 +937,15 @@ fn overlay_fixture(agent: &str, plugin_dir: &Path) -> Value {
         );
     }
 
-    compose_overlay(&lock, &decl, &scope(agent), "curie", plugin_dir).expect("generate the overlay")
+    compose_overlay(
+        &lock,
+        &decl,
+        &scope(agent),
+        "curie",
+        plugin_dir,
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
+    )
+    .expect("generate the overlay")
 }
 
 /// One service per hosted connector, pinned to the locked digest, joined to the

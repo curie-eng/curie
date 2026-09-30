@@ -134,6 +134,7 @@ from .capacity_wait import (
     current_wait,
 )
 from .config import WorkerConfig
+from .connector_grant import mint as mint_connector_grant
 from .delivery_lease import DeliveryLease, LeaseLostError
 from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, retry_expiry
 from .killswitch import KillSwitch
@@ -1545,6 +1546,37 @@ def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
+def _connector_tool_grant(
+    tool: object,
+    arguments: object,
+    *,
+    agent: str | None,
+    signing_key_text: str,
+) -> str | None:
+    """Mint a proxy grant for one connector live name, or None when it is not one.
+
+    ``mcp__<connector>__<tool>`` only. A plugin tool (``mcp__plugin_``) and a
+    resume that did not carry a dict of arguments mint nothing.
+    """
+
+    if not isinstance(tool, str) or not isinstance(arguments, dict):
+        return None
+    if not tool.startswith("mcp__") or tool.startswith("mcp__plugin_"):
+        return None
+    connector, separator, upstream = tool.removeprefix("mcp__").partition("__")
+    if not separator or not connector or not upstream or not agent or not signing_key_text.strip():
+        return None
+    return mint_connector_grant(
+        signing_key_text,
+        agent=agent,
+        connector=connector,
+        tool=upstream,
+        args=json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+        jti=str(uuid.uuid4()),
+    )
+
+
 class Kernel:
     """Routes events to runner turns and enforces the concurrency rules."""
 
@@ -2848,6 +2880,16 @@ class Kernel:
                         boot_env[GRANT_ARGUMENTS_ENV] = json.dumps(
                             grant_arguments, sort_keys=True, separators=(",", ":")
                         )
+                    # A connector live name is mcp__<server>__<tool>. Plugin
+                    # tools and a resume with no arguments mint no connector grant.
+                    connector_grant = _connector_tool_grant(
+                        grant_tool,
+                        grant_arguments,
+                        agent=agent_name if isinstance(agent_name, str) else None,
+                        signing_key_text=self._config.connector_caller_signing_key,
+                    )
+                    if connector_grant is not None:
+                        boot_env["CURIE_CONNECTOR_TOOL_GRANT"] = connector_grant
                 # A factory execution may report its phases for the live status
                 # card (#3077). The token is bound to this request and to the
                 # work_item.progress scope only; no other turn carries it.

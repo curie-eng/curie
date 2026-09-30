@@ -59,6 +59,7 @@ from .types import (
     SubstrateConfig,
     SuspendedThreadError,
     UnschedulableClaimError,
+    agent_warm_pool_name,
     claim_warm_pool,
 )
 
@@ -1097,6 +1098,27 @@ class SandboxSubstrate:
 
     # -- internals --------------------------------------------------------------
 
+    def _existing_agent_pool(self, base_pool: str, agent_name: str | None) -> str | None:
+        """The derived per-agent warm pool when the cluster already has it."""
+
+        if not agent_name:
+            return None
+        derived = agent_warm_pool_name(base_pool, agent_name)
+        if derived == base_pool:
+            return None
+        probe = getattr(self._k8s, "warm_pool_exists", None)
+        if not callable(probe):
+            return None
+        try:
+            present = bool(probe(derived))
+        except Exception:  # noqa: BLE001 - an unreadable pool must not fail the claim
+            logger.warning(
+                "could not read SandboxWarmPool %s; the claim keeps the chart pool choice",
+                derived,
+            )
+            return None
+        return derived if present else None
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1124,17 +1146,23 @@ class SandboxSubstrate:
 
         # Docker has no warm pools and passes connector secrets directly to
         # the runner. The rendered pool check applies only to Kubernetes.
-        pool = (
-            config.warm_pool
-            if isinstance(self._k8s, DockerSandboxClient)
-            else claim_warm_pool(
+        if isinstance(self._k8s, DockerSandboxClient):
+            pool = config.warm_pool
+        else:
+            pool = claim_warm_pool(
                 config.warm_pool,
                 env,
                 agent_name,
                 config.agent_pools,
                 config.connector_secret_pools,
             )
-        )
+            # A per-agent pool cloned after a hosted connector deploy is usable
+            # even when the chart did not list the agent. Absence keeps the
+            # choice above, including the generic pool and the secret refusal.
+            if pool == config.warm_pool:
+                derived = self._existing_agent_pool(config.warm_pool, agent_name)
+                if derived is not None:
+                    pool = derived
         self._k8s.create_claim(
             name,
             pool=pool,

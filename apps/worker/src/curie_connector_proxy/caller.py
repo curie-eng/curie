@@ -25,7 +25,11 @@ MISSING = "missing"
 INVALID = "invalid"
 EXPIRED = "expired"
 NOT_ADMITTED = "not_admitted"
-REFUSALS = (MISSING, INVALID, EXPIRED, NOT_ADMITTED)
+GRANT_REQUIRED = "grant_required"
+REFUSALS = (MISSING, INVALID, EXPIRED, NOT_ADMITTED, GRANT_REQUIRED)
+
+# A connector tool grant, not a caller token. ``cct`` claims stay {agent, exp}.
+GRANT_PREFIX = "ccg"
 
 _KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
@@ -33,6 +37,7 @@ _SIGNATURE_BYTES = 64
 _MAX_TOKEN_CHARS = 4096
 _SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
 _CLAIMS = frozenset({"agent", "exp"})
+_GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
 
 
 @dataclass(frozen=True)
@@ -86,13 +91,13 @@ def _signed_by(keys: Sequence[VerifyKey], message: bytes, signature: bytes) -> b
     return False
 
 
-def claims(keys: Sequence[VerifyKey], token: str) -> tuple[str, int] | None:
-    """The ``(agent, exp)`` a token carries when one of ``keys`` signed it."""
+def _opened(keys: Sequence[VerifyKey], token: str, prefix: str) -> dict[str, object] | None:
+    """The signed JSON object, or None. The same segment rules as ``claims``."""
 
     if len(token) > _MAX_TOKEN_CHARS or not token.isascii():
         return None
     parts = token.split(".")
-    if len(parts) != 3 or parts[0] != PREFIX:
+    if len(parts) != 3 or parts[0] != prefix:
         return None
     payload = _segment(parts[1])
     signature = _segment(parts[2])
@@ -104,12 +109,62 @@ def claims(keys: Sequence[VerifyKey], token: str) -> tuple[str, int] | None:
         parsed = json.loads(payload)
     except ValueError:
         return None
-    if not isinstance(parsed, dict) or set(parsed) != _CLAIMS:
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def claims(keys: Sequence[VerifyKey], token: str) -> tuple[str, int] | None:
+    """The ``(agent, exp)`` a token carries when one of ``keys`` signed it."""
+
+    parsed = _opened(keys, token, PREFIX)
+    if parsed is None or set(parsed) != _CLAIMS:
         return None
     agent, exp = parsed["agent"], parsed["exp"]
     if not isinstance(agent, str) or not agent or type(exp) is not int:
         return None
     return agent, exp
+
+
+@dataclass(frozen=True)
+class Grant:
+    """One signed connector tool call. ``args`` is canonical JSON text."""
+
+    agent: str
+    connector: str
+    tool: str
+    args: str
+    exp: int
+    jti: str
+
+
+def verify(keys: Sequence[VerifyKey], token: str) -> Grant | None:
+    """The ``ccg`` grant one of ``keys`` signed, or None. Never raises."""
+
+    parsed = _opened(keys, token, GRANT_PREFIX)
+    if parsed is None or set(parsed) != _GRANT_CLAIMS:
+        return None
+    agent = parsed["agent"]
+    connector = parsed["connector"]
+    tool = parsed["tool"]
+    args = parsed["args"]
+    exp = parsed["exp"]
+    jti = parsed["jti"]
+    if (
+        not isinstance(agent, str)
+        or not agent
+        or not isinstance(connector, str)
+        or not connector
+        or not isinstance(tool, str)
+        or not tool
+        or not isinstance(args, str)
+        or not args
+        or type(exp) is not int
+        or not isinstance(jti, str)
+        or not jti
+    ):
+        return None
+    return Grant(agent=agent, connector=connector, tool=tool, args=args, exp=exp, jti=jti)
 
 
 def decide(

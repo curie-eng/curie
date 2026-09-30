@@ -64,6 +64,7 @@ _CALLER_REFUSALS = {
     "invalid": "this sandbox's caller token is not valid",
     "expired": "this sandbox's caller token has expired",
     "not_admitted": "this agent is not in the connector's admits list",
+    "grant_required": "this sandbox presented no matching connector tool grant",
 }
 
 # Bounded retry for the boot capability probe (#2945). A failed dial is

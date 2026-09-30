@@ -1153,6 +1153,48 @@ def test_a_remote_connector_never_receives_the_caller_token(tmp_path: Path) -> N
     assert _CALLER_HEADER in servers["grafana"]["headers"]
 
 
+_GRANT_HEADER = "X-Curie-Connector-Grant"
+_GRANT_PLACEHOLDER = "${CURIE_CONNECTOR_TOOL_GRANT}"
+_GRANT_ENV = "CURIE_CONNECTOR_TOOL_GRANT"
+
+
+def test_a_hosted_connector_omits_the_grant_header_when_the_env_has_none(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True, env={})
+    assert servers["grafana"]["headers"] == {
+        "Authorization": "Bearer ${T}",
+        _CALLER_HEADER: _CALLER_PLACEHOLDER,
+    }
+    assert _GRANT_HEADER not in servers["grafana"]["headers"]
+
+
+def test_a_hosted_connector_names_the_grant_placeholder_when_the_env_sets_it(
+    tmp_path: Path,
+) -> None:
+    sentinel = "ccg.payload.signature"
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED),
+        **SCOPE,
+        caller_header=True,
+        env={_GRANT_ENV: sentinel},
+    )
+    assert servers["grafana"]["headers"] == {
+        "Authorization": "Bearer ${T}",
+        _CALLER_HEADER: _CALLER_PLACEHOLDER,
+        _GRANT_HEADER: _GRANT_PLACEHOLDER,
+    }
+    assert sentinel not in json.dumps(servers)
+
+
+def test_a_remote_connector_never_receives_the_grant_header(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, HOSTED + REMOTE.replace("connectors:\n", ""))
+    servers = derive_mcp_servers(
+        root, **SCOPE, caller_header=True, env={_GRANT_ENV: "ccg.payload.signature"}
+    )
+    assert servers["internal"] == {"type": "http", "url": "https://mcp.internal/mcp"}
+    assert _GRANT_HEADER not in servers["internal"]
+    assert servers["grafana"]["headers"][_GRANT_HEADER] == _GRANT_PLACEHOLDER
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),

@@ -1816,6 +1816,209 @@ pub fn prepare(
     })
 }
 
+const SANDBOX_TEMPLATE_KIND: &str = "sandboxtemplates.extensions.agents.x-k8s.io";
+const SANDBOX_POOL_KIND: &str = "sandboxwarmpools.extensions.agents.x-k8s.io";
+
+fn kubectl_get_args(namespace: &str, kind: &str, name: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        kind.into(),
+    ];
+    if let Some(name) = name {
+        argv.push(name.into());
+    }
+    argv.extend(["-o".into(), "json".into()]);
+    argv
+}
+
+fn object_name_of(value: &Value) -> Option<&str> {
+    value.pointer("/metadata/name").and_then(Value::as_str)
+}
+
+/// The release-wide runner template: name ends in `-runner` and is not a
+/// per-agent `{prefix}-agent-{agent}-runner` clone.
+fn generic_runner_template(list: &Value, release: &str) -> Option<Value> {
+    let items = list.get("items")?.as_array()?;
+    let mut candidates: Vec<&Value> = items
+        .iter()
+        .filter(|item| match object_name_of(item) {
+            Some(name) => name.ends_with("-runner") && !name.contains("-agent-"),
+            None => false,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let labeled: Vec<&Value> = candidates
+        .iter()
+        .copied()
+        .filter(|item| {
+            item.pointer("/metadata/labels")
+                .and_then(|labels| labels.get("app.kubernetes.io/instance"))
+                .and_then(Value::as_str)
+                == Some(release)
+        })
+        .collect();
+    if !labeled.is_empty() {
+        candidates = labeled;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+    let expected = crate::ops::chart_fullname(release).resource("runner");
+    candidates
+        .into_iter()
+        .find(|item| object_name_of(item) == Some(expected.as_str()))
+        .cloned()
+}
+
+fn scrubbed_object(source: &Value, name: &str) -> Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("name".into(), Value::String(name.to_string()));
+    if let Some(labels) = source.pointer("/metadata/labels").cloned() {
+        metadata.insert("labels".into(), labels);
+    }
+    serde_json::json!({
+        "apiVersion": source.get("apiVersion").cloned().unwrap_or_else(|| {
+            serde_json::json!("extensions.agents.x-k8s.io/v1beta1")
+        }),
+        "kind": source
+            .get("kind")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("SandboxTemplate")),
+        "metadata": metadata,
+        "spec": source
+            .get("spec")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+fn set_pod_agent_label(template: &mut Value, agent: &str) {
+    let Some(spec) = template.get_mut("spec").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let pod = spec
+        .entry("podTemplate")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(pod) = pod.as_object_mut() else {
+        return;
+    };
+    let metadata = pod
+        .entry("metadata")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    let labels = metadata
+        .entry("labels")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(labels) = labels.as_object_mut() {
+        labels.insert(
+            "curietech.ai/agent".into(),
+            Value::String(agent.to_string()),
+        );
+    }
+}
+
+async fn read_kubectl_json(target: &ClusterTarget, argv: &[String]) -> Result<Value> {
+    let (ok, out, err) = run(&target.args(argv), None).await?;
+    if !ok {
+        anyhow::bail!("{}", err.trim());
+    }
+    serde_json::from_str(&out).context("parsing kubectl json")
+}
+
+/// Clone the generic SandboxTemplate and SandboxWarmPool for one agent.
+///
+/// Names follow `agent_warm_pool_name`: `{prefix}-agent-{agent}-runner` and
+/// `{prefix}-agent-{agent}-runner-pool`. The template pod label
+/// `curietech.ai/agent` is what connector ingress selects. A missing generic
+/// template is an error the caller logs; connector objects already applied
+/// stay applied.
+async fn ensure_owning_agent_pool(
+    target: &ClusterTarget,
+    namespace: &str,
+    release: &str,
+    agent: &str,
+) -> Result<()> {
+    let listed = read_kubectl_json(
+        target,
+        &kubectl_get_args(namespace, SANDBOX_TEMPLATE_KIND, None),
+    )
+    .await
+    .context("reading SandboxTemplates")?;
+    let Some(generic) = generic_runner_template(&listed, release) else {
+        anyhow::bail!("no generic SandboxTemplate ending in -runner was found");
+    };
+    let Some(generic_name) = object_name_of(&generic).map(str::to_string) else {
+        anyhow::bail!("the generic SandboxTemplate has no name");
+    };
+    let Some(prefix) = generic_name.strip_suffix("-runner") else {
+        anyhow::bail!("SandboxTemplate {generic_name} has no -runner suffix");
+    };
+    let template_name = format!("{prefix}-agent-{agent}-runner");
+    let pool_name = format!("{prefix}-agent-{agent}-runner-pool");
+    let mut template = scrubbed_object(&generic, &template_name);
+    if let Some(kind) = template.get_mut("kind") {
+        *kind = Value::String("SandboxTemplate".into());
+    }
+    set_pod_agent_label(&mut template, agent);
+
+    let generic_pool = format!("{prefix}-runner-pool");
+    let pool = match read_kubectl_json(
+        target,
+        &kubectl_get_args(namespace, SANDBOX_POOL_KIND, Some(&generic_pool)),
+    )
+    .await
+    {
+        Ok(source) => {
+            let mut pool = scrubbed_object(&source, &pool_name);
+            if let Some(kind) = pool.get_mut("kind") {
+                *kind = Value::String("SandboxWarmPool".into());
+            }
+            if let Some(name) = pool.pointer_mut("/spec/sandboxTemplateRef/name") {
+                *name = Value::String(template_name.clone());
+            } else if let Some(spec) = pool.get_mut("spec").and_then(Value::as_object_mut) {
+                spec.insert(
+                    "sandboxTemplateRef".into(),
+                    serde_json::json!({ "name": template_name }),
+                );
+            }
+            pool
+        }
+        Err(error) => {
+            crate::ui::ui().warn(&format!(
+                "connectors: generic SandboxWarmPool {generic_pool} was not readable ({error:#}); cloning a pool with zero replicas"
+            ));
+            serde_json::json!({
+                "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                "kind": "SandboxWarmPool",
+                "metadata": { "name": pool_name },
+                "spec": {
+                    "replicas": 0,
+                    "sandboxTemplateRef": { "name": template_name }
+                }
+            })
+        }
+    };
+    let document = as_list_document(&[template, pool])?;
+    let (ok, _out, err) = run(&target.args(&apply_args(namespace)), Some(&document)).await?;
+    if !ok {
+        anyhow::bail!(
+            "applying the owning-agent sandbox pool failed: {}",
+            err.trim()
+        );
+    }
+    crate::ui::ui().note(&format!(
+        "connectors: cloned sandbox pool {pool_name} for {agent}"
+    ));
+    Ok(())
+}
+
 /// Apply a prepared connector plan, and prune what it no longer declares.
 ///
 /// Called after the bundle is deployed, so the objects exist before the next
@@ -1862,6 +2065,20 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
             "connectors: applied {} object(s) for {agent_name}",
             keep.len()
         ));
+    }
+
+    // Hosted connectors are only reachable from pods labeled for this agent.
+    // Clone the chart's generic sandbox onto that label when the pool is not
+    // already part of the Helm release. A failure here is logged: the connector
+    // objects above are already applied.
+    if !workloads.is_empty() {
+        if let Err(error) =
+            ensure_owning_agent_pool(&bound_target, &namespace, &target.release, &agent_name).await
+        {
+            ui.warn(&format!(
+                "connectors: skipped the owning-agent sandbox pool for {agent_name}: {error:#}"
+            ));
+        }
     }
 
     // Runs even with nothing declared -- that is the case where a connector was
