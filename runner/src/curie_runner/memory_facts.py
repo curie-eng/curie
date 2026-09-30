@@ -64,7 +64,7 @@ Don't remember descriptions of people beyond their role, data and figures that b
 
 Agent memory: don't save anything here.
 
-Nothing is kept for later unless a remember or update call succeeds in this turn. When someone asks you to remember something, make it stick, or set a standing instruction, call remember. Never say you saved, noted or will remember something unless that call succeeded. If it was refused or failed, say so.
+Nothing is kept for later unless a remember or update call succeeds. When someone asks you to remember something worth keeping, make it stick, or set a standing instruction, and the rules above allow it, save it to channel memory with remember. If they want it in every channel, still save it to channel memory and tell them it only applies in this channel. Never say you saved, noted or will remember something unless that call succeeded. If it was refused or failed, say so.
 
 Use remember for a new fact, update to change a fact by its id, and forget to remove one. Save one fact per call."""  # noqa: E501
 

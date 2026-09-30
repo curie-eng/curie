@@ -614,9 +614,10 @@ def build_memory_tools(
 
     @tool(
         REMEMBER_TOOL,
-        "Save one new fact to memory and return its id. This is the only way to keep "
-        "something for a later conversation: a request to remember, note or make "
-        "something stick, or to set a standing instruction, means calling this tool.",
+        "Save one new fact to memory and return its id. This, or update for a fact "
+        "that already exists, is the only way to keep something for a later "
+        "conversation: a request to remember, note or make something stick, or to set "
+        "a standing instruction, means calling one of them.",
         _REMEMBER_SCHEMA,
     )
     async def remember(args: dict[str, Any]) -> dict[str, Any]:
