@@ -70,8 +70,19 @@ another hardcoded handler. The five that exist:
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
   identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
-  This is a hardcoded platform ingress, not consumption of a bundle-declared
-  `webhook` path.
+  Optional `tool_access=read-only` narrows this turn under the existing
+  [TOOL-ACCESS contract](../aci-producer/INTERFACE.md). Omission retains ordinary
+  hooks and approvals; untrusted body text never selects the policy. The receipt's
+  `tool_access` proves only the queued value. Completed retries must match the
+  original value, and return 409 if it differs or the original queued turn is
+  unavailable. A pending restricted retry also returns 409; an ordinary pending
+  202 receipt proves no accepted turn. Before opting in, the operator must verify
+  homogeneous worker artifacts implementing TOOL-ACCESS-6 and compatible runners;
+  this API cannot discover or exclude old workers. Implementing workers verify the
+  exact runner's advertisement before dispatch. Old/mixed fleets remain an intake
+  installation blocker (#3603); this is neither automatic fleet admission nor
+  mandatory source policy. This is a hardcoded platform ingress, not consumption
+  of a bundle-declared `webhook` path.
 
 The five share no abstraction: a Slack Bolt event listener, two paths through a FastAPI
 GitHub HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push

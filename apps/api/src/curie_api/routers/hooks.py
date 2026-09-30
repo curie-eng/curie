@@ -54,6 +54,7 @@ from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
     QueuedTurn,
     ReplyHandle,
+    ToolAccess,
     TurnSource,
     parse_queued_turn,
 )
@@ -126,15 +127,20 @@ class HookAccepted(BaseModel):
     partition value, or the operator may have changed the pointer since, and
     either would name a thread the queued turn never landed on.
 
-    It is None when the landing thread is not knowable from this request: a
-    pending twin still mid-flight, a stream an operator has trimmed, or the 202
-    no-claim case where this request enqueued nothing and nothing is yet known.
+    It is None on an ordinary 202 pending/no-claim receipt, which attests no
+    accepted turn. An unavailable completed turn or a restricted pending retry
+    returns 409 because its original tool policy cannot be verified.
+
+    ``tool_access`` is the queued policy, not proof of worker support, runner
+    execution or delivery. A completed duplicate must match the original policy.
     """
 
     event_id: str
     stream_id: str | None
     duplicate: bool
     conversation_id: str | None
+    # Proof of the queued policy only, never worker/runner capability or delivery.
+    tool_access: ToolAccess | None = None
 
 
 def _hook_text(hook: str, body: bytes, outcome: MappingOutcome | None = None) -> str:
@@ -179,10 +185,8 @@ def _hook_text(hook: str, body: bytes, outcome: MappingOutcome | None = None) ->
     )
 
 
-async def _landed_conversation_id(
-    client: redis.Redis, stream: str, held: str
-) -> str | None:
-    """The conversation id of the turn a held claim already enqueued.
+async def _landed_turn(client: redis.Redis, stream: str, held: str) -> QueuedTurn | None:
+    """The original turn a held claim already enqueued.
 
     Read back from the stream rather than recomputed, and the reason is the very
     property that makes the claim correct: the claim key is DELIBERATELY
@@ -200,7 +204,7 @@ async def _landed_conversation_id(
             request is mid-flight, otherwise the stream id of its entry.
 
     Returns:
-        The queued turn's conversation id, or None when it is not knowable --
+        The queued turn, or None when it is not knowable --
         the claim is still ``pending:``, or the entry is gone because an operator
         trimmed the stream.
     """
@@ -217,7 +221,50 @@ async def _landed_conversation_id(
     payload = fields.get(STREAM_PAYLOAD_FIELD)
     if payload is None:
         return None
-    return parse_queued_turn(_text(payload)).conversation_id
+    return parse_queued_turn(_text(payload))
+
+
+async def _duplicate_receipt(
+    client: redis.Redis,
+    stream: str,
+    current: str,
+    response: Response,
+    event_id: str,
+    tool_access: ToolAccess | None,
+) -> HookAccepted:
+    """Attest the first delivery's policy, never relabel it from a retry.
+
+    An ordinary pending retry retains the existing 202 acknowledgement, which
+    attests no accepted turn. A restricted retry cannot use that unknown policy
+    as evidence. Once enqueued, unavailable original data also cannot prove the
+    policy, even when this retry asks for ordinary access.
+    """
+    if current.startswith("pending:") and tool_access is None:
+        return HookAccepted(
+            event_id=event_id,
+            stream_id=duplicate_stream_id(current, response),
+            duplicate=True,
+            conversation_id=None,
+            tool_access=None,
+        )
+    original = await _landed_turn(client, stream, current)
+    if original is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access cannot be verified from the original turn",
+        )
+    if original.tool_access != tool_access:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access differs from the original turn",
+        )
+    return HookAccepted(
+        event_id=event_id,
+        stream_id=duplicate_stream_id(current, response),
+        duplicate=True,
+        conversation_id=original.conversation_id,
+        tool_access=original.tool_access,
+    )
 
 
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
@@ -241,6 +288,7 @@ def _mint_turn(
     *,
     partition: str | None,
     outcome: MappingOutcome | None = None,
+    tool_access: ToolAccess | None = None,
 ) -> QueuedTurn:
     """Build the ``QueuedTurn`` a verified hook delivery becomes.
 
@@ -275,6 +323,7 @@ def _mint_turn(
         author=f"hook:{hook}",
         text=_hook_text(hook, body, outcome),
         source=TurnSource.WEBHOOK,
+        tool_access=tool_access,
         reply_handle=ReplyHandle(
             kind=binding.kind,
             channel=binding.address,
@@ -296,11 +345,20 @@ async def ingest_hook(
     kind: str | None = None,
     address: str | None = None,
     adapter: str | None = None,
+    tool_access: ToolAccess | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
     x_curie_timestamp: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
     """Verify one hook delivery and enqueue it as a turn.
+
+    ``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.
+    Before requesting it, the operator must verify homogeneous worker artifacts
+    implementing TOOL-ACCESS-6 and compatible runner artifacts. This API does
+    not discover worker support; an old worker can discard the field. The
+    implementing worker checks the exact target runner before dispatch. Omission
+    preserves ordinary hooks, including approvals. The receipt proves only the
+    queued policy, not runtime enforcement or successful reply delivery.
 
     Order, and why each step sits where it does:
 
@@ -330,9 +388,7 @@ async def ingest_hook(
         )
 
     settings = get_settings()
-    raw = await read_bounded_body(
-        request, settings.hook_max_body_bytes, subject="hook body"
-    )
+    raw = await read_bounded_body(request, settings.hook_max_body_bytes, subject="hook body")
 
     agent = await _load_agent(session, agent_id)
     # One refusal for "no such agent" and for "bad signature": a caller that can
@@ -489,8 +545,7 @@ async def ingest_hook(
                 # would let a source multiply its allowance by inventing names.
                 await release_claim(client, key, owner)
                 logger.warning(
-                    "hook ingress refused event_id=%s: agent backlog quota of %d "
-                    "per %ds exceeded",
+                    "hook ingress refused event_id=%s: agent backlog quota of %d per %ds exceeded",
                     event_id,
                     settings.hook_backlog_limit,
                     settings.hook_backlog_window_s,
@@ -518,6 +573,7 @@ async def ingest_hook(
                 raw,
                 partition=partition,
                 outcome=mapping,
+                tool_access=tool_access,
             )
             carrier: dict[str, str] = {}
             enqueue_error: Exception | None = None
@@ -589,8 +645,7 @@ async def ingest_hook(
                 # partition is reset by its full id, and this line plus the
                 # receipt are the two places that id is shown.
                 logger.info(
-                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s "
-                    "conversation_id=%s",
+                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s conversation_id=%s",
                     event_id,
                     current,
                     hook,
@@ -601,34 +656,30 @@ async def ingest_hook(
                     stream_id=current,
                     duplicate=False,
                     conversation_id=turn.conversation_id,
+                    tool_access=turn.tool_access,
                 )
             # Not `turn.conversation_id`: this request enqueued nothing, so the thread
             # the delivery landed on is the one the WINNING turn named, whatever
             # partition this body derives.
-            return HookAccepted(
-                event_id=event_id,
-                stream_id=duplicate_stream_id(current, response),
-                duplicate=True,
-                conversation_id=await _landed_conversation_id(
-                    client, settings.runs_stream, current
-                ),
+            return await _duplicate_receipt(
+                client, settings.runs_stream, current, response, event_id, tool_access
             )
         held = await client.get(key)
         if held is not None:
             current = _text(held)
-            return HookAccepted(
-                event_id=event_id,
-                stream_id=duplicate_stream_id(current, response),
-                duplicate=True,
-                conversation_id=await _landed_conversation_id(
-                    client, settings.runs_stream, current
-                ),
+            return await _duplicate_receipt(
+                client, settings.runs_stream, current, response, event_id, tool_access
             )
 
     # Both attempts found the key absent after failing to claim it. Someone is
     # mid-flight; answering "come back" is honest and never a second XADD. The
     # conversation id is None for the same reason the stream id is: nothing has
     # been enqueued that this request can name.
+    if tool_access is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access cannot be verified from the original turn",
+        )
     response.status_code = status.HTTP_202_ACCEPTED
     return HookAccepted(
         event_id=event_id,
