@@ -148,6 +148,9 @@ class Settings(BaseSettings):
     # Git flow (J1). The webhook secret authenticates inbound GitHub events; the
     # two bot identities are the routing targets recorded on each deployment.
     github_webhook_secret: str = "dev-webhook-secret"
+    # Durable git-flow notice outbox retry cadence; unlike optional ingress
+    # lanes, this cannot be disabled without abandoning pending notices.
+    deploy_notice_reconciler_interval_s: float = Field(default=5.0, gt=0)
     # Review-feedback ingress is separately gated from push handling. Keep it
     # off unless the GitHub App identity, webhook HMAC, and reconciler cadence
     # form a complete bootable configuration.

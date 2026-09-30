@@ -572,6 +572,137 @@ def test_notice_stream_and_group_follow_the_api_worker_installation_contract() -
     assert first_api.deploy_notice_stream_name() != other_stream_api.deploy_notice_stream_name()
 
 
+def test_notice_enqueue_error_does_not_poison_retry_dedupe(valkey: redis.Redis) -> None:
+    """A failed XADD must not leave a marker that suppresses later recovery."""
+    from curie_api.deploy_notice import _PUBLISH_ONCE
+    from redis.exceptions import ResponseError
+
+    token = uuid.uuid4().hex
+    marker = f"test:deploy-notice:marker:{token}"
+    stream = f"test:deploy-notice:stream:{token}"
+    valkey.set(stream, "wrong-type")
+    try:
+        with pytest.raises(ResponseError):
+            valkey.eval(_PUBLISH_ONCE, 2, marker, stream, 60, '{"status":"rejected"}')
+        assert not valkey.exists(marker)
+        valkey.delete(stream)
+        assert valkey.eval(_PUBLISH_ONCE, 2, marker, stream, 60, '{"status":"rejected"}')
+        assert valkey.xlen(stream) == 1
+    finally:
+        valkey.delete(marker, stream)
+
+
+def test_notice_outbox_recovers_after_valkey_outage_and_api_restart(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The recipient decision survives an unavailable stream and queue restart."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.models import DeployNoticeOutbox
+    from curie_api.schemas import WebhookResult
+    from redis.asyncio import Redis
+    from sqlalchemy import select
+
+    _register_agent(client, auth_headers)
+    stream = f"test:deploy-notice:outbox:{uuid.uuid4().hex}"
+    payload = _push_payload("refs/heads/dev", "a" * 40, "file:///unused")
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        try:
+            await valkey.set(stream, "wrong-type")
+            queue = DeployNoticeQueue(valkey, stream)
+            async with maker() as session:
+                assert await queue.publish(
+                    session,
+                    WebhookResult(
+                        status="rejected",
+                        errors=[{"code": "git.archive_failed"}],
+                    ),
+                    payload,
+                    settings,
+                ) == 0
+                rows = list(await session.scalars(select(DeployNoticeOutbox)))
+                assert len(rows) == 1
+                assert rows[0].enqueued_at is None
+                assert rows[0].stream == stream
+                assert rows[0].attempts == 1
+
+            await valkey.delete(stream)
+            restarted = DeployNoticeQueue(valkey, stream)
+            async with maker() as session:
+                assert await restarted.reconcile_once(session) == 1
+            async with maker() as session:
+                row = await session.scalar(select(DeployNoticeOutbox))
+                assert row is not None and row.enqueued_at is not None
+                assert row.attempts == 2
+            async with maker() as session:
+                assert await restarted.reconcile_once(session) == 0
+            async with maker() as session:
+                assert await restarted.publish(
+                    session,
+                    WebhookResult(
+                        status="rejected",
+                        errors=[{"code": "git.archive_failed"}],
+                    ),
+                    payload,
+                    settings,
+                ) == 0
+            assert await valkey.xlen(stream) == 1
+            notice = json.loads((await valkey.xrange(stream))[0][1]["payload"])
+            assert notice["status"] == "rejected"
+            assert notice["agent_name"] == "gitflow-agent"
+        finally:
+            await valkey.delete(stream)
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_webhook_reports_outbox_persistence_failure_instead_of_false_success(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    _register_agent(client, auth_headers)
+    payload = _push_payload("refs/heads/dev", "a" * 40, "file:///unused")
+    payload["repository"]["full_name"] = "Octo/Demo-Agent"
+    async def rename(statement: str) -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    try:
+        asyncio.run(
+            rename(
+                "ALTER TABLE curie.deploy_notice_outbox "
+                "RENAME TO deploy_notice_outbox_temporarily_unavailable"
+            )
+        )
+        response = _post(client, "push", payload)
+        assert response.status_code == 503
+        assert response.json()["detail"] == {"code": "git.notice_outbox_unavailable"}
+    finally:
+        asyncio.run(
+            rename(
+                "ALTER TABLE curie.deploy_notice_outbox_temporarily_unavailable "
+                "RENAME TO deploy_notice_outbox"
+            )
+        )
+
+    retry = _post(client, "push", payload)
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "rejected"
+
+
 def test_archive_rejection_notifies_without_success_opt_in(
     client: Any,
     auth_headers: dict[str, str],

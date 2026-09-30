@@ -104,6 +104,47 @@ def _poller_with_clock(
     return poller, now
 
 
+@pytest.mark.anyio
+async def test_notice_persistence_failure_retries_after_deploy_is_already_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poller must keep its failed notice obligation when the deploy is settled."""
+    from curie_api import gitflow
+    from curie_api.schemas import WebhookResult
+
+    deployed = {"value": False}
+    deploy_calls = {"n": 0}
+
+    async def deploy(_session, _store, _settings, _eval_queue, _payload):
+        deploy_calls["n"] += 1
+        deployed["value"] = True
+        return WebhookResult(status="deployed", commit_sha=REAL_SHA)
+
+    class FailingOnceNotice:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def publish(self, _session, _result, _payload, _settings) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("outbox write unavailable")
+            return 1
+
+    notice = FailingOnceNotice()
+    monkeypatch.setattr(gitflow, "process_push", deploy)
+    poller, _ = _poller_with_clock(
+        tips=Tips({(REPO, "dev"): REAL_SHA, (REPO, "main"): None}),
+        deployments_for_pass=lambda: [(REPO, "dev", REAL_SHA)] if deployed["value"] else [],
+    )
+    poller._notice_queue = notice
+
+    await poller.poll_once()
+    assert notice.calls == 1
+    await poller.poll_once()
+    assert notice.calls == 2
+    assert deploy_calls["n"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # Not deploying the same commit twice
 # --------------------------------------------------------------------------- #

@@ -7,38 +7,53 @@ the server-selected Slack identity and renders stable outcome codes.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
 from .config import Settings
 from .gitflow import environment_for_ref
+from .models import DeployNoticeOutbox
 from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
 
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DEDUP_TTL_SECONDS = 86400
+_OUTBOX_BATCH = 100
+_OUTBOX_RETENTION = timedelta(days=30)
 _PUBLISH_ONCE = """
-if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
-  return redis.call('XADD', KEYS[2], '*', 'payload', ARGV[2])
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return false
 end
-return false
+local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[2])
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+return stream_id
 """
 
 
 class DeployNoticeQueue:
     """One atomic dedupe-and-enqueue per Slack binding and push outcome."""
 
-    def __init__(self, redis: Redis, stream: str) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        stream: str,
+        sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
         self._redis = redis
         self._stream = stream
+        self._sessionmaker = sessionmaker
 
     async def publish(
         self,
@@ -78,7 +93,7 @@ class DeployNoticeQueue:
         codes = sorted(
             {error.get("code", "") for error in (result.errors or []) if error.get("code")}
         )
-        published = 0
+        rows: list[dict[str, str]] = []
         for agent in agents:
             # A clone may finish after an operator changed opt-in or channels.
             # The webhook shares process_push's expire_on_commit=False session,
@@ -101,10 +116,70 @@ class DeployNoticeQueue:
                 encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
                 identity = f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}\0{encoded}"
                 digest = hashlib.sha256(identity.encode()).hexdigest()
-                key = f"curie:deploy-notice:dedupe:{digest}"
-                stream_id = await self._redis.eval(
-                    _PUBLISH_ONCE, 2, key, self._stream, _DEDUP_TTL_SECONDS, encoded
-                )
+                rows.append({"key": digest, "stream": self._stream, "payload": encoded})
+        if not rows:
+            return 0
+        # Persist the recipient decision before touching Valkey. A process or
+        # Valkey outage leaves the row for the independent API reconciler.
+        await session.execute(
+            insert(DeployNoticeOutbox).values(rows).on_conflict_do_nothing(
+                index_elements=[DeployNoticeOutbox.key]
+            )
+        )
+        await session.commit()
+        return await self.reconcile_once(session, keys=[row["key"] for row in rows])
+
+    async def reconcile_once(
+        self, session: AsyncSession, *, keys: list[str] | None = None
+    ) -> int:
+        statement = (
+            select(DeployNoticeOutbox)
+            .where(
+                DeployNoticeOutbox.stream == self._stream,
+                DeployNoticeOutbox.enqueued_at.is_(None),
+            )
+            .order_by(DeployNoticeOutbox.created_at, DeployNoticeOutbox.key)
+            .limit(_OUTBOX_BATCH)
+            .with_for_update(skip_locked=True)
+        )
+        if keys is not None:
+            statement = statement.where(DeployNoticeOutbox.key.in_(keys))
+        published = 0
+        async with session.begin():
+            for row in await session.scalars(statement):
+                row.attempts += 1
+                try:
+                    stream_id = await self._redis.eval(
+                        _PUBLISH_ONCE,
+                        2,
+                        f"curie:deploy-notice:dedupe:{row.key}",
+                        row.stream,
+                        _DEDUP_TTL_SECONDS,
+                        row.payload,
+                    )
+                except Exception:
+                    logger.warning("deploy notice outbox enqueue deferred; pending row retained")
+                    break
+                row.enqueued_at = datetime.now(UTC)
                 if stream_id:
                     published += 1
+            if keys is None:
+                cutoff = datetime.now(UTC) - _OUTBOX_RETENTION
+                old_keys = select(DeployNoticeOutbox.key).where(
+                    DeployNoticeOutbox.stream == self._stream,
+                    DeployNoticeOutbox.enqueued_at < cutoff,
+                ).limit(_OUTBOX_BATCH)
+                await session.execute(
+                    delete(DeployNoticeOutbox).where(DeployNoticeOutbox.key.in_(old_keys))
+                )
         return published
+
+    async def run_forever(self, interval_s: float) -> None:
+        assert self._sessionmaker is not None
+        while True:
+            try:
+                async with self._sessionmaker() as session:
+                    await self.reconcile_once(session)
+            except Exception:
+                logger.exception("deploy notice outbox pass failed; pending rows retained")
+            await asyncio.sleep(interval_s)

@@ -769,7 +769,10 @@ receive successful deploy and promotion notices, opt each agent in through
 normal API key. The default is `false`; this setting does not affect rejection
 notices. Multiple Slack bindings each receive a notice through their configured
 bot identity. Notice delivery uses the worker's bounded retry and dead-letter
-path; inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
+path. The API first records selected recipients in a durable PostgreSQL outbox;
+its reconciler retries Valkey publication after a transient outage or API
+restart. An unavailable outbox returns HTTP 503 to the webhook instead of a
+false success. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
 stream if Slack delivery keeps failing. The stream follows the configured runs
 stream and installation ID, so installations sharing Valkey remain isolated.
 

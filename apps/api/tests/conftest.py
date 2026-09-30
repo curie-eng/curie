@@ -165,6 +165,7 @@ async def _truncate() -> None:
             await conn.execute(
                 text(
                     "TRUNCATE curie.execution_requests, curie.work_items, "
+                    "curie.deploy_notice_outbox, "
                     "curie.approvals, curie.deployments, "
                     "curie.agent_versions, curie.agents, "
                     "curie.console_sessions CASCADE"
