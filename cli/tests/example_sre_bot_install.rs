@@ -531,6 +531,11 @@ if [ "$1" = "status" ] && [ "$2" = "grafana" ]; then
     esac
 fi
 
+if [ "$1" = "status" ] && [ "$2" = "curie" ] && [ "$CURIE_TEST_HELM_MODE" = "existing-release" ]; then
+    printf '%s\n' '{"name":"curie","namespace":"curie","info":{"status":"deployed"}}'
+    exit 0
+fi
+
 if [ "$1" = "repo" ]; then
     exit 0
 fi
@@ -549,7 +554,7 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
             printf '%s\n' 'intentional fixture stop after Helm mutation boundary' >&2
             exit 42
             ;;
-        success)
+        success|existing-release)
             exit 0
             ;;
     esac
@@ -1017,12 +1022,218 @@ fn node(name: &str, memory: &str, ready: bool) -> Value {
         "metadata": {"name": name},
         "status": {
             "allocatable": {"memory": memory},
+            // Kubernetes Node.status.nodeInfo.containerRuntimeVersion is
+            // runtime://version; DaemonSets can tolerate NotReady/cordoned nodes.
+            // https://kubernetes.io/docs/reference/kubernetes-api/core/node-v1/
+            // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+            "nodeInfo": {"containerRuntimeVersion": "containerd://1.7.0"},
             "conditions": [{
                 "type": "Ready",
                 "status": if ready { "True" } else { "False" }
             }]
         }
     })
+}
+
+fn node_with_runtime(name: &str, ready: bool, runtime: &str, cordoned: bool) -> Value {
+    let mut value = node(name, "4Gi", ready);
+    value["status"]["nodeInfo"]["containerRuntimeVersion"] = json!(runtime);
+    value["spec"]["unschedulable"] = json!(cordoned);
+    value
+}
+
+#[test]
+fn mixed_runtime_on_cordoned_node_refuses_before_cluster_mutation() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-a", true, "containerd://1.7.0", false),
+            node_with_runtime("node-b", true, "docker://24.0.0", true),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("node-a") && stderr.contains("node-b"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty(), "Helm was mutated");
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|call| call.contains("apply -f -")),
+        "Grafana Secret was mutated"
+    );
+}
+
+#[test]
+fn docker_runtime_selects_docker_alloy_values() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-a",
+            true,
+            "docker://24.0.0",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let values = fixture.helm_values_file("alloy-values.yaml");
+    assert!(values.contains("dockercontainers: true"), "{values}");
+    assert!(values.contains("stage.docker {"), "{values}");
+    assert!(!values.contains("stage.cri {"), "{values}");
+}
+
+#[test]
+fn unknown_node_runtime_refuses_before_secret_or_helm() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-unknown",
+            true,
+            "mystery://1",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("node-unknown") && stderr.contains("mystery://1"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty());
+    assert!(fixture.kubectl_stdin().is_empty());
+}
+
+#[test]
+fn not_ready_docker_node_prevents_cri_alloy_install() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-ready", true, "containerd://1.7.0", false),
+            node_with_runtime("node-not-ready", false, "docker://24.0.0", false),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("node-not-ready"));
+    assert!(fixture.helm_calls().is_empty());
+}
+
+#[test]
+fn provision_observability_refuses_mixed_runtime_before_mutation() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-cri", true, "containerd://1.7.0", false),
+            node_with_runtime("node-docker", false, "docker://24.0.0", false),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "existing-release",
+    );
+    let output = fixture.run_command_args(
+        &[
+            "example",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            "charts/curie",
+        ],
+        &repo_root(),
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node-cri") && stderr.contains("node-docker"),
+        "{stderr}"
+    );
+    assert!(fixture
+        .helm_calls()
+        .iter()
+        .all(|call| call.starts_with("status ")));
+    assert!(fixture.kubectl_stdin().is_empty());
+}
+
+#[test]
+fn full_install_dry_run_never_reads_cluster_nodes() {
+    let fixture = Fixture::with_modes(nodes(vec![]), pods(vec![]), "failure", "failure", "success");
+    let output = fixture.run(&["--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture
+            .kubectl_calls()
+            .iter()
+            .all(|call| !call.contains("get nodes")
+                && !call.contains("apply")
+                && !call.contains("delete")),
+        "{:?}",
+        fixture.kubectl_calls()
+    );
+    assert!(fixture.helm_calls().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("node runtimes"));
+}
+
+#[test]
+fn full_install_passes_docker_values_to_alloy_chart() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-a",
+            true,
+            "docker://24.0.0",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&[]);
+    assert_reached_helm_upgrade(&fixture, &output);
+    let values = fixture.helm_values_file("alloy-values.yaml");
+    assert!(values.contains("dockercontainers: true"), "{values}");
+    assert!(values.contains("stage.docker {"), "{values}");
 }
 
 fn nodes(items: Vec<Value>) -> Value {

@@ -588,6 +588,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                 "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
                 opts.observability_namespace
             )];
+            lines.push(
+                "select the Alloy log parser from the cluster node runtimes on live installation"
+                    .to_string(),
+            );
             lines.extend(
                 stack_commands
                     .iter()
@@ -596,8 +600,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
         }
         preflight_capacity(&opts.observability_namespace).await?;
+        let log_runtime = preflight_log_runtime().await?;
         ensure_grafana_admin_secret(&opts.observability_namespace).await?;
-        let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
+        let workspace =
+            EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
         for command in &stack_commands {
             run_install_command(command, &workspace, Path::new("charts/curie")).await?;
         }
@@ -621,8 +627,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     let identity = InstallIdentity::from_opts(&opts);
     let mut model = ModelCredential::resolve()?;
 
-    preflight_capacity(&identity.observability_namespace).await?;
-
     let resolved_chart = crate::artifacts::resolve_chart(
         None,
         crate::artifacts::Channel::current(),
@@ -639,6 +643,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         let mut lines = vec![format!(
             "resolve {TEMPO_TAGGED_IMAGE} to its immutable OCI image index digest before cluster mutation"
         )];
+        lines.push(
+            "select the Alloy log parser from the cluster node runtimes on live installation"
+                .to_string(),
+        );
         lines.push(format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
             identity.observability_namespace
@@ -720,6 +728,8 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
     }
 
+    preflight_capacity(&identity.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
     let tempo_digest = resolve_tempo_index_digest().await?;
     let chart = crate::artifacts::ensure_cached(&resolved_chart).await?;
     crate::ops::require_on_path("helm")?;
@@ -732,7 +742,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         false => None,
     };
-    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        log_runtime,
+    )?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
@@ -804,7 +819,12 @@ pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput
         release: opts.release,
         observability_namespace: opts.observability_namespace,
     };
-    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        LogRuntime::Cri,
+    )?;
     if let Some(parent) = opts
         .out
         .parent()
@@ -903,8 +923,10 @@ pub async fn provision_observability(
     require_existing_release(&opts.release, &opts.namespace).await?;
     let chart = provision_chart(opts.chart.as_deref()).await?;
     preflight_capacity(&opts.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
     ensure_grafana_admin_secret(&opts.observability_namespace).await?;
-    let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
+    let workspace =
+        EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
     let identity = InstallIdentity {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
@@ -2130,6 +2152,7 @@ impl EmbeddedWorkspace {
         tempo_digest: &str,
         identity: &InstallIdentity,
         upgrade_digest: Option<&str>,
+        log_runtime: LogRuntime,
     ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-install-{}-{}",
@@ -2139,7 +2162,7 @@ impl EmbeddedWorkspace {
         std::fs::create_dir(&root)
             .with_context(|| format!("creating embedded SRE bot workspace {}", root.display()))?;
         let workspace = Self { root };
-        workspace.write_observability_files(&identity.observability_namespace)?;
+        workspace.write_observability_files(&identity.observability_namespace, log_runtime)?;
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
                 let runtime = runtime_connector_declaration(
@@ -2196,7 +2219,10 @@ impl EmbeddedWorkspace {
         Ok(workspace)
     }
 
-    fn create_observability(observability_namespace: &str) -> Result<Self> {
+    fn create_observability(
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-observability-{}-{}",
             std::process::id(),
@@ -2209,7 +2235,7 @@ impl EmbeddedWorkspace {
             )
         })?;
         let workspace = Self { root };
-        workspace.write_observability_files(observability_namespace)?;
+        workspace.write_observability_files(observability_namespace, log_runtime)?;
         Ok(workspace)
     }
 
@@ -2230,9 +2256,18 @@ impl EmbeddedWorkspace {
         self.root.join("bundle")
     }
 
-    fn write_observability_files(&self, observability_namespace: &str) -> Result<()> {
+    fn write_observability_files(
+        &self,
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<()> {
         for (name, contents) in OBSERVABILITY_FILES {
             let rendered = rewrite_observability_namespace(contents, observability_namespace);
+            let rendered = if *name == "alloy-values.yaml" {
+                render_alloy_values(&rendered, log_runtime)?
+            } else {
+                rendered
+            };
             self.write(&Path::new("observability").join(name), &rendered)?;
         }
         Ok(())
@@ -2819,6 +2854,80 @@ struct NodeSpec {
 struct NodeStatus {
     allocatable: BTreeMap<String, String>,
     conditions: Vec<NodeCondition>,
+    #[serde(rename = "nodeInfo", default)]
+    node_info: NodeInfo,
+}
+
+#[derive(Default, Deserialize)]
+struct NodeInfo {
+    #[serde(rename = "containerRuntimeVersion", default)]
+    container_runtime_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogRuntime {
+    Cri,
+    Docker,
+}
+
+fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
+    if nodes.is_empty() {
+        bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
+    }
+    let mut selected = None;
+    let mut observed = Vec::new();
+    for node in nodes {
+        let version = node.status.node_info.container_runtime_version.as_str();
+        let runtime = if version.starts_with("containerd://") || version.starts_with("cri-o://") {
+            Some(LogRuntime::Cri)
+        } else if version.starts_with("docker://") {
+            Some(LogRuntime::Docker)
+        } else {
+            None
+        };
+        observed.push(format!(
+            "{}={}",
+            node.metadata.name,
+            if version.is_empty() {
+                "<missing>"
+            } else {
+                version
+            }
+        ));
+        match (selected, runtime) {
+            (None, Some(runtime)) => selected = Some(runtime),
+            (Some(previous), Some(runtime)) if previous == runtime => {}
+            _ => bail!("Alloy needs one supported log format across every node, including cordoned and NotReady nodes; found {}", observed.join(", ")),
+        }
+    }
+    selected.ok_or_else(|| anyhow!("no supported node runtime; found {}", observed.join(", ")))
+}
+
+async fn preflight_log_runtime() -> Result<LogRuntime> {
+    crate::ops::require_on_path("kubectl")?;
+    let nodes: KubeList<Node> = read_kubernetes_json(
+        &["get", "nodes", "-o", "json"],
+        "kubectl get nodes -o json",
+        "node container runtimes",
+    )
+    .await?;
+    select_log_runtime(&nodes.items)
+}
+
+fn render_alloy_values(contents: &[u8], runtime: LogRuntime) -> Result<Vec<u8>> {
+    if runtime == LogRuntime::Cri {
+        return Ok(contents.to_vec());
+    }
+    let text = std::str::from_utf8(contents).context("Alloy values are not UTF-8")?;
+    if text.matches("dockercontainers: false").count() != 1
+        || text.matches("stage.cri { }").count() != 1
+    {
+        bail!("embedded Alloy values no longer match the supported CRI template");
+    }
+    Ok(text
+        .replace("dockercontainers: false", "dockercontainers: true")
+        .replace("stage.cri { }", "stage.docker { }")
+        .into_bytes())
 }
 
 #[derive(Deserialize)]
@@ -3081,6 +3190,51 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_runtime_classifies_supported_node_versions() {
+        // Node.status.nodeInfo.containerRuntimeVersion is a runtime://version
+        // string; DaemonSet pods can tolerate cordoned and NotReady nodes.
+        // https://kubernetes.io/docs/reference/kubernetes-api/core/node-v1/
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        for (version, expected) in [
+            ("containerd://1.7.0", LogRuntime::Cri),
+            ("cri-o://1.30.0", LogRuntime::Cri),
+            ("docker://24.0.0", LogRuntime::Docker),
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            assert_eq!(select_log_runtime(&nodes.items).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn log_runtime_refuses_missing_or_unknown_node_version() {
+        for version in ["", "mystery://1"] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("node-a"), "{error}");
+        }
+    }
 
     fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {
         serde_json::from_value(serde_json::json!({

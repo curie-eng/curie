@@ -24,8 +24,8 @@ keeps the existing CRI configuration. A uniform Docker runtime renders the
 embedded Alloy values with the Docker container-log mount and `stage.docker`.
 Missing, unsupported, or mixed runtimes fail with the offending node names and
 runtime types before Helm starts; do not silently choose one format for a mixed
-DaemonSet. `--dry-run`, including the full bot install path, does not access
-the cluster and states that runtime
+DaemonSet. `--dry-run`, including the full bot install path, does not read node
+runtimes or mutate the cluster and states that runtime
 selection occurs on the live run. Manual values-file installation remains
 possible, with the two Docker edits and the supported runtime assumption
 documented beside the example.
@@ -33,9 +33,12 @@ documented beside the example.
 ## Named failures
 
 On a Helm wait timeout or Tempo StatefulSet rollout timeout, inspect Pending
-PVCs and their Warning events in the target namespace. Bound these diagnostic
-reads by wall-clock time and match events by namespace and PVC UID where
-available. Include the PVC name and event reason/message in the CLI failure.
+PVCs and Warning events in the target namespace. The reported failure may be
+a Pod `FailedScheduling` event rather than an event on the PVC: correlate Pods
+that reference a Pending claim, then accept only a matching Pod UID event
+whose message names an unbound claim. Bound these diagnostic reads by
+wall-clock time and match PVC events by namespace and UID where available.
+Include the PVC name and relevant event reason/message in the CLI failure.
 Only present Helm pending-upgrade Secret cleanup as a conditional step after
 verifying that release state; it is not a PVC remedy. If the read fails or no
 PVC is Pending, keep the original command error and provide the exact
@@ -62,7 +65,8 @@ Alloy chart/image, rather than inferred from a text fixture.
 Test runtime selection with containerd, CRI-O, Docker, mixed, missing,
 cordoned, and NotReady-node inputs. Test both rendered values and the real Helm
 chart output. Test Helm and Tempo PVC diagnostics with a matching Pending PVC
-Warning event, a stale UID, and a non-PVC timeout. Use `promtool` to prove the
+Warning event, the reported Pod `FailedScheduling` event, a stale UID, and a
+non-PVC timeout. Use `promtool` to prove the
 zero-file and read-without-send
 alerts fire, and that a healthy/quiet collector does not. Run CLI lint/tests,
 the observability chart assertions, and the required local, local-release,

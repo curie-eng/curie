@@ -49,6 +49,13 @@ helm template alloy grafana/alloy \
   --version 1.11.1 \
   --namespace observability \
   -f "$ASSETS/alloy-values.yaml" >"$TMP/alloy.yaml"
+sed -e 's/dockercontainers: false/dockercontainers: true/' \
+  -e 's/stage.cri { }/stage.docker { }/' \
+  "$ASSETS/alloy-values.yaml" >"$TMP/alloy-docker-values.yaml"
+helm template alloy grafana/alloy \
+  --version 1.11.1 \
+  --namespace observability \
+  -f "$TMP/alloy-docker-values.yaml" >"$TMP/alloy-docker.yaml"
 helm template prometheus prometheus-community/prometheus \
   --version "$PROMETHEUS_CHART_VERSION" \
   --namespace observability \
@@ -79,6 +86,7 @@ python3 - \
   "$TMP/grafana.yaml" \
   "$TMP/loki.yaml" \
   "$TMP/alloy.yaml" \
+  "$TMP/alloy-docker.yaml" \
   "$TMP/prometheus.yaml" \
   "$TMP/prometheus-second-source.yaml" \
   "$ASSETS/tempo.yaml" \
@@ -101,6 +109,7 @@ import yaml
     grafana_path,
     loki_path,
     alloy_path,
+    alloy_docker_path,
     prometheus_path,
     prometheus_second_source_path,
     tempo_path,
@@ -295,6 +304,19 @@ assert "/var/lib/alloy" in host_paths, "Alloy positions must use durable hostPat
 alloy_content = at(alloy_values, "alloy", "configMap", "content")
 assert "stage.cri" in alloy_content, "Alloy must parse containerd CRI log lines"
 assert "/var/log/pods/" in alloy_content, "Alloy must discover Kubernetes pod logs"
+docker_docs = load_docs(alloy_docker_path)
+docker_config = next(doc for doc in docker_docs if doc.get("kind") == "ConfigMap")
+assert "stage.docker { }" in docker_config["data"]["config.alloy"], (
+    "Docker runtime must render the Docker parser into Alloy's ConfigMap"
+)
+docker_daemonset = next(doc for doc in docker_docs if doc.get("kind") == "DaemonSet")
+docker_paths = [
+    volume.get("hostPath", {}).get("path")
+    for volume in docker_daemonset["spec"]["template"]["spec"]["volumes"]
+]
+assert "/var/lib/docker/containers" in docker_paths, (
+    "Docker runtime must mount the real container-log host path"
+)
 
 assert at(prometheus_values, "alertmanager", "enabled") is False
 assert at(prometheus_values, "prometheus-pushgateway", "enabled") is False
