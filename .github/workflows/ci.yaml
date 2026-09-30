@@ -35,6 +35,7 @@ jobs:
       contents: read
     env:
       CI_REQUIRE_VALKEY_TESTS: "1"
+      CI_REQUIRE_POSTGRES_TESTS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -153,10 +154,13 @@ jobs:
       # commits with a pytest failure passed on a plain rerun of the same
       # commit, spread across many tests. `-rR` lists every test that needed
       # the rerun in the short summary, so a flake is visible, not absorbed.
+      # `s` lists every skipped test with its reason, so a suite that silently
+      # skipped is visible in the log. It shares the one `-r` token with `R`
+      # because pytest keeps only the last `-r` option.
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q -n 4 --dist loadgroup --ci-shard ${{ matrix.shard }}/3 --reruns 1 -rR --durations=25
+        run: uv run pytest -q -n 4 --dist loadgroup --ci-shard ${{ matrix.shard }}/3 --reruns 1 -rsR --durations=25
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
       - name: Record shard result

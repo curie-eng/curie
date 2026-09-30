@@ -878,7 +878,12 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     ]
     if extra[: len(distribution)] == distribution:
         extra = extra[len(distribution) :]
-    assert all(argument.startswith("--durations") or argument == "-rR" for argument in extra), (
+    report_chars = set("fEsxXpPaAR")
+    assert all(
+        argument.startswith("--durations")
+        or (argument.startswith("-r") and len(argument) > 2 and set(argument[2:]) <= report_chars)
+        for argument in extra
+    ), (
         "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
         f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
     )
