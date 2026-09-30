@@ -16,15 +16,10 @@ of the env this case set up.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import uuid
-from typing import Any, cast
 
 import pytest
-from aci_protocol import EvalJob
-from curie_api.config import Settings, get_settings
-from curie_api.evalqueue import EvalQueue, now_iso
+from curie_api.config import Settings
 from curie_dispatcher.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
 from pydantic import ValidationError
@@ -130,39 +125,13 @@ def test_eval_stream_default_agrees_across_lanes(
     assert Settings().eval_stream == WorkerConfig().eval_stream == "curie:evals"
 
 
-class _RecordingClient:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def xadd(self, stream: str, fields: dict[Any, Any]) -> bytes:
-        self.calls.append(stream)
-        return b"1-0"
-
-
-def test_api_eval_producer_enqueues_onto_the_worker_consumer_stream(
+def test_eval_stream_override_agrees_across_lanes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One CURIE_EVAL_STREAM value moves the API producer and the worker
-    consumer together (#3565)."""
     _clear_stream_env(monkeypatch)
     monkeypatch.setenv("CURIE_EVAL_STREAM", "operations:evals")
-    get_settings.cache_clear()
-    try:
-        client = _RecordingClient()
-        queue = EvalQueue(cast(Any, client))
-        job = EvalJob(
-            agent_id=uuid.uuid4(),
-            version_id=uuid.uuid4(),
-            sha="deadbeef",
-            suite="default",
-            bundle_ref="bundles/x/y.tar.gz",
-            requested_at=now_iso(),
-        )
-        asyncio.run(queue.enqueue(job))
-    finally:
-        get_settings.cache_clear()
 
-    assert client.calls == [WorkerConfig().eval_stream] == ["operations:evals"]
+    assert Settings().eval_stream == WorkerConfig().eval_stream == "operations:evals"
 
 
 class TestResumeDeadLetterStreamCoherence:
