@@ -50,16 +50,14 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
     assert {variant["type"] for variant in approval_variants} == {"null", "string"}
 
     handle_string = next(variant for variant in handle_variants if variant["type"] == "string")
-    approval_string = next(
-        variant for variant in approval_variants if variant["type"] == "string"
-    )
+    approval_string = next(variant for variant in approval_variants if variant["type"] == "string")
     assert "minLength" not in handle_string
     assert approval_string["minLength"] == 1
 
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.10"
+    assert schema["protocolVersion"] == "0.5.11"
 
     definitions = schema["$defs"]
     event = definitions["Event"]
@@ -86,3 +84,13 @@ def test_publication_context_is_an_optional_event_field_with_required_contents()
         "observed_body_sha256",
         "observed_at",
     }
+
+
+def test_memory_writes_is_an_optional_nullable_boolean_boot_env_field() -> None:
+    boot_env = build_schema()["$defs"]["BootEnv"]
+    assert "memory_writes" not in boot_env.get("required", [])
+    field = boot_env["properties"]["memory_writes"]
+    assert {variant["type"] for variant in field["anyOf"]} == {"boolean", "null"}
+    assert field["default"] is None
+    assert field["env"] == "CURIE_MEMORY_WRITES"
+    assert field["producer"] == ["worker"]
