@@ -918,18 +918,13 @@ def test_announcement_sits_between_answer_and_receipt(
     assert unannounced.rendered_with_receipt() == "answer\n\nRECEIPT"
 
 
-@pytest.mark.parametrize(
-    ("message", "thread"),
-    [
-        (_REPO_MESSAGE, "tWorkspacesOffRootUrl"),
-        (_BARE_REPO_MESSAGE, "tWorkspacesOffBareRepo"),
-    ],
-)
 def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
     make_harness,
-    message: str,
-    thread: str,
 ) -> None:
+    # A github.com URL plainly asks for a repository, so with no coordinator
+    # to attach one the turn is refused. A bare owner/repo token is a guess
+    # and is covered by the generic-turn test below (#3671).
+    message, thread = _REPO_MESSAGE, "tWorkspacesOffRootUrl"
     deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777a")
 
     async def go() -> None:
@@ -948,6 +943,49 @@ def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
             assert h.sink.last_text == _WORKSPACES_OFF_REFUSAL
             assert not any("workspace-error" in t for _a, _r, t in h.sink.updates)
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+_SLASH_PAIR_MESSAGE = "Can you check the Swap/Exchange reservation for next week?"
+
+
+@pytest.mark.parametrize(
+    ("message", "thread"),
+    [
+        (_SLASH_PAIR_MESSAGE, "tWorkspacesOffSlashPair"),
+        (_BARE_REPO_MESSAGE, "tWorkspacesOffBareRepo"),
+    ],
+)
+def test_bare_owner_repo_token_with_workspaces_off_runs_a_generic_turn(
+    make_harness,
+    message: str,
+    thread: str,
+) -> None:
+    # A bare `word/word` token is a guess (#2947). With workspaces on, the
+    # allowlist decides whether it named a repository; with them off there is
+    # no allowlist, so the guess is read as naming none rather than refusing an
+    # ordinary question with chart configuration advice (#3671).
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777780")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            assert h.kernel._workspace is None
+            h.runner.default_script = [Final(text="answered", status=DONE)]
+            event = qevent(message, thread=thread)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [message]
+            assert h.sink.last_text == "answered"
+            assert _WORKSPACES_OFF_REFUSAL not in [t for _a, _r, t in h.sink.updates]
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert len(h.fake_k8s.claim_envs) == 1
+            claim_env = h.fake_k8s.claim_envs[0] or {}
+            assert not any(key.startswith("CURIE_WORKSPACE_") for key in claim_env)
+            route = h.substrate.lookup(_thread_key(thread))
+            assert route is not None and route.workspace_repo is None
 
     asyncio.run(go())
 
