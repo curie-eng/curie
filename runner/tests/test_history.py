@@ -347,7 +347,18 @@ def test_native_checkpoint_under_this_system_prompt_is_restored(tmp_path) -> Non
     checkpoint = HarnessReplayState(
         harness="claude",
         kind="checkpoint",
-        entries=(_PRIOR_NATIVE_USER, _prompt_snapshot("bundle prompt")),
+        # A valid optional cache must include the complete portable conversation;
+        # the previous fixture omitted its assistant row (#3628).
+        entries=(
+            _PRIOR_NATIVE_USER,
+            {
+                "type": "assistant",
+                "uuid": "entry-2",
+                "timestamp": "1970-01-01T00:00:00.000Z",
+                "message": {"role": "assistant", "content": _PRIOR_TURN[1].content},
+            },
+            _prompt_snapshot("bundle prompt"),
+        ),
     )
 
     resume = build_structured_resume(

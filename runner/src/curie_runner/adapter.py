@@ -16,13 +16,14 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -53,7 +54,12 @@ from claude_agent_sdk.types import (
     SessionStoreEntry,
 )
 
-from .history import ConversationMessage, HarnessReplayState
+from .history import (
+    ConversationMessage,
+    HarnessReplayState,
+    HistoryError,
+    validate_assistant_groups,
+)
 from .mcp_argv import install as install_mcp_argv_offload
 
 install_mcp_argv_offload()
@@ -61,6 +67,86 @@ install_mcp_argv_offload()
 logger = logging.getLogger(__name__)
 
 _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
+
+
+def _assistant_group(identifier: object) -> str | None:
+    """Bound provider identity and retain only opaque replay provenance."""
+
+    if (
+        not isinstance(identifier, str)
+        or not 1 <= len(identifier) <= 256
+        or any(not 33 <= ord(char) <= 126 for char in identifier)
+    ):
+        return None
+    return hashlib.sha256(identifier.encode("ascii")).hexdigest()
+
+
+def _recover_assistant_groups(
+    messages: tuple[ConversationMessage, ...], checkpoint: tuple[dict[str, Any], ...]
+) -> tuple[tuple[ConversationMessage, ...], bool]:
+    """Recover identity only from an exact native conversation correspondence.
+
+    Checkpoint attachments and provider envelope data never become portable
+    content or current prompt authority. A partial match supplies no provenance.
+    """
+
+    native = [entry for entry in checkpoint if entry.get("type") in ("user", "assistant")]
+    if len(native) != len(messages):
+        return messages, False
+    pairs: list[tuple[ConversationMessage, str | None]] = []
+    native_to_portable: dict[str, str] = {}
+    portable_to_native: dict[str, str] = {}
+    native_eligible = True
+    for message, entry in zip(messages, native, strict=True):
+        payload = entry.get("message")
+        native_content = payload.get("content") if isinstance(payload, dict) else None
+        if isinstance(native_content, list):
+            # Observed SDK 0.2.159 parse_message projects this direct-caller
+            # envelope away when constructing ToolUseBlock. Other extras stay
+            # present, so they cannot pass exact portable correspondence.
+            native_content = [
+                {key: value for key, value in block.items() if key != "caller"}
+                if isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("caller") == {"type": "direct"}
+                else block
+                for block in native_content
+            ]
+        if (
+            not isinstance(payload, dict)
+            or entry["type"] != message.role
+            or payload.get("role") != message.role
+            or native_content != message.content
+        ):
+            return messages, False
+        group = _assistant_group(payload.get("id")) if message.role == "assistant" else None
+        if message.role == "assistant" and group is None and (
+            message.assistant_group is not None or payload.get("id") is not None
+        ):
+            # Exact content is insufficient when the native envelope cannot
+            # represent the portable grouping. Rebuild its IDs from portable.
+            native_eligible = False
+        if message.assistant_group is not None and group is not None:
+            # A reconstructed native ID is adapter-owned, not the original
+            # provider ID. Compare group correspondence, never raw ID hashes.
+            if (
+                native_to_portable.get(group, message.assistant_group) != message.assistant_group
+                or portable_to_native.get(message.assistant_group, group) != group
+            ):
+                raise HistoryError("native and portable assistant group provenance disagree")
+            native_to_portable[group] = message.assistant_group
+            portable_to_native[message.assistant_group] = group
+        pairs.append((message, group))
+    recovered = tuple(
+        replace(
+            message,
+            assistant_group=message.assistant_group or (
+                native_to_portable.get(group, group) if group is not None else None
+            ),
+        )
+        for message, group in pairs
+    )
+    return recovered, native_eligible
 
 # The CLI's built-in instructions tell the model to end commits with a
 # "Co-Authored-By: Claude" trailer and PR bodies with the "Generated with
@@ -170,8 +256,9 @@ def build_structured_resume(
 ) -> StructuredResume:
     """Materialize portable messages into the SDK's ephemeral resume envelope.
 
-    Portable role/content is always sufficient. When the matching harness left
-    an opaque native checkpoint, it is preferred to retain the SDK's exact
+    Portable content and proven assistant groups are sufficient. When the
+    matching harness left a complete, consistent native checkpoint, it is
+    preferred to retain the SDK's exact
     cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
     deterministic adapter details reconstructed on this runner. Native entries
     are an optional optimization, never Curie's portable persistence contract,
@@ -190,6 +277,11 @@ def build_structured_resume(
         and harness_replay.kind == "checkpoint"
         else ()
     )
+    if checkpoint:
+        messages, native_eligible = _recover_assistant_groups(messages, checkpoint)
+        if not native_eligible:
+            checkpoint = ()
+    validate_assistant_groups(messages)
     if checkpoint and not _checkpoint_keeps_system_prompt(checkpoint, system_prompt):
         logger.info(
             "native checkpoint recorded another system prompt; replaying the portable"
@@ -229,6 +321,11 @@ def build_structured_resume(
     for index, message in enumerate(messages):
         canonical = json.dumps(message.to_dict(), separators=(",", ":"), sort_keys=True)
         entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
+        provider_message = {"role": message.role, "content": message.to_dict()["content"]}
+        if message.assistant_group is not None:
+            provider_message["id"] = "msg_curie_" + uuid.uuid5(
+                uuid.UUID(session_id), message.assistant_group
+            ).hex
         entry = cast(
             "SessionStoreEntry",
             {
@@ -240,7 +337,7 @@ def build_structured_resume(
                 "version": __cli_version__,
                 "gitBranch": "",
                 "type": message.role,
-                "message": message.to_dict(),
+                "message": provider_message,
                 "uuid": entry_uuid,
                 # This is adapter envelope metadata, not conversation time. Keep it
                 # stable so separate runners materialize identical local transcripts.
@@ -320,9 +417,10 @@ _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_sta
 
 @dataclass(frozen=True, slots=True)
 class PartialMessageBoundary:
-    """Payload-free evidence that the provider began returning a message."""
+    """Bounded activity evidence and opaque internal replay provenance."""
 
     event_type: str
+    assistant_group: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,9 +656,18 @@ class ClaudeAgentSession:
                         if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
                             # Do not forward the StreamEvent object: its event body,
                             # uuid, SDK session id, and parent tool id are all
-                            # provider payload. Only this bounded type survives the
-                            # adapter seam into session telemetry.
-                            yield PartialMessageBoundary(event_type=event_type)
+                            # provider payload. Only the bounded type and hashed
+                            # assistant identity survive; identity is history-only
+                            # and must never enter activity telemetry.
+                            start = event.get("message") if event_type == "message_start" else None
+                            yield PartialMessageBoundary(
+                                event_type=event_type,
+                                assistant_group=(
+                                    _assistant_group(start.get("id"))
+                                    if isinstance(start, dict)
+                                    else None
+                                ),
+                            )
                         continue
                     yield message
 
