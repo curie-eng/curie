@@ -1,0 +1,8 @@
+version: 1
+connectors:
+  stubfin:
+    image: registry.example.com/acme/stubfin-bot-stubfin@sha256:424195b050f38786218f545d9aa678ff8dae3e9c45af721e6b9af220c9f49e75
+    delivery: registry
+    platforms:
+    - linux/amd64
+    source_digest: sha256:eef4ea902283447a7a8bbcf1556e5d90ec401898aef90cf9fbd6d1d4bebbd0d9

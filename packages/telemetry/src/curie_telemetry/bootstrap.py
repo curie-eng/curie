@@ -31,8 +31,19 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
 )
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics import (
+    Counter,
+    Histogram,
+    MeterProvider,
+    ObservableCounter,
+    ObservableGauge,
+    ObservableUpDownCounter,
+    UpDownCounter,
+)
+from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
+    PeriodicExportingMetricReader,
+)
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -158,12 +169,40 @@ def _metric_exporter(
     headers = _exporter_headers("metrics", env)
     if endpoint is None:
         return None
+    preference = env.get(
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "CUMULATIVE"
+    ).strip().upper()
+    preferred_temporality: dict[type, AggregationTemporality] = {
+        Counter: (
+            AggregationTemporality.DELTA
+            if preference in ("DELTA", "LOWMEMORY")
+            else AggregationTemporality.CUMULATIVE
+        ),
+        UpDownCounter: AggregationTemporality.CUMULATIVE,
+        Histogram: (
+            AggregationTemporality.DELTA
+            if preference in ("DELTA", "LOWMEMORY")
+            else AggregationTemporality.CUMULATIVE
+        ),
+        ObservableCounter: (
+            AggregationTemporality.DELTA
+            if preference == "DELTA"
+            else AggregationTemporality.CUMULATIVE
+        ),
+        ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
+        ObservableGauge: AggregationTemporality.CUMULATIVE,
+    }
     if protocol == "grpc":
         return GrpcOTLPMetricExporter(
             endpoint=endpoint,
             headers=tuple(headers.items()) if headers is not None else None,
+            preferred_temporality=preferred_temporality,
         )
-    return HttpOTLPMetricExporter(endpoint=endpoint, headers=headers)
+    return HttpOTLPMetricExporter(
+        endpoint=endpoint,
+        headers=headers,
+        preferred_temporality=preferred_temporality,
+    )
 
 
 def _tracer_provider(resource: Resource, env: Mapping[str, str]) -> TracerProvider | None:

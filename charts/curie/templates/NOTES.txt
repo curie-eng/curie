@@ -124,6 +124,21 @@ Kernel isolation (gVisor, security.gvisor.mode={{ $gvisorMode }}):
        handler are installed on every node -- so install runsc and re-run `helm upgrade`,
        or set security.gvisor.mode=off to run real code without isolation knowingly.
 {{- end }}
+{{- if and .Values.resourceQuota.enabled (ne (toString .Values.resourceQuota.capacityReport) "false") }}
+{{- /* capacity-report-guard: every Node/Pod lookup stays inside this block.
+     Empty under helm template / --dry-run: print nothing (#2949). */}}
+{{- $nodes := (lookup "v1" "Node" "" "").items | default list }}
+{{- if $nodes }}
+{{- $pods := (lookup "v1" "Pod" "" "").items | default list }}
+{{- $runnerRes := .Values.agentSandbox.runner.resources | default dict }}
+{{- $perSandbox := $runnerRes.requests | default dict }}
+{{- $sandboxPlacement := fromYaml (include "curie.placement.class" (dict "root" . "class" "sandbox")) }}
+{{- $cap := include "curie.sandboxCapacity" (dict "nodes" $nodes "pods" $pods "perSandbox" $perSandbox "perSandboxLimits" ($runnerRes.limits | default dict) "sandboxPriorityClass" (.Values.resourceQuota.sandboxPriorityClassName | default .Values.priorityClasses.sandbox.name) "tolerations" $sandboxPlacement.tolerations "nodeSelector" $sandboxPlacement.nodeSelector "hard" .Values.resourceQuota.hard) | fromJson }}
+
+Sandbox capacity (resourceQuota vs. node allocatable):
+{{- include "curie.sandboxCapacity.notes" (dict "fits" $cap.fits "ceiling" $cap.ceiling "cpu" $perSandbox.cpu "memory" $perSandbox.memory "fullname" (include "curie.fullname" .) "namespace" .Release.Namespace) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if not (include "curie.dispatcher.enabled" .) }}
 

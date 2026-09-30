@@ -74,6 +74,14 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from curie_api.migration_fence import (
+    AUDIT_COLUMNS_AT_0013,
+    UnreconstructableRow,
+    fence_identity_tables,
+    honor_declarations,
+    load_declarations,
+    report_and_guidance,
+)
 
 revision: str = "0022"
 down_revision: str | None = "0021a"
@@ -95,6 +103,17 @@ logger = logging.getLogger("alembic.runtime.migration")
 
 def upgrade() -> None:
     conn = op.get_bind()
+
+    # The identity fence. The preflight, the declaration arm, the backfill and
+    # the constraint tightening below all commit as ONE unit behind it, so a
+    # binding cannot be re-pointed between the preflight's answer and the
+    # backfill that records it. Alembic's per-migration transaction
+    # (`env.py:61`) is what releases it. It takes ACCESS EXCLUSIVE -- the
+    # strongest mode this revision needs, since the ADD COLUMNs below need it
+    # anyway -- so there is no later lock upgrade to deadlock a resolver that
+    # read before it wrote. A concurrent writer BLOCKS and then SUCCEEDS: an
+    # in-flight turn's approval request is queued, never refused.
+    fence_identity_tables(conn)
 
     # 0. The adapter selector: nullable, no backfill, no constraint.
     op.add_column(TABLE, sa.Column("reply_adapter", sa.String(), nullable=True), schema=SCHEMA)
@@ -121,15 +140,52 @@ def upgrade() -> None:
         )
     ).all()
 
+    # 2b. The declaration arm. An operator may vouch, per row and by hand, for
+    # the identity an approval was RAISED on -- and for EXACTLY the rows above,
+    # never for one this preflight can still establish. Each honored declaration
+    # appends one audit row, so the bypass is attributed rather than silent, and
+    # nothing is deleted. The 0013 column set is passed explicitly:
+    # `principal_kind` and `authenticated` do not exist until 0038.
+    rows = [
+        UnreconstructableRow(
+            approval_id=str(row.id),
+            reply_channel=row.reply_channel,
+            status=row.status,
+            reason=(
+                "its address resolves to no binding"
+                if row.kinds == 0
+                else f"its address resolves to {row.kinds} distinct kinds"
+            ),
+        )
+        for row in unreconstructable
+    ]
+    honored = honor_declarations(
+        conn,
+        unreconstructable={row.approval_id: row.reason for row in rows},
+        declarations=load_declarations(),
+        # Nothing is established at this revision: `reply_kind` is created NULL
+        # eight statements up, so a declaration here supplies the whole
+        # identity. 0024 passes the kinds THIS revision persisted, which is what
+        # stops a later revision rewriting an origin established here.
+        established_kinds={},
+        revision=revision,
+        audit_columns=AUDIT_COLUMNS_AT_0013,
+    )
+    rows = [row for row in rows if row.approval_id not in honored]
+
     # 3. Refuse on ambiguity, whatever the row's status. A settled row is not
     # inert here: `crud._RESUMABLE_STATUSES` is exactly (approved, rejected,
     # expired), and #532 can re-open an already-resumed row, so every status can
     # still owe a wake. Guessing buys a deferred misroute instead of an abort.
-    if unreconstructable:
+    #
+    # The refusal carries the WHOLE disposition -- every offending row's facts
+    # and a ready-to-fill declaration document -- because a blocked installation
+    # is on a pre-head schema and cannot start the API that would report them.
+    if rows:
         detail = "; ".join(
-            f"{row.id} (reply_channel {row.reply_channel!r}, status {row.status}: "
-            f"{'no binding' if row.kinds == 0 else f'{row.kinds} kinds'})"
-            for row in unreconstructable
+            f"{row.approval_id} (reply_channel {row.reply_channel!r}, "
+            f"status {row.status}: {row.reason})"
+            for row in rows
         )
         raise RuntimeError(
             "cannot backfill approvals.reply_kind (#1459): the channel kind of these "
@@ -138,8 +194,7 @@ def upgrade() -> None:
             "silent misroute this column exists to prevent, and no status is safe to "
             "guess on: approved, rejected and expired rows are exactly the ones the "
             "resume reconciler wakes, and a dead-lettered resume can re-open a row "
-            "that already woke. Re-point or restore the bindings these addresses "
-            "belong to, or delete the approvals, then re-run this migration."
+            "that already woke. " + report_and_guidance(rows, revision=revision)
         )
 
     # The provenance backfill: each row takes the kind of the binding its OWN
@@ -222,8 +277,8 @@ def downgrade() -> None:
             f"the only record of the channel they were raised on -- {detail}. After "
             "the drop a resume re-derives the kind from the CURRENT binding, so each "
             "of these would either have no kind at all or be delivered through the "
-            "wrong adapter. Resolve them, or re-point the bindings back, then re-run "
-            "this downgrade."
+            "wrong adapter. Resolve them, or re-point the bindings back, then "
+            "re-run this downgrade."
         )
 
     op.drop_column(TABLE, "reply_kind", schema=SCHEMA)

@@ -63,12 +63,25 @@ spec:
           command:
             - sh
             - -c
-            - exec valkey-server --requirepass "$VALKEY_PASSWORD"
+            {{- /* #3350: an internal ceiling below the container limit makes a
+                full broker refuse writes (OOM command not allowed) instead of
+                being OOMKilled. noeviction is fixed: evicting stream or lock
+                keys is worse than a refused write, and Langfuse BullMQ, which
+                shares this Valkey, requires it. */}}
+            {{- $maxmemory := toString (.Values.valkey.maxmemory | default "") }}
+            {{- if and $maxmemory (not (regexMatch "^[0-9]+([kKmMgG][bB]?)?$" $maxmemory)) }}
+            {{- fail (printf "valkey.maxmemory %q is not a Valkey size (bytes or a k/kb/m/mb/g/gb suffix) (#3350)" $maxmemory) }}
+            {{- end }}
+            {{- if and (eq $maxmemory "") .Values.valkey.resources.limits.memory }}
+            {{- $limit := include "curie.capacity.memBytes" .Values.valkey.resources.limits.memory | int64 }}
+            {{- $maxmemory = toString (div (mul $limit 3) 4) }}
+            {{- end }}
+            - exec valkey-server --dir /data --requirepass "$VALKEY_PASSWORD"{{ if $maxmemory }} --maxmemory {{ $maxmemory }}{{ end }} --maxmemory-policy noeviction --appendonly yes --appendfsync everysec
           env:
             - name: VALKEY_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
                   key: valkeyPassword
           ports:
             - name: valkey

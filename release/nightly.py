@@ -27,6 +27,11 @@ NIGHTLY_LABEL = "nightly-ladder"
 ALLOW_RED_TOKEN = "--allow-red-nightly"
 SIGNATURE_MARKER_PREFIX = "nightly-ladder-signature:"
 
+# CSI/OSC and single-character escapes GitHub runners emit into job logs.
+_ANSI_ESCAPE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]"
+)
+
 _ERROR_LINE = re.compile(
     r"(?:^|\n)(?:error: |AssertionError: |cluster: |local: |skill: ).+",
     re.IGNORECASE,
@@ -152,6 +157,7 @@ def signature_marker(sig_id: str) -> str:
 class Signature:
     job: str
     text: str
+    note: str = ""
 
     @property
     def signature_id(self) -> str:
@@ -174,14 +180,31 @@ def extract_signatures(jobs: Sequence[dict[str, object]]) -> list[Signature]:
     for job in jobs:
         if job.get("conclusion") != "failure":
             continue
-        log = str(job.get("log") or "")
         name = str(job.get("name") or "job")
-        text = _signature_text(log)
+        text = job_signature_text(job)
         if text in seen:
             continue
         seen.add(text)
-        found.append(Signature(job=name, text=text))
+        found.append(Signature(job=name, text=text, note=_log_note(job)))
     return found
+
+
+def job_signature_text(job: dict[str, object]) -> str:
+    """The signature a failed job files under.
+
+    A job whose log could not be fetched still gets a stable, per-rung
+    signature so the red rung is filed instead of crashing the filer (#2868).
+    """
+    if job.get("log_error"):
+        return f"{job.get('name') or 'job'}: failed, job log unavailable"
+    return _signature_text(str(job.get("log") or ""))
+
+
+def _log_note(job: dict[str, object]) -> str:
+    error = str(job.get("log_error") or "")
+    if not error:
+        return ""
+    return f"Log omitted: the job log could not be fetched ({error})."
 
 
 def _signature_text(log: str) -> str:
@@ -222,6 +245,8 @@ def plan_issue_actions(
             if run_url
             else f"Job: {sig.job}\nSignature: `{sig.text}`\n"
         )
+        if sig.note:
+            snippet += f"\n{sig.note}\n"
         if existing is not None:
             actions.append(
                 IssueAction(
@@ -295,6 +320,30 @@ def _ensure_label(repo: str) -> None:
     )
 
 
+def strip_ansi(text: str) -> str:
+    """Drop terminal escape sequences so signatures stay stable (#2819)."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
+def job_log(repo: str, job_id: object) -> str:
+    """One failed job's log, with terminal escape sequences removed.
+
+    Since gh 2.76 the CLI refuses to print a response carrying terminal
+    escape sequences unless `--allow-escape-sequences` is passed, which
+    killed nightly issue filing from 2026-09-03 (#2819). Ask for the raw
+    bytes, fall back when an older gh does not know the flag, and strip
+    the escapes ourselves either way.
+    """
+    endpoint = ["api", "-X", "GET", f"repos/{repo}/actions/jobs/{job_id}/logs"]
+    try:
+        raw = _gh([*endpoint, "--allow-escape-sequences"])
+    except subprocess.CalledProcessError as exc:
+        if "unknown flag" not in (exc.stderr or ""):
+            raise
+        raw = _gh(endpoint)
+    return strip_ansi(raw)
+
+
 def _failed_job_logs(repo: str, run_id: str) -> list[dict[str, object]]:
     payload = json.loads(
         _gh(["api", "-X", "GET", f"repos/{repo}/actions/runs/{run_id}/jobs"])
@@ -303,22 +352,17 @@ def _failed_job_logs(repo: str, run_id: str) -> list[dict[str, object]]:
     for job in payload.get("jobs") or []:
         if job.get("conclusion") != "failure":
             continue
-        job_id = job.get("id")
-        log = _gh(
-            [
-                "api",
-                "-X",
-                "GET",
-                f"repos/{repo}/actions/jobs/{job_id}/logs",
-            ]
-        )
-        jobs.append(
-            {
-                "name": job.get("name") or "job",
-                "conclusion": "failure",
-                "log": log,
-            }
-        )
+        entry: dict[str, object] = {
+            "name": job.get("name") or "job",
+            "conclusion": "failure",
+            "log": "",
+        }
+        # One unreadable log must not cost every rung its issue (#2868).
+        try:
+            entry["log"] = job_log(repo, job.get("id"))
+        except subprocess.CalledProcessError as exc:
+            entry["log_error"] = _gh_detail(exc)
+        jobs.append(entry)
     return jobs
 
 
@@ -343,48 +387,96 @@ def _open_nightly_issues(repo: str) -> list[dict[str, object]]:
     return payload if isinstance(payload, list) else []
 
 
+def _filing_error(message: str) -> int:
+    """Annotate and fail so a run nobody watches still shows red (#2819)."""
+    print(f"::error title=nightly-ladder issue filing failed::{message}")
+    return 1
+
+
+def _gh_detail(exc: subprocess.CalledProcessError) -> str:
+    return " ".join(((exc.stderr or exc.stdout or "").strip() or str(exc)).split())
+
+
 def file_issues(repo: str, run_id: str, run_url: str) -> int:
+    try:
+        return _file_issues(repo, run_id, run_url)
+    except subprocess.CalledProcessError as exc:
+        detail = _gh_detail(exc)
+        return _filing_error(
+            f"gh failed while filing nightly-ladder issues for run {run_id}: "
+            f"{detail}"
+        )
+
+
+def _file_issues(repo: str, run_id: str, run_url: str) -> int:
     _ensure_label(repo)
-    signatures = extract_signatures(_failed_job_logs(repo, run_id))
+    jobs = _failed_job_logs(repo, run_id)
+    signatures = extract_signatures(jobs)
     if not signatures:
-        print("no failure signatures extracted; nothing to file")
-        return 0
+        return _filing_error(
+            f"run {run_id} failed but no failed job produced a signature; "
+            "no nightly-ladder issue was filed"
+        )
     actions = plan_issue_actions(
         signatures, _open_nightly_issues(repo), run_url=run_url
     )
-    for action in actions:
-        if action.kind == "create":
-            label_args: list[str] = []
-            for label in action.labels:
-                label_args.extend(["--label", label])
-            _gh(
-                [
-                    "issue",
-                    "create",
-                    "--repo",
-                    repo,
-                    "--title",
-                    action.title,
-                    "--body",
-                    action.body,
-                    *label_args,
-                ]
-            )
-            print(f"created issue for {action.title!r}")
-        else:
-            _gh(
-                [
-                    "issue",
-                    "comment",
-                    str(action.number),
-                    "--repo",
-                    repo,
-                    "--body",
-                    action.body,
-                ]
-            )
-            print(f"commented on issue #{action.number}")
+    filed: set[str] = set()
+    failures: list[str] = []
+    for sig, action in zip(signatures, actions, strict=True):
+        try:
+            _apply_action(repo, action)
+        except subprocess.CalledProcessError as exc:
+            failures.append(f"{sig.job}: {_gh_detail(exc)}")
+            continue
+        filed.add(sig.text)
+    # Every red rung must end up with an issue created or updated (#2868).
+    unfiled = [
+        str(job.get("name") or "job")
+        for job in jobs
+        if job.get("conclusion") == "failure"
+        and job_signature_text(job) not in filed
+    ]
+    if unfiled:
+        detail = f"; gh errors: {'; '.join(failures)}" if failures else ""
+        return _filing_error(
+            f"red rung(s) with no nightly-ladder issue created or updated "
+            f"for run {run_id}: {', '.join(unfiled)}{detail}"
+        )
     return 0
+
+
+def _apply_action(repo: str, action: IssueAction) -> None:
+    if action.kind == "create":
+        label_args: list[str] = []
+        for label in action.labels:
+            label_args.extend(["--label", label])
+        _gh(
+            [
+                "issue",
+                "create",
+                "--repo",
+                repo,
+                "--title",
+                action.title,
+                "--body",
+                action.body,
+                *label_args,
+            ]
+        )
+        print(f"created issue for {action.title!r}")
+        return
+    _gh(
+        [
+            "issue",
+            "comment",
+            str(action.number),
+            "--repo",
+            repo,
+            "--body",
+            action.body,
+        ]
+    )
+    print(f"commented on issue #{action.number}")
 
 
 def main(argv: list[str] | None = None) -> int:

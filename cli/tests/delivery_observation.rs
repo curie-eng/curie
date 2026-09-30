@@ -16,9 +16,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,22 +29,13 @@ use std::process::Command;
 /// reader that took exposure from values would call this exposed.
 const CLUSTERIP_COMPUTED_VALUES: &str = r#"{"api":{"commitPollIntervalSeconds":0,"ingress":{"enabled":false},"service":{"type":"ClusterIP","nodePort":30081}}}"#;
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write stub executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read stub metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make stub executable");
-}
-
 /// helm/kubectl/docker for a default `curie`/`curie` install that is serving,
 /// exposed nowhere, and polling nothing. Unmatched probes exit 64 loudly rather
 /// than answering something plausible; both readers tolerate a failed probe, so
 /// a stub that quietly invented an answer would be the worst outcome here.
 fn install_clusterip_stubs(tools: &Path) {
-    write_executable(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
-    write_executable(
+    test_executable::install(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
+    test_executable::install(
         tools.join("kubectl").as_path(),
         r#"#!/bin/sh
 case "$*" in
@@ -54,7 +47,7 @@ case "$*" in
 esac
 "#,
     );
-    write_executable(
+    test_executable::install(
         tools.join("helm").as_path(),
         &format!(
             r#"#!/bin/sh

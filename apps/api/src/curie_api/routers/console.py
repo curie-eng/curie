@@ -19,6 +19,10 @@ Two endpoints, deliberately asymmetric:
 
 ADR-0106 consumes the live session only as an approval principal. The cookie
 does not become a platform key and cannot call either administrative mint.
+
+Readers accept only ``__Host-curie_console_session``. Sessions already minted
+under ``curie_console_session`` stop working; the session TTL is 12 hours, and
+the operator exchanges a new login code.
 """
 
 from typing import Annotated
@@ -26,7 +30,7 @@ from typing import Annotated
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 
 from .. import crud
-from ..approval_auth import CONSOLE_SESSION_COOKIE
+from ..approval_auth import CONSOLE_SESSION_COOKIE, set_console_session_cookie
 from ..auth import require_platform_key
 from ..deps import SessionDep
 from ..schemas import (
@@ -83,17 +87,10 @@ async def exchange_login_code(
     token, row = exchanged
 
     # The token leaves the server ONLY here and ONLY as a cookie. `httponly`
-    # keeps it away from page script; `secure` keeps it off plaintext hops;
-    # `samesite="strict"` means a cross-site request cannot carry it, which is the
-    # CSRF property that matters for an API whose every write is authorized by it.
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        path="/",
-    )
+    # keeps it away from page script; `secure` keeps it off plaintext hops.
+    # SameSite=Strict stays. It does not stop a same-site cross-origin form,
+    # which is why the cookie-only origin check exists.
+    set_console_session_cookie(response, token)
     # Note the response body: an expiry, never the token. Returning it would hand
     # the credential back to the JavaScript this whole design keeps it from.
     assert row.session_expires_at is not None  # set by the exchange above

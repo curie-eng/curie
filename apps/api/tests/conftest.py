@@ -11,6 +11,7 @@ real Postgres (and real Valkey/Langfuse); nothing here mocks them.
 import asyncio
 import os
 import secrets
+import sys
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,6 @@ import asyncpg
 import pytest
 import redis
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_test_support.valkey import connect_or_skip
@@ -30,6 +30,17 @@ from sqlalchemy import make_url
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
+
+# Test modules import shared helpers from this directory; see _migration_support.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _migration_support import (  # noqa: E402
+    IsolatedMigrationDb,
+    MigrationTemplates,
+    admin_execute,
+    alembic_config,
+    render_url,
+)
 
 # The object-store credential the suite talks to compose's RustFS with. The code
 # default in `curie_api.config` is deliberately empty so that omitting these
@@ -41,6 +52,10 @@ from sqlalchemy.sql import text
 # contributor pointing the suite at another store by exporting their own value wins.
 os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
 os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+# Production enables the work-item reconciler. Suite create_app() must not:
+# a 5s pass races TRUNCATE on the shared engine. Loop tests construct it.
+os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would
 # let any platform-key holder forge the Slack identity/channel proof ADR-0106
@@ -49,8 +64,6 @@ os.environ.setdefault(
     "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval-chat-attester-test-secret"
 )
 
-API_DIR = Path(__file__).resolve().parents[1]
-ALEMBIC_DIR = API_DIR / "alembic"
 DB_PREFIX = "curie_test_"
 TS_FORMAT = "%Y%m%d%H%M%S"
 
@@ -132,9 +145,7 @@ def _disposable_db() -> Any:
     get_settings.cache_clear()
     try:
         # Inside the try so a failed migration still drops the run's database.
-        cfg = Config()
-        cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-        command.upgrade(cfg, "head")
+        command.upgrade(alembic_config(), "head")
         yield run_db
     finally:
         asyncio.run(_drop(base, run_db))
@@ -153,7 +164,8 @@ async def _truncate() -> None:
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "TRUNCATE curie.approvals, curie.deployments, "
+                    "TRUNCATE curie.execution_requests, curie.work_items, "
+                    "curie.approvals, curie.deployments, "
                     "curie.agent_versions, curie.agents, "
                     "curie.console_sessions CASCADE"
                 )
@@ -215,8 +227,19 @@ def auth_headers() -> dict[str, str]:
     return {"X-API-Key": get_settings().api_key}
 
 
+@pytest.fixture(scope="session")
+def _migration_templates() -> Iterator[MigrationTemplates]:
+    templates = MigrationTemplates(make_url(get_settings().database_url))
+    try:
+        yield templates
+    finally:
+        templates.drop_all()
+
+
 @pytest.fixture
-def isolated_migration_db() -> Iterator[None]:
+def isolated_migration_db(
+    _migration_templates: MigrationTemplates,
+) -> Iterator[IsolatedMigrationDb]:
     """A throwaway database ALL to itself, for a test that downgrades/upgrades.
 
     The session ``_disposable_db`` is shared across every test in the run, so
@@ -225,41 +248,21 @@ def isolated_migration_db() -> Iterator[None]:
     explicit: migrations are tested against a database of their own, never
     shared state. This provisions one, points DATABASE_URL + alembic at it for
     the test, and drops it after, restoring the session URL so nothing else is
-    perturbed.
-
-    Lives here rather than in one test module because it now has a second
-    consumer (the 0015 provenance backfill and the 0020 blank-override
-    backfill). A private copy per migration test is how the next one silently
-    diverges from whichever version its author happened to find.
+    perturbed. It starts empty; ``.at(revision)`` swaps in a clone of the
+    session template at that revision.
     """
     base = make_url(get_settings().database_url)
     run_db = f"curie_test_mig_{secrets.token_hex(4)}"
-
-    async def _admin(sql: str) -> None:
-        conn = await asyncpg.connect(
-            user=base.username,
-            password=base.password,
-            host=base.host,
-            port=base.port,
-            database="postgres",
-        )
-        try:
-            await conn.execute(sql)
-        finally:
-            await conn.close()
-
     saved_url = os.environ.get("DATABASE_URL")
-    asyncio.run(_admin(f'CREATE DATABASE "{run_db}"'))
+    asyncio.run(admin_execute(base, f'CREATE DATABASE "{run_db}"'))
     try:
-        os.environ["DATABASE_URL"] = base.set(database=run_db).render_as_string(
-            hide_password=False
-        )
+        os.environ["DATABASE_URL"] = render_url(base.set(database=run_db))
         get_settings.cache_clear()
-        yield
+        yield IsolatedMigrationDb(base, run_db, _migration_templates)
     finally:
         if saved_url is None:
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = saved_url
         get_settings.cache_clear()
-        asyncio.run(_admin(f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))
+        asyncio.run(admin_execute(base, f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))

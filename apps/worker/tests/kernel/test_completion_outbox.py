@@ -25,19 +25,27 @@ The ordering EB-B6(c) settles on, at every ``mark_done`` call site:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import sys
 import time
-import uuid
-from collections.abc import Callable
+from pathlib import Path
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import Final, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until
 
 DONE = SessionStatus.DONE
 
@@ -45,28 +53,14 @@ ADAPTER = "agentmail-sandbox"
 EMAIL_ADDRESS = "agent@example.test"
 ENDPOINT = "https://adapter.example/hook"
 
-
-def _qevent(
-    text: str = "hi",
-    *,
-    thread: str = "th-1",
-    event_id: str | None = None,
-    placeholder: str = "msg_upstream",
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind="email",
-            channel=EMAIL_ADDRESS,
-            placeholder=placeholder,
-            endpoint=ENDPOINT,
-            adapter=ADAPTER,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
+_qevent = functools.partial(
+    qevent,
+    kind="email",
+    channel=EMAIL_ADDRESS,
+    placeholder="msg_upstream",
+    endpoint=ENDPOINT,
+    adapter=ADAPTER,
+)
 
 
 def _record(
@@ -105,15 +99,6 @@ def _record(
     )
 
 
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
-
-
 # --- T-B8: completion happens at the durable markers, and nowhere else --------
 
 
@@ -130,9 +115,14 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
     # The adapter would have sent the email and the turn would then run again.
     # Mutation: move the emit into the ``finally`` and all four fail.
     async def go() -> None:
-        async with make_harness(shimmer=False) as h:
+        async with make_harness(shimmer=False, reclaim_min_idle_ms=5000) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             if layer == "sink":
@@ -148,9 +138,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
                 async def db_boom(*_a: object, **_k: object) -> object:
                     raise RuntimeError("database layer failure")
 
-                monkeypatch.setattr(
-                    Markers, "mark_done", db_boom
-                )
+                monkeypatch.setattr(Markers, "settle_fenced", db_boom)
             else:
 
                 async def cancelled(*_a: object, **_k: object) -> object:
@@ -308,7 +296,12 @@ def test_the_startup_sweep_delivers_a_record_whose_entry_was_already_acked(
             await Markers(h.async_redis, h.config).mark_completion_pending(
                 "c1", _record("c1", thread="tC", done=True)
             )
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             task = asyncio.create_task(consumer.run())
@@ -674,7 +667,8 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner
+                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner,
+                    resume_event_id=None,
                 )
                 is True
             )

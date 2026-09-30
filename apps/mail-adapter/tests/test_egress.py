@@ -27,6 +27,10 @@ from _support import (
     completed,
     free_port,
     post_event,
+    progress_post,
+    progress_update,
+    refused_agentmail_connection,
+    refused_agentmail_reply,
     reply_post,
     spawn_adapter,
     stop,
@@ -35,7 +39,7 @@ from _support import (
     wait_for_healthz,
     wait_until,
 )
-from curie_mail_adapter.adapter import EVENT_MARKER, MailAdapter
+from curie_mail_adapter.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
 from curie_mail_adapter.agentmail import AgentMailClient
 from curie_mail_adapter.config import MailAdapterConfig
 
@@ -50,11 +54,12 @@ def seed(mail: MailState, adapter: MailAdapter, message_id: str = "msg-1", **kwa
 def restarted_adapter(
     adapter: MailAdapter,
     serve_egress: Callable[[MailAdapter], str],
+    config: MailAdapterConfig,
 ) -> Iterator[tuple[MailAdapter, str]]:
     """Reopen the same durable state the way a replacement pod does."""
     adapter.shutdown.set()
     adapter.close()
-    replacement = MailAdapter(adapter.config)
+    replacement = MailAdapter(config)
     try:
         yield replacement, serve_egress(replacement) + "/"
     finally:
@@ -166,7 +171,10 @@ def test_a_restart_does_not_double_send_a_terminal_event(
     post_event(egress_url, completed("ev-1"))
     assert len(mail.replies) == 1
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         assert post_event(replacement_url, completed("ev-1"))[0] == 200
 
     assert len(mail.replies) == 1
@@ -182,7 +190,10 @@ def test_after_a_restart_an_unmarked_event_id_still_sends(
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1"))
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         post_event(replacement_url, completed("ev-2"))
 
     assert len(mail.replies) == 2
@@ -443,7 +454,10 @@ def test_a_restart_preserves_admitted_reply_text(
     seed(mail, adapter)
     post_event(egress_url, update("the answer"))
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         status, _ = post_event(replacement_url, completed("ev-1"))
 
     assert status == 200
@@ -464,7 +478,10 @@ def test_a_delivered_reply_is_acked_after_a_restart(
     assert len(mail.replies) == 1
     assert f"{EVENT_MARKER} ev-1" in mail.replies[0][1]
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         status, _ = post_event(replacement_url, completed("ev-1"))
 
     assert status == 200
@@ -624,7 +641,10 @@ def test_an_unreadable_thread_does_not_send_a_duplicate_email(
     assert post_event(egress_url, completed("ev-1"))[0] == 502
     assert len(mail.replies) == 1
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         mail.fail_next_thread = thread_status
 
         status, _ = post_event(replacement_url, completed("ev-1"))
@@ -636,10 +656,36 @@ def test_an_unreadable_thread_does_not_send_a_duplicate_email(
     assert len(mail.replies) == 1
 
 
+@pytest.mark.parametrize("refusal_stage", ["thread", "reply"])
+def test_refused_provider_connection_has_a_distinct_egress_status(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+    refusal_stage: str,
+) -> None:
+    # Observed in #2824 and #2731: a denied provider socket dial raises ECONNREFUSED.
+    seed(mail, adapter)
+    post_event(egress_url, update("answer one"))
+    provider = (
+        refused_agentmail_connection() if refusal_stage == "thread" else refused_agentmail_reply()
+    )
+    with provider as provider_url:
+        with restarted_adapter(
+            adapter,
+            serve_egress,
+            adapter.config.model_copy(update={"agentmail_base_url": provider_url}),
+        ) as (_, replacement_url):
+            status, body = post_event(replacement_url, completed("ev-1"))
+
+    assert status == 424
+    assert body == {"detail": "provider egress refused"}
+    assert mail.replies == []
+
+
 def test_a_403_from_the_provider_is_a_delivery_failure(
     mail: MailState, adapter: MailAdapter, egress_url: str
 ) -> None:
-    """The spike logged "rejected by the send allow list; continuing" and acked 200."""
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     mail.fail_next_reply = 403
@@ -717,7 +763,7 @@ def test_deleted_provider_thread_is_terminal_once_across_restart(
     with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
-        with restarted_adapter(adapter, serve_egress) as (_, replacement_url):
+        with restarted_adapter(adapter, serve_egress, adapter.config) as (_, replacement_url):
             assert post_event(replacement_url, completed("ev-deleted"))[0] == 410
     assert mail.thread_calls == 1
     assert mail.replies == []
@@ -803,3 +849,125 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
         assert len(mail.replies) == 1
     finally:
         replacement.close()
+
+
+# --- a dropped turn with nothing to say sends nothing (ADR-0168 decision 6) ---
+
+
+def test_a_dropped_completion_with_no_text_sends_no_email(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """Mailing the empty-reply notice would be a new message to the sender.
+
+    When the sender is another of the installation's inboxes, that notice is the
+    next turn of the exchange the worker's sibling limit just ended.
+    """
+    seed(mail, adapter)
+
+    for _ in range(2):
+        status, _ = post_event(egress_url, completed("ev-drop", outcome="dropped"))
+        assert status == 200
+
+    assert mail.replies == []
+
+
+def test_a_dropped_completion_that_said_something_still_sends_it(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    post_event(egress_url, update("This agent is paused by an operator."))
+
+    status, _ = post_event(egress_url, completed("ev-paused", outcome="dropped"))
+
+    assert status == 200
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("This agent is paused by an operator.")
+
+
+def test_a_delivered_completion_with_no_text_still_sends_the_empty_reply_notice(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+
+    status, _ = post_event(egress_url, completed("ev-empty"))
+
+    assert status == 200
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith(EMPTY_REPLY_TEXT)
+
+
+# --- deliberate progress (reply wire 1.1, ADR-0130) is silent -----------------
+
+
+def test_a_progress_post_never_joins_the_buffered_reply(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """@spec ADR-0130 d5: progress never becomes a second answer.
+
+    An approval card's text is appended to the email; a progress post's text
+    would put a task-status line into the answer the correspondent reads.
+    """
+    seed(mail, adapter)
+    post_event(egress_url, update("the answer", reply_ref="msg-1"))
+
+    status, body = post_event(
+        egress_url, progress_post("Reading the ledger", reply_ref="msg-1")
+    )
+    post_event(egress_url, progress_post("Found it", reply_ref="msg-1", kind="milestone"))
+    post_event(egress_url, completed("ev-1"))
+
+    assert status == 200
+    assert body == {"ref": None}
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("the answer")
+    assert "Reading the ledger" not in text
+    assert "Found it" not in text
+
+
+def test_a_progress_post_with_no_ref_is_silent_even_when_two_turns_are_live(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """An approval card here is refused 503 as ambiguous; progress owes nothing."""
+    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
+    mail.add_inbound("msg-2", "thr-1", subject="Second", text="two")
+    adapter.poll_once()
+    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+
+    status, _ = post_event(egress_url, progress_post("Reading the ledger"))
+
+    assert status == 200
+    assert mail.replies == []
+
+
+def test_a_progress_body_for_an_unadmitted_conversation_is_silent(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """Silence has no owner to find, so it cannot be a retryable miss either."""
+    seed(mail, adapter)
+
+    post_status, _ = post_event(
+        egress_url, progress_post("Reading", conversation_id="thr-unknown", reply_ref="msg-x")
+    )
+    update_status, _ = post_event(
+        egress_url, progress_update("Testing", conversation_id="thr-unknown", reply_ref="msg-x")
+    )
+
+    assert (post_status, update_status) == (200, 200)
+    assert mail.replies == []
+
+
+def test_a_card_edit_never_replaces_or_clears_the_buffered_reply(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    post_event(egress_url, update("the answer", reply_ref="msg-1"))
+
+    status, body = post_event(egress_url, progress_update("Running the suite"))
+    post_event(egress_url, progress_update("Done", state="complete", revision=3))
+    post_event(egress_url, completed("ev-1"))
+
+    assert status == 200
+    assert body == {"ref": None}
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("the answer")
+    assert "Running the suite" not in text

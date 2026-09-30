@@ -1,7 +1,9 @@
 """Langfuse read proxy powering the Runs view."""
 
 import re
+from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..auth import require_api_key
@@ -22,6 +24,19 @@ router = APIRouter(
 # that could traverse into other upstream paths.
 _TRACE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
+# Observations can land before the trace row is readable. A 404 from the
+# trace GET is the same not-ready condition as an empty observation list.
+_TRACE_NOT_READY = "trace has no observations yet"
+
+
+async def _trace_or_not_ready(lf: LangfuseDep, trace_id: str) -> dict[str, Any]:
+    try:
+        return await lf.get_trace(trace_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY) from exc
+
 
 @router.get("/traces")
 async def list_traces(
@@ -41,10 +56,8 @@ async def get_trace(trace_id: str, lf: LangfuseDep) -> TraceTree:
         )
     observations = await lf.get_observations(trace_id)
     if not observations:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "trace has no observations yet"
-        )
-    trace = await lf.get_trace(trace_id)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY)
+    trace = await _trace_or_not_ready(lf, trace_id)
     return TraceTree(
         trace=trace,
         tree=build_tree(observations),
@@ -66,8 +79,6 @@ async def promote_trace_to_eval_case(trace_id: str, lf: LangfuseDep) -> EvalCase
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid trace id")
     observations = await lf.get_observations(trace_id)
     if not observations:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "trace has no observations yet"
-        )
-    trace = await lf.get_trace(trace_id)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY)
+    trace = await _trace_or_not_ready(lf, trace_id)
     return trace_to_eval_case(trace_id, trace, observations)

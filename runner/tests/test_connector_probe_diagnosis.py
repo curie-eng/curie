@@ -1,9 +1,10 @@
-"""Declared-connector capability diagnosis (#2519).
+"""Declared connector capability diagnosis (#2519).
 
-A SecretRef-form credential never reaches the sandbox under ADR-0090, so
-``Authorization: Bearer ${NAME}`` expands empty and the MCP capability probe
-only logged. This module pins the network-free diagnosis that names the
-connector and the credential, never a value, and the vector #2352 must reuse
+A SecretRef credential never reaches the sandbox under ADR-0090. Implicit
+SecretRef declarations therefore carry no Authorization header. When an author
+explicitly selects one as ``bearer_secret``, ``Bearer ${NAME}`` can still
+expand empty. This module pins the network free diagnosis that names the
+connector and credential, never a value. Vector #2352 must reuse this path
 instead of probing HTTP at deploy time.
 """
 
@@ -19,6 +20,8 @@ from curie_runner.mcp_tool_capability import (
     probe_mcp_tool_capability,
     reprobe_connector_failures,
 )
+from plugin_format.connector_render import mcp_entry
+from plugin_format.connectors import ConnectorSpec, SecretRef
 
 _VECTOR = (
     Path(__file__).resolve().parents[2] / "tests" / "vectors" / "connector-probe-diagnosis.json"
@@ -129,6 +132,37 @@ def test_missing_credential_skips_http_probe_for_that_derived_server(
     assert called == []
     assert result.connector_failures[0].reason == "missing_credential"
     assert result.connector_failures[0].credential_names == ("CURIE_TEST_CONNECTOR_TOKEN",)
+
+
+@pytest.mark.parametrize(
+    ("env", "reason"),
+    [({}, "missing_credential"), ({"GITHUB_TOKEN": ""}, "empty_expansion")],
+)
+def test_explicit_secret_ref_bearer_keeps_credential_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    reason: str,
+) -> None:
+    called: list[str] = []
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    async def boom(*_args: object, **_kwargs: object) -> tuple[int, bool, frozenset[str]]:
+        called.append("probed")
+        raise AssertionError("an unavailable explicit credential must not be sent")
+
+    monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", boom)
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=[SecretRef(name="GITHUB_TOKEN", from_secret="gh-pat")],
+        bearer_secret="GITHUB_TOKEN",
+    )
+    derived = {"github": mcp_entry("curie", "acme-dev", "curie", "github", spec)}
+
+    result = anyio.run(probe_mcp_tool_capability, None, derived, env)
+
+    assert called == []
+    assert result.connector_failures[0].reason == reason
+    assert result.connector_failures[0].credential_names == ("GITHUB_TOKEN",)
 
 
 def test_healthy_nonempty_header_still_probes_the_derived_server(

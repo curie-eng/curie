@@ -31,11 +31,17 @@ not write.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
+import re
+from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from .connectors import ConnectorSpec
+from .connectors import ADMITS_SELF, ConnectorSpec
 
 # Service names are DNS labels, so 63 characters is the hard ceiling. Names that
 # would exceed it are truncated and disambiguated with a digest rather than
@@ -125,6 +131,89 @@ def connector_forges_join(connector: str) -> bool:
     return _JOIN in f"-{connector}"
 
 
+# The port the caller proxy listens on in every hosted connector pod (ADR-0168
+# decision 7), and the one it moves to when a server declares that port itself.
+# Every example declares 8000.
+CALLER_PROXY_PORT = 8480
+CALLER_PROXY_ALTERNATE_PORT = 8481
+CALLER_PROXY_CONTAINER = "caller-proxy"
+_CALLER_PORT_NAME = "caller"
+_PUBLIC_KEY_BYTES = 32
+# The suffix of the Service that reaches a proxied connector's server directly.
+_DIRECT_SUFFIX = "-direct"
+_PULL_POLICIES = frozenset({"Always", "IfNotPresent", "Never"})
+# A Secret name: a DNS subdomain.
+_SECRET_NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
+_SECRET_NAME_MAX = 253
+
+
+@dataclass(frozen=True)
+class ConnectorProxy:
+    """What the render needs to put a caller proxy in front of a connector.
+
+    ``public_keys`` is the current key first, then the previous one during a
+    rotation, each the standard base64 of a 32-byte Ed25519 public key. The
+    proxy admits a token either key verifies.
+
+    The proxy runs from the worker image, so it pulls as the worker does:
+    ``pull_policy`` and ``pull_secrets`` are the worker's, and ``None`` and
+    ``()`` leave the cluster default.
+    """
+
+    image: str
+    public_keys: tuple[str, ...]
+    pull_policy: str | None = None
+    pull_secrets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.image.strip():
+            raise ValueError("the connector proxy image is empty")
+        if self.pull_policy is not None and self.pull_policy not in _PULL_POLICIES:
+            raise ValueError(
+                f"the connector proxy pull policy {self.pull_policy!r} is not one of "
+                f"{', '.join(sorted(_PULL_POLICIES))}"
+            )
+        for name in self.pull_secrets:
+            if len(name) > _SECRET_NAME_MAX or not _SECRET_NAME.fullmatch(name):
+                raise ValueError(f"the connector proxy pull secret {name!r} is not a Secret name")
+        if not self.public_keys:
+            raise ValueError("the connector proxy has no caller public key")
+        for text in self.public_keys:
+            try:
+                raw = base64.b64decode(text, validate=True)
+            except (binascii.Error, ValueError):
+                raise ValueError("a caller public key is not standard base64") from None
+            if len(raw) != _PUBLIC_KEY_BYTES:
+                raise ValueError(
+                    f"a caller public key decodes to {len(raw)} bytes; an Ed25519 public "
+                    f"key is {_PUBLIC_KEY_BYTES}"
+                )
+
+
+def caller_proxy_port(spec: ConnectorSpec) -> int:
+    """The port the caller proxy takes in this connector's pod."""
+
+    return CALLER_PROXY_ALTERNATE_PORT if spec.port == CALLER_PROXY_PORT else CALLER_PROXY_PORT
+
+
+def resolved_admits(spec: ConnectorSpec, agent: str) -> list[str]:
+    """The agent names this connector's proxy admits, with ``self`` resolved.
+
+    A missing list is the deploying agent alone and ``[]`` is nobody (ADR-0168
+    decision 7). ``self`` becomes ``agent``, the stored name the worker signs
+    into the token, and a list naming both collapses to one entry.
+    """
+
+    if spec.admits is None:
+        return [agent]
+    admitted: list[str] = []
+    for entry in spec.admits:
+        name = agent if entry == ADMITS_SELF else entry
+        if name not in admitted:
+            admitted.append(name)
+    return admitted
+
+
 def sandbox_selector(release: str, app_name: str) -> dict[str, str]:
     """The pods Rail 1's default-deny egress selects, exactly.
 
@@ -167,11 +256,11 @@ def object_name(release: str, agent: str, connector: str) -> str:
     names distinct per (release, agent, connector) but the join it introduced is
     a bare substring, so two DIFFERENT tuples could still render one Service,
     one Deployment, both NetworkPolicies and -- worst -- one
-    ``app.kubernetes.io/name``, which IS the pod selector. The connector is
-    deliberately unauthenticated (ADR-0086: the network is not one layer of the
-    access control, it is the whole of it), so this name is the only thing
-    binding a sandbox to a credential and a collision hands one agent another
-    agent's production token with nothing logged.
+    ``app.kubernetes.io/name``, which IS the pod selector. That selector is what
+    both NetworkPolicies and the Service bind to, and the caller proxy's
+    ``admits`` list rides in the Deployment it names (ADR-0168 decision 7), so a
+    collision hands one agent another agent's production token with nothing
+    logged.
 
     Raising, rather than quietly deriving some other unique name, is what keeps
     the other half of this function's contract intact. "Stable and derivable"
@@ -217,6 +306,32 @@ def object_name(release: str, agent: str, connector: str) -> str:
     return f"{base[:keep].rstrip('-')}-{digest}"
 
 
+def direct_service_name(release: str, agent: str, connector: str) -> str:
+    """The name of the Service that reaches a proxied connector's server directly.
+
+    ``object_name`` with ``-direct`` appended. A name that would pass the DNS
+    label limit keeps the suffix and is shortened with a digest of the whole
+    name, as ``object_name`` shortens its own.
+    """
+
+    base = f"{object_name(release, agent, connector)}{_DIRECT_SUFFIX}"
+    if len(base) <= _DNS_LABEL_MAX:
+        return base
+    digest = hashlib.sha256(base.encode()).hexdigest()[:_DIGEST_LEN]
+    keep = _DNS_LABEL_MAX - len(_DIRECT_SUFFIX) - _DIGEST_LEN - 1
+    return f"{base[:keep].rstrip('-')}-{digest}{_DIRECT_SUFFIX}"
+
+
+def shadows_a_direct_service(connector: str, hosted: Collection[str]) -> bool:
+    """Whether this connector's object name is a hosted sibling's direct Service name.
+
+    Connector ``x-direct`` and the direct Service of sibling ``x`` render one
+    name, so the two would overwrite a single Service.
+    """
+
+    return connector.endswith(_DIRECT_SUFFIX) and connector[: -len(_DIRECT_SUFFIX)] in hosted
+
+
 def service_dns(release: str, agent: str, connector: str, namespace: str) -> str:
     return f"{object_name(release, agent, connector)}.{namespace}.svc.cluster.local"
 
@@ -237,12 +352,48 @@ def host_aliases(release: str, agent: str, connector: str, namespace: str, port:
     ]
 
 
-def render_service(release: str, agent: str, connector: str, spec: ConnectorSpec) -> dict[str, Any]:
+def render_service(
+    release: str,
+    agent: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
+) -> dict[str, Any]:
+    """The Service the sandbox dials. It keeps ``spec.port``, so the URL and the
+    allowed hosts do not move; with a proxy it lands on the proxy's port."""
+
     name = object_name(release, agent, connector)
+    target = _CALLER_PORT_NAME if proxy is not None else "http"
     return {
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {"name": name, "labels": _labels(release, agent, connector)},
+        "spec": {
+            "type": "ClusterIP",
+            "selector": _labels(release, agent, connector),
+            "ports": [{"name": "http", "port": spec.port, "targetPort": target}],
+        },
+    }
+
+
+def render_direct_service(
+    release: str, agent: str, connector: str, spec: ConnectorSpec
+) -> dict[str, Any]:
+    """The Service that reaches a proxied connector's server itself (ADR-0168 decision 7).
+
+    For callers that are not agents, such as a keep-alive Job. It selects the
+    same pods on ``spec.port``, which neither rendered NetworkPolicy opens, so
+    only an operator-applied peer-ingress policy naming that port admits a
+    caller through it.
+    """
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": direct_service_name(release, agent, connector),
+            "labels": _labels(release, agent, connector),
+        },
         "spec": {
             "type": "ClusterIP",
             "selector": _labels(release, agent, connector),
@@ -294,6 +445,25 @@ def substitute(value: str, subs: dict[str, str]) -> str:
     return value
 
 
+def _readiness_probe(port: str = "http") -> dict[str, Any]:
+    """``tcpSocket`` on the named container port.
+
+    The connector spec declares no health path today, so the probe checks the
+    one thing every MCP server must do: accept a connection on its port. That
+    catches a server that hangs before binding, fails to bind, or listens on
+    the wrong port (#3058). The caller proxy gets the same probe on its own
+    port, because with a proxy that is the port the Service targets.
+    """
+
+    return {
+        "tcpSocket": {"port": port},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
 def render_deployment(
     release: str,
     agent: str,
@@ -301,6 +471,7 @@ def render_deployment(
     connector: str,
     spec: ConnectorSpec,
     secret_name: str,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
@@ -413,6 +584,13 @@ def render_deployment(
                             "env": env,
                             **({"volumeMounts": volume_mounts} if volume_mounts else {}),
                             "ports": [{"name": "http", "containerPort": spec.port}],
+                            # Without a probe, Ready means only "the process
+                            # started", so a server that hangs, fails to bind,
+                            # or listens on the wrong port stays Available and
+                            # CurieConnectorNotReady can never see it (#3058).
+                            # Readiness only, never liveness: a slow upstream
+                            # leaves the Service, it is not restarted in a loop.
+                            "readinessProbe": _readiness_probe(),
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
                                 "readOnlyRootFilesystem": True,
@@ -422,17 +600,72 @@ def render_deployment(
                                 "requests": {"cpu": "10m", "memory": "64Mi"},
                                 "limits": {"cpu": "500m", "memory": "256Mi"},
                             },
-                        }
+                        },
+                        *([_proxy_container(agent, spec, proxy)] if proxy is not None else []),
                     ],
                     **({"volumes": volumes} if volumes else {}),
+                    **(
+                        {"imagePullSecrets": [{"name": name} for name in proxy.pull_secrets]}
+                        if proxy is not None and proxy.pull_secrets
+                        else {}
+                    ),
                 },
             },
         },
     }
 
 
+def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> dict[str, Any]:
+    """The caller proxy: it checks each request's token and forwards to the server.
+
+    Every value is a literal. The public keys are public, and the proxy holds no
+    key that can mint. The hardening and the bounds match the server's; 128Mi
+    is roughly three times the proxy's measured peak.
+    """
+
+    port = caller_proxy_port(spec)
+    return {
+        "name": CALLER_PROXY_CONTAINER,
+        "image": proxy.image,
+        **({"imagePullPolicy": proxy.pull_policy} if proxy.pull_policy is not None else {}),
+        "command": ["python", "-m", "curie_connector_proxy"],
+        "env": [
+            {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
+            {"name": "CURIE_CALLER_PROXY_UPSTREAM_PORT", "value": str(spec.port)},
+            {"name": "CURIE_CALLER_PROXY_PUBLIC_KEYS", "value": ",".join(proxy.public_keys)},
+            {
+                "name": "CURIE_CALLER_PROXY_ADMITS",
+                "value": json.dumps(resolved_admits(spec, agent), separators=(",", ":")),
+            },
+        ],
+        "ports": [{"name": _CALLER_PORT_NAME, "containerPort": port}],
+        "readinessProbe": _readiness_probe(_CALLER_PORT_NAME),
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        },
+        "resources": {
+            "requests": {"cpu": "10m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "128Mi"},
+        },
+    }
+
+
+def _policy_port(spec: ConnectorSpec, proxy: ConnectorProxy | None) -> int:
+    # NetworkPolicy matches the destination pod port after the Service DNAT
+    # (see the module docstring), so with a proxy both policies name the
+    # proxy's port and nothing Curie renders opens `spec.port`.
+    return caller_proxy_port(spec) if proxy is not None else spec.port
+
+
 def render_networkpolicy(
-    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
+    release: str,
+    agent: str,
+    app_name: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     """Egress from the sandbox to this connector.
 
@@ -453,7 +686,7 @@ def render_networkpolicy(
             "egress": [
                 {
                     "to": [{"podSelector": {"matchLabels": _labels(release, agent, connector)}}],
-                    "ports": [{"protocol": "TCP", "port": spec.port}],
+                    "ports": [{"protocol": "TCP", "port": _policy_port(spec, proxy)}],
                 }
             ],
         },
@@ -461,16 +694,22 @@ def render_networkpolicy(
 
 
 def render_ingress_networkpolicy(
-    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
+    release: str,
+    agent: str,
+    app_name: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     """Ingress to this connector: any sandbox in this release, and nothing else.
 
     The egress policy above says where the sandbox may GO. It says nothing
     about who may ARRIVE, and those are not the same question. Without this,
-    every pod in the namespace can call the connector -- and the connector is
-    deliberately unauthenticated, because the sandbox holds no credential to
-    authenticate WITH. So the network is not one layer of the access control
-    here, it is the whole of it.
+    every pod in the namespace can call the connector. With a caller proxy
+    (ADR-0168 decision 7) this policy decides who may ask at all and the proxy
+    decides which agent is asking; on an install with no caller key there is no
+    proxy, and this policy is the whole of the access control. With a proxy it
+    opens only the proxy's port (``_policy_port``).
 
     What that is worth is concrete: a connector holds a production credential
     and answers anyone who asks. In a namespace that also runs Postgres,
@@ -485,12 +724,15 @@ def render_ingress_networkpolicy(
     switches it from allow-by-default to deny-by-default for that direction).
     A separate default-deny object would be inert.
 
-    Safe here specifically because the connector Deployment declares no probes:
-    an ingress policy that omits the kubelet would otherwise fail readiness and
-    take the connector out of its Service endpoints -- the failure mode being a
-    connector that is healthy, running, and unreachable. If probes are ever
-    added to ``render_deployment``, this rule has to grow a companion for them
-    in the same commit.
+    The connector Deployment carries a readiness probe (#3058), and this policy
+    deliberately grows no kubelet rule for it. The NetworkPolicy API guarantees
+    it: "When a pod is isolated for ingress, the only allowed connections into
+    the pod are those from the pod's node and those allowed by the ingress list"
+    (kubernetes.io, Network Policies). The kubelet's probe comes from the pod's
+    node, so it needs no ``from``. A CNI that denies it violates that contract
+    and breaks every probed pod behind a policy, not just this one. Adding one would
+    mean an ``ipBlock`` of node addresses: unknowable at render time, and wide
+    enough to readmit every hostNetwork pod this rule exists to keep out.
     """
 
     return {
@@ -512,7 +754,7 @@ def render_ingress_networkpolicy(
             "ingress": [
                 {
                     "from": [{"podSelector": {"matchLabels": sandbox_selector(release, app_name)}}],
-                    "ports": [{"protocol": "TCP", "port": spec.port}],
+                    "ports": [{"protocol": "TCP", "port": _policy_port(spec, proxy)}],
                 }
             ],
         },
@@ -528,6 +770,7 @@ def render(
     connector: str,
     spec: ConnectorSpec,
     secret_name: str,
+    proxy: ConnectorProxy | None = None,
 ) -> list[dict[str, Any]]:
     """Every object needed to run one hosted connector. Empty for a remote one.
 
@@ -560,10 +803,11 @@ def render(
             "before anything renders."
         )
     return [
-        render_service(release, agent, connector, spec),
-        render_deployment(release, agent, namespace, connector, spec, secret_name),
-        render_networkpolicy(release, agent, app_name, connector, spec),
-        render_ingress_networkpolicy(release, agent, app_name, connector, spec),
+        render_service(release, agent, connector, spec, proxy),
+        *([render_direct_service(release, agent, connector, spec)] if proxy is not None else []),
+        render_deployment(release, agent, namespace, connector, spec, secret_name, proxy),
+        render_networkpolicy(release, agent, app_name, connector, spec, proxy),
+        render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),
     ]
 
 
@@ -577,22 +821,28 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     Derived, not authored, for the same reason the URL above is: under ADR-0086
     the author writes no URL and no header, so there is nothing to get wrong.
     The value is the ``${NAME}`` placeholder -- no secret VALUE is ever read or
-    rendered here. The name is ``spec.bearer_secret`` when set, otherwise the
-    single declared secret (the github-mcp-server shape). A hosted connector
-    with several secrets and no ``bearer_secret`` is refused at validation
-    rather than silently using ``secrets[0]`` (#2559). Remaining secrets keep
-    their pod-side ``secretKeyRef`` delivery.
+    rendered here. The name is ``spec.bearer_secret`` when set, otherwise a
+    single plain string secret (the github-mcp-server shape). A ``SecretRef``
+    does not imply client authentication. An explicit ``bearer_secret`` still
+    requests a header for that name.
+    A hosted connector with several secrets, any of them a plain string, and no
+    ``bearer_secret`` is refused at validation rather than silently using
+    ``secrets[0]`` (#2559). One whose secrets are all ``SecretRef``s is valid and
+    derives no header (#3057). Remaining
+    secrets keep their pod-side ``secretKeyRef`` delivery.
 
     With the header present, a wrong token surfaces from the tool call as
-    GitHub's ``401 Bad credentials``; a MISSING value is refused at deploy
-    (``connectors.yaml declares secret(s) with no value available``). A
-    ``SecretRef`` value never reaches the sandbox under ADR-0090, so the
-    placeholder expands empty and the runner's capability probe still only
-    logs the failure -- a known gap, tracked as a follow-up issue.
+    GitHub's ``401 Bad credentials``. A ``SecretRef`` value never reaches the
+    sandbox under ADR-0090, which is why an implicit reference emits no header.
+    An explicitly selected reference still emits the requested placeholder so
+    the runner can diagnose its missing sandbox value honestly.
     """
 
-    name = spec.bearer_secret_name()
-    if not name:
+    if spec.bearer_secret:
+        name = spec.bearer_secret
+    elif len(spec.secrets) == 1 and isinstance(spec.secrets[0], str):
+        name = spec.secrets[0]
+    else:
         return {}
     return {"headers": {"Authorization": f"Bearer ${{{name}}}"}}
 
@@ -604,17 +854,17 @@ def unhosted_mcp_entry(spec: ConnectorSpec) -> dict[str, Any] | None:
     point at IS "declared but not exercisable here" (#1093). Mounting a URL that
     resolves nowhere would turn that into a connection refused mid-turn.
 
-    Unlike ``mcp_entry``, this fallback deliberately does not derive the
-    ``Authorization`` header: no non-cluster tier stages the declared secret
-    into the runner env, so there is nothing yet to derive it from (follow-up
-    issue noted in the PR).
+    The ``Authorization`` header is derived here exactly as ``mcp_entry``
+    derives it: the skill and local tiers stage the Bearer secret named by
+    ``_derived_headers`` into the runner env (#2518), so the ``${NAME}``
+    placeholder expands there the same way it does in a cluster sandbox.
     """
 
     if not spec.is_hosted:
         return mcp_entry("", "", "", "", spec)
     if not spec.unhosted_url:
         return None
-    return {"type": "http", "url": spec.unhosted_url}
+    return {"type": "http", "url": spec.unhosted_url, **_derived_headers(spec)}
 
 
 def mcp_entry(
@@ -625,7 +875,7 @@ def mcp_entry(
     For a hosted connector the URL is derived from the Service that Curie just
     created; hand-writing it is how a bundle ends up with an address that does
     not resolve in the tier it is deployed to. Its ``Authorization`` header is
-    derived from ``bearer_secret`` (or the single declared secret) for the same
+    derived from ``bearer_secret`` (or one plain string secret) for the same
     reason, so the author writes no header either -- see ``_derived_headers``.
     """
 

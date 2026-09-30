@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import anyio
 from aci_protocol import BootEnv
@@ -35,6 +36,7 @@ from .approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
+    build_memory_tools,
     include_generic_policy_pager,
     policy_disallowed_tools,
     resolve_approval_policy,
@@ -57,6 +59,8 @@ from .history import (
     DEFAULT_REPLAY_MAX_BYTES,
     DEFAULT_REPLAY_MAX_TURNS,
     ConversationReplay,
+    HistoryCapacityError,
+    HistoryConflictError,
     HistoryError,
     StructuredReplayUnsupported,
     TranscriptStore,
@@ -72,15 +76,42 @@ from .mcp_tool_capability import (
     probe_mcp_tool_capability,
     reprobe_connector_failures,
 )
-from .memory import MemoryStore, format_memory_preamble, resolve_memory
+from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resolve_memory
+from .memory_facts import (
+    DEFAULT_GUIDANCE,
+    MAX_FACTS_PER_MEMORY,
+    Fact,
+    MemoryTurn,
+    format_facts_preamble,
+    resolve_facts_store,
+)
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
+from .progress import (
+    PROGRESS_TOKEN_ENV,
+    PROGRESS_URL_ENV,
+    VERIFICATION_COMMAND,
+    ProgressActivity,
+    build_progress_tool,
+    factory_progress_requested,
+    preflight_workspace_verification,
+    resolve_progress,
+)
+from .publication_precheck import PublicationPrecheck
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .turn_progress import (
+    PROGRESS_PREAMBLE,
+    TurnProgress,
+    build_turn_progress_tool,
+    should_mount_turn_progress,
+    turn_progress_enabled,
+)
+from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
@@ -115,9 +146,7 @@ def _discover_attachments(mount: Path | None) -> tuple[Path, ...]:
         return ()
     return tuple(
         sorted(
-            child
-            for child in mount.iterdir()
-            if child.is_file() and not child.name.startswith(".")
+            child for child in mount.iterdir() if child.is_file() and not child.name.startswith(".")
         )
     )
 
@@ -172,7 +201,10 @@ def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
     return resolve_harness(name)
 
 
-def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
+def format_workspace_preamble(
+    mounted_workspace: Path | None,
+    verification: dict[str, Any] | None = None,
+) -> str | None:
     """Render mounted-workspace facts as a system-prompt preamble, or None.
 
     Hardcodes ``/workspace`` in the text so a caller Path never leaks into the
@@ -181,7 +213,7 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
 
     if mounted_workspace is None:
         return None
-    return (
+    lines = [
         "# Mounted workspace\n"
         "\n"
         "A managed checkout is already at /workspace (complete git working tree, "
@@ -190,8 +222,88 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
         "Do not git clone, git fetch, or git pull this repository over the network.\n"
         "General network egress is unavailable in this sandbox; git hosts including "
         "github.com are unreachable by design.\n"
-        "Do not git push; use publish_changes when ready."
+        "Do not git push; use publish_changes when ready.\n"
+        "Python, pip, and venv are already in the image. "
+        "Create a virtualenv only under /workspace.\n"
+        "Install dependencies only from files already in the checkout, with pip --no-index. "
+        "Do not contact a package index.\n"
+        "Run only the repository's documented focused check command.\n"
+        "Do not write a substitute test runner or shim."
+    ]
+    lines.append(f"Verification command: {VERIFICATION_COMMAND}")
+    if verification is None:
+        lines.append(
+            "No factory "
+            "verification preflight result is available in this turn. If in-sandbox "
+            "verification is unavailable, report only observed missing binaries or "
+            "blocked services. Do not claim that the check passed."
+        )
+    else:
+        command = verification.get("command", VERIFICATION_COMMAND)
+        outcome = verification.get("outcome", "unavailable")
+        exit_status = verification.get("exit_status")
+        missing = verification.get("missing_binaries", [])
+        blocked = verification.get("blocked_services", [])
+        missing_text = ", ".join(str(name) for name in missing) if missing else "none"
+        blocked_text = ", ".join(str(name) for name in blocked) if blocked else "none"
+        result_suffix = f" (exit status {exit_status})" if exit_status is not None else ""
+        lines.append(f"Verification result: {outcome}{result_suffix}")
+        if outcome == "passed":
+            result_text = (
+                f"At factory startup, in-sandbox verification passed: `{command}` "
+                f"completed with exit status {exit_status}. This records the preflight "
+                "only; run the check again after edits."
+            )
+        elif outcome == "failed":
+            result_text = (
+                f"At factory startup, `{command}` completed with exit status "
+                f"{exit_status}; its outcome is failed. Do not claim that in-sandbox "
+                "verification passed or use this as a successful check."
+            )
+        else:
+            result_text = (
+                f"At factory startup, in-sandbox verification is unavailable: "
+                f"`{command}` could not be completed."
+            )
+        lines.append(
+            f"{result_text} Missing binaries: {missing_text}. Blocked services: {blocked_text}."
+        )
+        if verification.get("report_status") != 201:
+            lines.append(
+                "The verification preflight report was not accepted by the factory "
+                f"status endpoint; observed status was {verification.get('report_status')}. "
+                "Do not present the preflight as recorded work item evidence."
+            )
+        failure_reason = verification.get("failure_reason")
+        if failure_reason:
+            lines.append(f"The observed command failure was: {failure_reason}.")
+        if outcome == "unavailable":
+            lines.append(
+                "State that in-sandbox verification was unavailable and that the "
+                "matching required CI check is pending proof only if that check selects "
+                "all changed paths. You may use publish_changes only after confirming "
+                "that matching required route, and the pull request body must state that "
+                "in-sandbox verification was unavailable and CI is pending proof. If no "
+                "matching required check exists, do not publish and the work item cannot "
+                "succeed."
+            )
+        elif outcome == "failed":
+            lines.append(
+                "Do not use publish_changes while this command fails. Repair the cause "
+                "and rerun the documented command after edits."
+            )
+        else:
+            lines.append(
+                "This pre-edit pass does not verify later changes. Run the documented "
+                "command again after edits before using publish_changes."
+            )
+    lines.append(
+        "Do not claim successful verification until a matching required check for the "
+        "changed paths has actually run and passed. A missing, skipped, unreadable, "
+        "unrelated, or failed check is not success. Do not publish if the preflight "
+        "report was not accepted by the status endpoint."
     )
+    return "\n".join(lines)
 
 
 def _compose_system_prompt(
@@ -201,8 +313,15 @@ def _compose_system_prompt(
     model: str | None,
     workspace_preamble: str | None = None,
     attachment_preamble: str | None = None,
+    progress_preamble: str | None = None,
+    facts_preamble: str | None = None,
+    guidance_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
+
+    Memory leads (#1461, ADR-0167): the legacy ``log`` records, then the
+    remembered agent and channel facts, then the memory guidance, all above the
+    bundle prompt so the bundle's own instructions have the last word.
 
     Conversation history is deliberately absent: ADR-0119 requires it to cross
     the harness boundary as ordered messages, never rendered system text.
@@ -210,6 +329,10 @@ def _compose_system_prompt(
     This turn's inbound attachments (#2567) come last, closest to the query they
     belong to. Absent -- the overwhelming majority of turns -- the composed
     prompt is byte-identical to what it was before the lane existed.
+
+    The deliberate progress block (ADR 0130) is a platform block like the
+    workspace one, present whenever the ``progress`` tool is mounted, and sits
+    ahead of the bundle's own instructions.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -217,7 +340,10 @@ def _compose_system_prompt(
         p
         for p in (
             memory_preamble,
+            facts_preamble,
+            guidance_preamble,
             workspace_preamble,
+            progress_preamble,
             base,
             model_preamble,
             attachment_preamble,
@@ -270,6 +396,9 @@ def build_runner(
     workspace_path: Path | None = None,
     attachments_path: Path | None = None,
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
+    history_capacity_exceeded: bool = False,
+    memory_facts_preamble: str | None = None,
+    memory_guidance: str | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -281,6 +410,10 @@ def build_runner(
     ``harness`` is the resolved contribution manifest (ADR-0060) whose fields
     drive the read-only tool set and bundle compile; it defaults to the built-in
     Claude harness so existing callers are unaffected.
+
+    ``memory_facts_preamble`` is the rendered remembered-facts block and
+    ``memory_guidance`` the operator's stored guidance text (None falls back to
+    ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -309,6 +442,17 @@ def build_runner(
         and (workspace_path / ".git").exists()
         else None
     )
+    verification: dict[str, Any] | None = None
+    if mounted_workspace is not None and not fake_model:
+        verification_url = os.environ.get(PROGRESS_URL_ENV)
+        verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
+        if verification_url and verification_token:
+            verification = anyio.run(
+                preflight_workspace_verification,
+                mounted_workspace,
+                verification_url,
+                verification_token,
+            )
     # Prior memory (#264) still leads the system prompt. Workspace facts are a
     # mounted-only boot block after memory. Conversation history (#20)
     # deliberately does not: ADR-0119 sends its ordered messages through the
@@ -320,12 +464,53 @@ def build_runner(
     # indistinguishable from one that never arrived, and the agent answers "I
     # don't see an attachment" about a message that visibly carries one.
     attachment_paths = _discover_attachments(attachments_path)
+    # The live status card (#3077): a factory execution carries a progress URL
+    # and token, and the bundle declares its phases. A malformed phase file is
+    # logged and mounts no tool; progress never stops a boot.
+    factory_requested = factory_progress_requested(os.environ)
+    try:
+        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
+    except ValueError as exc:
+        logger.warning("report_progress not mounted: %s", exc)
+        progress = None
+    # Deliberate progress (ADR 0130): only a worker-selected human Slack
+    # sandbox mounts the platform tool and prompt. The boot flag is part of the
+    # sandbox identity; per-turn headers still carry the actual authority.
+    turn_progress = (
+        TurnProgress()
+        if should_mount_turn_progress(
+            eligible=turn_progress_enabled(os.environ),
+            factory_progress_requested=factory_requested,
+            factory_progress_resolved=progress is not None,
+        )
+        else None
+    )
+    # The memory tools (#1461, ADR-0167) mount iff the worker set a channel
+    # memory ref (the operator's memory-writes switch as the sandbox sees it)
+    # AND a memory token to write with, and only on the real-model path, which
+    # is the only path that mounts platform MCP servers at all. The toolPolicy
+    # exemption below reads this same flag, so the claim matches the mount.
+    # The guidance block rides with the tools and only with them; the facts
+    # block does not, because reading memory needs no switch.
+    memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
+    if config.channel_memory_ref and channel_facts_store is None:
+        logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
+    if config.channel_memory_ref and memory_token is None:
+        logger.warning("memory tools not mounted: no memory token")
+    memory_tools_mounted = (
+        channel_facts_store is not None and memory_token is not None and not fake_model
+    )
+    memory_turn = MemoryTurn() if memory_tools_mounted else None
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
         model=config.model,
-        workspace_preamble=format_workspace_preamble(mounted_workspace),
+        workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
+        progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+        facts_preamble=memory_facts_preamble,
+        guidance_preamble=(memory_guidance or DEFAULT_GUIDANCE) if memory_tools_mounted else None,
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -349,6 +534,8 @@ def build_runner(
             operator_tools=config.approval_required_tools,
             policy_routes=resolution.route_by_tool,
             grant_tool=config.approval_grant_tool,
+            grant_arguments=config.approval_grant_arguments,
+            resumed_kind=config.approval_resumed_kind,
             grantable_by_route=resolution.grantable_by_route,
             summary_by_tool=resolution.summary_by_tool,
             # Bundle identity so an operator mcp__<server>__<tool> shorthand
@@ -388,12 +575,47 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    progress_activity = ProgressActivity()
+    progress_activity.model = config.model
+    # Per-model token usage for the run's cost line (#3223): reported whenever
+    # the progress URL and token are injected, phases.json or not.
+    progress_url = os.environ.get(PROGRESS_URL_ENV, "").strip()
+    progress_token = os.environ.get(PROGRESS_TOKEN_ENV, "").strip()
+    usage_reporter = (
+        UsageReporter(progress_url.rstrip("/") + USAGE_PATH, progress_token)
+        if progress_url and progress_token
+        else None
+    )
+    # Tell the gate whether the platform's own ``curie-state`` tools exist this
+    # session (#2286 adversarial round). The toolPolicy exemption is by exact
+    # live tool name, and a name the platform never published is not ours -- an
+    # ambient project ``.mcp.json`` can mount a server keyed ``curie-state``,
+    # because ``strict_mcp_config`` is off. Set AFTER construction rather than
+    # passed to ``build_approval_gate`` deliberately: the gate is built above at
+    # the three fail-closed approval boot checks, which must raise before any
+    # other boot work happens, and hoisting ``resolve_state_client`` above them
+    # would reorder the boot to suit a field. Both this flag and the conditional
+    # mount below read the same ``state_client`` local, which nothing rebinds in
+    # between, so the exemption and the mount cannot disagree. The mount keeps
+    # its own ``is not None`` because ``build_state_server`` needs the narrowed
+    # client, not the bool.
+    state_mounted = state_client is not None
+    if approval_gate is not None:
+        approval_gate.state_server_mounted = state_mounted
+        approval_gate.publication_precheck = PublicationPrecheck(
+            mounted_workspace,
+            os.environ.get(BootEnv.env_key("state_url"))
+            or os.environ.get(BootEnv.env_key("progress_url")),
+            network_enabled=not fake_model,
+        )
+        approval_gate.memory_tools_mounted = memory_tools_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        caller_header=config.connector_caller_token is not None,
     )
     # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
     # cannot read the PAT from the process env (#2559). The on-disk catalog
@@ -438,9 +660,7 @@ def build_runner(
             async def reprobe(
                 failures: tuple[ConnectorCapabilityFailure, ...],
             ) -> tuple[ConnectorCapabilityFailure, ...]:
-                return await reprobe_connector_failures(
-                    failures, reprobe_servers, reprobe_env
-                )
+                return await reprobe_connector_failures(failures, reprobe_servers, reprobe_env)
 
             connector_reprobe = reprobe
 
@@ -483,6 +703,28 @@ def build_runner(
                 approval_gate,
                 managed_workspace=mounted_workspace is not None,
                 include_request_approval=carries_request_approval,
+                progress_tool=(
+                    build_progress_tool(progress[1], progress[0], progress_activity)
+                    if progress is not None
+                    else None
+                ),
+                turn_progress_tool=(
+                    build_turn_progress_tool(turn_progress) if turn_progress is not None else None
+                ),
+                memory_tools=(
+                    build_memory_tools(
+                        agent_store=resolve_facts_store(
+                            config.session.memory_ref, os.environ.get(MEMORY_TOKEN_ENV)
+                        ),
+                        channel_store=channel_facts_store,
+                        turn=memory_turn,
+                        session_id=config.session.session_id,
+                    )
+                    if memory_tools_mounted
+                    and channel_facts_store is not None
+                    and memory_turn is not None
+                    else ()
+                ),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -495,6 +737,7 @@ def build_runner(
             curie_session_id=config.session.session_id,
             cwd=workspace_cwd,
             harness_replay=conversation_replay.harness_replay,
+            system_prompt=system_prompt,
         )
         real_options = build_options(
             plugins=compiled.plugins,
@@ -553,6 +796,9 @@ def build_runner(
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
                 disallowed_tools=config.disallowed_tools,
+                # The same holder the SDK tool closes over, so the scripted
+                # progress demo runs the real handler (ADR 0130).
+                turn_progress=turn_progress,
             )
         assert real_options is not None
         nonlocal sdk_generation
@@ -611,14 +857,16 @@ def build_runner(
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
+            progress_activity=progress_activity if progress is not None else None,
+            turn_progress=turn_progress,
+            usage_reporter=usage_reporter,
+            primary_model=config.model,
             connector_failures=connector_failures
-            or (
-                capability.connector_failures
-                if capability is not None
-                else ()
-            ),
+            or (capability.connector_failures if capability is not None else ()),
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
+            history_capacity_exceeded=history_capacity_exceeded,
+            memory_turn=memory_turn,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -650,7 +898,79 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationReplay]:
+async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
+    """Load agent and channel facts and the operator guidance at boot (#1461).
+
+    Returns the rendered facts block and the operator's guidance text. Each read
+    degrades on its own to nothing, like ``_load_memory``: an unreachable store
+    boots the agent without that part of its memory, never not at all.
+    """
+
+    token = os.environ.get(MEMORY_TOKEN_ENV)
+    agent_store = resolve_facts_store(config.session.memory_ref, token)
+    channel_store = resolve_facts_store(config.channel_memory_ref, token)
+    agent_facts: list[Fact] = []
+    channel_facts: list[Fact] = []
+    guidance: str | None = None
+
+    async def read(label: str, call: Callable[[], Awaitable[Any]]) -> Any:
+        try:
+            return await call()
+        except Exception as exc:  # noqa: BLE001 - degrade to nothing, never fail boot
+            logger.warning(
+                "memory %s load failed session=%s error_class=%s: %s",
+                label,
+                config.session.session_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    async def load_agent() -> None:
+        nonlocal agent_facts
+        if agent_store is not None:
+            agent_facts = await read("agent facts", agent_store.list) or []
+
+    async def load_channel() -> None:
+        nonlocal channel_facts
+        if channel_store is not None:
+            channel_facts = await read("channel facts", channel_store.list) or []
+
+    async def load_guidance() -> None:
+        nonlocal guidance
+        if agent_store is not None and channel_store is not None:
+            guidance = await read("guidance", agent_store.guidance)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_agent)
+        tg.start_soon(load_channel)
+        tg.start_soon(load_guidance)
+    # Counts and the guidance source only: never statements, authors or the
+    # guidance text. Counts are what the prompt shows, after the per-memory cap.
+    # "none" mirrors build_runner's mount rule as far as boot can see it (a
+    # channel store and a memory token).
+    if channel_store is None or not token:
+        guidance_source = "none"
+    else:
+        guidance_source = "operator" if guidance is not None else "default"
+    logger.info(
+        "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
+        config.session.session_id,
+        min(len(agent_facts), MAX_FACTS_PER_MEMORY),
+        min(len(channel_facts), MAX_FACTS_PER_MEMORY),
+        guidance_source,
+    )
+    return format_facts_preamble(agent_facts, channel_facts), guidance
+
+
+# Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
+# boot loaded, retried on a concurrent write with a fresh load.
+_BOOT_COMPACTION_PASSES = 3
+
+
+async def _load_history(
+    config: RunnerConfig,
+) -> tuple[TranscriptStore, ConversationReplay, bool]:
     """Resolve, compact when needed, and load the structured replay prefix.
 
     A configured history ref is continuity-critical. Failure is fatal: silently
@@ -661,6 +981,17 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
     defaults. They arrive through the declared boot env (parsed defensively, so
     a typo degrades to the default rather than failing boot), which is why the
     defaults are applied here rather than read off the process env at this call.
+
+    When the boot summary append is refused at the transcript cap (or its
+    headroom reserve), boot compacts the stored value it loaded with a
+    compare-and-set rewrite, then reloads and rebuilds the replay from what is
+    stored (#2927). A write since that load conflicts, and the next pass reloads
+    instead of writing a stale view over it; there are at most three passes.
+
+    A compaction that still cannot fit (or three passes that never settle) is
+    the one exception to fatal (#2820): no cold sandbox can fix that thread, so
+    the runner still boots and the returned flag makes it refuse every turn with
+    the append path's non-retryable capacity event instead of dying unserved.
     """
 
     store = resolve_history(config.history_ref, os.environ)
@@ -674,29 +1005,76 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
         if config.history_max_bytes is not None
         else DEFAULT_REPLAY_MAX_BYTES
     )
+    capacity_exceeded = False
+    compacted = False
     try:
         records = await store.load()
         replay, summary = build_conversation_replay(
             records, max_turns=max_turns, max_bytes=max_bytes
         )
-        if summary is not None:
-            await store.append(summary)
+        passes = 0
+        while summary is not None:
+            try:
+                await store.append(summary)
+                compacted = True
+                break
+            except HistoryCapacityError as exc:
+                if passes == _BOOT_COMPACTION_PASSES:
+                    logger.error(
+                        "history capacity exceeded at boot session=%s status=%d "
+                        "passes=%d (refusing turns)",
+                        config.session.session_id,
+                        exc.status,
+                        passes,
+                    )
+                    capacity_exceeded = True
+                    break
+            passes += 1
+            try:
+                await store.compact()
+                compacted = True
+            except HistoryConflictError:
+                logger.warning(
+                    "history compaction conflicted at boot session=%s pass=%d (reloading)",
+                    config.session.session_id,
+                    passes,
+                )
+            except HistoryCapacityError as exc:
+                logger.error(
+                    "history capacity exceeded at boot session=%s status=%d (refusing turns)",
+                    config.session.session_id,
+                    exc.status,
+                )
+                capacity_exceeded = True
+                break
+            records = await store.load()
+            replay, summary = build_conversation_replay(
+                records, max_turns=max_turns, max_bytes=max_bytes
+            )
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
-        logger.error(
-            "history load failed session=%s error_class=%s: %s",
-            config.session.session_id,
-            type(exc).__name__,
-            exc,
-        )
-        raise HistoryError("configured structured history could not be loaded") from exc
+        status = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], int) else None
+        if status is None:
+            logger.error(
+                "history load failed session=%s error_class=%s",
+                config.session.session_id,
+                type(exc).__name__,
+            )
+        else:
+            logger.error(
+                "history load failed session=%s error_class=%s status=%d",
+                config.session.session_id,
+                type(exc).__name__,
+                status,
+            )
+        raise HistoryError("configured structured history could not be loaded") from None
     logger.info(
         "history loaded session=%s records=%d messages=%d compacted=%s",
         config.session.session_id,
         len(records),
         len(replay.messages),
-        summary is not None,
+        compacted and not capacity_exceeded,
     )
-    return store, replay
+    return store, replay, capacity_exceeded
 
 
 @dataclass(frozen=True)
@@ -709,6 +1087,11 @@ class _BootFetches:
     conversation_replay: ConversationReplay
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
+    history_capacity_exceeded: bool = False
+    # Remembered facts and operator guidance (#1461); field names match the
+    # build_runner parameters they feed.
+    memory_facts_preamble: str | None = None
+    memory_guidance: str | None = None
 
 
 async def _load_boot_fetches(
@@ -722,18 +1105,18 @@ async def _load_boot_fetches(
     resolve_history(config.history_ref, os.environ)
 
     memory: tuple[MemoryStore, str | None] | None = None
-    history: tuple[TranscriptStore, ConversationReplay] | None = None
+    history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
+    facts: tuple[str | None, str | None] = (None, None)
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        caller_header=config.connector_caller_token is not None,
     )
     expansion_failures = (
-        diagnose_derived_connector_headers(
-            derived, {**os.environ, **dict(sdk_env or {})}
-        )
+        diagnose_derived_connector_headers(derived, {**os.environ, **dict(sdk_env or {})})
         if fake_model
         else ()
     )
@@ -746,6 +1129,10 @@ async def _load_boot_fetches(
         nonlocal history
         history = await _load_history(config)
 
+    async def load_facts() -> None:
+        nonlocal facts
+        facts = await _load_memory_facts(config)
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -757,6 +1144,7 @@ async def _load_boot_fetches(
     async with anyio.create_task_group() as tg:
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
+        tg.start_soon(load_facts)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -772,6 +1160,9 @@ async def _load_boot_fetches(
         conversation_replay=history[1],
         mcp_capability=capability,
         connector_failures=connector_failures,
+        history_capacity_exceeded=history[2],
+        memory_facts_preamble=facts[0],
+        memory_guidance=facts[1],
     )
 
 
@@ -839,7 +1230,11 @@ def _serve() -> None:
         workspace_path=workspace_path,
         attachments_path=attachments_path,
         connector_failures=fetches.connector_failures,
+        history_capacity_exceeded=fetches.history_capacity_exceeded,
+        memory_facts_preamble=fetches.memory_facts_preamble,
+        memory_guidance=fetches.memory_guidance,
     )
+
     def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is
         # the repository fact. The proposal is runner-held state from the

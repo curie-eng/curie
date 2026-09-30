@@ -1,0 +1,33 @@
+{
+  "comment": "The connector caller token wire (ADR-0168 decision 7). The worker mints one per sandbox boot (apps/worker/src/curie_worker/caller_token.py) and the runner presents it to each hosted connector in the X-Curie-Caller header. A verifier holds only the public half, so what it checks must be exactly what the worker signs, and this file freezes that. The token is `cct.<payload>.<signature>`: payload is the base64url, unpadded, of the compact JSON object {agent, exp} with sorted keys and ASCII escapes; signature is the base64url, unpadded, of the 64-byte Ed25519 signature over the ASCII bytes of `cct.<payload>`. `agent` is the stored agent name, verbatim. `exp` is absolute unix seconds. Each vector carries `seed` (standard base64 of the 32-byte Ed25519 seed the chart's Secret holds), `public` (standard base64 of its 32-byte public key), the claims, and `minted`. Ed25519 signing is deterministic, so a minter must reproduce `minted` byte for byte. Read by apps/worker/tests/test_connector_caller_token.py, which rejects an unknown key so a key added for one reader cannot pass vacuously.",
+  "prefix": "cct",
+  "vectors": [
+    {
+      "name": "a_plain_agent_name",
+      "why": "The common case: a deploy.yaml-shaped agent name and a far expiry.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "agent": "acme-dev",
+      "exp": 1790000000,
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwfQ.8ks6uoMW7jnu0d4jBXc01ZELdx0dS57EodIPOCvUsL8vQO3A1eJd1fXJ_TLJTc-I9pd37bawfwTkmm923KkrDQ"
+    },
+    {
+      "name": "the_same_claims_under_another_seed",
+      "why": "The payload is identical and only the signature moves, so a verifier that checked the payload and skipped the signature would accept both.",
+      "seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "public": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+      "agent": "acme-dev",
+      "exp": 1790000000,
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwfQ.teUNDdQXEDLtbAut3QmdwhPoK8Q23Eds9F2sri57rLKmonkTtJH1FQXeHLtlWYPkClFsak4PNwKFS8vGzBscAQ"
+    },
+    {
+      "name": "a_stored_name_outside_the_bundle_shape_is_carried_verbatim",
+      "why": "The API stores agent names wider than deploy.yaml accepts. The claim carries the stored name as it is, and the JSON escapes pin one encoding of it.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "agent": "Acme Café",
+      "exp": 1790000000,
+      "minted": "cct.eyJhZ2VudCI6IkFjbWUgQ2FmXHUwMGU5IiwiZXhwIjoxNzkwMDAwMDAwfQ.199INA_vpUCEox4gfZt2cwG0r_sTxQjrNl0v4HALgpJHTFlX2DjnAks8ojQ-khUAqU9V244TbBIUrxzbIhLdDg"
+    }
+  ]
+}

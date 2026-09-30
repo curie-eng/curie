@@ -49,8 +49,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- if or (not .Values.priorityClasses.platform.create) (not .Release.IsUpgrade) }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
+      {{- end }}
       {{- end }}
       {{- with .Values.api.imagePullSecrets }}
       imagePullSecrets:
@@ -115,8 +117,13 @@ spec:
                   # is already at its own head; upgrade head is a no-op.
                   exec alembic -c alembic.ini upgrade head
                 fi
+                # Name the probe's error class while waiting, not only at exit:
+                # a restarted container's logs are gone, and "too many clients"
+                # must read differently from "store is down" (#2865).
                 if [ "$attempt" -eq 1 ]; then
-                  echo "Waiting for Postgres readiness"
+                  echo "Waiting for Postgres readiness; probe error class: $probe_error_class"
+                elif [ $((attempt % 10)) -eq 0 ] && [ "$attempt" -lt "$max_attempts" ]; then
+                  echo "Still waiting for Postgres readiness after $attempt of $max_attempts attempts; probe error class: $probe_error_class"
                 fi
                 if [ "$attempt" -lt "$max_attempts" ]; then
                   sleep 2
@@ -129,6 +136,42 @@ spec:
             {{- include "curie.env.postgres" . | nindent 12 }}
             - name: CURIE_SCHEMA_FORWARD_ONLY
               value: {{ .Values.api.migrate.forwardOnly | default false | quote }}
+            {{- /*
+            The identity fence's bound. The worker is already drained at hook
+            weight -10, so the only remaining contenders are ordinary API
+            requests with sub-second budgets; 15 s outlasts one, and three
+            backoffLimit retries of a wedged fence cost 45 s against this Job's
+            activeDeadlineSeconds of 600.
+            */}}
+            - name: CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS
+              value: {{ .Values.api.migrate.fenceLockTimeoutMs | default 15000 | quote }}
+            {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+            {{- /*
+            Optional, and a FILE rather than a value, on purpose: `helm get
+            values` would retain an inline declaration in the release forever
+            and re-apply it to every future upgrade, whereas an operator-created
+            Secret can be deleted after the upgrade, which makes the grant
+            single-use by construction. An install that has never been blocked
+            sets nothing here and renders neither the volume nor this env.
+            */}}
+            - name: CURIE_APPROVAL_PROVENANCE_DECLARATIONS
+              value: /etc/curie/provenance/declarations.json
+            {{- end }}
+          {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+          volumeMounts:
+            - name: provenance-declarations
+              mountPath: /etc/curie/provenance
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+      volumes:
+        - name: provenance-declarations
+          secret:
+            secretName: {{ . | quote }}
+            items:
+              - key: declarations.json
+                path: declarations.json
+      {{- end }}
 {{- end }}

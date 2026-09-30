@@ -1,20 +1,11 @@
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::Command;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
-}
-
-fn write_exec(root: &Path, name: &str, body: &str) {
-    let path = root.join(name);
-    fs::write(&path, body).expect("write executable");
-    let mut permissions = fs::metadata(&path)
-        .expect("executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make executable");
 }
 
 #[test]
@@ -22,7 +13,7 @@ fn local_up_without_credentials_warns_about_fake_model() {
     let temp = tempfile::tempdir().expect("create temporary directory");
     let tools = temp.path().join("tools");
     fs::create_dir(&tools).expect("create tools directory");
-    write_exec(&tools, "docker", "#!/bin/sh\nexit 0\n");
+    test_executable::install_in(&tools, "docker", "#!/bin/sh\nexit 0\n");
 
     let compose_file = temp.path().join("compose.yaml");
     fs::write(&compose_file, "services: {}\n").expect("write compose file");

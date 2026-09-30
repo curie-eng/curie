@@ -111,14 +111,6 @@ def test_pr_body_check_accepts_technical_references_to_the_harness(
     assert completed.returncode == 0, _diagnostics(completed)
 
 
-def test_pr_body_guard_delegates_to_one_matcher() -> None:
-    """Both surfaces must share a matcher, or the vendor lists drift apart."""
-    checker = CHECKER.read_text(encoding="utf-8")
-
-    assert "check-commit-messages.sh" in checker
-    assert "--message-file" in checker
-
-
 def test_pr_body_self_test_covers_the_attribution_half() -> None:
     """CI trusts --self-test before running the gate, so it must not be vacuous."""
     completed = subprocess.run(

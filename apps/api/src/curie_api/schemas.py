@@ -8,6 +8,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -17,10 +18,14 @@ from urllib.parse import urlsplit
 # ``ApprovalCreate``; ``EvalReport`` kept its name.
 from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
+from aci_protocol import PublicationContext as PublicationContext
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
+from plugin_format.connectors import ADMITS_SELF
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -30,10 +35,19 @@ from pydantic import (
     model_validator,
 )
 
+from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
-from .models import GIT_FLOW_CREATED_BY, Environment
+from .identities import refuse_undeclared
+from .models import (
+    GIT_FLOW_CREATED_BY,
+    MAX_EXECUTION_DEADLINE_SECONDS,
+    MIN_EXECUTION_DEADLINE_SECONDS,
+    Environment,
+)
+from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
+from .runner_resources import RunnerResourcesError, validate_runner_resources
 from .source_binding import (
     validate_revision,
     validate_source_binding_keys,
@@ -47,6 +61,8 @@ from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_nam
 # also rejects bare names ("general"), pasted URLs, and lowercase IDs -- none of
 # which the worker can route on.
 _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
+# Public alias for the approval plane, which must recognize the shape too.
+SLACK_CHANNEL_ID = _SLACK_CHANNEL_ID
 # Slack user-group (subteam) IDs start with S; user IDs start with U, or W for
 # enterprise-grid users. Same allowlist discipline and same reason as channels:
 # a @handle or a bare name never resolves, and the S/C prefix is the whole
@@ -153,6 +169,13 @@ _validate_thinking_override = _nullable_override_validator(
 _validate_model_override = _nullable_override_validator(
     "model", "a model id like 'claude-sonnet-5' or 'kimi-k2'"
 )
+
+
+def _validate_runner_resources(value: Any) -> Any:
+    try:
+        return validate_runner_resources(value)
+    except RunnerResourcesError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _slack_shape_error(value: str) -> str:
@@ -286,6 +309,132 @@ def _validate_channel_endpoint(endpoint: str) -> str:
             "the worker attach its configured credential."
         )
     return endpoint
+
+
+# The caller list a binding may carry (ADR 0175 decision 1). Exact ids only: no
+# wildcards, domains or patterns, because a pattern is a rule an operator has to
+# reason about and an id is a fact they can check.
+MAX_ALLOWED_CALLERS = 100
+# The kind whose caller ids are email addresses, compared lowercase because the
+# mail adapter sends the sender that way (`_bare_address` lowercases it).
+EMAIL_KIND = "email"
+# A Slack caller is a user (U), an enterprise-grid user (W) or a bot (B). Same
+# allowlist discipline as `_SLACK_USER_ID`, widened by exactly the bot prefix:
+# the dispatcher asks with the bot id when a bot sent the message.
+_SLACK_CALLER_ID = re.compile(r"^[UWB][A-Z0-9]{7,}$")
+# One bare address: exactly one `@`, something on each side, and none of the
+# characters that would make it a display-name form, a list or a wildcard. `*`
+# is legal in a mailbox name but refused here: `*@example.com` is how an
+# operator spells "the whole domain", and an exact match would silently read it
+# as one mailbox literally named `*`.
+_EMAIL_CALLER = re.compile(r'^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$')
+# Longer than any real address (RFC 5321 caps a path at 256 octets) or provider
+# id, so a longer entry is a paste error rather than a caller.
+_CALLER_MAX_CHARS = 256
+
+
+def normalize_caller_id(kind: str, caller: str) -> str:
+    """The form a caller id is stored and compared in, for this binding kind.
+
+    Email ids are lowercased, exactly as the mail adapter sends a sender; every
+    other kind's ids are compared as sent, because Slack ids are uppercase by
+    construction and an unknown kind's ids are opaque.
+
+    Args:
+        kind: the binding's channel kind.
+        caller: one caller id, as sent or as stored.
+
+    Returns:
+        The id in its comparison form.
+    """
+
+    return caller.lower() if kind == EMAIL_KIND else caller
+
+
+def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] | None:
+    """Check a binding's caller list against its kind and return the stored form.
+
+    The authoritative gate for every caller of the list's endpoint (CLI, API,
+    console): None means everyone and passes through; an empty list is refused
+    because one operator reads it as "no limit" and the next as "nobody"; every
+    entry must be an exact id of the binding's kind. Duplicates are dropped
+    (after normalizing, so two spellings of one address count once) and the
+    order of first appearance is kept, so a read shows the list as written.
+
+    Args:
+        kind: the binding's channel kind, which chooses the id shape.
+        callers: the list as sent, or None.
+
+    Returns:
+        None, or the deduplicated, normalized list.
+
+    Raises:
+        ValueError: the list is empty, too long, or holds an id the kind rejects.
+    """
+
+    if callers is None:
+        return None
+    if not callers:
+        raise ValueError(
+            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
+            "to one operator and \"no limit\" to the next. Send null to let "
+            "everyone talk to the bot through this binding, or list at least one "
+            "caller id."
+        )
+    stored: list[str] = []
+    for caller in callers:
+        if len(caller) > _CALLER_MAX_CHARS:
+            raise ValueError(
+                f"caller id is longer than {_CALLER_MAX_CHARS} characters, which "
+                "no real id is; the value is not echoed here."
+            )
+        if kind == SLACK_KIND:
+            if not _SLACK_CALLER_ID.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not a Slack user or bot id: a Slack "
+                    "binding's callers are exact ids starting with U, W or B "
+                    "(e.g. U0123ABCD), never a @handle, a display name or an "
+                    "email. Find a person's id in their profile, under "
+                    "\"Copy member ID\"."
+                )
+        elif kind == EMAIL_KIND:
+            if not _EMAIL_CALLER.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not one bare email address: an email "
+                    "binding's callers are exact addresses like "
+                    "person@example.com, with no display name, no angle "
+                    "brackets and no domain-only or wildcard entries."
+                )
+        elif not caller or _ADDRESS_WHITESPACE.search(caller):
+            raise ValueError(
+                f"caller {caller!r} is not a caller id: it must be non-empty and "
+                "contain no whitespace, because it is matched exactly against "
+                "the id the channel reports for the sender."
+            )
+        normalized = normalize_caller_id(kind, caller)
+        if normalized not in stored:
+            stored.append(normalized)
+    if len(stored) > MAX_ALLOWED_CALLERS:
+        raise ValueError(
+            f"allowed_callers holds {len(stored)} distinct ids; the limit is "
+            f"{MAX_ALLOWED_CALLERS} per binding."
+        )
+    return stored
+
+
+class ChannelCallersWrite(BaseModel):
+    """The body of `PUT /agents/{agent_id}/channels/callers` (ADR 0175).
+
+    `allowed_callers` is REQUIRED, with null as an explicit value: a body that
+    omits it is a 422 rather than a silent "clear", so removing a binding's
+    protection is always something the caller wrote down. The kind-specific
+    checks run in the handler, since the kind comes from the selected binding
+    rather than from this body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_callers: list[str] | None
 
 
 class AppConfig(BaseModel):
@@ -438,7 +587,16 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
 
 
 def _validate_agent_name(value: str) -> str:
-    """Reject an agent name that would forge the connector object-name join.
+    """Reject an agent name that forges the connector join, or is the sentinel.
+
+    Two independent refusals share this validator:
+
+    ``self`` is reserved (ADR-0168 decision 7): ``admits`` uses it to mean the
+    agent a bundle is deployed as, and ``deploy.yaml``'s ``target.agent``
+    (``deploy.bad_agent_name``) and the CLI's per-agent secret binding already
+    refuse a target genuinely named that, since it would be indistinguishable
+    from the sentinel. ``POST /agents`` was the remaining hole, closed here the
+    same way #1446 closed the ``-mcp-`` join below.
 
     A connector's Kubernetes objects are named
     ``{release}-{agent}-mcp-{connector}``
@@ -447,12 +605,12 @@ def _validate_agent_name(value: str) -> str:
     join point is not recoverable from the rendered string: agent ``a-mcp-b``
     with connector ``c`` and agent ``a`` with connector ``b-mcp-c`` render
     byte-identical objects AND the identical ``app.kubernetes.io/name`` pod
-    selector. The connector is deliberately unauthenticated (ADR-0086 -- the
-    sandbox holds no credential to authenticate WITH, so the network is the
-    whole of the access control), which makes that name the only thing binding
-    a sandbox to a credential: one agent's sandbox reaches another agent's
-    connector holding another agent's production token, and nothing errors
-    anywhere (#1446).
+    selector. That selector is what the connector's Service and both
+    NetworkPolicies bind to, and the Deployment it names carries the caller
+    proxy's admits list (ADR-0086, ADR-0168 decision 7), which makes that name
+    what binds a sandbox to a credential: one agent's sandbox reaches another
+    agent's connector holding another agent's production token, and nothing
+    errors anywhere (#1446).
 
     ``connectors.yaml`` names and ``deploy.yaml``'s ``target.agent`` are both
     gated by bundle validation. ``POST /agents`` is the hole -- the stored
@@ -478,6 +636,13 @@ def _validate_agent_name(value: str) -> str:
     exists to protect.
     """
 
+    if value == ADMITS_SELF:
+        raise ValueError(
+            f"agent name {value!r} is reserved: `admits` (ADR-0168 decision 7) "
+            "uses it to mean the agent a bundle is deployed as, so a target "
+            "genuinely named `self` would be indistinguishable from that "
+            "sentinel. Pick a different name."
+        )
     if agent_forges_join(value):
         raise ValueError(
             f"agent name {value!r} collides with the connector object-name "
@@ -774,6 +939,32 @@ def _reject_retired_update_binding_key(data: Any) -> Any:
     return data
 
 
+def _reject_null_publication_switches(data: Any) -> Any:
+    """Policy and draft are not nullable. Prefix null clears the prefix."""
+
+    if not isinstance(data, dict):
+        return data
+    if "publication_policy" in data and data["publication_policy"] is None:
+        raise ValueError("publication_policy must be approve or auto")
+    if "publication_draft" in data and data["publication_draft"] is None:
+        raise ValueError("publication_draft must be true or false")
+    return data
+
+
+def _validate_publication_policy_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in (POLICY_APPROVE, POLICY_AUTO):
+        raise ValueError("publication_policy must be approve or auto")
+    return value
+
+
+def _validate_publication_branch_prefix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return validate_branch_prefix(value)
+
+
 class ChannelBinding(BaseModel):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
@@ -828,43 +1019,63 @@ class ChannelBindingOut(BaseModel):
     stored. Showing the bad address is also the more useful outcome: an operator
     cannot fix a value the API refuses to tell them.
 
-    The shape stays `{kind, address}`, identical to what `ChannelBinding`
-    serialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring
-    already describes that as the read contract.
+    The read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):
+    `adapter` is part of the route's identity, not a credential, so it belongs
+    on the read side; `endpoint` stays write-only, unchanged from before.
+    `ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.
+
+    `allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the
+    exact ids that may start a turn through this binding. It is written only by
+    `PUT /agents/{agent_id}/channels/callers`, never by a binding write.
     """
 
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 
     kind: str
     address: str
+    adapter: str | None = None
+    allowed_callers: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _present_route_identity(self) -> "ChannelBindingOut":
+        # Migration 0070 names every Slack row's identity, but a stored
+        # approval notification target keeps the default implicit
+        # (`ApprovalNotificationTarget`), and `ApprovalTargetOut` reads it
+        # through this class. `route_identity` is the one place every reader
+        # compares that identity, so the presentation happens here rather than
+        # on the raw column, and a non-Slack row with no adapter stays
+        # untouched.
+        self.__dict__["adapter"] = route_identity(self.kind, self.adapter)
+        return self
 
 
 class ChannelBindingWrite(ChannelBinding):
     """The WRITE side of a binding: the public pair plus its reply ROUTE.
 
-    A separate model from `ChannelBinding` because that one doubles as the
-    element type of `AgentOut.channels` in RESPONSES, and the read contract is
-    exactly
-    `{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and
-    `adapter` are server-controlled facts an operator configures at bind time --
-    where this kind's replies go back through, and which egress credential
-    authenticates them -- so they are durable on the row and ABSENT from every
-    read. A write-side policy on the shared model would 422 valid reads and
+    A separate model from `ChannelBinding` because `ChannelBindingOut`, not this
+    one, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase
+    2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168
+    decision 3). `endpoint` is a server-controlled fact an operator configures
+    at bind time -- where this kind's replies go back through -- so it is
+    durable on the row and ABSENT from every read; `adapter` is now part of the
+    route's identity rather than only a credential, so it is present on both
+    sides. A write-side policy on the shared model would 422 valid reads and
     leak a write rule into a read contract.
 
-    Three rules, stated here because this is the write path every caller (UI,
-    API, CLI) passes through; `agent_channels_route_pair_ck` states the first of
-    them at the database for out-of-band writers:
+    The rules, stated here because this is the write path every caller (UI,
+    API, CLI) passes through; `agent_channels_route_ck` states the first two
+    at the database for out-of-band writers:
 
-    - **Both or neither.** A half-configured route is an operator error that
-      would otherwise surface as a fail-closed escalation mid-turn, in the
-      worker, far from the request that caused it.
-    - **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,
-      migration 0024 backfills every existing row to exactly that, and the
-      cutover binds the agent first and PATCHes the route in later. The gate for
-      an unroutable binding is `POST /channels/token`, which refuses (409) to
-      mint for a non-`slack` binding with no route -- `slack`'s route is
-      legitimately implicit (the worker's configured Slack origin).
+    - **A Slack route names its identity**, `default` when omitted, and has no
+      endpoint (ADR-0168 decision 3): its replies go through the worker's
+      configured Slack origin, so an endpoint is refused by field name.
+    - **Any other kind is both or neither.** A half-configured route is an
+      operator error that would otherwise surface as a fail-closed escalation
+      mid-turn, in the worker, far from the request that caused it.
+    - **Both absent is legal** for a non-Slack kind: the cutover binds the
+      agent first and PATCHes the route in later. The gate for an unroutable
+      binding is `POST /channels/token`, which refuses (409) to mint for a
+      non-`slack` binding with no route.
     - **`adapter` is a lowercase slug**, on the same pattern as `kind`, because
       it is a CONFIG-MAP KEY on the worker
       (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a
@@ -889,7 +1100,35 @@ class ChannelBindingWrite(ChannelBinding):
 
     @model_validator(mode="after")
     def _check_route(self) -> "ChannelBindingWrite":
-        if (self.endpoint is None) != (self.adapter is None):
+        # The reserved-relay literal is refused before anything else reads it,
+        # so it never gets the chance to read as an undeclared IDENTITY on a
+        # Slack route below: "reserved" is the more specific, more actionable
+        # answer, and an operator binding can never legitimately carry this
+        # value under either reading.
+        if self.adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+            raise ValueError(
+                f"channel adapter {BUILTIN_CLUSTER_MESSAGE_ADAPTER!r} is reserved "
+                "for the platform's built-in disconnected-message relay and "
+                "cannot be configured on an operator binding."
+            )
+
+        if self.kind == SLACK_KIND:
+            if self.endpoint is not None:
+                # ADR-0168 decision 3: the custom-transport form is retired.
+                raise ValueError(
+                    "a Slack route takes no endpoint: its replies go through the "
+                    "worker's configured Slack origin, and adapter names the bot "
+                    "identity. Remove endpoint."
+                )
+            # Checked against the RESOLVED identity: an omitted adapter means
+            # the default app (`route_identity`), and that is what is stored.
+            identity = route_identity(self.kind, self.adapter)
+            refuse_undeclared(self.kind, identity)
+            # `__dict__`, not setattr: pydantic's `__setattr__` would mark an
+            # omitted adapter as SENT, and a PATCH reads `model_fields_set` to
+            # decide whether a route was touched at all.
+            self.__dict__["adapter"] = identity
+        elif (self.endpoint is None) != (self.adapter is None):
             missing = "adapter" if self.endpoint is not None else "endpoint"
             present = "endpoint" if missing == "adapter" else "adapter"
             raise ValueError(
@@ -899,18 +1138,13 @@ class ChannelBindingWrite(ChannelBinding):
                 f"it (adapter) -- so set {missing} too, or send neither and "
                 "configure the route later."
             )
+
         if self.adapter is not None and not _CHANNEL_KIND.match(self.adapter):
             raise ValueError(
                 f"channel adapter {self.adapter!r} is not an adapter name: an "
                 "adapter names the egress identity whose credential authenticates "
                 "the reply and is used as a config key by the worker, so it must "
                 "be a lowercase slug (e.g. 'agentmail-sandbox', 'ms-teams')."
-            )
-        if self.adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
-            raise ValueError(
-                f"channel adapter {BUILTIN_CLUSTER_MESSAGE_ADAPTER!r} is reserved "
-                "for the platform's built-in disconnected-message relay and "
-                "cannot be configured on an operator binding."
             )
         if self.endpoint is not None:
             _validate_channel_endpoint(self.endpoint)
@@ -948,6 +1182,9 @@ class ChannelBindingPatch(ChannelBindingWrite):
     def _check_route_presence(self) -> "ChannelBindingPatch":
         endpoint_sent = "endpoint" in self.model_fields_set
         adapter_sent = "adapter" in self.model_fields_set
+        if self.kind == SLACK_KIND and adapter_sent and not endpoint_sent:
+            # A Slack route is its identity alone (ADR-0168 decision 3).
+            return self
         if endpoint_sent != adapter_sent:
             missing = "adapter" if endpoint_sent else "endpoint"
             raise ValueError(
@@ -958,25 +1195,57 @@ class ChannelBindingPatch(ChannelBindingWrite):
 
 
 class ApprovalResolutionTarget(ChannelBinding):
-    """The one target permitted to carry an approval-resolving affordance.
+    """A fixed channel for a route's approval card.
 
     ``kind`` is an explicit extension point, but it is intentionally Slack-only
     until a second adapter can present the scoped verified identity ADR-0096
     requires. Merely teaching an adapter to render buttons cannot widen this
-    authority boundary.
+    authority boundary. A card reaches any other channel only through
+    ``ApprovalRequestingSurfaceTarget``, and only in the conversation that
+    asked (ADR-0177).
     """
 
     kind: Literal["slack"]
 
 
+REQUESTING_SURFACE_MODE = "requesting_surface"
+
+
+class ApprovalRequestingSurfaceTarget(BaseModel):
+    """Show the card in the conversation that asked, on any channel (ADR-0177).
+
+    The other form of a route's ``resolution``: instead of a fixed Slack
+    channel, the card goes where the request was asked, exactly as a routeless
+    approval's card already does. Who may answer then follows the channel the
+    card lands on: Slack keeps its approver sets, and any other channel admits
+    the requester alone (``approvers.RequesterOnly``).
+
+    Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
+    ``address`` beside it is a mix of the two forms, which the ADR refuses
+    rather than guessing which half the operator meant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["requesting_surface"]
+
+
 class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
     """A visibility-only approval ping target and its server-side transport.
 
-    Slack may use the worker's configured default transport. Every other kind
-    needs the full endpoint/adapter pair at write time, so a declared
-    notification cannot persist as a permanently undeliverable best-effort
-    branch.
+    A Slack target names no transport, and may name its identity in
+    `adapter`. Every other kind needs the full endpoint/adapter pair at write
+    time, so a declared notification cannot persist as a permanently
+    undeliverable best-effort branch.
     """
+
+    @model_validator(mode="after")
+    def _default_identity_stays_implicit(self) -> "ApprovalNotificationTarget":
+        # A stored JSON document, not a route row: keep the default implicit so
+        # stored routes and every comparison of them are unchanged.
+        if self.kind == SLACK_KIND and self.adapter == DEFAULT_IDENTITY:
+            self.__dict__["adapter"] = None
+        return self
 
     @model_validator(mode="after")
     def _require_non_slack_transport(self) -> "ApprovalNotificationTarget":
@@ -992,7 +1261,8 @@ class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
 class ApprovalRouteBinding(_StoredWithoutNulls):
     """One strict workspace binding for a declared approval route (#1460).
 
-    ``resolution`` is the single verified-identity action surface.
+    ``resolution`` is the single verified-identity action surface: a fixed
+    Slack channel, or the conversation that asked (ADR-0177).
     ``notification`` may make the pending request visible elsewhere, but its
     message carries no interaction. ``approvers`` continues to narrow WHO may
     act through the resolution card path and is never inferred from notification
@@ -1001,12 +1271,21 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     model_config = ConfigDict(extra="forbid")
 
-    resolution: ApprovalResolutionTarget
+    resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
 
     @model_validator(mode="after")
     def _targets_must_differ(self) -> "ApprovalRouteBinding":
+        if isinstance(self.resolution, ApprovalRequestingSurfaceTarget):
+            if self.notification is not None:
+                # ADR-0177 decision 1: the card already joins the thread that
+                # asked, so there is nobody further to notify.
+                raise ValueError(
+                    "a requesting_surface resolution cannot carry a notification: "
+                    "the card is already shown in the conversation that asked"
+                )
+            return self
         if self.notification is not None and (
             self.resolution.kind,
             self.resolution.address,
@@ -1027,8 +1306,22 @@ class ApprovalTargetOut(ChannelBindingOut):
     """
 
     # Stored bindings contain endpoint/adapter. Accept and discard those
-    # server-controlled fields so AgentOut never discloses them.
+    # server-controlled fields so AgentOut never discloses them. `endpoint` is
+    # not a declared field at all, so `extra="ignore"` drops it; `adapter` IS
+    # declared, inherited from `ChannelBindingOut` (ADR-0168 decision 3), but
+    # a notification/resolution target's `adapter` is TRANSPORT (which egress
+    # credential authenticates it), not a route identity -- decision 3 only
+    # widens the read shape for an agent's own channel bindings, whose
+    # `adapter` names the Slack app -- so it is excluded from serialization
+    # here to keep this read shape exactly as it always was.
     model_config = ConfigDict(extra="ignore")
+
+    adapter: str | None = Field(default=None, exclude=True)
+    # A binding's caller list (ADR 0175), inherited from `ChannelBindingOut`,
+    # has no meaning on an approval target, which is where a card is posted,
+    # not a place a caller starts a turn; excluded for the same reason as
+    # `adapter` above, so this read shape stays exactly as it was.
+    allowed_callers: list[str] | None = Field(default=None, exclude=True)
 
 
 class ApprovalApproversOut(BaseModel):
@@ -1040,12 +1333,24 @@ class ApprovalApproversOut(BaseModel):
     users: list[str] | None = None
 
 
+class ApprovalRequestingSurfaceTargetOut(BaseModel):
+    """Read projection of ``ApprovalRequestingSurfaceTarget`` (ADR-0177).
+
+    Tolerant like every read shape here, so a hand-edited row still reads back
+    for repair instead of failing the whole agent response.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str
+
+
 class ApprovalRouteBindingOut(BaseModel):
     """The required resolution plus optional, redacted visibility policy."""
 
     model_config = ConfigDict(extra="ignore")
 
-    resolution: ApprovalTargetOut
+    resolution: ApprovalTargetOut | ApprovalRequestingSurfaceTargetOut
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
 
@@ -1057,9 +1362,10 @@ class AgentCreate(BaseModel):
     # cannot receive a turn -- it would look deployed and healthy while
     # answering nothing, which is #38's silent-shadow failure.
     #
-    # The WRITE model: a create may also configure the reply route (ADR-0096
-    # phase 2). `AgentOut.channels` stays a list of read-only `{kind, address}`
-    # pairs. Additional bindings are added through the subresource, never here.
+    # The WRITE model: a create may also configure the reply route
+    # (ADR-0096 phase 2). `AgentOut.channels` stays a list of read-only
+    # `{kind, address, adapter}` routes. Additional bindings are added through
+    # the subresource, never here.
     channel: ChannelBindingWrite
     repo_full_name: RepoFullName | None = None
     behavior_packs: BehaviorPacksConfig | None = None
@@ -1091,6 +1397,10 @@ class AgentCreate(BaseModel):
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
     memory: bool = False
+    # ADR 0147. Omitted means human approval. A bundle cannot set this.
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
 
     _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
@@ -1100,6 +1410,9 @@ class AgentCreate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -1129,6 +1442,20 @@ class AgentUpdate(BaseModel):
     # `model` above: omitted is unchanged, explicit null clears to the platform
     # default.
     thinking: str | None = None
+    # New per-agent work-item execution deadline in seconds (#3071). Same
+    # three-way semantics as `model`: omitted is unchanged, explicit null clears
+    # to the platform default of 1800 s.
+    execution_deadline_seconds: (
+        Annotated[
+            int,
+            Field(ge=MIN_EXECUTION_DEADLINE_SECONDS, le=MAX_EXECUTION_DEADLINE_SECONDS),
+        ]
+        | None
+    ) = None
+    # Per-agent runner resources (#3209). Same three-way semantics as `model`:
+    # omitted is unchanged, explicit null clears to the chart block, and an
+    # object sets requests and limits.
+    runner_resources: dict[str, Any] | None = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
     approval_required_tools: list[str] | None = None
@@ -1156,18 +1483,35 @@ class AgentUpdate(BaseModel):
     repo_full_name: RepoFullName | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
+    # Whether the runner mounts its memory tools (#1461). Omitted (None) leaves
+    # it unchanged; the column is NOT NULL, so like `memory` there is no
+    # default for a null to clear back to.
+    memory_writes: bool | None = None
+    # Omitted leaves the current publication policy. Explicit null is refused.
+    # ``publication_branch_prefix`` null clears the prefix.
+    publication_policy: Literal["approve", "auto"] | None = None
+    publication_draft: bool | None = None
+    publication_branch_prefix: str | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
+    _check_runner_resources = field_validator("runner_resources")(_validate_runner_resources)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_policy = field_validator("publication_policy")(
+        _validate_publication_policy_value
+    )
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
+    _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
 
 
 class AgentOut(BaseModel):
@@ -1186,6 +1530,10 @@ class AgentOut(BaseModel):
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
+    # Null means the platform default execution deadline (1800 s) (#3071).
+    execution_deadline_seconds: int | None = None
+    # Null means the chart runner resource block (#3209).
+    runner_resources: dict[str, Any] | None = None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
@@ -1199,6 +1547,12 @@ class AgentOut(BaseModel):
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up).
     memory: bool
+    # Whether the runner mounts its remember/update/forget tools (#1461).
+    memory_writes: bool = False
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_policy_version: int = 1
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
     created_at: datetime
 
     @field_validator("secrets", mode="before")
@@ -1310,6 +1664,10 @@ class ResolvedTarget(BaseModel):
     agent: str | None = None
     env: str = "dev"
     slack_channel: str | None = None
+    # @spec ADR-0168 d8: the identity the binding speaks through, and the
+    # connectors the bound agent runs (None is every declared one).
+    identity: str = "default"
+    connectors: list[str] | None = None
 
 
 class NamedTarget(ResolvedTarget):
@@ -1397,6 +1755,12 @@ class ConnectorManifests(BaseModel):
     # Service in `manifests`, so an author never hand-writes a URL that
     # resolves in one tier and not another.
     mcp_entries: dict[str, Any] = Field(default_factory=dict)
+    # The version whose bundle was read. Required: the route always names the
+    # version it was given and does not look up a second deployment.
+    version_id: uuid.UUID
+    # plugin.json triggers as stored. Missing, null, and non-list values are
+    # an empty list. Entries are not validated or rewritten.
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DeploymentCreate(BaseModel):
@@ -1477,8 +1841,14 @@ class PublicationCreate(BaseModel):
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None
     base_sha: str
-    patch_b64: str = Field(min_length=1)
-    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    work_item_request_id: uuid.UUID | None = None
+    work_item_runtime_epoch: int | None = Field(default=None, ge=1)
+    observed_title: str | None = Field(default=None, max_length=256)
+    observed_body_sha256: str | None = Field(default=None, pattern=r"[0-9a-f]{64}")
+    observed_lineage_id: uuid.UUID | None = None
+    observed_lineage_version: int | None = Field(default=None, ge=1)
+    patch_b64: str
+    changed_paths: list[str] = Field(max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)
     title: str | None = Field(default=None, max_length=256)
     body: str | None = Field(default=None, max_length=65_536)
@@ -1500,13 +1870,29 @@ class PublicationCreate(BaseModel):
     @model_validator(mode="after")
     def _valid_reply_route(self) -> "PublicationCreate":
         _validate_channel_binding(self.reply_kind, self.reply_channel)
+
+        # The built-in relay is a platform-set sentinel (the worker's own
+        # disconnected-message consumer), not an identity or an egress
+        # credential, on ANY kind including slack -- so it is exempt from the
+        # kind-aware identity check below, exactly as it was exempt from the
+        # both-or-neither check before this kind split existed.
         builtin_relay = self.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
-        if builtin_relay and self.reply_endpoint is not None:
-            raise ValueError(
-                "the built-in cluster-message publication reply route must not set an endpoint"
-            )
-        if not builtin_relay and ((self.reply_endpoint is None) != (self.reply_adapter is None)):
+        slack = self.reply_kind == SLACK_KIND
+
+        if builtin_relay:
+            if self.reply_endpoint is not None:
+                raise ValueError(
+                    "the built-in cluster-message publication reply route must not set an endpoint"
+                )
+        elif slack:
+            # For Slack, reply_adapter is the identity with or without an
+            # endpoint; an endpoint is the CLI stub's per-turn origin (#19).
+            identity = route_identity(self.reply_kind, self.reply_adapter)
+            refuse_undeclared(self.reply_kind, identity)
+            self.__dict__["reply_adapter"] = identity
+        elif (self.reply_endpoint is None) != (self.reply_adapter is None):
             raise ValueError("publication reply route must set endpoint and adapter together")
+
         if self.reply_adapter is not None and not _CHANNEL_KIND.match(self.reply_adapter):
             raise ValueError("publication reply adapter must be a lowercase slug")
         if self.reply_endpoint is not None:
@@ -1574,6 +1960,47 @@ class ReviewRevisionCancel(BaseModel):
     expected_version: int = Field(ge=1, strict=True)
 
 
+class PublicationContextMint(BaseModel):
+    """Trusted worker identity for a running factory execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: uuid.UUID
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    runtime_epoch: int = Field(gt=0, strict=True)
+    queued_event_id: str = Field(min_length=1, max_length=1024)
+
+
+class PublicationPrecheck(BaseModel):
+    """Observed metadata and a proposal, with no caller selected resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_title: str = Field(max_length=256)
+    observed_body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: AwareDatetime
+    proposed_title: str = Field(min_length=1, max_length=256)
+    proposed_body: str = Field(min_length=1, max_length=65_536)
+
+    @field_validator("observed_title", "proposed_title", "proposed_body")
+    @classmethod
+    def _utf8_metadata(cls, value: str) -> str:
+        value.encode("utf-8")
+        return value
+
+    @field_validator("proposed_title", "proposed_body")
+    @classmethod
+    def _nonblank_metadata(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("publication title and body must be nonblank")
+        return value
+
+
+class PublicationPrecheckResult(BaseModel):
+    result: Literal["unchanged", "metadata_changed"]
+
+
 class PublicationLineageAdvance(BaseModel):
     """Exact compare-and-set facts for one publication revision outcome."""
 
@@ -1587,6 +2014,7 @@ class PublicationLineageAdvance(BaseModel):
     pr_number: int = Field(gt=0)
     pr_url: str = Field(min_length=1, max_length=2048)
     head_sha: str
+    metadata_updated_at: AwareDatetime | None
 
     @field_validator("expected_head_sha", "head_sha")
     @classmethod
@@ -1649,6 +2077,8 @@ class PublicationOut(BaseModel):
     pr_url: str | None
     repo_full_name: str
     status: str
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
     version: int
     base_sha: str
     changed_paths: list[str]
@@ -1664,6 +2094,145 @@ class PublicationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     terminal_at: datetime | None
+
+
+WorkItemOutcomeState = Literal[
+    "queued",
+    "waiting",
+    "running",
+    "cancellation_requested",
+    "cancelled",
+    "expired",
+    "failed",
+    "awaiting_approval",
+    "publishing",
+    "published",
+    "completed_unpublished",
+]
+WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
+
+
+class WorkItemRequestOut(BaseModel):
+    """Operator view of one ExecutionRequest (#2577). Built from an explicit
+    allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
+
+    sequence: int
+    status: str
+    created_at: datetime
+    wait_deadline: datetime | None
+    started_at: datetime | None
+    execution_deadline: datetime | None
+    terminal_at: datetime | None
+    terminal_cause: str | None
+    termination_observation: str | None
+    capacity_deferrals: int
+    last_deferral_reason: str | None
+
+
+class WorkItemPrOut(BaseModel):
+    number: int
+    url: str
+    status: str
+
+
+class WorkItemPublicationOut(BaseModel):
+    status: str
+    revision_number: int | None
+    approval_status: str | None
+
+
+class WorkItemCorrectnessOut(BaseModel):
+    """The platform never asserts correctness; the bundle owns it (ADR 0162)."""
+
+    asserted: Literal[False] = False
+    owner: Literal["bundle"] = "bundle"
+
+
+class WorkItemCiOut(BaseModel):
+    """A live, unpersisted CI observation of the published head."""
+
+    state: WorkItemCiState
+    reason: str | None = None
+    head_sha: str | None = None
+    observed_at: datetime | None = None
+
+
+class WorkItemUsageRole(BaseModel):
+    """Tokens and estimate of one role (#3223). The estimate covers priced rows only."""
+
+    tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+    cost_complete: bool = True
+
+
+class WorkItemUsageModel(BaseModel):
+    model: str
+    role: Literal["implementer", "reviewer"]
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+
+
+class WorkItemUsageRequest(BaseModel):
+    request_id: uuid.UUID
+    tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+
+
+class WorkItemUsagePriceSource(BaseModel):
+    source: str
+    as_of: datetime
+
+
+class WorkItemUsageOut(BaseModel):
+    """Token usage and estimated cost summed over every request of a WorkItem (#3223).
+
+    ``cost_complete`` is false when any reported model had no price, and then
+    ``estimated_cost_usd`` covers only the priced models. It is also false when
+    ``requests_without_usage`` (started requests with no usage report) is > 0.
+    """
+
+    work_item_id: uuid.UUID
+    total_tokens: int
+    estimated_cost_usd: Decimal | None
+    cost_complete: bool
+    requests_without_usage: int = 0
+    roles: dict[str, WorkItemUsageRole]
+    models: list[WorkItemUsageModel]
+    requests: list[WorkItemUsageRequest]
+    price_sources: list[WorkItemUsagePriceSource]
+    pr_number: int | None = None
+    pr_url: str | None = None
+
+
+class WorkItemOutcomeOut(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    repo_full_name: str
+    github_issue_number: int
+    issue_url: str
+    cancelled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    state: WorkItemOutcomeState
+    actionable_cause: str
+    objective: str | None
+    objective_truncated: bool
+    requester: str | None
+    pr: WorkItemPrOut | None
+    publication: WorkItemPublicationOut | None
+    correctness: WorkItemCorrectnessOut
+    # Null on the list route: CI is observed live on the detail route only.
+    ci: WorkItemCiOut | None
+    requests: list[WorkItemRequestOut]
+
+
+class WorkItemOutcomeList(BaseModel):
+    items: list[WorkItemOutcomeOut]
+    limit: int
+    truncated: bool
 
 
 class ApprovalResolve(BaseModel):
@@ -1690,6 +2259,109 @@ class ApprovalResolve(BaseModel):
         return data
 
 
+class _RecoveryRequest(BaseModel):
+    """Shared shape of a break-glass request (#2753).
+
+    ``reason`` is the ENTIRE after-the-fact review surface for an operation that
+    bypasses the ordinary approver set, so a blank one is refused rather than
+    stored: an unexplained administrative rejection is exactly the thing the
+    accepted blast radius relies on being reviewable.
+
+    ``recovery_key`` is caller-supplied and makes the operation idempotent. A
+    retried request carrying the same key is a READ of the recorded outcome; a
+    different key against an already-recovered record is a second intent and a
+    conflict.
+    """
+
+    reason: str = Field(min_length=1)
+    recovery_key: str = Field(min_length=1)
+
+    @field_validator("reason", "recovery_key")
+    @classmethod
+    def _nonblank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class ApprovalRecover(_RecoveryRequest):
+    """One administrative settlement of a stranded approval.
+
+    ``rejected`` is the only disposition there is. There is deliberately no
+    approve-on-behalf-of: an administrative path that could grant would let a
+    platform-key holder authorize the action a human was asked about, which is
+    a different power from settling a record nobody can reach.
+    """
+
+    disposition: Literal["rejected"]
+
+
+class ApprovalRecoveryOut(BaseModel):
+    """The RECORDED outcome of an administrative settlement.
+
+    Every field is read back off the row, so a replay of the same
+    ``recovery_key`` renders an identical body rather than a fresh one.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    approval_id: uuid.UUID
+    status: str
+    recovery_key: str | None
+    reason: str | None
+    actor: str | None
+    recovered_at: datetime | None
+
+
+class ApprovalIdentityFactsOut(BaseModel):
+    """Per-row FACTS about one pending approval (#2753).
+
+    Facts, never verdicts: nothing here says a row cannot be resolved. A route
+    whose approver set is the card channel's membership is a HEALTHY route that
+    any attested chat click resolves, and it is reported like any other row.
+    """
+
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    status: str
+    route: str | None
+    reply_kind: str
+    reply_adapter: str | None
+    reply_channel: str
+    card_channel: str | None
+    has_reply_placeholder: bool
+    created_at: datetime
+    facts: list[str]
+
+
+class ApprovalReplyIdentityDeclaration(BaseModel):
+    """The skeleton the migration workflow consumes.
+
+    Everything but the id is the OPERATOR's to fill in. The report never
+    pre-fills provenance it does not have: a guessed reply kind is precisely the
+    silent misroute the declaration document exists to prevent.
+    """
+
+    approval_id: uuid.UUID
+    reply_kind: str | None = None
+    reply_adapter: str | None = None
+    actor: str | None = None
+    reason: str | None = None
+
+
+class ApprovalIdentityReportOut(BaseModel):
+    """A pure read an operator runs on a broken installation.
+
+    It makes no Slack call and reads only ``approvals`` and ``agent_channels``,
+    so it still answers against a schema old enough that the fence refuses to
+    serve it.
+    """
+
+    approvals: list[ApprovalIdentityFactsOut]
+    declarations: list[ApprovalReplyIdentityDeclaration]
+
+
 class ApprovalPrincipalMint(BaseModel):
     """Administrative request to mint one operator approval credential."""
 
@@ -1709,6 +2381,46 @@ class ApprovalPrincipalOut(BaseModel):
     token: str
     subject: str
     kind: Literal["operator"] = "operator"
+    expires_at: datetime
+
+
+class AdapterPrincipalMint(BaseModel):
+    """Administrative request to issue one channel adapter credential (ADR-0154)."""
+
+    subject: str = Field(min_length=1)
+    binding_ids: list[uuid.UUID] = Field(min_length=1)
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
+class AdapterPrincipalRotate(BaseModel):
+    """Self-rotation request: only the next credential's lifetime is chosen."""
+
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+
+class AdapterPrincipalOut(BaseModel):
+    """One-time delivery of a channel adapter credential."""
+
+    token: str
+    subject: str
+    kind: Literal["adapter"] = "adapter"
+    binding_ids: list[uuid.UUID]
+    scopes: list[str]
     expires_at: datetime
 
 
@@ -1864,8 +2576,11 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator"] | None
+    principal_kind: Literal["chat", "console", "operator", "adapter", "platform"] | None
     authenticated: bool
+    # The adapter that transported an `adapter` principal's decision
+    # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.
+    principal_subject: str | None
     decision: str
     authorizer: str
     authorized: bool
@@ -1899,6 +2614,7 @@ class ObservationNode(BaseModel):
     startTime: str | None = None  # noqa: N815 (Langfuse wire field name)
     model: str | None = None
     usageDetails: dict[str, Any] | None = None  # noqa: N815
+    toolName: str | None = None  # noqa: N815 (which tool an execute_tool span ran)
     children: list["ObservationNode"] = []
 
 
@@ -2184,9 +2900,15 @@ class StateEntryPut(BaseModel):
 class StateAppendIn(BaseModel):
     """Append ``item`` to a log-shaped (JSON array) state entry (#248). If the
     entry does not exist it is created as a single-element array; if it exists
-    its value must already be an array, else the append is rejected."""
+    its value must already be an array, else the append is rejected.
+
+    ``reserve_bytes`` (#2927) refuses the append with 413 when the new value
+    would leave fewer than that many bytes free under the per-value cap. The
+    runner sets it on transcript appends to keep headroom for the worker's
+    publication outcome append; omitting it keeps the plain cap."""
 
     item: Any
+    reserve_bytes: int | None = Field(default=None, ge=0)
 
 
 class StateEntryOut(BaseModel):
@@ -2292,6 +3014,34 @@ class MemoryEntryCreate(BaseModel):
         return stripped
 
 
+class MemoryGuidanceIn(BaseModel):
+    """Operator memory guidance for one agent (#1461).
+
+    Stored verbatim at ``memory/guidance`` as ``{"text": ...}``; the runner shows
+    it to the model beside its memory tools in place of the platform default.
+    """
+
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _text_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty")
+        return value
+
+
+class MemoryGuidanceOut(BaseModel):
+    """The agent's effective memory guidance and where it comes from (#1461).
+
+    ``source`` is ``operator`` when guidance is stored for the agent, else
+    ``default`` and ``text`` is the platform default.
+    """
+
+    text: str
+    source: Literal["default", "operator"]
+
+
 # --- console sessions (ADR-0083, #1044) -------------------------------------
 
 
@@ -2336,3 +3086,55 @@ class ConsoleSessionOut(BaseModel):
 
     subject: str | None
     expires_at: datetime
+
+
+ScheduleOutcome = Literal["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"]
+
+
+class ScheduleHookOut(BaseModel):
+    """One cron hook on the in-force bundle, with its newest slot."""
+
+    name: str
+    trigger: str
+    schedule: str
+    zone: str
+    last_fire_at: datetime | None
+    last_outcome: ScheduleOutcome | None
+    paused: bool
+
+
+class ScheduleControlOut(BaseModel):
+    """Current operator pause state for a named cron hook."""
+
+    agent: str
+    name: str
+    paused: bool
+
+
+class AgentSchedulesOut(BaseModel):
+    """The scheduled hooks of one agent's in-force deployment."""
+
+    agent: str
+    agent_id: uuid.UUID
+    bundle_error: str | None
+    hooks: list[ScheduleHookOut]
+
+
+class ScheduleListOut(BaseModel):
+    """Every in-force cron hook the platform can see."""
+
+    schedules: list[AgentSchedulesOut]
+
+
+class HookFireOut(BaseModel):
+    """One test-fire run record. `outcome` is null while the turn is in flight."""
+
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    agent: str
+    name: str
+    trigger: str
+    slot_utc: datetime
+    outcome: ScheduleOutcome | None
+    started_at: datetime
+    ended_at: datetime | None

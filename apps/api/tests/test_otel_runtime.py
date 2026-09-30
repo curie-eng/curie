@@ -124,6 +124,43 @@ def test_http_metric_manifest_covers_every_registered_api_route(client: TestClie
     assert registered <= declared_operations
 
 
+def test_api_lifespan_initializes_both_history_capacity_series(
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del clean_db
+    recorded: list[_Metric] = []
+    validated_record_metric = main_module.record_metric
+
+    def capture(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        validated_record_metric(name, value, attributes=attributes)
+        if name == "curie.history.persistence.failure":
+            recorded.append(_Metric(name, float(value), dict(attributes or {})))
+
+    monkeypatch.setattr(main_module, "record_metric", capture)
+    with TestClient(main_module.create_app()):
+        pass
+
+    assert recorded == [
+        _Metric(
+            "curie.history.persistence.failure",
+            0.0,
+            {
+                "service.name": "curie-api",
+                "source": "state-api",
+                "outcome": "capacity",
+                "limit": limit,
+            },
+        )
+        for limit in ("value", "namespace")
+    ]
+
+
 def test_http_server_span_extracts_the_standard_w3c_parent(
     client: TestClient,
 ) -> None:
@@ -373,12 +410,19 @@ def test_background_loop_records_an_injected_database_failure_and_keeps_running(
         )
         task = asyncio.create_task(reconciler.run_forever())
         try:
-            deadline = asyncio.get_running_loop().time() + 2
-            while not any(
-                point.name == "curie.background.loop"
-                and point.attributes.get("outcome") == "failure"
-                for point in probe.metrics
+            # Two recorded failures prove the loop survived the first one. The
+            # ceiling only bounds a hung loop: each pass is a refused connect, so
+            # a loaded runner, not the product, decides how long the wait takes.
+            deadline = asyncio.get_running_loop().time() + 30
+            while (
+                sum(
+                    point.name == "curie.background.loop"
+                    and point.attributes.get("outcome") == "failure"
+                    for point in probe.metrics
+                )
+                < 2
             ):
+                assert task.done() is False
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)
             assert task.done() is False

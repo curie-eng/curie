@@ -20,6 +20,7 @@ from .events import (
     Event,
     Final,
     Interrupt,
+    PublicationContext,
     SideEffectFlag,
     TextDelta,
     ToolNote,
@@ -27,7 +28,7 @@ from .events import (
 from .events import InboundMessage as InboundMessageUnion
 from .events import OutboundEvent as OutboundEventUnion
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
-from .turn import Attachment, QueuedTurn, ReplyHandle
+from .turn import Attachment, HookRunRef, QueuedTurn, ReplyHandle
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport
 
@@ -52,6 +53,7 @@ _MODELS = (
     InboundMessage,
     OutboundEvent,
     Event,
+    PublicationContext,
     Interrupt,
     TextDelta,
     ToolNote,
@@ -60,6 +62,7 @@ _MODELS = (
     SideEffectFlag,
     ReplyHandle,
     Attachment,
+    HookRunRef,
     QueuedTurn,
     EvalJob,
     EvalReport,

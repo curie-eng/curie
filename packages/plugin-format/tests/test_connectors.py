@@ -364,11 +364,7 @@ def test_a_reserved_name_cannot_be_declared_as_a_secret_file_key() -> None:
     # Same name, same resolution, same per-agent Secret -- only the delivery
     # differs, so the fence has to cover this key too.
     assert "connectors.secret_name_reserved" in _codes(
-        {
-            "connectors": {
-                "g": {"image": "x:1", "secret_files": {"HTTPS_PROXY": "/secrets/proxy"}}
-            }
-        }
+        {"connectors": {"g": {"image": "x:1", "secret_files": {"HTTPS_PROXY": "/secrets/proxy"}}}}
     )
 
 
@@ -408,6 +404,49 @@ def test_a_hosted_connector_with_several_secrets_must_name_the_bearer() -> None:
     # both into the sandbox (and using the first as the Bearer).
     assert "connectors.bearer_secret_required" in _codes(
         {"connectors": {"g": {"image": "x:1", "secrets": ["POD_ONLY", "PAT"]}}}
+    )
+
+
+def test_a_hosted_connector_with_only_secretrefs_needs_no_bearer() -> None:
+    # #3057: every SecretRef is the connector's own upstream credential, so
+    # there is no client to authenticate and no correct bearer_secret.
+    from plugin_format.connector_render import mcp_entry
+
+    doc = {
+        "connectors": {
+            "tool": {
+                "image": "ghcr.io/example/tool@sha256:" + "0" * 64,
+                "secrets": [
+                    {
+                        "name": "SERVICE_A_TOKEN",
+                        "from_secret": "tool-credentials",
+                        "key": "SERVICE_A_TOKEN",
+                    },
+                    {
+                        "name": "SERVICE_B_TOKEN",
+                        "from_secret": "tool-credentials",
+                        "key": "SERVICE_B_TOKEN",
+                    },
+                ],
+            }
+        }
+    }
+    parsed, errors = validate_connectors(doc)
+    assert errors == []
+    entry = mcp_entry("curie", "agent", "curie", "tool", parsed.connectors["tool"])
+    assert "headers" not in entry
+
+
+def test_a_secretref_plus_a_plain_secret_still_must_name_the_bearer() -> None:
+    assert "connectors.bearer_secret_required" in _codes(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "secrets": ["PAT", {"name": "UPSTREAM", "from_secret": "s"}],
+                }
+            }
+        }
     )
 
 
@@ -636,7 +675,11 @@ def test_build_beside_another_form_is_ambiguous(second: str) -> None:
     # Two image sources, or an image source plus a claim that the process is
     # already running elsewhere. Picking either silently ignores the other, and
     # the one ignored is the one the author edited last.
-    value = "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1" if second == "image" else "https://mcp.acme.example.com/mcp"
+    value = (
+        "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1"
+        if second == "image"
+        else "https://mcp.acme.example.com/mcp"
+    )
     codes = _codes(
         {
             "connectors": {
@@ -759,6 +802,35 @@ def test_connector_declaration_field_names_match_the_frozen_vector() -> None:
     fields = _vector_file("connector-fields.json")["models"]
     assert set(ConnectorSpec.model_fields) == set(fields["ConnectorSpec"])
     assert set(ConnectorBuild.model_fields) == set(fields["ConnectorBuild"])
+
+
+def test_runner_declaration_field_names_match_the_frozen_vector() -> None:
+    # ADR 0173: the optional top-level `runner:` block rides connectors.yaml.
+    from plugin_format.connectors import ConnectorsFile, RunnerSpec
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorsFile.model_fields) == set(fields["ConnectorsFile"])
+    assert set(RunnerSpec.model_fields) == set(fields["RunnerSpec"])
+
+
+def test_a_runner_build_block_is_carried_not_dropped() -> None:
+    # The corpus proves accept/reject parity; this proves an accepted block is
+    # actually on the parsed model with its defaults resolved.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {},
+            "runner": {"build": {"context": "runner", "platforms": ["linux/amd64"]}},
+        }
+    )
+    assert errors == [], errors
+    assert parsed is not None
+    assert parsed.runner is not None
+    assert parsed.runner.build.context == "runner"
+    assert parsed.runner.build.dockerfile == "Dockerfile"
+
+    parsed, errors = validate_connectors({"connectors": {}})
+    assert errors == [] and parsed is not None
+    assert parsed.runner is None
 
 
 # --------------------------------------------------------------------------- #
@@ -884,11 +956,7 @@ def test_a_forging_hosted_connector_with_an_unhosted_url_stays_refused() -> None
     # shape most likely to be mis-gated by a later edit that broadens the
     # `url`-only exemption to "anything with a URL on it."
     assert _codes(
-        {
-            "connectors": {
-                "mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}
-            }
-        }
+        {"connectors": {"mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}}}
     ) == ["connectors.ambiguous_name"]
 
 
@@ -902,3 +970,134 @@ def test_bundle_surfaces_an_ambiguous_connector_name(tmp_path: Path) -> None:
     offending = [e for e in result.errors if e.code == "connectors.ambiguous_name"]
     assert offending, [e.code for e in result.errors]
     assert "mcp-grafana" in offending[0].message
+
+
+# --------------------------------------------------------------------------- #
+# `admits`: the agents whose sandboxes a hosted connector lets in
+# (ADR-0168 decision 7)
+# --------------------------------------------------------------------------- #
+def test_a_hosted_connector_carries_the_agents_it_admits() -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1", "admits": ["acme-dev", "acme-ops"]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].admits == ["acme-dev", "acme-ops"]
+
+
+def test_a_missing_admits_list_stays_distinct_from_an_empty_one() -> None:
+    # Absent admits the deploying agent alone and `[]` admits no agent, so the
+    # parsed model must keep the two apart for the renderer to tell them apart.
+    parsed, errors = validate_connectors(
+        {"connectors": {"alone": {"image": "x:1"}, "closed": {"image": "x:1", "admits": []}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["alone"].admits is None
+    assert parsed.connectors["closed"].admits == []
+
+
+def test_admits_accepts_self_for_the_agent_the_bundle_is_deployed_as() -> None:
+    # `self` keeps a bundle portable across deploy targets: the same file admits
+    # whichever agent it is deployed as. Validation carries it as written;
+    # nothing resolves it to a name yet.
+    parsed, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1", "admits": ["self", "acme-ops"]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].admits == ["self", "acme-ops"]
+
+
+def test_self_admitted_twice_is_a_duplicate() -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": ["self", "self"]}}}) == [
+        "connectors.duplicate_admits"
+    ]
+
+
+def test_a_build_form_connector_carries_admits_too() -> None:
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "k8s-write": {
+                        "build": {"context": "connectors/k8s-write", "platforms": ["linux/amd64"]},
+                        "admits": ["acme-dev"],
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("admits", [["acme-dev"], []])
+def test_admits_on_a_remote_connector_is_refused(admits: list[str]) -> None:
+    # An empty list is still an explicit ``admits:`` on a ``url`` connector, so
+    # it must be refused the same as a populated one -- a guard written as
+    # ``spec.admits and spec.url`` would miss it, because ``[]`` is falsy.
+    assert _codes(
+        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "admits": admits}}}
+    ) == ["connectors.remote_has_admits"]
+
+
+@pytest.mark.parametrize(
+    "name", ["Acme-Dev", "acme_dev", "acme dev", "-acme", "acme-", "", "a" * 41, "Self", "SELF"]
+)
+def test_an_admitted_name_must_have_the_agent_name_shape(name: str) -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": [name]}}}) == [
+        "connectors.bad_admits_agent"
+    ]
+
+
+def test_an_agent_admitted_twice_is_reported_once() -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": ["acme-dev"] * 3}}}) == [
+        "connectors.duplicate_admits"
+    ]
+
+
+def test_the_admitted_name_rule_is_the_deploy_target_agent_rule() -> None:
+    # deploy_targets imports connectors, so connectors cannot import the agent
+    # rule back. The two copies are pinned equal here instead.
+    from plugin_format import connectors, deploy_targets
+
+    assert connectors._NAME_RE.pattern == deploy_targets._NAME_RE.pattern
+    assert connectors._NAME_MAX == deploy_targets._NAME_MAX
+
+
+def test_bundle_surfaces_a_refused_admits_entry(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "connectors:\n  grafana:\n    image: x:1\n    admits: [Acme]\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert "connectors.bad_admits_agent" in [e.code for e in result.errors]
+
+
+# ADR-0168 decision 7: with a caller proxy, connector `X` also renders a Service
+# named `<X's object name>-direct`, which is exactly the object name of a
+# sibling connector named `X-direct`. The two would overwrite one Service.
+def test_a_hosted_connector_named_after_a_siblings_direct_service_is_rejected() -> None:
+    codes = _codes(
+        {"connectors": {"grafana": {"image": "x:1"}, "grafana-direct": {"image": "y:1"}}}
+    )
+    assert codes == ["connectors.direct_service_collision"]
+    _, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1"}, "grafana-direct": {"image": "y:1"}}}
+    )
+    message = errors[0][1]
+    assert "grafana-direct" in message
+    assert "rename" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        {"grafana-direct": {"image": "y:1"}},
+        {"grafana": {"url": "https://g.example/mcp"}, "grafana-direct": {"image": "y:1"}},
+        {"grafana": {"image": "x:1"}, "grafana-direct": {"url": "https://g.example/mcp"}},
+    ],
+    ids=["no_sibling", "remote_sibling", "remote_direct"],
+)
+def test_a_direct_suffix_that_renders_no_colliding_service_is_accepted(
+    connectors: dict[str, object],
+) -> None:
+    assert "connectors.direct_service_collision" not in _codes({"connectors": connectors})

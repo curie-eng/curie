@@ -51,29 +51,66 @@ conversation, reconstructed through the selected harness adapter.
   other scheme (an old SDK-resume id, `s3://` …) is reserved for a future loader
   and rejected loudly.
 - **Load side.** `load()` returns prior turns/summaries oldest-first (empty when
-  none). At boot `build_conversation_replay` reconstructs the ordered portable
-  prefix. The Claude adapter prefers an optional native checkpoint so its exact
+  none). The state API advertises its configured transcript value cap on both
+  a successful GET and a missing transcript response. The runner requires that
+  cap and uses it for every history bound; it does not assume a local default.
+  The API default is 16 MiB (chart value `api.transcriptMaxThreadBytes`,
+  env `TRANSCRIPT_MAX_THREAD_BYTES`), sized for a whole factory turn. At boot `build_conversation_replay`
+  reconstructs the ordered portable prefix. The Claude adapter prefers an
+  optional native checkpoint so its exact
   cache-breakpoint shape survives; without one it materializes deterministic
-  provider-local entries from role/content. The fake consumes the same portable prefix, and a
+  provider-local entries from role/content. It restores a checkpoint only when
+  every system prompt the checkpoint recorded is the one this boot composed:
+  the Claude CLI resends a recorded prompt on resume instead of the one it is
+  given, so a checkpoint from an earlier prompt would hide this turn's
+  attachments, new memory, or a redeployed bundle prompt. A checkpoint recorded
+  under another prompt is set aside and the portable prefix is materialized. The fake consumes the same portable prefix, and a
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
-- **Append side.** `append(record)` durably writes one turn. The runner appends
-  structured messages after each persistable terminal `final`
-  (`SessionRunner._record_turn`): either a successful model-produced `DONE`
-  reply or an `AWAITING_APPROVAL` suspension whose structured tool and approval
-  context must survive the runner boundary. A
-  dangling denied tool call gets an explicit non-executed result so the next
-  provider request is structurally valid. Append remains best-effort after a
-  delivered turn; classified failures, budget/auth halts, idle outcomes, and
-  synthetic incomplete fallback finals are not recorded.
+- **Append side.** `append(record)` durably writes one turn. A serving runner
+  holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
+  within its 15 second budget. A dangling denied tool call gets an explicit
+  nonexecuted result so the next provider request is structurally valid.
+  Classified failures, budget/auth halts, idle outcomes, and synthetic
+  incomplete fallback finals are not recorded. Best effort applies only to
+  ordinary persistence failures: they retain the candidate final while marking
+  history durability lost. Every runner append sends `reserve_bytes` (8192), so
+  the state API refuses with 413 any append that would leave less than that free
+  under the value cap. The reserve keeps room for the worker's publication
+  outcome append, which sends no reserve. A 413 on a turn append is not a
+  failure yet: the store reads the key and its version, rewrites it with a
+  compare-and-set `PUT` to the compacted value (see Capacity recovery), and
+  retries a version conflict with a fresh read, three attempts in all. A 413
+  that survives compaction is the narrow exception. It becomes
+  `HistoryCapacityError`, discards the candidate record and approval state,
+  emits `history-persistence-error`, and ends with one `CLASSIFIED_FAILURE`
+  final. The worker does not retry that classified failure.
 - **Compaction and cache.** Crossing the turn/byte bound appends one deterministic
   `SummaryRecord`; ordinary appends retain the exact prefix until the next
   boundary. Compaction deliberately drops the old native checkpoint; the first
   turn over the new portable summary writes a fresh one, while later turns append
-  only deltas. The first resumed terminal result records
+  only deltas. Within one active turn, older completed tool exchanges can be
+  replaced with a deterministic marker when the turn exceeds the bound. The
+  first user message, final answer, recent tool call and result pairs, and any
+  pending approval remain intact. A 413 while boot appends its summary makes
+  boot rewrite the value it loaded with a
+  compare-and-set `PUT` to the compacted value, then reload and rebuild the
+  replay from what is stored. A write after that load returns 409 and boot
+  reloads instead of writing a stale view, for at most three passes. Only when
+  the compacted value still cannot fit, or the passes never settle, does boot
+  refuse: the runner serves, and every turn ends with the append path's
+  `history-persistence-error` and one `CLASSIFIED_FAILURE` final before any
+  model or tool starts, so the worker does not retry it. Any other boot
+  compaction failure is still fatal. The first
+  resumed terminal result records
   `curie.history.resume.cache_read` with the provider's observed cache-read token
   count and a bounded `cache_hit` attribute.
+- **Timeouts.** A worker retries a stream timeout only when the runner confirms
+  that timeout ownership was accepted. A conflict or unconfirmed result is the
+  terminal worker outcome `runner-timeout-unconfirmed`; it is not retryable.
+  It is a worker display value, not a runner `ErrorEvent` classification, so raw
+  ingress of that token remains `unclassified`.
 
 ## Implementations today
 
@@ -81,7 +118,21 @@ One: **`StateApiTranscriptStore`**, backing the transcript as a per-thread
 `transcript/<thread_key>` key over the durable KV/document store landed for
 #23/#248 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres
 JSONB). `load` GETs the key; `append` POSTs to the key's `/append` endpoint,
-inheriting durability and the per-value/per-namespace size caps.
+inheriting durability and the per-value/per-namespace size caps. A 413 detail
+names the key over the per-value cap, or the largest key in the namespace for
+the per-namespace cap. The transcript key is the thread key, so the refusal
+names the thread to recover even when a sibling thread's append was refused.
+The loader maps rejected appends to typed `HistoryCapacityError` or
+`HistoryAppendError` values and never reads an arbitrary API response body.
+Immediately before either transcript 413, the API increments
+`curie_history_persistence_failure_total` with fixed `service.name=curie-api`,
+`source=state-api`, `outcome=capacity`, and `limit=value` or `limit=namespace`
+attributes. A refusal for the append's optional `reserve_bytes` headroom is also
+a 413, with a detail naming the reserve, but it does not increment the counter:
+it is the runner's compaction trigger, not a persistence failure. Both limit series initialize to zero during API startup. Health and
+readiness remain healthy because capacity is data state, not process
+availability. Operational consumers can use the counter to identify a capacity
+refusal without treating it as an API health failure.
 `NullTranscriptStore` is the no-ref sink. The worker (`binding.boot_env`)
 delivers the ref as `http(s)://api/agents/<id>/state/transcript/<thread_key>`
 (URL-encoded thread key) and forwards a scoped, agent-bound `state` token
@@ -98,12 +149,35 @@ unplanned-restart case needs no special worker/kernel branch.
   agent-bound, HMAC-signed `state` token minted per turn, accepted only by the
   state router and bound to this agent's namespace, so the sandbox credential can
   no longer resolve approvals or reach another agent's state.
-- **Unbounded source log under the state-store size caps.** A very long thread
-  will eventually hit the per-namespace/per-value cap on the stored transcript.
-  Delivery-side stable summarization bounds the reconstructed prefix
-  (`CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES`, overridable), but the
-  source turns and append-only summary records remain in the state log. A later
-  retention/rollup mechanism is still needed before the state-store cap.
+- **Capacity recovery accepts history loss.** At the value cap the runner
+  rewrites the key to worker publication markers (records with a
+  `publication_id`, kept verbatim and first), then one new summary of every
+  active turn but the latest, then that latest turn without its native
+  checkpoint, bounded so the reserve stays free. What is lost is the older
+  turns' messages beyond their summary lines, which keep the user and assistant
+  text, tool names, and the first 300 characters of each tool result (the
+  summary itself is cut near 8 KB, with the digest of what it covers), plus any
+  tool output the bound replaces with a digest marker. The rewrite is
+  `compact_transcript_value`, and the `PUT` carries `expected_version`, which
+  the state API checks under the same row lock an append takes, so a concurrent
+  append is never overwritten. The runner still refuses when publication
+  markers and the summary alone leave no room for the latest bounded turn. A
+  single turn that cannot be bounded under the cap fails the run with an error
+  naming the turn's compacted size and the cap. A
+  terminal capacity notice tells the operator to inspect the affected work and
+  retry the run. There is no other automatic data retention or deletion policy
+  for the stored source. For a value cap the runner cannot recover, quiesce
+  and release the affected thread, export and verify its owned key,
+  including version, digest, and records, then delete it with
+  `DELETE .../state/transcript/<thread_key>?expected_version=<exported version>`.
+  The delete returns 409 and keeps the row when anything was appended after the
+  export, so repeat the export instead of losing those turns. Starting
+  the same thread on a fresh route accepts the historical reset. A retained
+  runner with sticky durability loss needs the existing operator release before
+  it can be handed off. For a namespace cap, quiesce the affected agent route,
+  export and verify only owned keys, starting with the largest key the 413
+  names, then remove enough old owned keys with the same versioned delete to
+  restore space before retrying the target thread.
 - **History lives OUTSIDE the sandbox** (ADR-0003) — the store is
   network-reachable and rehydratable, never pod-local state.
 

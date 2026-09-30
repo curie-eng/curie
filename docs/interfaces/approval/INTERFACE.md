@@ -50,6 +50,23 @@ in code now:
   a past-SLA record flips to expired (410) and now also enqueues the expiry resume turn
   (#412, below) so the late resolver's dead end no longer strands the session. Creation is
   idempotent on `dedupe_key` (the triggering event id).
+- **No re-raise after a rejection (landed, #2885).** `POST /approvals` refuses, with 409
+  code `approval.rejected_in_thread` (frozen with the worker in
+  `tests/vectors/approval-reraise-refusal.json`), a request for an approval a person
+  rejected in the same thread when nobody has asked for it since
+  (`apps/api/src/curie_api/crud.py::find_rejected_reraise`). "The same approval" is the
+  same agent, conversation, route, gate kind and gated tool; the model-authored summary is
+  deliberately not part of it, so a reworded retry is still a retry. "Nobody has asked" is
+  read off the request's `dedupe_key`: a resume turn's event id is
+  `resume_event_id(<approval id>)`, so the guard walks those ids back through every
+  approval raised since the last turn a person started, and refuses when one of them is a
+  matching rejection. A request from a person's turn (any other event id) is the explicit
+  ask and is created as before. The refusal appends a `reraise_refused` audit row to the
+  rejected record, and the worker posts the API-authored message (the rejected approval,
+  who rejected it and when, and how to ask again) to the thread and ends the turn instead
+  of pausing or escalating (`apps/worker/src/curie_worker/approvals.py::ApprovalRefused`).
+  One consequence to know: a steer a person sends into a resumed turn does not count as
+  asking, because it joins that platform-authored turn rather than starting one.
 - **The `awaiting-approval` status (landed, #244).** `SessionStatus.AWAITING_APPROVAL` plus
   the optional `Final.approval_summary` field
   (`packages/aci-protocol/src/aci_protocol/events.py`), regenerated across all three language
@@ -64,8 +81,9 @@ in code now:
   A further optional `Final` field, `approval_display` (#2565, Draft ADR-0151), carries the
   human sentence a bundle-authored `approvalPolicy.gates[].summary` template rendered. It is
   additive (ACI patch 0.4.5). The worker uses `approval_display or approval_summary` for the
-  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`), and the
-  resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
+  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`, which is
+  the full notice only where the card is not posted into the requester's own thread;
+  there it is one line pointing at the card, ADR-0179), and the resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
   `gate_kind IS NULL` prefix fallback and the audit record are unchanged. A gate without a
   template leaves `approval_display` unset, which is today's bytes.
 - **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
@@ -76,6 +94,17 @@ in code now:
   including an unknown or unreachable surface) and no permission gate already pages.
   An explicit `approvalPolicy` or `toolPolicy.approvalRequired` gate is already a pager;
   keeping `request_approval` beside it raises a second card for the same action (#2657).
+  A `toolPolicy` can never take the pager itself away: `mcp__curie__request_approval`,
+  publication, and the `curie-state` channel-memory tools are platform owned and outside
+  `toolPolicy` scope, exempted by exact live tool name in
+  `runner/src/curie_runner/approval.py::is_platform_owned_tool` before the policy is
+  classified at all (#2286, ADR-0139). By exact name and not by server prefix, because
+  `strict_mcp_config` is off and an ambient project `.mcp.json` server keyed
+  `curie__extra` would otherwise inherit the exemption; and the `curie-state` names are
+  exempt only when that server was actually mounted, which needs a state URL. The same rule costs a bundle the ability to restrict
+  those tools, which ADR-0139 accepts: bundle configuration may add restrictions but may not
+  hollow out platform controls. Outside policy scope is not permission to run, so an operator
+  gate naming one of these tools still blocks it.
   A surface with no MCP tools or only explicitly read-only tools and no grantable
   policy route carries no generic pager, because approval cannot unlock an action it
   cannot perform. `readOnlyHint` is not authorization and does not change gates
@@ -112,8 +141,9 @@ in code now:
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`, #411), which re-enqueues
   every owed wake past a grace horizon. In Helm, `api.resumeReconciler.graceSeconds` derives
   from `worker.deliveryBudgetSeconds + worker.deliveryShutdownReserveSeconds`, and an explicit
-  non-null override below that floor is refused at render time so a duplicate resume cannot
-  reach an active turn. Outside Helm, `resume_reconciler_grace_seconds` remains the intentionally
+  non-null override below that floor is refused at render time so the backstop allows the
+  inline delivery its configured lifecycle before retrying. Outside Helm,
+  `resume_reconciler_grace_seconds` remains the intentionally
   conservative 900s Settings fallback. Since #532, it first runs
   `ResumeReconciler.reopen_dead_lettered_resumes` to re-open an approval whose *delivered*
   resume turn died at the worker's ADR-0039 delivery cap and was dead-lettered (`resumed_at`
@@ -123,9 +153,16 @@ in code now:
   wake at all, which the sweeper's own failure log states outright (the resolve endpoint
   compensates for the same switch by re-raising its enqueue failure as a 500 instead of
   deferring, `apps/api/src/curie_api/routers/approvals.py`, but a sweeper flip has no caller
-  to raise to). The reconciler is a backstop, not an unconditional exactly-once guarantee: a
-  worker retry loop can keep a turn live past the grace after an inline mark failure, for
-  which a worker-side in-flight lease is the named follow-up.
+  to raise to). Concurrent copies of the same resume event are serialized in the worker by an
+  event ID claim tied to the active delivery lease. A losing delivery is acknowledged as
+  redundant while the original delivery remains pending under its lease. If the holder crashes,
+  the claim may outlive its delivery lease. A new claimant detects that the recorded winner's
+  lease is gone or its PEL row is absent, then atomically replaces the stale claim so delivery
+  recovery can retry the original delivery. After it reaches terminal completion, the existing
+  marker absorbs later enqueues within the configured idempotency TTL (default 24h). The
+  reconciler remains a backstop, and
+  neither the claim nor the terminal marker guarantees exactly once external side effects across
+  a crash after a side effect or after the marker TTL expires.
 - **The permission gate (landed, #245, #1852).** Per-agent config
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
   worker binding) marks tools approval-required. The runner intercepts those calls
@@ -359,9 +396,9 @@ names as unrecognized on purpose, so arming one still trips the existing
 ## Implementations today
 
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
-it) over **three approver sets** behind the `ApproverSet` port (ADR-0034), after an
+it) over **four approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
-`operator` principals. A set answers only "is this actor in the set"; every rule that is
+`operator` principals, or ADR-0154's `adapter` principal. A set answers only "is this actor in the set"; every rule that is
 not membership lives in the authorizer, applied identically whatever the set. Requester
 equality is deliberately not a rule: the selected set is always consulted, so a requester
 who belongs may confirm and one who does not remains denied. A deployment that needs
@@ -400,8 +437,23 @@ Slack feature.
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
   (`apps/api/src/curie_api/schemas.py::_SLACK_USER_ID`), never a handle or a name, so even this
   "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
-  for `operator` principals; Console principals may use it or a verified user group. The
-  authenticated subject must appear in the selected set.
+  for `operator` principals; Console principals may use it or a verified user group. It
+  refuses `adapter` principals: its entries are Slack IDs, and only the Slack dispatcher
+  vouches for a Slack ID (ADR-0106), so an adapter naming a listed ID proves nothing
+  ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). The authenticated subject must appear in the selected set.
+
+- **`RequesterOnly`** ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), `approvers.py`), the set for a card shown in a non-Slack
+  conversation, such as an email thread. The selector picks it when the card went to the
+  conversation that asked (a routeless approval, or a route in `requesting_surface` mode,
+  `apps/api/src/curie_api/approvers.py::card_on_requesting_surface`) and that conversation is not Slack. It
+  admits one actor, the approval's `author`, and only through an `adapter` principal: the
+  resolve route has already checked that the adapter serves the binding the card went to
+  (`apps/api/src/curie_api/crud.py::_approval_served`), and no `chat`, `console` or `operator` principal is
+  eligible, whatever subject it names. It is a confirmation step by the requester, not a
+  second person's sign-off, and an interim until approvers are principals linked to every
+  channel identity (ADR-0166, #2910). A route that lists approvers and lands on a non-Slack
+  conversation is escalated by the worker when the approval is raised; approvers added to
+  such a route while an approval pends make it admit nobody (`InvalidApprovers`).
 
 Platform-RBAC remains the epic's fourth set and is not built.
 
@@ -449,11 +501,26 @@ not depend on card location. Terminal principals remain explicit-user-only. A Co
 principal may use the server-side group lookup because its session authenticates the
 subject, but it still cannot satisfy channel membership without an attested channel.
 
-`resolution.kind` is the explicit extension point, but the writer rejects every kind except
-Slack today. A second interactive channel first needs an adapter-scoped credential that
-establishes a verified resolver identity; this change does not build that credential or
-turn notification delivery into resolution. Notification `endpoint` and `adapter` remain
-stored server-side for egress and are omitted from read responses.
+`resolution.kind` is the explicit extension point, but the writer rejects every fixed kind
+except Slack today. Notification `endpoint` and `adapter` remain stored server-side for
+egress and are omitted from read responses.
+
+**A route may instead show its card where the request was asked ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)).** A
+`resolution` of exactly `{"mode": "requesting_surface"}` sends the card into the
+conversation that asked, on whatever channel that is, the way a routeless approval's card
+already goes. Anything else beside `mode`, a mix of the mode and a fixed target, or a
+`notification` on such a route is refused by the API writer, by the CLI's route file
+reader and again by the worker's parse of the stored row. Who may answer follows the
+channel the card lands on: Slack keeps the sets above, and any other channel takes
+`RequesterOnly`. The card is answered only where it is shown.
+
+```
+approval_routes: {
+  "confirm": {
+    "resolution": {"mode": "requesting_surface"}   # no notification allowed
+  }
+}
+```
 
 **Precedence: `users` > `group` > channel membership.** When `users` is set, `group` is
 ignored and no Slack call is made. When neither is declared, channel membership decides.
@@ -490,14 +557,21 @@ resolves normally; nothing is lost.
 ### The three ports
 
 **`ApproverSet`** (`approvers.py`) is the black line #420 draws: `async contains(actor,
-actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`, and
-`console_eligible` policies for the audit and principal eligibility checks. It is async
+actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`,
+`console_eligible`, and `adapter_eligible` policies for the audit and principal eligibility
+checks. It is async
 because a set may own a lookup; `ExplicitUsers` simply never awaits. `MembershipVerdict`
 carries a third state beyond member/not-member: `undetermined`, meaning the set could not
 find out. The authorizer fails closed on it, and it is deliberately never collapsed into
 `member=False` — "you are not in the set" and "we could not check" deny for different
 reasons, and telling a clicker the first when the second is true sends them arguing with
 policy over an outage.
+
+`operator_eligible` governs the `operator` principal. Only `ExplicitUsers` sets it, so an
+operator cannot inherit a channel or user-group membership proof. `adapter_eligible`
+governs the `adapter` principal, and no Slack set sets it: every Slack set names Slack IDs,
+which an adapter cannot vouch for. The config sentinels (`InvalidApprovers`,
+`UnboundRoute`) set every flag so their own fail-closed reason reaches the audit row.
 
 The two Slack sets are asymmetrical and the port does not hide it. `contains` takes
 `actor_channel` precisely because channel membership proves membership from the authenticated
@@ -567,8 +641,22 @@ bindings (where the verified card resolves, where a text-only notification goes,
 approve) are per-agent deployment config (#247, #1460).
 
 The audit trail now records both halves rather than overstating either one. Authentication
-establishes the actor and writes `principal_kind` (`chat`, `console`, or `operator`) with
-`authenticated=true`; authorization writes the selected set's evidence and verdict.
+establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`, or
+`adapter`) with `authenticated=true`; authorization writes the selected set's evidence
+and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
+the sender it vouches for: the sender is carried as `actor` from the
+`X-Curie-Approval-Actor` header, and no Slack approver set admits an adapter, not even an
+explicit user list ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). An adapter is served, and so may list
+and resolve, an approval whose card went to one of its own bindings on the same agent:
+the conversation that asked (routeless or `requesting_surface`), matched on the record's
+`(reply_kind, reply_channel)` pair, or a fixed route target the recorded `card_channel`
+names. Where the card went is read from the record, not the current route: re-pointing a
+route after the ask neither moves the card nor hands the approval to the new target's
+adapter, and approvers added meanwhile make a non-Slack card admit nobody. The record
+keeps the card's address but not its kind, so a non-Slack asking address shaped like a
+Slack channel ID is read as a possible Slack card, which no adapter may answer. On a
+non-Slack conversation the `RequesterOnly` set then admits the sender it names only when
+that sender is the approval's author.
 Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
 An audit row may truthfully show the same principal as requester and approver: that says
 one authenticated member confirmed their own request, not that a second person reviewed it.
@@ -578,3 +666,5 @@ one authenticated member confirmed their own request, not that a second person r
 - **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
 - **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
+- **Additional ADR:** [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.
+- **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.

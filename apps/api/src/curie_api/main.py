@@ -43,6 +43,7 @@ from .resumereconciler import ResumeReconciler
 from .routers import (
     actions,
     agents,
+    approval_recovery,
     approvals,
     bundles,
     channels,
@@ -53,23 +54,30 @@ from .routers import (
     deploy_targets,
     deployments,
     evals,
+    factory_status,
     gitflow_routing,
     github,
     github_reviews,
+    hook_fire,
     hooks,
     memory,
     observability,
+    publication_precheck,
     publications,
     runs,
+    schedules,
     state,
+    turn_progress,
+    work_item_outcomes,
+    work_items,
     workspaces,
 )
 from .schema_compat import assert_servable
-from .slack_approvers import SlackApproverSetSelector
-from .slack_usergroups import SlackUserGroupClient
+from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
 
@@ -113,6 +121,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sessionmaker,
         valkey,
         settings,
+        http_client,
     )
     app.state.github_review_reconciler_task = (
         asyncio.create_task(app.state.github_review_reconciler.run_forever())
@@ -122,21 +131,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. The usergroup
-    # client shares the app's httpx client and is None when no bot token is
-    # configured, which is the normal Slack-free deployment -- a route that
-    # declares an approvers group then fails closed at resolve time rather than
-    # silently widening.
-    usergroups = (
-        SlackUserGroupClient(
-            http_client,
-            token=settings.slack_bot_token,
-            ttl_s=settings.slack_usergroup_cache_ttl_s,
-        )
-        if settings.slack_bot_token
-        else None
-    )
-    app.state.approver_sets = SlackApproverSetSelector(usergroups)
+    # resolve endpoint depend on ports rather than on a provider. Each Slack
+    # identity's usergroup client shares the app's httpx client (ADR-0168
+    # decision 5); with no bot token there is none, the normal Slack-free
+    # deployment, and a route that declares an approvers group then fails
+    # closed at resolve time rather than silently widening.
+    app.state.approver_sets = build_approver_set_selector(http_client, settings)
     app.state.github_reporter = GitHubStatusReporter(
         http_client,
         api_url=settings.github_api_url,
@@ -155,6 +155,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         dead_letter_scan_limit=settings.resume_dead_letter_scan_limit,
     )
     app.state.resume_reconciler = reconciler
+    work_item_reconciler = WorkItemReconciler(
+        app.state.sessionmaker,
+        valkey,
+        settings,
+    )
+    app.state.work_item_reconciler = work_item_reconciler
+    app.state.work_item_reconciler_task = (
+        asyncio.create_task(work_item_reconciler.run_forever())
+        if settings.work_item_reconciler_enabled
+        else None
+    )
     app.state.resume_reconciler_task = (
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
@@ -172,9 +183,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.resume_queue,
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
-                publication_patch_retention_seconds=(
-                    settings.publication_patch_retention_seconds
-                ),
+                publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
             )
         )
     else:
@@ -220,6 +229,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         level=settings.log_level.upper(),
     )
     app.state.telemetry = telemetry
+    for limit in ("value", "namespace"):
+        record_metric(
+            "curie.history.persistence.failure",
+            0,
+            attributes={
+                "service.name": "curie-api",
+                "source": "state-api",
+                "outcome": "capacity",
+                "limit": limit,
+            },
+        )
     try:
         yield
     finally:
@@ -233,6 +253,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Both background loops enqueue via resume_queue (which uses the valkey
         # client) and read via the sessionmaker, so both are stopped BEFORE
         # valkey.aclose()/engine.dispose() below.
+        work_item_task = getattr(app.state, "work_item_reconciler_task", None)
+        if work_item_task is not None:
+            work_item_task.cancel()
+            try:
+                await work_item_task
+            except asyncio.CancelledError:
+                pass
         task = getattr(app.state, "resume_reconciler_task", None)
         if task is not None:
             task.cancel()
@@ -378,12 +405,22 @@ def create_app() -> FastAPI:
     app.include_router(control.router)
     app.include_router(evals.router)
     app.include_router(runs.router)
+    app.include_router(schedules.router)
+    app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(memory.router)
+    # BEFORE approvals.router: GET /approvals/identity-report would otherwise
+    # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
+    app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(work_items.router)
+    app.include_router(factory_status.router)
+    app.include_router(turn_progress.router)
+    app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspaces.router)

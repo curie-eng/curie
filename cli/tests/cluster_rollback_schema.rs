@@ -5,69 +5,329 @@
 //! 0.8.4's migrate init container does not know. This file pins the additional
 //! pre-mutation gate. Status filtering stays in `cluster_rollback.rs`.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Output;
 
 use curie::exit::classify;
 use curie::ops::{
     parse_helm_history, rollback, select_rollback_revision, ClusterRollbackOutput, CommonOpts,
     HelmRevision, RollbackOpts,
 };
-use curie::schema_window::{live_in_window, window_for};
+use curie::schema_compat::{pending_revisions, plan_upgrade, TargetMetadata};
+use curie::schema_window::{live_in_window, newest_fail_forward, window_for};
 
-/// Release v0.8.7 carries the same Alembic head as v0.8.6. Pin both the
-/// accepted live head and the fail-closed boundary for an unknown successor.
-#[test]
-fn v087_accepts_0039_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.8.7").expect("0.8.7 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0039");
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0040", &window));
+fn catalog_marks_artifact_identity_ambiguous(version: &str) -> bool {
+    let catalog: serde_json::Value =
+        serde_json::from_str(include_str!("../src/application_schema_windows.json"))
+            .expect("application schema catalog parses");
+    catalog["windows"][version]["artifact_identity_ambiguous"]
+        .as_bool()
+        .unwrap_or(false)
 }
 
-/// Release v0.8.8 carries Alembic head 0044. Pin both the
-/// accepted live head and the fail-closed boundary for an unknown successor.
+/// Keep each release's catalog window and accepted boundaries in one table.
 #[test]
-fn v088_accepts_0044_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.8.8").expect("0.8.8 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0044");
-    assert!(live_in_window("0044", &window));
-    assert!(!live_in_window("0045", &window));
+fn release_catalog_windows_match_their_revision_boundaries() {
+    let catalog: serde_json::Value =
+        serde_json::from_str(include_str!("../src/application_schema_windows.json"))
+            .expect("application schema catalog parses");
+
+    type ReleaseCase<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        bool,
+        bool,
+    );
+    let cases: &[ReleaseCase<'_>] = &[
+        ("0.8.7", "0001", "0039", &["0039"], &["0040"], false, false),
+        ("0.8.8", "0001", "0039", &["0039"], &["0044"], true, false),
+        ("0.8.9", "0001", "0039", &["0039"], &["0044"], true, false),
+        (
+            "0.9.0",
+            "0001",
+            "0044",
+            &["0039", "0044"],
+            &["0045"],
+            false,
+            false,
+        ),
+        (
+            "0.9.1",
+            "0001",
+            "0044",
+            &["0039", "0044"],
+            &["0045"],
+            false,
+            false,
+        ),
+        (
+            "0.9.2",
+            "0045",
+            "0045",
+            &["0045"],
+            &["0044", "0046"],
+            false,
+            false,
+        ),
+        (
+            "0.10.0-rc.1",
+            "0045",
+            "0057",
+            &["0045", "0056", "0057"],
+            &["0044"],
+            false,
+            true,
+        ),
+        (
+            "0.10.0-rc.2",
+            "0045",
+            "0057",
+            &["0045", "0056", "0057"],
+            &["0044"],
+            false,
+            true,
+        ),
+    ];
+
+    for (version, schema_min, schema_head, accepted, refused, ambiguous, prefixed_alias) in cases {
+        let window = window_for(version).unwrap_or_else(|| panic!("{version} is catalogued"));
+        assert_eq!(window.schema_min, *schema_min, "{version}");
+        assert_eq!(window.schema_head, *schema_head, "{version}");
+        for revision in *accepted {
+            assert!(
+                live_in_window(revision, &window),
+                "{version} accepts {revision}"
+            );
+        }
+        for revision in *refused {
+            assert!(
+                !live_in_window(revision, &window),
+                "{version} refuses {revision}"
+            );
+        }
+        assert_eq!(
+            catalog_marks_artifact_identity_ambiguous(version),
+            *ambiguous,
+            "{version} artifact identity ambiguity"
+        );
+        if *prefixed_alias {
+            assert!(catalog["windows"].get(*version).is_some());
+            assert_eq!(
+                window_for(&format!("v{version}"))
+                    .expect("prefixed release candidate is catalogued")
+                    .schema_head,
+                window.schema_head,
+                "{version} prefixed alias"
+            );
+        }
+    }
 }
 
-/// Release v0.8.9 carries Alembic head 0044. Pin both the accepted live head
-/// and the fail-closed boundary for an unknown successor.
 #[test]
-fn v089_accepts_0044_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.8.9").expect("0.8.9 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0044");
-    assert!(live_in_window("0044", &window));
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0045", &window));
+fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1"], "0057").as_deref(),
+        Some("0.10.0-rc.1")
+    );
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1", "0.10.0"], "0057").as_deref(),
+        Some("0.10.0")
+    );
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1", "0.10.0-rc.2"], "0057").as_deref(),
+        Some("0.10.0-rc.2")
+    );
 }
 
-/// Release v0.9.0 carries Alembic head 0044. Pin both the accepted live head
-/// and the fail-closed boundary for an unknown successor.
+/// Released 0.9.1 reports catalog head 0044. The packaged chart applies
+/// expansions through 0059, contracts 0060 and 0063, feature-train expansions
+/// through 0069, route-identity contract 0070, then memory-writes expansion
+/// 0071, so the upgrade is forward-only.
 #[test]
-fn v090_accepts_0044_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.9.0").expect("0.9.0 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0044");
-    assert!(live_in_window("0044", &window));
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0045", &window));
+fn v091_source_upgrades_through_the_packaged_chart_graph() {
+    let source = window_for("0.9.1").expect("0.9.1 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0044");
+    assert_eq!(target.schema_min, "0070");
+    assert_eq!(target.schema_head, "0071");
+
+    let pending =
+        pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(
+        revisions,
+        [
+            "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
+            "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
+            "0067", "0068", "0069", "0070", "0071"
+        ]
+    );
+    let contracts: Vec<&str> = pending
+        .iter()
+        .filter(|step| step.kind == "contract")
+        .map(|step| step.revision.as_str())
+        .collect();
+    assert_eq!(contracts, ["0060", "0063", "0070"]);
+    assert!(pending
+        .iter()
+        .all(|step| step.kind == "expand" || contracts.contains(&step.revision.as_str())));
+
+    let refused = plan_upgrade(
+        Some("0044"),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(refused.action, "refuse");
+
+    let decision = plan_upgrade(
+        Some("0044"),
+        &target,
+        &pending,
+        true,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+    assert_eq!(decision.source_head.as_deref(), Some("0044"));
+    assert_eq!(decision.target_min, "0070");
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut perms = fs::metadata(&path).expect("stat fake").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod fake executable");
+#[test]
+fn released_v0101_upgrades_through_the_new_feature_train_revision() {
+    let source = window_for("0.10.1").expect("released 0.10.1 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0058");
+    assert_eq!(target.schema_head, "0071");
+    let pending = pending_revisions(Some(&source.schema_head), &target)
+        .expect("released 0.10.1 reaches the new head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(
+        revisions,
+        [
+            "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
+            "0070", "0071"
+        ]
+    );
+
+    // Contracts 0060, 0063, and 0070 are pending, so 0.10.1 needs the forward flag.
+    let refused = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(refused.action, "refuse");
+    let decision = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        true,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+    assert_eq!(decision.target_min, "0070");
+}
+
+/// Released 0.10.2 stamps 0062. Stable 0.10.3 follows with contract 0063,
+/// the feature train continues with expansions through 0069, contract
+/// 0070 establishes route identity, and expansion 0071 adds memory writes.
+#[test]
+fn released_v0102_upgrades_through_the_feature_train_revisions() {
+    let source = window_for("0.10.2").expect("released 0.10.2 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0062");
+    let pending = pending_revisions(Some(&source.schema_head), &target)
+        .expect("released 0.10.2 reaches the new head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(
+        revisions,
+        ["0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071"]
+    );
+    let contracts: Vec<&str> = pending
+        .iter()
+        .filter(|step| step.kind == "contract")
+        .map(|step| step.revision.as_str())
+        .collect();
+    assert_eq!(contracts, ["0063", "0070"]);
+
+    let refused = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(refused.action, "refuse");
+    let decision = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        true,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+}
+
+/// Released 0.10.3 owns revision 0063. The feature train must start after it,
+/// so an upgrade applies every unreleased expansion without mistaking the
+/// released factory queue migration for runner resources. Route identity 0070
+/// is the only contract step; memory writes 0071 expands after it.
+#[test]
+fn released_v0103_upgrades_through_the_renumbered_feature_train() {
+    let source = window_for("0.10.3").expect("released 0.10.3 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0063");
+    let pending = pending_revisions(Some(&source.schema_head), &target)
+        .expect("released 0.10.3 reaches the new head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(
+        revisions,
+        ["0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071"]
+    );
+    let contracts: Vec<&str> = pending
+        .iter()
+        .filter(|step| step.kind == "contract")
+        .map(|step| step.revision.as_str())
+        .collect();
+    assert_eq!(contracts, ["0070"]);
+
+    let refused = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(refused.action, "refuse");
+    let decision = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        true,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
 }
 
 fn rollback_opts() -> RollbackOpts {
@@ -83,6 +343,131 @@ fn rollback_opts() -> RollbackOpts {
         disable_schema_gate: false,
         live_schema_revision: None,
     }
+}
+
+fn two_revision_history(target: &str, current: &str) -> String {
+    format!(
+        r#"[
+          {{"revision":1,"status":"superseded","chart":"curie-{target}","app_version":"{target}","description":"Upgrade complete"}},
+          {{"revision":2,"status":"deployed","chart":"curie-{current}","app_version":"{current}","description":"Upgrade complete"}}
+        ]"#
+    )
+}
+
+fn compatibility_manifest(name: &str, app: &str, schema_min: &str, schema_head: &str) -> String {
+    format!(
+        r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {name}
+  labels:
+    app.kubernetes.io/component: schema-compat
+data:
+  application-version: "{app}"
+  compatibility.json: |
+    {{"schema_min":"{schema_min}","schema_head":"{schema_head}","revisions":[]}}
+"#
+    )
+}
+
+struct RollbackFixture {
+    dir: tempfile::TempDir,
+}
+
+impl RollbackFixture {
+    fn new(history: &str, live: &str, manifest: Result<&str, &str>) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history_path = dir.path().join("history.json");
+        let manifest_path = dir.path().join("manifest.yaml");
+        let manifest_error_path = dir.path().join("manifest.err");
+        let helm_log = dir.path().join("helm-argv.log");
+        let kubectl_log = dir.path().join("kubectl-argv.log");
+        fs::write(&history_path, history).expect("write history");
+        let manifest_action = match manifest {
+            Ok(rendered) => {
+                fs::write(&manifest_path, rendered).expect("write manifest");
+                format!("cat '{}'", manifest_path.display())
+            }
+            Err(error) => {
+                fs::write(&manifest_error_path, error).expect("write manifest error");
+                format!("cat '{}' >&2; exit 1", manifest_error_path.display())
+            }
+        };
+        test_executable::install_in(
+            dir.path(),
+            "helm",
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> '{helm_log}'\n\
+                 case \"$1:$2\" in\n\
+                 history:*) cat '{history}' ;;\n\
+                 get:manifest) {manifest_action} ;;\n\
+                 rollback:*) echo 'Rollback was a success.' ;;\n\
+                 *) echo \"unexpected helm invocation: $*\" >&2; exit 1 ;;\n\
+                 esac\n",
+                helm_log = helm_log.display(),
+                history = history_path.display(),
+            ),
+        );
+        test_executable::install_in(
+            dir.path(),
+            "kubectl",
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> '{kubectl_log}'\n\
+                 echo '{live} (head)'\n",
+                kubectl_log = kubectl_log.display(),
+            ),
+        );
+        Self { dir }
+    }
+
+    fn run(&self, extra: &[&str]) -> Output {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![self.dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&existing));
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
+        cmd.args(["cluster", "rollback"])
+            .args(["--namespace", "agent-ns", "--release", "prod-release"])
+            .args(["--yes", "--json"])
+            .args(extra)
+            .env("PATH", std::env::join_paths(paths).expect("join PATH"))
+            .env("NO_COLOR", "1");
+        cmd.output().expect("run curie cluster rollback")
+    }
+
+    fn helm_log(&self) -> String {
+        fs::read_to_string(self.dir.path().join("helm-argv.log")).unwrap_or_default()
+    }
+
+    fn kubectl_log(&self) -> String {
+        fs::read_to_string(self.dir.path().join("kubectl-argv.log")).unwrap_or_default()
+    }
+
+    fn assert_no_mutation(&self) {
+        let helm = self.helm_log();
+        assert!(
+            !helm.lines().any(|line| line.starts_with("rollback ")),
+            "refusal must not invoke helm rollback: {helm}"
+        );
+        let kubectl = self.kubectl_log();
+        for verb in ["rollout", "scale", "patch", "delete", "apply", "replace"] {
+            assert!(
+                !kubectl.split_whitespace().any(|token| token == verb),
+                "refusal must not mutate workloads with {verb}: {kubectl}"
+            );
+        }
+    }
+}
+
+fn json_payload(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!(
+            "expected JSON output, got stdout={stdout:?} stderr={:?}: {error}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 /// Issue #2296 history: a failed Helm revision sits between 0.8.4 and 0.8.5,
@@ -159,19 +544,21 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
     std::env::set_var("FAKE_HELM_ROLLBACK_LOG", &rollback_log);
     std::env::set_var("FAKE_KUBECTL_LOG", &kubectl_log);
 
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         "#!/bin/sh\n\
+         echo \"$*\" >> \"$FAKE_HELM_ROLLBACK_LOG\"\n\
          case \"$1\" in\n\
          history) cat \"$FAKE_HELM_HISTORY\" ;;\n\
-         rollback) echo \"$*\" >> \"$FAKE_HELM_ROLLBACK_LOG\"; echo 'Rollback was a success.' ;;\n\
+         get) echo 'schema gate read must be disabled' >&2; exit 1 ;;\n\
+         rollback) echo 'Rollback was a success.' ;;\n\
          *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
          esac\n",
     );
     // Probe stdout is only the alembic current line. Stderr plants a DSN so a
     // leak in the refusal would fail the redaction assertion below.
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "kubectl",
         "#!/bin/sh\n\
@@ -209,9 +596,12 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
             && !fix.contains("secret-password"),
         "the refusal must not leak the probe DSN: shown={shown} fix={fix}"
     );
+    let first_helm_log = fs::read_to_string(&rollback_log).unwrap_or_default();
     assert!(
-        !rollback_log.exists() || fs::read_to_string(&rollback_log).unwrap().is_empty(),
-        "helm rollback must not have been invoked"
+        !first_helm_log
+            .lines()
+            .any(|line| line.starts_with("rollback ")),
+        "helm rollback must not have been invoked: {first_helm_log}"
     );
     let kubectl = fs::read_to_string(&kubectl_log).unwrap_or_default();
     assert!(
@@ -225,34 +615,217 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
         );
     }
 
-    // Negative control: removing the schema gate allows the unsafe attempt.
+    // Negative control: an ambiguous target still performs no retained
+    // manifest read when the whole schema gate is disabled.
+    fs::write(&history_json, two_revision_history("0.8.9", "0.9.0"))
+        .expect("write ambiguous history");
     let mut opts = rollback_opts();
     opts.disable_schema_gate = true;
     let out = rollback(opts)
         .await
-        .expect("without the schema gate the status filter admits 0.8.4");
+        .expect("without the schema gate the status filter admits 0.8.9");
     match out {
         ClusterRollbackOutput::RolledBack {
             to_revision,
             skipped,
             ..
         } => {
-            assert_eq!(to_revision, 1, "status-eligible target is v0.8.4");
-            assert_eq!(skipped, vec![2]);
+            assert_eq!(to_revision, 1, "status eligible target is v0.8.9");
+            assert!(skipped.is_empty());
         }
         other => panic!("expected a completed rollback, got {other:?}"),
     }
     let logged = fs::read_to_string(&rollback_log).expect("helm rollback ran");
-    assert_eq!(
-        logged.trim(),
-        "rollback prod-release 1 -n agent-ns",
-        "removing the schema gate must allow the unsafe helm rollback"
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "rollback prod-release 1 -n agent-ns"),
+        "removing the schema gate must allow the unsafe helm rollback: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| line.starts_with("get manifest ")),
+        "the disabled schema gate must not inspect retained manifests: {logged}"
     );
 
     match std::env::var_os("PATH") {
         Some(_) => std::env::set_var("PATH", existing),
         None => std::env::remove_var("PATH"),
     }
+}
+
+#[test]
+fn published_v089_without_labeled_metadata_refuses_live_0044_before_mutation() {
+    let history = two_revision_history("v0.8.9", "0.9.0");
+    let manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: byo-config\n  labels:\n    app.kubernetes.io/component: api\ndata:\n  note: no schema metadata\n";
+    let fixture = RollbackFixture::new(&history, "0044", Ok(manifest));
+    let output = fixture.run(&[]);
+    assert!(!output.status.success(), "published 0.8.9 must be refused");
+    let payload = json_payload(&output);
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("0.8.9") && error.contains("0039") && error.contains("0044"),
+        "refusal must name 0.8.9, published head 0039, and live head 0044: {payload}"
+    );
+    let fix = payload["fix"].as_str().unwrap_or_default();
+    assert!(
+        fix.contains("fail forward to application 0.9.0"),
+        "published refusal must lead with the safe fail forward path: {payload}"
+    );
+    assert!(
+        !fix.contains("repair") && !fix.contains("retry"),
+        "successfully classified published metadata must not suggest repair or retry: {payload}"
+    );
+    assert!(
+        fix.contains("helm get manifest prod-release -n agent-ns --revision 1"),
+        "published classification must explain how to inspect the retained manifest: {payload}"
+    );
+    assert!(
+        fix.contains("absent") && fix.contains("published") && fix.contains("0039"),
+        "published classification must explain that absent labeled metadata selects the catalog head: {payload}"
+    );
+    assert!(
+        fix.contains("helm rollback prod-release 1 -n agent-ns")
+            && fix.contains("operator")
+            && fix.contains("risk"),
+        "refusal must preserve the explicit operator owned raw Helm escape: {payload}"
+    );
+    assert!(
+        fixture
+            .helm_log()
+            .contains("get manifest prod-release -n agent-ns --revision 1"),
+        "selected retained manifest was not inspected: {}",
+        fixture.helm_log()
+    );
+    fixture.assert_no_mutation();
+}
+
+#[test]
+fn historical_v089_candidate_enforces_its_complete_window() {
+    let history = two_revision_history("v0.8.9", "0.9.0");
+    let manifest = compatibility_manifest("candidate", "0.8.9", "0044", "0044");
+    let compatible = RollbackFixture::new(&history, "0044", Ok(&manifest));
+    let output = compatible.run(&[]);
+    assert!(
+        output.status.success(),
+        "known candidate window should roll back: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(json_payload(&output)["rolled_back"], true);
+    assert!(compatible
+        .helm_log()
+        .lines()
+        .any(|line| line == "rollback prod-release 1 -n agent-ns"));
+
+    let below_floor = RollbackFixture::new(&history, "0039", Ok(&manifest));
+    let output = below_floor.run(&[]);
+    assert!(
+        !output.status.success(),
+        "candidate floor 0044 must refuse 0039"
+    );
+    let payload = json_payload(&output);
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("0044") && error.contains("0039"),
+        "{payload}"
+    );
+    below_floor.assert_no_mutation();
+}
+
+#[test]
+fn ambiguous_v089_metadata_failures_refuse_without_mutation() {
+    let history = two_revision_history("0.8.9", "0.9.0");
+    let first = compatibility_manifest("first", "0.8.9", "0044", "0044");
+    let conflicting = format!(
+        "{first}\n---\n{}",
+        compatibility_manifest("second", "0.8.9", "0039", "0044")
+    );
+    let cases = vec![
+        ("invalid yaml", "apiVersion: [".to_string()),
+        (
+            "labeled missing payload",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: missing\n  labels:\n    app.kubernetes.io/component: schema-compat\ndata: {}\n".to_string(),
+        ),
+        (
+            "malformed payload",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: malformed\n  labels:\n    app.kubernetes.io/component: schema-compat\ndata:\n  application-version: \"0.8.9\"\n  compatibility.json: \"not json\"\n".to_string(),
+        ),
+        (
+            "application version mismatch",
+            compatibility_manifest("mismatch", "0.8.8", "0044", "0044"),
+        ),
+        ("conflicting metadata", conflicting),
+        (
+            "unknown minimum",
+            compatibility_manifest("unknown-min", "0.8.9", "9998", "0044"),
+        ),
+        (
+            "unknown head",
+            compatibility_manifest("unknown-head", "0.8.9", "0044", "9999"),
+        ),
+    ];
+    for (name, manifest) in cases {
+        let fixture = RollbackFixture::new(&history, "0044", Ok(&manifest));
+        let output = fixture.run(&[]);
+        assert!(
+            !output.status.success(),
+            "{name} must fail closed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fixture.assert_no_mutation();
+    }
+
+    let read_failure = RollbackFixture::new(
+        &history,
+        "0044",
+        Err("postgresql://curie:secret-password@postgres:5432/curie"),
+    );
+    let output = read_failure.run(&[]);
+    assert!(
+        !output.status.success(),
+        "manifest read failure must refuse"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let payload = json_payload(&output);
+    let fix = payload["fix"].as_str().unwrap_or_default();
+    assert!(fix.contains("helm get manifest prod-release -n agent-ns --revision 1"));
+    assert!(fix.contains("0039") && fix.contains("absent") && fix.contains("published"));
+    assert!(fix.contains("repair") && fix.contains("retry"));
+    assert!(fix.contains("helm rollback prod-release 1 -n agent-ns") && fix.contains("risk"));
+    assert!(!stdout.contains("secret-password") && !stderr.contains("secret-password"));
+    assert!(!stdout.contains("postgresql://") && !stderr.contains("postgresql://"));
+    read_failure.assert_no_mutation();
+}
+
+#[test]
+fn identical_candidate_metadata_is_accepted() {
+    let history = two_revision_history("0.8.9", "0.9.0");
+    let manifest = format!(
+        "{}\n---\n{}",
+        compatibility_manifest("first", "v0.8.9", "0044", "0044"),
+        compatibility_manifest("second", "0.8.9", "0044", "0044")
+    );
+    let fixture = RollbackFixture::new(&history, "0044", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "identical metadata must agree");
+    assert_eq!(json_payload(&output)["rolled_back"], true);
+}
+
+#[test]
+fn unambiguous_v090_does_not_read_retained_manifest() {
+    let history = two_revision_history("0.9.0", "0.9.1");
+    let fixture = RollbackFixture::new(&history, "0044", Err("must not read manifest"));
+    let output = fixture.run(&[]);
+    assert!(
+        output.status.success(),
+        "unambiguous 0.9.0 must remain supported"
+    );
+    let log = fixture.helm_log();
+    assert!(!log.lines().any(|line| line.starts_with("get manifest ")));
+    assert!(log
+        .lines()
+        .any(|line| line == "rollback prod-release 1 -n agent-ns"));
 }
 
 fn run_rollback_json(dir: &Path) -> std::process::Output {
@@ -276,7 +849,7 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let history = dir.path().join("history.json");
     fs::write(&history, issue_2296_history_json()).expect("write history");
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         &format!(
@@ -291,7 +864,7 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
             history = history.display(),
         ),
     );
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "kubectl",
         "#!/bin/sh\necho 'postgresql://curie:secret-password@postgres:5432/curie' >&2\necho '0039 (head)'\n",

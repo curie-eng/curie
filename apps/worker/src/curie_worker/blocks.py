@@ -28,9 +28,18 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-from channel_protocol import ChoiceIntent, ConfirmIntent, OutboundMessage
+from channel_protocol import (
+    ChoiceIntent,
+    ConfirmIntent,
+    OutboundMessage,
+    ProgressCard,
+    ProgressMilestone,
+    progress_heading,
+    progress_text,
+)
 from pydantic import ValidationError
 
 from .behaviorpacks import BehaviorPacks, NavPack, ensure_hub_button
@@ -383,7 +392,13 @@ def approval_card(
 
 
 def resolved_approval_card(
-    *, summary: str, requested_by: str, decision: str, resolver: str, note: str | None
+    *,
+    summary: str,
+    requested_by: str,
+    decision: str,
+    resolver: str,
+    note: str | None,
+    resolved_at: datetime | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """The approval card rebuilt in its RESOLVED form (#1084).
 
@@ -400,40 +415,104 @@ def resolved_approval_card(
 
     from curie_dispatcher.approval_actions import (
         settled_approval_card,
+        settled_card_header,
         settled_verdict_line,
     )
 
     return settled_approval_card(
         summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),
         requested_by=requested_by,
-        verdict=settled_verdict_line(decision=decision, resolver=resolver, note=note),
+        verdict=settled_verdict_line(
+            decision=decision, resolver=resolver, note=note, resolved_at=resolved_at
+        ),
+        header=settled_card_header(decision),
     )
 
 
-def expired_approval_card(*, summary: str) -> tuple[str, list[dict[str, Any]]]:
+def expired_approval_card(
+    *, summary: str, requested_by: str = ""
+) -> tuple[str, list[dict[str, Any]]]:
     """The approval card rebuilt in its EXPIRED, no-longer-actionable form (#419).
 
     The same summary the live card showed, with the Approve/Reject actions block
     dropped and an expiry line in its place -- so the card cannot be clicked and
-    reads as settled. This is the expiry mirror of the dispatcher's resolved-card
-    edit, rebuilt from the remembered summary because the worker does not keep the
-    original card's blocks. Returns ``(fallback_text, blocks)`` for ``chat.update``.
+    reads as settled. Rendered by the same settled-card builder as a resolved
+    card, headed ``Expired`` and naming the requester when it is known
+    (ADR-0179); an expiry has no decision time. Returns ``(fallback_text,
+    blocks)`` for ``chat.update``.
     """
 
-    clamped = _truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX)
-    fallback = _truncate(f"Approval expired: {summary}", _SLACK_TEXT_MAX)
+    from curie_dispatcher.approval_actions import settled_approval_card, settled_card_header
+
+    return settled_approval_card(
+        summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),
+        requested_by=requested_by,
+        verdict="This request expired and can no longer be approved or rejected.",
+        header=settled_card_header("expired"),
+    )
+
+
+# --- Deliberate progress (ADR-0130) -----------------------------------------------
+
+# Every block of a card, and every block of a milestone, starts with its prefix.
+# The CLI's Slack stub tells progress from the answer by them, so they are
+# frozen with it in tests/vectors/progress-blocks.json.
+PROGRESS_CARD_BLOCK_ID_PREFIX = "curie-progress-card:"
+PROGRESS_MILESTONE_BLOCK_ID_PREFIX = "curie-progress-milestone:"
+
+_PROGRESS_CLOSED_LINE = "This task is closed. The card will not change again."
+
+
+def _plain(text: str) -> dict[str, Any]:
+    """A text object Slack shows as written: no mention, link or emoji code forms."""
+    return {"type": "plain_text", "text": text, "emoji": False}
+
+
+def _slack_escaped(text: str) -> str:
+    """``text`` for a field Slack parses, with its three control characters escaped.
+
+    ``&`` first, so the entities the other two become are not escaped again.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def progress_card(card: ProgressCard) -> tuple[str, list[dict[str, Any]]]:
+    """The progress card as ``(fallback_text, blocks)`` for a post or an edit.
+
+    @spec ADR-0130 d2, d5. The worker README section "How the Slack adapter
+    renders progress" is the contract. Block ids carry the revision because an
+    edited message should get new ones.
+    """
+
+    prefix = f"{PROGRESS_CARD_BLOCK_ID_PREFIX}r{card.revision}:"
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "block_id": f"{prefix}state", "text": _plain(progress_heading(card))},
+        {"type": "section", "block_id": f"{prefix}summary", "text": _plain(card.summary)},
+    ]
+    if card.terminal:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": f"{prefix}closed",
+                "elements": [_plain(_PROGRESS_CLOSED_LINE)],
+            }
+        )
+    return _slack_escaped(progress_text(card)), blocks
+
+
+def progress_milestone(milestone: ProgressMilestone) -> tuple[str, list[dict[str, Any]]]:
+    """One milestone reply as ``(fallback_text, blocks)`` for ``chat.postMessage``.
+
+    @spec ADR-0130 d3, d5. Never edited, so its ids carry the ordinal alone.
+    """
+
+    prefix = f"{PROGRESS_MILESTONE_BLOCK_ID_PREFIX}{milestone.ordinal}:"
     blocks: list[dict[str, Any]] = [
         {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": _truncate("Approval expired", _HEADER_MAX),
-                "emoji": True,
-            },
+            "type": "context",
+            "block_id": f"{prefix}class",
+            "elements": [_plain(progress_heading(milestone))],
         },
-        {"type": "section", "text": {"type": "mrkdwn", "text": clamped}},
-        _context_block(
-            "This request expired and can no longer be approved or rejected."
-        ),
+        {"type": "section", "block_id": f"{prefix}summary", "text": _plain(milestone.summary)},
     ]
-    return fallback, blocks
+    return _slack_escaped(progress_text(milestone)), blocks

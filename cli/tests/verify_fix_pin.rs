@@ -1,5 +1,7 @@
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -22,16 +24,6 @@ fn write_file(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().expect("file has a parent")).expect("create parent");
     fs::write(path, body).expect("write fixture file");
-}
-
-fn write_exec(root: &Path, name: &str, body: &str) {
-    let path = root.join(name);
-    fs::write(&path, body).expect("write executable");
-    let mut permissions = fs::metadata(&path)
-        .expect("executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make executable");
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -368,7 +360,7 @@ fn direct_verifier_rejects_rust_test_flag_before_cargo_can_report_pinned() {
         "Fix Rust behavior",
     );
     let cargo_log = fixture.external_path("cargo.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "cargo",
         r#"#!/bin/sh
@@ -614,7 +606,7 @@ fn assert_tool_selector_route(
         "Fix behavior with routed assertion",
     );
     let route_log = fixture.external_path("route.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         tool,
         r#"#!/bin/sh
@@ -745,6 +737,130 @@ fn python_runner_selector_uses_uv_with_the_exact_root_command() {
 }
 
 #[test]
+fn local_python_selector_uses_the_existing_python_verifier_command() {
+    let selector = "cli/tests/local/test_pin.py::test_pin";
+    assert_tool_selector_route(
+        "cli/tests/local/test_pin.py",
+        selector,
+        "def test_pin():\n    assert 1 == 1\n",
+        "def test_pin():\n    assert 2 == 2\n",
+        "uv",
+        &["run", "--python", "3.13", "pytest", selector],
+        &format!("FAILED {selector} - AssertionError"),
+    );
+}
+
+#[test]
+fn local_python_selector_is_pinned_by_a_real_selected_assertion_failure() {
+    let selector = "cli/tests/local/test_pin.py::test_selected";
+    let fixture = Fixture::new(
+        "cli/tests/local/test_pin.py",
+        "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 1\n",
+    );
+    fixture.commit(
+        &[
+            (
+                "pyproject.toml",
+                r#"[project]
+name = "pin-fixture"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+"#,
+            ),
+            ("pin_fixture.py", "def value():\n    return 1\n"),
+        ],
+        "Add local Python fixture",
+    );
+    let change = fixture.commit(
+        &[
+            ("pin_fixture.py", "def value():\n    return 2\n"),
+            (
+                "cli/tests/local/test_pin.py",
+                "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 2\n",
+            ),
+        ],
+        "Fix local Python behavior",
+    );
+
+    let output = fixture
+        .command(&change, selector)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        output.status.success(),
+        "the local selector must prove the pin\n{shown}"
+    );
+    assert!(stdout_has_result(&output, "PINNED"), "{shown}");
+    assert!(
+        shown.contains("1 failed"),
+        "pytest must report the selected failure\n{shown}"
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
+fn local_python_selector_reports_unpinned_when_reversal_stays_green() {
+    let selector = "cli/tests/local/test_pin.py::test_selected";
+    let fixture = Fixture::new(
+        "cli/tests/local/test_pin.py",
+        "def test_selected():\n    assert True\n",
+    );
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            (
+                "cli/tests/local/test_pin.py",
+                "def test_selected():\n    assert 1 == 1\n",
+            ),
+        ],
+        "Add weak local assertion",
+    );
+    let run_log = fixture.external_path("uv-runs.log");
+    test_executable::install_in(
+        &fixture.tools,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = run ] && [ "$2" = --python ] && [ "$4" = python ]; then
+    shift 4
+    exec python3 "$@"
+fi
+printf 'run\n' >> "$VERIFY_RUN_LOG"
+exit 0
+"#,
+    );
+
+    let output = fixture
+        .command(&change, selector)
+        .env("VERIFY_RUN_LOG", &run_log)
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "an unpinned local selector must fail\n{shown}"
+    );
+    assert!(stdout_has_result(&output, "UNPINNED"), "{shown}");
+    assert_eq!(
+        fs::read_to_string(run_log).expect("read uv run log"),
+        "run\nrun\n",
+        "both selector phases must run",
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn rust_selector_uses_cargo_with_an_exact_safe_test_name() {
     assert_tool_selector_route(
         "cli/tests/verify_pin.rs",
@@ -788,11 +904,10 @@ fn one_line_rust_test_function_can_prove_a_pin() {
     );
 }
 
-#[test]
-fn unchanged_selected_python_node_refuses_a_claimed_selected_failure() {
-    let selector = "apps/api/tests/test_pin.py::test_selected";
+fn assert_unchanged_selected_python_node_refuses(selector: &str) {
+    let test_path = selector.split("::").next().expect("selector path");
     let fixture = Fixture::new(
-        "apps/api/tests/test_pin.py",
+        test_path,
         r#"def test_selected():
     assert True
 
@@ -805,7 +920,7 @@ def test_other():
         &[
             ("runner/Dockerfile", "value=fixed\n"),
             (
-                "apps/api/tests/test_pin.py",
+                test_path,
                 r#"def test_selected():
     assert True
 
@@ -818,7 +933,7 @@ def test_other():
         "Change only another Python test",
     );
     let run_log = fixture.external_path("uv-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -859,6 +974,16 @@ exit 1
 }
 
 #[test]
+fn unchanged_selected_python_node_refuses_a_claimed_selected_failure() {
+    assert_unchanged_selected_python_node_refuses("apps/api/tests/test_pin.py::test_selected");
+}
+
+#[test]
+fn unchanged_selected_local_python_node_refuses_a_claimed_failure() {
+    assert_unchanged_selected_python_node_refuses("cli/tests/local/test_pin.py::test_selected");
+}
+
+#[test]
 fn unchanged_selected_rust_node_refuses_a_claimed_selected_runtime_failure() {
     let fixture = Fixture::new(
         "cli/tests/verify_pin.rs",
@@ -893,7 +1018,7 @@ fn other_pin() {
         "Change only another Rust test",
     );
     let run_log = fixture.external_path("cargo-runs.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "cargo",
         r#"#!/bin/sh
@@ -946,7 +1071,7 @@ fn changed_selected_python_node_refuses_an_unrelated_collection_failure() {
         ],
         "Change selected Python test",
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -980,6 +1105,80 @@ exit 2
     fixture.assert_clean_and_single_worktree();
 }
 
+fn assert_local_python_reversed_failure_refused(junit: &str, reversed_exit: &str) {
+    let selector = "cli/tests/local/test_pin.py::test_selected";
+    let fixture = Fixture::new(
+        "cli/tests/local/test_pin.py",
+        "def test_selected():\n    assert 1 == 1\n",
+    );
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            (
+                "cli/tests/local/test_pin.py",
+                "def test_selected():\n    assert 2 == 2\n",
+            ),
+        ],
+        "Change selected local Python test",
+    );
+    let run_log = fixture.external_path("uv-runs.log");
+    test_executable::install_in(
+        &fixture.tools,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = run ] && [ "$2" = --python ] && [ "$4" = python ]; then
+    shift 4
+    exec python3 "$@"
+fi
+printf 'run\n' >> "$VERIFY_RUN_LOG"
+if grep -qx 'value=fixed' runner/Dockerfile; then
+    exit 0
+fi
+if [ -n "$VERIFY_JUNIT" ]; then
+    printf '%s\n' "$VERIFY_JUNIT" > "$7"
+fi
+exit "$VERIFY_REVERSED_EXIT"
+"#,
+    );
+
+    let output = fixture
+        .command(&change, selector)
+        .env("VERIFY_RUN_LOG", &run_log)
+        .env("VERIFY_JUNIT", junit)
+        .env("VERIFY_REVERSED_EXIT", reversed_exit)
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "a nonassertion local failure must be refused\n{shown}",
+    );
+    assert!(
+        shown.contains("reversed failure was not attributed"),
+        "the refusal must identify failed attribution\n{shown}",
+    );
+    assert!(!stdout_has_result(&output, "PINNED"), "{shown}");
+    assert_eq!(
+        fs::read_to_string(run_log).expect("read uv run log"),
+        "run\nrun\n",
+        "both selector phases must run",
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
+fn local_python_selector_refuses_a_setup_error() {
+    assert_local_python_reversed_failure_refused(
+        r#"<testsuites><testsuite tests="1" failures="0" errors="1"><testcase classname="cli.tests.local.test_pin" name="test_selected"><error message="setup failed" type="RuntimeError">setup failed</error></testcase></testsuite></testsuites>"#,
+        "1",
+    );
+}
+
+#[test]
+fn local_python_selector_refuses_pytest_exit_five() {
+    assert_local_python_reversed_failure_refused("", "5");
+}
+
 #[test]
 fn forged_selected_python_failure_followed_by_unrelated_teardown_error_refuses() {
     let selector = "apps/api/tests/test_pin.py::test_selected";
@@ -998,7 +1197,7 @@ fn forged_selected_python_failure_followed_by_unrelated_teardown_error_refuses()
         "Change selected Python test",
     );
     let junit_copy = fixture.external_path("reversed.junit.xml");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1060,7 +1259,7 @@ fn assert_python_junit_cardinality_refused(junit: &str) {
         ],
         "Change selected Python test",
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "uv",
         r#"#!/bin/sh
@@ -1490,6 +1689,42 @@ fn unsupported_selector_path_is_refused() {
 }
 
 #[test]
+fn local_python_selector_grammar_rejects_other_cli_python_paths() {
+    let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            ("charts/curie/ci/assert-pin.sh", CHART_FIXED),
+        ],
+        "Fix chart behavior",
+    );
+
+    for selector in [
+        "cli/tests/test_pin.py::test_pin",
+        "cli/tests/local/nested/test_pin.py::test_pin",
+        "cli/tests/local/../test_pin.py::test_pin",
+        "cli/tests/local/pin.py::test_pin",
+        "cli/tests/local/test_pin.py::helper",
+    ] {
+        let output = fixture
+            .command(&change, selector)
+            .output()
+            .expect("run verify fix pin");
+        let shown = output_text(&output);
+        assert!(
+            !output.status.success(),
+            "an out of grammar local selector must fail: {selector}\n{shown}",
+        );
+        assert!(
+            shown.contains("unsupported selector"),
+            "the refusal must identify the unsupported selector: {selector}\n{shown}",
+        );
+        assert!(!stdout_has_result(&output, "PINNED"));
+    }
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn pr_url_uses_the_resolved_patch_and_reports_the_same_pinned_result() {
     let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
     let base = fixture.head();
@@ -1503,7 +1738,7 @@ fn pr_url_uses_the_resolved_patch_and_reports_the_same_pinned_result() {
     let patch_path = fixture.external_path("pr.patch");
     fs::write(&patch_path, fixture.patch(&base, &head)).expect("write PR patch");
     let gh_log = fixture.external_path("gh.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "gh",
         r#"#!/bin/sh
@@ -1564,7 +1799,7 @@ fn numeric_pr_uses_gh_even_when_git_would_resolve_the_number_as_a_commit() {
     fs::write(&patch_path, fixture.patch(&base, &head)).expect("write PR patch");
     let gh_log = fixture.external_path("gh.log");
     let git_log = fixture.external_path("git.log");
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "gh",
         r#"#!/bin/sh
@@ -1588,7 +1823,7 @@ fi
 exit 64
 "#,
     );
-    write_exec(
+    test_executable::install_in(
         &fixture.tools,
         "git",
         r#"#!/bin/sh

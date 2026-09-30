@@ -76,9 +76,7 @@ def test_the_bundles_and_their_gates_are_readable() -> None:
     _gated_bundles(),
     ids=[f"{b}:{g}" for b, g, _ in _gated_bundles()],
 )
-def test_a_gated_write_is_named_in_the_permission_map(
-    bundle: str, gate: str, doc: Path
-) -> None:
+def test_a_gated_write_is_named_in_the_permission_map(bundle: str, gate: str, doc: Path) -> None:
     assert doc.is_file(), (
         f"{bundle} declares the gated write '{gate}' but has no "
         f"docs/PERMISSION-MAP.md. A bundle that can write needs the document "

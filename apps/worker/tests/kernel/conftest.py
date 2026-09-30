@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import socket
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,7 +26,7 @@ from typing import Any
 import aiohttp
 import pytest
 import redis
-from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus
+from aci_protocol import Final, HookRunRef, OutboundEvent, QueuedTurn, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import OutboundMessage
@@ -62,11 +64,134 @@ from curie_worker.sandbox import (
 from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
 # here AND by ``tests/test_delivery_lease.py``, which drives the lease store
 # directly against the same real Valkey without a full kernel harness.
+
+_DB_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    os.environ.get(
+        "DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class HookRunSeed:
+    """One exactly owned hook run row and its real Postgres recorder."""
+
+    engine: AsyncEngine
+    agent_id: uuid.UUID
+    version_id: uuid.UUID
+    run_id: uuid.UUID
+    ref: HookRunRef
+
+    def recorder(self) -> object:
+        from curie_worker.hook_runs import HookRunRecorder
+
+        return HookRunRecorder(self.engine)
+
+    async def state(self) -> tuple[str | None, datetime | None] | None:
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT outcome, ended_at FROM curie.hook_runs "
+                        "WHERE id = :run_id"
+                    ),
+                    {"run_id": self.run_id},
+                )
+            ).one_or_none()
+        return None if row is None else (row.outcome, row.ended_at)
+
+    async def lease_expires_at(self) -> datetime | None:
+        async with self.engine.connect() as conn:
+            return (
+                await conn.execute(
+                    text("SELECT lease_expires_at FROM curie.hook_runs WHERE id = :run_id"),
+                    {"run_id": self.run_id},
+                )
+            ).scalar_one()
+
+
+@pytest.fixture
+def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[HookRunSeed]]:
+    """Seed one migrated hook run and clean only rows owned by that seed."""
+
+    @contextlib.asynccontextmanager
+    async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
+        engine = create_async_engine(_DB_URL)
+        token = uuid.uuid4().hex
+        agent_id = uuid.uuid4()
+        version_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+        slot = datetime(2026, 9, 22, 3, 0, tzinfo=UTC)
+        ref = HookRunRef(
+            agent_id=str(agent_id),
+            name=f"hook_{token}",
+            slot_utc=slot.isoformat(),
+        )
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                    {"id": agent_id, "name": f"hook_agent_{token}"},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_versions "
+                        "(id, agent_id, version_label, created_by) "
+                        "VALUES (:id, :agent_id, :label, :created_by)"
+                    ),
+                    {
+                        "id": version_id,
+                        "agent_id": agent_id,
+                        "label": f"hook_version_{token}",
+                        "created_by": "kernel-test",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.hook_runs "
+                        "(id, agent_id, name, slot_utc, version_id, outcome, "
+                        "started_at, ended_at) VALUES "
+                        "(:id, :agent_id, :name, :slot_utc, :version_id, :outcome, "
+                        "now(), :ended_at)"
+                    ),
+                    {
+                        "id": run_id,
+                        "agent_id": agent_id,
+                        "name": ref.name,
+                        "slot_utc": slot,
+                        "version_id": version_id,
+                        "outcome": outcome,
+                        "ended_at": datetime.now(UTC) if outcome is not None else None,
+                    },
+                )
+            yield HookRunSeed(engine, agent_id, version_id, run_id, ref)
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM curie.hook_runs WHERE id = :id"), {"id": run_id}
+                )
+                await conn.execute(
+                    text("DELETE FROM curie.agent_versions WHERE id = :id"),
+                    {"id": version_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM curie.agents WHERE id = :id"), {"id": agent_id}
+                )
+            await engine.dispose()
+
+    return seed
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
@@ -313,10 +438,15 @@ class FakeK8s:
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     sandboxes: dict[str, _FakeSandbox] = field(default_factory=dict)
     claim_envs: list[dict[str, str] | None] = field(default_factory=list)
+    deleted_claims: list[str] = field(default_factory=list)
     bind_ready: bool = True
     quota_rejection: QuotaRejection | None = None
+    quota_claim_capacity: int | None = None
+    quota_headroom_results: list[bool | BaseException] = field(default_factory=list)
+    quota_headroom_calls: list[tuple[QuotaRejection, float]] = field(default_factory=list)
     ready_reason: str | None = None
     ready_message: str | None = None
+    unschedulable_message: str | None = None
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -359,15 +489,24 @@ class FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
+        quota_rejection = self.quota_rejection
+        if (
+            quota_rejection is not None
+            and self.quota_claim_capacity is not None
+            and len(self.claims) < self.quota_claim_capacity
+        ):
+            quota_rejection = None
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=sandbox_name,
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
-            ready=self.bind_ready and self.quota_rejection is None,
-            quota_rejection=self.quota_rejection,
+            ready=self.bind_ready and quota_rejection is None,
+            quota_rejection=quota_rejection,
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
         )
@@ -375,7 +514,10 @@ class FakeK8s:
             name=sandbox_name, port=self._take_port(sandbox_name)
         )
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -390,9 +532,11 @@ class FakeK8s:
             ready_message=claim.ready_message,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.pop(name, None)
         if claim is not None:
+            self.deleted_claims.append(name)
             self.sandboxes.pop(claim.sandbox_name, None)
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
@@ -400,12 +544,15 @@ class FakeK8s:
         out = []
         for claim in self.claims.values():
             if claim.labels.get(key) == value:
-                view = self.get_claim(claim.name)
+                view = self.get_claim(claim.name, request_timeout_seconds=1.0)
                 assert view is not None
                 out.append(view)
         return out
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
             return None
@@ -423,6 +570,25 @@ class FakeK8s:
             operating_mode=sandbox.operating_mode,
             port=sandbox.port,
         )
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        assert 0 < request_timeout_seconds <= 1.0
+        self.quota_headroom_calls.append((rejection, request_timeout_seconds))
+        if not self.quota_headroom_results:
+            return False
+        result = self.quota_headroom_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        assert request_timeout_seconds > 0
+        return self.unschedulable_message
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
@@ -452,82 +618,140 @@ class FakeRunner:
                 web.get("/status", self._status),
                 web.get("/v1/status", self._status),
                 web.post("/v1/event", self._event),
+                web.post("/v1/turn-admit", self._turn_admit),
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
+                web.post("/v1/timeout", self._timeout),
             ]
         )
         self.turn_active = False
+        self.turn_epoch: str | None = None
+        self._turn_lock = asyncio.Lock()
+        self._admission_gate: asyncio.Event | None = None
+        self._admission_granted = False
+        self.admission_results: dict[str, str] = {}
+        self.admit_response_gate: asyncio.Event | None = None
+        self.turn_ready = False
+        self.admission_timeout_s = 5.0
         self.history_durable = True
         self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
+        self.supports_capacity_admission = True
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
+        self.status_delay_seconds = 0.0
         self.turn_scripts: list[list[OutboundEvent]] = []
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
         self.opened: list[str] = []
+        self.request_epochs: list[tuple[str, str]] = []
+        self.queried: list[str] = []
+        self.admissions: list[tuple[str, bool]] = []
         self.steers: list[str] = []
         self.interrupts: int = 0
         self.hold: object | None = None  # asyncio.Event when a turn should hang
         self.accept: asyncio.Event | None = None  # gate after opened, before prepare
         self.tail: list[OutboundEvent] = []
         self.event_fail_times: int = 0  # return 500 on the next N /v1/event calls
+        # Match the real runner: every accepted turn carries an epoch and its
+        # timeout callback succeeds. Tests for an older or malformed runner opt
+        # into the missing epoch shape explicitly with None.
+        self.timeout_status: int | None = 200
+        self.timeout_delay_seconds = 0.0
+        self.timeout_calls = 0
+        # Handler entry means the runner has received the callback. It is not
+        # causal confirmation to the worker until the HTTP 200 reaches it.
+        self.timeout_handler_entered = asyncio.Event()
         # Per-route captured request headers (the ACI auth Bearer check reads
         # these): the most recent request's headers for each route, so a test can
         # assert the worker delivered its per-sandbox token as Authorization.
         self.event_headers: list[dict[str, str]] = []
         self.steer_headers: list[dict[str, str]] = []
         self.interrupt_headers: list[dict[str, str]] = []
+        self.timeout_headers: list[dict[str, str]] = []
         self.status_headers: list[dict[str, str]] = []
 
     async def _status(self, request: web.Request) -> web.Response:
         self.status_headers.append(dict(request.headers))
+        if self.status_delay_seconds > 0:
+            await asyncio.sleep(self.status_delay_seconds)
         if self.status_fails:
             return web.json_response({"error": "boom"}, status=500)
         if self.status_malformed:
             # 200, but without the field the liveness read needs. A newer or
             # third-party runner could answer exactly this.
             return web.json_response({"status": "idle-awaiting-input"})
-        return web.json_response(
-            {
-                "status": self.session_status,
-                "turn_active": self.turn_active,
-                "history_durable": self.history_durable,
-            }
-        )
+        body: dict[str, object] = {
+            "status": self.session_status,
+            "turn_active": self.turn_active,
+            "history_durable": self.history_durable,
+        }
+        if request.path == "/v1/status":
+            body["turn_epoch"] = self.turn_epoch
+            if self.supports_capacity_admission:
+                body["capacity_admission"] = True
+            queried_epoch = request.headers.get("X-Curie-Turn-Epoch")
+            if queried_epoch is not None:
+                body["capacity_admission_result"] = self.admission_results.get(
+                    queried_epoch, "unknown"
+                )
+        return web.json_response(body)
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
         self.event_headers.append(dict(request.headers))
         body = await request.json()
         self.opened.append(body["text"])
+        epoch = uuid.uuid4().hex
+        self.request_epochs.append((body["text"], epoch))
         if self.event_fail_times > 0:
             self.event_fail_times -= 1
             return web.json_response({"error": "transient runner failure"}, status=500)
         script = self.turn_scripts.pop(0) if self.turn_scripts else list(self.default_script)
-        resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
+        headers = {"Content-Type": "application/x-ndjson"}
+        if self.timeout_status is not None:
+            headers["X-Curie-Turn-Epoch"] = epoch
+        resp = web.StreamResponse(status=200, headers=headers)
         if self.accept is not None:
             await self.accept.wait()
         await resp.prepare(request)
-        self.turn_active = True
-        # Cleared on EVERY exit path, not just the normal one. A client that
-        # gives up mid-stream (its total/sock-read budget expiring, #2011)
-        # releases the response, and aiohttp then CANCELS this handler while it
-        # is parked on ``hold`` -- so a fake that only cleared the flag on its
-        # way out would stay "busy" forever, and every later turn on the thread
-        # would be answered by a 200 from /v1/steer and folded into the dead
-        # turn instead of opening a fresh one. The real runner's session ends
-        # with the process/turn that died, so idle-after-a-drop is the faithful
-        # model, and it is what makes the timeout retry path testable at all.
-        try:
-            for frame in script:
-                await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-            if self.hold is not None:
-                await self.hold.wait()  # type: ignore[attr-defined]
-                for frame in self.tail:
+        # The real server sends headers before its session acquires the turn
+        # lock. Private status must name the holder, not this queued request.
+        async with self._turn_lock:
+            self.turn_epoch = epoch
+            self.turn_active = True
+            admission_required = request.headers.get("X-Curie-Capacity-Admission") == "wait"
+            self._admission_gate = asyncio.Event() if admission_required else None
+            self._admission_granted = False
+            if admission_required:
+                self.admission_results[epoch] = "pending"
+            self.turn_ready = not admission_required
+            # Clear ownership even if a client disconnects while waiting for
+            # admission or for the scripted turn to finish.
+            try:
+                if admission_required:
+                    gate = self._admission_gate
+                    assert gate is not None
+                    try:
+                        await asyncio.wait_for(gate.wait(), timeout=self.admission_timeout_s)
+                    except TimeoutError:
+                        pass
+                    if not self._admission_granted:
+                        self.admission_results[epoch] = "denied"
+                        return resp
+                    self.turn_ready = True
+                self.queried.append(body["text"])
+                for frame in script:
                     await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-        finally:
-            self.turn_active = False
+                if self.hold is not None:
+                    await self.hold.wait()  # type: ignore[attr-defined]
+                    for frame in self.tail:
+                        await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+            finally:
+                self.turn_ready = False
+                self._admission_gate = None
+                self.turn_epoch = None
+                self.turn_active = False
         # Normal path only: on a dead transport this raises, and there is no
         # eof to send to a client that already went away.
         await resp.write_eof()
@@ -536,9 +760,33 @@ class FakeRunner:
     async def _steer(self, request: web.Request) -> web.Response:
         self.steer_headers.append(dict(request.headers))
         body = await request.json()
-        if not self.turn_active:
+        if not self.turn_active or (
+            self._admission_gate is not None and not self.turn_ready
+        ):
             return web.json_response({"error": "no active turn"}, status=409)
         self.steers.append(body["text"])
+        return web.json_response({"ok": True})
+
+    async def _turn_admit(self, request: web.Request) -> web.Response:
+        epoch = request.headers.get("X-Curie-Turn-Epoch")
+        body = await request.json()
+        gate = self._admission_gate
+        if (
+            gate is None
+            or gate.is_set()
+            or not self.turn_active
+            or epoch != self.turn_epoch
+            or type(body.get("allow")) is not bool
+        ):
+            return web.json_response({"error": "turn epoch is not pending"}, status=409)
+        allowed = body["allow"]
+        self._admission_granted = allowed
+        assert epoch is not None
+        self.admission_results[epoch] = "granted" if allowed else "denied"
+        self.admissions.append((epoch, allowed))
+        gate.set()
+        if allowed and self.admit_response_gate is not None:
+            await self.admit_response_gate.wait()
         return web.json_response({"ok": True})
 
     async def _interrupt(self, request: web.Request) -> web.Response:
@@ -549,6 +797,23 @@ class FakeRunner:
         # ``accept`` is the gate before prepare. Releasing it here would hide a
         # kill that lands after the POST is received and before the stream starts.
         return web.json_response({"ok": True})
+
+    async def _timeout(self, request: web.Request) -> web.Response:
+        self.timeout_headers.append(dict(request.headers))
+        self.timeout_calls += 1
+        self.timeout_handler_entered.set()
+        if self.timeout_delay_seconds:
+            await asyncio.sleep(self.timeout_delay_seconds)
+        status = self.timeout_status if self.timeout_status is not None else 404
+        if status == 200 and request.headers.get("X-Curie-Turn-Epoch") != self.turn_epoch:
+            status = 409
+        if status == 200:
+            gate = self._admission_gate
+            if gate is not None and not gate.is_set():
+                gate.set()
+            elif self.hold is not None:
+                self.hold.set()  # type: ignore[attr-defined]
+        return web.json_response({"ok": status == 200}, status=status)
 
 
 # --- Delivery-lease test helpers (ADR-0131, #1971) -----------------------------
@@ -686,7 +951,10 @@ def make_harness(
     ledger recorder), ``with_killswitch``
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
-    the rest are config overrides. ``runner_total_timeout_s`` is an ordinary
+    ``sibling_limit_factory`` builds the kernel's sibling limit from the
+    harness's own Valkey client and config, and ``progress_factory`` its
+    deliberate progress store the same way; the rest are config overrides.
+    ``runner_total_timeout_s`` is an ordinary
     config override: it drives BOTH the ``WorkerConfig`` and the
     ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
     expires the stream mid-flight (#2011) passes a fractional value and the
@@ -712,6 +980,7 @@ async def kernel_harness(
     sync_redis: redis.Redis,
     *,
     binding: object | None = None,
+    binding_factory: Callable[[WorkerConfig], object] | None = None,
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
@@ -722,10 +991,16 @@ async def kernel_harness(
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
+    hook_runs: object | None = None,
+    sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
     config = make_config(names, **config_overrides)
+    if binding_factory is not None:
+        assert binding is None
+        binding = binding_factory(config)
     fake_runner = FakeRunner()
     # Most kernel tests use the deliberately tiny ACI fake above.  The coder
     # publication boundary test supplies the real runner app, still with its
@@ -759,9 +1034,24 @@ async def kernel_harness(
     fleet_port = _closed_port() if per_sandbox_runners else port
 
     fake_k8s = FakeK8s(runner_ports=list(runners))
+    pressure_async_redis: AsyncRedis = AsyncRedis(
+        host=_VALKEY_HOST,
+        port=_VALKEY_PORT,
+        password=_VALKEY_PW or None,
+        decode_responses=True,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     substrate = SandboxSubstrate(
         fake_k8s,  # type: ignore[arg-type]
-        AffinityStore(sync_redis, key_prefix=names["sandbox_prefix"]),
+        AffinityStore(
+            sync_redis,
+            pressure_client=pressure_async_redis,
+            key_prefix=names["sandbox_prefix"],
+        ),
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="test-pool",
@@ -795,6 +1085,13 @@ async def kernel_harness(
             acquire_timeout_s=config.lock_acquire_timeout_s,
             poll_interval_s=config.lock_poll_interval_s,
         ),
+        pressure_lock=ThreadLock(
+            pressure_async_redis,
+            ttl_ms=config.lock_ttl_ms,
+            acquire_timeout_s=0.1,
+            poll_interval_s=0.02,
+            owner=None,
+        ),
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,  # type: ignore[arg-type]
@@ -806,6 +1103,17 @@ async def kernel_harness(
             workspace_factory(substrate) if workspace_factory else None
         ),  # type: ignore[arg-type]
         card_store=card_store,
+        **({"hook_runs": hook_runs} if hook_runs is not None else {}),
+        **(
+            {"sibling_limit": sibling_limit_factory(async_redis, config)}
+            if sibling_limit_factory is not None
+            else {}
+        ),
+        **(
+            {"progress": progress_factory(async_redis, config)}
+            if progress_factory is not None
+            else {}
+        ),
     )
     killswitch = None
     if with_killswitch:
@@ -831,6 +1139,8 @@ async def kernel_harness(
             await runner_client.close()
         with contextlib.suppress(Exception):
             await async_redis.aclose()
+        with contextlib.suppress(Exception):
+            await pressure_async_redis.aclose()
         with contextlib.suppress(Exception):
             await server.close()
         # Every per-sandbox server too: a missed close leaks an aiohttp site for

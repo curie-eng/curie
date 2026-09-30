@@ -8,19 +8,30 @@ import logging
 import os
 import threading
 import uuid
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_worker.approval_cards import ApprovalCardRef
-from curie_worker.publication_loop import PublicationReconcileError
+from curie_worker.config import WorkerConfig
+from curie_worker.publication_loop import (
+    PublicationIdentityUnavailable,
+    PublicationLineageRefused,
+    PublicationReconcileError,
+    PublicationRemoteTerminalError,
+)
 from curie_worker.publication_store import (
     PostgresPublicationStore,
     PublicationStoreError,
 )
-from curie_worker.reply_sink import TargetRoute
+from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
+from curie_worker.slack_sink import UnconfiguredSlackIdentityError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -40,6 +51,10 @@ REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 LINEAGE_BRANCH = "curie/thread-lineage-example"
 PRIOR_HEAD = "a" * 40
 REVISION_HEAD = "b" * 40
+REPOSITORY_ID = 9001
+INSTALLATION_ID = 41
+PR_NODE_ID = "PR_example_123"
+BASE_REF = "main"
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
@@ -72,6 +87,7 @@ class _Store:
         self.retry_terminal_after = 99
         self.card_pending: Any | None = None
         self.card_delivery_retries: list[tuple[uuid.UUID, str]] = []
+        self.card_delivery_permanent: list[bool] = []
         self.card_delivered: set[uuid.UUID] = set()
         self.card_retry_terminal_after = 99
         self.cleanup_pending: set[uuid.UUID] = set()
@@ -80,6 +96,7 @@ class _Store:
         self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
         self.lineage_terminals: list[dict[str, Any]] = []
         self.history_ready: set[uuid.UUID] = set()
+        self.releases: list[uuid.UUID] = []
 
     def claim_pending_card(self) -> Any | None:
         return self.card_pending
@@ -88,9 +105,12 @@ class _Store:
         self.card_delivered.add(publication_id)
         self.card_pending = None
 
-    def retry_card_delivery(self, publication_id: uuid.UUID, *, error: str) -> None:
+    def retry_card_delivery(
+        self, publication_id: uuid.UUID, *, error: str, permanent: bool
+    ) -> None:
         self.card_delivery_retries.append((publication_id, error))
-        if len(self.card_delivery_retries) >= self.card_retry_terminal_after:
+        self.card_delivery_permanent.append(permanent)
+        if permanent or len(self.card_delivery_retries) >= self.card_retry_terminal_after:
             self.completed[publication_id] = ("failed", None)
             self.pending[publication_id] = {
                 "outcome": "failed",
@@ -141,6 +161,7 @@ class _Store:
         result = {
             "resolved_by": None,
             "resolution_note": None,
+            "resolved_at": None,
             **value,
         }
         return SimpleNamespace(
@@ -162,6 +183,7 @@ class _Store:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         self.completed[publication_id] = (outcome, pr_url)
         if outcome == "failed" and error is not None:
@@ -175,7 +197,6 @@ class _Store:
         }
         if outcome in {"published", "failed"}:
             self.cleanup_pending.add(publication_id)
-
     def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
         self.delivered.add(publication_id)
         self.pending.pop(publication_id, None)
@@ -197,6 +218,9 @@ class _Store:
                 "error": error,
             }
             self.cleanup_pending.add(publication_id)
+
+    def release(self, publication_id: uuid.UUID) -> None:
+        self.releases.append(publication_id)
 
     def mark_lineage_terminal(
         self,
@@ -221,7 +245,7 @@ class _Store:
             }
         )
 
-    async def claim_next(self) -> None:
+    async def claim_next(self, *, exclude: Any = ()) -> None:
         return None
 
 
@@ -234,8 +258,6 @@ class _Lineage:
         if self.error is not None:
             raise self.error
         self.advances.append({"publication_id": publication_id, **advance})
-
-
 class _Credentials:
     def __init__(self, module: Any) -> None:
         self.module = module
@@ -407,7 +429,9 @@ class _GitHub:
         *,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> Any | None:
+        del draft
         self.authorization_headers.append(authorization_header)
         self.recover_calls.append((repo_full_name, branch, expected_head_sha))
         if expected_head_sha != self.recovered_head_sha:
@@ -464,6 +488,13 @@ class _Cards:
         self.restored: list[tuple[str, ApprovalCardRef]] = []
         self.remember_fail_once = False
         self.restore_failures_remaining = 0
+        self.notice_refs: dict[str, str] = {}
+        self.notice_read_fails = False
+
+    async def read_notice_ref(self, approval_id: str) -> str | None:
+        if self.notice_read_fails:
+            raise RuntimeError("notice ref store unavailable")
+        return self.notice_refs.get(approval_id)
 
     async def pop(self, approval_id: str) -> ApprovalCardRef | None:
         self.popped.append(approval_id)
@@ -549,7 +580,12 @@ def _target(kind: str = "slack") -> ReplyTarget:
     )
 
 
-def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> Any:
+def _work(
+    module: Any,
+    *,
+    decision: str = "approved",
+    kind: str = "slack",
+) -> Any:
     return module.PublicationWork(
         publication_id=PUBLICATION_ID,
         approval_id=APPROVAL_ID,
@@ -562,11 +598,15 @@ def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> An
         branch=LINEAGE_BRANCH,
         pr_number=None,
         pr_url=None,
+        github_repository_id=None,
+        github_pr_node_id=None,
         expected_prior_head=PRIOR_HEAD,
         expected_remote_head=None,
         base_sha="a" * 40,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
+        observed_title_sha256=None,
+        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(kind),
@@ -602,11 +642,15 @@ def _lineage_work(
         branch=LINEAGE_BRANCH,
         pr_number=pr_number,
         pr_url=pr_url,
+        github_repository_id=9001 if pr_number is not None else None,
+        github_pr_node_id="PR_example_123" if pr_number is not None else None,
         expected_prior_head=expected_prior_head,
         expected_remote_head=(expected_prior_head if pr_number is not None else None),
         base_sha=expected_prior_head or PRIOR_HEAD,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
+        observed_title_sha256=None,
+        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(),
@@ -638,6 +682,7 @@ def _loop(
     module: Any,
     cards: _Cards | None = None,
     transcript: _Transcript | None | object = _DEFAULT_TRANSCRIPT,
+    lineage: _Lineage | None = None,
 ) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
     k8s = importlib.import_module("curie_worker.publication_k8s")
     store = _Store()
@@ -651,7 +696,7 @@ def _loop(
     loop = module.PublicationReconciler(
         store=store,
         credentials=credentials,
-        lineage=_Lineage(),
+        lineage=lineage if lineage is not None else _Lineage(),
         cluster=cluster,
         github=github,
         replies=replies,
@@ -832,6 +877,181 @@ async def test_missing_transcript_wiring_is_logged_loudly(
         _loop(publication, transcript=None)
 
     assert "publication transcript recording is not configured" in caplog.text
+
+
+CLUSTER_MESSAGE_REPLY_REF = "123e4567-e89b-42d3-a456-426614174000"
+CLUSTER_MESSAGE_WORKER_TOKEN = "worker-only-cluster-message-token"
+
+
+class _ClusterMessageRelay:
+    """The API's internal cluster-message reply route, answered like the real one."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.status = 200
+        self.app = web.Application()
+        self.app.add_routes(
+            [web.post("/v1/internal/cluster-message-replies/{reply_ref}", self._append)]
+        )
+
+    async def _append(self, request: web.Request) -> web.Response:
+        reply_ref = request.match_info["reply_ref"]
+        self.posts.append((reply_ref, await request.json()))
+        if self.status != 200:
+            return web.Response(status=self.status)
+        return web.json_response({"ref": reply_ref})
+
+
+def _cluster_message_card_work(reply_ref: str | None) -> Any:
+    work = _card_work()
+    work.target = ReplyTarget(
+        kind="slack",
+        address="C0EXAMPLE1",
+        conversation_id="1700000000.000100",
+        reply_ref=reply_ref,
+    )
+    work.route = TargetRoute(endpoint=None, adapter=CLUSTER_MESSAGE_ADAPTER)
+    return work
+
+
+async def _cluster_message_card_loop(
+    publication: Any, relay: _ClusterMessageRelay, work: Any
+) -> tuple[Any, _Store, _Cards, Any, TestServer]:
+    server = TestServer(relay.app)
+    await server.start_server()
+    cards = _Cards()
+    loop, store, _, _, _, _ = _loop(publication, cards)
+    sink = build_reply_sink(
+        WorkerConfig(
+            api_base_url=f"http://127.0.0.1:{server.port}",
+            internal_worker_token=CLUSTER_MESSAGE_WORKER_TOKEN,
+        )
+    )
+    loop._replies = sink
+    store.card_pending = work
+    return loop, store, cards, sink, server
+
+
+async def test_cluster_message_publication_card_posts_to_the_session_reply_bucket(
+    publication: Any,
+) -> None:
+    """#2720 success: the card reaches the relay bucket and its ref is remembered."""
+    relay = _ClusterMessageRelay()
+    loop, store, cards, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(CLUSTER_MESSAGE_REPLY_REF)
+    )
+    try:
+        assert await loop.deliver_pending_card() is True
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert [ref for ref, _ in relay.posts] == [CLUSTER_MESSAGE_REPLY_REF]
+    body = relay.posts[0][1]
+    assert body["event"] == "reply.post"
+    assert body["message"]["interaction"]["id"] == str(APPROVAL_ID)
+    assert cards.ref is not None and cards.ref.ts == CLUSTER_MESSAGE_REPLY_REF
+    assert store.card_delivered == {PUBLICATION_ID}
+    assert store.card_delivery_retries == []
+
+
+async def test_cluster_message_card_without_reply_ref_dead_letters_without_hot_retry(
+    publication: Any,
+) -> None:
+    """#2720 card failure: the relay refusal is permanent and terminal on attempt one."""
+    relay = _ClusterMessageRelay()
+    loop, store, cards, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(None)
+    )
+    try:
+        with pytest.raises(ValueError, match="reply_ref is required"):
+            await loop.deliver_pending_card()
+        assert await loop.deliver_pending_card() is False
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert relay.posts == []
+    assert store.card_delivery_permanent == [True]
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert cards.ref is None
+    assert store.card_delivered == set()
+
+
+async def test_publication_card_transport_value_error_is_not_permanent(
+    publication: Any,
+) -> None:
+    """#2720: only an unaddressable target is permanent.
+
+    A transport can surface a ValueError after the request left, such as the
+    UnicodeDecodeError a malformed provider body raises; that stays a bounded
+    retry instead of failing the publication on one bad response.
+    """
+    loop, store, _, _, _, replies = _loop(publication, _Cards())
+    store.card_pending = _card_work()
+
+    async def malformed(*_args: Any, **_kwargs: Any) -> Any:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    replies.emit = malformed  # type: ignore[method-assign]
+
+    with pytest.raises(UnicodeDecodeError):
+        await loop.deliver_pending_card()
+
+    assert store.card_delivery_permanent == [False]
+    assert store.completed == {}
+
+
+async def test_untokened_identity_card_delivery_retries_rather_than_dead_letters(
+    publication: Any,
+) -> None:
+    """A card addressed to an identity this worker holds no bot token for is
+    a retryable gap, not a dead letter.
+
+    ``UnconfiguredSlackIdentityError`` is not an ``InvalidReplyTargetError``,
+    so it falls through the generic ``except`` below like the transport
+    ``ValueError`` above: ``permanent`` stays False and the durable
+    ``reconcile_attempts`` counter, not this one call, decides when the
+    publication finally gives up.
+    """
+    loop, store, _, _, _, _ = _loop(publication, _Cards())
+    loop._replies = build_reply_sink(WorkerConfig(slack_bot_token=""))
+    work = _card_work()
+    work.route = TargetRoute(endpoint=None, adapter="ghost")
+    store.card_pending = work
+
+    with pytest.raises(UnconfiguredSlackIdentityError):
+        await loop.deliver_pending_card()
+
+    assert store.card_delivery_permanent == [False]
+    assert store.completed == {}
+    assert len(store.card_delivery_retries) == 1
+    _, error = store.card_delivery_retries[0]
+    assert "ghost" in error
+
+
+async def test_cluster_message_card_relay_outage_is_a_bounded_retry(
+    publication: Any,
+) -> None:
+    """#2720 bounded retry: a transient relay failure counts toward the cap."""
+    relay = _ClusterMessageRelay()
+    relay.status = 503
+    loop, store, _, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(CLUSTER_MESSAGE_REPLY_REF)
+    )
+    store.card_retry_terminal_after = 2
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="answered 503"):
+                await loop.deliver_pending_card()
+        assert await loop.deliver_pending_card() is False
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert len(relay.posts) == 2
+    assert store.card_delivery_permanent == [False, False]
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
 
 
 async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
@@ -1675,6 +1895,41 @@ async def test_non_slack_publication_result_uses_the_stored_adapter_route_withou
 
 
 @pytest.mark.parametrize(
+    ("remembered", "read_fails", "expected_ref"),
+    [
+        ("1700000000.000077", False, "1700000000.000077"),
+        (None, False, None),
+        ("1700000000.000077", True, None),
+    ],
+)
+async def test_publication_result_edits_the_remembered_pending_notice(
+    publication: Any,
+    remembered: str | None,
+    read_fails: bool,
+    expected_ref: str | None,
+) -> None:
+    # #2721: a ref-less row's pending notice ref lives only in the card store.
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    if remembered is not None:
+        cards.notice_refs[str(APPROVAL_ID)] = remembered
+    cards.notice_read_fails = read_fails
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": None,
+    }
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    event, _ = replies.events[0]
+    assert PR_URL in event.text
+    assert event.target.reply_ref == expected_ref
+
+
+@pytest.mark.parametrize(
     ("outcome", "pr_url", "error", "decision", "text_fragment"),
     [
         ("published", PR_URL, None, "approved", "Published the approved changes"),
@@ -1691,15 +1946,19 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     decision: str | None,
     text_fragment: str,
 ) -> None:
+    from curie_worker.approvals import decided_at
+
     cards = _Cards()
     loop, store, _, _, _, replies = _loop(publication, cards)
     cards.ref = _card()
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
     store.pending[PUBLICATION_ID] = {
         "outcome": outcome,
         "pr_url": pr_url,
         "error": error,
         "resolved_by": RESOLVER if decision is not None else None,
         "resolution_note": RESOLUTION_NOTE if decision is not None else None,
+        "resolved_at": decided if decision is not None else None,
     }
 
     await loop.deliver_pending_result(PUBLICATION_ID)
@@ -1716,9 +1975,50 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     assert card_update.settled.note == (
         RESOLUTION_NOTE if decision is not None else None
     )
+    # ADR-0179 decision 1: the publication rebuild keeps the time the click
+    # stamped, read off the same row; an expiry has no decision time.
+    assert decided_at(card_update.message) == (decided if decision is not None else None)
     assert card_route == TargetRoute(endpoint=None, adapter=None)
     assert cards.ref is None
     assert cards.restored == []
+
+
+@pytest.mark.parametrize(
+    ("stored_kind", "stored_adapter", "result_adapter", "expected_card_adapter"),
+    [
+        ("", None, "ops-bot", None),
+        ("slack", "ops-bot", None, "ops-bot"),
+    ],
+)
+async def test_terminal_result_uses_the_identity_that_posted_the_card(
+    publication: Any,
+    stored_kind: str,
+    stored_adapter: str | None,
+    result_adapter: str | None,
+    expected_card_adapter: str | None,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    cards.ref = replace(
+        _card(),
+        kind=stored_kind,
+        adapter=stored_adapter,
+    )
+    store.route = TargetRoute(endpoint=None, adapter=result_adapter)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    _result, result_route = replies.events[0]
+    _card_update, card_route = replies.events[1]
+    assert result_route == TargetRoute(endpoint=None, adapter=result_adapter)
+    assert card_route == TargetRoute(endpoint=None, adapter=expected_card_adapter)
 
 
 async def test_result_does_not_consume_a_card_stored_under_another_approval(
@@ -2075,7 +2375,7 @@ async def test_claim_next_failure_names_the_cause_and_still_escapes(
 ) -> None:
     reconciler, store, *_ = _loop(publication)
 
-    async def boom() -> None:
+    async def boom(*, exclude: Any = ()) -> None:
         raise RuntimeError("publication claim CAS was lost")
 
     store.claim_next = boom
@@ -2105,9 +2405,9 @@ async def test_idle_publication_loop_does_not_page(
     claims = {"n": 0}
     original = store.claim_next
 
-    async def idle_claim() -> None:
+    async def idle_claim(*, exclude: Any = ()) -> None:
         claims["n"] += 1
-        return await original()
+        return await original(exclude=exclude)
 
     store.claim_next = idle_claim
 
@@ -2264,3 +2564,357 @@ async def test_transient_observe_error_stays_bounded_not_terminal(
     assert "apiserver temporarily unavailable" in store.retries[0][1]
     assert store.completed == {}
     assert replies.events == []
+
+
+# --- API lineage advance and bounded provider failures -------------------------
+
+
+def _uncharged_bound(module: Any) -> int:
+    return int(module._MAX_UNCHARGED_IDENTITY_ESCAPES)
+
+
+def _recovery_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+    github.branch_head = REVISION_HEAD
+    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+    return _work(module)
+
+
+def _later_revision_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+    github.head_sha = PRIOR_HEAD
+    return _lineage_work(module)
+
+
+async def test_lineage_advance_carries_the_publication_lease_fence(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    assert lineage.advances == [
+        {
+            "publication_id": work.publication_id,
+            "expected_version": work.lineage_version,
+            "expected_head_sha": work.expected_remote_head,
+            "expected_publication_version": work.version,
+            "lease_owner": work.lease_owner,
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+            "metadata_updated_at": None,
+        }
+    ]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_metadata_only_job_forwards_update_marker_to_lineage_authority(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    import hashlib
+
+    original = _lineage_work(publication)
+    work = replace(
+        original,
+        patch=b"",
+        changed_paths=(),
+        observed_title_sha256=hashlib.sha256(original.title.encode()).hexdigest(),
+        observed_body_sha256=hashlib.sha256(original.body.encode()).hexdigest(),
+    )
+    cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    github.head_sha = PRIOR_HEAD
+    marker_time = datetime.fromisoformat("2026-09-25T12:34:56+00:00")
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url=PR_URL,
+        pr_number=123,
+        commit_sha=PRIOR_HEAD,
+        logs=(
+            f"CURIE_PR_UPDATED_AT={marker_time.isoformat()}\n"
+            f"CURIE_PR_URL={PR_URL}\n"
+            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={PRIOR_HEAD}\n"
+        ),
+    )
+
+    await loop.reconcile(work)
+
+    assert len(lineage.advances) == 1
+    assert lineage.advances[0]["head_sha"] == PRIOR_HEAD
+    assert lineage.advances[0]["metadata_updated_at"] == marker_time
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_terminal_lineage_response_uses_the_worker_terminal_cas(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationRemoteTerminalError("merged")
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    assert len(lineage.advances) == 0
+    assert store.lineage_terminals == [
+        {
+            "lineage_id": work.lineage_id,
+            "expected_version": work.lineage_version,
+            "expected_stored_head": work.expected_remote_head,
+            "state": "merged",
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+        }
+    ]
+    assert store.retries == [
+        (PUBLICATION_ID, "pull request lineage is merged; start a new thread")
+    ]
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "normal_completion",
+        "recovery_completion",
+        "later_revision",
+    ],
+)
+async def test_lineage_unavailable_escapes_uncharged_then_charges_on_every_advance_site(
+    publication: Any,
+    site: str,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationIdentityUnavailable(
+        "publication lineage verification is temporarily unavailable"
+    )
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    if site == "normal_completion":
+        work = _work(publication)
+    elif site == "recovery_completion":
+        work = _recovery_work(publication, cluster, github)
+    else:
+        work = _later_revision_work(publication, cluster, github)
+
+    for _ in range(_uncharged_bound(publication)):
+        with pytest.raises(PublicationIdentityUnavailable):
+            await loop.reconcile(work)
+        assert store.retries == []
+
+    await loop.reconcile(work)
+
+    assert store.retries == [
+        (
+            work.publication_id,
+            "publication lineage verification is temporarily unavailable",
+        )
+    ]
+
+
+async def test_lineage_refusal_is_charged_without_an_uncharged_escape(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationLineageRefused("publication lineage advance was refused")
+    loop, store, _, _, _, _ = _loop(publication, lineage=lineage)
+
+    await loop.reconcile(_work(publication))
+
+    assert store.retries == [
+        (PUBLICATION_ID, "publication lineage advance was refused")
+    ]
+
+
+_TRIPLE_LOGS = (
+    f"CURIE_PR_URL={PR_URL}\nCURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
+)
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+async def test_running_job_with_full_success_markers_settles_immediately(
+    publication: Any, preexisting: bool
+) -> None:
+    """#3074: the PR exists once the final marker prints; do not wait on Job exit."""
+
+    lineage = _Lineage()
+    loop, store, _, cluster, _, replies = _loop(publication, lineage=lineage)
+    work = _work(publication)
+    if preexisting:
+        cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert [advance["head_sha"] for advance in lineage.advances] == [REVISION_HEAD]
+    assert store.retries == []
+    assert store.releases == []
+    assert PR_URL in replies.events[0][0].text
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+async def test_running_job_with_only_url_marker_waits_and_releases_lease(
+    publication: Any, preexisting: bool
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    work = _work(publication)
+    if preexisting:
+        cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=f"CURIE_PR_URL={PR_URL}\n"
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {}
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+    assert replies.events == []
+
+
+async def test_running_job_with_state_marker_is_not_settled_early(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, _ = _loop(publication)
+    cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS + "CURIE_PR_STATE=closed\n"
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert store.releases == [PUBLICATION_ID]
+
+
+async def test_running_job_without_markers_releases_lease_uncharged_then_settles(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    work = _work(publication)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=""
+    )
+
+    await loop.reconcile(work)
+
+    assert store.releases == [PUBLICATION_ID]
+    assert store.retries == []
+    assert store.completed == {}
+
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS
+    )
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID], "re-claim adopts, never re-redeems"
+    assert len(cluster.applied) == 1
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+class _QueueStore(_Store):
+    def __init__(
+        self, works: list[Any], shutdown: asyncio.Event, *, sticky: bool = False
+    ) -> None:
+        super().__init__()
+        self.queue = list(works)
+        self.shutdown = shutdown
+        # Sticky models the real store after an uncharged release: the work
+        # stays claimable and is returned oldest first unless excluded.
+        self.sticky = sticky
+
+    async def claim_next(self, *, exclude: Any = ()) -> Any:
+        claimable = [w for w in self.queue if w.publication_id not in exclude]
+        if not claimable:
+            self.shutdown.set()
+            return None
+        if not self.sticky:
+            self.queue.remove(claimable[0])
+        return claimable[0]
+
+
+class _RecordingReconciler:
+    def __init__(self) -> None:
+        self.reconciled: list[uuid.UUID] = []
+
+    async def deliver_pending_card(self) -> bool:
+        return False
+
+    async def deliver_pending_cleanup(self) -> bool:
+        return False
+
+    async def deliver_pending_result(self) -> bool:
+        return False
+
+    async def reconcile(self, work: Any, *, allow_launch: bool = True) -> None:
+        self.reconciled.append(work.publication_id)
+
+
+def _distinct_works(module: Any, count: int) -> list[Any]:
+    return [
+        _lineage_work(module, publication_id=uuid.uuid4()) for _ in range(count)
+    ]
+
+
+async def test_supervisor_drains_every_claimable_publication_in_one_pass(
+    publication: Any,
+) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    store = _QueueStore(works, shutdown)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=60
+    )
+
+    await asyncio.wait_for(supervisor.run_forever(shutdown), timeout=5)
+
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+async def test_supervisor_pass_stops_at_batch_limit(publication: Any) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    store = _QueueStore(works, shutdown)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=0.5, batch_limit=2
+    )
+    task = asyncio.create_task(supervisor.run_forever(shutdown))
+    await asyncio.sleep(0.1)
+
+    assert reconciler.reconciled == [work.publication_id for work in works[:2]]
+    assert len(store.queue) == 1
+
+    await asyncio.wait_for(task, timeout=5)
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+async def test_supervisor_pass_reaches_newer_work_behind_a_released_publication(
+    publication: Any,
+) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    # Every work stays claimable, as a released in-flight Job does in the real
+    # store, so the oldest must not be handed back ahead of the newer ones.
+    store = _QueueStore(works, shutdown, sticky=True)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=0.01
+    )
+
+    await asyncio.wait_for(supervisor.run_forever(shutdown), timeout=5)
+
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+def test_supervisor_rejects_non_positive_batch_limit(publication: Any) -> None:
+    with pytest.raises(ValueError, match="batch limit"):
+        publication.PublicationReconcileLoop(
+            store=_Store(), reconciler=_RecordingReconciler(), batch_limit=0
+        )

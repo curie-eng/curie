@@ -18,6 +18,7 @@ from pathlib import Path
 import jsonschema
 import yaml
 from plugin_format import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     ApprovalPolicy,
     PluginManifest,
     ToolPolicy,
@@ -100,7 +101,8 @@ def validate(bundle):
             if pattern.split("/")[0] not in declared:
                 errors.append("toolPolicy references an undeclared connector")
     expected_legacy = {f"mcp__{name.split('/')[0]}__{name.split('/')[1]}" for name in intended}
-    if gates - expected_legacy:
+    allowed_gates = expected_legacy | {PLATFORM_PUBLISH_TOOL_NAME}
+    if gates - allowed_gates:
         errors.append("approval gate names no supported tool")
     return errors, (surface, policy, gates)
 

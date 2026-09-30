@@ -1,0 +1,9 @@
+{
+  "name": "stubfin-bot",
+  "version": "0.1.0",
+  "description": "Answers questions about invoices in a third-party finance system through one read-only hosted connector. A spike fixture for the custom-connector ADR, not a product.",
+  "starterPrompts": [
+    "List the invoices for 2026-Q2 and total them.",
+    "What is the status of invoice INV-2026-042?"
+  ]
+}

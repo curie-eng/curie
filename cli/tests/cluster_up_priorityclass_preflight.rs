@@ -2,8 +2,10 @@
 //! issue #1568. Every case drives the real `curie cluster up` entrypoint with
 //! recording Helm and kubectl executables on PATH.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -20,7 +22,7 @@ fn chart() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie")
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}",
@@ -30,14 +32,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -57,7 +52,7 @@ impl Fixture {
         let query_log = temp.path().join("priorityclass-queries.log");
         let controller_query_log = temp.path().join("controller-queries.log");
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -143,12 +138,17 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     exit 0
 fi
 
+if [ "$1" = "history" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+fi
+
 printf 'unexpected helm invocation: %s\n' "$*" >&2
 exit 64
 "#,
         );
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh

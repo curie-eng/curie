@@ -137,7 +137,9 @@ def serve_egress() -> Iterator[Callable[[MailAdapter], str]]:
     def _serve_one(instance: MailAdapter) -> str:
         server = make_server(instance, 0)
         server.daemon_threads = True
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        ).start()
         servers.append(server)
         return f"http://127.0.0.1:{server.server_address[1]}"
 

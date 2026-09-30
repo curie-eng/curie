@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Final
@@ -32,7 +33,41 @@ _TURN_OUTCOMES: Final = [
     # value crashes terminal completion after the turn has already settled
     # and leaves the stream entry pending.
     "deadline_halted",
+    "capacity_wait_expired",
 ]
+
+
+# Distinct agent names admitted on ``curie.agent.turn.completed`` in one
+# process. Names past the ceiling, and names that are not a short slug, share
+# the reserved ``other`` series. ``unbound`` is the series for a terminal turn
+# that never resolved an agent. Neither reserved value consumes a ceiling slot.
+_AGENT_LABEL_CEILING: Final = 32
+_AGENT_LABEL_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_BOUNDED_SEEN: dict[tuple[str, str], dict[str, None]] = {}
+
+
+def reset_bounded_labels() -> None:
+    """Drop process-local bounded-label admissions. Tests only."""
+
+    _BOUNDED_SEEN.clear()
+
+
+def _bounded_agent_label() -> dict[str, Any]:
+    return {
+        "kind": "bounded",
+        "ceiling": _AGENT_LABEL_CEILING,
+        "reserved": ["other", "unbound"],
+        "overflow": "other",
+        # Names that are not this slug, including spaces and names longer than
+        # 63 characters, share overflow. They never open their own series.
+        "pattern": r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+    }
+
+
+def _domain_width(values: Any) -> int:
+    if isinstance(values, Mapping) and values.get("kind") == "bounded":
+        return int(values["ceiling"]) + len(values["reserved"])
+    return len(values)
 
 
 def _definition(
@@ -40,10 +75,15 @@ def _definition(
     unit: str,
     description: str,
     monotonic: bool,
-    attributes: Mapping[str, list[str]],
+    attributes: Mapping[str, Any],
 ) -> dict[str, Any]:
-    domains = {key: list(values) for key, values in attributes.items()}
-    bound = math.prod(len(values) for values in domains.values())
+    domains: dict[str, Any] = {}
+    for key, values in attributes.items():
+        if isinstance(values, Mapping) and values.get("kind") == "bounded":
+            domains[key] = dict(values)
+        else:
+            domains[key] = list(values)
+    bound = math.prod(_domain_width(values) for values in domains.values())
     return {
         "type": instrument_type,
         "unit": unit,
@@ -64,15 +104,47 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
+# One agent dimension, on its own instrument, so the fleet-wide turn counter
+# stays unlabeled. The ceiling is the cardinality contract (#2952).
+_AGENT_TURN_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "source": ["worker"],
+    "outcome": _TURN_OUTCOMES,
+    "agent": _bounded_agent_label(),
+}
+_SCHEDULE_FIRE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "trigger": ["cron", "bind", "webhook", "test"],
+    "outcome": ["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"],
+}
+# A caller refused before any turn starts (ADR 0175 decision 3). Labeled only by
+# service and reason: never by binding, caller or channel, so the series count
+# stays fixed however many bindings carry a list, and nothing about who was
+# refused leaves the log line.
+_TURN_REFUSED_ATTRIBUTES = {
+    "service.name": ["curie-api", "curie-dispatcher"],
+    "reason": ["caller_not_allowed", "admission_unavailable"],
+}
 _HISTORY_CACHE_ATTRIBUTES = {
     "service.name": ["curie-runner"],
     "source": ["runner"],
     "cache_hit": ["true", "false"],
 }
+_HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "source": ["state-api"],
+    "outcome": ["capacity"],
+    "limit": ["value", "namespace"],
+}
 _QUEUE_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-dispatcher", "curie-worker"],
     "source": ["api", "dispatcher", "worker", "local", "eval"],
-    "outcome": ["success", "failure", "pending", "ack", "retry", "dead-letter"],
+    "outcome": ["success", "failure", "pending", "ack", "retry", "dead-letter", "queued"],
+}
+_CAPACITY_WAIT_COUNT_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "source": ["worker"],
+    "state": ["waiting", "active", "expired"],
 }
 _QUEUE_RETRY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -100,7 +172,15 @@ _THREAD_ATTRIBUTES = {
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["claim", "resume", "release", "suspend", "cleanup"],
+    "operation": [
+        "claim",
+        "resume",
+        "release",
+        "suspend",
+        "cleanup",
+        "reclaim",
+        "terminate",
+    ],
     "outcome": [
         "claimed",
         "reused",
@@ -110,6 +190,16 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        "terminated",
+        "expiry-unsupported",
+        "race-lost",
+        "reclaimed",
+        "reclaimed-retry-refused",
+        "refused-invalid-quota",
+        "refused-no-budget",
+        "refused-no-safe-route",
+        "scan-incomplete",
+        "timeout",
     ],
 }
 _SANDBOX_INVENTORY_ATTRIBUTES = {
@@ -119,7 +209,7 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout"],
+    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout", "turn-admit"],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }
@@ -175,9 +265,12 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/behavior-packs",
     "/agents/{agent_id}/budget",
     "/agents/{agent_id}/channels",
+    "/agents/{agent_id}/channels/callers",
     "/agents/{agent_id}/cost",
+    "/agents/{agent_id}/hook-secret",
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
+    "/agents/{agent_id}/memory/guidance",
     "/agents/{agent_id}/memory/{index}",
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",
@@ -190,15 +283,23 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/state/{namespace}/{key}",
     "/agents/{agent_id}/state/{namespace}/{key}/append",
     "/agents/{agent_id}/threads/{thread_key}/reset",
+    "/agents/{agent_id}/hooks/{name}/fire",
+    "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
     "/agents/{agent_id}/versions",
     "/agents/{agent_id}/versions/{version_id}/bundle",
     "/agents/{agent_id}/versions/{version_id}/connectors",
     "/agents/{agent_id}/versions/{version_id}/files",
     "/approvals",
+    "/approvals/principals/adapter",
+    "/approvals/principals/adapter/rotate",
     "/approvals/principals/operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
+    # Break-glass recovery (#2753).
+    "/approvals/identity-report",
+    "/approvals/{approval_id}/recover",
+    "/channels/admission",
     "/channels/token",
     "/channels/turns",
     "/cluster-message-replies/{reply_ref}",
@@ -229,11 +330,13 @@ _HTTP_OPERATIONS = [
     "/observability/runners",
     "/observability/runners/{namespace}/{pod}/logs",
     "/publications",
+    "/publications/precheck",
     "/publications/{publication_id}",
     "/v1/internal/cluster-message-replies/{reply_ref}",
     "/v1/internal/github/reviews/{event_id}/reserve",
     "/v1/internal/github/reviews/{event_id}/verify",
     "/v1/internal/publications",
+    "/v1/internal/publications/precheck/context",
     "/v1/internal/publications/lineage",
     "/v1/internal/publications/review-reservations",
     "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -241,6 +344,32 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
+    "/v1/internal/work-items/admissions",
+    "/v1/internal/work-items/requests/{request_id}",
+    "/v1/internal/work-items/{work_item_id}/cancel",
+    "/v1/internal/work-items/requests/{request_id}/acquire",
+    "/v1/internal/work-items/requests/{request_id}/defer",
+    "/v1/internal/work-items/requests/{request_id}/start",
+    "/v1/internal/work-items/requests/{request_id}/heartbeat",
+    "/v1/internal/work-items/requests/{request_id}/hold-approval",
+    "/v1/internal/work-items/requests/{request_id}/owner-lost",
+    "/v1/internal/work-items/running",
+    "/v1/internal/work-items/runtime-owners",
+    "/v1/internal/work-items/requests/{request_id}/finish",
+    "/v1/internal/work-items/requests/{request_id}/termination/claim",
+    "/v1/internal/work-items/requests/{request_id}/termination",
+    "/v1/work-item-progress/{request_id}",
+    "/v1/work-item-progress/{request_id}/usage",
+    "/v1/work-item-progress/{request_id}/verification",
+    # Deliberate progress from a running turn (ADR 0130).
+    "/v1/turn-progress/{progress_id}",
+    "/v1/factory/cards/{token}.svg",
+    "/schedules",
+    "/schedules/{agent}/{name}/pause",
+    "/schedules/{agent}/{name}/resume",
+    "/work-items",
+    "/work-items/{work_item_id}",
+    "/work-items/{work_item_id}/usage",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {
@@ -295,8 +424,28 @@ _METRICS: dict[str, dict[str, Any]] = {
     "curie.turn.completed": _definition(
         "counter", "{turn}", "Turns reaching a terminal result.", True, _TURN_COMPLETED_ATTRIBUTES
     ),
+    "curie.turn.refused": _definition(
+        "counter",
+        "{turn}",
+        "Callers refused before a turn by a binding's caller list.",
+        True,
+        _TURN_REFUSED_ATTRIBUTES,
+    ),
     "curie.turn.duration": _definition(
         "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
+    ),
+    "curie.agent.turn.completed": _definition(
+        "counter",
+        "{turn}",
+        "Terminal turns for one agent. Each process admits at most 32 distinct "
+        "slugs; further slugs, non-slugs, and the reserved names other and unbound "
+        "share other. A turn with no resolved agent is unbound. The cap is per "
+        "process, so a fleet query can still fold a slug into other on one worker.",
+        True,
+        _AGENT_TURN_ATTRIBUTES,
+    ),
+    "curie.schedule.fire": _definition(
+        "counter", "{fire}", "Durably settled hook fires.", True, _SCHEDULE_FIRE_ATTRIBUTES
     ),
     "curie.history.resume.cache_read": _definition(
         "histogram",
@@ -304,6 +453,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Provider cache read input tokens on the first turn after structured replay.",
         False,
         _HISTORY_CACHE_ATTRIBUTES,
+    ),
+    "curie.history.persistence.failure": _definition(
+        "counter",
+        "{failure}",
+        "Transcript persistence failures caused by state capacity limits.",
+        True,
+        _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES,
     ),
     "curie.queue.enqueue": _definition(
         "counter", "{message}", "Messages enqueued.", True, _QUEUE_ATTRIBUTES
@@ -401,6 +557,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _COMPLETION_OUTBOX_AGE_ATTRIBUTES,
     ),
+    "curie.capacity.wait": _definition(
+        "gauge",
+        "{turn}",
+        "Interactive turns by persisted capacity wait state.",
+        False,
+        _CAPACITY_WAIT_COUNT_ATTRIBUTES,
+    ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES
     ),
@@ -484,6 +647,25 @@ def configure_meter_provider(provider: MeterProvider) -> MeterProvider:
     return provider
 
 
+def _admit_bounded(metric: str, key: str, spec: Mapping[str, Any], value: str) -> str:
+    """Map one label onto the declared ceiling without raising."""
+
+    overflow = str(spec["overflow"])
+    reserved = spec["reserved"]
+    if value in reserved:
+        return value
+    pattern = re.compile(str(spec.get("pattern") or _AGENT_LABEL_RE.pattern))
+    if pattern.fullmatch(value) is None:
+        return overflow
+    seen = _BOUNDED_SEEN.setdefault((metric, key), {})
+    if value in seen:
+        return value
+    if len(seen) >= int(spec["ceiling"]):
+        return overflow
+    seen[value] = None
+    return value
+
+
 def record_metric(
     name: str,
     value: float = 1,
@@ -496,15 +678,22 @@ def record_metric(
     if definition is None:
         raise ValueError(f"undeclared metric {name!r}")
     supplied = dict(attributes or {})
-    domains: dict[str, list[str]] = definition["attributes"]
+    domains: dict[str, Any] = definition["attributes"]
     unknown = set(supplied) - set(domains)
     if unknown:
         raise ValueError(f"undeclared attribute for {name}: {sorted(unknown)!r}")
     missing = set(domains) - set(supplied)
     if missing:
         raise ValueError(f"missing declared attribute for {name}: {sorted(missing)!r}")
+    normalized = dict(supplied)
     for key, item in supplied.items():
-        if item not in domains[key]:
+        domain = domains[key]
+        if isinstance(domain, dict):
+            if not isinstance(item, str):
+                raise ValueError(f"attribute {key!r} value must be a string")
+            normalized[key] = _admit_bounded(name, key, domain, item)
+            continue
+        if item not in domain:
             raise ValueError(f"attribute {key!r} value {item!r} is outside its declared domain")
     if not math.isfinite(float(value)):
         raise ValueError("metric value must be finite")
@@ -514,8 +703,8 @@ def record_metric(
     context = _normalize_trace_context()
     instrument_type = definition["type"]
     if instrument_type in {"counter", "up_down_counter"}:
-        instrument.add(value, supplied, context=context)
+        instrument.add(value, normalized, context=context)
     elif instrument_type == "histogram":
-        instrument.record(value, supplied, context=context)
+        instrument.record(value, normalized, context=context)
     else:
-        instrument.set(value, supplied, context=context)
+        instrument.set(value, normalized, context=context)

@@ -63,7 +63,7 @@ case "${0##*/}:$*" in
   kubectl:"get pods -n mail-test -l app.kubernetes.io/instance=acme,app.kubernetes.io/component=worker -o json")
     printf '%s\n' '{"items":[{"metadata":{"name":"acme-worker-abc","labels":{"app.kubernetes.io/instance":"acme","app.kubernetes.io/component":"worker"}},"status":{"phase":"Running"}}]}'
     exit 0 ;;
-  kubectl:"exec -n mail-test acme-worker-abc -- python -m curie_worker.upgrade_drain --mode status --json")
+  kubectl:"exec -n mail-test acme-worker-abc -- python -m curie_worker.upgrade_drain --mode status --json --with-ttl")
     printf '%s\n' '{"state":"claims_enabled","since":null,"revision":null}'
     exit 0 ;;
   kubectl:"get pods"*) cat "${0%/*}/pods.json"; exit 0 ;;

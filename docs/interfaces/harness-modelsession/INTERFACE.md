@@ -23,9 +23,9 @@ epic_note: folds into
 Inside the runner the model harness is reached through one in-process port: the
 `ModelSession` Protocol. Everything above it (ACI translation, budget, side-effect
 flagging, NDJSON, the HTTP layer) is written against the Protocol. The port itself is
-CLEAN, but the SDK is not yet confined to one module: eleven runner modules still import
+CLEAN, but the SDK is not yet confined to one module: fourteen runner modules still import
 `claude_agent_sdk` today (`check.py`, `session.py`, `hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`,
-`approval.py`, `translate.py`, `plugin.py`, `state.py`, `__main__.py`, whose boot path
+`approval.py`, `translate.py`, `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `usage_report.py`, `__main__.py`, whose boot path
 assembles the approval gate's `PreToolUse` hook matcher alongside the bundle's), and the
 value that crosses the port is currently the raw SDK message union rather than a
 runner-owned neutral type. The
@@ -57,6 +57,17 @@ A second harness must supply an object satisfying `ModelSession`
 - `async def interrupt(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.interrupt`) — native hard stop at the next
   safe boundary.
 - `async def close(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.close`) — tear down.
+
+Optional capabilities sit beside the five-method port. A session may implement
+`McpServerReconnector.ensure_mcp_server`
+(`runner/src/curie_runner/adapter.py::McpServerReconnector.ensure_mcp_server`) so the runner
+can verify and repair the session's own MCP connection before clearing a connector failure.
+A harness that omits it keeps side-probe-only connector recovery. A session may also expose
+the duck-typed `export_replay_state` hook. It returns `HarnessReplayState` for a full
+checkpoint or delta, or `None` when there is nothing new to export
+(`runner/src/curie_runner/history.py::HarnessReplayState`), and `SessionRunner` bounds the export to
+`_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS` (five seconds) before preserving portable replay
+without the harness checkpoint (`runner/src/curie_runner/session.py::SessionRunner`).
 
 Apart from `PartialMessageBoundary` and `StreamedToolUseBoundary`, the values a `receive_turn` iterator yields must be
 mappable by `translate_message` (`runner/src/curie_runner/translate.py::translate_message`)
@@ -122,7 +133,7 @@ The port is CLEAN as a code interface but leaks harness shape where the SDK is n
 walled off, called out in vision-doc Job 1:
 
 - **SDK-shaped message payload.** The value crossing the port is the concrete
-  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across eleven
+  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across fourteen
   runner modules rather than one harness package. The runner-owned `TurnEvent` model that
   was to draw the neutral line is withdrawn (issue #307 closed as superseded, its PR #315
   closed unmerged and kept only as mining material for the package-shaped redesign);
@@ -139,6 +150,10 @@ walled off, called out in vision-doc Job 1:
   `runner/src/curie_runner/harness/contribution.py::BundleCompileResult` whose `plugins`
   field is typed `list[Any]` and, for the built-in, is filled with the SDK's own
   `SdkPluginConfig` objects (`runner/src/curie_runner/plugin.py::load_plugins`).
+- **Duck-typed replay export.** `export_replay_state` is discovered with `getattr` in
+  `runner/src/curie_runner/session.py::SessionRunner`, unlike the declared
+  `McpServerReconnector` optional protocol. A second harness can therefore miss a
+  load-bearing checkpoint capability without a protocol conformance failure.
 
 ## Cross-links
 

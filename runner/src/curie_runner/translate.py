@@ -16,6 +16,7 @@ translation serve both the live HTTP turn and the conformance producer.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,10 +39,13 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from curie_telemetry.redact import redact_text
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
-from .approval import APPROVAL_TOOL_NAME, PUBLISH_TOOL_NAME, guard_reserved_summary
+from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .history import ConversationMessage
 from .otel import _GenerationSpan
+from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 
 # Longest raw tool reply this will parse into a recordable ``result``. The reply
@@ -64,17 +68,66 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
+    # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
+    "max-turns",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+
+# SDK ResultMessage subtypes that name a known platform failure (#3071). Only
+# this explicit table maps an SDK token onto platform vocabulary; everything
+# else still goes through the allowlist unchanged.
+_RESULT_SUBTYPE_CLASSIFICATIONS = {
+    "error_max_turns": "max-turns",
+    "error_max_budget_usd": "budget-exceeded",
+}
 
 
 def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+# A provider refusing a request for lack of credits (#3073). The SDK names an
+# Anthropic billing refusal ``billing_error``; an OpenAI-compatible provider
+# such as OpenRouter answers HTTP 402, which the SDK reports only as
+# ``unknown`` with the provider's message as the assistant text. Terminal and
+# not retryable: more attempts cannot add credits.
+CREDIT_EXHAUSTED_CLASSIFICATION = "model-credit-exhausted"
+_BILLING_SDK_CODE = "billing_error"
+_CREDIT_EXHAUSTED_TEXT = re.compile(
+    r"\b402\b|payment required|insufficient (?:credits?|balance|funds)"
+    r"|(?:credit|spend|usage) limit|(?:more|out of|no) credits",
+    re.IGNORECASE,
+)
+# Longest provider message carried on the error event.
+_PROVIDER_TEXT_MAX = 600
+
+
+def _provider_error_text(message: AssistantMessage) -> str:
+    """The provider's own message off an errored assistant message, redacted.
+
+    Redacted before it is clipped so a truncated key still matches.
+    """
+
+    text = " ".join(
+        block.text.strip()
+        for block in message.content
+        if isinstance(block, TextBlock) and block.text.strip()
+    )
+    text = redact_text(text)
+    if len(text) > _PROVIDER_TEXT_MAX:
+        text = text[: _PROVIDER_TEXT_MAX - 3].rstrip() + "..."
+    return text
+
+
+def _is_credit_exhausted(error: str, provider_text: str) -> bool:
+    return error == _BILLING_SDK_CODE or bool(_CREDIT_EXHAUSTED_TEXT.search(provider_text))
 
 
 @dataclass
@@ -99,6 +152,7 @@ class TurnState:
     # policy gate never carries one (Decision A), so it stays None here.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_granted_arguments: dict[str, Any] | None = None
     # Bundle-authored human sentence (#2565). None means the card uses
     # approval_summary. Never grant provenance.
     approval_display: str | None = None
@@ -139,7 +193,7 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # The raw ``ToolUseBlock.input`` of every publication call seen on the
+    # The exact tool ID and input of every publication call seen on the
     # stream this turn (#2294), in call order. Captured here, decided in
     # ``SessionRunner._observe_publication_calls``: this module stays pure and
     # never touches the ApprovalGate, so the same seam serves the live turn and
@@ -149,7 +203,7 @@ class TurnState:
     # standing. It is load-bearing for the case where neither SDK layer recorded
     # the call at all and the turn would otherwise finalize DONE with nothing to
     # approve.
-    publication_calls: list[dict[str, Any]] = field(default_factory=list)
+    publication_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # How many of ``publication_calls`` the session has already acted on, so the
     # observation runs exactly once per call even though it is invoked on every
     # message of the turn.
@@ -166,11 +220,17 @@ def translate_message(
     state: TurnState,
     classifier: SideEffectClassifier,
     gen: _GenerationSpan | None,
+    *,
+    activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
-    """Map one SDK message to the ACI outbound events it produces."""
+    """Map one SDK message to the ACI outbound events it produces.
+
+    ``activity`` (#3077) receives the turn and tool-call counters the
+    ``report_progress`` tool carries; None when no progress tool is mounted.
+    """
 
     if isinstance(message, AssistantMessage):
-        return _translate_assistant(message, state, classifier, gen)
+        return _translate_assistant(message, state, classifier, gen, activity)
     if isinstance(message, ResultMessage):
         return _translate_result(message, state)
     if isinstance(message, UserMessage):
@@ -194,6 +254,7 @@ def _translate_assistant(
     state: TurnState,
     classifier: SideEffectClassifier,
     gen: _GenerationSpan | None,
+    activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
 
@@ -208,10 +269,28 @@ def _translate_assistant(
 
     error = getattr(message, "error", None)
     if error:
-        mapped = map_error_classification(error)
+        provider_text = _provider_error_text(message)
+        if _is_credit_exhausted(error, provider_text):
+            mapped = CREDIT_EXHAUSTED_CLASSIFICATION
+        else:
+            mapped = map_error_classification(error)
         state.error_classification = mapped
-        events.append(ErrorEvent(message=f"model error: {error}", classification=mapped))
+        detail = f"model error: {error}"
+        if provider_text:
+            detail = f"{detail}: {provider_text}"
+        events.append(ErrorEvent(message=detail, classification=mapped))
 
+    if activity is not None:
+        activity.observe_assistant_message()
+    if gen is not None:
+        # Record the whole message's output first (#3128): the first tool_use
+        # below closes the generation, so a later block in a parallel tool
+        # response would otherwise be dropped. Tool names only, never arguments.
+        for block in message.content:
+            if isinstance(block, TextBlock) and block.text:
+                gen.observe_output(block.text)
+            elif isinstance(block, ToolUseBlock):
+                gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text:
@@ -219,6 +298,8 @@ def _translate_assistant(
                 events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
+            if activity is not None:
+                activity.observe_tool(block.name)
             # Every tool call is evidence for the false-completion check (#517),
             # including the approval-request tool below and read-only tools.
             state.tool_call_count += 1
@@ -226,12 +307,12 @@ def _translate_assistant(
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
-            if block.name == PUBLISH_TOOL_NAME:
+            if block.name == PLATFORM_PUBLISH_TOOL_NAME:
                 # Wire-level capture only (#2294). The session decides what to
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.
                 state.publication_calls.append(
-                    block.input if isinstance(block.input, dict) else {}
+                    (block.id, block.input if isinstance(block.input, dict) else {})
                 )
             if block.name == APPROVAL_TOOL_NAME:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
@@ -374,10 +455,13 @@ def _translate_result(
         events: list[OutboundEvent] = []
         if state.error_classification is None:
             raw = subtype or "server-error"
-            mapped = map_error_classification(raw)
+            known = _RESULT_SUBTYPE_CLASSIFICATIONS.get(raw)
+            mapped = known or map_error_classification(raw)
+            if known is not None:
+                state.error_classification = known
             events.append(
                 ErrorEvent(
-                    message=text if mapped == raw else f"{text}: {raw}",
+                    message=text if mapped == raw or known else f"{text}: {raw}",
                     classification=mapped,
                 )
             )

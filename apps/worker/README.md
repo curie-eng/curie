@@ -167,6 +167,9 @@ XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
    -> XACK
 ```
 
+A targeted cron turn posts one message containing the final reply and does not
+show the booting caption or stream partial edits.
+
 Rules (detailed-architecture 2b), each with an integration test that provokes it
 (`tests/kernel/`):
 
@@ -186,7 +189,8 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   `side_effect_flag` escalates to a human (the placeholder is edited to say so)
   instead of retrying. The flag is persisted to Valkey the instant it is seen, so
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
-  a non-idempotent action. Flag-clean failures retry by classification:
+  a non-idempotent action. For noncron turns, flag-clean failures retry by
+  classification:
   `rate-limit`, `runner-error`, `runner-timeout` and `workspace-error` are
   transient (bounded exponential backoff); `budget-exceeded` and everything else
   escalate.
@@ -194,8 +198,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   told apart from `runner-error` -- the sandbox or the transport dying -- so an
   operator can see which one happened.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
-  ever accepted (#2004): the clone, the archive, the upload, or a missing
-  workspace coordinator on a turn that names no repository. It is told apart
+  ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
   reason, and it always carries a `workspace start failed` WARNING naming the
   agent, the deployment, the repository the turn asked for and the stage that
@@ -203,10 +206,17 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
   answers the user, and logs at INFO instead. A turn that names a repository
-  while the worker-wide coordinator is off is such a refusal (#2659); and a
-  turn that attaches a workspace because its own message named the repository
-  ends its reply with one platform line naming that repository, placed after
-  the model's answer and before the receipt or the awaiting-approval notice.
+  while the coordinator is off for the worker is such a refusal (#2659). Generic
+  turns continue through the normal claim path while it is off. A retained live
+  or suspended route that already has a repository workspace and verified review
+  feedback are also terminal refusals, because both require repository authority.
+  The disabled lane does not consult repository selections or webhook operator
+  mappings held only by the server. A turn with no repository message, verified
+  review, or retained route that carries a repository stays generic and runs
+  without a workspace.
+  A turn that attaches a workspace because its own message named the repository
+  ends its reply with one platform line naming that repository, placed after the
+  model's answer and before the receipt or the awaiting-approval notice.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   A renewable worker lease distinguishes process death from ordinary consumer
@@ -242,6 +252,30 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   transcript, just not delivered). A reply over a *configured* default
   transport, and any non-resume turn, still raises on an unreachable
   endpoint and follows the normal retry/dead-letter path above.
+
+### Turns between sibling identities
+
+A turn whose author is one of this installation's own identities counts against
+two fixed-window Valkey counters (ADR-0168 decision 6), under
+`<key_prefix>:sibling:`. On Slack, that author is an identity's bot user from
+`auth.test`. On the channel port, it is the address a binding is bound at. One
+counter is kept per session key, admitting 5 sibling-written turns
+(`SIBLING_TURN_LIMIT`), and one per ordered identity pair, admitting 5
+conversations the pair opens (`SIBLING_OPEN_LIMIT`), both in a 600 s window
+(`SIBLING_WINDOW_SECONDS`); these are `curie_worker.sibling_turns` constants,
+not configuration. Past them the kernel logs
+`dropping event <id> from a sibling identity: sibling_conversation_limit` (or
+`sibling_pair_limit`). On Slack it edits the placeholder with a notice that
+mentions nobody, and on every kind it completes the turn as dropped. An install
+with one Slack identity and at most one adapter builds none of this.
+
+The counters count delivery attempts, not events: `check()` takes no event id,
+so a non-terminal redelivery of a turn already counted -- a binding lookup that
+raised, a lock lost mid-turn, a worker crash after the check but before the
+turn finished -- increments both counters again on retry. A legitimate sibling
+exchange can therefore be cut short a little early during an outage that
+redelivers it. That is consistent with failing safe: the counters undercount a
+conversation's true budget, never let one run longer than intended.
 
 ### The dead-letter graveyard
 
@@ -280,7 +314,7 @@ not inbound stream entries, and must not be replayed onto the main stream.
   system's poison rate, saturating rather than growing once the bound is
   hit.
 
-The graveyard has two row families. Stream-consumer rows carry the original
+The graveyard has three row families. Stream-consumer rows carry the original
 entry's fields verbatim plus namespaced failure metadata, so a human or replay
 tool can inspect exactly what inbound entry died and why:
 
@@ -288,7 +322,7 @@ tool can inspect exactly what inbound entry died and why:
 |---|---|
 | `dl_original_id` | the entry's id on the source stream |
 | `dl_delivery_count` | deliveries made before it was given up on |
-| `dl_reason` | `max-delivery-exceeded`, or `unparseable` |
+| `dl_reason` | `max-delivery-exceeded`, `unparseable`, or `broker-entry-vanished` |
 | `dl_dead_lettered_at` | UTC ISO-8601 timestamp |
 
 Completion-outbox rows are written by `Markers.dead_letter_completion` only for
@@ -299,6 +333,14 @@ serialized `completion`, `dl_reason="thread deleted at provider"`,
 `dl_dead_lettered_at`; they have no `dl_original_id` and are not replayable as
 inbound stream entries. Every other completion delivery failure leaves the
 completion owed in the outbox for re-emission.
+
+Progress-outbox rows are written by `ProgressStore.dead_letter` for a progress
+delivery whose attempt budget is spent. They carry `delivery_id`,
+`progress_id`, the stored `event`, `dl_reason="max-attempts-exceeded"`,
+`dl_delivery_count` (the attempts made), `dl_source="progress-outbox"`, and
+`dl_dead_lettered_at`. Like completion-outbox rows they have no
+`dl_original_id` and are not replayable as inbound stream entries; see
+[Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130).
 
 The `dl_` prefix keeps the stream-consumer metadata namespaced, but the
 unparseable path stores
@@ -343,9 +385,13 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_MAX_ATTEMPTS`, `CURIE_MAX_DELIVERY` / `CURIE_DEAD_LETTER_STREAM` /
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
 `1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
-one delivery lease TTL) and `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
-when a delivery's handler raises), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
-the substrate. Run with `python -m curie_worker`.
+one delivery lease TTL), `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
+when a delivery's handler raises), `CURIE_TURN_RECEIPT` (what the receipt
+beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180) and
+`CURIE_PROGRESS_RENDER` (deliberate progress rendering, off; see
+[Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)),
+plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
+substrate. Run with `python -m curie_worker`.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
@@ -425,18 +471,19 @@ user-visible effect.
 | Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
-| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. |
+| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
 | Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
 | Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
 | Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
+| Write platform progress, terminal states included | `progress.py` `ProgressStore.apply_platform_update` (no caller yet; ADR 0130) | One Lua script checks the lease token and the fencing generation, the same two checks `settle_fenced` makes, before it writes anything. A loser writes no state and enqueues no delivery, and is refused `lease-lost`. |
 | Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
 
 Stated plainly, as ADR-0131 requires: **a fenced-out owner is refused ACK,
 dead-letter, outbox clearing, and terminal emit** — and is refused starting a
 new attempt.
 
-Two verbs are **deliberately not lease-fenced**, and neither is an oversight:
+Three verbs are **deliberately not lease-fenced**, and none is an oversight:
 
 - **The side-effect marker** (`markers.mark_side_effect`, written from
   `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
@@ -450,6 +497,21 @@ Two verbs are **deliberately not lease-fenced**, and neither is an oversight:
   acked off the group, where no lease exists or ever will. Its guard is the
   record's done flag plus the compare-and-checked `clear_completion`, not a
   lease. Do not "complete the fence" by adding one here.
+- **The progress-outbox sweeper** (`progress.py` `sweep_pending_progress`,
+  called from the maintenance tick next to the completion sweeper). It is not an
+  owner for the same reason: a pending progress delivery outlives the stream
+  entry whose turn caused it. Its guard is the record's generation, compared on
+  every attempt charge, acknowledgement and dead-letter, not a lease.
+
+Applying a model's progress command (`ProgressStore.apply_model_command`,
+called by the kernel's per-turn pump) is not an owner verb either. The pump
+applies what the ingress accepted from the authenticated running turn, not a
+stream delivery, so its guard is the `(epoch, seq)` order and terminal
+monotonicity rather than a lease: an owner that lost its fence can only apply
+its own turn's commands, which the record orders like anyone else's. While
+rendering is off the pump also removes the deliveries an applied command
+enqueued (`ProgressStore.discard_deliveries`); nothing a person sees depends on
+that write.
 
 ### Adapter idempotency: which channel may claim one terminal effect
 
@@ -460,12 +522,341 @@ delivery is impossible, and nothing below claims it. An adapter may claim the
 property only when its receiving boundary applies `event_id` idempotently or the
 adapter mutates one stable target.
 
+Slack has two verbs here and only one of them takes a key. `chat.update` takes
+none, so an edit is idempotent by its stable target. `chat.postMessage` takes
+`client_msg_id`, which is how the approval card has always survived an
+ambiguous retry, and every create that carries a reply wire 1.1 `delivery_id`
+passes it there (ADR-0130 section 4), including an approval post. Existing 1.0
+approval posts keep using the approval UUID because they carry no
+`delivery_id`; the CLI recognizes either form from the structured Approve
+button's UUID value. On 2026-09-29, exact candidate
+`0b26aa3e3bd5d0663267e4393030200d88ece156` ran
+`apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`
+against real Slack. The duplicate call answered `ok: true` with the first
+message's `ts`; the thread contained exactly one card and one fresh-key
+milestone. `_adopt_posted_ts` adopts that returned `ts`. An API error still
+raises, so the delivery remains retryable under the same key.
+
 | Adapter / path | Receiving boundary | Idempotent apply? | Claim |
 |---|---|---|---|
-| `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes — by **stable target**, not by `event_id`; Slack exposes no idempotency key. | One user-visible terminal effect per `event_id`. |
-| `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn) | `chat.postMessage` — a **create**, not a mutation, until the minted ts is adopted as the turn's ref. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
+| `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes, by **stable target**, not by `event_id`: `chat.update` takes no idempotency key. | One user-visible terminal effect per `event_id`. |
+| `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn), 1.0 body | `chat.postMessage`, a **create**, not a mutation, until the minted ts is adopted as the turn's ref. A 1.0 body carries no `delivery_id`, so the post carries no `client_msg_id`. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
+| `SlackReplyAdapter`, placeholder-less turn, 1.1 body carrying `delivery_id` | The same `chat.postMessage`, with `client_msg_id` set to the `delivery_id`. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible answer message per `delivery_id`; the adapter adopts the original `ts`. |
+| `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | For a 1.0 body, `chat.postMessage` keeps the approval UUID as `client_msg_id`. For a 1.1 body, `client_msg_id` is the wire operation's `delivery_id`; the approval UUID remains in the structured Approve button value, where `cli/src/chat.rs::approval_card_id` reads it. | Slack deduplicates by whichever stable key the body form supplies. | One visible card per approval UUID on 1.0, or per `delivery_id` on 1.1. |
+| `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible card or milestone per `delivery_id`; the adapter adopts the original `ts`. |
+| `SlackReplyAdapter`, progress edit (`reply.update` carrying `progress`) | `chat.update` on the card's own ts, the `ref` acknowledged for its first post, never the placeholder's. Never the answer path, and never the approval card's settle path. | Yes, by **stable target**. The `delivery_id` has no Slack expression on an edit. | One visible card whatever the retry count. Which revision shows last is the coordinator's order, because Slack keeps the last edit it received. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
+
+### Cron hook run outcomes
+
+A cron turn carries a `hook_run` carrier with `agent_id`, `name`, and `slot_utc`.
+The scheduler producer must supply all three fields for every cron turn, with
+`slot_utc` as an ISO8601 UTC timestamp.
+
+When a started turn exits, the worker writes `ran` for a normal exit, including
+an approval pause, or `failed` for a bad exit or deadline, with `ended_at`
+before writing the done marker. A prestart deferral leaves the row open for
+scheduler reconciliation. A cron failure is not retried within its fire.
+Slack and webhook turns perform no hook run writes.
+
+If persistence fails before durable closure, the delivery stays pending and
+may run again on redelivery. The close and the done marker use PostgreSQL and
+Valkey, so they are not atomic across both systems.
+
+## Deliberate progress (ADR 0130)
+
+`curie_worker.progress` is the worker coordinator's durable state for
+[ADR 0130](../../docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md):
+one progress record per logical turn chain, its milestone budget, and an outbox
+of the card and milestone deliveries the record owes its channel. It lives in
+Valkey, like the completion outbox; Postgres holds none of it.
+
+A model's command reaches it through the running turn: the kernel hands an
+eligible turn a progress capability, the runner's `progress` tool posts each
+command to the API's scoped ingress, the API appends it to the chain's inbox,
+and a per-turn pump in the kernel applies it to the record (see
+[The capability and the pump](#the-capability-and-the-pump) below). Rendering is
+off: no adapter is called for progress, and the maintenance tick runs its
+sweeper without a deliverer (below).
+
+### Keys
+
+Every key is built by a `WorkerConfig` helper under `key_prefix`
+(`curie:worker` by default), like every other worker key.
+
+| Key | Type | Holds |
+|---|---|---|
+| `<key_prefix>:progress:{pid}` | hash | The record: `state`, `summary`, `revision`, `epoch`, `last_seq`, `turn_generation`, `active_generation`, `milestones_used`, `card_ref`, `answer_ref`, `terminal`, `inbox_cursor`, `update_count`, and one field per accepted update id. |
+| `<key_prefix>:progress:delivery:{delivery_id}` | hash | One pending delivery: the semantic event (`event`), its route (`route`), `attempts`, `gen`, and the `pid`, `slot` and `created_at` its scripts and the sweeper read. |
+| `<key_prefix>:progress:pending` | set | The index of pending delivery ids, so the sweeper never scans the keyspace. |
+| `<key_prefix>:progress:chain:{event_id}` | string | The `pid` an approval resume event continues. |
+| `<key_prefix>:progress:inbox:{pid}` | stream | The chain's inbox: one entry per command the API accepted, with the fields `command` (the `ProgressCommand` as JSON), worker-issued `generation` and runner-issued `seq`. The API writes it; the live pump or maintenance drainer reads it. |
+| `<key_prefix>:progress:inbox:pending` | set | Progress ids with inbox work not yet reflected by `inbox_cursor`. The API adds atomically with `XADD`; the worker removes only after proving no later stream id exists. |
+| `<key_prefix>:progress:rate:{token digest}` | hash | The API's per-token rate limit bucket (`tokens`, `at`). |
+
+The inbox and the rate bucket are written by the API, which shares the
+worker's `KEY_PREFIX` (`worker_key_prefix`), and their shape is frozen in
+[`tests/vectors/turn-progress-capability.json`](../../tests/vectors/turn-progress-capability.json).
+The API caps the inbox at 128 entries and gives it a 14 day expiry on every
+append, and the bucket expires a minute after its last use. Every other key
+expires after `max(completion_max_retention_s, 14 days)`. Fourteen
+days is the approval card's own lifetime (`approval_cards.DEFAULT_CARD_TTL_S`),
+because a chain lives across the approval it suspends for. The record's expiry
+is renewed by every accepted update. A delivery keeps the expiry it was written
+with, and the pending set's expiry is renewed by every enqueue, so the set
+outlives every member it indexes; the sweeper drops a member whose delivery has
+expired.
+
+### Identity
+
+- `progress_id_for(thread_key, root_event_id)` is
+  `uuid5(PROGRESS_ID_NAMESPACE, thread_key + "\0" + root_event_id)` with a fixed
+  namespace constant, so a redelivered root event reopens the same record
+  rather than minting a second one.
+- `ProgressStore.chain_for_turn` is how a turn finds its record. A fresh turn
+  opens, idempotently, the record its own event id derives. An approval resume
+  only follows `chain:{resume_event_id}`, the pointer `link_resume` writes when
+  the chain suspends, so it continues the same record with the same milestone
+  budget. When that pointer has expired the resume gets no record at all: the
+  helper returns `None` and the caller renders nothing. A resume never derives a
+  record from its own event id, so an expired pointer cannot become a fresh
+  budget.
+- Delivery ids are derived, never minted, so a retry cannot change identity.
+  The card's first post is `uuid5(pid, "card")`, the card edit at revision r is
+  `uuid5(pid, "card:r")`, and milestone n is `uuid5(pid, "milestone:n")`, each in
+  the canonical lowercase form reply wire 1.1's `DeliveryId` requires.
+
+### Who writes which state
+
+- `apply_model_command` takes a validated `ProgressCommand` and accepts only
+  `investigating`, `preparing-workspace`, `testing` and `publishing`. A command
+  naming `queued`, `awaiting-approval`, `complete`, `failed` or `cancelled` is
+  refused (`platform-only-state`) before Valkey is touched.
+- `apply_platform_update` is the platform's separate entry point and may write
+  any state, the terminal ones included. It takes the caller's ADR-0131 lease
+  (owner token and fencing generation, with the delivery triple that names its
+  keys). Its script first checks that the lease key still holds the token and
+  that the delivery state's generation is still the caller's, the two checks
+  `markers.py` `settle_fenced` makes, and writes nothing when either has moved
+  (`lease-lost`). The leaseless sentinel, `unfenced_lease()`, holds no token and
+  is refused the same way.
+- Model and platform update ids are recorded in separate namespaces (`m:` and
+  `p:` fields), so a model cannot pre-empt a platform write by reusing its id.
+
+### Update rules
+
+Each update is one Lua script. Its checks run in this order, and the first that
+fails answers:
+
+1. The record must exist (`no-chain`). Only opening a chain creates one; no
+   update does.
+2. An update id already accepted is a no-op reported as `duplicate`, not an
+   error, and writes nothing.
+3. A terminal record (`complete`, `failed`, `cancelled`) refuses every update
+   (`terminal`), so nothing reopens it.
+4. Updates are ordered by `(epoch, seq)`, where a model command's epoch is the
+   durable generation the worker allocated for its turn. A command from an older epoch is
+   refused (`stale-epoch`), and within the record's epoch a `seq` at or below
+   `last_seq` is refused (`stale-seq`); a newer epoch is accepted and restarts
+   the sequence. A platform update names an epoch and no seq. It is refused from
+   an older epoch, and at a newer one it moves the record to that epoch, which
+   refuses every later command of the older one: an `awaiting-approval` written
+   for the resume's epoch fences out a late command from the suspended session.
+5. A chain accepts at most 50 updates (`MAX_PROGRESS_UPDATES`), and the 51st
+   non-terminal update is refused (`update-cap`). The terminal write is exempt,
+   so a chain that spent its updates can still close its card. Terminal is
+   monotonic, so the exemption adds at most one.
+
+An accepted update increments `update_count`, records its id, and advances
+`epoch` and `last_seq`. It increments `revision` by exactly one when it changes
+the state or the summary, and only then; an update that changes neither leaves
+the revision, and the card, as they were.
+
+The card payload and every delivery id depend on the revision and the
+milestone count, and only Python derives them. So the script also compares the
+two counts it is about to advance against the ones the store read before
+building them, and when another update moved either in between it writes
+nothing and the store reads again and retries. Each retry means another change
+was accepted, and a chain has a bounded number of revisions and reservations,
+so the retry loop is bounded too.
+
+### Milestones
+
+A model command carrying `milestone` reserves the next ordinal in the same
+script that accepts the update, while `milestones_used` is below 3. The fourth
+request is refused, reported as `milestone_refused`, and the update itself
+still applies: its state and summary still move the card, it still counts
+toward the 50, and its id is still recorded, so a retry of it is a duplicate
+rather than a second try for a slot. An update that is refused reserves
+nothing. Reservations are fields of the record, so a restarted worker and an
+approval resume (the same pid) read the same count. Approval cards and the
+canonical final answer use no slot, and the platform entry point cannot
+request one.
+
+### The outbox
+
+The script that accepts a change also enqueues the delivery it owes, in the
+same atomic step: the delivery record and its `progress:pending` membership.
+Revision 1 owes the card's first post (`reply.post`), each later revision one
+card edit (`reply.update`), and each reservation one milestone post. The stored
+event is the semantic payload (`ProgressCard` or `ProgressMilestone`), its
+operation and its reply target. An edit is addressed to the record's
+`card_ref`, which only exists once the first post is acknowledged, so it is
+read at delivery time rather than stored in the edit.
+
+- `ack(delivery_id, generation, card_ref=...)` clears a delivery only when its
+  stored generation is the caller's, so a late acknowledgement cannot clear a
+  record written after it. For the card's first post it also records the
+  adapter's ref as `card_ref` in the same script, so a crash cannot separate
+  the two.
+- `sweep_pending_progress` is bounded: it samples at most 64 members, stops
+  after 30 seconds, and bounds each delivery by the time left. For each member:
+  - a malformed record is quarantined: its index membership is removed, the
+    payload is left in place for an operator to inspect, and an ERROR is
+    logged, so one bad record cannot crash-loop the tick;
+  - a member whose delivery has expired or been cleared is dropped from the
+    index;
+  - a delivery that has used its 5 attempts (`PROGRESS_MAX_ATTEMPTS`) is
+    dead-lettered to the graveyard (`dl_source=progress-outbox`, described
+    [above](#the-dead-letter-graveyard));
+  - otherwise, given a deliverer and once the delivery is older than a 60
+    second grace that keeps the sweeper out of the live path's window, it
+    charges one attempt, calls the deliverer with the stored record, whose
+    `delivery_id` never changes, and acknowledges on success. A failure leaves
+    the delivery for a later pass, and the attempt that reaches the cap
+    dead-letters it at once.
+- The maintenance tick calls the sweep right after `sweep_pending_completions`,
+  with no deliverer, because nothing delivers progress yet. That sweeper
+  quarantines, drops and dead-letters, and never charges an attempt it cannot
+  make, so a replica that can deliver never finds its deliveries' budget spent
+  by an older one during a rolling upgrade. A failed pass is logged and does
+  not stop the rest of the tick.
+
+Every attempt charge, acknowledgement and dead-letter compares the stored
+generation, so a pass holding a stale read can neither clear nor accuse a
+delivery written after it.
+
+### The capability and the pump
+
+`curie_worker.turn_progress` is the kernel's side of the ingress.
+
+- **Eligibility.** Only a human's Slack turn gets a capability: its source is
+  `slack`, its reply handle's kind is `slack`, it has a reply target, and it is
+  neither a factory work-item turn nor a `curie cluster message` relay turn
+  (adapter `curie-cluster-message`). An approval resume of such a turn is
+  eligible too. Before claiming its sandbox, the worker writes
+  `CURIE_TURN_PROGRESS_ENABLED=1` only for an eligible turn. That boot fact is
+  part of sandbox reuse comparison, so a sandbox with the opposite eligibility
+  is cold-recreated rather than adopted. The runner mounts the progress tool
+  and prompt only when the fact is present. A job, cron turn, targetless hook,
+  factory execution and relay turn therefore see neither the tool nor its
+  prompt, in addition to receiving no progress headers.
+- **The chain.** A fresh turn's chain is `progress_id_for(thread_key,
+  event_id)`, so a retry of the same event, in the same delivery or a
+  redelivery, names the same record. An approval resume follows only the
+  pointer its suspended turn wrote; when that pointer has expired the resume
+  gets no capability. The record is opened (idempotently) when the turn's
+  stream is consumed, never when an event only steers a live turn, so a steer
+  opens no chain. When an eligible turn pauses for approval the kernel links
+  the resume event `approval-<id>-resolved` to its chain with `link_resume`.
+- **The capability.** Each actual turn start atomically increments the record's
+  durable `turn_generation`, marks it as `active_generation`, and mints a
+  sandbox token (the byte-identical `sandbox_token` module) with scope
+  `turn.progress` and subject `progress_id:generation`. It sends the token,
+  generation, and URL to the runner on `POST /v1/event` in
+  `X-Curie-Progress-Token`, `X-Curie-Progress-Generation`, and
+  `X-Curie-Progress-Url`. They are runner control headers, like
+  `X-Curie-Turn-Epoch`, and not ACI fields. The API's append script checks the
+  signed generation is still active and its Valkey-server-time lease has not
+  passed. The lease lasts five seconds. Renewal begins as soon as activation
+  succeeds, before the worker waits for the runner's response headers, and is
+  handed to the live pump once stream consumption starts. Both renew only the
+  active, unexpired generation; a missed lease cannot be revived. The worker clears the
+  generation and deadline when the turn closes; if that best-effort clear loses
+  Valkey, expiry within one lease is the fail-closed backstop. A
+  retry or cold resume advances it first, so an old token cannot enqueue or
+  fence the current turn. Nothing opens a generation when the API key is unset.
+- **The pump.** A startup lease keeper covers runner admission and response-header
+  delay. While the kernel consumes the turn's stream, a pump takes over renewal of
+  the active lease and reads the
+  chain's inbox after the record's `inbox_cursor`, at most 64 entries every
+  half second, and applies each entry with `apply_model_command` at the
+  entry's `(epoch, seq)`, advancing `inbox_cursor` past it. The cursor only
+  moves forward and is never written to an expired record. When the stream
+  ends the pump drains what remains, bounded to 5 seconds, and stops. A
+  malformed entry is logged and skipped. The pump never fails a turn: a Valkey
+  error is logged and the turn goes on. Every accepted append also puts the
+  progress id in `progress:inbox:pending`; the maintenance loop drains that
+  index after a crash, cancellation, final-drain timeout, or transient read
+  failure. It removes membership only with a script that proves the stream has
+  no id after the durable cursor, so a concurrent append cannot be orphaned.
+  Any failure after runner start but before pump handoff stops the startup
+  keeper and closes the generation. Keeper shutdown never consumes cancellation
+  of the owning delivery: it attempts the generation close first, then
+  re-propagates cancellation.
+- **Rendering is off.** `CURIE_PROGRESS_RENDER` (default `false`) is the
+  temporary switch the rendering change will turn on; the chart does not set
+  it. With it off, the same Lua update records state, revision and milestone
+  reservations but does not enqueue a delivery at all. The no-delivery choice
+  is therefore atomic with acceptance: a crash or transient Valkey failure
+  cannot strand an outbox row for a later release to replay. This worker has no
+  progress deliverer, so it refuses to start with
+  `CURIE_PROGRESS_RENDER=true`.
+
+`answer_ref` is the reply ref of the turn's answer, given when the chain is
+opened. Nothing reads it yet.
+
+### How the Slack adapter renders progress
+
+`SlackReplyAdapter.emit` is ADR-0130's Slack adapter path. It checks `progress`
+before anything else on both events, so a progress body never reaches the
+answer path, the placeholder, or the approval card's settle path. The Block Kit
+comes from `apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, and nothing else
+builds a progress block.
+
+- **A card's first revision** (`reply.post`, `progress.kind == "card"`) is posted
+  into the turn's thread with `client_msg_id` set to its `delivery_id`, and the
+  `ts` Slack answers is the `ref` the coordinator records as the card's ref.
+- **A later revision** (`reply.update` carrying `progress`) is a `chat.update`
+  of `target.reply_ref`, the card's ref. One without a ref raises, because there
+  is no card to edit and posting a second one would break the one-card rule.
+- **A milestone** (`reply.post`, `progress.kind == "milestone"`) is a new message
+  in the thread, posted the way a card's first revision is. It is never edited.
+
+What a reader sees:
+
+- The card states its state in plain words (`queued` reads "Queued",
+  `awaiting-approval` "Waiting for approval", `preparing-workspace` "Preparing
+  the workspace") and then the summary. An open card reads "Task status:
+  <state>". A terminal card reads "Task complete", "Task failed" or "Task
+  cancelled" and adds a closing line saying the card will not change again, so
+  a closed card is visibly closed when the final answer arrives beneath it.
+- A milestone names its class ("Evidence acquired", "Scope changed",
+  "Verification result") and then the summary.
+- Every text element either builder renders is `plain_text` with `emoji`
+  false, never `mrkdwn`. A summary is model-authored, and Slack reads mentions
+  and emoji codes out of `mrkdwn` only, so `<!channel>` or `<@U0EXAMPLE1>` in a
+  summary is shown as those characters and pings nobody. The message's `text` fallback, which
+  Slack does parse, is the channel-neutral `progress_text` with `&`, `<` and
+  `>` escaped the way Slack's formatting reference requires. Neither adds an
+  emoji.
+- A rejected Block Kit payload falls back to text only, like every other
+  Slack path here. For an edit that fallback sends an empty `blocks` list,
+  because Slack keeps a message's previous blocks when an update omits them,
+  and a stale card would otherwise stay on screen under a changed fallback.
+
+Every block either builder renders carries a stable `block_id` prefix:
+`curie-progress-card:` for a card and `curie-progress-milestone:` for a
+milestone. A card's ids also carry its revision, because Slack asks for a new
+`block_id` on each iteration of an updated message. The prefixes are frozen in
+[`tests/vectors/progress-blocks.json`](../../tests/vectors/progress-blocks.json)
+with the CLI's Slack stub (`cli/src/chat.rs`), which uses them to tell a
+progress post or edit from the turn's answer: a progress call is shown as a
+status line at most, and never becomes the reply `local message`, `cluster
+message` or local eval report. Changing a prefix means changing that file, and
+both lanes' tests fail until it is.
 
 ## The sandbox substrate (`curie_worker.sandbox`)
 
@@ -481,7 +872,10 @@ from curie_worker.sandbox import (
 
 substrate = SandboxSubstrate(
     KubernetesSandboxClient(namespace),          # or any SandboxClient impl
-    AffinityStore(redis_client),                 # the compose/chart Valkey
+    AffinityStore(
+        redis_client,
+        pressure_client=pressure_redis_client,
+    ),                                           # bounded async pressure lane
     SubstrateConfig(namespace=..., warm_pool="<release>-runner-pool"),
 )
 
@@ -495,6 +889,48 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 
 Contract notes the kernel must know:
 
+Quota pressure reclamation runs only after a real ResourceQuota refusal and
+only when the remaining delivery budget is at least 70 seconds plus
+`claim_timeout_seconds`. A lower budget skips the scan. An interactive Slack
+turn waits durably for capacity under its original event identity, with a
+fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
+The worker acknowledges a parked stream delivery, then wakes the turn through
+the same stream when its retry is due. Waiting does not use a runner attempt or
+hold a conversation lock. Its placeholder says queued while waiting and
+receives an expiry message if the deadline passes. Other turn sources retain
+their capacity response. Operators can inspect the persisted wait state and
+`curie.capacity.wait` metrics for waiting, active, and expired turns.
+
+The rejection retains every exceeded resource and its requested, used, and
+hard quantity. Before scanning, the worker validates the complete map with
+Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
+counts, and combined rejections. Invalid or incomplete evidence skips
+pressure reclamation with `outcome=refused-invalid-quota` and performs no
+pressure Redis call or deletion.
+
+After one exact idle route is detached and deleted, the worker polls the exact
+named ResourceQuota in its configured namespace within the existing 20 second
+cleanup window. It retries only when live spec and status hard limits agree and
+every rejected resource has enough current headroom. The worker Role grants
+only namespaced `get` on core `resourcequotas`. A missing permission, malformed
+quantity, mismatched spec and status limits, or timeout fails closed. The
+rejected claim or another quota can consume the freed capacity before the full
+retry. That bounded race records `reclaimed-retry-refused`; it does not delete
+another victim or schedule work.
+
+The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
+roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
+separate limit counts at most 256 matching route keys before filtering, so
+suspended routes count toward it, and at most four candidates are probed. A
+database outside either finite window fails closed. Alert on
+`curie.sandbox.lifecycle` with `operation=reclaim` and
+`outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
+`PEXPIRETIME`, so the pass returns `expiry-unsupported`.
+
+On a terminal pressure timeout, cancellation is delivered once and victim lock
+release can add one finite cold pressure Redis operation, at most four seconds.
+That tail consumes unused claim reserve and never authorizes requester retry.
+
 - **One live session per thread.** `claim()` is claim-or-adopt: a lost
   creation race deletes the loser's claim and returns the winner's handle. The
   route lives in Valkey (`curie:sandbox:route:<thread_key>`) with a TTL;
@@ -503,8 +939,9 @@ Contract notes the kernel must know:
   `agentSandbox.deploy=true` installs `<release>-runner` (SandboxTemplate) and
   `<release>-runner-pool` (SandboxWarmPool). Claims without per-claim env bind
   a pre-warmed sandbox (0.04-0.07 s measured on a scratch k3s cluster); claims **with**
-  env (the resume path) get a fresh sandbox instead (cold create, seconds not
-  sub-second) because env cannot be injected into an already-running pod.
+  env through resume or retained attachment replacement get a fresh sandbox
+  instead. This cold create takes seconds rather than less than one second
+  because env cannot be injected into a running pod.
 - **Suspend/resume is a cold rehydrate.** `suspend()` flips the Sandbox
   to `Suspended` (the pod is deleted) and records the caller-supplied history
   ref. `resume()` retires the old claim and creates a new one whose per-claim
@@ -541,3 +978,30 @@ Contract notes the kernel must know:
   plane); Valkey is never mocked. The env-gated e2e
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
+
+### Retained thread attachments
+
+An attachment on an idle retained thread needs new claim environment, so the
+worker cold creates a candidate runner. Replacement requires an authenticated
+old runner that is inactive, has a safe completed or idle status, and reports
+durable history. The old route remains authoritative while the candidate binds.
+The worker then swaps the candidate over the exact old claim and generation in
+one affinity operation. This temporarily requires capacity for both the old and
+candidate runners. A capacity refusal, bind failure, or lost fence deletes only
+the candidate and preserves the old route.
+
+The replacement keeps the logical session identity and durable transcript
+reference, but it loses prompt cache warmth, process memory, and other container
+local state. Text without an attachment keeps the existing steering behavior.
+An active runner asks the sender to wait. An unauthenticated, unreadable,
+nondurable, malformed, or otherwise unsafe runner asks the sender to start a
+new thread. Neither refusal processes the message text.
+
+In v0.9.1 a retained thread with an open repository workspace says that its
+workspace is already open and asks the sender to start a new thread. A generic
+retained thread whose new file message selects a repository, or whose server
+state already holds a repository selection, gives a separate repository
+selection refusal and the same recovery. When repository workspaces are
+disabled, the existing workspaces disabled refusal takes precedence before the
+file is resolved. Fresh workspace claims and suspended workspace resumes still
+receive attachments. Retained workspace replacement is tracked in #2728.

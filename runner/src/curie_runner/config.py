@@ -48,6 +48,10 @@ class RunnerConfig:
     connector_agent: str | None
     connector_namespace: str | None
     history_ref: str | None
+    # This turn's channel memory (#1461, ADR-0167): the binding-scoped memory
+    # namespace URL. The worker sets it only when memory writes are on and the
+    # turn has a binding; its presence mounts the remember/update/forget tools.
+    channel_memory_ref: str | None
     # Tool names whose calls require human approval (#245, ADR-0010). The
     # runner intercepts these proactively via the SDK can_use_tool callback
     # and ends the turn awaiting-approval instead of executing. Injected
@@ -61,12 +65,17 @@ class RunnerConfig:
     # boots the resume claim for a genuinely-approved permission-gate block;
     # None/empty means no grant and the ordinary deny-and-pause posture holds.
     approval_grant_tool: str | None
+    # Trusted resume input parsed by BootEnv (#3255): the canonical arguments
+    # the approver saw. The gate admits the granted tool only with these exact
+    # arguments (#3174).
+    approval_grant_arguments: dict[str, Any] | None
     # Turn-end reconciliation marker (#544, Decision A2), authority-free. The
     # worker injects CURIE_APPROVAL_RESUMED_KIND='policy' at resume boot to
     # record that the approval being resumed from was a POLICY gate. Unlike
     # CURIE_APPROVAL_GRANT_TOOL it confers NO authority -- it is a fact about
     # the past, used only to emit an observe-only warning when a resumed policy
-    # turn takes no action. It must never influence can_use_tool.
+    # turn takes no action, and to NARROW a name-only grant to genuine policy
+    # resumes (#3174). It must never widen what can_use_tool admits.
     approval_resumed_kind: str | None
     # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
     # (approved/rejected/expired) of the approval this resume boot is resuming
@@ -92,6 +101,9 @@ class RunnerConfig:
     # ClaudeAgentOptions.disallowed_tools. Unset/blank keeps the historical
     # empty list so an unconfigured agent is unchanged. Not a BootEnv field.
     disallowed_tools: tuple[str, ...]
+    # The caller token this sandbox presents to its hosted connectors
+    # (ADR-0168 decision 7), or None when the worker minted none.
+    connector_caller_token: str | None = None
 
     @property
     def ceiling(self) -> int:
@@ -150,8 +162,10 @@ class RunnerConfig:
             connector_agent=boot.connector_agent,
             connector_namespace=boot.connector_namespace,
             history_ref=boot.history_ref,
+            channel_memory_ref=boot.channel_memory_ref,
             approval_required_tools=boot.approval_required_tools,
             approval_grant_tool=boot.approval_grant_tool,
+            approval_grant_arguments=boot.approval_grant_arguments,
             approval_resumed_kind=boot.approval_resumed_kind,
             approval_decision=boot.approval_decision,
             false_completion_check=false_completion_check,
@@ -160,4 +174,5 @@ class RunnerConfig:
             history_max_turns=boot.history_max_turns,
             history_max_bytes=boot.history_max_bytes,
             disallowed_tools=disallowed_tools,
+            connector_caller_token=boot.connector_caller_token,
         )

@@ -162,11 +162,15 @@ The most complete example in this repo is a production triage bot:
 Kubernetes MCP connector. Thirteen exact core read tools run immediately, six
 exact mutation tools require approval, and unmatched tools deny.
 
-Kubernetes RBAC is the capability boundary. The connector can read enumerated
-non-secret operational resources cluster-wide and can mutate workload APIs only
-inside the disposable `sre-demo` namespace. It cannot read Secrets or mutate
-identity, RBAC, namespaces, nodes, admission configuration, CRDs, or any
-cluster-scoped resource.
+Kubernetes RBAC is the capability boundary. With the default grant, the
+connector can read enumerated non-secret operational resources cluster-wide and
+can mutate workload APIs only inside the disposable `sre-demo` namespace. It
+cannot read Secrets or mutate identity, RBAC, namespaces, nodes, admission
+configuration, CRDs, or any cluster-scoped resource. An operator can instead
+apply the opt-in operator grant, which widens reads and writes to every
+built-in kind except Secrets and ServiceAccount tokens; reads stay ungated,
+every write still needs approval, and the example's README lists what then
+sits behind that approval.
 
 The supported installer applies that identity, constructs its file-mounted
 kubeconfig in memory, installs the observability stack, and deploys the bundle:
@@ -174,16 +178,21 @@ kubeconfig in memory, installs the observability stack, and deploys the bundle:
 ```bash
 export CURIE_CREDENTIALS=sk-ant-...
 curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
-curie example sre-bot install --observability
+curie example sre-bot install --observability --approvers U0EXAMPLE1
 curie cluster message "Is any pod crashlooping right now?"
 ```
+
+The installer binds the `sre-approvals` route that gates the Kubernetes
+mutations. The required `--approvers` flag takes Slack user IDs, separated by
+commas, and binds the only users who may resolve those approvals.
 
 Run the installer with `--dry-run` first to inspect its ordered mutation plan.
 The optional `--platform-upgrade` flag adds a separate, much wider
 zero-argument Job-trigger path; read
 [the platform-upgrade Role](examples/sre-bot/manifests/platform-upgrade-role.yaml)
-before enabling it. The general Kubernetes connector never receives that Role
-or credential.
+before enabling it. Under the default grant, the general Kubernetes connector
+never receives that Role or credential; under the opt-in operator grant it can
+run a pod as the platform upgrader, one approved call away.
 
 For manual deployment, apply
 [the Kubernetes access manifest](examples/sre-bot/manifests/kubernetes-access.yaml),
@@ -193,10 +202,15 @@ route it declares, and deploy again:
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
-curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
+  --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
+
+Drop `--route-approvers` only if Slack channel members should be the sole
+approvers; operator principals cannot resolve a route without an explicit user
+list.
 
 On a fresh install the first deploy creates the agent and refuses locally
 (exit 2) with the binding command, before uploading anything; the platform API

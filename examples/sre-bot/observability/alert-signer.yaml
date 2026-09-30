@@ -1,0 +1,88 @@
+# Apply in the same namespace as the Prometheus release after creating the
+# alert-signer-code ConfigMap and the two Secrets described in the README.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-signer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-signer
+  template:
+    metadata:
+      labels:
+        app: alert-signer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signer
+          image: python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
+          imagePullPolicy: IfNotPresent
+          command: [python3, -B, /app/server.py]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: CURIE_HOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: alert-signer-hook
+                  key: CURIE_HOOK_URL
+            - name: CURIE_HOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: alert-signer-hook
+                  key: CURIE_HOOK_SECRET
+            - name: CURIE_SIGNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: alertmanager-signer-token
+                  key: token
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: alert-signer-code
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-signer
+spec:
+  selector:
+    app: alert-signer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

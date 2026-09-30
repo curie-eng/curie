@@ -3,11 +3,11 @@
 ``runner/tests/test_repo_toolchain_proof.py`` skips every container leg when
 the runner image is absent. The Python job does not build that image, so those
 legs were a silent skip on the merge gate. This file pins the dedicated job
-that builds the image and sets ``CURIE_REPO_TOOLCHAIN_PROOF`` to required.
+that loads the image and sets ``CURIE_REPO_TOOLCHAIN_PROOF`` to required.
 
 The two negative controls are driven through the same assertion the real check
 uses, rather than testing a matcher in isolation: dropping the required
-setting, or building without loading the image into the daemon, fails the pin.
+setting, or dropping the step that loads the image into the daemon, fails the pin.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 JOB_ID = "repo-toolchain-proof"
 REQUIRED_ASSIGNMENT = "CURIE_REPO_TOOLCHAIN_PROOF: required"
 HARNESS = "runner/tests/test_repo_toolchain_proof.py"
-BUILD_STEP = "Build the runner image locally (gha layer cache)"
+LOAD_STEP = "Load the runner image built by the ci-images job"
+TAG_STEP = "Tag the runner image as the harness default (curie-runner)"
 PROOF_STEP = "Repository toolchain proof"
 ABSENT_IMAGE_STEP = "Absent image fails in required mode (negative control)"
 REQUIRED_STEP = "Required setting is present (negative control)"
@@ -53,12 +54,16 @@ def assert_proof_job_gates(doc: dict[str, Any]) -> None:
         "every run instead of gating in the dedicated job"
     )
 
-    assert "needs" not in job, (
-        "repo-toolchain-proof must not serialise behind another job; it is "
-        "the parallel half of the Python suite"
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    assert needs == ["changes", "ci-images"], (
+        "repo-toolchain-proof may wait on the path selector and the shared "
+        "image build only; it must not serialise behind the Python suite"
     )
-    assert "if" not in job, (
-        "a job-level if: makes a required check skip, which is not a pass (#1470)"
+    assert job.get("if") == "${{ needs.changes.outputs.images == 'true' }}", (
+        "repo-toolchain-proof runs when images are selected; a skip here is "
+        "not a merge-required check"
     )
 
     env = job.get("env") or {}
@@ -88,25 +93,22 @@ def assert_proof_job_gates(doc: dict[str, Any]) -> None:
         "the absent-image control must assert the required-mode failure, not any non-zero exit"
     )
 
-    assert BUILD_STEP in by_name, f"ci.yaml lost the {BUILD_STEP!r} step"
-    build = by_name[BUILD_STEP]
-    build_with = build.get("with") or {}
-    assert build_with.get("file") == "runner/Dockerfile", (
-        "the job must build runner/Dockerfile, not some other image"
+    assert LOAD_STEP in by_name, f"ci.yaml lost the {LOAD_STEP!r} step"
+    load = by_name[LOAD_STEP]
+    assert load.get("uses") == "./.github/actions/load-ci-images", (
+        "the job must load the runner image the ci-images job built"
     )
-    assert build_with.get("load") is True, (
-        "load must be true so the harness can docker-run the tag; a cache-only "
-        "build leaves the image absent and the required-mode pytest would fail "
-        "for the environment rather than for the recipe"
+    assert (load.get("with") or {}).get("images") == "runner", (
+        "the job must load the runner image, not some other image"
     )
-    assert build_with.get("push") is False
-    assert "curie-runner" in str(build_with.get("tags")), (
-        "the built tag must match the harness default CURIE_RUNNER_IMAGE"
+    assert TAG_STEP in by_name, f"ci.yaml lost the {TAG_STEP!r} step"
+    tag_run = by_name[TAG_STEP].get("run") or ""
+    assert tag_run.split()[-1:] == ["curie-runner"] and "curie-ci/runner:candidate" in tag_run, (
+        "the loaded image must be tagged as the harness default CURIE_RUNNER_IMAGE"
     )
-    assert build_with.get("cache-from") == "type=gha,scope=runner"
-    assert "cache-to" not in build_with, (
-        "this job must not write the runner cache; the images matrix already "
-        "refreshes scope=runner, and a second writer only contends"
+    names = [step.get("name") for step in steps]
+    assert names.index(LOAD_STEP) < names.index(TAG_STEP) < names.index(PROOF_STEP), (
+        "the image must be loaded and tagged before the proof runs"
     )
 
     assert PROOF_STEP in by_name, f"ci.yaml lost the {PROOF_STEP!r} step"
@@ -139,12 +141,11 @@ def test_dropping_required_from_the_job_fails_the_pin() -> None:
         assert_proof_job_gates(doctored)
 
 
-def test_a_build_that_does_not_load_the_image_fails_the_pin() -> None:
-    """Negative control: a cache-only build is an absent image on the job."""
+def test_a_job_that_does_not_load_the_image_fails_the_pin() -> None:
+    """Negative control: dropping the load step leaves the image absent."""
 
     doc = _workflow()
     job = doc["jobs"][JOB_ID]
-    build = next(step for step in job["steps"] if step.get("name") == BUILD_STEP)
-    build["with"]["load"] = False
-    with pytest.raises(AssertionError, match="load"):
+    job["steps"] = [step for step in job["steps"] if step.get("name") != LOAD_STEP]
+    with pytest.raises(AssertionError, match="Load the runner image"):
         assert_proof_job_gates(doc)

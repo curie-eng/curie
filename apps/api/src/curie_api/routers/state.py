@@ -15,20 +15,21 @@ platform key.
 
 import enum
 import hashlib
-import json
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from sqlalchemy import Text, cast, func, select, text
+from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token
+from .. import crud, sandbox_token, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import AgentChannel, WorkflowStateEntry
+from ..models import ThreadTranscript, WorkflowStateEntry
 from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
+from ..transcripts import TRANSCRIPT_NAMESPACE
+from ..transcripts import json_size as _json_size
 
 # Two scoped-token scopes the state router accepts (ADR-0033). The BROAD scope is
 # minted for the runner's own memory/history loaders, which MUST read and write
@@ -50,7 +51,7 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-RESERVED_NAMESPACES = frozenset({"memory", "transcript"})
+RESERVED_NAMESPACES = frozenset({"memory", TRANSCRIPT_NAMESPACE})
 
 
 class StateCaller(enum.Enum):
@@ -111,16 +112,16 @@ async def _binding_scope(
     rejected alternative for #1525 was widening it to carry one, but a
     same-agent partition key has no privilege for that credential to carry in
     the first place).
+
+    No caller here NAMES an adapter -- the state API has no such parameter --
+    and an agent's rows on one pair share this one scope whichever identity
+    holds them, so this checks for any row of THIS agent on the pair rather
+    than resolving the default identity's route the way `crud.binding_for_route`
+    does for a turn (an identity-narrowed read would 404 every named-identity
+    binding's own state).
     """
 
-    exists = await session.scalar(
-        select(AgentChannel.id).where(
-            AgentChannel.agent_id == agent_id,
-            AgentChannel.kind == kind,
-            AgentChannel.address == address,
-        )
-    )
-    if exists is None:
+    if not await crud.agent_holds_channel_pair(session, agent_id, kind, address):
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )
@@ -150,11 +151,6 @@ async def forbid_reserved_namespace(
 router = APIRouter(
     prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)]
 )
-
-
-def _json_size(value: Any) -> int:
-    """Serialized-JSON byte length, the unit both size caps are measured in."""
-    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
 
 
 # Advisory-lock class for the per-agent namespace-count cap (#933). The
@@ -215,8 +211,16 @@ async def _enforce_caps(
     namespace: str,
     key: str,
     value: Any,
+    *,
+    reserve_bytes: int | None = None,
 ) -> None:
     """Reject a write that breaks the per-value or per-namespace size cap (#248).
+
+    ``reserve_bytes`` (#2927) additionally refuses a value that fits the
+    per-value cap but leaves fewer than that many bytes free under it. The
+    runner's transcript appends set it so the worker's publication outcome
+    append always has room; the refusal is the runner's compaction trigger, not
+    a persistence failure, so it records no failure metric.
 
     The namespace total counts the incoming value plus every *other* key already
     in the namespace (the key being written replaces its own prior size). Both
@@ -230,7 +234,14 @@ async def _enforce_caps(
     if value_bytes > settings.state_max_value_bytes:
         raise HTTPException(
             413,
-            f"value is {value_bytes} bytes, over the "
+            f"value for key {key!r} is {value_bytes} bytes, over the "
+            f"{settings.state_max_value_bytes}-byte per-value cap",
+        )
+    if reserve_bytes is not None and settings.state_max_value_bytes - value_bytes < reserve_bytes:
+        raise HTTPException(
+            413,
+            f"value for key {key!r} is {value_bytes} bytes, leaving under the "
+            f"{reserve_bytes}-byte reserve of the "
             f"{settings.state_max_value_bytes}-byte per-value cap",
         )
 
@@ -268,13 +279,21 @@ async def _enforce_caps(
     if bool(has_multibyte) or (
         value_bytes + sibling_bound_bytes > settings.state_max_namespace_bytes
     ):
-        others = await session.scalars(select(WorkflowStateEntry.value).where(*sibling_filter))
-        namespace_bytes = value_bytes + sum(_json_size(v) for v in others)
+        others = await session.execute(
+            select(WorkflowStateEntry.key, WorkflowStateEntry.value).where(*sibling_filter)
+        )
+        sizes = {key: value_bytes}
+        sizes.update((other_key, _json_size(v)) for other_key, v in others)
+        namespace_bytes = sum(sizes.values())
         if namespace_bytes > settings.state_max_namespace_bytes:
+            # Name the key holding the most bytes (#2820), which is often not
+            # the key whose write was refused.
+            largest = max(sizes, key=lambda k: (sizes[k], k == key))
             raise HTTPException(
                 413,
                 f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
-                f"{settings.state_max_namespace_bytes}-byte per-namespace cap",
+                f"{settings.state_max_namespace_bytes}-byte per-namespace cap; "
+                f"largest key {largest!r} is {sizes[largest]} bytes",
             )
 
     # Per-agent namespace-count cap (#852): refuse only a NEW namespace, and only
@@ -348,6 +367,17 @@ async def _enforce_caps(
         )
 
 
+def _transcript_out(row: ThreadTranscript) -> StateEntryOut:
+    """A transcript row in the state API's entry shape (ADR-0170)."""
+    return StateEntryOut(
+        namespace=TRANSCRIPT_NAMESPACE,
+        key=row.thread_key,
+        value=row.value,
+        version=row.version,
+        updated_at=row.updated_at,
+    )
+
+
 async def _get_entry(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
 ) -> WorkflowStateEntry | None:
@@ -358,6 +388,29 @@ async def _get_entry(
             WorkflowStateEntry.namespace == namespace,
             WorkflowStateEntry.key == key,
         )
+    )
+    return entry
+
+
+async def _get_entry_locked(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
+) -> WorkflowStateEntry | None:
+    """Same lookup as ``_get_entry``, row-locked for a read-modify-write (#2927).
+
+    Used by both a CAS put and an append: a plain read let a concurrent write
+    commit between the version check and the write, and the later write then
+    overwrote it.
+    """
+
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
+            WorkflowStateEntry.namespace == namespace,
+            WorkflowStateEntry.key == key,
+        )
+        .with_for_update()
     )
     return entry
 
@@ -374,8 +427,13 @@ async def _put_state(
     # signal). expected_version opts into compare-and-set.
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if namespace == TRANSCRIPT_NAMESPACE:
+        row = await transcripts.put(
+            session, agent_id, scope, key, data.value, data.expected_version
+        )
+        return _transcript_out(row)
     await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
-    entry = await _get_entry(session, agent_id, scope, namespace, key)
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
             # A CAS put that expects a prior version cannot create the entry.
@@ -446,19 +504,17 @@ async def _append_state(
     """
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
-            WorkflowStateEntry.key == key,
+    if namespace == TRANSCRIPT_NAMESPACE:
+        row = await transcripts.append(
+            session, agent_id, scope, key, data.item, data.reserve_bytes
         )
-        .with_for_update()
-    )
+        return _transcript_out(row)
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
-        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
+        await _enforce_caps(
+            session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
+        )
         entry = WorkflowStateEntry(
             agent_id=agent_id, binding_scope=scope, namespace=namespace, key=key, value=new_value
         )
@@ -470,7 +526,9 @@ async def _append_state(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, data.item]
-        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
+        await _enforce_caps(
+            session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
+        )
         entry.value = new_value
         entry.version += 1
     await session.commit()
@@ -540,7 +598,7 @@ async def _list_namespaces(
         .order_by(func.max(WorkflowStateEntry.updated_at).desc())
     )
     rows = await session.execute(query)
-    return [
+    listed = [
         StateNamespaceOut(
             namespace=row.namespace,
             key_count=row.key_count,
@@ -552,6 +610,20 @@ async def _list_namespaces(
         # the state.app scope fences off (#856).
         if not (caller is StateCaller.APP and row.namespace in RESERVED_NAMESPACES)
     ]
+    # Transcripts live in their own table (ADR-0170) but are still listed here
+    # as the reserved namespace the operator's inspector already knows.
+    if caller is not StateCaller.APP:
+        threads = await transcripts.summary(session, agent_id, scope)
+        if threads is not None:
+            listed.append(
+                StateNamespaceOut(
+                    namespace=TRANSCRIPT_NAMESPACE,
+                    key_count=threads[0],
+                    last_updated=threads[1],
+                )
+            )
+            listed.sort(key=lambda row: row.last_updated, reverse=True)
+    return listed
 
 
 @router.get("/{agent_id}/state", response_model=list[StateNamespaceOut])
@@ -576,8 +648,26 @@ async def list_namespaces_for_binding(
 
 
 async def _get_state(
-    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+    agent_id: uuid.UUID,
+    scope: str | None,
+    namespace: str,
+    key: str,
+    session: AsyncSession,
+    response: Response,
 ) -> StateEntryOut:
+    if namespace == TRANSCRIPT_NAMESPACE:
+        headers = {
+            "X-Curie-Transcript-Max-Bytes": str(get_settings().transcript_max_thread_bytes)
+        }
+        row = await transcripts.get(session, agent_id, scope, key)
+        if row is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "state entry not found",
+                headers=headers,
+            )
+        response.headers.update(headers)
+        return _transcript_out(row)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
@@ -590,9 +680,9 @@ async def _get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep, response: Response
 ) -> StateEntryOut:
-    return await _get_state(agent_id, None, namespace, key, session)
+    return await _get_state(agent_id, None, namespace, key, session, response)
 
 
 @router.get(
@@ -601,10 +691,16 @@ async def get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    response: Response,
 ) -> StateEntryOut:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _get_state(agent_id, scope, namespace, key, session)
+    return await _get_state(agent_id, scope, namespace, key, session, response)
 
 
 async def _list_state(
@@ -613,6 +709,9 @@ async def _list_state(
     # Which scope this lists is a function of which URL was called, same as
     # _list_namespaces above -- uniform for every caller, no caller-type
     # branching here either.
+    if namespace == TRANSCRIPT_NAMESPACE:
+        rows = await transcripts.list_threads(session, agent_id, scope)
+        return [_transcript_out(row) for row in rows]
     query = select(WorkflowStateEntry).where(
         WorkflowStateEntry.agent_id == agent_id,
         WorkflowStateEntry.binding_scope == scope,
@@ -646,12 +745,49 @@ async def list_state_for_binding(
 
 
 async def _delete_state(
-    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+    agent_id: uuid.UUID,
+    scope: str | None,
+    namespace: str,
+    key: str,
+    expected_version: int | None,
+    session: AsyncSession,
 ) -> Response:
+    # expected_version opts into compare-and-delete (#2820), so an operator
+    # that exported a transcript never deletes turns appended after the export.
+    # The version is a predicate of the DELETE itself, so an append that
+    # commits between the read and the delete cannot be removed with it.
+    if namespace == TRANSCRIPT_NAMESPACE:
+        await transcripts.remove(session, agent_id, scope, key, expected_version)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
-    if entry is not None:
-        await session.delete(entry)
-        await session.commit()
+    if expected_version is None:
+        if entry is not None:
+            await session.delete(entry)
+            await session.commit()
+    else:
+        stored = entry.version if entry is not None else None
+        deleted = None
+        if stored == expected_version and entry is not None:
+            deleted = await session.scalar(
+                delete(WorkflowStateEntry)
+                .where(
+                    WorkflowStateEntry.id == entry.id,
+                    WorkflowStateEntry.version == expected_version,
+                )
+                .returning(WorkflowStateEntry.id)
+            )
+            await session.commit()
+        if deleted is None:
+            if stored is None:
+                found = "entry does not exist"
+            elif stored != expected_version:
+                found = f"stored {stored}"
+            else:
+                found = "entry changed during the delete"
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"version mismatch: expected {expected_version}, {found}",
+            )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -661,9 +797,13 @@ async def _delete_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def delete_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    expected_version: int | None = None,
 ) -> Response:
-    return await _delete_state(agent_id, None, namespace, key, session)
+    return await _delete_state(agent_id, None, namespace, key, expected_version, session)
 
 
 @router.delete(
@@ -672,7 +812,13 @@ async def delete_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def delete_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    expected_version: int | None = None,
 ) -> Response:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _delete_state(agent_id, scope, namespace, key, session)
+    return await _delete_state(agent_id, scope, namespace, key, expected_version, session)

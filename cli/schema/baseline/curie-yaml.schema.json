@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/curie-yaml/v1.json",
+  "title": "curie.yaml installation file",
+  "description": "Input schema for the installation file `curie apply` and `curie diff` parse. Secret fields are NAMES of environment variables or `curie secrets` entries, never values. Unknown keys are an error.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "install"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "install": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "release"
+      ],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Kubernetes context. `--context` on apply/diff wins over this field."
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ui": {
+          "type": "boolean"
+        },
+        "inference": {
+          "type": "boolean"
+        },
+        "inference_persistence": {
+          "type": "boolean"
+        },
+        "inference_pull_model": {
+          "type": "boolean"
+        },
+        "sandbox_controller": {
+          "type": "boolean",
+          "description": "Maps to agentSandbox.controller.deploy. false is the shared-cluster opt-out."
+        },
+        "priority_classes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "platform": {
+              "type": "boolean",
+              "description": "Maps to priorityClasses.platform.create."
+            },
+            "sandbox": {
+              "type": "boolean",
+              "description": "Maps to priorityClasses.sandbox.create."
+            }
+          }
+        },
+        "gvisor": {
+          "enum": [
+            "auto",
+            "require",
+            "off"
+          ],
+          "description": "Maps to security.gvisor.mode."
+        },
+        "egress": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "host"
+            ],
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "github_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "comms": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "slack": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "app_token",
+            "bot_token"
+          ],
+          "properties": {
+            "app_token": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bot_token": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "set": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Verbatim helm --set-string values. Boolean and null shaped strings are refused; use a modeled field or the empty string."
+    }
+  }
+}

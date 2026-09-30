@@ -9,6 +9,7 @@ model's offline approval script.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import anyio
 import pytest
@@ -23,7 +24,6 @@ from curie_runner.adapter import build_options
 from curie_runner.approval import (
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
@@ -47,7 +47,7 @@ from curie_runner.session import SessionRunner, _apply_approval_override
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.translate import TurnState, translate_message
 from mcp import types as mcp_types
-from plugin_format import validate_bundle
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, validate_bundle
 
 
 def _event(text: str = "hello") -> Event:
@@ -367,7 +367,7 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
             operator_tools=None, policy_routes={}, managed_workspace=True
         )
         assert mounted_gate is not None
-        assert mounted_gate.required == frozenset({PUBLISH_TOOL_NAME})
+        assert mounted_gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})
 
         # Defence in depth is also unconditional. Calling the discoverable
         # tool without a mounted checkout must fail usefully, never fabricate a
@@ -821,14 +821,89 @@ def test_non_gated_tool_does_not_consume_the_grant() -> None:
     anyio.run(go)
 
 
-def test_consume_grant_only_matches_the_named_tool() -> None:
-    # A direct unit check on consume_grant: True + clears iff the name matches.
+def test_consume_grant_refuses_same_tool_with_different_arguments() -> None:
+    # #3174: the grant admits the approved call, not every call to that tool.
+    approved = {"asset": "a-1", "share_with": ["ops"]}
+    gate = ApprovalGate(
+        required=frozenset({"share_asset"}),
+        grant_tool="share_asset",
+        grant_arguments=approved,
+    )
+    assert gate.consume_grant("share_asset", {"asset": "a-2", "share_with": ["ops"]}) is False
+    assert gate.consume_grant("share_asset") is False
+    assert gate.grant_tool == "share_asset"  # a mismatch does not spend the grant
+    # Key order is not significant; the canonical form is equal.
+    assert gate.consume_grant("share_asset", {"share_with": ["ops"], "asset": "a-1"}) is True
+    assert gate.grant_tool is None
+    assert gate.consume_grant("share_asset", approved) is False  # single use
+
+
+def test_granted_tool_with_different_arguments_is_refused_with_a_reason() -> None:
+    async def go() -> None:
+        gate = ApprovalGate(
+            required=frozenset({"share_asset"}),
+            grant_tool="share_asset",
+            grant_arguments={"asset": "a-1"},
+        )
+        callback = build_can_use_tool(gate)
+
+        other = await callback("share_asset", {"asset": "a-2"}, ToolPermissionContext())
+        assert isinstance(other, PermissionResultDeny)
+        assert "exact arguments" in other.message
+        assert other.interrupt is False
+        # A refused mismatch mints no new approval and leaves the grant unspent.
+        assert gate.pending_summary is None
+        assert gate.grant_tool == "share_asset"
+
+        approved = await callback("share_asset", {"asset": "a-1"}, ToolPermissionContext())
+        assert isinstance(approved, PermissionResultAllow)
+        assert gate.grant_tool is None
+
+    anyio.run(go)
+
+
+def test_permission_grant_without_arguments_is_dropped() -> None:
+    # #3174: a permission grant that lost its approved arguments cannot prove
+    # what the approver saw, so it grants nothing.
+    gate = build_approval_gate(operator_tools=["Bash"], policy_routes={}, grant_tool="Bash")
+    assert gate is not None
+    assert gate.grant_tool is None
+    assert gate.consume_grant("Bash", {"command": "x"}) is False
+
+
+def test_policy_grant_without_arguments_keeps_the_name_match() -> None:
+    gate = build_approval_gate(
+        operator_tools=None,
+        policy_routes={"close_issue": "ops"},
+        grant_tool="close_issue",
+        resumed_kind="policy",
+        grantable_by_route={"ops": "close_issue"},
+    )
+    assert gate is not None
+    assert gate.consume_grant("close_issue", {"id": 1}) is True
+    assert gate.consume_grant("close_issue", {"id": 1}) is False
+
+
+def test_permission_resume_on_a_policy_grantable_tool_still_needs_arguments() -> None:
+    # The overlap: a tool both permission-gated and grantableViaPolicy. A
+    # permission resume that lost its arguments must not pass as a policy grant.
+    gate = build_approval_gate(
+        operator_tools=["close_issue"],
+        policy_routes={"close_issue": "ops"},
+        grant_tool="close_issue",
+        resumed_kind=None,
+        grantable_by_route={"ops": "close_issue"},
+    )
+    assert gate is not None
+    assert gate.grant_tool is None
+
+
+def test_grant_without_arguments_keeps_the_name_match() -> None:
+    # A policy grant carries no call arguments; it stays tool-name-scoped.
     gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
-    assert gate.consume_grant("Read") is False
-    assert gate.grant_tool == "Bash"  # a non-match does not clear the grant
-    assert gate.consume_grant("Bash") is True
-    assert gate.grant_tool is None  # a match clears it (single use)
-    assert gate.consume_grant("Bash") is False  # already spent
+    assert gate.consume_grant("Read", {}) is False
+    assert gate.consume_grant("Bash", {"command": "x"}) is True
+    assert gate.consume_grant("Bash", {"command": "x"}) is False
 
 
 def test_runner_config_parses_approval_grant_tool() -> None:
@@ -1073,34 +1148,34 @@ def test_publish_gate_is_an_additive_exact_platform_member() -> None:
         managed_workspace=True,
     )
     assert gate is not None
-    assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Read", "Bash", PLATFORM_PUBLISH_TOOL_NAME})
     assert gate.route_by_tool == {"Bash": "managers"}
-    assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
+    assert gate.route_by_tool.get(PLATFORM_PUBLISH_TOOL_NAME) is None
 
 
 def test_bundle_may_attach_a_route_to_platform_publish() -> None:
     gate = build_approval_gate(
         operator_tools=None,
-        policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+        policy_routes={PLATFORM_PUBLISH_TOOL_NAME: "bundle-selected-audience"},
         managed_workspace=True,
     )
 
     assert gate is not None
-    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
-    assert PUBLISH_TOOL_NAME in gate.route_by_tool
-    assert gate.route_by_tool[PUBLISH_TOOL_NAME] == "bundle-selected-audience"
+    assert gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.route_by_tool
+    assert gate.route_by_tool[PLATFORM_PUBLISH_TOOL_NAME] == "bundle-selected-audience"
 
 
 def test_publish_permission_block_carries_policy_route() -> None:
     async def go() -> None:
         gate = build_approval_gate(
             operator_tools=None,
-            policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+            policy_routes={PLATFORM_PUBLISH_TOOL_NAME: "bundle-selected-audience"},
             managed_workspace=True,
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME,
+            PLATFORM_PUBLISH_TOOL_NAME,
             {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
             ToolPermissionContext(),
         )
@@ -1117,13 +1192,13 @@ def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME,
+            PLATFORM_PUBLISH_TOOL_NAME,
             {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
             ToolPermissionContext(),
         )
         assert isinstance(result, PermissionResultDeny)
         assert gate.pending_gate_kind == "permission"
-        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         assert gate.pending_route is None
         assert gate.publication_title == "Update documentation"
         assert gate.publication_body == "Exact body\n" * 100
@@ -1138,7 +1213,7 @@ def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
+            PLATFORM_PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
         )
 
         assert isinstance(result, PermissionResultDeny)
@@ -1155,16 +1230,16 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         gate = build_approval_gate(
             operator_tools=None,
             policy_routes={},
-            grant_tool=PUBLISH_TOOL_NAME,
+            grant_tool=PLATFORM_PUBLISH_TOOL_NAME,
             managed_workspace=True,
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
+            PLATFORM_PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
         )
         assert isinstance(result, PermissionResultDeny)
         assert gate.grant_tool is None
-        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
         # Bypass the permission callback and call the in-process tool directly:
         # it must still refuse, because publication belongs to the platform Job.
@@ -1174,7 +1249,7 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         direct = await entry.handler(
             None,
             mcp_types.CallToolRequestParams(
-                name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
                 arguments={"title": "Ship changes"},
             ),
         )
@@ -1195,7 +1270,7 @@ def _managed_publish_gate() -> ApprovalGate:
 
     gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
     assert gate is not None
-    assert PUBLISH_TOOL_NAME in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
     return gate
 
 
@@ -1207,14 +1282,16 @@ def test_observe_publication_records_the_pending_approval_without_a_halt() -> No
     # exact runner-stamped provenance.
     gate = _managed_publish_gate()
 
-    recorded = gate.observe_publication({"title": "  Ship changes  ", "body": "Full body"})
+    recorded = anyio.run(
+        gate.observe_publication, "publish-1", {"title": "  Ship changes  ", "body": "Full body"}
+    )
 
     assert recorded is True
     assert gate.pending_summary is not None
     assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
-    assert PUBLISH_TOOL_NAME in gate.pending_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.pending_summary
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Platform-owned gate: the request thread owns the card, so no bundle route.
     assert gate.pending_route is None
     assert gate.publication_title == "Ship changes"
@@ -1230,10 +1307,14 @@ def test_observe_publication_is_idempotent_for_a_duplicate_call() -> None:
     # publish_changes twice in one turn creates two approvals for one action, and
     # the human resolves against the second while the first stays pending.
     gate = _managed_publish_gate()
-    assert gate.observe_publication({"title": "First proposal", "body": "one"}) is True
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "First proposal", "body": "one"}
+    ) is True
     first_summary = gate.pending_summary
 
-    second = gate.observe_publication({"title": "Second proposal", "body": "two"})
+    second = anyio.run(
+        gate.observe_publication, "publish-2", {"title": "Second proposal", "body": "two"}
+    )
 
     assert second is False
     assert gate.pending_summary == first_summary
@@ -1250,7 +1331,7 @@ def test_observe_publication_rejects_a_malformed_title_and_records_nothing() -> 
     gate = _managed_publish_gate()
 
     with pytest.raises(ValueError):
-        gate.observe_publication({"title": "   ", "body": "ignored"})
+        anyio.run(gate.observe_publication, "publish-1", {"title": "   ", "body": "ignored"})
 
     assert gate.pending_summary is None
     assert gate.pending_granted_tool is None
@@ -1264,16 +1345,18 @@ def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
     # normal path) the stream observer would overwrite the hook's record and drop
     # its halt-backed provenance, turning the working path into a second one.
     gate = _managed_publish_gate()
-    gate.block(PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
+    gate.block(PLATFORM_PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
     hook_summary = gate.pending_summary
 
-    assert gate.observe_publication({"title": "Stream observed", "body": "stream body"}) is False
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Stream observed", "body": "stream body"}
+    ) is False
 
     assert gate.pending_summary == hook_summary
     assert gate.publication_title == "Hook recorded"
     assert gate.publication_body == "hook body"
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # The hook's own halt marker survives untouched: the observer only ever adds
     # a record, it never edits what another layer already decided.
     assert gate.pending_halt is True
@@ -1288,21 +1371,25 @@ def test_observe_publication_never_mints_a_grant() -> None:
     gate = build_approval_gate(
         operator_tools=None,
         policy_routes={},
-        grant_tool=PUBLISH_TOOL_NAME,
+        grant_tool=PLATFORM_PUBLISH_TOOL_NAME,
         managed_workspace=True,
     )
     assert gate is not None
     # build_approval_gate already refuses to carry a publish grant (safe_grant_tool).
     assert gate.grant_tool is None
 
-    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is True
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Ship changes", "body": "body"}
+    ) is True
 
     assert gate.grant_tool is None
-    assert gate.consume_grant(PUBLISH_TOOL_NAME) is False
+    assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
     # And the record it wrote is still the one-per-turn record: a second call
     # blocks again rather than being waved through.
-    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is False
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert anyio.run(
+        gate.observe_publication, "publish-2", {"title": "Ship changes", "body": "body"}
+    ) is False
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
 
 def test_build_approval_gate_carries_the_grant_tool() -> None:
@@ -1312,9 +1399,11 @@ def test_build_approval_gate_carries_the_grant_tool() -> None:
         operator_tools=["Bash"],
         policy_routes={},
         grant_tool="Bash",
+        grant_arguments={"command": "x"},
     )
     assert gate is not None
     assert gate.grant_tool == "Bash"
+    assert gate.grant_arguments == {"command": "x"}
 
 
 def test_gate_block_records_the_declared_route() -> None:
@@ -2077,6 +2166,7 @@ def test_permission_gate_grants_the_denied_tool_name() -> None:
         assert final["status"] == "awaiting-approval"
         assert final["approval_gate_kind"] == "permission"
         assert final["approval_granted_tool"] == "Bash"
+        assert final["approval_granted_arguments"] == {"command": "echo hi"}
 
     anyio.run(go)
 
@@ -2089,10 +2179,12 @@ def test_reset_clears_gate_kind_and_granted_tool() -> None:
     gate.block("Bash", {"command": "x"})
     assert gate.pending_gate_kind == "permission"
     assert gate.pending_granted_tool == "Bash"
+    assert gate.pending_granted_arguments == {"command": "x"}
 
     gate.reset()
     assert gate.pending_gate_kind is None
     assert gate.pending_granted_tool is None
+    assert gate.pending_granted_arguments is None
     # The existing fields still reset alongside them.
     assert gate.pending_summary is None
     assert gate.pending_route is None
@@ -3079,3 +3171,130 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
             f"frozen vector says {case['expected']!r} -- normalization drift between "
             "the deploy-time reader and the loader is the #453/#544 fail-open shape"
         )
+
+
+
+# --- #3077: the platform report_progress tool -----------------------------------
+
+
+def test_report_progress_is_a_platform_owned_tool_name() -> None:
+    from curie_runner.approval import (
+        APPROVAL_SERVER_NAME,
+        PROGRESS_TOOL_NAME,
+        is_platform_owned_tool,
+        platform_tool_names,
+    )
+
+    assert PROGRESS_TOOL_NAME == f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
+    for mounted in (False, True):
+        assert PROGRESS_TOOL_NAME in platform_tool_names(state_server_mounted=mounted)
+        assert is_platform_owned_tool(PROGRESS_TOOL_NAME, state_server_mounted=mounted)
+    # Exact names only (#2286): a lookalike on a curie-shaped prefix is not exempt.
+    assert not is_platform_owned_tool(
+        "mcp__curie__report_progress_extra", state_server_mounted=False
+    )
+
+
+def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> None:
+    from curie_runner.progress import (
+        PROGRESS_TOKEN_ENV,
+        PROGRESS_URL_ENV,
+        ProgressActivity,
+        build_progress_tool,
+        resolve_progress,
+    )
+
+    bundle = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
+    resolved = resolve_progress(
+        {
+            PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/example",
+            PROGRESS_TOKEN_ENV: "sbx.example.token",
+        },
+        bundle,
+    )
+    assert resolved is not None
+    client, declaration = resolved
+    progress_tool = build_progress_tool(declaration, client, ProgressActivity())
+
+    async def names(server: object) -> set[str]:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    async def go() -> None:
+        assert "report_progress" not in await names(build_approval_server())
+        assert "report_progress" in await names(
+            build_approval_server(progress_tool=progress_tool)
+        )
+        assert await names(
+            build_approval_server(include_request_approval=False, progress_tool=progress_tool)
+        ) == {"publish_changes", "report_progress"}
+
+    anyio.run(go)
+
+
+# --- ADR 0130: the platform progress tool --------------------------------------
+
+
+def test_the_turn_progress_tool_is_a_platform_owned_tool_name() -> None:
+    from curie_runner.approval import (
+        APPROVAL_SERVER_NAME,
+        TURN_PROGRESS_TOOL_NAME,
+        is_platform_owned_tool,
+        platform_tool_names,
+    )
+
+    assert TURN_PROGRESS_TOOL_NAME == f"mcp__{APPROVAL_SERVER_NAME}__progress"
+    for mounted in (False, True):
+        assert TURN_PROGRESS_TOOL_NAME in platform_tool_names(state_server_mounted=mounted)
+        assert is_platform_owned_tool(TURN_PROGRESS_TOOL_NAME, state_server_mounted=mounted)
+    # Exact names only (#2286): a lookalike on a curie-shaped prefix is not exempt.
+    assert not is_platform_owned_tool("mcp__curie__progress_extra", state_server_mounted=False)
+    assert not is_platform_owned_tool("mcp__curie__progressx", state_server_mounted=True)
+
+
+def test_the_turn_progress_tool_is_never_mounted_beside_report_progress() -> None:
+    from curie_runner.progress import (
+        PROGRESS_TOKEN_ENV,
+        PROGRESS_URL_ENV,
+        ProgressActivity,
+        build_progress_tool,
+        resolve_progress,
+    )
+    from curie_runner.turn_progress import TurnProgress, build_turn_progress_tool
+
+    bundle = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
+    resolved = resolve_progress(
+        {
+            PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/example",
+            PROGRESS_TOKEN_ENV: "sbx.example.token",
+        },
+        bundle,
+    )
+    assert resolved is not None
+    client, declaration = resolved
+    report = build_progress_tool(declaration, client, ProgressActivity())
+    progress = build_turn_progress_tool(TurnProgress())
+
+    async def names(server: object) -> set[str]:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    async def go() -> None:
+        assert "progress" not in await names(build_approval_server())
+        assert await names(
+            build_approval_server(include_request_approval=False, turn_progress_tool=progress)
+        ) == {"publish_changes", "progress"}
+        # A factory execution keeps its own tool, and only its own.
+        assert await names(
+            build_approval_server(
+                include_request_approval=False,
+                progress_tool=report,
+                turn_progress_tool=progress,
+            )
+        ) == {"publish_changes", "report_progress"}
+
+    anyio.run(go)

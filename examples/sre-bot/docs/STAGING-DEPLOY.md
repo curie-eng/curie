@@ -3,7 +3,7 @@
 The supported cluster reproduction is one command:
 
 ```bash
-curie example sre-bot install --observability
+curie example sre-bot install --observability --approvers U0EXAMPLE1
 ```
 
 With no targeting flags, Curie lands as release `curie` in namespace `curie`,
@@ -12,6 +12,7 @@ beside an existing release:
 
 ```bash
 curie example sre-bot install --observability \
+  --approvers U0EXAMPLE1 \
   --namespace <ns> \
   --release <release> \
   --observability-namespace <obs-ns>
@@ -33,14 +34,19 @@ from `--slack-channel` when supplied.
 
 The installer applies `manifests/kubernetes-access.yaml`, waits for the one
 ServiceAccount token, constructs one kubeconfig, and reconciles it as
-`K8S_KUBECONFIG`. That credential combines non-secret operational reads with
-workload writes only in `sre-demo`.
+`K8S_KUBECONFIG`. Under that default grant, the credential combines non-secret
+operational reads with workload writes only in `sre-demo`. The installer never
+applies the opt-in operator grant, `manifests/kubernetes-operator-access.yaml`,
+which widens the same credential's reads and writes to every built-in kind
+except Secrets and ServiceAccount tokens; see the README before applying it.
 
 There is no write allowlist flag and no separate scale identity. The exact 13
 read tools execute immediately, the exact six mutating core tools require
 one-shot approval, and unmatched tools deny. The config toolset and
-multi-cluster support are disabled at server startup. RBAC, not approval, keeps
-the write blast radius inside the disposable workload namespace.
+multi-cluster support are disabled at server startup. Under the default grant,
+RBAC, not approval, keeps the write blast radius inside the disposable workload
+namespace; under the operator grant, approval is what stands in front of Secret
+contents.
 
 ## Upgrade path: `--platform-upgrade`
 
@@ -48,7 +54,8 @@ Passing the flag keeps the `self-upgrade` connector and installs the platform
 upgrade Job path:
 
 ```bash
-curie example sre-bot install --observability --platform-upgrade
+curie example sre-bot install --observability --platform-upgrade \
+  --approvers U0EXAMPLE1
 ```
 
 After the ordinary deploy, the installer:
@@ -65,8 +72,11 @@ After the ordinary deploy, the installer:
 Read both Role manifests before accepting this flag. Kubernetes lets a holder
 of the connector token create a Job selecting the wider platform-upgrader
 ServiceAccount; RBAC does not restrict `spec.serviceAccountName` on Job create.
-The connector cannot form that request, but a leaked token can bypass it. The
-permission map names mitigation choices and the residual risk.
+The connector cannot form that request, but a leaked token can bypass it.
+Draft ADR-0141 proposes admission that pins those Jobs to the live CronJob
+templates. The installer does not apply `manifests/upgrade-job-admission.yaml`;
+the residual risk is unchanged until that ADR is Accepted and the policy is
+installed with both identities.
 
 The same connector publishes the separate zero-argument `upgrade_self` tool,
 which targets `self-upgrade/cronjob.yaml`. The installer does not apply `self-upgrade/cronjob.yaml`;
@@ -80,8 +90,13 @@ and does not roll back. Rollback remains an operator action.
 ## Slack
 
 ```bash
-curie example sre-bot install --observability --slack-channel <channel-id>
+curie example sre-bot install --observability --slack-channel <channel-id> \
+  --approvers <user-id>[,<user-id>]
 ```
+
+`--approvers` binds explicit Slack user IDs on the `sre-approvals` route. You
+must supply at least one user. The installer refuses omission before reading or
+changing cluster state.
 
 Bind by channel ID, never `#name`. `deploy.yaml` carries no active documentation
 placeholder binding. Both API and CLI refuse the `C0EXAMPLE<digits>` placeholder
@@ -95,9 +110,11 @@ shape before creating or changing an agent, version, or deployment.
   immutable registry locks for any connector it keeps.
 - The Kubernetes connector is already an immutable upstream image and must keep
   its core-only, stateless, single-cluster arguments.
-- `toolPolicy` and `approvalPolicy` references must name connectors that remain
-  in the runtime bundle. Removing `self-upgrade` also removes its two allow
-  entries and legacy gates; the installer performs this transformation.
+- `toolPolicy` references and connector approval gates must name connectors that
+  remain in the runtime bundle. The exact `mcp__curie__publish_changes` gate is
+  platform mounted, has no connector, and remains in both installer modes.
+  Removing `self-upgrade` removes its two allow entries and legacy gates; the
+  installer performs this transformation.
 - `K8S_KUBECONFIG` must be supplied outside the bundle. If self-upgrade remains,
   `SELF_UPGRADE_KUBECONFIG` is also required.
 

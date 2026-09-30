@@ -17,10 +17,11 @@ import io
 import json
 import logging
 import os
+import sys
 import tarfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -66,6 +67,7 @@ from curie_worker.eval import (
     EvalReporter,
     EvalStreamConsumer,
     EvalSuite,
+    ExpectedStatus,
     Grader,
     GraderKind,
     LangfuseEvalRecorder,
@@ -74,27 +76,26 @@ from curie_worker.eval import (
 from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
-from curie_worker.sandbox.types import ClaimView, SandboxError, SandboxView
+from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxError, SandboxView
 from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 CONTAINS = GraderKind.CONTAINS
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
 )
 _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 class _StubRepo:
@@ -120,9 +121,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking
+        return self._model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -134,7 +135,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -180,6 +181,8 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
@@ -194,7 +197,10 @@ class _FakeK8s:
             pool=pool,
         )
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -209,7 +215,8 @@ class _FakeK8s:
             ready_message=None,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         self.claims.pop(name, None)
         self.deleted.append(name)
 
@@ -218,17 +225,30 @@ class _FakeK8s:
         out = []
         for claim in self.claims.values():
             if claim.labels.get(key) == value:
-                view = self.get_claim(claim.name)
+                view = self.get_claim(claim.name, request_timeout_seconds=1.0)
                 assert view is not None
                 out.append(view)
         return out
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         if not any(c.sandbox_name == name for c in self.claims.values()):
             return None
         return SandboxView(
             name=name, ready=True, service_fqdn="127.0.0.1", operating_mode="Running"
         )
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        del rejection
+        assert 0 < request_timeout_seconds <= 1.0
+        return False
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:  # pragma: no cover - unused here
         pass
@@ -428,21 +448,67 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                         ).model_dump_json()
                     },
                 )
+
+                async def liveness_ttls() -> tuple[int, int]:
+                    async with client.pipeline(transaction=False) as pipe:
+                        pipe.pttl(alive)
+                        pipe.pttl(capable)
+                        alive_ttl, capable_ttl = await pipe.execute()
+                    return int(alive_ttl), int(capable_ttl)
+
                 task = asyncio.create_task(consumer.run())
+                # One EXISTS per key can observe the 150ms alive lease in its
+                # last milliseconds and fail the following assert. Require both
+                # TTLs in one round trip, with margin, and do not sample again.
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
-                    if await client.exists(alive) and await client.exists(capable):
+                    alive_ttl, capable_ttl = await liveness_ttls()
+                    if alive_ttl > 40 and capable_ttl > 40:
                         break
                     await asyncio.sleep(0.005)
-                assert await client.exists(alive)
-                assert await client.exists(capable)
+                else:
+                    pytest.fail("eval consumer did not publish both liveness markers")
 
                 await _wait_until(lambda: bool(fake.seen))
                 consumer.request_stop()
-                await asyncio.sleep(0.35)
+                # b23d87c9b polled one PTTL sample after a sleep longer than the
+                # 150ms alive lease. That sleep is the other race: a stalled
+                # refresh expires the key and kills the generation before the
+                # sample. A rise in both TTLs is one renewal transaction. A
+                # non-positive sample resets the baselines, so a lapse and a
+                # later republish cannot count as that renewal. The 450ms
+                # capability lease would otherwise still be the original key.
+                low_alive: int | None = None
+                low_capable: int | None = None
+                alive_rose = False
+                capable_rose = False
+                renewal_deadline = time.monotonic() + 2
+                while time.monotonic() < renewal_deadline:
+                    if task.done():
+                        break
+                    alive_ttl, capable_ttl = await liveness_ttls()
+                    if alive_ttl <= 0 or capable_ttl <= 0:
+                        low_alive = None
+                        low_capable = None
+                        alive_rose = False
+                        capable_rose = False
+                        await asyncio.sleep(0.005)
+                        continue
+                    if low_alive is not None and alive_ttl > low_alive:
+                        alive_rose = True
+                    if low_capable is not None and capable_ttl > low_capable:
+                        capable_rose = True
+                    if alive_rose and capable_rose:
+                        break
+                    if low_alive is None or alive_ttl < low_alive:
+                        low_alive = alive_ttl
+                    if low_capable is None or capable_ttl < low_capable:
+                        low_capable = capable_ttl
+                    await asyncio.sleep(0.005)
                 assert not task.done(), "graceful stop must drain the inline eval handler"
-                assert await client.pttl(alive) > 0
-                assert await client.pttl(capable) > 0
+                assert alive_rose and capable_rose, (
+                    "eval consumer did not renew both liveness markers"
+                )
                 release.set()
                 await task
                 assert reports and reports[0]["passed_count"] == 1
@@ -928,6 +994,17 @@ def test_provisioned_runner_end_to_end(
                 sync_client = redis.Redis(
                     host=_VH, port=_VP, password=_VPW or None, decode_responses=False
                 )
+                pressure_client = AsyncRedis(
+                    host=_VH,
+                    port=_VP,
+                    password=_VPW or None,
+                    decode_responses=False,
+                    socket_timeout=1.0,
+                    socket_connect_timeout=1.0,
+                    retry=AsyncRetry(NoBackoff(), 0),
+                    driver_info=None,
+                    maint_notifications_config=MaintNotificationsConfig(enabled=False),
+                )
 
                 @dataclass
                 class _ModelEchoK8s(_FakeK8s):
@@ -938,6 +1015,8 @@ def test_provisioned_runner_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        runner_resources: dict[str, object] | None = None,
+                        agent_name: str | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
                         super().create_claim(name, pool=pool, env=env, labels=labels)
@@ -945,7 +1024,11 @@ def test_provisioned_runner_end_to_end(
                 fake_k8s = _ModelEchoK8s()
                 substrate = SandboxSubstrate(
                     fake_k8s,  # type: ignore[arg-type]
-                    AffinityStore(sync_client, key_prefix=sandbox_prefix),
+                    AffinityStore(
+                        sync_client,
+                        pressure_client=pressure_client,
+                        key_prefix=sandbox_prefix,
+                    ),
                     SubstrateConfig(
                         namespace="test-ns",
                         warm_pool="test-pool",
@@ -1020,6 +1103,7 @@ def test_provisioned_runner_end_to_end(
                 if keys:
                     sync_client.delete(*keys)
                 sync_client.close()
+                await pressure_client.aclose()
                 await client.aclose()
         finally:
             if agent_id is not None:
@@ -1861,8 +1945,23 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _FakeK8s()
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    sync_client = redis.Redis(
+        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
+    )
+    pressure_client = AsyncRedis(
+        host=_VH,
+        port=_VP,
+        password=_VPW or None,
+        decode_responses=False,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     affinity = AffinityStore(
-        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        sync_client,
+        pressure_client=pressure_client,
         key_prefix=sandbox_prefix,
     )
     substrate = SandboxSubstrate(
@@ -1871,6 +1970,9 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="curie-runner-pool",
+            # The chart renders acme-a's pool (CURIE_AGENT_SANDBOX_POOLS, #2943).
+            agent_pools=frozenset({"acme-a"}),
+            connector_secret_pools=frozenset({"acme-a"}),
             claim_timeout_seconds=3.0,
             poll_interval_seconds=0.005,
             key_prefix=sandbox_prefix,
@@ -1893,7 +1995,11 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item, "test-stream-id")
+        try:
+            await consumer._run_and_report(item, "test-stream-id")
+        finally:
+            await pressure_client.aclose()
+            sync_client.close()
 
     asyncio.run(go())
     assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
@@ -1914,7 +2020,8 @@ class _DelayedDeleteK8s(_FakeK8s):
     sandbox_gets: dict[str, int] = field(default_factory=dict)
     lingering_sandboxes: dict[str, str] = field(default_factory=dict)
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None or name in self.claim_gets:
             return
@@ -1923,15 +2030,19 @@ class _DelayedDeleteK8s(_FakeK8s):
         self.lingering_sandboxes[claim.sandbox_name] = name
         self.deleted.append(name)
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         if name in self.claim_gets:
             self.claim_gets[name] += 1
             if self.claim_gets[name] >= self.claim_gone_after_gets:
                 self.claims.pop(name, None)
                 return None
-        return super().get_claim(name)
+        return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
         if name in self.sandbox_gets:
             self.sandbox_gets[name] += 1
             if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
@@ -1940,7 +2051,7 @@ class _DelayedDeleteK8s(_FakeK8s):
             return SandboxView(
                 name=name, ready=True, service_fqdn="127.0.0.1", operating_mode="Running"
             )
-        return super().get_sandbox(name)
+        return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
 
 
 def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
@@ -1958,8 +2069,23 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _DelayedDeleteK8s(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    sync_client = redis.Redis(
+        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
+    )
+    pressure_client = AsyncRedis(
+        host=_VH,
+        port=_VP,
+        password=_VPW or None,
+        decode_responses=False,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     affinity = AffinityStore(
-        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        sync_client,
+        pressure_client=pressure_client,
         key_prefix=sandbox_prefix,
     )
     substrate = SandboxSubstrate(
@@ -1992,7 +2118,11 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item, "test-stream-id")
+        try:
+            await consumer._run_and_report(item, "test-stream-id")
+        finally:
+            await pressure_client.aclose()
+            sync_client.close()
 
     asyncio.run(go())
     assert fake_k8s.deleted, "eval must still issue the claim delete"
@@ -2238,6 +2368,63 @@ def test_committed_fixture_loads_from_bundle_with_name_override(
     assert len(suite.cases) == 1
     assert suite.cases[0].grader.grade("I am the example agent.") is True
     assert suite.cases[0].grader.grade("literally anything") is False
+
+
+@pytest.mark.parametrize("unknown_key", ["requires", "note", "expect_stauts"])
+def test_bundle_loader_refuses_unknown_case_keys(unknown_key: str) -> None:
+    """The platform loader refuses extra case fields instead of dropping them."""
+    payload = json.dumps(
+        {
+            "name": "strict-case-keys",
+            "cases": [
+                {
+                    "id": "c",
+                    "input": "i",
+                    "grader": {"kind": "contains", "expected": "x"},
+                    unknown_key: "portable",
+                }
+            ],
+        }
+    ).encode()
+    bundle = _suite_bundle(
+        EvalSuite(
+            name="strict-case-keys",
+            cases=[EvalCase(id="c", input="i", grader=Grader(kind=CONTAINS, expected="x"))],
+        ),
+        cases_payload=payload,
+    )
+    assert load_suite_from_bundle(bundle, "strict-case-keys") is None
+
+
+def test_bundle_loader_retains_valid_optional_case_fields() -> None:
+    """Strictness leaves the supported case options intact through bundle loading."""
+    payload = json.dumps(
+        {
+            "name": "valid-case-options",
+            "cases": [
+                {
+                    "id": "c",
+                    "input": "i",
+                    "grader": {"kind": "contains", "expected": "x"},
+                    "shared_history": True,
+                    "expect_status": "awaiting-approval",
+                }
+            ],
+        }
+    ).encode()
+    bundle = _suite_bundle(
+        EvalSuite(
+            name="valid-case-options",
+            cases=[EvalCase(id="c", input="i", grader=Grader(kind=CONTAINS, expected="x"))],
+        ),
+        cases_payload=payload,
+    )
+
+    suite = load_suite_from_bundle(bundle, "valid-case-options")
+
+    assert suite is not None
+    assert suite.cases[0].shared_history is True
+    assert suite.cases[0].expect_status is ExpectedStatus.AWAITING_APPROVAL
 
 
 def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
@@ -3119,7 +3306,8 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
         # dead-lettered on the next pass.
         assert (
             await store.release(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner
+                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner,
+                resume_event_id=None,
             )
             is True
         )

@@ -19,6 +19,8 @@ NODE_SIZES = {
     "observability": (104, 40),
     "data": (100, 40),
     "substrate": (96, 38),
+    "bot-capability": (116, 40),
+    "deployed-agent": (116, 40),
 }
 
 

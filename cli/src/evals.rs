@@ -120,6 +120,7 @@ impl Grader {
 /// `expect_status` asserts the turn's terminal status: default `done`, or
 /// `awaiting-approval` to assert an approval gate blocked the action.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCase {
     pub id: String,
     pub input: String,
@@ -437,6 +438,13 @@ pub fn selection_note(selector: &[String], selected: usize, total: usize) -> Opt
 }
 
 fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
+    #[derive(Deserialize)]
+    struct SuiteEnvelope {
+        #[serde(rename = "name")]
+        _name: String,
+        cases: Vec<serde_json::Value>,
+    }
+
     let value: serde_json::Value = serde_json::from_slice(body)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
     if value.is_array() {
@@ -449,8 +457,38 @@ fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
             path.display()
         );
     }
-    let suite: EvalSuite = serde_json::from_value(value)
-        .with_context(|| format!("{} is not a valid eval suite", path.display()))?;
+    let envelope: SuiteEnvelope = serde_json::from_value(value.clone()).map_err(|err| {
+        let reason = err.to_string();
+        anyhow::Error::new(err).context(format!(
+            "{} is not a valid eval suite: {reason}",
+            path.display()
+        ))
+    })?;
+    let suite: EvalSuite = serde_json::from_value(value).map_err(|err| {
+        let detail = envelope
+            .cases
+            .iter()
+            .enumerate()
+            .find_map(|(index, case)| {
+                serde_json::from_value::<EvalCase>(case.clone())
+                    .err()
+                    .map(|case_err| {
+                        let location = case
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map_or_else(
+                                || format!("case at index {index}"),
+                                |id| format!("case {id:?}"),
+                            );
+                        format!("{location}: {case_err}")
+                    })
+            })
+            .unwrap_or_else(|| err.to_string());
+        anyhow::Error::new(err).context(format!(
+            "{} is not a valid eval suite: {detail}",
+            path.display()
+        ))
+    })?;
     validate_suite(&suite.name, &suite.cases)?;
     Ok(suite)
 }
@@ -767,6 +805,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -802,6 +841,22 @@ mod tests {
         // An absent expect_status defaults to Done, keeping pre-existing cases
         // byte-identical in behavior.
         assert_eq!(suite.cases[0].expect_status, ExpectedStatus::Done);
+    }
+
+    #[test]
+    fn rejects_unknown_case_keys() {
+        for (key, value) in [
+            ("requires", "portable"),
+            ("note", "documentation"),
+            ("expect_stauts", "done"),
+        ] {
+            let body = format!(
+                r#"{{"name":"s","cases":[{{"id":"a","input":"b","grader":{{"kind":"contains","expected":"x"}},"{key}":"{value}"}}]}}"#
+            );
+            let (_dir, path) = write(&body);
+            let err = format!("{:#}", load_suite(&path).unwrap_err());
+            assert!(err.contains(key), "{key} was not named in {err}");
+        }
     }
 
     #[test]
@@ -861,6 +916,42 @@ mod tests {
             r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"llm_judge","expected":"x"}}]}"#,
         );
         assert!(load_suite(&path).is_err());
+    }
+
+    #[test]
+    fn invalid_grader_names_the_case_and_valid_kinds_in_the_human_error() {
+        let (_dir, path) = write(
+            r#"{"name":"s","cases":[{"id":"valid_case","input":"b","grader":{"kind":"contains","expected":"x"}},{"id":"bad_grader_case","input":"b","grader":{"kind":"llm_judge","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("bad_grader_case"), "{shown}");
+        assert!(shown.contains("unknown variant"), "{shown}");
+        assert!(shown.contains("contains"), "{shown}");
+        assert!(shown.contains("tool_called"), "{shown}");
+    }
+
+    #[test]
+    fn invalid_case_id_does_not_name_a_later_case_with_the_same_serde_error() {
+        let (_dir, path) = write(
+            r#"{"name":"s","cases":[{"id":42,"input":"b","grader":{"kind":"contains","expected":"x"}},{"id":"later_case","input":42,"grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("invalid type"), "{shown}");
+        assert!(shown.contains("case at index 0"), "{shown}");
+        assert!(!shown.contains("later_case"), "{shown}");
+    }
+
+    #[test]
+    fn invalid_suite_name_is_not_attributed_to_a_case_with_the_same_serde_error() {
+        let (_dir, path) = write(
+            r#"{"name":42,"cases":[{"id":"bad_case","input":42,"grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("invalid type"), "{shown}");
+        assert!(!shown.contains("bad_case"), "{shown}");
     }
 
     #[test]
@@ -1059,7 +1150,6 @@ mod tests {
         let case = &suite.cases[0];
         // Answer matcher: a passing final answer must carry a temperature figure.
         // The trajectory sidecar supplies the separate fetch capability proof.
-        // The loader ignores the documentation-only `note` key on the case.
         assert_eq!(case.id, "reports-a-temperature");
         assert_eq!(case.grader.kind, GraderKind::Regex);
         // #620: the pattern accepts the degree glyph AND the spelled-out unit, so

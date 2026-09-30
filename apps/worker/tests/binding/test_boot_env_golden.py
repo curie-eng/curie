@@ -26,11 +26,20 @@ real WorkerConfig exercises the real code path end to end.
 
 from __future__ import annotations
 
+import base64
+import json
+import time
 import uuid
 
-from curie_worker.binding import BindingResolver, ResolvedDeployment, inject_connector_secrets
+from curie_worker.binding import (
+    SANDBOX_TOKEN_TTL_SECONDS,
+    BindingResolver,
+    ResolvedDeployment,
+    inject_connector_secrets,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox_token import verify
+from nacl.signing import SigningKey
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _THREAD = "thread-1"
@@ -354,3 +363,69 @@ def test_no_connector_scope_when_the_release_is_unset() -> None:
     # hosted connector, which is visible, instead of dialing a dead address.
     env = _boot_env(WorkerConfig(connector_namespace="curie"), _resolved())
     assert not [k for k in env if k.startswith("CURIE_CONNECTOR_")]
+
+
+# --- The connector caller token (ADR-0168 decision 7). ----------------------
+
+_SCOPED = {"connector_release": "curie", "connector_namespace": "curie"}
+
+
+def _caller_seed() -> str:
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def _b64url_decode(segment: str) -> bytes:
+    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
+
+def _claims(token: str) -> dict[str, object]:
+    claims: dict[str, object] = json.loads(_b64url_decode(token.split(".")[1]))
+    return claims
+
+
+def test_a_scoped_boot_carries_a_caller_token_signed_for_its_agent() -> None:
+    seed = _caller_seed()
+    before = int(time.time())
+    env = _boot_env(WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), _resolved())
+    after = int(time.time())
+
+    token = env["CURIE_CONNECTOR_CALLER_TOKEN"]
+    prefix, payload, signature = token.split(".")
+    SigningKey(base64.b64decode(seed)).verify_key.verify(
+        f"{prefix}.{payload}".encode("ascii"), _b64url_decode(signature)
+    )
+    claims = _claims(token)
+    # The agent NAME, because `admits:` lists names.
+    assert claims["agent"] == "test-agent"
+    exp = claims["exp"]
+    assert isinstance(exp, int)
+    assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS
+
+
+def test_the_caller_token_expires_with_the_state_tokens() -> None:
+    env = _boot_env(
+        WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED), _resolved()
+    )
+    assert _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"] == _claims(
+        env["CURIE_STATE_TOKEN"]
+    )["exp"]
+
+
+def test_without_a_signing_key_a_scoped_boot_is_unchanged() -> None:
+    # The stock install: no key, no token, and every other key byte-identical
+    # to a keyed boot's.
+    plain = _boot_env(WorkerConfig(**_SCOPED), _resolved())
+    keyed = _boot_env(
+        WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED), _resolved()
+    )
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in plain
+    plain_stable, _ = _split_minted(plain)
+    keyed_stable, _ = _split_minted(keyed)
+    keyed_stable.pop("CURIE_CONNECTOR_CALLER_TOKEN")
+    assert keyed_stable == plain_stable
+
+
+def test_an_unscoped_boot_carries_no_caller_token_even_with_a_key() -> None:
+    # No scope mounts no hosted connector, so there is nobody to present it to.
+    env = _boot_env(WorkerConfig(connector_caller_signing_key=_caller_seed()), _resolved())
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in env

@@ -245,6 +245,28 @@ def read_connectors(root: Path) -> ConnectorsFile:
     return parsed
 
 
+def read_manifest_triggers(root: Path) -> list[Any]:
+    """Return ``plugin.json`` ``triggers`` as stored, or an empty list.
+
+    A missing key, JSON null, or a non-list value becomes ``[]``. The list is
+    not validated and its objects are not rewritten.
+    """
+
+    manifest_path = resolve_manifest(bundle_root(root))
+    if manifest_path is None:
+        return []
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    triggers = raw.get("triggers")
+    if isinstance(triggers, list):
+        return triggers
+    return []
+
+
 def read_connector_lock(root: Path) -> ConnectorLockFile | None:
     """Parse a validated bundle's ``connectors.lock.yaml``, or None (ADR 0113).
 
@@ -293,6 +315,7 @@ def render_connector_manifests(
     namespace: str,
     app_name: str,
     secret_name: str,
+    proxy: connector_render.ConnectorProxy | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
 
@@ -315,6 +338,7 @@ def render_connector_manifests(
                 connector=name,
                 spec=spec,
                 secret_name=secret_name,
+                proxy=proxy,
             )
         )
     return objects

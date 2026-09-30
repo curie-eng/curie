@@ -185,6 +185,16 @@
       "title": "MessageLink",
       "type": "object"
     },
+    "MilestoneClass": {
+      "description": "Why a durable interruption is warranted (ADR-0130 section 3).\n\nA class is a reason, not a step: a chain may skip one or repeat one while\nits milestone budget lasts.",
+      "enum": [
+        "evidence",
+        "scope",
+        "verification"
+      ],
+      "title": "MilestoneClass",
+      "type": "string"
+    },
     "NavAffordance": {
       "additionalProperties": false,
       "description": "The no-dead-ends way back, in wire terms.\n\nThe worker-local ``NavPack`` cannot cross into this package without\ninverting the dependency, so the worker's sink layer maps an ENABLED pack to\nthis and a disabled one to ``None``: absence is the disabled form, and there\nis no dead affordance on the wire.",
@@ -302,6 +312,146 @@
       "title": "OutboundMessage",
       "type": "object"
     },
+    "ProgressCard": {
+      "additionalProperties": false,
+      "description": "The semantic form of a turn chain's one mutable progress card.",
+      "properties": {
+        "kind": {
+          "const": "card",
+          "title": "Kind",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Counts the record's accepted updates from 1. A higher revision supersedes a lower one, so an adapter can drop a stale redelivery.",
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ProgressState"
+        },
+        "summary": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+          "title": "Summary",
+          "type": "string"
+        },
+        "terminal": {
+          "description": "True exactly when state is complete, failed or cancelled. Carried so an adapter renders the closed card without its own copy of that set.",
+          "title": "Terminal",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "state",
+        "summary",
+        "revision",
+        "terminal"
+      ],
+      "title": "ProgressCard",
+      "type": "object"
+    },
+    "ProgressCommand": {
+      "additionalProperties": false,
+      "description": "One deliberate progress update, as a model submits it.",
+      "properties": {
+        "milestone": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MilestoneClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Requests a durable milestone reply of this class. The milestone budget is the platform's to apply, not the command's to state."
+        },
+        "state": {
+          "$ref": "#/$defs/ProgressState"
+        },
+        "summary": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+          "title": "Summary",
+          "type": "string"
+        },
+        "update_id": {
+          "description": "Identifies this update within its record, for idempotency.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+          "title": "Update Id",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "update_id",
+        "state",
+        "summary"
+      ],
+      "title": "ProgressCommand",
+      "type": "object"
+    },
+    "ProgressMilestone": {
+      "additionalProperties": false,
+      "description": "One durable milestone reply of a turn chain.",
+      "properties": {
+        "kind": {
+          "const": "milestone",
+          "title": "Kind",
+          "type": "string"
+        },
+        "milestone": {
+          "$ref": "#/$defs/MilestoneClass"
+        },
+        "ordinal": {
+          "description": "The chain's milestone slot this reply holds, from 1. The bound makes a fourth milestone inexpressible on the wire.",
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "summary": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "milestone",
+        "summary",
+        "ordinal"
+      ],
+      "title": "ProgressMilestone",
+      "type": "object"
+    },
+    "ProgressState": {
+      "description": "The initial state set, in ADR-0130 section 1's order.",
+      "enum": [
+        "queued",
+        "investigating",
+        "awaiting-approval",
+        "preparing-workspace",
+        "testing",
+        "publishing",
+        "complete",
+        "failed",
+        "cancelled"
+      ],
+      "title": "ProgressState",
+      "type": "string"
+    },
     "ReplyAck": {
       "additionalProperties": false,
       "description": "What an adapter answers with. ``ref`` is None when it mints no handle.",
@@ -324,8 +474,22 @@
     },
     "ReplyPost": {
       "additionalProperties": false,
-      "description": "A NEW platform-owned message (the approval card), acked with its ref.",
+      "description": "A NEW platform-owned message, acked with its ref.\n\nThe approval card, or, 1.1 only, a progress card's first revision or a\nmilestone. ``message.text`` is the complete plain-text fallback either way.",
       "properties": {
+        "delivery_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.1. The platform-minted idempotency key of this one post or edit; a retry of an ambiguous attempt carries the same value. Outbound, and unrelated to the inbound delivery_id an adapter sends to POST /channels/turns.",
+          "title": "Delivery Id"
+        },
         "event": {
           "const": "reply.post",
           "title": "Event",
@@ -333,6 +497,33 @@
         },
         "message": {
           "$ref": "#/$defs/OutboundMessage"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "card": "#/$defs/ProgressCard",
+                  "milestone": "#/$defs/ProgressMilestone"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ProgressCard"
+                },
+                {
+                  "$ref": "#/$defs/ProgressMilestone"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.1. A progress card's first revision or a milestone; message.text is its plain-text fallback and carries no interaction.",
+          "title": "Progress"
         },
         "requested_by": {
           "title": "Requested By",
@@ -342,7 +533,10 @@
           "$ref": "#/$defs/ReplyTarget"
         },
         "version": {
-          "const": "1.0",
+          "enum": [
+            "1.0",
+            "1.1"
+          ],
           "title": "Version",
           "type": "string"
         }
@@ -403,8 +597,22 @@
     },
     "ReplyUpdate": {
       "additionalProperties": false,
-      "description": "The turn's reply, edited in place where the channel supports it.\n\n``text`` is a streamed or final reply. ``message`` plus ``settled`` is the\nother form: an already-posted platform message being settled (an approval\ncard that expired or was resolved).",
+      "description": "The turn's reply, edited in place where the channel supports it.\n\n``text`` is a streamed or final reply. ``message`` plus ``settled`` is the\nother form: an already-posted platform message being settled (an approval\ncard that expired or was resolved). ``progress`` is the third, 1.1 only: an\nedit of the progress card ``target.reply_ref`` names, carrying none of the\nanswer fields.",
       "properties": {
+        "delivery_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.1. The platform-minted idempotency key of this one post or edit; a retry of an ambiguous attempt carries the same value. Outbound, and unrelated to the inbound delivery_id an adapter sends to POST /channels/turns.",
+          "title": "Delivery Id"
+        },
         "event": {
           "const": "reply.update",
           "title": "Event",
@@ -431,6 +639,18 @@
             }
           ],
           "default": null
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgressCard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.1. An edit of the progress card target.reply_ref names; the body then carries no text, message, settled or nav."
         },
         "settled": {
           "anyOf": [
@@ -459,7 +679,10 @@
           "title": "Text"
         },
         "version": {
-          "const": "1.0",
+          "enum": [
+            "1.0",
+            "1.1"
+          ],
           "title": "Version",
           "type": "string"
         }

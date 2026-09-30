@@ -1,0 +1,189 @@
+{{/*
+  ADR 0176 decision 4, issue #3243: the end to end connector's identity on a
+  test cluster. Installed by the test cluster's owner release (ADR 0129 sense)
+  through `curie cluster up --e2e-connector-identity`; off by default.
+
+  The identity may act only in namespaces carrying its prefix and ownership
+  label, and the test cluster enforces that, not connector code. Kubernetes
+  RBAC cannot scope a create by object name or a grant by namespace label, so
+  the grant is split in three:
+
+  1. A cluster grant that holds NO read or write of any namespaced object and
+     no cluster scoped write beyond namespaces: create, delete and read
+     namespaces; create RoleBindings; and `bind` on exactly one ClusterRole.
+  2. A ClusterRole with no cluster scoped effect that the identity binds to
+     itself, with a RoleBinding, inside a namespace in its scope. That
+     RoleBinding is the ONLY source of namespaced reads and writes, so every
+     other namespace is unreadable to it: no binding, no access. A namespace an
+     administrator creates with the prefix and label is in scope by
+     definition; the label is the ownership claim.
+  3. A ValidatingAdmissionPolicy the API server evaluates on every write made
+     by this service account AND by any service account inside a prefixed
+     namespace (a token the identity mints there must not step outside the
+     policy):
+       - a namespace create is admitted only when the name carries the prefix,
+         the namespace carries the ownership label, and it enforces Pod
+         Security `baseline` or `restricted`, so no pod in it may be
+         privileged, share the host namespaces or mount a host path; a delete
+         is admitted only for a prefixed, labelled namespace;
+       - a namespaced write is admitted only inside a namespace carrying the
+         prefix and the label;
+       - every cluster scoped write other than that namespace create or delete
+         is denied, as a second wall behind RBAC granting none;
+       - a RoleBinding may name only service accounts of its own namespace (or
+         this identity), so no grant inside a test namespace reaches a user, a
+         group or another namespace's service account.
+
+  RBAC's escalation check does the rest: inside an owned namespace the
+  identity may bind only permissions it already holds there, and `bind` on the
+  worker ClusterRole is the only role it can grant without holding it.
+  Namespace UPDATE is granted nowhere, so the identity cannot relabel a
+  namespace into its scope or lower its Pod Security level.
+*/}}
+{{- $cfg := .Values.e2eConnectorIdentity }}
+{{- if $cfg.enabled }}
+{{- $prefix := required "e2eConnectorIdentity.namespacePrefix is required" $cfg.namespacePrefix }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$" $prefix) }}
+{{- fail (printf "e2eConnectorIdentity.namespacePrefix %q must be a lowercase DNS label ending in '-'" $prefix) }}
+{{- end }}
+{{- /* The policy matches every service account in a prefixed namespace and
+       fails closed, so a prefix covering this release or a system namespace
+       would lock out that namespace's own service accounts. */}}
+{{- if or (hasPrefix $prefix .Release.Namespace) (hasPrefix $prefix "kube-system") (hasPrefix $prefix "default-") }}
+{{- fail (printf "e2eConnectorIdentity.namespacePrefix %q must not cover the release namespace %q or a system namespace" $prefix .Release.Namespace) }}
+{{- end }}
+{{- $labelKey := required "e2eConnectorIdentity.ownerLabel.key is required" $cfg.ownerLabel.key }}
+{{- if not (regexMatch "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" $labelKey) }}
+{{- fail (printf "e2eConnectorIdentity.ownerLabel.key %q is not a valid label key" $labelKey) }}
+{{- end }}
+{{- $labelValue := default .Release.Name $cfg.ownerLabel.value }}
+{{- if not (regexMatch "^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$" $labelValue) }}
+{{- fail (printf "e2eConnectorIdentity.ownerLabel.value %q is not a valid label value" $labelValue) }}
+{{- end }}
+{{- $name := printf "%s-e2e-connector" (include "curie.fullname" .) }}
+{{- $sa := default $name $cfg.serviceAccountName }}
+{{- $worker := printf "%s-namespace" $name }}
+{{- $user := printf "system:serviceaccount:%s:%s" .Release.Namespace $sa }}
+{{- $saPrefix := printf "system:serviceaccount:%s" $prefix }}
+{{- $podSecurity := "pod-security.kubernetes.io/enforce" }}
+{{- $owned := printf "%s.metadata.name.startsWith('%s') && has(%s.metadata.labels) && '%s' in %s.metadata.labels && %s.metadata.labels['%s'] == '%s'" "%[1]s" $prefix "%[1]s" $labelKey "%[1]s" "%[1]s" $labelKey $labelValue }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-cluster
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+rules:
+  # Create and delete are admitted only for prefixed, labelled namespaces by the
+  # policy below. No update or patch: the identity cannot relabel a namespace.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # The bootstrap RoleBinding in a namespace it just created. The policy admits
+  # it only inside an owned namespace.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+  # The one role it may grant without holding it first.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: [{{ $worker | quote }}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-cluster
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-cluster
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+# Bound only by a RoleBinding inside an owned namespace, never by a
+# ClusterRoleBinding. Through a RoleBinding a wildcard reaches namespaced
+# resources of that one namespace and nothing cluster scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $worker }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}-scope
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*/*"]
+        operations: ["CREATE", "UPDATE", "DELETE", "CONNECT"]
+        scope: "*"
+  matchConditions:
+    - name: e2e-connector-identity-or-owned-namespace-service-account
+      expression: {{ printf "request.userInfo.username == '%s' || request.userInfo.username.startsWith('%s')" $user $saPrefix | quote }}
+  validations:
+    - expression: >-
+        request.resource.group != '' || request.resource.resource != 'namespaces' ||
+        ((!has(request.subResource) || request.subResource == '') &&
+         ((request.operation == 'CREATE' && {{ printf $owned "object" }} &&
+           '{{ $podSecurity }}' in object.metadata.labels &&
+           object.metadata.labels['{{ $podSecurity }}'] in ['baseline', 'restricted']) ||
+          (request.operation == 'DELETE' && {{ printf $owned "oldObject" }})))
+      message: {{ printf "the e2e connector may create only namespaces named %s* labelled %s=%s and %s=baseline or restricted, and delete only namespaces named %s* labelled %s=%s" $prefix $labelKey $labelValue $podSecurity $prefix $labelKey $labelValue | quote }}
+      reason: Forbidden
+    - expression: >-
+        (request.resource.group == '' && request.resource.resource == 'namespaces') ||
+        (has(request.namespace) && request.namespace != '' && namespaceObject != null && {{ printf $owned "namespaceObject" }})
+      message: {{ printf "the e2e connector may write only inside namespaces named %s* labelled %s=%s, and never a cluster scoped object" $prefix $labelKey $labelValue | quote }}
+      reason: Forbidden
+    - expression: >-
+        request.resource.group != 'rbac.authorization.k8s.io' ||
+        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
+        !has(object.subjects) ||
+        object.subjects.all(s, s.kind == 'ServiceAccount' && has(s.namespace) &&
+         (s.namespace == request.namespace ||
+          (s.namespace == '{{ .Release.Namespace }}' && s.name == '{{ $sa }}')))
+      message: "a RoleBinding in an e2e connector namespace may name only service accounts of that namespace"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}-scope
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: e2e-connector
+spec:
+  policyName: {{ $name }}-scope
+  validationActions: ["Deny"]
+{{- end }}

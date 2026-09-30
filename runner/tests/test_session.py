@@ -6,19 +6,33 @@ import logging
 
 import anyio
 import pytest
-from aci_protocol import ErrorEvent, Event, Interrupt, SessionStatus, parse_ndjson
+from aci_protocol import ErrorEvent, Event, Final, Interrupt, SessionStatus, parse_ndjson
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    RateLimitEvent,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
+from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
 from curie_runner import session as session_module
 from curie_runner.adapter import ClaudeAgentSession, McpServerReconnector
-from curie_runner.fake import FakeModelSession, default_turn
+from curie_runner.fake import FakeModelSession, approval_turn, default_turn
+from curie_runner.history import (
+    HarnessReplayState,
+    StateApiTranscriptStore,
+    TurnRecord,
+)
 from curie_runner.hooks import build_gated_pre_tool_use_hooks
 from curie_runner.mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
 )
 from curie_runner.session import SessionRunner
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -114,6 +128,94 @@ def _runner(
     return runner, fake
 
 
+class _RecordingTranscriptStore:
+    def __init__(self) -> None:
+        self.attempts: list[TurnRecord] = []
+        self.turns: list[TurnRecord] = []
+
+    async def load(self) -> list[TurnRecord]:
+        return list(self.turns)
+
+    async def append(self, record: TurnRecord) -> bool:
+        self.attempts.append(record)
+        self.turns.append(record)
+        return record.harness_replay is not None
+
+
+class _BlockedTranscriptStore(_RecordingTranscriptStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = anyio.Event()
+        self.release = anyio.Event()
+
+    async def append(self, record: TurnRecord) -> bool:
+        self.attempts.append(record)
+        self.entered.set()
+        await self.release.wait()
+        self.turns.append(record)
+        return record.harness_replay is not None
+
+
+class _CapacityTranscriptStore(_RecordingTranscriptStore):
+    async def append(self, record: TurnRecord) -> bool:
+        from curie_runner.history import HistoryCapacityError
+
+        self.attempts.append(record)
+        raise HistoryCapacityError(413)
+
+
+class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = anyio.Event()
+        self.cancelled = anyio.Event()
+
+    async def append(self, record: TurnRecord) -> bool:
+        self.attempts.append(record)
+        if len(self.attempts) == 1:
+            self.entered.set()
+            try:
+                await anyio.sleep_forever()
+            finally:
+                self.cancelled.set()
+        self.turns.append(record)
+        return record.harness_replay is not None
+
+
+class _ReplayExportSession(FakeModelSession):
+    def __init__(self, mode: str) -> None:
+        super().__init__(default_turn)
+        self.mode = mode
+
+    async def export_replay_state(self) -> HarnessReplayState:
+        if self.mode == "error":
+            raise RuntimeError("private replay token-PLACEHOLDER")
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+
+def _runner_with_history(
+    store,
+    *,
+    script_factory=default_turn,
+    tracer: RunTracer | None = None,
+    session: FakeModelSession | None = None,
+) -> tuple[SessionRunner, FakeModelSession]:
+    fake = session or FakeModelSession(script_factory)
+    return (
+        SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            tracer=tracer or RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="history-test",
+            session_id="session-PLACEHOLDER",
+            history_store=store,
+        ),
+        fake,
+    )
+
+
 def _drain(runner: SessionRunner, frame) -> list:
     lines: list[str] = []
 
@@ -137,6 +239,370 @@ def test_happy_turn_stream_shape() -> None:
     assert events[-1].status == SessionStatus.DONE
     assert fake.queries == ["go"]  # the event text was pushed into the session
     assert runner.status == SessionStatus.DONE
+
+
+def test_transcript_capacity_failure_precedes_terminal_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
+    append_attempts: list[dict[str, object]] = []
+    app = web.Application()
+
+    async def reject_append(request: web.Request) -> web.Response:
+        append_attempts.append(await request.json())
+        return web.Response(status=413, text=sensitive_body)
+
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"},
+            status=404,
+            headers={"X-Curie-Transcript-Max-Bytes": "65536"},
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
+    app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    metrics: list[tuple[str, dict[str, object]]] = []
+
+    def capture_metric(
+        name: str,
+        _value: float = 1,
+        *,
+        attributes: dict[str, object],
+    ) -> None:
+        metrics.append((name, dict(attributes)))
+
+    monkeypatch.setattr(session_module, "record_metric", capture_metric)
+
+    async def go() -> tuple[list, SessionRunner]:
+        async with TestServer(app) as server:
+            store = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            assert await store.load() == []
+            runner, _fake = _runner_with_history(store, tracer=RunTracer(provider))
+            await runner.start()
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="question", user="U", ts="1")
+                )
+            ]
+            await runner.close()
+            return parse_ndjson("".join(lines)), runner
+
+    events, runner = anyio.run(go)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    finals = [event for event in events if isinstance(event, Final)]
+    assert len(errors) == 1
+    assert errors[0].classification == "history-persistence-error"
+    assert sensitive_body not in errors[0].message
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+    assert finals[0].text != "all done"
+    assert finals[0].approval_summary is None
+    assert finals[0].approval_route is None
+    assert events[-2:] == [errors[0], finals[0]]
+    assert len(append_attempts) == 1
+    assert runner.history_durable is False
+
+    roots = _span_named(list(exporter.get_finished_spans()), "agent.run")
+    assert len(roots) == 1
+    assert roots[0].attributes["curie.terminal.cause"] == "classified_failure"
+    assert roots[0].attributes["curie.terminal.status"] == "failed"
+    assert roots[0].status.status_code is StatusCode.ERROR
+    completed = [
+        attributes
+        for name, attributes in metrics
+        if name == "curie.turn.completed"
+    ]
+    assert completed == [
+        {
+            "service.name": "curie-runner",
+            "source": "runner",
+            "outcome": "classified_failure",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("script_factory", "expected_status"),
+    (
+        (default_turn, SessionStatus.DONE),
+        (lambda: approval_turn("Approve the action"), SessionStatus.AWAITING_APPROVAL),
+        (
+            lambda: approval_turn("Approve the action")[:-1],
+            SessionStatus.AWAITING_APPROVAL,
+        ),
+    ),
+)
+def test_persistable_terminal_waits_for_append_and_closes_control_window(
+    script_factory,
+    expected_status: SessionStatus,
+) -> None:
+    store = _BlockedTranscriptStore()
+    runner, fake = _runner_with_history(store, script_factory=script_factory)
+    epoch = "P" * 43
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+
+        async def consume() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="question", user="U", ts="1"),
+                turn_epoch=epoch,
+            ):
+                lines.append(line)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume)
+            await store.entered.wait()
+            observed = parse_ndjson("".join(lines))
+            assert not any(isinstance(event, Final) for event in observed)
+            assert runner.turn_active is False
+            with anyio.fail_after(0.2):
+                assert await runner.timeout(epoch) is False
+            with anyio.fail_after(0.2):
+                assert await runner.steer("too late") is False
+            interrupts_before = fake.interrupts
+            with anyio.fail_after(0.2):
+                await runner.interrupt("late stop")
+            assert fake.interrupts == interrupts_before
+            store.release.set()
+
+        events = parse_ndjson("".join(lines))
+        assert events[-1].status is expected_status
+        assert len(store.turns) == 1
+        if expected_status is SessionStatus.AWAITING_APPROVAL:
+            assert store.turns[0].approval is not None
+            assert store.turns[0].approval.summary == "Approve the action"
+        assert all(
+            not (
+                message.role == "user"
+                and message.content == "too late"
+            )
+            for message in store.turns[0].messages
+        )
+
+        interrupts_before_idle = fake.interrupts
+        with anyio.fail_after(0.2):
+            await runner.interrupt("idle lease fence")
+        assert fake.interrupts == interrupts_before_idle + 1
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_closing_stream_after_success_final_cannot_skip_append() -> None:
+    store = _RecordingTranscriptStore()
+    runner, _fake = _runner_with_history(store)
+
+    async def go() -> None:
+        await runner.start()
+        stream = runner.run_turn(
+            Event(type="message", text="question", user="U", ts="1")
+        )
+        async for line in stream:
+            event = parse_ndjson(line)[0]
+            if isinstance(event, Final):
+                assert event.status is SessionStatus.DONE
+                break
+        await stream.aclose()
+
+    anyio.run(go)
+    assert len(store.turns) == 1
+    assert store.turns[0].user == "question"
+    assert runner.history_durable is True
+
+
+@pytest.mark.parametrize(
+    "script_factory",
+    (
+        lambda: approval_turn("Approve the action"),
+        lambda: approval_turn("Approve the action")[:-1],
+    ),
+)
+def test_approval_capacity_failure_clears_pending_approval(script_factory) -> None:
+    store = _CapacityTranscriptStore()
+    runner, _fake = _runner_with_history(store, script_factory=script_factory)
+
+    async def go() -> list:
+        await runner.start()
+        lines = [
+            line
+            async for line in runner.run_turn(
+                Event(type="message", text="question", user="U", ts="1")
+            )
+        ]
+        return parse_ndjson("".join(lines))
+
+    events = anyio.run(go)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    finals = [event for event in events if isinstance(event, Final)]
+    assert len(errors) == 1
+    assert errors[0].classification == "history-persistence-error"
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+    assert finals[0].approval_summary is None
+    assert finals[0].approval_route is None
+    assert events[-2:] == [errors[0], finals[0]]
+    assert len(store.attempts) == 1
+    assert store.turns == []
+    assert runner.history_durable is False
+
+
+def test_capacity_loss_stays_sticky_after_a_later_successful_append() -> None:
+    class RecoveringStore(_RecordingTranscriptStore):
+        async def append(self, record: TurnRecord) -> bool:
+            from curie_runner.history import HistoryCapacityError
+
+            self.attempts.append(record)
+            if len(self.attempts) == 1:
+                raise HistoryCapacityError(413)
+            self.turns.append(record)
+            return record.harness_replay is not None
+
+    store = RecoveringStore()
+    runner, _fake = _runner_with_history(store)
+
+    async def go() -> list[list]:
+        await runner.start()
+        turns: list[list[object]] = []
+        for text, ts in (("first", "1"), ("second", "2")):
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text=text, user="U", ts=ts)
+                )
+            ]
+            turns.append(parse_ndjson("".join(lines)))
+        return turns
+
+    first, second = anyio.run(go)
+    assert first[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert second[-1].status is SessionStatus.DONE
+    assert [record.user for record in store.turns] == ["second"]
+    assert runner.history_durable is False
+
+
+@pytest.mark.parametrize("mode", ("error", "timeout"))
+def test_optional_replay_export_failure_still_appends_portable_history(
+    mode: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if mode == "timeout":
+        monkeypatch.setattr(
+            session_module,
+            "_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS",
+            0.01,
+        )
+    store = _RecordingTranscriptStore()
+    session = _ReplayExportSession(mode)
+    runner, _fake = _runner_with_history(store, session=session)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        events = _drain(
+            runner,
+            Event(type="message", text="question", user="U", ts="1"),
+        )
+
+    assert events[-1].status is SessionStatus.DONE
+    assert len(store.turns) == 1
+    assert store.turns[0].harness_replay is None
+    assert runner.history_durable is True
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("harness replay export failed" in message for message in messages)
+    assert all("private replay token-PLACEHOLDER" not in message for message in messages)
+
+
+def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert session_module._HISTORY_PERSISTENCE_BUDGET_SECONDS == 15.0
+    monkeypatch.setattr(
+        session_module,
+        "_HISTORY_PERSISTENCE_BUDGET_SECONDS",
+        0.05,
+    )
+    store = _FirstBlockedTranscriptStore()
+    runner, _fake = _runner_with_history(store)
+
+    async def go() -> tuple[list, list]:
+        await runner.start()
+        with anyio.fail_after(1):
+            first_lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="first", user="U", ts="1")
+                )
+            ]
+        await store.cancelled.wait()
+        second_lines = [
+            line
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U", ts="2")
+            )
+        ]
+        return parse_ndjson("".join(first_lines)), parse_ndjson("".join(second_lines))
+
+    first, second = anyio.run(go)
+    assert first[-1].status is SessionStatus.DONE
+    assert second[-1].status is SessionStatus.DONE
+    assert [record.user for record in store.turns] == ["second"]
+    assert runner.turn_active is False
+    assert runner.history_durable is False
+
+
+def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -> None:
+    store = _FirstBlockedTranscriptStore()
+    runner, fake = _runner_with_history(store)
+    first_lines: list[str] = []
+
+    async def go() -> list:
+        await runner.start()
+        cancelled = anyio.Event()
+        scope_holder: list[anyio.CancelScope] = []
+
+        async def consume_first() -> None:
+            with anyio.CancelScope() as scope:
+                scope_holder.append(scope)
+                async for line in runner.run_turn(
+                    Event(type="message", text="first", user="U", ts="1")
+                ):
+                    first_lines.append(line)
+            cancelled.set()
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume_first)
+            await store.entered.wait()
+            scope_holder[0].cancel()
+            await cancelled.wait()
+        await store.cancelled.wait()
+        second_lines = [
+            line
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U", ts="2")
+            )
+        ]
+        return parse_ndjson("".join(second_lines))
+
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        second = anyio.run(go)
+    first = parse_ndjson("".join(first_lines))
+    assert not any(isinstance(event, Final) for event in first)
+    assert second[-1].status is SessionStatus.DONE
+    assert sum("turn end" in record.getMessage() for record in caplog.records) == 1
+    assert [record.user for record in store.turns] == ["second"]
+    assert fake.interrupts == 0
+    assert runner.turn_active is False
+    assert runner.history_durable is False
 
 
 def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
@@ -324,6 +790,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
 
 def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     monkeypatch: pytest.MonkeyPatch,
+    caplog,
 ) -> None:
     """Closing at a suspended yield must not let abandonment store first."""
 
@@ -331,12 +798,14 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     fake = FakeModelSession()
+    store = _RecordingTranscriptStore()
     runner = SessionRunner(
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(provider),
         classifier=SideEffectClassifier(),
         trace_name="t",
+        history_store=store,
     )
     metrics: list[tuple[str, dict[str, str]]] = []
 
@@ -365,7 +834,13 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
         await turn.aclose()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert sum(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    ) == 1
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "runner_timeout"
@@ -383,6 +858,7 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
             "outcome": "classified_failure",
         }
     ]
+    assert store.attempts == []
 
 
 def test_timeout_epoch_is_isolated_from_stale_spoofed_and_replayed_turns() -> None:
@@ -697,6 +1173,23 @@ class _OrderedTimeoutWireSession:
 
     async def receive_turn(self):
         if self.queries == 1:
+            if self.first_receive_entered.is_set() and any(
+                kind == "interrupt" for kind, _ in self.wire
+            ):
+                # The next turn's resync read of the abandoned first turn
+                # (#3425): the CLI ends a turn with its terminal result once it
+                # reads a written stop, whether or not the ack reached the runner.
+                self.wire.append(("drained", "first"))
+                yield ResultMessage(
+                    subtype="error_during_execution",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="sdk-session-PLACEHOLDER",
+                    result="",
+                )
+                return
             self.first_receive_entered.set()
             await self.end_first_receive.wait()
             return
@@ -862,6 +1355,7 @@ def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> Non
         ("query", "first"),
         ("interrupt", 1),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
@@ -889,6 +1383,7 @@ def test_timeout_cancelled_before_stop_write_uses_cleanup_before_next_query() ->
     assert session.wire == [
         ("query", "first"),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
@@ -954,6 +1449,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
     session_type,
     expected_phase: str,
     expect_tool: bool,
+    caplog,
 ) -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -990,7 +1486,9 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
             scope_holder[0].cancel()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert not any("turn end" in record.getMessage() for record in caplog.records)
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.phase"] == expected_phase
@@ -1015,6 +1513,57 @@ def test_turn_lifecycle_logged(caplog) -> None:
     assert any("turn start" in message and "user=U-log" in message for message in messages)
     assert any("turn end" in message and "status=done" in message for message in messages)
     assert any("tool call" in message and "tool=Bash" in message for message in messages)
+
+
+def test_no_tool_turn_start_log_carries_its_agent_run_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    fake = FakeModelSession(
+        lambda: [
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="fake-session",
+                result="done",
+                usage=None,
+            )
+        ]
+    )
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="no-tool-turn",
+    )
+    contexts: list[tuple[int, int]] = []
+
+    class CaptureStart(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "turn start" in record.getMessage():
+                context = trace.get_current_span().get_span_context()
+                contexts.append((context.trace_id, context.span_id))
+
+    logger = logging.getLogger("curie_runner.session")
+    capture = CaptureStart()
+    logger.addHandler(capture)
+    try:
+        with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+            events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    finally:
+        logger.removeHandler(capture)
+
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert events[-1].status == SessionStatus.DONE
+    assert not _span_named(spans, "execute_tool")
+    assert contexts == [(root.context.trace_id, root.context.span_id)]
 
 
 def test_bare_interrupt_yields_idle_final() -> None:
@@ -1127,12 +1676,16 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
         classifier=SideEffectClassifier(),
         trace_name="t",
     )
-    with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     messages = [record.getMessage() for record in caplog.records]
     assert [e.type for e in events] == ["error", "final"]
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in message and "status=classified-failure" in message
+        for message in messages
+    )
     assert any(
         record.levelno == logging.ERROR
         and "turn failed" in record.getMessage()
@@ -1236,6 +1789,36 @@ def test_transient_model_error_is_not_fast_failed() -> None:
     assert fake.interrupts == 0  # not aborted
 
 
+def test_model_error_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [AssistantMessage(content=[], model="m", error="unknown")]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "unclassified"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_rejected_rate_limit_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(status="rejected"),
+                uuid="u",
+                session_id="s",
+            )
+        ]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "rate-limit"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_budget_halt_logged(caplog) -> None:
     script = [
         AssistantMessage(
@@ -1256,10 +1839,15 @@ def test_budget_halt_logged(caplog) -> None:
     ]
     runner, _ = _runner(lambda: script, ceiling=10)
 
-    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    )
     assert any(
         record.levelno == logging.WARNING and "budget halt" in record.getMessage()
         for record in caplog.records

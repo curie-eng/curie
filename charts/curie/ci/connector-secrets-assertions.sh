@@ -69,6 +69,39 @@ rendered="$(helm template curie "$CHART" \
   --set-string 'agentSandbox.connectorSecrets.acme-b.GITHUB_PERSONAL_ACCESS_TOKEN=agent-b-sentinel' \
   2>/dev/null)"
 
+# #2943: the worker routes a connector-secret claim only to a pool the chart
+# rendered, so every per-agent pool must be named in CURIE_AGENT_SANDBOX_POOLS.
+worker="$(require_resource "$rendered" Deployment curie-worker)"
+require_text "$worker" 'name: CURIE_AGENT_SANDBOX_POOLS' \
+  "worker lacks CURIE_AGENT_SANDBOX_POOLS"
+require_text "$(grep -A1 'name: CURIE_AGENT_SANDBOX_POOLS' <<<"$worker")" 'value: "acme-a,acme-b"' \
+  "CURIE_AGENT_SANDBOX_POOLS must list every connectorSecrets agent the chart renders a pool for"
+require_text "$(grep -A1 'name: CURIE_AGENT_CONNECTOR_SECRET_POOLS' <<<"$worker")" 'value: "acme-a,acme-b"' \
+  "CURIE_AGENT_CONNECTOR_SECRET_POOLS must list every agent whose pool carries connector secrets"
+
+# The worker derives a per-agent pool name from its base pool. With
+# worker.warmPool overridden that derivation no longer names the pools the chart
+# renders under the release fullname, so the chart lists none and the worker
+# refuses a secret claim at once instead of waiting on a missing pool.
+override_worker="$(require_resource "$(helm template curie "$CHART" \
+  --set worker.warmPool=custom-runner-pool \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  2>/dev/null)" Deployment curie-worker)"
+for name in CURIE_AGENT_SANDBOX_POOLS CURIE_AGENT_CONNECTOR_SECRET_POOLS; do
+  require_text "$(grep -A1 "name: $name" <<<"$override_worker")" 'value: ""' \
+    "$name must be empty when worker.warmPool is overridden"
+done
+
+# agentSandbox.deploy=false renders no pools at all, so none are listed.
+undeployed_worker="$(require_resource "$(helm template curie "$CHART" \
+  --set agentSandbox.deploy=false \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  2>/dev/null)" Deployment curie-worker)"
+for name in CURIE_AGENT_SANDBOX_POOLS CURIE_AGENT_CONNECTOR_SECRET_POOLS; do
+  require_text "$(grep -A1 "name: $name" <<<"$undeployed_worker")" 'value: ""' \
+    "$name must be empty when agentSandbox.deploy is false"
+done
+
 secret_a="$(require_resource "$rendered" Secret curie-agent-acme-a-connector-secrets)"
 secret_b="$(require_resource "$rendered" Secret curie-agent-acme-b-connector-secrets)"
 require_text "$secret_a" 'curietech.ai/agent: "acme-a"' \

@@ -115,8 +115,18 @@ worker_resources = {
     for rule in worker_role.get("rules") or []
     for resource in rule.get("resources") or []
 }
-if worker_resources & {"jobs", "configmaps", "secrets", "pods", "pods/log"}:
+if worker_resources & {"jobs", "configmaps", "secrets", "pods/log"}:
     fail(f"main worker Role carries publication authority: {sorted(worker_resources)}")
+# The one pod grant is the exact-name read an unschedulable claim needs
+# (#3169); publication's pod authority is list plus pods/log.
+pod_verbs = {
+    verb
+    for rule in worker_role.get("rules") or []
+    if "pods" in (rule.get("resources") or [])
+    for verb in rule.get("verbs") or []
+}
+if pod_verbs - {"get"}:
+    fail(f"main worker Role grants pods beyond get: {sorted(pod_verbs)}")
 
 role = one("Role", component="publication-worker")
 rules = role.get("rules") or []

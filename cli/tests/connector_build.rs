@@ -407,6 +407,7 @@ fn lock_with(image: &str, delivery: Delivery, digest: &str) -> ConnectorLockFile
     ConnectorLockFileDecl {
         version: connector_build::LOCK_VERSION,
         connectors,
+        ..Default::default()
     }
 }
 
@@ -807,6 +808,7 @@ fn declaration(entries: &[(&str, ConnectorSpecDecl)]) -> connector_build::Connec
             .iter()
             .map(|(name, spec)| ((*name).to_string(), spec.clone()))
             .collect(),
+        ..Default::default()
     }
 }
 

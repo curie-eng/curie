@@ -8,8 +8,7 @@
         "kind": "contains",
         "expected": "aci-protocol",
         "case_sensitive": false
-      },
-      "note": "Falsifiable: issue #7's title is about promoting the queue payload into aci-protocol; an agent that does not read the issue cannot produce the distinctive term 'aci-protocol'. Anchored on a CLOSED issue so the fact is stable."
+      }
     },
     {
       "id": "reads-a-specific-issue-state",
@@ -18,8 +17,7 @@
         "kind": "contains",
         "expected": "closed",
         "case_sensitive": false
-      },
-      "note": "Falsifiable: #7 is closed; an agent that does not query the issue state will guess wrong or hedge. Stable (a closed issue stays closed)."
+      }
     },
     {
       "id": "lists-real-issue-numbers",
@@ -28,8 +26,7 @@
         "kind": "regex",
         "expected": "#\\d+",
         "case_sensitive": false
-      },
-      "note": "Partly falsifiable: an agent that returns no issue-number-shaped text fails. LIMIT: a fake-model agent that INVENTS a '#5' still passes; proving the numbers came from an actual GitHub query needs the tool-call grader (ADR-0022 Phase 1). The two #7 cases above are the fully-falsifiable anchors."
+      }
     }
   ]
 }

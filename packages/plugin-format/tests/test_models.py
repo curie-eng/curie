@@ -6,6 +6,7 @@ from plugin_format import (
     PluginManifest,
     SkillFrontmatter,
     ToolPolicy,
+    TriggerDeclaration,
 )
 from pydantic import ValidationError
 
@@ -90,6 +91,50 @@ def test_manifest_trigger_and_approval_policy_fields() -> None:
     # Absent -> None (backward compatible).
     bare = PluginManifest.model_validate({"name": "demo"})
     assert bare.triggers is None and bare.approvalPolicy is None
+
+
+def test_trigger_declaration_keeps_cron_fields_optional() -> None:
+    declared = TriggerDeclaration.model_validate(
+        {
+            "type": "cron",
+            "name": "weekday-digest",
+            "schedule": "0 9 * * 1-5",
+            "timezone": "America/New_York",
+            "target": "C0EXAMPLE1",
+            "prompt": "Post the daily plan.",
+        }
+    )
+    assert declared.name == "weekday-digest"
+    assert declared.timezone == "America/New_York"
+    assert declared.target == "C0EXAMPLE1"
+    assert declared.prompt == "Post the daily plan."
+
+    # The model does not require name, timezone, target, or prompt.
+    bare = TriggerDeclaration.model_validate({"type": "cron", "schedule": "0 9 * * 1-5"})
+    assert bare.name is None
+    assert bare.timezone is None
+    assert bare.target is None
+    assert bare.prompt is None
+
+    schema = TriggerDeclaration.model_json_schema()
+    assert schema["required"] == ["type"]
+    assert "name" in schema["properties"]
+    assert "timezone" in schema["properties"]
+    assert "target" in schema["properties"]
+    assert "prompt" in schema["properties"]
+
+
+def test_trigger_declaration_rejects_an_object_target() -> None:
+    with pytest.raises(ValidationError):
+        TriggerDeclaration.model_validate(
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "target": {"channel": "C0EXAMPLE1"},
+                "prompt": "Post the daily plan.",
+            }
+        )
 
 
 def test_approval_gate_grantable_via_policy_field() -> None:

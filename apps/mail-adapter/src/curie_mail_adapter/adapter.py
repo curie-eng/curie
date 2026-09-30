@@ -14,9 +14,9 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
-from .agentmail import AgentMailClient, request
+from .agentmail import EGRESS_REFUSAL_ERROR, AgentMailClient, request
 from .config import MailAdapterConfig
 from .state import MailState
 
@@ -40,6 +40,26 @@ BACKOFF_MAX_SECONDS = 60.0
 CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
 
+# What one channel port POST settled: admitted, refused for good by the
+# binding's caller list (403, ADR 0175), or left pending for another attempt.
+IngressOutcome = Literal["accepted", "refused", "retry"]
+
+# The exact `detail` the channel port puts on a caller-list refusal. Only a 403
+# carrying it is final: a 403 from a proxy or firewall in front of the platform,
+# or from any other check, is an infrastructure fault and must stay retryable,
+# or real mail would be dropped for good. Frozen with the platform side in
+# `tests/vectors/channel-port-refusal.json`.
+CALLER_NOT_ALLOWED_DETAIL = "caller_not_allowed"
+
+
+def _is_caller_refusal(status: int, body: Any) -> bool:
+    """Whether a channel port answer is the caller-list refusal and nothing else."""
+    return (
+        status == 403
+        and isinstance(body, dict)
+        and body.get("detail") == CALLER_NOT_ALLOWED_DETAIL
+    )
+
 
 def _poll_should_back_off(status: int) -> bool:
     return status == 0 or 400 <= status < 500
@@ -47,6 +67,10 @@ def _poll_should_back_off(status: int) -> bool:
 
 class ProviderThreadDeletedError(RuntimeError):
     """The provider definitively rejected the thread lookup with HTTP 404."""
+
+
+class ProviderEgressRefusedError(RuntimeError):
+    """The outbound AgentMail connection was refused before an HTTP response."""
 
 
 class MailAdapter:
@@ -327,8 +351,9 @@ class MailAdapter:
 
         Status is the gate, not the body's shape. Only a status 0 body is one
         this package synthesized locally: ``agentmail.request`` builds
-        ``{"error": str(exc)}`` for an ``OSError`` and ``{"error": "response
-        body exceeds configured byte limit"}`` for an oversize response, both
+        ``{"error": "connection_refused"}`` for a refused TCP connection,
+        ``{"error": str(exc)}`` for another ``OSError``, and ``{"error": "response
+        body exceeds configured byte limit"}`` for an oversize response, all
         local strings with a shape the adapter can reason about. Every other
         status carries a body the PROVIDER authored - arbitrary, unbounded, and
         able to carry mail content, an upstream stack trace or a page of HTML -
@@ -479,12 +504,22 @@ class MailAdapter:
         )
 
     def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
-        settled = self.post_turn(turn)
-        if settled:
+        outcome = self.post_turn(turn)
+        if outcome == "accepted":
             self.state.accept_ingress(message_id)
-        else:
-            self.state.defer_ingress(message_id, 0.0)
-        return settled
+            return True
+        if outcome == "refused":
+            # ADR 0175: the binding's caller list does not admit this sender.
+            # Final, like the adapter's own sender gate: the message is settled
+            # without a turn and never retried, and the reply slot store_turn
+            # opened is closed first, so a crash between the two steps leaves a
+            # delivery that is retried (and refused again) rather than a live
+            # reply slot for a turn that will never exist.
+            self.state.finish_reply(str(turn["conversation_id"]), str(turn["reply_ref"]))
+            self.state.settle_without_turn(message_id, "rejected")
+            return True
+        self.state.defer_ingress(message_id, 0.0)
+        return False
 
     def provider_authenticated(self, labels: Iterable[str]) -> bool:
         return not set(labels) & REJECTED_LABELS
@@ -500,8 +535,17 @@ class MailAdapter:
                 return True
         return False
 
-    def post_turn(self, turn: dict[str, Any]) -> bool:
-        """Return True only for the platform's terminal 200 admission."""
+    def post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
+        """Post one turn to the channel port and classify the platform's answer.
+
+        Returns:
+            ``"accepted"`` only for the platform's terminal 200 admission;
+            ``"refused"`` for a 403 whose ``detail`` is ``caller_not_allowed``,
+            which the channel port answers when the binding's caller list does
+            not admit the sender (ADR 0175) and which is final for every
+            adapter; ``"retry"`` for everything else, any other 403 included,
+            which leaves the delivery pending under the same stable id.
+        """
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
         headers = {"X-API-Key": self.config.channel_token}
         for attempt in range(1, self.config.ingress_attempts + 1):
@@ -539,17 +583,24 @@ class MailAdapter:
                 _correlation(str(turn["delivery_id"])),
             )
             if result.status == 200:
-                return True
+                return "accepted"
+            if _is_caller_refusal(result.status, result.body):
+                logger.warning(
+                    "ingress refused correlation=%s: the binding's caller list does not "
+                    "admit this sender; settling the message without a turn",
+                    _correlation(str(turn["delivery_id"])),
+                )
+                return "refused"
             if result.status == 429:
                 retry_after = _retry_after_seconds(result.headers)
                 if retry_after > 0:
                     self.shutdown.wait(retry_after)
-            return False
+            return "retry"
         logger.warning(
             "ingress unreachable; correlation=%s remains pending",
             _correlation(str(turn["delivery_id"])),
         )
-        return False
+        return "retry"
 
     # -- egress -------------------------------------------------------------
 
@@ -594,6 +645,12 @@ class MailAdapter:
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
+        if (
+            status == 0
+            and isinstance(thread, dict)
+            and thread.get("error") == EGRESS_REFUSAL_ERROR
+        ):
+            raise ProviderEgressRefusedError
         if status == 404:
             # Only the PROVIDER's own answer is deletion. `request` parses a JSON
             # body and hands back the raw text when it is not JSON, so a 404
@@ -622,8 +679,15 @@ class MailAdapter:
                     return True
         return False
 
-    def send_reply(self, event_id: str, conversation_id: str, reply_ref: str | None) -> int:
-        """Apply the provider-witness four-way recovery decision."""
+    def send_reply(
+        self,
+        event_id: str,
+        conversation_id: str,
+        reply_ref: str | None,
+        *,
+        outcome: str = "delivered",
+    ) -> int:
+        """Apply the provider witness recovery decision."""
         if not reply_ref:
             logger.info(
                 "reply skipped: correlation=%s carries no reply_ref",
@@ -638,8 +702,29 @@ class MailAdapter:
         if claim == "busy":
             return 503
         try:
+            if outcome == "dropped":
+                exists, text = self.state.reply_text(conversation_id, reply_ref)
+                if not text:
+                    # A turn dropped before it said anything owes its sender no
+                    # mail; the empty-reply notice would be a new message, and
+                    # from a sibling inbox the next turn of the exchange the
+                    # drop ended (ADR-0168 decision 6).
+                    self.state.finish_event(event_id)
+                    if exists:
+                        self.state.finish_reply(conversation_id, reply_ref)
+                    logger.info(
+                        "reply skipped: dropped correlation=%s recorded no text",
+                        _correlation(event_id),
+                    )
+                    return 200
             try:
                 carries = self.thread_carries(conversation_id, event_id)
+            except ProviderEgressRefusedError:
+                logger.warning(
+                    "provider egress connection refused during thread witness; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 424
             except ProviderThreadDeletedError:
                 exists, _text = self.state.reply_text(conversation_id, reply_ref)
                 if not exists:
@@ -670,7 +755,17 @@ class MailAdapter:
                     _correlation(event_id),
                 )
                 return 502
-            status, _out = self.client.reply(reply_ref, body)
+            status, response = self.client.reply(reply_ref, body)
+            if (
+                status == 0
+                and isinstance(response, dict)
+                and response.get("error") == EGRESS_REFUSAL_ERROR
+            ):
+                logger.warning(
+                    "provider egress connection refused during send; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 424
             if 200 <= status < 300:
                 self.state.finish_event(event_id)
                 if exists:

@@ -172,6 +172,9 @@ fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
+        }
     }
 }
 
@@ -319,7 +322,7 @@ async fn routes_from_builds_the_strict_split_route_shape() {
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
             let binding = &routes["deal_desk"];
-            assert_eq!(binding.resolution.address, "C0EXAMPLE1");
+            assert_eq!(binding.resolution.describe(), "slack:C0EXAMPLE1");
             assert_eq!(
                 binding
                     .notification
@@ -340,6 +343,9 @@ async fn routes_from_builds_the_strict_split_route_shape() {
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
+        }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
         }
     }
 }
@@ -425,7 +431,7 @@ async fn route_approvers_narrows_who_without_moving_where() {
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
             let binding = &routes["finance"];
-            assert_eq!(binding.resolution.address, "C0EXAMPLE3");
+            assert_eq!(binding.resolution.describe(), "slack:C0EXAMPLE3");
             assert_eq!(
                 binding.approvers.as_ref().and_then(|a| a.group.as_deref()),
                 Some("S0FINGRP0")
@@ -442,6 +448,9 @@ async fn route_approvers_narrows_who_without_moving_where() {
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
+        }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
         }
     }
 }
@@ -491,7 +500,10 @@ async fn list_routes_reads_without_writing() {
     match out {
         ApprovalsOutput::Routes { agent, routes } => {
             assert_eq!(agent, "deal-desk");
-            assert_eq!(routes["deal_desk"].resolution.address, "C0EXAMPLE1");
+            assert_eq!(
+                routes["deal_desk"].resolution.describe(),
+                "slack:C0EXAMPLE1"
+            );
         }
         ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
         ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
@@ -504,6 +516,9 @@ async fn list_routes_reads_without_writing() {
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
+        }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
         }
     }
 }
@@ -662,6 +677,9 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
             }
             ApprovalsOutput::ConsoleLoginCode { .. } => {
                 panic!("expected the DryRun output, not a console login-code mint")
+            }
+            ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+                panic!("expected the DryRun output, not an administrative recovery result")
             }
         }
     };
@@ -1106,6 +1124,9 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
+        }
     }
 }
 
@@ -1166,4 +1187,95 @@ async fn a_routes_file_without_a_channel_writes_nothing() {
         "the error must identify the required field: {err}"
     );
     assert_no_write(&server);
+}
+
+// --- ADR-0177: a route may show its card where the request was asked ---------
+
+#[tokio::test]
+async fn routes_from_forwards_the_requesting_surface_mode_and_lists_it_back() {
+    let bound = r#"{"confirm":{"resolution":{"mode":"requesting_surface"}}}"#;
+    let server = stub(bound, bound);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, bound).expect("write routes file");
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a requesting_surface route should be written");
+
+    let body = patch_body(&server);
+    assert_eq!(
+        body["approval_routes"]["confirm"],
+        serde_json::json!({"resolution": {"mode": "requesting_surface"}}),
+        "the PATCH must carry the mode alone, got {body:?}"
+    );
+    let json = out.to_json();
+    assert_eq!(
+        json["routes"]["confirm"]["resolution"],
+        serde_json::json!({"mode": "requesting_surface"}),
+        "the read-back must keep the mode, got {json:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_with_a_requesting_surface_route_still_lists() {
+    // An older CLI that decoded only {kind, address} would fail to read this
+    // agent at all; the read model must decode both forms.
+    let bound = r#"{"confirm":{"resolution":{"mode":"requesting_surface"},"notification":null},"fixed":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#;
+    let server = stub(bound, bound);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            list_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("--list-routes should read a requesting_surface route");
+
+    assert_no_write(&server);
+    match out {
+        ApprovalsOutput::Routes { routes, .. } => {
+            assert_eq!(
+                routes["confirm"].resolution.describe(),
+                "requesting_surface"
+            );
+            assert_eq!(routes["fixed"].resolution.describe(), "slack:C0EXAMPLE1");
+        }
+        _ => panic!("expected the Routes output"),
+    }
+}
+
+#[tokio::test]
+async fn a_requesting_surface_route_refuses_a_notification_an_unknown_mode_and_a_mix() {
+    for (route, expected) in [
+        (
+            serde_json::json!({"confirm": {
+                "resolution": {"mode": "requesting_surface"},
+                "notification": {"kind": "slack", "address": "C0EXAMPLE2"}
+            }}),
+            "cannot carry a notification",
+        ),
+        (
+            serde_json::json!({"confirm": {"resolution": {"mode": "anywhere"}}}),
+            "resolution mode \"anywhere\" is unsupported",
+        ),
+        (
+            serde_json::json!({"confirm": {"resolution": {
+                "mode": "requesting_surface", "kind": "slack", "address": "C0EXAMPLE1"
+            }}}),
+            "did not match any variant",
+        ),
+    ] {
+        let message = rejected_routes_file(route, expected).await;
+        assert!(message.contains("confirm"), "{expected}: {message}");
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
 }

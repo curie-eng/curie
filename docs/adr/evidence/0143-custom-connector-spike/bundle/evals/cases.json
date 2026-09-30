@@ -1,0 +1,15 @@
+{
+  "name": "stubfin-bot",
+  "cases": [
+    {
+      "id": "lists-invoices-through-the-connector",
+      "input": "List the invoices for 2026-Q2 and total them.",
+      "grader": {
+        "kind": "regex",
+        "expected": "INV-2026-04[123]",
+        "case_sensitive": false
+      },
+      "note": "Passes only if a figure the connector returned appears in the reply; the invoice ids exist nowhere but the stub API."
+    }
+  ]
+}

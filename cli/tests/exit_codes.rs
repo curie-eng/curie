@@ -115,6 +115,40 @@ fn run_skill_up_with_path(debug: bool, path: &Path, name: &str) -> Output {
         .expect("run skill up")
 }
 
+fn run_installation_command(
+    cwd: &Path,
+    verb: &str,
+    file: &Path,
+    json: bool,
+    debug: bool,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if json {
+        command.arg("--json");
+    }
+    if debug {
+        command.arg("--debug");
+    }
+    command.arg(verb);
+    if verb == "apply" {
+        command.arg("--dry-run");
+    }
+    command
+        .arg("--file")
+        .arg(file)
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|err| panic!("run curie {verb}: {err}"))
+}
+
+fn json_error(output: &Output, label: &str) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!("{label} must emit one JSON error: {err}\nstdout: {stdout}\nstderr: {stderr}")
+    })
+}
+
 fn executable_docker_stub() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create executable directory");
     let docker = dir.path().join("docker");
@@ -241,6 +275,262 @@ fn error_json_fix_is_null_for_plain_error() {
     let value = exit::error_json(&err);
     assert_eq!(value["error"], "kaboom");
     assert!(value["fix"].is_null());
+}
+
+#[test]
+fn apply_and_diff_file_errors_name_the_problem_and_give_a_runnable_fix() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let missing = temp.path().join("missing install.yaml");
+    let unknown = temp.path().join("unknown install.yaml");
+    fs::write(
+        &unknown,
+        "version: 1\ninstall:\n  namespace: x\n  release: x\n  cluster: y\n",
+    )
+    .expect("write installation with an unknown key");
+
+    for (case, file) in [("missing", &missing), ("unknown", &unknown)] {
+        let quoted_file = format!("'{}'", file.display());
+        for verb in ["apply", "diff"] {
+            for json in [false, true] {
+                let label = format!(
+                    "{verb} {case} file in {} mode",
+                    if json { "JSON" } else { "human" }
+                );
+                let output = run_installation_command(temp.path(), verb, file, json, false);
+                assert_eq!(
+                    output.status.code(),
+                    Some(ExitClass::Usage.code()),
+                    "{label} must be a deterministic input error"
+                );
+
+                let (message, fix) = if json {
+                    let payload = json_error(&output, &label);
+                    (
+                        payload["error"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("{label} must carry an error: {payload}"))
+                            .to_string(),
+                        payload["fix"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("{label} must carry a fix: {payload}"))
+                            .to_string(),
+                    )
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    (
+                        single_line_with_prefix(&stderr, "Error: ")
+                            .trim_start_matches("Error: ")
+                            .to_string(),
+                        single_line_with_prefix(&stderr, "Fix: ")
+                            .trim_start_matches("Fix: ")
+                            .to_string(),
+                    )
+                };
+
+                assert!(
+                    message.contains(&file.display().to_string()),
+                    "{label} must name the selected file: {message}"
+                );
+                assert!(
+                    fix.contains(&quoted_file),
+                    "{label} must shell quote the selected file in its runnable fix: {fix}"
+                );
+                assert!(!fix.trim().is_empty(), "{label} must carry a usable fix");
+
+                match case {
+                    "missing" => {
+                        assert!(
+                            message.contains("not found"),
+                            "{label} must distinguish a missing file: {message}"
+                        );
+                        assert!(
+                            !message.contains("No such file or directory")
+                                && !message.contains("os error"),
+                            "{label} must hide the raw operating system error: {message}"
+                        );
+                    }
+                    "unknown" => {
+                        assert!(
+                            message.contains("cluster")
+                                && message.contains("line 5")
+                                && message.contains("column 3"),
+                            "{label} must name the key and exact YAML location: {message}"
+                        );
+                        assert_eq!(
+                            message.matches("cluster").count(),
+                            1,
+                            "{label} must not duplicate the parser cause: {message}"
+                        );
+                        assert!(
+                            message.matches(": ").count() <= 1,
+                            "{label} must render one operator sentence: {message}"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn installation_file_debug_output_retains_read_and_parse_causes() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let missing = temp.path().join("missing.yaml");
+    let unknown = temp.path().join("unknown.yaml");
+    fs::write(
+        &unknown,
+        "version: 1\ninstall:\n  namespace: x\n  release: x\n  cluster: y\n",
+    )
+    .expect("write installation with an unknown key");
+
+    let missing_output = run_installation_command(temp.path(), "apply", &missing, false, true);
+    let missing_stderr = String::from_utf8_lossy(&missing_output.stderr);
+    assert!(
+        missing_stderr.contains("No such file or directory"),
+        "debug output must retain the read cause: {missing_stderr}"
+    );
+
+    let unknown_output = run_installation_command(temp.path(), "diff", &unknown, false, true);
+    let unknown_stderr = String::from_utf8_lossy(&unknown_output.stderr);
+    assert!(
+        unknown_stderr.contains("unknown field `cluster`")
+            && unknown_stderr.contains("line 5 column 3"),
+        "debug output must retain the serde cause: {unknown_stderr}"
+    );
+}
+
+#[test]
+fn malformed_installation_yaml_names_its_file_and_source_location() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let file = temp.path().join("malformed install.yaml");
+    fs::write(
+        &file,
+        "version: 1\ninstall:\n  namespace: \"unterminated\n  release: x\n",
+    )
+    .expect("write malformed installation");
+
+    let output = run_installation_command(temp.path(), "apply", &file, true, false);
+    assert_eq!(output.status.code(), Some(ExitClass::Usage.code()));
+    let payload = json_error(&output, "malformed apply");
+    let message = payload["error"].as_str().expect("malformed error message");
+    let fix = payload["fix"].as_str().expect("malformed error fix");
+    assert!(
+        message.contains(&file.display().to_string())
+            && message.contains("line ")
+            && message.contains("column "),
+        "malformed YAML must name its file and parser location: {message}"
+    );
+    assert!(
+        fix.contains(&format!("'{}'", file.display())),
+        "malformed YAML must give a shell safe edit command: {fix}"
+    );
+}
+
+#[test]
+fn wrong_typed_installation_value_preserves_the_parser_key() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let file = temp.path().join("wrong type.yaml");
+    fs::write(
+        &file,
+        "version: 1\ninstall:\n  namespace: [x]\n  release: x\n",
+    )
+    .expect("write installation with wrong value type");
+
+    let output = run_installation_command(temp.path(), "diff", &file, false, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(ExitClass::Usage.code()));
+    let message = single_line_with_prefix(&stderr, "Error: ");
+    assert!(
+        message.contains(&file.display().to_string())
+            && message.contains("install.namespace")
+            && message.contains("line ")
+            && message.contains("column "),
+        "a typed parser error must retain its field path and location: {stderr}"
+    );
+    single_line_with_prefix(&stderr, "Fix: ");
+}
+
+#[test]
+fn a_directory_is_reported_as_an_unreadable_installation_file() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let file = temp.path().join("directory instead of file");
+    fs::create_dir(&file).expect("create directory at installation path");
+
+    let output = run_installation_command(temp.path(), "diff", &file, false, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(ExitClass::Failure.code()));
+    let message = single_line_with_prefix(&stderr, "Error: ");
+    let fix = single_line_with_prefix(&stderr, "Fix: ");
+    assert!(
+        message.contains("could not be read") && message.contains(&file.display().to_string()),
+        "a nonfile path must receive an accurate read diagnosis: {stderr}"
+    );
+    assert!(
+        !message.contains("Is a directory") && !message.contains("os error"),
+        "normal output must hide the raw read cause: {stderr}"
+    );
+    assert!(
+        fix.contains(&format!("'{}'", file.display())),
+        "the read remedy must shell quote the selected path: {stderr}"
+    );
+
+    let json_output = run_installation_command(temp.path(), "diff", &file, true, false);
+    assert_eq!(json_output.status.code(), Some(ExitClass::Failure.code()));
+    let payload = json_error(&json_output, "unreadable directory");
+    let json_fix = payload["fix"]
+        .as_str()
+        .expect("an unreadable path must carry a JSON fix");
+    assert!(
+        json_fix.contains(&format!("'{}'", file.display())),
+        "the JSON read remedy must shell quote the selected path: {payload}"
+    );
+}
+
+#[test]
+fn installation_load_still_accepts_a_valid_file() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let file = temp.path().join("valid.yaml");
+    fs::write(
+        &file,
+        "version: 1\ninstall:\n  namespace: x\n  release: x\n",
+    )
+    .expect("write valid installation");
+
+    let loaded = curie::installation::Installation::load(&file)
+        .expect("a valid installation file must still load");
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.install.namespace, "x");
+    assert_eq!(loaded.install.release, "x");
+}
+
+#[test]
+fn installation_load_preserves_typed_validation_class_and_fix() {
+    let temp = tempfile::tempdir().expect("create installation directory");
+    let file = temp.path().join("typed validation.yaml");
+    fs::write(
+        &file,
+        "version: 1\ninstall:\n  namespace: x\n  release: x\nplatform:\n  inference: true\n",
+    )
+    .expect("write semantically invalid installation");
+
+    let err = curie::installation::Installation::load(&file)
+        .expect_err("an incomplete inference policy must fail validation");
+    let (class, fix) = exit::classify(&err);
+    let (message, presented_fix) = exit::present_error(&err);
+    assert_eq!(class, ExitClass::Usage);
+    assert_eq!(fix, presented_fix);
+    let fix = fix.expect("typed validation must retain its actionable fix");
+    for choice in ["inference_persistence: true", "inference_pull_model: false"] {
+        assert!(
+            message.contains(choice) || fix.contains(choice),
+            "typed validation must retain recovery choice {choice}: {message}; {fix}"
+        );
+    }
+    assert!(
+        !message.contains("line ") && !message.contains("column "),
+        "semantic validation must not invent a parser location: {message}"
+    );
 }
 
 #[test]

@@ -44,6 +44,59 @@ def _objs(
     )
 
 
+_VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
+_DERIVED_BEARER = json.loads(
+    (_VECTORS / "connector-derived-bearer.json").read_text(encoding="utf-8")
+)
+_DERIVED_BEARER_KEYS = {"name", "why", "document", "expected_name"}
+
+
+def test_shipped_sre_bot_connector_names_and_secret_refs_match_renderer() -> None:
+    root = Path(__file__).resolve().parents[3]
+    bundle = root / "examples" / "sre-bot"
+    connectors_data = yaml.safe_load((bundle / "connectors.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load(
+        (bundle / "observability" / "curie-values.yaml").read_text(encoding="utf-8")
+    )
+    parsed, errors = validate_connectors(connectors_data)
+    assert errors == []
+    assert parsed is not None
+
+    connector_names = ("grafana", "tempo")
+    grafana_values = values["grafanaConnector"]
+    expected_names = {r.object_name("curie", "sre-bot", name) for name in connector_names}
+    assert set(grafana_values["restartDeploymentNames"]) == expected_names
+
+    for name in connector_names:
+        spec = parsed.connectors[name]
+        expected_name = r.object_name("curie", "sre-bot", name)
+        secret_refs = [item for item in spec.secrets if isinstance(item, SecretRef)]
+        assert len(secret_refs) == 1
+        secret_ref = secret_refs[0]
+        assert secret_ref.from_secret == grafana_values["secretName"]
+        assert secret_ref.secret_key() == grafana_values["secretKey"]
+
+        deployment = r.render_deployment(
+            "curie",
+            "sre-bot",
+            "curie",
+            name,
+            spec.model_copy(update={"image": "example.invalid/mcp:unit"}),
+            grafana_values["secretName"],
+        )
+        assert deployment["metadata"]["name"] == expected_name
+        entry = next(
+            item
+            for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            if item["name"] == grafana_values["secretKey"]
+        )
+        assert entry["valueFrom"]["secretKeyRef"] == {
+            "name": grafana_values["secretName"],
+            "key": grafana_values["secretKey"],
+            "optional": False,
+        }
+
+
 # Two NetworkPolicies ship per connector now, so selecting "the NetworkPolicy"
 # by kind picks whichever happens to be first and silently tests the wrong
 # object. Select by direction.
@@ -770,6 +823,31 @@ def test_a_hosted_connector_with_a_fallback_is_reachable_where_it_cannot_be_host
     }
 
 
+def test_the_fallback_derives_the_bearer_header_the_tier_now_stages() -> None:
+    # #2518: skill and local stage the Bearer secret into the runner env, so the
+    # fallback carries the same derived header `mcp_entry` does on a cluster.
+    spec = ConnectorSpec(
+        image="x:1", secrets=["GH_PAT"], unhosted_url="http://host.docker.internal:8765/mcp"
+    )
+    assert r.unhosted_mcp_entry(spec) == {
+        "type": "http",
+        "url": "http://host.docker.internal:8765/mcp",
+        "headers": {"Authorization": "Bearer ${GH_PAT}"},
+    }
+
+
+def test_the_fallback_honors_an_explicit_bearer_secret() -> None:
+    spec = ConnectorSpec(
+        image="x:1",
+        secrets=["A", "B"],
+        bearer_secret="B",
+        unhosted_url="http://host.docker.internal:8765/mcp",
+    )
+    entry = r.unhosted_mcp_entry(spec)
+    assert entry is not None
+    assert entry["headers"] == {"Authorization": "Bearer ${B}"}
+
+
 def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_url() -> None:
     # None is a real answer: "declared but not exercisable here" (#1093). A URL
     # that resolves nowhere would turn that into a connection refused mid-turn.
@@ -1477,9 +1555,9 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
 # <PAT>` on every request, and an unauthenticated `GET /mcp` is a 401. Until
 # now the hosted entry carried a URL and nothing else, so the probe failed and
 # the agent simply listed no `mcp__github__*` tools -- a silent no-tools, not
-# an error. The header is DERIVED from ``bearer_secret`` (or the single
-# declared secret) for the same reason the URL is derived (ADR-0086): the
-# author writes neither.
+# an error. The header is DERIVED from ``bearer_secret`` or one plain string
+# secret for the same reason the URL is derived (ADR-0086): the author writes
+# neither.
 # --------------------------------------------------------------------------- #
 GITHUB = ConnectorSpec(
     image="ghcr.io/github/github-mcp-server:v0.20.1",
@@ -1502,16 +1580,29 @@ def test_a_hosted_connector_carries_a_bearer_header_for_its_declared_secret() ->
     )
 
 
-def test_a_secret_ref_contributes_its_env_var_name_not_the_secret_it_points_at() -> None:
-    # `secrets:` is `list[str | SecretRef]`. The header names the ENV VAR the
-    # MCP client expands, which for a SecretRef is `.name` -- `from_secret` is
-    # a Kubernetes Secret name and would expand to nothing in the sandbox.
+def test_an_implicit_secret_ref_stays_in_the_connector_pod() -> None:
+    # A SecretRef is delivered only to the connector pod. Its value does not
+    # exist in the sandbox, so an implicit Bearer placeholder would make the
+    # runner report a missing credential and hide the connector tools.
     spec = ConnectorSpec(
         image="ghcr.io/github/github-mcp-server:v0.20.1",
-        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+        secrets=[
+            SecretRef(
+                name="GITHUB_PERSONAL_ACCESS_TOKEN",
+                from_secret="gh-pat",
+                key="token",
+            )
+        ],
     )
-    assert _github_entry(spec)["headers"] == {
-        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert "headers" not in _github_entry(spec)
+
+    deployment = next(obj for obj in _objs(spec=spec) if obj["kind"] == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    credential = next(item for item in env if item["name"] == "GITHUB_PERSONAL_ACCESS_TOKEN")
+    assert credential["valueFrom"]["secretKeyRef"] == {
+        "name": "gh-pat",
+        "key": "token",
+        "optional": False,
     }
 
 
@@ -1562,6 +1653,17 @@ def test_bearer_secret_names_the_header_when_several_secrets_are_declared() -> N
     }
 
 
+def test_an_explicit_secret_ref_bearer_keeps_its_header() -> None:
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+        bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
 def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret() -> None:
     # The github-mcp-server shape. Requiring the new field on every existing
     # one-secret bundle would be a break for no security gain: there is only
@@ -1574,3 +1676,357 @@ def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret
     assert _github_entry(spec)["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
+
+
+def test_derived_bearer_vector_keys_are_known() -> None:
+    # A key added for the Rust lane alone would pass vacuously here.
+    assert set(_DERIVED_BEARER) == {"comment", "vectors"}
+    for vector in _DERIVED_BEARER["vectors"]:
+        assert set(vector) == _DERIVED_BEARER_KEYS, vector["name"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    _DERIVED_BEARER["vectors"],
+    ids=lambda v: v["name"],
+)
+def test_derived_bearer_header_matches_the_frozen_vector(vector: dict) -> None:
+    # Cross-language pin: the renderer and the CLI bearer_secret_name helper
+    # must name the same secret, including the SecretRef case that used to
+    # diverge.
+    connectors = vector["document"]["connectors"]
+    assert list(connectors) == ["gh"], vector["name"]
+    spec = ConnectorSpec.model_validate(connectors["gh"])
+    entry = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "gh", spec)
+    authorization = (entry.get("headers") or {}).get("Authorization")
+    expected = vector["expected_name"]
+    if expected is None:
+        assert authorization is None, vector["name"]
+    else:
+        assert authorization == f"Bearer ${{{expected}}}", vector["name"]
+
+
+# ADR-0168 decision 7: the caller proxy. The keys are the public halves frozen
+# in tests/vectors/connector-caller-token.json.
+_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+_CALLER_PREVIOUS = "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+
+
+def _proxy(*keys: str) -> r.ConnectorProxy:
+    # Built per test, not at import, so a missing ConnectorProxy fails these
+    # tests alone and leaves the rest of the module collecting.
+    return r.ConnectorProxy(image=_PROXY_IMAGE, public_keys=keys or (_CALLER_PUBLIC,))
+
+
+def _by_kind(objs: list[dict]) -> dict[str, dict]:
+    keyed: dict[str, dict] = {}
+    for obj in objs:
+        key = obj["kind"]
+        if key == "NetworkPolicy":
+            key = f"{key}/{obj['spec']['policyTypes'][0]}"
+        # The Service named after the connector is the one the sandbox dials;
+        # any other Service selecting the same pods is the direct one.
+        if key == "Service" and (
+            obj["metadata"]["name"] != obj["metadata"]["labels"]["app.kubernetes.io/name"]
+        ):
+            key = "Service/direct"
+        assert key not in keyed, key
+        keyed[key] = obj
+    return keyed
+
+
+def _proxied(
+    spec: ConnectorSpec = HOSTED, proxy: r.ConnectorProxy | None = None
+) -> dict[str, dict]:
+    return _by_kind(
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="grafana",
+            spec=spec,
+            secret_name="conn-secrets",
+            proxy=proxy or _proxy(),
+        )
+    )
+
+
+def _containers(objs: dict[str, dict]) -> dict[str, dict]:
+    pod = objs["Deployment"]["spec"]["template"]["spec"]
+    return {c["name"]: c for c in pod["containers"]}
+
+
+def _proxy_env(objs: dict[str, dict]) -> dict[str, str]:
+    return {e["name"]: e["value"] for e in _containers(objs)[r.CALLER_PROXY_CONTAINER]["env"]}
+
+
+def _policy_ports(objs: dict[str, dict]) -> list[int]:
+    ports: list[int] = []
+    for key in ("NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        rules = objs[key]["spec"].get("egress") or objs[key]["spec"].get("ingress")
+        ports.extend(p["port"] for rule in rules for p in rule["ports"])
+    return ports
+
+
+# @spec ADR-0168 d7
+def test_without_a_proxy_a_connector_renders_as_it_did() -> None:
+    objs = _by_kind(_objs())
+    assert list(_containers(objs)) == ["server"]
+    assert objs["Service"]["spec"]["ports"] == [
+        {"name": "http", "port": HOSTED.port, "targetPort": "http"}
+    ]
+    assert _policy_ports(objs) == [HOSTED.port, HOSTED.port]
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_fronts_the_server_and_nothing_rendered_opens_the_server_port() -> None:
+    objs = _proxied()
+    containers = _containers(objs)
+    assert list(containers) == ["server", r.CALLER_PROXY_CONTAINER]
+    assert containers["server"]["ports"] == [{"name": "http", "containerPort": HOSTED.port}]
+    assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
+        {"name": "caller", "containerPort": r.CALLER_PROXY_PORT}
+    ]
+    # The sandbox keeps dialling spec.port, so the URL and the allowed hosts
+    # stay; the Service lands it on the proxy.
+    assert objs["Service"]["spec"]["ports"] == [
+        {"name": "http", "port": HOSTED.port, "targetPort": "caller"}
+    ]
+    # Both policies, not only the ingress one: each matches the pod port after
+    # the Service DNAT, so an egress rule left on spec.port drops every call.
+    assert _policy_ports(objs) == [r.CALLER_PROXY_PORT, r.CALLER_PROXY_PORT]
+    assert HOSTED.port not in _policy_ports(objs)
+
+
+# @spec ADR-0168 d7
+def test_the_proxy_is_told_the_server_port_the_keys_and_its_own_port() -> None:
+    objs = _proxied(proxy=_proxy(_CALLER_PUBLIC, _CALLER_PREVIOUS))
+    container = _containers(objs)[r.CALLER_PROXY_CONTAINER]
+    assert container["image"] == _PROXY_IMAGE
+    assert container["command"] == ["python", "-m", "curie_connector_proxy"]
+    env = _proxy_env(objs)
+    assert env["CURIE_CALLER_PROXY_PORT"] == str(r.CALLER_PROXY_PORT)
+    assert env["CURIE_CALLER_PROXY_UPSTREAM_PORT"] == str(HOSTED.port)
+    assert env["CURIE_CALLER_PROXY_PUBLIC_KEYS"] == f"{_CALLER_PUBLIC},{_CALLER_PREVIOUS}"
+    assert "valueFrom" not in json.dumps(container["env"])
+
+
+def test_the_proxy_is_hardened_like_the_server() -> None:
+    containers = _containers(_proxied())
+    proxy, server = containers[r.CALLER_PROXY_CONTAINER], containers["server"]
+    assert proxy["securityContext"] == server["securityContext"]
+    assert proxy["resources"] == {
+        "requests": {"cpu": "10m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "128Mi"},
+    }
+
+
+# @spec ADR-0168 d7
+@pytest.mark.parametrize(
+    ("admits", "rendered"),
+    [
+        (None, ["acme-bot"]),
+        ([], []),
+        (["self"], ["acme-bot"]),
+        (["self", "acme-bot"], ["acme-bot"]),
+        (["acme-bot", "self"], ["acme-bot"]),
+        (["self", "other-agent"], ["acme-bot", "other-agent"]),
+        (["other-agent"], ["other-agent"]),
+    ],
+)
+def test_admits_renders_with_self_resolved_to_the_deploying_agent(
+    admits: list[str] | None, rendered: list[str]
+) -> None:
+    spec = HOSTED.model_copy(update={"admits": admits})
+    assert r.resolved_admits(spec, "acme-bot") == rendered
+    assert json.loads(_proxy_env(_proxied(spec))["CURIE_CALLER_PROXY_ADMITS"]) == rendered
+
+
+# @spec ADR-0168 d7
+def test_a_server_on_the_proxy_port_moves_the_proxy_not_the_server() -> None:
+    spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
+    objs = _proxied(spec)
+    containers = _containers(objs)
+    assert containers["server"]["ports"] == [
+        {"name": "http", "containerPort": r.CALLER_PROXY_PORT}
+    ]
+    assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
+        {"name": "caller", "containerPort": r.CALLER_PROXY_ALTERNATE_PORT}
+    ]
+    assert _proxy_env(objs)["CURIE_CALLER_PROXY_UPSTREAM_PORT"] == str(r.CALLER_PROXY_PORT)
+    assert _policy_ports(objs) == [r.CALLER_PROXY_ALTERNATE_PORT, r.CALLER_PROXY_ALTERNATE_PORT]
+
+
+def test_a_remote_connector_renders_no_proxy() -> None:
+    assert (
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="internal",
+            spec=REMOTE,
+            secret_name="conn-secrets",
+            proxy=_proxy(),
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("image", "keys"),
+    [
+        ("", (_CALLER_PUBLIC,)),
+        (_PROXY_IMAGE, ()),
+        (_PROXY_IMAGE, ("not base64!",)),
+        (_PROXY_IMAGE, ("c2hvcnQ=",)),
+        (_PROXY_IMAGE, (_CALLER_PUBLIC.replace("/", "_"),)),
+    ],
+)
+def test_a_proxy_without_an_image_or_a_usable_key_is_refused(
+    image: str, keys: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValueError):
+        r.ConnectorProxy(image=image, public_keys=keys)
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_not_agents() -> (
+    None
+):
+    objs = _proxied()
+    direct = objs["Service/direct"]
+    assert direct["metadata"]["name"] == "acme-rel-acme-bot-mcp-grafana-direct"
+    assert direct["metadata"]["name"] == r.direct_service_name("acme-rel", "acme-bot", "grafana")
+    assert direct["metadata"]["labels"] == objs["Service"]["metadata"]["labels"]
+    # The same pods as the connector Service, landing on the server itself.
+    assert direct["spec"]["selector"] == objs["Service"]["spec"]["selector"]
+    assert direct["spec"]["type"] == "ClusterIP"
+    assert direct["spec"]["ports"] == [{"name": "http", "port": HOSTED.port, "targetPort": "http"}]
+    # Nothing rendered opens that port: only an operator-applied peer-ingress
+    # policy naming spec.port lets a caller through it.
+    assert HOSTED.port not in _policy_ports(objs)
+
+
+# @spec ADR-0168 d7
+def test_without_a_proxy_there_is_no_direct_service() -> None:
+    assert [o["metadata"]["name"] for o in _objs() if o["kind"] == "Service"] == [
+        r.object_name("acme-bot", "acme-bot", "grafana")
+    ]
+
+
+# @spec ADR-0168 d7
+def test_a_server_on_the_proxy_port_keeps_its_direct_service_on_that_port() -> None:
+    spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
+    direct = _proxied(spec)["Service/direct"]
+    assert direct["spec"]["ports"] == [
+        {"name": "http", "port": r.CALLER_PROXY_PORT, "targetPort": "http"}
+    ]
+
+
+# @spec ADR-0168 d7
+def test_a_long_direct_service_name_is_still_a_dns_label_and_still_distinct() -> None:
+    release, agent = "a-release-name-that-is-long", "an-agent-name-that-is-long"
+    names = {
+        connector: r.direct_service_name(release, agent, connector)
+        for connector in ("connector-one", "connector-two", "c")
+    }
+    for connector, name in names.items():
+        assert len(name) <= 63, name
+        assert name.endswith("-direct"), name
+        assert name != r.object_name(release, agent, connector)
+        assert name == r.direct_service_name(release, agent, connector)
+    assert len(set(names.values())) == len(names)
+
+
+def _pull_proxy(**pull: object) -> r.ConnectorProxy:
+    return r.ConnectorProxy(image=_PROXY_IMAGE, public_keys=(_CALLER_PUBLIC,), **pull)
+
+
+# @spec ADR-0168 d7
+def test_the_proxy_pulls_with_the_worker_pull_secrets_and_policy() -> None:
+    objs = _proxied(
+        proxy=_pull_proxy(pull_policy="Always", pull_secrets=("ghcr-pull", "mirror-pull"))
+    )
+    pod = objs["Deployment"]["spec"]["template"]["spec"]
+    assert pod["imagePullSecrets"] == [{"name": "ghcr-pull"}, {"name": "mirror-pull"}]
+    containers = _containers(objs)
+    assert containers[r.CALLER_PROXY_CONTAINER]["imagePullPolicy"] == "Always"
+    # The server's pull policy stays what it was: the cluster default.
+    assert "imagePullPolicy" not in containers["server"]
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_with_no_pull_settings_renders_none() -> None:
+    objs = _proxied()
+    assert "imagePullSecrets" not in objs["Deployment"]["spec"]["template"]["spec"]
+    assert "imagePullPolicy" not in _containers(objs)[r.CALLER_PROXY_CONTAINER]
+
+
+@pytest.mark.parametrize(
+    "pull",
+    [{"pull_policy": "Sometimes"}, {"pull_secrets": ("",)}, {"pull_secrets": ("Not_A_Name",)}],
+)
+def test_a_proxy_with_an_unusable_pull_setting_is_refused(pull: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        _pull_proxy(**pull)
+
+
+# -- readiness (#3058) --------------------------------------------------------
+
+
+def _server(spec: ConnectorSpec) -> dict:
+    (dep,) = [o for o in _objs(spec=spec) if o["kind"] == "Deployment"]
+    (container,) = dep["spec"]["template"]["spec"]["containers"]
+    return container
+
+
+def test_connector_gets_a_tcp_readiness_probe_on_its_own_port() -> None:
+    # A server that never binds (the `sleep infinity` break test) stayed
+    # 1/1 Available because Ready meant only "the process started".
+    container = _server(HOSTED)
+    probe = container["readinessProbe"]
+    assert probe["tcpSocket"] == {"port": "http"}
+    assert "httpGet" not in probe
+    # "http" must name the port the server actually listens on.
+    assert {"name": "http", "containerPort": HOSTED.port} in container["ports"]
+    moved = _server(HOSTED.model_copy(update={"port": 9100}))
+    assert moved["readinessProbe"]["tcpSocket"] == {"port": "http"}
+    assert {"name": "http", "containerPort": 9100} in moved["ports"]
+
+
+def test_connector_never_gets_a_liveness_or_startup_probe() -> None:
+    # A slow upstream must leave the Service, not be restarted in a loop.
+    for spec in (HOSTED, HOSTED.model_copy(update={"port": 9100})):
+        container = _server(spec)
+        assert "livenessProbe" not in container
+        assert "startupProbe" not in container
+
+
+def test_every_shipped_sre_bot_connector_renders_a_readiness_probe() -> None:
+    root = Path(__file__).resolve().parents[3]
+    data = yaml.safe_load((root / "examples" / "sre-bot" / "connectors.yaml").read_text())
+    parsed, errors = validate_connectors(data)
+    assert errors == [] and parsed is not None
+    hosted = {n: s for n, s in parsed.connectors.items() if s.is_hosted}
+    assert {"kubernetes", "grafana", "tempo"} <= set(hosted)
+    for name, spec in hosted.items():
+        dep = r.render_deployment("curie", "sre-bot", "curie", name, spec, "s")
+        (container,) = dep["spec"]["template"]["spec"]["containers"]
+        assert "readinessProbe" in container, name
+
+
+# @spec ADR-0168 d7
+def test_a_proxied_connector_is_ready_only_when_its_proxy_accepts() -> None:
+    # The Service targets the proxy's port, so a proxy that never binds must
+    # take the pod out of the Service the way a server that never binds does.
+    for spec in (HOSTED, HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})):
+        containers = _containers(_proxied(spec))
+        proxy = containers[r.CALLER_PROXY_CONTAINER]
+        assert proxy["readinessProbe"]["tcpSocket"] == {"port": "caller"}
+        assert {"name": "caller", "containerPort": r.caller_proxy_port(spec)} in proxy["ports"]
+        assert "livenessProbe" not in proxy
+        assert "startupProbe" not in proxy
+        assert containers["server"]["readinessProbe"]["tcpSocket"] == {"port": "http"}

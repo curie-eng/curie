@@ -776,7 +776,35 @@ pub(crate) fn mail_probe_is_gated_off(computed: Option<&serde_json::Value>) -> b
     })
 }
 
-pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
+/// The error for a status run that resolved no Kubernetes context and could reach
+/// neither Helm nor the pod list (#2864). Without a context the failure says nothing
+/// about the release, so it names the missing context and suggests `--context`,
+/// never a mutating `cluster up`.
+fn unresolved_context_error(
+    context_resolved: bool,
+    helm_ok: bool,
+    pods_listed: bool,
+    available: &[String],
+) -> Option<crate::exit::CliError> {
+    if context_resolved || helm_ok || pods_listed {
+        return None;
+    }
+    let names = if available.is_empty() {
+        "(none)".to_string()
+    } else {
+        available.join(", ")
+    };
+    Some(
+        crate::exit::CliError::failure(
+            "no Kubernetes context resolved (the kubeconfig has no current-context) and the cluster could not be reached",
+        )
+        .with_fix(format!(
+            "rerun with an explicit context: `curie cluster --context <name> status`; available contexts: {names}"
+        )),
+    )
+}
+
+pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
         // A dry run makes no cluster call, so the release's fullname cannot be
         // discovered and the chart's no-override rule is the honest best guess.
@@ -912,7 +940,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             }
         }
         crate::worker_claims::ClaimsState::Quiescing { .. }
-        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => {
             unhealthy.push(worker_claims.state.status_diagnosis());
         }
         crate::worker_claims::ClaimsState::Unknown => {
@@ -937,6 +965,12 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
     }
 
+    let context_error = unresolved_context_error(
+        context_resolved,
+        helm_ok,
+        ok,
+        &crate::kube_context::available_contexts(),
+    );
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
@@ -954,6 +988,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         upgrade,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
+    if let Some(error) = context_error {
+        return Err(crate::ui::ui().failed_report(&output, error.into()));
+    }
     if json["healthy"] != true {
         return Err(crate::ui::ui().failed_report(
             &output,
@@ -1486,6 +1523,22 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// Read the manifest Helm retained for one selected revision.
+fn helm_retained_manifest_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("manifest"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("--revision"),
+            plain(revision.to_string()),
+        ],
+    )
+}
+
 /// Read the live Alembic revision from the running API pod before Helm mutates.
 pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
     let deploy = chart_fullname(&o.release).resource("api");
@@ -1648,6 +1701,33 @@ fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
 const LIVE_SCHEMA_PROBE_OVERRIDE_FIX: &str =
     "pass --live-schema-revision <rev> with the live Alembic revision so the schema-window check can run without the API pod";
 
+fn retained_manifest_guidance(
+    common: &CommonOpts,
+    revision: u32,
+    published_head: &str,
+    remediation: Option<&str>,
+) -> String {
+    let inspect = helm_retained_manifest_cmd(common, revision);
+    let raw_rollback = helm_rollback_cmd(common, revision);
+    let remediation = remediation
+        .map(|text| format!(" {text}."))
+        .unwrap_or_default();
+    format!(
+        "inspect `{}`; an absent ConfigMap labeled app.kubernetes.io/component=schema-compat identifies the published artifact with schema head {published_head}.{remediation} Only after accepting the schema risk, the operator owns using `{}` directly outside Curie's guarded rollback",
+        inspect.display(),
+        raw_rollback.display()
+    )
+}
+
+fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &str) -> String {
+    retained_manifest_guidance(
+        common,
+        revision,
+        published_head,
+        Some("repair Helm access or the retained metadata and retry"),
+    )
+}
+
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
     require_on_path("kubectl")?;
     let probe = live_schema_revision_cmd(common);
@@ -1749,11 +1829,88 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
             .into());
         };
-        if let Err(refusal) =
-            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
-        {
+        let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
+            let refusal = crate::schema_window::missing_target_window_refusal(
+                &target_app,
+                &live,
+                &history_apps,
+            );
             return Err(crate::exit::CliError::failure(refusal.message)
                 .with_fix(refusal.fix)
+                .into());
+        };
+        let (resolved_window, published_identity_fix) = if catalog_window
+            .artifact_identity_ambiguous
+        {
+            let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
+            ui.plumbing(&format!("+ {}", manifest_cmd.display()));
+            let (ok, manifest_out, manifest_err) = run_capture(&manifest_cmd).await?;
+            let fix = retained_manifest_fix(
+                &opts.common,
+                choice.to_revision,
+                &catalog_window.schema_head,
+            );
+            if !ok {
+                let detail = crate::schema_window::redact_probe_text(
+                    manifest_err
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or("helm get manifest exited nonzero with no message"),
+                );
+                return Err(crate::exit::CliError::failure(format!(
+                    "refusing rollback to application {target_app}: could not establish the selected artifact identity from its retained manifest: {detail}"
+                ))
+                .with_fix(fix)
+                .into());
+            }
+            match crate::schema_compat::classify_retained_manifest(&manifest_out, &target_app) {
+                Ok(crate::schema_compat::RetainedManifestIdentity::Published) => {
+                    let guidance = retained_manifest_guidance(
+                        &opts.common,
+                        choice.to_revision,
+                        &catalog_window.schema_head,
+                        None,
+                    );
+                    (catalog_window, Some(guidance))
+                }
+                Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) => {
+                    let candidate = crate::schema_window::candidate_window(
+                        &metadata.schema_min,
+                        &metadata.schema_head,
+                    )
+                    .map_err(|error| {
+                        crate::exit::CliError::failure(format!(
+                            "refusing rollback to application {target_app}: {}",
+                            crate::schema_window::redact_probe_text(&error)
+                        ))
+                        .with_fix(fix.clone())
+                    })?;
+                    (candidate, None)
+                }
+                Err(error) => {
+                    return Err(crate::exit::CliError::failure(format!(
+                        "refusing rollback to application {target_app}: could not establish the selected artifact identity: {}",
+                        crate::schema_window::redact_probe_text(&error)
+                    ))
+                    .with_fix(fix)
+                    .into());
+                }
+            }
+        } else {
+            (catalog_window, None)
+        };
+        if let Err(refusal) = crate::schema_window::check_target_schema(
+            &target_app,
+            &resolved_window,
+            &live,
+            &history_apps,
+        ) {
+            let fix = published_identity_fix
+                .map(|identity| format!("{}. {identity}", refusal.fix))
+                .unwrap_or(refusal.fix);
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(fix)
                 .into());
         }
         if opts.live_schema_revision.is_some() {
@@ -2201,42 +2358,41 @@ mod api_key_discovery_tests {
     }
 
     #[test]
-    fn a_failed_lookup_is_unknown_and_never_reads_as_real_slack() {
-        // The distinction that keeps #1030 from returning in another shape. A
-        // kubectl failure is not evidence that the worker talks to real Slack, and
-        // treating it as such posts a real token wherever real Slack is while the
-        // worker edits through a proxy the CLI never saw.
-        assert_eq!(parse_slack_api_base(false, ""), SlackApiBase::Unknown);
-        assert_eq!(
-            parse_slack_api_base(false, "https://proxy.example/api"),
-            SlackApiBase::Unknown
-        );
-    }
-
-    #[test]
-    fn an_empty_successful_lookup_means_real_slack() {
-        // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
-        // non-empty, so a clean empty result is the ordinary case, not a failure.
-        assert_eq!(parse_slack_api_base(true, ""), SlackApiBase::RealSlack);
-        assert_eq!(parse_slack_api_base(true, "  \n "), SlackApiBase::RealSlack);
-    }
-
-    #[test]
-    fn a_configured_base_is_returned_trimmed() {
-        assert_eq!(
-            parse_slack_api_base(true, "  https://proxy.example/api \n"),
-            SlackApiBase::Configured("https://proxy.example/api".to_string())
-        );
-    }
-
-    #[test]
-    fn two_containers_reporting_a_base_is_unknown_not_a_coin_flip() {
-        // Cannot happen in this chart today. If it ever does, picking one half is
-        // exactly the ambiguity this issue is about, so say so instead.
-        assert_eq!(
-            parse_slack_api_base(true, "https://a/api\nhttps://b/api\n"),
-            SlackApiBase::Unknown
-        );
+    fn parse_slack_api_base_cases() {
+        let cases = [
+            // The distinction that keeps #1030 from returning in another shape. A
+            // kubectl failure is not evidence that the worker talks to real Slack, and
+            // treating it as such posts a real token wherever real Slack is while the
+            // worker edits through a proxy the CLI never saw.
+            ("failed_lookup_empty", false, "", SlackApiBase::Unknown),
+            (
+                "failed_lookup_with_output",
+                false,
+                "https://proxy.example/api",
+                SlackApiBase::Unknown,
+            ),
+            // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
+            // non-empty, so a clean empty result is the ordinary case, not a failure.
+            ("empty_success", true, "", SlackApiBase::RealSlack),
+            ("whitespace_success", true, "  \n ", SlackApiBase::RealSlack),
+            (
+                "configured_base_trimmed",
+                true,
+                "  https://proxy.example/api \n",
+                SlackApiBase::Configured("https://proxy.example/api".to_string()),
+            ),
+            // Cannot happen in this chart today. If it ever does, picking one half is
+            // exactly the ambiguity this issue is about, so say so instead.
+            (
+                "two_containers_reporting_a_base",
+                true,
+                "https://a/api\nhttps://b/api\n",
+                SlackApiBase::Unknown,
+            ),
+        ];
+        for (name, ok, stdout, expected) in cases {
+            assert_eq!(parse_slack_api_base(ok, stdout), expected, "{name}");
+        }
     }
     use super::*;
 
@@ -2269,18 +2425,8 @@ mod api_key_discovery_tests {
         }
     }
 
-    fn write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write fake cluster executable");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .expect("read fake cluster executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
-    }
-
     fn install_cluster_diagnosis_tools(tools: &std::path::Path) -> EnvRestore {
-        write_executable(
+        crate::test_executable::install(
             &tools.join("kubectl"),
             r#"#!/bin/sh
 case "$*" in
@@ -2298,7 +2444,7 @@ case "$*" in
 esac
 "#,
         );
-        write_executable(
+        crate::test_executable::install(
             &tools.join("helm"),
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
@@ -2854,54 +3000,44 @@ mod release_secret_name_tests {
     /// contains the chart name. A default install renders
     /// `<release>-curie-secrets`, and every read silently found nothing.
     #[test]
-    fn a_default_install_secret_is_found() {
-        let listed = "t-curie-secrets\nsh.helm.release.v1.t.v1\n";
-        assert_eq!(
-            pick_release_secret(listed),
-            Some("t-curie-secrets".to_string())
-        );
-    }
-
-    /// The shape that hid the bug: with `nameOverride` equal to the release
-    /// name, both forms collapse to the same string.
-    #[test]
-    fn a_name_override_install_secret_is_found() {
-        assert_eq!(
-            pick_release_secret("acme-bot-secrets\n"),
-            Some("acme-bot-secrets".to_string())
-        );
-    }
-
-    /// The collision the exclusion exists for. Per-agent connector Secrets
-    /// carry the same release labels, so without it the selector could return
-    /// one -- a confidently WRONG answer, which is worse than an empty one.
-    #[test]
-    fn a_connector_secret_is_never_mistaken_for_the_chart_secret() {
-        let listed = "acme-bot-acme-bot-connector-secrets\n                      acme-bot-acme-dev-connector-secrets\n                      acme-bot-secrets\n";
-        assert_eq!(
-            pick_release_secret(listed),
-            Some("acme-bot-secrets".to_string())
-        );
-    }
-
-    /// Ordering must not decide it: the connector Secret sorting first is the
-    /// realistic case, since kubectl lists alphabetically.
-    #[test]
-    fn ordering_does_not_change_the_answer() {
-        let connector_first = "a-connector-secrets\nz-curie-secrets\n";
-        assert_eq!(
-            pick_release_secret(connector_first),
-            Some("z-curie-secrets".to_string())
-        );
-    }
-
-    /// An absent release must yield nothing, not a guess. The callers turn
-    /// `None` into an actionable error naming their escape-hatch flag.
-    #[test]
-    fn no_matching_secret_yields_none() {
-        assert_eq!(pick_release_secret(""), None);
-        assert_eq!(pick_release_secret("sh.helm.release.v1.t.v1\n"), None);
-        assert_eq!(pick_release_secret("only-connector-secrets\n"), None);
+    fn pick_release_secret_cases() {
+        let cases = [
+            (
+                "default_install",
+                "t-curie-secrets\nsh.helm.release.v1.t.v1\n",
+                Some("t-curie-secrets"),
+            ),
+            // The shape that hid the bug: with `nameOverride` equal to the release
+            // name, both forms collapse to the same string.
+            ("name_override_install", "acme-bot-secrets\n", Some("acme-bot-secrets")),
+            // The collision the exclusion exists for. Per-agent connector Secrets
+            // carry the same release labels, so without it the selector could return
+            // one -- a confidently WRONG answer, which is worse than an empty one.
+            (
+                "connector_secret_never_mistaken",
+                "acme-bot-acme-bot-connector-secrets\n                      acme-bot-acme-dev-connector-secrets\n                      acme-bot-secrets\n",
+                Some("acme-bot-secrets"),
+            ),
+            // Ordering must not decide it: the connector Secret sorting first is the
+            // realistic case, since kubectl lists alphabetically.
+            (
+                "ordering_does_not_change_the_answer",
+                "a-connector-secrets\nz-curie-secrets\n",
+                Some("z-curie-secrets"),
+            ),
+            // An absent release must yield nothing, not a guess. The callers turn
+            // `None` into an actionable error naming their escape-hatch flag.
+            ("empty_listing", "", None),
+            ("helm_release_only", "sh.helm.release.v1.t.v1\n", None),
+            ("connector_only", "only-connector-secrets\n", None),
+        ];
+        for (name, listed, expected) in cases {
+            assert_eq!(
+                pick_release_secret(listed),
+                expected.map(String::from),
+                "{name}"
+            );
+        }
     }
 }
 
@@ -3050,28 +3186,49 @@ mod chart_fullname_tests {
     /// `contains $name .Release.Name`, so a release that merely embeds the
     /// chart name anywhere takes no suffix. A "stricter" reading here would
     /// diverge from what helm actually renders.
-    #[test]
-    fn a_release_containing_curie_takes_no_suffix() {
-        assert_eq!(chart_fullname("curie").as_str(), "curie");
-        assert_eq!(chart_fullname("curieish").as_str(), "curieish");
-        assert_eq!(chart_fullname("my-curie-prod").as_str(), "my-curie-prod");
-        assert_eq!(chart_fullname("curieish").resource("api"), "curieish-api");
-    }
-
+    ///
     /// The reported bug: `helm template platform charts/curie` renders
     /// `platform-curie-api`, and the CLI used to ask for `platform-api`.
     #[test]
-    fn a_release_not_containing_curie_takes_the_chart_suffix() {
-        assert_eq!(chart_fullname("platform").as_str(), "platform-curie");
-        assert_eq!(chart_fullname("acme-prod").as_str(), "acme-prod-curie");
-        assert_eq!(
-            chart_fullname("platform").resource("api"),
-            "platform-curie-api"
-        );
-        assert_eq!(
-            chart_fullname("acme-prod").resource("worker"),
-            "acme-prod-curie-worker"
-        );
+    fn chart_fullname_suffix_cases() {
+        // (name, release, component, expected); `None` checks the bare fullname.
+        let cases = [
+            ("contains_curie_exact", "curie", None, "curie"),
+            ("contains_curie_prefix", "curieish", None, "curieish"),
+            (
+                "contains_curie_middle",
+                "my-curie-prod",
+                None,
+                "my-curie-prod",
+            ),
+            (
+                "contains_curie_resource",
+                "curieish",
+                Some("api"),
+                "curieish-api",
+            ),
+            ("no_curie_platform", "platform", None, "platform-curie"),
+            ("no_curie_acme_prod", "acme-prod", None, "acme-prod-curie"),
+            (
+                "no_curie_platform_api",
+                "platform",
+                Some("api"),
+                "platform-curie-api",
+            ),
+            (
+                "no_curie_acme_prod_worker",
+                "acme-prod",
+                Some("worker"),
+                "acme-prod-curie-worker",
+            ),
+        ];
+        for (name, release, component, expected) in cases {
+            let fullname = chart_fullname(release);
+            match component {
+                None => assert_eq!(fullname.as_str(), expected, "{name}"),
+                Some(c) => assert_eq!(fullname.resource(c), expected, "{name}"),
+            }
+        }
     }
 
     /// Helm applies `trunc 63` to the FULLNAME -- `printf "%s-%s" .Release.Name
@@ -3697,26 +3854,66 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
     preferred_probe_outcome(api, worker)
 }
 
-/// The per-process memo behind [`release_fullname`]. One
+/// The per-process memo behind [`release_fullname_discovery`]. One
 /// [`tokio::sync::OnceCell`] per `(namespace, release)`, handed out under a std
-/// mutex that is never held across an await.
-type ReleaseFullnameCache = std::sync::Mutex<
+/// mutex that is never held across an await. It stores the raw discovery
+/// outcome so callers can choose whether falling back to the chart name is
+/// safe for their operation.
+type ReleaseFullnameDiscoveryCache = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<ComponentDiscovery>>,
+    >,
+>;
+
+static RELEASE_FULLNAME_DISCOVERY_CACHE: std::sync::LazyLock<ReleaseFullnameDiscoveryCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The fallback adapter memo behind [`release_fullname`]. It preserves the
+/// existing once per process fallback warning behavior while taking every raw
+/// outcome from [`release_fullname_discovery`].
+type ReleaseFullnameFallbackCache = std::sync::Mutex<
     std::collections::HashMap<
         (String, String),
         std::sync::Arc<tokio::sync::OnceCell<ReleaseFullname>>,
     >,
 >;
 
-static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
+static RELEASE_FULLNAME_FALLBACK_CACHE: std::sync::LazyLock<ReleaseFullnameFallbackCache> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Return the cached raw release fullname discovery outcome.
+///
+/// This is the only path that probes component names. Callers that can safely
+/// use the chart-computed fallback should use [`release_fullname`] instead.
+pub(crate) async fn release_fullname_discovery(
+    namespace: &str,
+    release: &str,
+) -> ComponentDiscovery {
+    // The std mutex is held only long enough to hand back this key's cell --
+    // never across the await below, which is what would deadlock the runtime.
+    let cell = {
+        let mut cache = RELEASE_FULLNAME_DISCOVERY_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry((namespace.to_string(), release.to_string()))
+            .or_default()
+            .clone()
+    };
+    cell.get_or_init(|| discover_release_fullname(namespace, release))
+        .await
+        .clone()
+}
 
 /// The release's fullname: discovered from the cluster, falling back to the
 /// chart's no-override rule.
 ///
-/// THE live entry point. Every path that can reach a cluster resolves here, and
-/// [`chart_fullname`] is what it degrades to. Discovery finding nothing is
-/// normal rather than an error -- `doctor` and a not-yet-installed release must
-/// still work -- so this never fails.
+/// The fallback enabled live entry point. Callers that can safely use the
+/// chart computed name resolve here, while mutating callers that need a
+/// confirmed resource target use [`release_fullname_discovery`] directly.
+/// Discovery finding nothing is normal rather than an error -- `doctor` and a
+/// not-yet-installed release must still work -- so this never fails.
 ///
 /// It is not, however, silent about WHY it degraded. A failed probe (RBAC
 /// denial, no kubectl, unreachable API server) and an ambiguous match both warn
@@ -3725,8 +3922,9 @@ static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
 /// the warning `cluster status` reports "not found" for a Service that exists
 /// and a self-plumbed deploy fails against a name helm never rendered. Control
 /// flow is deliberately unchanged -- the fallback still happens, loudly.
-/// Failing mutating verbs closed on a failed probe is the stronger fix and is
-/// left as a follow-up policy decision.
+/// A mutating caller that needs a confirmed resource target must inspect
+/// [`release_fullname_discovery`] directly and fail closed on every outcome
+/// other than [`ComponentDiscovery::Found`].
 ///
 /// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
 /// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
@@ -3745,20 +3943,20 @@ static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
 ///
 /// Two consequences, both deliberate:
 ///
-/// - The fallback warning is emitted ONCE per process instead of once per
-///   call. It says the rendered name could not be discovered, which is a fact
-///   about the run, not about the call site; repeating it per caller was noise.
-/// - Every outcome is cached, the [`chart_fullname`] fallback included. That is
-///   safe because no verb resolves a fullname both BEFORE and AFTER mutating
-///   the cluster within one process: `cluster up` and `cluster down` never call
-///   this (they name chart resources through the chart's own templates), so
-///   there is no window in which a cached miss could outlive the install that
-///   would have turned it into a hit.
+/// - Every raw discovery outcome is cached, so callers share one probe result
+///   without making a fallback choice on another caller's behalf. This adapter
+///   separately caches its mapped fullname, preserving one fallback warning per
+///   namespace and release.
+/// - No verb resolves a fullname both BEFORE and AFTER mutating the cluster
+///   within one process: `cluster up` and `cluster down` never call this (they
+///   name chart resources through the chart's own templates), so there is no
+///   window in which a cached miss could outlive the install that would have
+///   turned it into a hit.
 pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
     // The std mutex is held only long enough to hand back this key's cell --
     // never across the await below, which is what would deadlock the runtime.
     let cell = {
-        let mut cache = RELEASE_FULLNAME_CACHE
+        let mut cache = RELEASE_FULLNAME_FALLBACK_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache
@@ -3767,7 +3965,7 @@ pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname
             .clone()
     };
     cell.get_or_init(|| async {
-        match discover_release_fullname(namespace, release).await {
+        match release_fullname_discovery(namespace, release).await {
             ComponentDiscovery::Found(fullname) => fullname,
             outcome => {
                 let fallback = chart_fullname(release);
@@ -5367,7 +5565,10 @@ mod tests {
     fn pod_summary_does_not_panic_on_empty() {
         // No items: empty items array.
         let items: Vec<serde_json::Value> = Vec::new();
-        let _ = collect_pod_summary(&items);
+        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        assert!(rows.is_empty());
+        assert_eq!((ready, total), (0, 0));
+        assert!(unhealthy.is_empty());
     }
 
     #[test]

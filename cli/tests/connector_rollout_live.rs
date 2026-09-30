@@ -9,10 +9,6 @@ use curie::connectors::{bind_current_cluster, wait_for_connector_rollouts, Conne
 use curie::exit::{classify, ExitClass};
 use serde_json::{json, Value};
 
-fn live_cluster() -> bool {
-    std::env::var("CURIE_E2E_CLUSTER").ok().as_deref() == Some("1")
-}
-
 fn kubectl(args: &[&str]) -> (bool, String, String) {
     let output = Command::new("kubectl")
         .args(args)
@@ -83,11 +79,8 @@ fn minimal_deployment(name: &str, image: &str, command: &[&str]) -> Value {
 }
 
 #[tokio::test]
+#[ignore = "requires CURIE_E2E_CLUSTER=1 and a disposable Kubernetes cluster"]
 async fn live_cluster_ready_crashloop_image_pull_timeout_and_empty() {
-    if !live_cluster() {
-        eprintln!("skipping: set CURIE_E2E_CLUSTER=1 for disposable Kubernetes proof");
-        return;
-    }
     let ns = format!(
         "curie-2350-{}-{}",
         std::process::id(),

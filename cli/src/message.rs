@@ -26,15 +26,15 @@ use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::api::{Agent, ApiClient};
+use crate::api::{Agent, ApiClient, ClusterMessageProgress, ClusterMessageReplyEvent};
 use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
-    parse_approval_id, resolve_targets, Outcome, SlackStub,
+    failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn,
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, speak_as, synthetic_turn,
     thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
@@ -148,6 +148,7 @@ fn resolve_supplied_credential(raw: &str, env_value: Option<String>) -> String {
 /// as a positional and the two-positional trap fires on a valid invocation.
 const MESSAGE_VALUE_FLAGS: &[&str] = &[
     "--channel",
+    "--agent",
     "--thread",
     "--namespace",
     "--release",
@@ -163,6 +164,7 @@ const MESSAGE_VALUE_FLAGS: &[&str] = &[
     "--timeout-secs",
     "--api-url",
     "--color",
+    "--context",
 ];
 
 /// Boolean flags that may appear on the message verbs, including globals.
@@ -207,9 +209,9 @@ pub fn reject_agent_named_message(args: &[String]) -> Option<anyhow::Error> {
              <AGENT> <TEXT> is the shape of {siblings}, not this verb."
         ))
         .with_fix(format!(
-            "Pass only the message text. Route with `--channel <CHANNEL>`, or omit \
-             `--channel` when exactly one channel is bound. Example: `curie {verb} \
-             'Who are you?'`"
+            "Pass only the message text. Route with `--agent <AGENT>` or `--channel \
+             <CHANNEL>`, or omit both when exactly one channel is bound. Example: `curie \
+             {verb} 'Who are you?'`"
         )),
     ))
 }
@@ -382,8 +384,8 @@ fn local_stub_binding() -> LocalStubBinding {
 
 /// The reply-endpoint URL the local stub advertises, built the same way the
 /// stub's own `base_api_url` is (`http://{host}:{port}/api/`).
-fn local_stub_reply_endpoint(advertise_host: &str) -> String {
-    format!("http://{advertise_host}:{DEFAULT_LOCAL_STUB_PORT}/api/")
+fn local_stub_reply_endpoint(advertise_host: &str, port: u16) -> String {
+    format!("http://{advertise_host}:{port}/api/")
 }
 
 /// In-cluster service ports the port-forwards target.
@@ -395,6 +397,8 @@ pub const API_REMOTE_PORT: u16 = 8000;
 pub struct MessageOpts {
     pub text: String,
     pub channel: Option<String>,
+    /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
+    pub agent: Option<String>,
     pub thread: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -426,14 +430,16 @@ pub struct MessageOpts {
 /// sentinel comparison against [`DEFAULT_API_KEY`] in
 /// [`crate::state::apply_continue`] that issue #540 exists to protect.
 ///
-/// The genuinely-empty fields (`text`, `channel`, `thread`, `listen_host`,
-/// `user`, `stream`, `dry_run`, `local`, `api_url`) have no crate-level default:
+/// The genuinely-empty fields (`text`, `channel`, `agent`, `thread`,
+/// `listen_host`, `user`, `stream`, `dry_run`, `local`, `api_url`) have no
+/// crate-level default:
 /// they are per-invocation values a caller must supply.
 impl Default for MessageOpts {
     fn default() -> Self {
         Self {
             text: String::new(),
             channel: None,
+            agent: None,
             thread: None,
             namespace: "curie".to_string(),
             release: "curie".to_string(),
@@ -498,7 +504,15 @@ fn save_turn_context(
 
 fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts: &str) {
     let ui = crate::ui::ui();
-    let verb_str = format!("{} message", tier_str(verb));
+    let verb_str = match verb {
+        TurnVerb::Local => format!("{} message", tier_str(verb)),
+        TurnVerb::Cluster => format!(
+            "{} message --namespace {} --release {}",
+            tier_str(verb),
+            crate::ops::shell_quote(&opts.namespace),
+            crate::ops::shell_quote(&opts.release),
+        ),
+    };
     match save_turn_context(opts, verb, channel, thread_ts) {
         Ok(()) => ui.note(&continue_hint_line(&verb_str)),
         Err(err) => {
@@ -538,16 +552,18 @@ pub fn port_forward_command(
     )
 }
 
-/// The `/api/` base URL the worker posts its placeholder edits to.
-fn advertised_url(host: &str, port: u16) -> String {
-    format!("http://{host}:{port}/api/")
-}
-
 /// Reserved built-in worker adapter for disconnected `cluster message` turns.
 /// It is intentionally language-local and byte-identical to the worker/API
 /// literal: the frozen queue contract already has an adapter slot, so no wire
-/// change is needed.
-const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
+/// change is needed. `pub(crate)` so `queue::thread_key_for` shares this one
+/// constant instead of duplicating the literal.
+pub(crate) const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
+
+/// Case output when a text-graded cluster eval relay wait hits its deadline.
+/// Not [`diagnostics`]: that dump is Redis stream internals and must not land
+/// under the graded reply.
+const CLUSTER_EVAL_RELAY_TIMEOUT: &str =
+    "the cluster message relay did not deliver a reply before the deadline";
 
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
@@ -594,6 +610,135 @@ async fn dispatcher_connected_strict(
 
 const CLUSTER_MESSAGE_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Worker `publication_loop._report` prefixes. A publication result is a
+/// `reply.update` with one of these texts and no `turn.completed`: resolving a
+/// publication does not enqueue a model resume, so the cluster-message waiter
+/// that only watches completion would hang until `--timeout-secs` (#2757).
+fn is_publication_result_text(text: &str) -> bool {
+    text.starts_with("Published the approved changes: ")
+        || text.starts_with("Changes were not published: ")
+        || text.starts_with("Publication failed safely after approval: ")
+}
+
+/// A delivered reply is a successful task reply only when it is not a failed turn.
+///
+/// `escalated` is the worker's `turn.completed` outcome. A reply whose first line
+/// is the failure marker carries its class even when that completion is missing.
+/// An escalation with no marker is still a failure, class `unclassified`.
+fn reply_or_failed(latest: Option<String>, escalated: bool) -> Outcome {
+    match latest {
+        Some(text) => {
+            if let Some(class) = failure_class_from_reply(&text) {
+                Outcome::Failed {
+                    class: class.to_string(),
+                    reply: text,
+                }
+            } else if escalated {
+                Outcome::Failed {
+                    class: "unclassified".to_string(),
+                    reply: text,
+                }
+            } else {
+                Outcome::Replied(text)
+            }
+        }
+        None if escalated => Outcome::Failed {
+            class: "unclassified".to_string(),
+            reply: String::new(),
+        },
+        None => Outcome::CompletedNoEdit,
+    }
+}
+
+/// The status line a relayed progress card or milestone shows while the CLI
+/// waits (ADR-0130). The wire's own words, since the CLI keeps no copy of the
+/// worker's labels.
+fn progress_status_line(progress: &ClusterMessageProgress) -> String {
+    if progress.kind == "milestone" {
+        let milestone = progress.milestone.as_deref().unwrap_or("progress");
+        format!("Milestone ({milestone}): {}", progress.summary)
+    } else {
+        let state = progress.state.as_deref().unwrap_or("unknown");
+        format!("Progress ({state}): {}", progress.summary)
+    }
+}
+
+/// Classify one relay page into a resume wait outcome. Pure so the #2757 hang
+/// (publication result delivered, waiter still looping) is unit-testable
+/// without a cluster.
+///
+/// Session approval expiry and rejection still enqueue a model resume, so this
+/// classifier must not treat a durable approval row as terminal. Only a
+/// publication result text or a real completion/terminal page stops the wait.
+fn cluster_relay_page_outcome(
+    events: &[ClusterMessageReplyEvent],
+    terminal_page: bool,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) -> Result<Option<Outcome>> {
+    let mut awaiting_approval = false;
+    let mut completed = false;
+    let mut publication_result = false;
+    for event in events {
+        if let Some(progress) = event.progress.as_ref() {
+            // A progress post or card edit (ADR-0130): a status line at most,
+            // never the reply and never a completion, even when it closes.
+            if matches!(event.kind.as_str(), "reply.update" | "reply.post") {
+                observer(&progress_status_line(progress));
+                continue;
+            }
+        }
+        match event.kind.as_str() {
+            "turn.status" => {
+                if let Some(status) = event.status.as_deref() {
+                    observer(status);
+                }
+            }
+            "reply.update" => {
+                if let Some(text) = event.text.as_ref() {
+                    if latest.as_deref() != Some(text.as_str()) {
+                        observer(text);
+                        *latest = Some(text.clone());
+                    }
+                    if is_publication_result_text(text) {
+                        publication_result = true;
+                    }
+                }
+            }
+            "reply.post" => {}
+            "turn.completed" => match event.outcome.as_deref() {
+                Some("awaiting-approval") => awaiting_approval = true,
+                Some("delivered" | "dropped" | "escalated") => {
+                    awaiting_approval = false;
+                    completed = true;
+                }
+                Some(outcome) => {
+                    bail!("cluster-message relay returned unknown outcome {outcome:?}")
+                }
+                None => bail!("cluster-message completion omitted its outcome"),
+            },
+            _ => {}
+        }
+    }
+    if publication_result {
+        return Ok(Some(reply_or_failed(latest.clone(), false)));
+    }
+    if completed || terminal_page {
+        let escalated = events.iter().any(|event| {
+            event.kind == "turn.completed" && event.outcome.as_deref() == Some("escalated")
+        });
+        return Ok(Some(reply_or_failed(latest.clone(), escalated)));
+    }
+    if awaiting_approval {
+        let approval_id = latest.as_deref().and_then(parse_approval_id);
+        return Ok(Some(Outcome::AwaitingApproval {
+            reply: latest.clone(),
+            approval_id,
+        }));
+    }
+    Ok(None)
+}
+
 /// One disconnected cluster turn plus the opaque API bucket the worker will
 /// write. The normal Slack binding coordinates stay intact so agent resolution
 /// does not diverge; only reply delivery selects the reserved built-in adapter.
@@ -612,7 +757,10 @@ fn cluster_relay_turn(
         reply_ref.hyphenated().to_string(),
         None,
     );
-    turn.reply_handle.adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+    turn.reply_handle
+        .as_mut()
+        .expect("cluster relay turns are targeted")
+        .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
     (turn, reply_ref)
 }
 
@@ -629,6 +777,12 @@ struct ClusterRelayObservation {
 /// poll. No stream/PENDING read is used as completion: the worker's relay event
 /// is the reply-delivery outcome, while XACK remains worker-owned and continues
 /// even if this CLI exits.
+///
+/// A publication result is a `reply.update` with no `turn.completed` (resolving
+/// a publication does not enqueue a model resume). The waiter treats that text
+/// as terminal so `curie cluster message` is told instead of reprinting the
+/// waiting note until `--timeout-secs` (#2757). Session expiry still waits for
+/// the resume turn.
 async fn await_cluster_relay(
     api: &ApiClient,
     reply_ref: &uuid::Uuid,
@@ -666,52 +820,12 @@ async fn await_cluster_relay(
                     page.next_cursor
                 );
             }
-            let mut awaiting_approval = false;
-            let mut completed = false;
-            for event in page.events {
-                match event.kind.as_str() {
-                    "turn.status" => {
-                        if let Some(status) = event.status.as_deref() {
-                            observer(status);
-                        }
-                    }
-                    "reply.update" => {
-                        if let Some(text) = event.text {
-                            if latest.as_deref() != Some(text.as_str()) {
-                                observer(&text);
-                                latest = Some(text);
-                            }
-                        }
-                    }
-                    "reply.post" => {}
-                    "turn.completed" => match event.outcome.as_deref() {
-                        Some("awaiting-approval") => awaiting_approval = true,
-                        Some("delivered" | "dropped" | "escalated") => {
-                            awaiting_approval = false;
-                            completed = true;
-                        }
-                        Some(outcome) => {
-                            bail!("cluster-message relay returned unknown outcome {outcome:?}")
-                        }
-                        None => bail!("cluster-message completion omitted its outcome"),
-                    },
-                    _ => {}
-                }
-            }
+            let outcome =
+                cluster_relay_page_outcome(&page.events, page.terminal, &mut latest, observer)?;
             cursor = page.next_cursor;
-            if completed || page.terminal {
+            if let Some(outcome) = outcome {
                 return Ok(ClusterRelayObservation {
-                    outcome: latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied),
-                    next_cursor: cursor,
-                });
-            }
-            if awaiting_approval {
-                let approval_id = latest.as_deref().and_then(parse_approval_id);
-                return Ok(ClusterRelayObservation {
-                    outcome: Outcome::AwaitingApproval {
-                        reply: latest,
-                        approval_id,
-                    },
+                    outcome,
                     next_cursor: cursor,
                 });
             }
@@ -725,8 +839,8 @@ async fn await_cluster_relay(
 /// Local mode: the Valkey URL the CLI enqueues onto -- the compose Valkey on its
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
-pub fn local_valkey_url(password: &str) -> String {
-    format!("redis://:{password}@localhost:{DEFAULT_LOCAL_VALKEY_PORT}")
+pub fn local_valkey_url(password: &str, host: &str, port: u16) -> String {
+    format!("redis://:{password}@{host}:{port}")
 }
 
 /// Local mode: the platform API base for the channel lookup -- an explicit
@@ -768,6 +882,142 @@ pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
         }
     }
+}
+
+/// The Slack route a driver sends as when `--agent` names the agent.
+/// @spec ADR-0168 d8
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedRoute {
+    pub channel: String,
+    /// The binding's identity when it is not the default.
+    pub identity: Option<String>,
+    pub agent: String,
+}
+
+/// Pick `agent` (name or id) and its one Slack binding, narrowed by `channel`.
+/// @spec ADR-0168 d8.
+pub fn select_agent_route(
+    agents: &[Agent],
+    agent: &str,
+    channel: Option<&str>,
+) -> Result<SelectedRoute> {
+    let Some(found) = agents.iter().find(|a| a.name == agent || a.id == agent) else {
+        let deployed = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+        return Err(crate::exit::usage(format!(
+            "no deployed agent is named {agent:?} (deployed: {})",
+            if deployed.is_empty() {
+                "none".to_string()
+            } else {
+                deployed.join(", ")
+            }
+        )));
+    };
+    let routes: Vec<&crate::api::ChannelBinding> = found
+        .channels
+        .iter()
+        .filter(|b| b.kind == "slack" && channel.is_none_or(|c| b.address == c))
+        .collect();
+    let describe = |b: &crate::api::ChannelBinding| match b.named_adapter() {
+        Some(identity) => format!("{} as {identity}", b.address),
+        None => b.address.clone(),
+    };
+    match routes.as_slice() {
+        [only] => Ok(SelectedRoute {
+            channel: only.address.clone(),
+            identity: only.named_adapter().map(str::to_string),
+            agent: found.name.clone(),
+        }),
+        [] => Err(crate::exit::usage(format!(
+            "agent {} has no Slack binding{}; it answers on: {}",
+            found.name,
+            channel.map(|c| format!(" on {c}")).unwrap_or_default(),
+            found
+                .channels
+                .iter()
+                .map(describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        many => Err(crate::exit::usage(format!(
+            "agent {} answers on several Slack routes; pass --channel <id> to pick one ({})",
+            found.name,
+            many.iter()
+                .map(|b| describe(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Refuse a named route on a path whose turn speaks as the default bot.
+/// @spec ADR-0168 d8: sending anyway would reach the default binding's agent.
+fn refuse_named_route(
+    route_identity: Option<&str>,
+    agent: &str,
+    channel: &str,
+    path: &str,
+) -> Result<()> {
+    let Some(identity) = route_identity else {
+        return Ok(());
+    };
+    Err(crate::exit::CliError::usage(format!(
+        "agent {agent} answers on {channel} as `{identity}`, and a turn over {path} speaks as \
+         the installation's default bot, so it would reach a different binding"
+    ))
+    .with_fix(format!(
+        "drive this agent with `eval --agent {agent}`, which sends through the reply stub, or \
+         mention the `{identity}` bot in Slack"
+    ))
+    .into())
+}
+
+/// The named-route refusal for `message_local`'s connected-transport branch.
+/// Factored out of the caller so a test can reach it without a live connected
+/// workspace, and a mutant that drops the call site there goes red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_local_connected(route: &SelectedRoute) -> Result<()> {
+    refuse_named_route(
+        route.identity.as_deref(),
+        &route.agent,
+        &route.channel,
+        "the connected Slack transport",
+    )
+}
+
+/// The named-route refusal for `message_connected` (the cluster
+/// connected-transport path). Factored out so a test can reach it without a
+/// live dispatcher, and a mutant that drops the call site there goes red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_cluster_connected(
+    identity: Option<&str>,
+    agent: Option<&str>,
+    channel: &str,
+) -> Result<()> {
+    refuse_named_route(
+        identity,
+        agent.unwrap_or_default(),
+        channel,
+        "the connected Slack transport",
+    )
+}
+
+/// The named-route refusal for `message_cluster`'s disconnected relay lane
+/// (the missing-carrier compatibility control #1817 requires, which always
+/// speaks as the installation's default bot). Factored out so a test can reach
+/// it without a live cluster, and a mutant that drops the call site there goes
+/// red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_relay(
+    identity: Option<&str>,
+    agent: Option<&str>,
+    channel: &str,
+) -> Result<()> {
+    refuse_named_route(
+        identity,
+        agent.unwrap_or_default(),
+        channel,
+        "the disconnected cluster relay",
+    )
 }
 
 /// Parse a kubeconfig `cluster.server` URL into its host and optional raw port,
@@ -819,6 +1069,30 @@ pub fn server_host_and_port(server: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
+/// The `--dry-run` line naming where a local-tier turn would land: a named
+/// `--agent` resolves its own Slack binding (channel AND identity) at send
+/// time via `api_base`, so the plan says that instead of guessing a channel it
+/// cannot see from here. Shared by `local message` and `local eval`, whose
+/// plans render this identically.
+/// @spec ADR-0168 d8.
+fn local_dry_run_channel_line(
+    agent: Option<&str>,
+    channel: Option<&str>,
+    api_base: &str,
+) -> String {
+    match agent {
+        Some(agent) => format!(
+            "the Slack binding of agent `{agent}` (channel and identity) via {api_base}/agents"
+        ),
+        None => match channel {
+            Some(channel) => format!("channel {channel}"),
+            None => format!(
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
+            ),
+        },
+    }
+}
+
 /// The ordered command lines (plus the stub URL and enqueue description) that a
 /// real run would execute, for `--dry-run`. Pure so the rendering is testable.
 /// The reply routes back to the stub via the per-turn endpoint on the queue
@@ -849,15 +1123,31 @@ pub fn dry_run_lines(opts: &MessageOpts, _advertise_host: &str) -> Vec<String> {
     );
     let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
     lines.push(format!("poll replies at {poll_url}"));
-    let channel = opts
-        .channel
-        .clone()
-        .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string());
+    // @spec ADR-0168 d8. `--agent` resolves its own Slack binding (channel AND
+    // identity) at send time via the api port-forward this plan already
+    // renders, so the plan says that instead of guessing a channel it cannot
+    // see offline.
+    let channel = match opts.agent.as_deref() {
+        Some(agent) => {
+            format!("the Slack binding of agent `{agent}` (channel and identity) via .../agents")
+        }
+        None => opts
+            .channel
+            .clone()
+            .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string()),
+    };
     lines.push(format!(
         "enqueue a synthetic QueuedTurn (adapter {CLUSTER_MESSAGE_RELAY_ADAPTER}, no reply \
          endpoint, UUIDv4 reply ref) for channel {channel} on stream {}",
         opts.stream
     ));
+    if opts.agent.is_some() {
+        lines.push(
+            "a named identity's route is refused here: both the disconnected relay and the \
+             connected Slack transport speak as the installation's default bot"
+                .to_string(),
+        );
+    }
     lines.push(connected_transport_dry_run_note());
     lines
 }
@@ -872,6 +1162,21 @@ pub fn message_reply_json(thread: &str, reply: Option<&str>) -> serde_json::Valu
         "reply": reply,
         "thread": thread,
         "finalized": reply.is_some(),
+    })
+}
+
+/// The machine-readable object for a failed runner turn (#3401).
+///
+/// `finalized` is false so a consumer that treats a finalized reply as task
+/// success cannot score this turn as successful. `failure_class` is the
+/// platform token, and `reply` is the delivered text.
+pub fn message_failed_json(thread: &str, reply: &str, failure_class: &str) -> serde_json::Value {
+    serde_json::json!({
+        "reply": reply,
+        "thread": thread,
+        "finalized": false,
+        "failed": true,
+        "failure_class": failure_class,
     })
 }
 
@@ -993,6 +1298,12 @@ impl crate::ui::CliOutput for MessageDryRunOutput {
 pub enum MessageOutcomeOutput {
     /// The worker finalized the turn with reply text.
     Replied { thread: String, reply: String },
+    /// The worker delivered a failed runner turn. Exit code is 1.
+    Failed {
+        thread: String,
+        reply: String,
+        failure_class: String,
+    },
     /// The worker finished the turn but never edited the placeholder.
     NoEdit { thread: String },
     /// The turn parked awaiting human approval. `tier`/`agent`/`channel` shape the
@@ -1031,6 +1342,11 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
             MessageOutcomeOutput::Replied { thread, reply } => {
                 message_reply_json(thread, Some(reply))
             }
+            MessageOutcomeOutput::Failed {
+                thread,
+                reply,
+                failure_class,
+            } => message_failed_json(thread, reply, failure_class),
             MessageOutcomeOutput::NoEdit { thread } => message_reply_json(thread, None),
             MessageOutcomeOutput::AwaitingApproval { thread, reply, .. } => {
                 message_awaiting_approval_json(thread, reply.as_deref())
@@ -1045,6 +1361,10 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             MessageOutcomeOutput::Replied { reply, .. } => {
+                ui.answer(reply);
+                ui.print_tokens("\n");
+            }
+            MessageOutcomeOutput::Failed { reply, .. } => {
                 ui.answer(reply);
                 ui.print_tokens("\n");
             }
@@ -1087,78 +1407,9 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
 // Effectful helpers
 // ---------------------------------------------------------------------------
 
-/// The routable host the stub advertises: `--listen-host` verbatim, otherwise
-/// the local IP the kernel would use to reach the cluster's API server (via a
-/// UDP-connect that sends no packets -- it only resolves the source interface).
-/// The address a container/pod uses to reach the Docker Desktop host from inside
-/// the Docker VM (macOS/Windows). Not routable on native-Linux Docker, where the
-/// host is reached via the bridge gateway instead.
+/// The address a container uses to reach the Docker Desktop host from inside
+/// the Docker VM (macOS/Windows). Not routable on native-Linux Docker.
 const DOCKER_INTERNAL_HOST: &str = "host.docker.internal";
-
-/// Whether the cluster-message reply stub should advertise `host.docker.internal`
-/// rather than a host-local IP. True only under Docker Desktop's VM topology
-/// (macOS/Windows) talking to a loopback-exposed API server -- i.e. a local
-/// cluster (kind) whose in-VM worker cannot reach the host's own LAN IP or the
-/// kind bridge gateway (both live in the VM), only `host.docker.internal` (#900).
-/// `platform_is_docker_vm` is passed in (a compile-time OS check at the call
-/// site) so the decision stays unit-testable off those platforms.
-fn prefers_docker_internal_host(server_host: &str, platform_is_docker_vm: bool) -> bool {
-    platform_is_docker_vm && host_is_loopback(server_host)
-}
-
-/// Whether `host` names the loopback interface (`localhost`, `127.0.0.0/8`, `::1`).
-fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
-}
-
-async fn resolve_advertise_host(listen_host: Option<&str>) -> Result<String> {
-    if let Some(host) = listen_host {
-        return Ok(host.to_string());
-    }
-    let (ok, out, err) = run_capture(&crate::ops::kubeconfig_host_cmd()).await?;
-    if !ok {
-        bail!(
-            "could not read the kubeconfig API server to auto-detect a routable host ({}); \
-             pass --listen-host <host>",
-            err.trim()
-                .lines()
-                .next()
-                .unwrap_or("kubectl config view failed")
-        );
-    }
-    let server = out.trim();
-    let (host, port) = server_host_and_port(server).with_context(|| {
-        format!("could not parse the kubeconfig server url {server:?}; pass --listen-host <host>")
-    })?;
-    // Docker Desktop (macOS/Windows) runs the cluster inside a LinuxKit VM, so a
-    // host-local IP or the kind bridge gateway is unreachable from the in-cluster
-    // worker -- it reaches the host only via host.docker.internal. Detect that
-    // (a loopback-exposed API server on a Docker-VM platform, i.e. a local kind
-    // cluster) and advertise host.docker.internal instead of the local egress IP
-    // (#900). Native-Docker Linux (CI included) is unaffected: it passes
-    // --listen-host explicitly (returned above), and this branch is false off
-    // macOS/Windows anyway.
-    if prefers_docker_internal_host(&host, cfg!(any(target_os = "macos", target_os = "windows"))) {
-        return Ok(DOCKER_INTERNAL_HOST.to_string());
-    }
-    let ip = detect_local_ip(&host, port).with_context(|| {
-        format!("could not detect the local IP toward {host}:{port}; pass --listen-host <host>")
-    })?;
-    Ok(ip.to_string())
-}
-
-/// The local source IP the kernel would use to reach `host:port`. A UDP socket
-/// `connect` only sets the default peer and picks the egress interface; no
-/// datagram is sent, so this needs no reachability and touches no network.
-fn detect_local_ip(host: &str, port: u16) -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect((host, port)).ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip())
-}
 
 /// Spawn a `kubectl port-forward` child (killed on drop via `kill_on_drop`) and
 /// block until its effective local port accepts TCP, so callers can use it
@@ -1323,16 +1574,21 @@ async fn bounded_diagnostics(
 async fn observe_message_claims(
     opts: &MessageOpts,
     verb: TurnVerb,
-) -> crate::worker_claims::ClaimsState {
+) -> Result<crate::worker_claims::ClaimsState> {
     match verb {
         TurnVerb::Local => {
-            crate::worker_claims::observe_local(crate::local::DEFAULT_COMPOSE_FILE).await
+            let resources = crate::local::current_resources()?;
+            Ok(
+                crate::worker_claims::observe_local(&resources.project, &resources.compose_files)
+                    .await,
+            )
         }
-        TurnVerb::Cluster => {
-            crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
-                .await
-                .state
-        }
+        TurnVerb::Cluster => Ok(crate::worker_claims::observe_cluster(
+            &opts.namespace,
+            &opts.release,
+        )
+        .await
+        .state),
     }
 }
 
@@ -1448,8 +1704,9 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 /// Both halves now live in `local.rs` (#1925), because every `local` verb that
 /// recreates a service needs the same derivation -- this one just narrows it to
 /// the single image the one-shot producer runs.
-async fn one_shot_dispatcher_image() -> Option<String> {
-    crate::local::running_stack_image("curie-dispatcher").await
+async fn one_shot_dispatcher_image() -> Result<Option<String>> {
+    let project = crate::local::current_resources()?.project;
+    Ok(crate::local::running_stack_image("curie-dispatcher", &project).await)
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -1537,6 +1794,7 @@ fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
 }
 
 struct LocalDispatcherContext {
+    project: String,
     compose_files: Vec<String>,
     /// The dispatcher image the running stack would use, when it can be
     /// determined and is actually present.
@@ -1569,9 +1827,16 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
     // #1915: the stack's own image tag, so the one-shot producer below runs what
     // the stack runs. Best-effort: an unreadable image is not worth failing an
     // enqueue over, and compose's default then applies exactly as before.
-    let dispatcher_image = one_shot_dispatcher_image().await;
+    let resources = crate::local::current_resources()?;
+    let dispatcher_image = one_shot_dispatcher_image().await?;
+    let compose_files = if resources.isolated() {
+        resources.compose_files.clone()
+    } else {
+        compose_files
+    };
 
     Ok(LocalDispatcherContext {
+        project: resources.project,
         compose_files,
         otel_env,
         dispatcher_image,
@@ -1582,6 +1847,7 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
 /// environment entries, never argv; Slack variables are explicitly cleared so
 /// this process cannot acquire or use a workspace credential.
 fn dispatcher_enqueue_command(
+    project: &str,
     compose_files: &[String],
     container_name: &str,
     stream: &str,
@@ -1594,6 +1860,8 @@ fn dispatcher_enqueue_command(
     // graph before the one-shot Python producer starts.
     let mut args = vec![
         plain("compose"),
+        plain("-p"),
+        plain(project),
         plain("--profile"),
         plain("core"),
         plain("--profile"),
@@ -1639,10 +1907,7 @@ fn dispatcher_enqueue_command(
             .cloned(),
     );
     let mut env = vec![
-        (
-            "COMPOSE_PROJECT_NAME".to_string(),
-            crate::local::COMPOSE_PROJECT.to_string(),
-        ),
+        ("COMPOSE_PROJECT_NAME".to_string(), project.to_string()),
         ("CURIE_STREAM".to_string(), stream.to_string()),
     ];
     // Only when the running stack has one. Passing nothing leaves compose's
@@ -1699,6 +1964,7 @@ async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Resu
     let sequence = DISPATCHER_ENQUEUE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let container_name = format!("curie-dispatcher-enqueue-{}-{sequence}", std::process::id());
     let cmd = dispatcher_enqueue_command(
+        &context.project,
         &context.compose_files,
         &container_name,
         &opts.stream,
@@ -1787,17 +2053,19 @@ async fn enqueue_for_turn_verb(
 /// `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
 async fn message_local(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
-    let valkey_url = local_valkey_url(&opts.valkey_password);
-    let api_base = local_api_base(opts.api_url.as_deref());
+    let resources = crate::local::current_resources()?;
+    let valkey_url = local_valkey_url(
+        &opts.valkey_password,
+        &resources.valkey_host,
+        resources.valkey_port,
+    );
+    let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
 
     if opts.dry_run {
-        let reply_endpoint = local_stub_reply_endpoint(&local_stub_binding().advertise_host);
-        let channel_line = match opts.channel.as_deref() {
-            Some(channel) => format!("channel {channel}"),
-            None => format!(
-                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
-            ),
-        };
+        let reply_endpoint =
+            local_stub_reply_endpoint(&local_stub_binding().advertise_host, resources.stub_port);
+        let channel_line =
+            local_dry_run_channel_line(opts.agent.as_deref(), opts.channel.as_deref(), &api_base);
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
             format!("enqueue onto redis {valkey_url}"),
@@ -1825,14 +2093,24 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
     if let Some(transport) = local_connected_transport().await {
-        let channel = match opts.channel.as_deref() {
-            Some(channel) => channel.to_string(),
-            None => {
-                let api = ApiClient::new(&api_base, &opts.api_key)?;
-                let agents = api.list_agents().await.with_context(|| {
-                    format!("listing agents via {api_base} (is `curie local up` running?)")
-                })?;
-                select_channel(&agents, None)?
+        let channel = if let Some(agent) = opts.agent.as_deref() {
+            let api = ApiClient::new(&api_base, &opts.api_key)?;
+            let agents = api.list_agents().await.with_context(|| {
+                format!("listing agents via {api_base} (is `curie local up` running?)")
+            })?;
+            let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+            refuse_named_route_for_local_connected(&route)?;
+            route.channel
+        } else {
+            match opts.channel.as_deref() {
+                Some(channel) => channel.to_string(),
+                None => {
+                    let api = ApiClient::new(&api_base, &opts.api_key)?;
+                    let agents = api.list_agents().await.with_context(|| {
+                        format!("listing agents via {api_base} (is `curie local up` running?)")
+                    })?;
+                    select_channel(&agents, None)?
+                }
             }
         };
         ui.plumbing(&format!(
@@ -1858,7 +2136,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let binding = local_stub_binding();
     let mut stub = SlackStub::start(
         &binding.bind_host,
-        DEFAULT_LOCAL_STUB_PORT,
+        resources.stub_port,
         &binding.advertise_host,
     )
     .await?;
@@ -1873,17 +2151,27 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // resolve hint is copy-paste runnable), and `None` for an explicit --channel
     // (we don't know which agent it binds) -- then the hint shows an `<AGENT>`
     // slot (#766).
-    let (channel, agent_hint): (String, Option<String>) = match opts.channel.as_deref() {
-        Some(channel) => (channel.to_string(), None),
-        None => {
+    let (channel, agent_hint, identity): (String, Option<String>, Option<String>) =
+        if let Some(agent) = opts.agent.as_deref() {
             let api = ApiClient::new(&api_base, &opts.api_key)?;
             let agents = api.list_agents().await.with_context(|| {
                 format!("listing agents via {api_base} (is `curie local up` running?)")
             })?;
-            let channel = select_channel(&agents, None)?;
-            (channel, agents.first().map(|a| a.name.clone()))
-        }
-    };
+            let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+            (route.channel, Some(route.agent), route.identity)
+        } else {
+            match opts.channel.as_deref() {
+                Some(channel) => (channel.to_string(), None, None),
+                None => {
+                    let api = ApiClient::new(&api_base, &opts.api_key)?;
+                    let agents = api.list_agents().await.with_context(|| {
+                        format!("listing agents via {api_base} (is `curie local up` running?)")
+                    })?;
+                    let channel = select_channel(&agents, None)?;
+                    (channel, agents.first().map(|a| a.name.clone()), None)
+                }
+            }
+        };
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // This turn carries its own reply endpoint (issue #19), so the compose worker
@@ -1891,14 +2179,17 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let reply_endpoint = stub.base_api_url().to_string();
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
-    let event = synthetic_turn(
-        "slack",
-        &channel,
-        &opts.user,
-        &opts.text,
-        &thread_ts,
-        &placeholder_ts,
-        Some(reply_endpoint),
+    let event = speak_as(
+        synthetic_turn(
+            "slack",
+            &channel,
+            &opts.user,
+            &opts.text,
+            &thread_ts,
+            &placeholder_ts,
+            Some(reply_endpoint),
+        ),
+        identity.as_deref(),
     );
     let stream_id = enqueue_for_turn_verb(&opts, &mut conn, TurnVerb::Local, &event).await?;
     ui.plumbing(&format!(
@@ -1912,7 +2203,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let outcome = {
@@ -1942,6 +2233,16 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             });
             persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
             Ok(())
+        }
+        Outcome::Failed { reply, class } => {
+            step.fail(&format!("failed ({class})"));
+            ui.emit(&MessageOutcomeOutput::Failed {
+                thread: thread_ts.clone(),
+                reply,
+                failure_class: class,
+            });
+            persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, stub);
         }
         Outcome::CompletedNoEdit => {
             step.done("no edit");
@@ -1985,6 +2286,9 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                     .await
                     {
                         ResumeExit::Done => Ok(()),
+                        ResumeExit::Failed => {
+                            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, stub);
+                        }
                         // Still parked: the durable approval stays pending and is
                         // resolvable later, so this is retryable. Local mode holds
                         // no port-forward children, but it DOES still hold the
@@ -2027,7 +2331,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             // next `local message` can bind successfully right away regardless of
             // how long anything after this line takes (#751).
             drop(stub);
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -2131,6 +2435,7 @@ async fn hint_channel(
     turn_channel: &str,
     id: &str,
     deadline: Instant,
+    budget: Duration,
 ) -> String {
     let lookup = async {
         // The port-forward guard is bound HERE, in the enclosing async block,
@@ -2185,7 +2490,7 @@ async fn hint_channel(
     // it is decorating (#1531; `cli/src/chat.rs:497-499`). Reuses the same
     // `capped` helper the resume scan uses rather than a second copy of the
     // bound.
-    match tokio::time::timeout(capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline), lookup).await {
+    match tokio::time::timeout(capped(budget, deadline), lookup).await {
         // A present, non-empty card channel is the only real answer. The
         // emptiness guard is load-bearing, not defensive: the server reads
         // `approval.card_channel or approval.reply_channel`, and in Python
@@ -2275,6 +2580,8 @@ fn note_approval_pending(ui: &crate::ui::Ui, tier: &str, agent: Option<&str>, ch
 enum ResumeExit {
     /// Fully handled; the caller returns `Ok(())` and its guards drop normally.
     Done,
+    /// The resumed turn failed. The caller drops its guards and exits 1.
+    Failed,
     /// The turn is still parked (the wait elapsed, or the resumed turn hit a NEW
     /// gate). The durable `Approval` stays pending and resolvable later, so this
     /// is retryable: the caller drops its port-forward guards and exits with the
@@ -2360,7 +2667,15 @@ async fn resume_after_approval(
         last_hint_channel = if ui.json() {
             channel.to_string()
         } else {
-            hint_channel(opts, verb, channel, &current_id, deadline).await
+            hint_channel(
+                opts,
+                verb,
+                channel,
+                &current_id,
+                deadline,
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await
         };
         // Recompute AFTER the lookup, because the lookup itself consumes turn
         // time. The pre-lookup value is stale by up to the whole lookup budget,
@@ -2420,6 +2735,15 @@ async fn resume_after_approval(
                 });
                 persist_and_hint(opts, verb, channel, thread_ts);
                 return ResumeExit::Done;
+            }
+            Outcome::Failed { reply, class } => {
+                ui.emit(&MessageOutcomeOutput::Failed {
+                    thread: thread_ts.to_string(),
+                    reply,
+                    failure_class: class,
+                });
+                persist_and_hint(opts, verb, channel, thread_ts);
+                return ResumeExit::Failed;
             }
             Outcome::CompletedNoEdit => {
                 ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -2550,7 +2874,15 @@ async fn resume_cluster_after_approval(
         last_hint_channel = if ui.json() {
             channel.to_string()
         } else {
-            hint_channel(opts, TurnVerb::Cluster, channel, &current_id, deadline).await
+            hint_channel(
+                opts,
+                TurnVerb::Cluster,
+                channel,
+                &current_id,
+                deadline,
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2589,6 +2921,15 @@ async fn resume_cluster_after_approval(
                 });
                 persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
                 return Ok(ResumeExit::Done);
+            }
+            Outcome::Failed { reply, class } => {
+                ui.emit(&MessageOutcomeOutput::Failed {
+                    thread: thread_ts.to_string(),
+                    reply,
+                    failure_class: class,
+                });
+                persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+                return Ok(ResumeExit::Failed);
             }
             Outcome::CompletedNoEdit => {
                 ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -2636,10 +2977,6 @@ async fn resume_cluster_after_approval(
 /// `local comms --disconnect` restores this value, so seeing it means the compose
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
-
-/// The host in `comms::LOCAL_SLACK_STUB_URL`. A worker whose `SLACK_API_BASE_URL`
-/// points here talks to the in-compose stub, never to Slack.
-const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
 
 /// The Slack transport the RUNNING compose worker is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
@@ -2700,7 +3037,10 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
     let api_base = api_base?;
     // Wired to the stub is not connected: the stub is literally the transport the
     // worker will edit the placeholder over, so no real post can ever be updated.
-    if api_base.contains(LOCAL_SLACK_STUB_HOST) {
+    let Ok(resources) = crate::local::current_resources() else {
+        return None;
+    };
+    if api_base.contains(&format!("localhost:{}", resources.stub_port)) {
         return None;
     }
     let token = token?.trim().to_string();
@@ -2925,15 +3265,41 @@ fn connected_turn(
 }
 
 /// Resolve the target channel (and the sole-agent hint for resolve messages) for
-/// a cluster turn: an explicit `--channel`, else the sole bound Slack pair via a
-/// short-lived API port-forward (dropped once the lookup returns). Shared by the
-/// stub path and the connected-transport path.
+/// a cluster turn: `--agent`'s own Slack binding (channel and identity), else
+/// an explicit `--channel`, else the sole bound Slack pair via a short-lived
+/// API port-forward (dropped once the lookup returns). Shared by the stub path
+/// and the connected-transport path.
 async fn resolve_cluster_channel(
     opts: &MessageOpts,
     fullname: &crate::ops::ReleaseFullname,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, Option<String>)> {
+    // `--agent` (ADR-0168 decision 8) needs the agent listing even when
+    // `--channel` is also passed, to check the identity the named binding
+    // speaks through -- a plain `--channel` never has, so that branch below
+    // still skips the port-forward entirely.
+    if let Some(agent) = opts.agent.as_deref() {
+        let (_api_pf, api_local_port) = start_port_forward(
+            &port_forward_command(
+                &opts.namespace,
+                fullname,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            ),
+            opts.api_local_port,
+            "api",
+        )
+        .await?;
+        let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+        let agents = api
+            .list_agents()
+            .await
+            .context("listing agents through the api port-forward")?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        return Ok((route.channel, Some(route.agent), route.identity));
+    }
     match opts.channel.as_deref() {
-        Some(channel) => Ok((channel.to_string(), None)),
+        Some(channel) => Ok((channel.to_string(), None, None)),
         None => {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
@@ -2953,7 +3319,7 @@ async fn resolve_cluster_channel(
                 .await
                 .context("listing agents through the api port-forward")?;
             let channel = select_channel(&agents, None)?;
-            Ok((channel, agents.first().map(|a| a.name.clone())))
+            Ok((channel, agents.first().map(|a| a.name.clone()), None))
         }
     }
 }
@@ -2986,7 +3352,8 @@ async fn message_connected(
     )
     .await?;
 
-    let (channel, _agent_hint) = resolve_cluster_channel(&opts, fullname).await?;
+    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, fullname).await?;
+    refuse_named_route_for_cluster_connected(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!(
         "routing to channel {channel} over the connected Slack transport"
     ));
@@ -3119,9 +3486,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     )
     .await?;
 
-    // Channel: explicit --channel, else the sole deployed agent via a
-    // short-lived API port-forward (#766). Shared with the connected path.
-    let (channel, agent_hint) = resolve_cluster_channel(&opts, &fullname).await?;
+    // Channel: --agent's own binding, else explicit --channel, else the sole
+    // deployed agent via a short-lived API port-forward (#766). Shared with
+    // the connected path.
+    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, &fullname).await?;
+    refuse_named_route_for_relay(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // The worker self-dials the in-cluster API; this distinct loopback tunnel is
@@ -3161,7 +3530,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let observed = {
@@ -3189,6 +3558,16 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             Ok(())
+        }
+        Outcome::Failed { reply, class } => {
+            step.fail(&format!("failed ({class})"));
+            ui.emit(&MessageOutcomeOutput::Failed {
+                thread: thread_ts.clone(),
+                reply,
+                failure_class: class,
+            });
+            persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, (_api_pf, _valkey_pf));
         }
         Outcome::CompletedNoEdit => {
             step.done("no edit");
@@ -3226,6 +3605,10 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     .await?
                     {
                         ResumeExit::Done => Ok(()),
+                        ResumeExit::Failed => crate::exit::exit_after_drop(
+                            crate::exit::ExitClass::Failure,
+                            (_api_pf, _valkey_pf),
+                        ),
                         ResumeExit::Transient => crate::exit::exit_after_drop(
                             crate::exit::ExitClass::Transient,
                             (_api_pf, _valkey_pf),
@@ -3256,7 +3639,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -3298,6 +3681,8 @@ pub struct EvalOpts {
     /// silently narrowing to nothing -- a mistyped selector fails the gate.
     pub case_ids: Vec<String>,
     pub channel: Option<String>,
+    /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
+    pub agent: Option<String>,
     pub namespace: String,
     pub release: String,
     pub listen_host: Option<String>,
@@ -3401,10 +3786,15 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
             // tool-call trajectory, so a tool_called grader has nothing to read
             // here and fails closed. The trajectory-aware grade lives on the
             // `skill eval` path (`turn_passes`) and the server-side eval matrix.
-            Outcome::Replied(reply) => case.grader.grade(reply, &[]),
-            Outcome::CompletedNoEdit | Outcome::AwaitingApproval { .. } | Outcome::TimedOut => {
-                false
+            // A failed runner turn never passes, even when its text contains the
+            // grader's expected answer (#3401).
+            Outcome::Replied(reply) => {
+                failure_class_from_reply(reply).is_none() && case.grader.grade(reply, &[])
             }
+            Outcome::Failed { .. }
+            | Outcome::CompletedNoEdit
+            | Outcome::AwaitingApproval { .. }
+            | Outcome::TimedOut => false,
         },
         // Gate-blocked assertion: the turn must have parked awaiting approval, and
         // the latest placeholder text (the model's narration before the gate flip)
@@ -3414,7 +3804,10 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
             Outcome::AwaitingApproval { reply, .. } => {
                 case.grader.grade(reply.as_deref().unwrap_or_default(), &[])
             }
-            Outcome::Replied(_) | Outcome::CompletedNoEdit | Outcome::TimedOut => false,
+            Outcome::Replied(_)
+            | Outcome::Failed { .. }
+            | Outcome::CompletedNoEdit
+            | Outcome::TimedOut => false,
         },
     }
 }
@@ -3422,7 +3815,11 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
 /// The plan a `--dry-run` eval prints: the tier, the suite/case count, and the
 /// same enqueue/port-forward description a real run would produce. Pure so the
 /// rendering is unit-testable with no stack or cluster (mirrors `dry_run_lines`).
-pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) -> Vec<String> {
+pub fn eval_dry_run_lines(
+    opts: &EvalOpts,
+    suite_name: &str,
+    case_count: usize,
+) -> Result<Vec<String>> {
     let tier = if opts.local { "local" } else { "cluster" };
     // A `--model` sweep (#526) is the platform eval plane, so its plan is the
     // trigger-per-model + matrix-poll shape, not the message enqueue path.
@@ -3443,9 +3840,13 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
              (the deployed bundle's cases are graded server-side)",
             opts.models.len()
         )];
-        let target = match opts.channel.as_deref() {
-            Some(channel) => format!("channel {channel}"),
-            None => "the sole deployed agent".to_string(),
+        // @spec ADR-0168 d8. `--agent` beats `--channel` here exactly as the
+        // real sweep resolves it, so the plan names the agent rather than a
+        // channel two identities could share.
+        let target = match (opts.agent.as_deref(), opts.channel.as_deref()) {
+            (Some(agent), _) => format!("agent `{agent}`'s Slack binding"),
+            (None, Some(channel)) => format!("channel {channel}"),
+            (None, None) => "the sole deployed agent".to_string(),
         };
         for model in &opts.models {
             lines.push(format!(
@@ -3455,33 +3856,35 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         lines.push(format!(
             "then poll {api_base}/evals/matrix?suite={suite_name} for per-model pass-rate"
         ));
-        return lines;
+        return Ok(lines);
     }
     let mut lines = vec![format!(
         "grade {case_count} case(s) from suite {suite_name:?} against the {tier} tier"
     )];
     if opts.local {
-        let valkey_url = local_valkey_url(&opts.valkey_password);
-        let api_base = local_api_base(opts.api_url.as_deref());
+        let resources = crate::local::current_resources()?;
+        let valkey_url = local_valkey_url(
+            &opts.valkey_password,
+            &resources.valkey_host,
+            resources.valkey_port,
+        );
+        let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
         lines.push("local mode (compose stack; no kubectl/helm)".to_string());
         lines.push(format!("enqueue onto redis {valkey_url}"));
         lines.push(format!(
-            "stub advertised at http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/"
+            "stub advertised at http://localhost:{}/api/",
+            resources.stub_port
         ));
-        match opts.channel.as_deref() {
-            Some(channel) => lines.push(format!("channel {channel}")),
-            None => lines.push(format!(
-                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
-            )),
-        }
+        lines.push(local_dry_run_channel_line(
+            opts.agent.as_deref(),
+            opts.channel.as_deref(),
+            &api_base,
+        ));
     } else {
-        let host = opts
-            .listen_host
-            .clone()
-            .unwrap_or_else(|| "<auto-detected-local-ip>".to_string());
         // Offline by contract: a dry run contacts no cluster, so it renders the
         // chart's no-override `curie.fullname` rule rather than discovering the
-        // rendered name (#1533).
+        // rendered name (#1533). `--listen-host` and `--listen-port` stay on
+        // the opts struct but do not select a Slack stub.
         let fullname = crate::ops::chart_fullname(&opts.release);
         lines.push(
             port_forward_command(
@@ -3493,21 +3896,23 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
             )
             .display(),
         );
-        if opts.channel.is_none() {
-            lines.push(
-                port_forward_command(
-                    &opts.namespace,
-                    &fullname,
-                    "api",
-                    opts.api_local_port,
-                    API_REMOTE_PORT,
-                )
-                .display(),
-            );
-        }
+        lines.push(
+            port_forward_command(
+                &opts.namespace,
+                &fullname,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            )
+            .display(),
+        );
         lines.push(format!(
-            "stub advertised at {}",
-            advertised_url(&host, opts.listen_port)
+            "poll replies at http://127.0.0.1:{}/cluster-message-replies/<uuid-v4>",
+            opts.api_local_port
+        ));
+        lines.push(format!(
+            "enqueue a synthetic QueuedTurn (adapter {CLUSTER_MESSAGE_RELAY_ADAPTER}, no reply \
+             endpoint, UUIDv4 reply ref)"
         ));
     }
     lines.push(format!("concurrency: sequential ({})", opts.concurrency));
@@ -3522,7 +3927,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
     lines.push(
         "without ambient durable agent memory (eval: conversation prefix per case)".to_string(),
     );
-    lines
+    Ok(lines)
 }
 
 /// Resolve the eval suite the way `skill eval` does: an explicit `--cases`
@@ -3538,17 +3943,25 @@ fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
     crate::evals::load_eval(&path)
 }
 
+/// How one text-graded eval sample collects its reply.
+///
+/// Local eval keeps the compose Slack stub. Cluster eval uses the same
+/// ref-keyed relay as disconnected `cluster message` and never starts a stub.
+enum EvalReplyTransport<'a> {
+    Stub(&'a mut SlackStub),
+    Relay(&'a ApiClient),
+}
+
 /// The shared per-tier eval engine: enqueue one synthetic `QueuedTurn` per case
-/// through the already-stood-up stub + Valkey (the same enqueue+await path a
-/// single `message` walks), grade the captured reply, and collect
-/// `(id, passed, seconds, output)` rows for `report_eval`. Tier-agnostic: the
-/// caller binds the stub/connection for its tier, then hands them here.
+/// through the caller's reply transport + Valkey, grade the captured reply, and
+/// collect `(id, passed, seconds, output)` rows for `report_eval`.
 async fn run_eval_turns(
     opts: &EvalOpts,
     channel: &str,
+    identity: Option<&str>,
     suite: &EvalSuite,
     conn: &mut MultiplexedConnection,
-    stub: &mut SlackStub,
+    mut transport: EvalReplyTransport<'_>,
 ) -> Result<crate::commands::EvalReport> {
     let ui = crate::ui::ui();
     let sampling = opts.sampling;
@@ -3572,16 +3985,44 @@ async fn run_eval_turns(
                 // Thread reset (#1534) must use the same prefixed key the
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-                let reply_endpoint = stub.base_api_url().to_string();
-                let event = eval_case_turn(
-                    "slack",
-                    &channel_id,
-                    &opts.user,
-                    &case.input,
-                    &thread_ts,
-                    &placeholder_ts,
-                    Some(reply_endpoint),
-                );
+                let (event, relay_ref) = match &transport {
+                    EvalReplyTransport::Stub(stub) => {
+                        let reply_endpoint = stub.base_api_url().to_string();
+                        (
+                            speak_as(
+                                eval_case_turn(
+                                    "slack",
+                                    &channel_id,
+                                    &opts.user,
+                                    &case.input,
+                                    &thread_ts,
+                                    &placeholder_ts,
+                                    Some(reply_endpoint),
+                                ),
+                                identity,
+                            ),
+                            None,
+                        )
+                    }
+                    EvalReplyTransport::Relay(_) => {
+                        let reply_ref = uuid::Uuid::new_v4();
+                        let mut event = eval_case_turn(
+                            "slack",
+                            &channel_id,
+                            &opts.user,
+                            &case.input,
+                            &thread_ts,
+                            reply_ref.hyphenated().to_string(),
+                            None,
+                        );
+                        event
+                            .reply_handle
+                            .as_mut()
+                            .expect("eval turns are targeted")
+                            .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+                        (event, Some(reply_ref))
+                    }
+                };
                 // The worker claims under quote(kind):quote(channel):quote(conversation_id),
                 // not the bare eval-prefixed conversation_id. SADD the scoped key
                 // or the drain is a no-op and the sandbox keeps its quota slot (#2259).
@@ -3590,31 +4031,55 @@ async fn run_eval_turns(
                 let started = Instant::now();
                 let stream_id = xadd(conn, &opts.stream, &event).await?;
                 let mut observe_update = |_: &str| {};
-                let outcome = await_reply(
-                    stub,
-                    conn,
-                    &opts.stream,
-                    &stream_id,
-                    &placeholder_ts,
-                    Duration::from_secs(opts.timeout_secs),
-                    &mut observe_update,
-                )
-                .await;
+                let outcome = match &mut transport {
+                    EvalReplyTransport::Stub(stub) => {
+                        await_reply(
+                            stub,
+                            conn,
+                            &opts.stream,
+                            &stream_id,
+                            &placeholder_ts,
+                            Duration::from_secs(opts.timeout_secs),
+                            &mut observe_update,
+                        )
+                        .await
+                    }
+                    EvalReplyTransport::Relay(api) => {
+                        let reply_ref = relay_ref
+                            .as_ref()
+                            .expect("cluster eval relay samples carry a reply ref");
+                        await_cluster_relay(
+                            api,
+                            reply_ref,
+                            0,
+                            Duration::from_secs(opts.timeout_secs),
+                            &mut observe_update,
+                        )
+                        .await?
+                        .outcome
+                    }
+                };
                 // Release this sample's sandbox on every completed/red/timed-out
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
                 queue_thread_reset(conn, &thread_key).await?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
-                    Outcome::Replied(reply) => reply.clone(),
+                    Outcome::Replied(reply) | Outcome::Failed { reply, .. } => reply.clone(),
                     Outcome::AwaitingApproval { reply, .. } => reply.clone().unwrap_or_default(),
                     Outcome::CompletedNoEdit => String::new(),
-                    Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
+                    Outcome::TimedOut => match relay_ref {
+                        // Local stub timeouts keep the capped stream dump (#751).
+                        // Cluster relay timeouts must not.
+                        None => diagnostics(conn, &opts.stream, &stream_id).await,
+                        Some(_) => CLUSTER_EVAL_RELAY_TIMEOUT.to_string(),
+                    },
                 };
                 let passed = reply_passes(case, &outcome);
                 let completed = matches!(
                     outcome,
                     Outcome::Replied(_)
+                        | Outcome::Failed { .. }
                         | Outcome::AwaitingApproval { .. }
                         | Outcome::CompletedNoEdit
                 );
@@ -3825,7 +4290,31 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the target agent's id for the trigger plane. Mirrors `select_channel`
 /// (explicit `--channel` matches an agent's channel, else the sole
 /// deployed agent), but returns the agent id the trigger endpoint keys on.
-pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String> {
+/// An explicit `agent` beats both: it names the agent directly, by name or
+/// id, the same match `select_agent_route` uses.
+/// @spec ADR-0168 d8
+pub fn select_agent_id(
+    agents: &[Agent],
+    agent: Option<&str>,
+    channel: Option<&str>,
+) -> Result<String> {
+    if let Some(agent) = agent {
+        return agents
+            .iter()
+            .find(|a| a.name == agent || a.id == agent)
+            .map(|a| a.id.clone())
+            .ok_or_else(|| {
+                let deployed = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+                crate::exit::usage(format!(
+                    "no deployed agent is named {agent:?} (deployed: {})",
+                    if deployed.is_empty() {
+                        "none".to_string()
+                    } else {
+                        deployed.join(", ")
+                    }
+                ))
+            });
+    }
     if let Some(channel) = channel {
         return agents
             .iter()
@@ -4012,13 +4501,15 @@ fn worker_label_selector() -> String {
     format!("label=com.docker.compose.service={COMPOSE_WORKER_SERVICE}")
 }
 
-fn worker_ps_command() -> OpsCommand {
+fn worker_ps_command(project: &str) -> OpsCommand {
     OpsCommand::new(
         "docker",
         vec![
             plain("ps"),
             plain("--filter"),
             plain(worker_label_selector()),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
             plain("--format"),
             plain("{{.Names}}"),
         ],
@@ -4057,7 +4548,8 @@ fn select_worker_container(stdout: &str) -> Result<String> {
 }
 
 async fn local_worker_container() -> Result<String> {
-    let cmd = worker_ps_command();
+    let project = crate::local::current_resources()?.project;
+    let cmd = worker_ps_command(&project);
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
         bail!("listing the local worker container: {}", stderr.trim());
@@ -4076,7 +4568,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         // A dry run is an offline, non-mutating plan: it does not probe the
         // runtime, so it must not claim what the current stack would do.
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4127,7 +4619,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         .list_agents()
         .await
         .context("listing agents to resolve the eval target")?;
-    let agent_id = select_agent_id(&agents, opts.channel.as_deref())?;
+    let agent_id = select_agent_id(&agents, opts.agent.as_deref(), opts.channel.as_deref())?;
 
     // The suite NAME is what the worker keys on; the cases it grades come from the
     // DEPLOYED bundle, not the local suite, so we do NOT present the local case
@@ -4279,7 +4771,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         .list_agents()
         .await
         .context("listing agents to resolve the trajectory eval target")?;
-    let agent_id = select_agent_id(&agents, opts.channel.as_deref())?;
+    let agent_id = select_agent_id(&agents, opts.agent.as_deref(), opts.channel.as_deref())?;
     let triggered = api
         .trigger_eval(&agent_id, Some(&suite.name), None)
         .await
@@ -4484,12 +4976,17 @@ fn sweep_ready_rows(
 
 async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let ui = crate::ui::ui();
-    let valkey_url = local_valkey_url(&opts.valkey_password);
-    let api_base = local_api_base(opts.api_url.as_deref());
+    let resources = crate::local::current_resources()?;
+    let valkey_url = local_valkey_url(
+        &opts.valkey_password,
+        &resources.valkey_host,
+        resources.valkey_port,
+    );
+    let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4500,7 +4997,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let binding = local_stub_binding();
     let mut stub = SlackStub::start(
         &binding.bind_host,
-        DEFAULT_LOCAL_STUB_PORT,
+        resources.stub_port,
         &binding.advertise_host,
     )
     .await?;
@@ -4509,19 +5006,37 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         stub.base_api_url()
     ));
 
-    let channel = match opts.channel.as_deref() {
-        Some(channel) => channel.to_string(),
-        None => {
-            let api = ApiClient::new(&api_base, &opts.api_key)?;
-            let agents = api.list_agents().await.with_context(|| {
-                format!("listing agents via {api_base} (is `curie local up` running?)")
-            })?;
-            select_channel(&agents, None)?
-        }
+    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
+        let api = ApiClient::new(&api_base, &opts.api_key)?;
+        let agents = api.list_agents().await.with_context(|| {
+            format!("listing agents via {api_base} (is `curie local up` running?)")
+        })?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        (route.channel, route.identity)
+    } else {
+        let channel = match opts.channel.as_deref() {
+            Some(channel) => channel.to_string(),
+            None => {
+                let api = ApiClient::new(&api_base, &opts.api_key)?;
+                let agents = api.list_agents().await.with_context(|| {
+                    format!("listing agents via {api_base} (is `curie local up` running?)")
+                })?;
+                select_channel(&agents, None)?
+            }
+        };
+        (channel, None)
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let results = run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await?;
+    let results = run_eval_turns(
+        &opts,
+        &channel,
+        identity.as_deref(),
+        &suite,
+        &mut conn,
+        EvalReplyTransport::Stub(&mut stub),
+    )
+    .await?;
     crate::commands::report_eval(&results, None, stub)
 }
 
@@ -4570,7 +5085,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4581,15 +5096,8 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     // cluster, and every kubectl target below is a chart resource (#1533).
     let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
 
-    let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
-    let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
-    ui.note(&format!(
-        "slack stub listening; the worker will post to {}",
-        stub.base_api_url()
-    ));
-
     // Valkey port-forward for the enqueue, kept alive for the whole eval loop.
-    let (_valkey_pf, valkey_local_port) = start_port_forward(
+    let (valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &fullname,
@@ -4602,28 +5110,49 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     )
     .await?;
 
-    let channel = match opts.channel.as_deref() {
-        Some(channel) => channel.to_string(),
-        None => {
-            let (_api_pf, api_local_port) = start_port_forward(
-                &port_forward_command(
-                    &opts.namespace,
-                    &fullname,
-                    "api",
-                    opts.api_local_port,
-                    API_REMOTE_PORT,
-                ),
-                opts.api_local_port,
-                "api",
-            )
-            .await?;
-            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
-            let agents = api
-                .list_agents()
-                .await
-                .context("listing agents through the api port-forward")?;
-            select_channel(&agents, None)?
-        }
+    // Relay polling and a missing-channel lookup share one API forward for the
+    // whole run, including when `--channel` is already set.
+    let (api_pf, api_local_port) = start_port_forward(
+        &port_forward_command(
+            &opts.namespace,
+            &fullname,
+            "api",
+            opts.api_local_port,
+            API_REMOTE_PORT,
+        ),
+        opts.api_local_port,
+        "api",
+    )
+    .await?;
+    let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+
+    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
+        let agents = api
+            .list_agents()
+            .await
+            .context("listing agents through the api port-forward")?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        // Cluster eval replies come back through the message relay, which
+        // speaks only as the default identity (ADR-0168 d8).
+        refuse_named_route(
+            route.identity.as_deref(),
+            agent,
+            &route.channel,
+            "the cluster message relay",
+        )?;
+        (route.channel, route.identity)
+    } else {
+        let channel = match opts.channel.as_deref() {
+            Some(channel) => channel.to_string(),
+            None => {
+                let agents = api
+                    .list_agents()
+                    .await
+                    .context("listing agents through the api port-forward")?;
+                select_channel(&agents, None)?
+            }
+        };
+        (channel, None)
     };
     ui.note(&format!("routing to channel {channel}"));
 
@@ -4633,18 +5162,175 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     );
     let mut conn = connect(&valkey_url).await?;
 
-    let results = match run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await {
+    let results = match run_eval_turns(
+        &opts,
+        &channel,
+        identity.as_deref(),
+        &suite,
+        &mut conn,
+        EvalReplyTransport::Relay(&api),
+    )
+    .await
+    {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    // report_eval process::exits on a red suite without unwinding, so the
-    // Valkey forward and stub must move in as guards (#1908).
-    crate::commands::report_eval(&results, None, (_valkey_pf, stub))
+    // report_eval process::exits on a red suite without unwinding, so both
+    // port-forwards must move in as guards (#1908). There is no stub guard.
+    crate::commands::report_eval(&results, None, (valkey_pf, api_pf))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PERSIST_HINT_DRIVER: &str = "CURIE_TEST_PERSIST_HINT_DRIVER";
+
+    fn capture_persist_hint(mode: &str) -> std::process::Output {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "message::tests::persist_and_hint_subprocess_driver",
+                "--nocapture",
+            ])
+            .env(PERSIST_HINT_DRIVER, mode)
+            .env("NO_COLOR", "1")
+            .env("CI", "1")
+            .current_dir(dir.path())
+            .output()
+            .expect("run hint driver")
+    }
+
+    fn captured_stderr(output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn persist_and_hint_subprocess_driver() {
+        let Ok(mode) = std::env::var(PERSIST_HINT_DRIVER) else {
+            return;
+        };
+        let mut opts = MessageOpts::default();
+        match mode.as_str() {
+            "cluster-short" => {
+                opts.namespace = "acme-platform".into();
+                opts.release = "acme-prod".into();
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "cluster-fallback" => {
+                opts.namespace = "acme-platform".into();
+                opts.release = "acme-prod".into();
+                std::fs::write(".curie", "blocks the state directory")
+                    .expect("create state obstruction");
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "cluster-default" => {
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100")
+            }
+            "cluster-default-fallback" => {
+                std::fs::write(
+                    "curie.yaml",
+                    "version: 1\ninstall:\n  namespace: acme-platform\n  release: acme-prod\n",
+                )
+                .expect("write conflicting installation file");
+                std::fs::write(".curie", "blocks the state directory")
+                    .expect("create state obstruction");
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "local" => {
+                opts.namespace = "must-not-appear".into();
+                opts.release = "must-not-appear".into();
+                persist_and_hint(&opts, TurnVerb::Local, "C0EXAMPLE1", "1700000000.000100");
+            }
+            other => panic!("unknown hint driver mode {other}"),
+        }
+    }
+
+    /// Each persist-hint driver mode, the text its stderr must carry, and the
+    /// text it must not. Every mode must also exit successfully.
+    #[test]
+    fn persist_hint_carries_the_right_target_flags_per_mode() {
+        struct Case {
+            name: &'static str,
+            mode: &'static str,
+            contains: &'static [&'static str],
+            absent: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                name: "cluster_continue_nondefault_target",
+                mode: "cluster-short",
+                contains: &[
+                    "curie cluster message",
+                    "--namespace",
+                    "acme-platform",
+                    "--release",
+                    "acme-prod",
+                    "--continue",
+                ],
+                absent: &[],
+            },
+            Case {
+                name: "cluster_fallback_nondefault_target",
+                mode: "cluster-fallback",
+                contains: &[
+                    "could not save turn context",
+                    "curie cluster message",
+                    "--namespace",
+                    "acme-platform",
+                    "--release",
+                    "acme-prod",
+                    "--channel",
+                    "C0EXAMPLE1",
+                    "--thread",
+                    "1700000000.000100",
+                ],
+                absent: &[],
+            },
+            Case {
+                name: "default_cluster_both_target_flags",
+                mode: "cluster-default",
+                contains: &["--namespace curie", "--release curie", "--continue"],
+                absent: &[],
+            },
+            Case {
+                name: "default_cluster_fallback_cannot_redirect_to_file_target",
+                mode: "cluster-default-fallback",
+                contains: &[
+                    "could not save turn context",
+                    "--namespace curie",
+                    "--release curie",
+                ],
+                absent: &["acme-platform", "acme-prod", "--continue"],
+            },
+            Case {
+                name: "local_no_cluster_target_flags",
+                mode: "local",
+                contains: &[],
+                absent: &["--namespace", "--release", "must-not-appear"],
+            },
+        ];
+        for case in cases {
+            let output = capture_persist_hint(case.mode);
+            let text = captured_stderr(&output);
+            assert!(output.status.success(), "[{}] {text}", case.name);
+            for needle in case.contains {
+                assert!(
+                    text.contains(needle),
+                    "[{}] missing {needle:?}: {text}",
+                    case.name
+                );
+            }
+            for needle in case.absent {
+                assert!(
+                    !text.contains(needle),
+                    "[{}] unexpected {needle:?}: {text}",
+                    case.name
+                );
+            }
+        }
+    }
 
     const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
         "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4729,6 +5415,7 @@ mod tests {
             .map(|name| (name.to_string(), otel_exporter_test_value(name)))
             .collect();
         let command = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["/tmp/curie compose.yaml".to_string()],
             "curie-dispatcher-enqueue-test",
             "test:curie:runs",
@@ -4840,6 +5527,7 @@ mod tests {
                 "UNRELATED_SECRET=must-not-forward\n",
             ));
             let command = dispatcher_enqueue_command(
+                crate::local::COMPOSE_PROJECT,
                 &["/tmp/compose.yaml".to_string()],
                 "curie-dispatcher-enqueue-test",
                 "test:curie:runs",
@@ -5100,6 +5788,7 @@ mod tests {
     //         turn_channel: &str,
     //         id: &str,
     //         deadline: Instant,
+    //         budget: Duration,
     //     ) -> String
     //
     // The `deadline` parameter is the turn's overall deadline, NOT this
@@ -5107,6 +5796,8 @@ mod tests {
     // `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)` (`cli/src/chat.rs:86`), so
     // a short `--timeout-secs` shortens the lookup rather than being overrun by
     // it. See `the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline`.
+    // `budget` is a parameter so the stalling-peer tests can exercise the bound
+    // with a fraction of a second instead of waiting out the production ten.
     //
     // and, as part of the same contract, the bound it is capped against:
     //
@@ -5240,45 +5931,6 @@ mod tests {
         }
     }
 
-    /// The defect itself (#1531 finding 3): a route binding put the card in a
-    /// different channel, and the hint must name THAT channel.
-    ///
-    /// The hint is a command a human copy-pastes. With the turn channel on it,
-    /// the default approver set -- `SlackChannelMembers(card_channel or
-    /// reply_channel)` in `apps/api/.../slack_approvers.py` -- refuses the
-    /// resolve 403 with "resolve this from the approval's channel", and the
-    /// operator has no way to derive the right value from what was printed.
-    ///
-    /// Mutation it catches: keeping `channel` at the call site, i.e. never
-    /// performing the lookup at all -- which is the pre-change behavior and is
-    /// exactly what every degraded path below must still produce.
-    #[tokio::test]
-    async fn the_hint_names_the_approvals_card_channel_when_a_route_bound_one() {
-        let base = hint_stub_api(200, HINT_ROUTE_BOUND_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_CARD_CHANNEL,
-            "the hint must name the channel the card was posted to, which is \
-             where an authenticated chat principal can act on the card"
-        );
-        assert_ne!(
-            resolved, HINT_TURN_CHANNEL,
-            "the fixture keeps the card and turn channels distinct on purpose; \
-             if they matched, this test could not tell a real lookup from the \
-             unchanged fallback"
-        );
-    }
-
     /// A-T4a. The API is unreachable, so the hint degrades to the turn channel
     /// and does it promptly.
     ///
@@ -5310,6 +5962,7 @@ mod tests {
             HINT_TURN_CHANNEL,
             HINT_APPROVAL_ID,
             hint_far_deadline(),
+            HINT_CHANNEL_LOOKUP_BUDGET,
         )
         .await;
         let elapsed = started.elapsed();
@@ -5354,6 +6007,10 @@ mod tests {
     async fn a_stalled_api_is_cut_off_at_the_budget_rather_than_hanging_the_turn() {
         let (base, stall) = hint_stalling_peer().await;
         let opts = hint_opts(&base);
+        // A short budget stands in for the production one: the bound is the
+        // same code path either way, and waiting out ten real seconds proves
+        // nothing a half second does not.
+        let budget = Duration::from_millis(500);
 
         let started = Instant::now();
         // The outer bound is the test harness's own safety net, deliberately
@@ -5361,18 +6018,19 @@ mod tests {
         // forgot the inner timeout would hang this test forever and block CI
         // instead of failing it. Its expiry IS the failure signal.
         let resolved = tokio::time::timeout(
-            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            budget * 20,
             hint_channel(
                 &opts,
                 TurnVerb::Local,
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 hint_far_deadline(),
+                budget,
             ),
         )
         .await
         .expect(
-            "the lookup never returned within three budgets against a stalled peer, so nothing \
+            "the lookup never returned within twenty budgets against a stalled peer, so nothing \
              is bounding it: a real turn would sit here forever",
         );
         let elapsed = started.elapsed();
@@ -5388,12 +6046,12 @@ mod tests {
         // error path that happened to answer quickly and would leave the real
         // stall unbounded. Upper bound: proves the budget actually fired.
         assert!(
-            elapsed >= HINT_CHANNEL_LOOKUP_BUDGET,
+            elapsed >= budget,
             "returning before the budget means the stall was not reached and \
              this test proved nothing about the bound; took {elapsed:?}"
         );
         assert!(
-            elapsed < HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            elapsed < budget * 4,
             "the lookup must be cut off at its own budget, not left to some \
              wider deadline; took {elapsed:?}"
         );
@@ -5425,20 +6083,24 @@ mod tests {
     async fn the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline() {
         let (base, stall) = hint_stalling_peer().await;
         let opts = hint_opts(&base);
-        // A turn with one second left, against a peer that never answers.
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // A turn with a fifth of a second left, against a peer that never
+        // answers, and a budget twenty times that so only the deadline can end
+        // the lookup early.
+        let budget = Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_millis(200);
 
         let started = Instant::now();
         // Same harness safety net as above: an implementation that ignored the
         // deadline would otherwise hang CI instead of failing it.
         let resolved = tokio::time::timeout(
-            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            budget * 3,
             hint_channel(
                 &opts,
                 TurnVerb::Local,
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 deadline,
+                budget,
             ),
         )
         .await
@@ -5454,173 +6116,148 @@ mod tests {
             "a deadline that expires mid-lookup is 'no answer' like any other, \
              so the hint still degrades to the turn channel"
         );
-        // Half a budget, not the one second itself: the deadline is what must
+        // Half the budget, not the deadline itself: the deadline is what must
         // end this, and anything at or near the full budget means the turn's
         // remaining time was ignored. The slack is deliberately wide so a loaded
         // machine cannot flake it, while still being far below the value a
         // deadline-blind implementation would produce.
         assert!(
-            elapsed < HINT_CHANNEL_LOOKUP_BUDGET / 2,
-            "with one second left on the turn, the lookup must end in about one \
-             second, not run its full budget: a `--timeout-secs 1` turn would \
+            elapsed < budget / 2,
+            "with a fifth of a second left on the turn, the lookup must end in \
+             about that, not run its full budget: a `--timeout-secs 1` turn would \
              otherwise take about eleven seconds and break the hard bound \
              `cli/src/chat.rs:497-499` promises. Took {elapsed:?}"
         );
     }
 
-    /// A-T4b. The lookup succeeds but the record carries no card channel, so
-    /// there is nothing to override with.
-    ///
-    /// A null `card_channel` is an older row or a direct API write, which means
-    /// the REQUESTING channel applies (#1431) -- and the requesting channel is
-    /// the turn channel. Substituting an empty string or the literal "null"
-    /// here would print an unrunnable command.
-    ///
-    /// Mutation it catches: `unwrap_or_default()` on the option, which yields
-    /// an empty, unusable channel hint.
-    #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_record_binds_no_route() {
-        let base = hint_stub_api(200, HINT_UNROUTED_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "a null card_channel means the requesting channel applies, not that \
-             the hint should print an empty or literal-null channel"
-        );
+    /// One stub response for [`hint_channel_resolves_from_the_stubbed_approval_record`].
+    struct HintStubCase {
+        name: &'static str,
+        status: u16,
+        body: &'static str,
+        expected: &'static str,
+        expected_msg: &'static str,
+        /// A channel the result must NOT be, with the reason.
+        not_expected: Option<(&'static str, &'static str)>,
+        /// Also assert the result is non-empty.
+        require_nonempty: bool,
     }
 
-    /// P2. An EMPTY `card_channel` is not a channel, and must degrade exactly
-    /// like a null one.
+    /// Every `hint_channel` case whose only input is the stub API's response.
     ///
-    /// The wire model admits `"card_channel": ""`, and the SERVER already reads
-    /// it as absent: the authorizer resolves the approver set as
-    /// `approval.card_channel or approval.reply_channel`
-    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and an empty string is
-    /// falsy in Python, so the members of the REPLY channel are the approver
-    /// set. A CLI that echoed the empty value would print an unusable hint --
-    /// the exact failure #1531 exists to remove, reintroduced by the fix for it
-    /// and on a record shape nothing else in the suite covers.
-    ///
-    /// The turn channel is the right answer rather than merely a safe one: it
-    /// IS the reply channel, which is what the server falls back to.
-    ///
-    /// Mutation it catches: `Ok(Some(card_channel)) => card_channel` with no
-    /// emptiness check, which is what the current implementation does.
+    /// - `route_bound` (#1531 finding 3): a route binding put the card in a
+    ///   different channel and the hint must name THAT channel; the turn
+    ///   channel would draw a 403 from `SlackChannelMembers(card_channel or
+    ///   reply_channel)`. Catches never performing the lookup.
+    /// - `unrouted` (A-T4b): a null `card_channel` means the requesting (turn)
+    ///   channel applies (#1431). Catches `unwrap_or_default()`.
+    /// - `empty_card_channel` (P2): `""` is falsy in Python, so the server falls
+    ///   back to the reply channel (`slack_approvers.py:174`). Catches a missing
+    ///   emptiness check.
+    /// - `whitespace_card_channel`: `" "` is TRUTHY in Python, so the server
+    ///   authorizes against it verbatim. This row and `empty_card_channel` are
+    ///   deliberately a PAIR differing by one space; do not "simplify" with a
+    ///   `trim()`. Catches `!card_channel.trim().is_empty()`.
+    /// - `approval_gone`: a 404 (another operator resolved or expired it) is
+    ///   absorbed by the advisory wrapper, not surfaced. Catches bubbling the
+    ///   client error out and failing the turn.
     #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_card_channel_is_empty() {
-        let base = hint_stub_api(200, HINT_EMPTY_CARD_APPROVAL).await;
-        let opts = hint_opts(&base);
+    async fn hint_channel_resolves_from_the_stubbed_approval_record() {
+        let cases = [
+            HintStubCase {
+                name: "route_bound",
+                status: 200,
+                body: HINT_ROUTE_BOUND_APPROVAL,
+                expected: HINT_CARD_CHANNEL,
+                expected_msg: "the hint must name the channel the card was posted to, which is \
+                               where an authenticated chat principal can act on the card",
+                not_expected: Some((
+                    HINT_TURN_CHANNEL,
+                    "the fixture keeps the card and turn channels distinct on purpose; \
+                     if they matched, this test could not tell a real lookup from the \
+                     unchanged fallback",
+                )),
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "unrouted",
+                status: 200,
+                body: HINT_UNROUTED_APPROVAL,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "a null card_channel means the requesting channel applies, not that \
+                               the hint should print an empty or literal-null channel",
+                not_expected: None,
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "empty_card_channel",
+                status: 200,
+                body: HINT_EMPTY_CARD_APPROVAL,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "an empty card_channel is what the server itself treats as absent, \
+                               so the hint must name the reply channel the server falls back to, \
+                               which is the turn channel",
+                not_expected: None,
+                require_nonempty: true,
+            },
+            HintStubCase {
+                name: "whitespace_card_channel",
+                status: 200,
+                body: HINT_BLANK_CARD_APPROVAL,
+                expected: HINT_BLANK_CARD_CHANNEL,
+                expected_msg: "a whitespace-only card_channel is TRUTHY in Python, so the server \
+                               authorizes against that exact value; the hint must reproduce it \
+                               byte for byte rather than trimming it away",
+                not_expected: Some((
+                    HINT_TURN_CHANNEL,
+                    "degrading here prints a channel the server will not accept, which \
+                     is the 403 this whole change exists to remove",
+                )),
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "approval_gone",
+                status: 404,
+                body: r#"{"detail":"approval not found"}"#,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "an approval resolved out from under the wait is 'no answer'; the \
+                               hint degrades rather than the turn failing",
+                not_expected: None,
+                require_nonempty: false,
+            },
+        ];
 
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
+        for case in cases {
+            let base = hint_stub_api(case.status, case.body).await;
+            let opts = hint_opts(&base);
 
-        assert!(
-            !resolved.is_empty(),
-            "the hint must never report an empty card location; fall back to \
-             the requesting channel when no route-bound location exists"
-        );
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "an empty card_channel is what the server itself treats as absent, \
-             so the hint must name the reply channel the server falls back to, \
-             which is the turn channel"
-        );
-    }
+            let resolved = hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await;
 
-    /// The other side of that boundary: a WHITESPACE-ONLY `card_channel` is a
-    /// real channel to the server, so the hint must print it VERBATIM.
-    ///
-    /// This test and
-    /// `the_hint_names_the_turn_channel_when_the_card_channel_is_empty` are
-    /// deliberately a PAIR, and the pair is the point. The server picks the
-    /// approver set with `approval.card_channel or approval.reply_channel`
-    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python ONLY the
-    /// empty string is falsy. `" "` is truthy, so the authorizer takes that
-    /// exact whitespace value as the card channel. A CLI that trimmed before
-    /// testing for emptiness would degrade to the turn channel and hand the
-    /// operator the wrong card location -- which is the very failure #1531
-    /// exists to remove, so a guard meant to prevent it would be causing it.
-    ///
-    /// The CLI's job here is to mirror Python falsiness exactly, not to improve
-    /// on it: only `""` is absent, and everything else is printed as-is. A later
-    /// reader must not "simplify" these two tests into one with a `trim()`; the
-    /// two fixtures differ by a single space precisely so that collapse fails.
-    ///
-    /// Mutation it catches: `!card_channel.trim().is_empty()` in place of
-    /// `!card_channel.is_empty()`, which is what the current implementation
-    /// does.
-    #[tokio::test]
-    async fn a_whitespace_only_card_channel_is_a_channel_and_prints_verbatim() {
-        let base = hint_stub_api(200, HINT_BLANK_CARD_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_BLANK_CARD_CHANNEL,
-            "a whitespace-only card_channel is TRUTHY in Python, so the server \
-             authorizes against that exact value; the hint must reproduce it \
-             byte for byte rather than trimming it away"
-        );
-        assert_ne!(
-            resolved, HINT_TURN_CHANNEL,
-            "degrading here prints a channel the server will not accept, which \
-             is the 403 this whole change exists to remove"
-        );
-    }
-
-    /// A 404 is absorbed by the advisory wrapper, not surfaced.
-    ///
-    /// Real rather than theoretical: another operator can resolve or expire the
-    /// approval between the pending notice and the hint. The client method
-    /// propagates the 404 (see `cli/tests/approval_hint_channel.rs`), and this
-    /// is the layer that turns it into today's behavior. The operator then
-    /// discovers the resolution through the wait itself.
-    ///
-    /// Mutation it catches: bubbling the client error out of the wrapper, which
-    /// would make a race between two operators fail the turn.
-    #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_approval_is_already_gone() {
-        let base = hint_stub_api(404, r#"{"detail":"approval not found"}"#).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "an approval resolved out from under the wait is 'no answer'; the \
-             hint degrades rather than the turn failing"
-        );
+            if case.require_nonempty {
+                assert!(
+                    !resolved.is_empty(),
+                    "[{}] the hint must never report an empty card location; fall back to \
+                     the requesting channel when no route-bound location exists",
+                    case.name
+                );
+            }
+            assert_eq!(
+                resolved, case.expected,
+                "[{}] {}",
+                case.name, case.expected_msg
+            );
+            if let Some((forbidden, why)) = case.not_expected {
+                assert_ne!(resolved, forbidden, "[{}] {}", case.name, why);
+            }
+        }
     }
 
     // ─── #1531 finding 3, cluster arm: degradation without a leaked child ────
@@ -5774,6 +6411,7 @@ mod tests {
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 hint_far_deadline(),
+                HINT_CHANNEL_LOOKUP_BUDGET,
             ),
         )
         .await
@@ -5842,10 +6480,14 @@ mod tests {
             worker_label_selector(),
             "label=com.docker.compose.service=curie-worker"
         );
-        let argv = worker_ps_command().display();
+        let argv = worker_ps_command(crate::local::COMPOSE_PROJECT).display();
         assert!(
             argv.contains("--filter label=com.docker.compose.service=curie-worker"),
             "docker ps argv lost the service filter: {argv}"
+        );
+        assert!(
+            argv.contains("--filter label=com.docker.compose.project=curie"),
+            "docker ps argv lost the project filter: {argv}"
         );
     }
 
@@ -5892,11 +6534,15 @@ mod tests {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
+            hook_partitions: None,
+            source_bindings: None,
             channels: channels
                 .iter()
                 .map(|c| crate::api::ChannelBinding {
                     kind: "slack".to_string(),
                     address: c.to_string(),
+                    adapter: None,
+                    allowed_callers: None,
                 })
                 .collect(),
             repo_full_name: None,
@@ -5904,14 +6550,184 @@ mod tests {
             approval_routes: None,
             model: None,
             thinking: None,
+            execution_deadline_seconds: None,
+            runner_resources: None,
             memory: false,
+            memory_writes: false,
+            publication_policy: "approve".to_string(),
+            publication_policy_version: 1,
+            publication_draft: false,
+            publication_branch_prefix: None,
         }
+    }
+
+    fn agent_on(name: &str, routes: &[(&str, Option<&str>)]) -> Agent {
+        let mut agent = test_agent_bound_to(name, &[]);
+        agent.channels = routes
+            .iter()
+            .map(|(address, adapter)| crate::api::ChannelBinding {
+                kind: "slack".to_string(),
+                address: address.to_string(),
+                adapter: adapter.map(str::to_string),
+                allowed_callers: None,
+            })
+            .collect();
+        agent
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_picks_that_agents_binding_and_identity() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        let route = select_agent_route(&agents, "ops", None).unwrap();
+        assert_eq!(route.channel, "C0EXAMPLE1");
+        assert_eq!(route.identity.as_deref(), Some("ops-bot"));
+        assert_eq!(route.agent, "ops");
+        let default = select_agent_route(&agents, "sre-bot", None).unwrap();
+        assert_eq!(
+            default.identity, None,
+            "the default identity stamps nothing"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_accepts_the_agent_id() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        assert_eq!(
+            select_agent_route(&agents, "id-ops", None).unwrap().agent,
+            "ops"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_unknown_agent_is_a_usage_error_listing_the_deployed_ones() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        let err = select_agent_route(&agents, "opz", None).unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        assert!(err.to_string().contains("ops"), "{err}");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_on_several_routes_needs_a_channel_and_lists_them() {
+        let agents = [agent_on(
+            "ops",
+            &[("C0EXAMPLE1", Some("ops-bot")), ("C0EXAMPLE2", None)],
+        )];
+        let err = select_agent_route(&agents, "ops", None).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("C0EXAMPLE1") && text.contains("C0EXAMPLE2"),
+            "{text}"
+        );
+        assert!(text.contains("ops-bot"), "{text}");
+        let one = select_agent_route(&agents, "ops", Some("C0EXAMPLE2")).unwrap();
+        assert_eq!((one.channel.as_str(), one.identity), ("C0EXAMPLE2", None));
+        assert!(select_agent_route(&agents, "ops", Some("C0EXAMPLE9")).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn select_agent_id_prefers_the_agent_selector() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("ops"), Some("C0EXAMPLE1")).unwrap(),
+            "id-ops"
+        );
+        assert!(select_agent_id(&agents, Some("nobody"), None).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_named_route_is_refused_where_the_turn_cannot_speak_as_it() {
+        assert!(refuse_named_route(None, "ops", "C0EXAMPLE1", "the relay").is_ok());
+        let err =
+            refuse_named_route(Some("ops-bot"), "ops", "C0EXAMPLE1", "the relay").unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the relay"),
+            "{text}"
+        );
+    }
+
+    // @spec ADR-0168 d8. Only `refuse_named_route` itself was pinned above; none
+    // of its three call sites (`message_local`'s connected branch,
+    // `message_connected`, and `message_cluster`'s disconnected relay) had a
+    // test that would go red if the call were simply dropped from the caller.
+    // Each call site is factored into its own named, pure wrapper so a test can
+    // reach it without a live dispatcher, connected workspace, or cluster.
+    #[test]
+    fn local_messages_connected_transport_branch_refuses_a_named_route() {
+        let named = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: Some("ops-bot".to_string()),
+            agent: "ops".to_string(),
+        };
+        let err = refuse_named_route_for_local_connected(&named).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        let default = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: None,
+            agent: "ops".to_string(),
+        };
+        assert!(refuse_named_route_for_local_connected(&default).is_ok());
+    }
+
+    #[test]
+    fn message_connected_refuses_a_named_route() {
+        let err =
+            refuse_named_route_for_cluster_connected(Some("ops-bot"), Some("ops"), "C0EXAMPLE1")
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_cluster_connected(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
+    #[test]
+    fn message_clusters_disconnected_relay_refuses_a_named_route() {
+        // #1817's retained compatibility lane: it always speaks as the
+        // installation's default bot, so a named identity must refuse here too.
+        let err =
+            refuse_named_route_for_relay(Some("ops-bot"), Some("ops"), "C0EXAMPLE1").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the disconnected cluster relay"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_relay(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_flag_is_not_counted_as_a_positional() {
+        let args: Vec<String> = ["local", "message", "--agent", "ops", "hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(reject_agent_named_message(&args).is_none());
     }
 
     fn opts(channel: Option<&str>) -> MessageOpts {
         MessageOpts {
             text: "hi".into(),
             channel: channel.map(str::to_string),
+            agent: None,
             thread: None,
             namespace: "curie".into(),
             release: "curie".into(),
@@ -6283,22 +7099,22 @@ mod tests {
             test_agent_bound_to("two", &["C0EXAMPLE3"]),
         ];
         assert_eq!(
-            select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(),
+            select_agent_id(&agents, None, Some("C0EXAMPLE2")).unwrap(),
             "id-one"
         );
         assert_eq!(
-            select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(),
+            select_agent_id(&agents, None, Some("C0EXAMPLE3")).unwrap(),
             "id-two"
         );
         // An address bound to nobody still errors, naming it.
-        assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
+        assert!(select_agent_id(&agents, None, Some("C0EXAMPLE9"))
             .unwrap_err()
             .to_string()
             .contains("C0EXAMPLE9"));
         // Agent selection still counts AGENTS, not pairs: a sole agent with
         // two bindings is one agent, so it resolves with no flag. This is the
         // deliberate asymmetry with `select_channel` above -- do not "fix" it.
-        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
+        assert_eq!(select_agent_id(&agents[..1], None, None).unwrap(), "id-one");
     }
 
     #[test]
@@ -6343,12 +7159,12 @@ mod tests {
     #[test]
     fn local_valkey_url_targets_the_compose_valkey_with_the_password() {
         assert_eq!(
-            local_valkey_url("valkeypass"),
+            local_valkey_url("valkeypass", "localhost", DEFAULT_LOCAL_VALKEY_PORT),
             "redis://:valkeypass@localhost:26379"
         );
         // A custom password flows through unchanged.
         assert_eq!(
-            local_valkey_url("s3cr3t"),
+            local_valkey_url("s3cr3t", "localhost", DEFAULT_LOCAL_VALKEY_PORT),
             "redis://:s3cr3t@localhost:26379"
         );
     }
@@ -6366,7 +7182,6 @@ mod tests {
         // The stub port is coupled to the compose worker's SLACK_API_BASE_URL
         // (http://localhost:8155/api/); pin it so a change to one flags the other.
         assert_eq!(DEFAULT_LOCAL_STUB_PORT, 8155);
-        assert_eq!(DEFAULT_LOCAL_STUB_PORT, DEFAULT_LISTEN_PORT);
     }
 
     /// Native Linux Docker: `network_mode: host` shares the host loopback, so the
@@ -6390,7 +7205,7 @@ mod tests {
         assert_eq!(binding.bind_host, "0.0.0.0");
         assert_eq!(binding.advertise_host, "host.docker.internal");
 
-        let endpoint = local_stub_reply_endpoint(&binding.advertise_host);
+        let endpoint = local_stub_reply_endpoint(&binding.advertise_host, DEFAULT_LOCAL_STUB_PORT);
         assert_eq!(endpoint, "http://host.docker.internal:8155/api/");
         assert!(
             !endpoint.contains("localhost"),
@@ -6486,7 +7301,9 @@ mod tests {
 
     fn local_comms_opts(disconnect: bool) -> crate::comms::LocalCommsOpts {
         crate::comms::LocalCommsOpts {
-            file: "compose.dev.yaml".to_string(),
+            project: crate::local::COMPOSE_PROJECT.to_string(),
+            files: vec!["compose.dev.yaml".to_string()],
+            stub_port: DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: "xapp-real-workspace".to_string(),
             bot_token: "xoxb-real-workspace".to_string(),
@@ -6542,7 +7359,7 @@ mod tests {
             disconnected_env
                 .0
                 .as_deref()
-                .is_some_and(|base| base.contains(LOCAL_SLACK_STUB_HOST)),
+                .is_some_and(|base| base.contains(&format!("localhost:{DEFAULT_LOCAL_STUB_PORT}"))),
             "`local comms --disconnect` must point the worker back at the stub: {:?}",
             disconnected_env.0
         );
@@ -6614,18 +7431,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("create temporary directory");
         let pidfile = temp.path().join("pid");
         let script = temp.path().join("wedged-docker");
-        std::fs::write(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n")
-            .expect("write wedged docker shim");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("shim metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("make shim executable");
+        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
 
         let cmd = OpsCommand::new(
             script.to_str().expect("shim path is UTF 8"),
@@ -6710,6 +7519,62 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn cluster_message_dry_run_shows_the_agents_binding_not_a_guessed_channel() {
+        // A plain --channel prints verbatim; a real run with --agent instead
+        // resolves that agent's own (channel, identity) pair, which the plan
+        // cannot see offline, so it must say so rather than reprinting whatever
+        // --channel happens to also carry.
+        let mut named = opts(Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = dry_run_lines(&named, "10.1.2.3");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("for channel C123")),
+            "a named agent must not be reported as channel C123: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("a named identity's route is refused")),
+            "the plan must say a named identity is refused on cluster message: {lines:?}"
+        );
+
+        // No --agent still prints the plain --channel line, unchanged.
+        let unnamed = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
+        assert!(
+            unnamed.iter().any(|l| l.contains("for channel C123")),
+            "{unnamed:?}"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn local_dry_run_channel_line_prefers_the_agents_binding() {
+        // Shared by `local message` and `local eval`: an --agent beats a
+        // --channel that happens to also be set, since the real send resolves
+        // the agent's own binding rather than trusting the channel flag.
+        assert_eq!(
+            local_dry_run_channel_line(Some("ops"), Some("C123"), "http://localhost:8080"),
+            "the Slack binding of agent `ops` (channel and identity) via http://localhost:8080/agents"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, Some("C123"), "http://localhost:8080"),
+            "channel C123"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, None, "http://localhost:8080"),
+            "channel <the sole bound (agent, Slack channel) pair via http://localhost:8080/agents>"
+        );
+    }
+
     #[test]
     fn connected_turn_conversation_id_is_the_real_placeholder_ts() {
         // Issue #954: with no --thread the connected path posts a TOP-LEVEL
@@ -6721,16 +7586,20 @@ mod tests {
         // was the wiring, so wiring a synthetic thread back in must fail HERE.
         let placeholder_ts = "1717171717.000900";
         let turn = connected_turn("C-real", &opts(Some("C-real")), None, placeholder_ts);
+        let reply_handle = turn
+            .reply_handle
+            .as_ref()
+            .expect("connected turns are targeted");
         assert_eq!(
-            turn.reply_handle.placeholder.as_deref(),
+            reply_handle.placeholder.as_deref(),
             Some(turn.conversation_id.as_str()),
             "the connected turn must thread on the placeholder we actually posted"
         );
         assert_eq!(turn.conversation_id, placeholder_ts);
-        assert_eq!(turn.reply_handle.channel, "C-real");
+        assert_eq!(reply_handle.channel, "C-real");
         // #770/ADR-0078: no per-turn endpoint, so the reply rides the connected
         // transport.
-        assert!(turn.reply_handle.endpoint.is_none());
+        assert!(reply_handle.endpoint.is_none());
     }
 
     #[test]
@@ -6747,124 +7616,12 @@ mod tests {
             placeholder_ts,
         );
         assert_eq!(turn.conversation_id, thread);
-        assert_eq!(
-            turn.reply_handle.placeholder.as_deref(),
-            Some(placeholder_ts)
-        );
-        assert!(turn.reply_handle.endpoint.is_none());
-    }
-
-    #[test]
-    fn host_is_loopback_recognizes_loopback_names_and_addresses() {
-        assert!(host_is_loopback("localhost"));
-        assert!(host_is_loopback("LocalHost")); // case-insensitive
-        assert!(host_is_loopback("127.0.0.1"));
-        assert!(host_is_loopback("127.0.0.5")); // all of 127.0.0.0/8
-        assert!(host_is_loopback("::1"));
-        assert!(!host_is_loopback("10.0.0.5"));
-        assert!(!host_is_loopback("192.168.65.254"));
-        assert!(!host_is_loopback("my-eks.example.com"));
-    }
-
-    #[test]
-    fn docker_internal_advertise_only_under_vm_platform_and_loopback_server() {
-        // Docker Desktop (VM platform) + a loopback-exposed API server (local
-        // kind) -> advertise host.docker.internal (#900).
-        assert!(prefers_docker_internal_host("127.0.0.1", true));
-        assert!(prefers_docker_internal_host("localhost", true));
-        assert!(prefers_docker_internal_host("::1", true));
-        // Native-Docker Linux never rewrites, even with a loopback API server
-        // (it reaches the host via the bridge gateway / an explicit --listen-host).
-        assert!(!prefers_docker_internal_host("127.0.0.1", false));
-        // A remote / non-loopback API server keeps the local-IP detection path
-        // even on a VM platform (not the local-kind case #900 addresses).
-        assert!(!prefers_docker_internal_host("10.0.0.5", true));
-        assert!(!prefers_docker_internal_host("my-eks.example.com", true));
-    }
-
-    const ADVERTISE_HOST_CHILD_CASE: &str = "CURIE_TEST_ADVERTISE_HOST_CASE";
-
-    fn run_advertise_host_child(case: &str, path: &std::path::Path) {
-        let output =
-            std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
-                .arg("message::tests::advertise_host_child")
-                .arg("--exact")
-                .arg("--nocapture")
-                .env(ADVERTISE_HOST_CHILD_CASE, case)
-                .env("PATH", path)
-                .output()
-                .expect("run advertise host child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "advertise host child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        let sentinel = format!("ADVERTISE_HOST_OK {case}");
-        assert!(
-            stdout
-                .lines()
-                .any(|line| line.trim() == sentinel.as_str()),
-            "advertise host child did not prove case {case} ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertise_host_child() {
-        let Ok(case) = std::env::var(ADVERTISE_HOST_CHILD_CASE) else {
-            return;
-        };
-        match case.as_str() {
-            "kernel_route" => {
-                let target = "192.0.2.1";
-                let socket =
-                    std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route source probe");
-                socket
-                    .connect((target, 6443))
-                    .expect("select route toward documentation address");
-                let expected = socket.local_addr().expect("read route source").ip();
-                let actual = resolve_advertise_host(None)
-                    .await
-                    .expect("derive advertise host");
-                assert_eq!(actual, expected.to_string());
-                assert_ne!(actual, target);
-            }
-            "explicit" => {
-                let actual = resolve_advertise_host(Some("192.0.2.44"))
-                    .await
-                    .expect("accept explicit listen host");
-                assert_eq!(actual, "192.0.2.44");
-            }
-            other => panic!("unknown advertise host child case {other}"),
-        }
-        println!("ADVERTISE_HOST_OK {case}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_advertise_host_uses_kernel_route_source() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tools = tempfile::tempdir().expect("create kubectl stub directory");
-        let kubectl = tools.path().join("kubectl");
-        std::fs::write(
-            &kubectl,
-            "#!/bin/sh\nprintf '%s\\n' 'https://192.0.2.1:6443'\n",
-        )
-        .expect("write kubectl stub");
-        let mut permissions = std::fs::metadata(&kubectl)
-            .expect("read kubectl stub metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
-
-        run_advertise_host_child("kernel_route", tools.path());
-    }
-
-    #[test]
-    fn explicit_listen_host_bypasses_auto_detection() {
-        let no_tools = tempfile::tempdir().expect("create empty executable directory");
-        run_advertise_host_child("explicit", no_tools.path());
+        let reply_handle = turn
+            .reply_handle
+            .as_ref()
+            .expect("connected turns are targeted");
+        assert_eq!(reply_handle.placeholder.as_deref(), Some(placeholder_ts));
+        assert!(reply_handle.endpoint.is_none());
     }
 
     #[test]
@@ -6968,6 +7725,7 @@ mod tests {
         EvalOpts {
             cases: None,
             channel: channel.map(str::to_string),
+            agent: None,
             namespace: "curie".into(),
             release: "curie".into(),
             listen_host: None,
@@ -7069,7 +7827,8 @@ mod tests {
     #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
-        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3);
+        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7106,7 +7865,8 @@ mod tests {
 
     #[test]
     fn eval_dry_run_plan_names_sampling_policy() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7117,7 +7877,8 @@ mod tests {
 
     #[test]
     fn local_eval_dry_run_names_the_channel_lookup_when_omitted() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7126,9 +7887,25 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
     #[test]
-    fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
-        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2);
+    fn local_eval_dry_run_shows_the_agents_binding_when_named() {
+        let mut named = eval_opts(true, Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_eval_dry_run_plan_lists_the_relay_even_with_a_channel() {
+        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7141,16 +7918,26 @@ mod tests {
                 .any(|l| l == "kubectl -n curie port-forward svc/curie-valkey 56381:6379"),
             "{lines:?}"
         );
-        // Explicit channel -> no api forward.
-        assert!(
-            !lines.iter().any(|l| l.contains("svc/curie-api")),
-            "explicit channel needs no api forward: {lines:?}"
-        );
+        // An explicit channel still polls the relay, so the API forward stays.
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("stub advertised at http://")),
+                .any(|l| l == "kubectl -n curie port-forward svc/curie-api 8123:8000"),
+            "explicit channel still needs the relay api forward: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| {
+                l == "poll replies at http://127.0.0.1:8123/cluster-message-replies/<uuid-v4>"
+            }),
             "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("no reply endpoint")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("stub advertised")),
+            "cluster eval must not advertise a Slack stub: {lines:?}"
         );
     }
 
@@ -7168,7 +7955,8 @@ mod tests {
             &sweep_opts(true, Some("C7"), &["opus", "sonnet"]),
             "smoke",
             2,
-        );
+        )
+        .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7197,9 +7985,25 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn model_sweep_dry_run_names_the_agent_over_a_channel_it_also_carries() {
+        let mut named = sweep_opts(true, Some("C7"), &["opus"]);
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("/evals/trigger") && l.contains("agent `ops`'s Slack binding")),
+            "the trigger line must name the agent, not channel C7: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("channel C7")), "{lines:?}");
+    }
+
     #[test]
     fn cluster_model_sweep_dry_run_reaches_the_api_via_port_forward() {
-        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1);
+        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7214,43 +8018,65 @@ mod tests {
             Agent {
                 id: "a1".into(),
                 name: "one".into(),
+                hook_partitions: None,
+                source_bindings: None,
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C1".into(),
+                    adapter: None,
+                    allowed_callers: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                execution_deadline_seconds: None,
+                runner_resources: None,
                 memory: false,
+                memory_writes: false,
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
             },
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
+                hook_partitions: None,
+                source_bindings: None,
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C2".into(),
+                    adapter: None,
+                    allowed_callers: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                execution_deadline_seconds: None,
+                runner_resources: None,
                 memory: false,
+                memory_writes: false,
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
             },
         ];
         // Explicit channel picks the matching agent's id.
-        assert_eq!(select_agent_id(&agents, Some("C2")).unwrap(), "a2");
+        assert_eq!(select_agent_id(&agents, None, Some("C2")).unwrap(), "a2");
         // An unknown channel errors, naming the channel.
-        assert!(select_agent_id(&agents, Some("C9"))
+        assert!(select_agent_id(&agents, None, Some("C9"))
             .unwrap_err()
             .to_string()
             .contains("C9"));
         // Many agents + no channel is ambiguous.
-        assert!(select_agent_id(&agents, None).is_err());
+        assert!(select_agent_id(&agents, None, None).is_err());
         // A sole agent + no channel resolves without a flag.
-        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "a1");
+        assert_eq!(select_agent_id(&agents[..1], None, None).unwrap(), "a1");
     }
 
     fn model_summary(
@@ -7501,6 +8327,7 @@ mod tests {
     #[test]
     fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
             "curie:runs",
@@ -7524,6 +8351,7 @@ mod tests {
     #[test]
     fn a_published_stack_leaves_the_image_to_compose() {
         let cmd = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
             "curie:runs",
@@ -7685,29 +8513,324 @@ mod tests {
         }
     }
 
+    /// Decoded the way a relay page is, so a field the DTO grows does not need
+    /// every caller to learn it.
+    fn relay_event(
+        kind: &str,
+        text: Option<&str>,
+        outcome: Option<&str>,
+    ) -> ClusterMessageReplyEvent {
+        serde_json::from_value(serde_json::json!({
+            "event": kind,
+            "text": text,
+            "outcome": outcome,
+        }))
+        .expect("a relay event")
+    }
+
+    /// A reply wire 1.1 progress body as the worker's relay adapter stores it:
+    /// a card edit carries no answer fields, a post carries its text fallback.
+    fn relay_progress(kind: &str, progress: serde_json::Value) -> ClusterMessageReplyEvent {
+        let mut body = serde_json::json!({
+            "version": "1.1",
+            "event": kind,
+            "target": {
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "conversation_id": "thread-example",
+                "reply_ref": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            },
+            "delivery_id": "00000000-0000-4000-8000-000000000002",
+            "progress": progress,
+        });
+        if kind == "reply.post" {
+            body["message"] = serde_json::json!({"version": "1.0", "text": "fallback text"});
+            body["requested_by"] = serde_json::json!("U0EXAMPLE1");
+        } else {
+            for field in ["text", "message", "settled", "nav"] {
+                body[field] = serde_json::Value::Null;
+            }
+        }
+        serde_json::from_value(body).expect("a relay progress event")
+    }
+
+    fn relay_card(state: &str, summary: &str, terminal: bool) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "card",
+            "state": state,
+            "summary": summary,
+            "revision": 2,
+            "terminal": terminal,
+        })
+    }
+
+    /// ADR-0130 decision 5: a card edit is a status line, never the reply, and
+    /// the answer that follows it is still the reply.
     #[test]
-    fn reject_agent_named_message_sees_json_before_the_verb() {
-        let err = reject_agent_named_message(&argv(&[
-            "--json",
-            "local",
-            "message",
-            "acme-bot",
-            "Who are you?",
-        ]))
-        .expect("global --json must not hide the two-positional trap");
-        assert!(format!("{err:#}").contains("local message"), "{err:#}");
+    fn a_progress_update_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.update",
+                    relay_card("testing", "Running the integration suite", false),
+                ),
+                relay_event("reply.update", Some("the answer"), None),
+                relay_progress("reply.update", relay_card("complete", "Fix verified", true)),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        match outcome {
+            Outcome::Replied(reply) => assert_eq!(reply, "the answer"),
+            other => panic!("expected Replied, got {other:?}"),
+        }
+        assert_eq!(observed.len(), 3, "{observed:?}");
+        assert!(
+            observed[0].starts_with("Progress")
+                && observed[0].contains("Running the integration suite")
+        );
+        assert_eq!(observed[1], "the answer");
+        assert!(observed[2].starts_with("Progress") && observed[2].contains("Fix verified"));
+    }
+
+    /// A closed card is not the turn's completion: with no `turn.completed` the
+    /// wait keeps polling for the answer.
+    #[test]
+    fn a_terminal_card_without_a_completion_keeps_waiting() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_progress(
+                "reply.update",
+                relay_card("complete", "Fix verified", true),
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification");
+
+        assert!(outcome.is_none());
+        assert_eq!(latest, None);
+    }
+
+    /// A progress post (a card's first revision or a milestone) is a status
+    /// line; its text fallback is not a reply the wait could report.
+    #[test]
+    fn a_progress_post_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.post",
+                    serde_json::json!({
+                        "kind": "milestone",
+                        "milestone": "evidence",
+                        "summary": "Found the failing migration",
+                        "ordinal": 1,
+                    }),
+                ),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        assert!(matches!(outcome, Outcome::CompletedNoEdit), "{outcome:?}");
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert!(
+            observed[0].starts_with("Milestone")
+                && observed[0].contains("Found the failing migration")
+        );
     }
 
     #[test]
-    fn reject_agent_named_message_sees_json_between_target_and_verb() {
-        let err = reject_agent_named_message(&argv(&[
-            "cluster",
-            "--json",
-            "message",
-            "acme-bot",
-            "Who are you?",
-        ]))
-        .expect("global --json between target and verb must not hide the trap");
-        assert!(format!("{err:#}").contains("cluster message"), "{err:#}");
+    fn cluster_relay_page_treats_publication_result_update_as_terminal() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "reply.update",
+                Some("Publication failed safely after approval: card delivery failed"),
+                None,
+            )],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("publication result classification")
+        .expect("must stop waiting");
+        match outcome {
+            Outcome::Replied(reply) => {
+                assert!(reply.contains("Publication failed safely after approval"));
+            }
+            other => panic!("expected Replied, got {other:?}"),
+        }
+        assert_eq!(observed.len(), 1);
+    }
+
+    #[test]
+    fn cluster_relay_page_treats_published_result_update_as_terminal() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "reply.update",
+                Some(
+                    "Published the approved changes: https://github.com/acme-corp/acme-bot/pull/1",
+                ),
+                None,
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("published result classification")
+        .expect("must stop waiting after the PR lands");
+        match outcome {
+            Outcome::Replied(reply) => assert!(reply.contains("pull/1")),
+            other => panic!("expected Replied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_relay_page_keeps_waiting_on_card_post_without_result() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event("reply.post", None, None)],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("card post classification");
+        assert!(
+            outcome.is_none(),
+            "an approval card without a publication result must keep polling"
+        );
+    }
+
+    #[test]
+    fn cluster_relay_page_still_parks_on_awaiting_approval_completion() {
+        let mut latest = Some("approve 3f2504e0-4f89-41d3-9a0c-0305e82c3301".to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "turn.completed",
+                None,
+                Some("awaiting-approval"),
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("awaiting-approval classification")
+        .expect("must still park");
+        match outcome {
+            Outcome::AwaitingApproval { .. } => {}
+            other => panic!("expected AwaitingApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escalated_completion_is_not_a_successful_reply_even_when_the_text_looks_done() {
+        let success = "Task complete. All checks passed.";
+        let mut latest = Some(success.to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some(success), None),
+                relay_event("turn.completed", None, Some("escalated")),
+            ],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("escalation is terminal");
+        match &outcome {
+            Outcome::Failed { class, reply } => {
+                assert_eq!(class, "unclassified");
+                assert_eq!(reply, success);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let case = eval_case(GraderKind::Contains, "Task complete");
+        assert!(!reply_passes(&case, &outcome));
+    }
+
+    #[test]
+    fn a_failure_marked_reply_exposes_its_class_and_does_not_pass() {
+        let reply = "curie-turn-failure: max-turns\n\nThe run failed (max-turns).";
+        let mut latest = Some(reply.to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some(reply), None),
+                relay_event("turn.completed", None, Some("escalated")),
+            ],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("marked failure is terminal");
+        match &outcome {
+            Outcome::Failed { class, .. } => assert_eq!(class, "max-turns"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let case = eval_case(GraderKind::Contains, "max-turns");
+        assert!(!reply_passes(&case, &outcome));
+        let delivered = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some("the answer is PONG"), None),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut Some("the answer is PONG".to_string()),
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("success is terminal");
+        assert!(matches!(delivered, Outcome::Replied(_)));
+        assert!(reply_passes(
+            &eval_case(GraderKind::Contains, "PONG"),
+            &delivered
+        ));
+    }
+
+    #[test]
+    fn turn_failure_reply_prefix_matches_the_frozen_vector() {
+        let raw = include_str!("../../tests/vectors/turn-failure-reply.json");
+        let vector: serde_json::Value = serde_json::from_str(raw).expect("vector json");
+        let allowed = [
+            "comment",
+            "reply_prefix",
+            "factory_class_line_prefix",
+            "examples",
+        ];
+        let object = vector.as_object().expect("vector object");
+        let unknown: Vec<_> = object
+            .keys()
+            .filter(|key| !allowed.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        assert!(unknown.is_empty(), "unknown vector keys: {unknown:?}");
+        let prefix = vector["reply_prefix"].as_str().expect("reply_prefix");
+        assert_eq!(prefix, crate::chat::TURN_FAILURE_REPLY_PREFIX);
+        for example in vector["examples"].as_array().expect("examples") {
+            let line = example["reply_first_line"].as_str().expect("line");
+            let class = example["classification"].as_str().expect("class");
+            assert_eq!(failure_class_from_reply(line), Some(class));
+        }
+        assert_eq!(
+            failure_class_from_reply("Task complete.\ncurie-turn-failure: max-turns"),
+            None
+        );
     }
 }

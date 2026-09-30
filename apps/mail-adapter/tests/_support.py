@@ -33,8 +33,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, cast
 
 from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
@@ -247,11 +248,11 @@ class IngressState:
         self.attempts = 0  # includes the ones dropped mid-flight
         self.attempt_times: list[float] = []
         self.drop_next = 0  # simulate N transport failures before answering
-        self.response: tuple[int, dict[str, Any]] = (
+        self.response: tuple[int, dict[str, Any] | str] = (
             200,
             {"event_id": "chn-1-abc", "stream_id": "1-0", "duplicate": False},
         )
-        self.responses: list[tuple[int, dict[str, Any], dict[str, str]]] = []
+        self.responses: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -414,9 +415,12 @@ class IngressHandler(_JsonHandler):
         else:
             status, payload = state.response
             headers = {}
-        body_bytes = json.dumps(payload).encode()
+        # A str payload is sent raw as HTML, the way a proxy or firewall in
+        # front of the platform answers; a dict is the platform's own JSON.
+        is_raw = isinstance(payload, str)
+        body_bytes = payload.encode() if is_raw else json.dumps(payload).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/html" if is_raw else "application/json")
         self.send_header("Content-Length", str(len(body_bytes)))
         for name, value in headers.items():
             self.send_header(name, value)
@@ -487,8 +491,46 @@ def serve(handler: type[BaseHTTPRequestHandler], state: Any) -> ThreadingHTTPSer
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.state = state  # type: ignore[attr-defined]
     server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+    ).start()
     return server
+
+
+@contextmanager
+def refused_agentmail_connection() -> Iterator[str]:
+    """Reserve a loopback port without listening so an HTTP dial gets ECONNREFUSED."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}/v0"
+
+
+class _ThreadThenRefuseHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = b'{"messages":[]}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.server.server_close()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+@contextmanager
+def refused_agentmail_reply() -> Iterator[str]:
+    """Serve the witness read, then refuse the following reply connection."""
+    server = HTTPServer(("127.0.0.1", 0), _ThreadThenRefuseHandler)
+    server.timeout = 5
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v0"
+    finally:
+        server.server_close()
+        thread.join(5)
 
 
 # --- the neutral reply wire the platform speaks to the adapter ---------------
@@ -543,6 +585,60 @@ def reply_post(text: str, conversation_id: str = "thr-1") -> dict[str, Any]:
         "target": target(conversation_id, reply_ref=None),
         "message": {"version": "1.0", "text": text},
         "requested_by": "U9",
+    }
+
+
+def progress_post(
+    summary: str,
+    conversation_id: str = "thr-1",
+    reply_ref: str | None = None,
+    *,
+    delivery_id: str = "00000000-0000-4000-8000-000000000001",
+    kind: str = "card",
+) -> dict[str, Any]:
+    """A reply wire 1.1 progress post (ADR-0130): a card's first revision or a milestone.
+
+    Its ``message.text`` is the plain-text fallback the platform always sends;
+    the mail adapter must not append it to the reply it is buffering.
+    """
+    progress: dict[str, Any] = (
+        {"kind": "card", "state": "investigating", "summary": summary, "revision": 1,
+         "terminal": False}
+        if kind == "card"
+        else {"kind": "milestone", "milestone": "evidence", "summary": summary, "ordinal": 1}
+    )
+    return {
+        "version": "1.1",
+        "event": "reply.post",
+        "target": target(conversation_id, reply_ref=reply_ref),
+        "message": {"version": "1.0", "text": summary},
+        "requested_by": "U9",
+        "delivery_id": delivery_id,
+        "progress": progress,
+    }
+
+
+def progress_update(
+    summary: str,
+    conversation_id: str = "thr-1",
+    reply_ref: str | None = "msg-1",
+    *,
+    state: str = "testing",
+    revision: int = 2,
+) -> dict[str, Any]:
+    """A reply wire 1.1 card edit: no text, message, settled or nav."""
+    return {
+        "version": "1.1",
+        "event": "reply.update",
+        "target": target(conversation_id, reply_ref),
+        "delivery_id": "00000000-0000-4000-8000-000000000002",
+        "progress": {
+            "kind": "card",
+            "state": state,
+            "summary": summary,
+            "revision": revision,
+            "terminal": state in {"complete", "failed", "cancelled"},
+        },
     }
 
 

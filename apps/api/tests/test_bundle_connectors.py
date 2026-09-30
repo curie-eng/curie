@@ -622,7 +622,7 @@ def _agent_row(name: str) -> str:
             async with sessionmaker() as session:
                 agent = Agent(
                     name=name,
-                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4")],
+                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4", adapter="default")],
                 )
                 session.add(agent)
                 await session.commit()
@@ -719,3 +719,135 @@ def test_the_returned_entry_carries_the_connector_credential(tmp_path: Path) -> 
     assert entries["github"]["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
+
+
+# --------------------------------------------------------------------------- #
+# The route renders only what the agent's targets allow (ADR-0168 decision 8).
+# Both appliers of this route, `curie cluster deploy` and the worker's reconcile
+# loop, prune what they own and no longer see, so narrowing here is what keeps
+# an unlisted connector out of the agent's pods.
+# --------------------------------------------------------------------------- #
+_TWO_HOSTED = HOSTED + (
+    "  loki:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    args: [-t, streamable-http]\n"
+    "    env: {GRAFANA_URL: 'https://g.example.com'}\n"
+    "    secrets: [LOKI_TOKEN]\n"
+)
+
+
+def _allowlisted_bundle(root: Path, deploy_yaml: str) -> Path:
+    _bundle(root, _TWO_HOSTED)
+    (root / "b" / "deploy.yaml").write_text(deploy_yaml, encoding="utf-8")
+    return root
+
+
+def _rendered(client: Any, headers: dict[str, str], root: Path) -> dict[str, Any]:
+    agent_id, version_id = _version_with_bundle(client, headers, _archive(root))
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _connector_of(obj: dict[str, Any]) -> str:
+    return obj["metadata"]["labels"]["app.kubernetes.io/name"].rsplit("-mcp-", 1)[1]
+
+
+# @spec ADR-0168 d8
+def test_the_route_renders_only_the_connectors_the_agents_target_lists(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path,
+        "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    connectors: [grafana]\n",
+    )
+    body = _rendered(client, auth_headers, root)
+    assert {_connector_of(o) for o in body["manifests"]} == {"grafana"}
+    assert sorted(body["mcp_entries"]) == ["grafana"]
+    assert body["owned_secret_keys"] == ["GRAFANA_TOKEN"]
+
+
+# @spec ADR-0168 d8
+def test_an_empty_allowlist_renders_nothing_so_the_appliers_prune_everything(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path, "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    connectors: []\n"
+    )
+    body = _rendered(client, auth_headers, root)
+    assert body["manifests"] == []
+    assert body["mcp_entries"] == {}
+    assert body["owned_secret_keys"] == []
+
+
+# @spec ADR-0168 d8
+def test_an_agent_no_target_names_still_renders_every_connector(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path, "targets:\n  dev:\n    agent: acme-dev\n    connectors: []\n"
+    )
+    body = _rendered(client, auth_headers, root)
+    assert {_connector_of(o) for o in body["manifests"]} == {"grafana", "loki"}
+    assert body["owned_secret_keys"] == ["GRAFANA_TOKEN", "LOKI_TOKEN"]
+
+
+# ADR-0168 decision 7: the caller proxy rides every hosted connector render
+# once the API holds a caller public key. The key is a public half frozen in
+# tests/vectors/connector-caller-token.json.
+_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+
+
+def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
+    dep = next(o for o in manifests if o["kind"] == "Deployment")
+    containers = {c["name"]: c for c in dep["spec"]["template"]["spec"]["containers"]}
+    env = {e["name"]: e["value"] for e in containers["caller-proxy"]["env"]}
+    return json.loads(env["CURIE_CALLER_PROXY_ADMITS"])
+
+
+# @spec ADR-0168 d7
+def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None:
+    from plugin_format.connector_render import ConnectorProxy
+
+    root = _bundle(tmp_path, HOSTED)
+    manifests = bundles.render_connector_manifests(
+        bundles.read_connectors(root),
+        release=RELEASE,
+        agent=AGENT,
+        namespace=NAMESPACE,
+        app_name=APP_NAME,
+        secret_name=SECRET_NAME,
+        proxy=ConnectorProxy(image=_PROXY_IMAGE, public_keys=(_CALLER_PUBLIC,)),
+    )
+    # The stored agent name, the same name the worker signs into the token.
+    assert _proxy_admits(manifests) == [AGENT]
+    assert "caller-proxy" not in json.dumps(_render(root))
+
+
+@pytest.fixture
+def _caller_key(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_PUBLIC_KEY", _CALLER_PUBLIC)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE", _PROXY_IMAGE)
+    get_settings.cache_clear()
+    yield
+    monkeypatch.undo()
+    get_settings.cache_clear()
+
+
+# @spec ADR-0168 d7
+def test_the_route_renders_the_proxy_from_the_api_settings(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    body = _rendered(client, auth_headers, _bundle(tmp_path, HOSTED))
+    assert _proxy_admits(body["manifests"]) == ["acme-bot"]
+    service = next(o for o in body["manifests"] if o["kind"] == "Service")
+    assert service["spec"]["ports"][0]["targetPort"] == "caller"

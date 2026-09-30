@@ -41,10 +41,12 @@ from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 
 from .session import SessionRunner
+from .turn_progress import ProgressCapability
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
 _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+_CAPACITY_ADMISSION_HEADER = "X-Curie-Capacity-Admission"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 
@@ -57,6 +59,7 @@ _GATED_PATHS = frozenset(
         "/v1/steer",
         "/v1/interrupt",
         "/v1/timeout",
+        "/v1/turn-admit",
         "/v1/reset",
         "/v1/snapshot",
         "/v1/status",
@@ -165,6 +168,7 @@ def create_app(
             web.post("/v1/steer", _steer),
             web.post("/v1/interrupt", _interrupt),
             web.post("/v1/timeout", _timeout),
+            web.post("/v1/turn-admit", _turn_admit),
             web.post("/v1/reset", _reset),
             web.post("/v1/snapshot", _snapshot),
         ]
@@ -190,6 +194,13 @@ async def _status(request: web.Request) -> web.Response:
         "history_durable": runner.history_durable,
     }
     if request.path == "/v1/status":
+        body["turn_epoch"] = runner.active_turn_epoch
+        body["capacity_admission"] = True
+        admission_epoch = request.headers.get(_TURN_EPOCH_HEADER)
+        if admission_epoch is not None:
+            if not _valid_turn_epoch(admission_epoch):
+                return web.json_response({"error": "invalid turn epoch"}, status=400)
+            body["capacity_admission_result"] = runner.admission_result(admission_epoch)
         attestation = cast("Mapping[str, object] | None", request.app[STATUS_ATTESTATION])
         if attestation is not None:
             body.update(attestation)
@@ -226,6 +237,9 @@ def _parse(body: object) -> Event | Interrupt:
 
 async def _event(request: web.Request) -> web.StreamResponse:
     runner: SessionRunner = request.app[RUNNER]
+    admission_header = request.headers.get(_CAPACITY_ADMISSION_HEADER)
+    if admission_header not in (None, "wait"):
+        return web.json_response({"error": "invalid capacity admission mode"}, status=400)
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001 - map any decode/validation error to 400
@@ -253,8 +267,15 @@ async def _event(request: web.Request) -> web.StreamResponse:
     if traceparent is not None:
         carrier[TRACEPARENT_STREAM_FIELD] = traceparent
     parent = extract_trace_context(carrier)
+    # The turn's deliberate progress capability (ADR 0130): two runner control
+    # headers, like the admission one above, and never ACI fields.
+    progress = ProgressCapability.from_headers(request.headers)
     async with contextlib.aclosing(
-        runner.run_turn(frame, parent=parent, turn_epoch=turn_epoch)
+        runner.run_turn(
+            frame, parent=parent, turn_epoch=turn_epoch,
+            admission_required=admission_header == "wait",
+            progress=progress,
+        )
     ) as stream:
         async for line in stream:
             await response.write(line.encode("utf-8"))
@@ -271,7 +292,7 @@ async def _steer(request: web.Request) -> web.Response:
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
-    delivered = await runner.steer(frame.text)
+    delivered = await runner.steer(frame.text, event=frame)
     if not delivered:
         return web.json_response(
             {"error": "no active turn to steer; open a new /v1/event"}, status=409
@@ -313,6 +334,25 @@ async def _timeout(request: web.Request) -> web.Response:
     assert turn_epoch is not None
     if not await runner.timeout(turn_epoch):
         return web.json_response({"error": "turn epoch is not active"}, status=409)
+    return web.json_response({"ok": True})
+
+
+async def _turn_admit(request: web.Request) -> web.Response:
+    """Resolve the exact capacity turn waiting behind its runner lock."""
+
+    epoch = request.headers.get(_TURN_EPOCH_HEADER)
+    if not _valid_turn_epoch(epoch):
+        return web.json_response({"error": "invalid turn epoch"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid admission body"}, status=400)
+    if not isinstance(body, dict) or type(body.get("allow")) is not bool:
+        return web.json_response({"error": "invalid admission decision"}, status=400)
+    assert epoch is not None
+    runner: SessionRunner = request.app[RUNNER]
+    if not runner.admit_turn(epoch, allow=body["allow"]):
+        return web.json_response({"error": "turn epoch is not pending"}, status=409)
     return web.json_response({"ok": True})
 
 

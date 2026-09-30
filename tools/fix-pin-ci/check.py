@@ -49,6 +49,9 @@ SELECTOR = re.compile(
     r"|runner/tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::"
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
+    r"|cli/tests/local/test_[A-Za-z0-9_-]+\.py::"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
+    r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
     r"|cli/tests/[A-Za-z0-9_-]+\.rs::[A-Za-z_][A-Za-z0-9_]*"
     r"|charts/curie/ci/[A-Za-z0-9_-]+\.sh"
     r")"
@@ -57,9 +60,9 @@ BUG_LABEL = "bug"
 # Discovery surfaces and pin tiers share this order. A pin whose location maps
 # below the closed issue's found:* label fails unless the body also carries
 # `Fix pin waiver: <reason>`. Location, not prose, decides the pin tier:
-# */test_live.py -> live, charts/curie/ci/* -> cluster, everything else that
-# the selector grammar admits -> unit. Ladder rungs are not a declared
-# selector form yet, so a found:local issue with a unit pin needs a waiver.
+# cli/tests/local/test_*.py -> local, */test_live.py -> live,
+# charts/curie/ci/* -> cluster, everything else that the selector grammar
+# admits -> unit.
 TIERS = ("unit", "local", "cluster", "live")
 TIER_RANK = {name: index for index, name in enumerate(TIERS)}
 FOUND_LABELS = {f"found:{name}": name for name in TIERS}
@@ -71,17 +74,15 @@ DISCOVERY_FIELD = re.compile(
     re.MULTILINE,
 )
 WAIVER = re.compile(r"^Fix pin waiver:\s*(?P<reason>.*)$")
-ISSUE_JQ = "{labels:[.labels[].name],body:.body,milestone:.milestone.title}"
-MAPPING_PATH = Path(__file__).resolve().with_name("milestone-trains.json")
+ISSUE_JQ = "{labels:[.labels[].name],body:.body}"
 
 
 @dataclass(frozen=True)
 class IssueRecord:
-    """Labels, body, and milestone of a closed GitHub issue the gate inspects."""
+    """Labels and body of a closed GitHub issue the gate inspects."""
 
     labels: list[str]
     body: str
-    milestone: str | None
 
 
 @dataclass(frozen=True)
@@ -151,32 +152,97 @@ def _base_ref(event: dict[str, object]) -> str:
     return ref
 
 
-def _milestone_trains(path: Path = MAPPING_PATH) -> dict[str, str]:
+def _effective_train(event: dict[str, object]) -> str:
+    base_ref = _base_ref(event)
+    if base_ref in {"main", "next"}:
+        return base_ref
+    if not base_ref.startswith("task/"):
+        raise ValueError(
+            f"pull request base {base_ref!r} is not main, next, or a task branch"
+        )
+
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, dict):
+        raise ValueError("pull request event is missing pull_request")
+    base = pull_request.get("base")
+    if not isinstance(base, dict):
+        raise ValueError("pull request is missing base")
+    base_sha = base.get("sha")
+    if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+        raise ValueError("task branch pull request base sha is missing or malformed")
+
+    repository_payload = event.get("repository")
+    if not isinstance(repository_payload, dict):
+        raise ValueError("pull request event is missing repository")
+    repository = repository_payload.get("full_name")
+    if not isinstance(repository, str) or repository.count("/") != 1:
+        raise ValueError("pull request event repository full name is missing or malformed")
+    owner, name = repository.split("/", 1)
+    if not owner or not name:
+        raise ValueError("pull request event repository full name is missing or malformed")
+
+    base_repository = base.get("repo")
+    if not isinstance(base_repository, dict) or base_repository.get("full_name") != repository:
+        raise ValueError("pull request base repository does not match the event repository")
+
+    gh = shutil.which("gh")
+    if gh is None:
+        raise ValueError("gh is not on PATH, so the prerequisite pull request cannot be read")
+    completed = subprocess.run(
+        [
+            gh,
+            "api",
+            f"repos/{repository}/pulls",
+            "--method",
+            "GET",
+            "--raw-field",
+            f"head={owner}:{base_ref}",
+            "--raw-field",
+            "state=open",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"could not read prerequisite pull requests: {detail}")
+
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"could not read {path.name}: {error}") from error
-    if not isinstance(raw, dict):
-        raise ValueError(f"{path.name} must be an object")
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not parse prerequisite pull requests: {error}") from error
+    if not isinstance(payload, list) or len(payload) != 1:
+        raise ValueError("expected exactly one open prerequisite pull request")
 
-    trains = raw.get("trains")
-    milestones = raw.get("milestones")
-    if not isinstance(trains, dict) or not all(
-        isinstance(kind, str) and isinstance(branch, str) for kind, branch in trains.items()
+    prerequisite = payload[0]
+    if not isinstance(prerequisite, dict) or prerequisite.get("state") != "open":
+        raise ValueError("prerequisite pull request is malformed or not open")
+    head = prerequisite.get("head")
+    parent_base = prerequisite.get("base")
+    if not isinstance(head, dict) or not isinstance(parent_base, dict):
+        raise ValueError("prerequisite pull request is missing head or base")
+    head_repository = head.get("repo")
+    parent_base_repository = parent_base.get("repo")
+    if (
+        not isinstance(head_repository, dict)
+        or head_repository.get("full_name") != repository
+        or not isinstance(parent_base_repository, dict)
+        or parent_base_repository.get("full_name") != repository
     ):
-        raise ValueError(f"{path.name} trains must map kind names to branches")
-    if not isinstance(milestones, dict) or not all(
-        isinstance(name, str) and isinstance(kind, str) for name, kind in milestones.items()
+        raise ValueError("prerequisite pull request must stay in the event repository")
+    if head.get("ref") != base_ref:
+        raise ValueError("prerequisite pull request head does not match the dependent base")
+    head_sha = head.get("sha")
+    if (
+        not isinstance(head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or head_sha != base_sha
     ):
-        raise ValueError(f"{path.name} milestones must map titles to train kinds")
-
-    mapping: dict[str, str] = {}
-    for name, kind in milestones.items():
-        branch = trains.get(kind)
-        if not isinstance(branch, str) or not branch:
-            raise ValueError(f"{path.name} milestone {name!r} has unknown train kind {kind!r}")
-        mapping[name] = branch
-    return mapping
+        raise ValueError("prerequisite pull request head sha is missing, malformed, or stale")
+    parent_train = parent_base.get("ref")
+    if not isinstance(parent_train, str) or parent_train not in {"main", "next"}:
+        raise ValueError("prerequisite pull request must target main or next directly")
+    return parent_train
 
 
 def _declaration(body: str) -> Declaration:
@@ -232,6 +298,8 @@ def _pin_tier(selector: str) -> str:
     # has to survive verify-fix-pin on its own. Until that job can run live
     # tests, a found:live bug is expected to use a lower-tier pin plus
     # `Fix pin waiver:`.
+    if path.startswith("cli/tests/local/"):
+        return "local"
     if filename == "test_live.py":
         return "live"
     if path.startswith("charts/curie/ci/"):
@@ -330,14 +398,9 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
         body = ""
     if not isinstance(body, str):
         raise ValueError(f"could not parse the body of issue #{issue}: not a string")
-    milestone = payload.get("milestone")
-    if milestone is not None and not isinstance(milestone, str):
-        raise ValueError(f"could not parse the milestone of issue #{issue}")
-    title = milestone.strip() if isinstance(milestone, str) and milestone.strip() else None
     return IssueRecord(
         labels=[label for label in labels if isinstance(label, str)],
         body=body,
-        milestone=title,
     )
 
 
@@ -349,34 +412,6 @@ def _closed_issue_records(
         return []
     repository = _repository(event)
     return [(issue, _issue_record(repository, issue)) for issue in issues]
-
-
-def _check_milestone_trains(
-    event: dict[str, object], records: list[tuple[int, IssueRecord]]
-) -> None:
-    if not records:
-        return
-    base = _base_ref(event)
-    trains = _milestone_trains()
-    for number, record in records:
-        if record.milestone is None:
-            if BUG_LABEL in record.labels:
-                raise ValueError(
-                    f"bug issue #{number} has no milestone; "
-                    "assign a patch milestone (main) or a feature milestone (next)"
-                )
-            continue
-        train = trains.get(record.milestone)
-        if train is None:
-            raise ValueError(
-                f"issue #{number} milestone {record.milestone!r} is not in "
-                f"{MAPPING_PATH.name}; add it as patch (main) or feature (next)"
-            )
-        if train != base:
-            raise ValueError(
-                f"issue #{number} milestone {record.milestone} maps to {train}, "
-                f"but this pull request targets {base}"
-            )
 
 
 def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
@@ -401,6 +436,25 @@ def _required_discovery(
     if not found:
         return None
     return max(found, key=lambda tier: TIER_RANK[tier])
+
+
+def _print_verification_failure_guidance() -> None:
+    print(
+        "Fix pin verification failed. This failure is deterministic. Edit the "
+        "PR body's `Fix pin:` declaration or add a changed test. Rerunning "
+        "unchanged will not help.",
+        file=sys.stderr,
+    )
+
+
+def _is_deterministic_pin_failure(stdout: bytes, stderr: bytes) -> bool:
+    return b"UNPINNED" in stdout.splitlines() or any(
+        marker in stderr
+        for marker in (
+            b"selector file was not changed by ",
+            b"selected Rust test node was not changed by ",
+        )
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -432,11 +486,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Fix pin requirement error: {error}", file=sys.stderr)
         return 1
 
-    try:
-        _check_milestone_trains(event, records)
-    except ValueError as error:
-        print(f"Milestone train error: {error}", file=sys.stderr)
-        return 1
+    if records:
+        try:
+            _effective_train(event)
+        except ValueError as error:
+            print(f"Pull request base error: {error}", file=sys.stderr)
+            return 1
 
     if declaration.not_applicable is not None:
         print(f"SKIPPED: Fix pin declared not applicable: {declaration.not_applicable}")
@@ -487,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.stderr.buffer.flush()
 
     if completed.returncode != 0:
+        if _is_deterministic_pin_failure(completed.stdout, completed.stderr):
+            _print_verification_failure_guidance()
         return completed.returncode
     if b"PINNED" not in completed.stdout.splitlines():
         print("Fix pin verification error: verifier did not report PINNED", file=sys.stderr)

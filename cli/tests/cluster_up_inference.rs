@@ -1,9 +1,13 @@
 //! Binary contract for facts inferred by `curie cluster up`.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use serde_json::Value;
 
 const TARGET_RELEASE: &str = "target-release";
 const TARGET_NAMESPACE: &str = "target-namespace";
@@ -24,7 +28,7 @@ fn chart() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie")
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}",
@@ -34,14 +38,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -50,6 +47,7 @@ struct Fixture {
     helm_log: PathBuf,
     kubectl_log: PathBuf,
     upgrade_log: PathBuf,
+    upgrade_argv_log: PathBuf,
     values_dir: PathBuf,
     existing_values: String,
 }
@@ -62,10 +60,11 @@ impl Fixture {
         let helm_log = temp.path().join("helm.log");
         let kubectl_log = temp.path().join("kubectl.log");
         let upgrade_log = temp.path().join("upgrades.log");
+        let upgrade_argv_log = temp.path().join("upgrade-argv.log");
         let values_dir = temp.path().join("helm-values");
         fs::create_dir(&values_dir).expect("create helm-values capture directory");
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -97,9 +96,11 @@ fi
 
 if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     printf '%s\n' "$*" >> "$CURIE_TEST_UPGRADE_LOG"
+    : > "$CURIE_TEST_UPGRADE_ARGV_LOG"
     n=0
     prev=""
     for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$CURIE_TEST_UPGRADE_ARGV_LOG"
         if [ "$prev" = "-f" ]; then
             n=$((n + 1))
             dest="$CURIE_TEST_VALUES_DIR/values-$n.yaml"
@@ -114,12 +115,17 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     exit 0
 fi
 
+if [ "$1" = "history" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+fi
+
 printf 'unexpected helm invocation: %s\n' "$*" >&2
 exit 64
 "#,
         );
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -155,6 +161,7 @@ exit 64
             helm_log,
             kubectl_log,
             upgrade_log,
+            upgrade_argv_log,
             values_dir,
             existing_values: existing_values.to_string(),
         }
@@ -202,6 +209,7 @@ exit 64
             .env("CURIE_TEST_HELM_LOG", &self.helm_log)
             .env("CURIE_TEST_KUBECTL_LOG", &self.kubectl_log)
             .env("CURIE_TEST_UPGRADE_LOG", &self.upgrade_log)
+            .env("CURIE_TEST_UPGRADE_ARGV_LOG", &self.upgrade_argv_log)
             .env("CURIE_TEST_VALUES_DIR", &self.values_dir)
             .env("CURIE_TEST_EXISTING_VALUES", &self.existing_values)
             .env("CURIE_TEST_PROVIDER_EGRESS_JSON", resolver)
@@ -230,6 +238,14 @@ exit 64
 
     fn upgrade_count(&self) -> usize {
         self.upgrade_log().lines().count()
+    }
+
+    fn upgrade_argv(&self) -> Vec<String> {
+        fs::read_to_string(&self.upgrade_argv_log)
+            .unwrap_or_default()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     fn captured_values(&self) -> String {
@@ -264,6 +280,137 @@ fn all_output(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn render_retained_values_with_real_helm(fixture: &Fixture) -> Value {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .expect("locate Helm");
+    assert!(
+        helm.status.success(),
+        "real Helm is required for the retained values render"
+    );
+    let helm = String::from_utf8(helm.stdout).expect("Helm path is UTF 8");
+
+    let probe_chart = fixture._temp.path().join("retained-probe-chart");
+    let templates = probe_chart.join("templates");
+    fs::create_dir_all(&templates).expect("create probe chart templates");
+    fs::write(
+        probe_chart.join("Chart.yaml"),
+        "apiVersion: v2\nname: retained-probe\nversion: 0.1.0\n",
+    )
+    .expect("write probe Chart.yaml");
+    fs::write(
+        probe_chart.join("values.yaml"),
+        fs::read_to_string(Path::new(chart()).join("values.yaml"))
+            .expect("read chart defaults for probe"),
+    )
+    .expect("write probe values.yaml");
+    fs::write(
+        templates.join("values.yaml"),
+        r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retained-probe
+data:
+  values.json: {{ .Values | toJson | quote }}
+"#,
+    )
+    .expect("write probe template");
+
+    let captured = fixture.upgrade_argv();
+    let mut value_args = Vec::new();
+    let mut index = 0;
+    while index < captured.len() {
+        if matches!(
+            captured[index].as_str(),
+            "-f" | "--values" | "--set" | "--set-string" | "--set-json" | "--set-file"
+        ) {
+            let value = captured
+                .get(index + 1)
+                .unwrap_or_else(|| panic!("value flag has no operand: {captured:?}"));
+            value_args.push(captured[index].clone());
+            value_args.push(value.clone());
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    assert!(
+        !value_args.is_empty(),
+        "cluster up produced no Helm value arguments: {captured:?}"
+    );
+
+    let rendered = Command::new(helm.trim())
+        .args(["template", "retained-probe"])
+        .arg(&probe_chart)
+        .args(&value_args)
+        .output()
+        .expect("render captured values with Helm");
+    assert!(
+        rendered.status.success(),
+        "real Helm rejected captured values\nargv: {value_args:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rendered.stdout),
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let manifest: Value = serde_norway::from_slice(&rendered.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse probe ConfigMap ({error}): {}",
+            String::from_utf8_lossy(&rendered.stdout)
+        )
+    });
+    let values = manifest
+        .pointer("/data/values.json")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("probe ConfigMap has no values JSON: {manifest}"));
+    serde_json::from_str(values)
+        .unwrap_or_else(|error| panic!("parse rendered values ({error}): {values}"))
+}
+
+fn render_retained_probe_with_real_helm(fixture: &Fixture) -> Value {
+    let values = render_retained_values_with_real_helm(fixture);
+    serde_json::json!({
+        "metricsIngress": values.pointer("/security/otelCollectorNetworkPolicy/metricsIngress").cloned().unwrap_or(Value::Null),
+        "independentLabels": values.get("independentLabels").cloned().unwrap_or(Value::Null),
+        "ordinary": values.get("ordinary").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn assert_helm_value_argument(fixture: &Fixture, flag: &str, expression: &str) {
+    assert!(
+        fixture
+            .upgrade_argv()
+            .windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == expression),
+        "Helm did not receive {flag} {expression}: {:?}",
+        fixture.upgrade_argv()
+    );
+}
+
+fn assert_retained_empty_collection_refusal(shape: &str, existing: Value, key: &str) {
+    let fixture = Fixture::new(&existing.to_string());
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    let shown = all_output(&output);
+
+    assert!(
+        !output.status.success(),
+        "retained empty {shape} succeeded: {shown}"
+    );
+    assert!(
+        shown.contains(key),
+        "the refusal must name the escaped retained {shape} key {key}: {shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "the retained empty {shape} must refuse before Helm mutation"
+    );
+    assert!(
+        fixture.kubectl_log().is_empty(),
+        "the retained empty {shape} must refuse before Kubernetes mutation: {}",
+        fixture.kubectl_log()
+    );
 }
 
 fn assert_success(fixture: &Fixture, output: &Output) {
@@ -873,5 +1020,373 @@ fn a_fresh_dev_install_does_not_mint_comms_or_sealing_values() {
             && !values.contains("privateKey")
             && !values.contains("apiKey"),
         "a fresh --dev install must not invent comms, sealing, or store secrets: {values}"
+    );
+}
+
+#[test]
+fn retained_dotted_keys_render_as_literal_maps_and_operator_override_wins() {
+    let existing = serde_json::json!({
+        "security": {
+            "allowDevDefaults": true,
+            "otelCollectorNetworkPolicy": {
+                "metricsIngress": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": "observability"
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": "prometheus"
+                        }
+                    }
+                }]
+            }
+        },
+        "independentLabels": {
+            "app.kubernetes.io/name": "retained",
+            "example.com/tier": "retained"
+        },
+        "ordinary": {
+            "mode": "off",
+            "affirmative": "yes",
+            "short": "n",
+            "numeric": "00123",
+            "enabled": true,
+            "replicas": 3
+        }
+    });
+    let fixture = Fixture::new(&existing.to_string());
+    let output = fixture.run(
+        &[],
+        VALID_RESOLVER,
+        &["--set", "independentLabels.example\\.com/tier=operator"],
+    );
+    assert_success(&fixture, &output);
+
+    assert_eq!(
+        render_retained_probe_with_real_helm(&fixture),
+        serde_json::json!({
+            "metricsIngress": [{
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": "observability"
+                    }
+                },
+                "podSelector": {
+                    "matchLabels": {
+                        "app.kubernetes.io/name": "prometheus"
+                    }
+                }
+            }],
+            "independentLabels": {
+                "app.kubernetes.io/name": "retained",
+                "example.com/tier": "operator"
+            },
+            "ordinary": {
+                "mode": "off",
+                "affirmative": "yes",
+                "short": "n",
+                "numeric": "00123",
+                "enabled": true,
+                "replicas": 3
+            }
+        }),
+        "captured cluster up arguments must reconstruct the exact retained maps and scalar types"
+    );
+}
+
+#[test]
+fn retained_empty_string_replaces_a_nonempty_chart_default_in_real_helm() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "global":{"imagePullPolicy":""}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(&fixture, "--set-string", "global.imagePullPolicy=");
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).pointer("/global/imagePullPolicy"),
+        Some(&serde_json::json!("")),
+        "the retained empty string must replace the nonempty chart default"
+    );
+}
+
+#[test]
+fn retained_empty_null_reaches_helm_and_removes_the_coalesced_default_leaf() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "global":{"imagePullPolicy":null}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(&fixture, "--set", "global.imagePullPolicy=null");
+
+    // Real Helm 3 removes this nonempty chart default when --set reaches it as null.
+    assert!(
+        render_retained_values_with_real_helm(&fixture)
+            .pointer("/global/imagePullPolicy")
+            .is_none(),
+        "a retained null must remove the coalesced default leaf"
+    );
+}
+
+#[test]
+fn retained_empty_absent_key_keeps_the_chart_default() {
+    let fixture = Fixture::new(r#"{"security":{"allowDevDefaults":true}}"#);
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).pointer("/global/imagePullPolicy"),
+        Some(&serde_json::json!("IfNotPresent")),
+        "an absent retained key must leave the chart default in place"
+    );
+}
+
+#[test]
+fn retained_empty_false_zero_and_string_controls_keep_their_types() {
+    let existing = serde_json::json!({
+        "security": {"allowDevDefaults": true},
+        "retainedControls": {
+            "flag": false,
+            "zero": 0,
+            "word": "off"
+        }
+    });
+    let fixture = Fixture::new(&existing.to_string());
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).get("retainedControls"),
+        existing.get("retainedControls"),
+        "false, zero, and an ordinary string must remain distinct shapes"
+    );
+}
+
+#[test]
+fn retained_empty_map_refuses_with_the_escaped_path_before_mutation() {
+    assert_retained_empty_collection_refusal(
+        "map",
+        serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "retained.with.dot": {"empty\\map": {}}
+        }),
+        r"retained\.with\.dot.empty\\map",
+    );
+}
+
+#[test]
+fn retained_empty_list_refuses_with_the_escaped_array_path_before_mutation() {
+    assert_retained_empty_collection_refusal(
+        "list",
+        serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "retained.with.dot": {"items": [{"empty.list": []}]}
+        }),
+        r"retained\.with\.dot.items[0].empty\.list",
+    );
+}
+
+#[test]
+fn retained_empty_operator_overrides_replace_empty_collection_shapes() {
+    let map = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{"empty\\map":{}}
+        }"#,
+    );
+    let output = map.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.empty\\map.replacement=operator",
+        ],
+    );
+    assert_success(&map, &output);
+    assert_eq!(
+        render_retained_values_with_real_helm(&map)
+            .pointer("/retained.with.dot/empty\\map/replacement"),
+        Some(&serde_json::json!("operator")),
+        "the operator map replacement must win over the retained empty map"
+    );
+
+    let list = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{"items":[{"empty.list":[]}]}
+        }"#,
+    );
+    let output = list.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.items[0].empty\.list[0]=operator",
+        ],
+    );
+    assert_success(&list, &output);
+    assert_eq!(
+        render_retained_values_with_real_helm(&list)
+            .pointer("/retained.with.dot/items/0/empty.list/0"),
+        Some(&serde_json::json!("operator")),
+        "the operator list replacement must win over the retained empty list"
+    );
+}
+
+#[test]
+fn retained_empty_managed_collection_does_not_refuse() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "api":{"extraEnv":[]}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+}
+
+#[test]
+fn retained_secret_dotted_and_backslash_paths_render_one_literal_map() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "referenceExistingSecret":"acme-external-secret",
+              "ordinary.value":"retained"
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "referenceExistingSecret": "acme-external-secret",
+            "ordinary.value": "retained"
+        })),
+        "both overlay walkers must name the original literal map"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the unescaped Secret walker must not create a sibling map: {rendered}"
+    );
+}
+
+#[test]
+fn retained_secret_operator_override_wins_without_an_unescaped_sibling() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "referenceExistingSecret":"acme-retained-secret",
+              "ordinary.value":"retained"
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.nested\\segment.referenceExistingSecret=acme-operator-secret",
+        ],
+    );
+    assert_success(&fixture, &output);
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "referenceExistingSecret": "acme-operator-secret",
+            "ordinary.value": "retained"
+        })),
+        "the operator Secret reference must replace the retained value"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the retained Secret reference must not create an unescaped sibling: {rendered}"
+    );
+}
+
+#[test]
+fn retained_secret_empty_string_and_null_keep_their_distinct_helm_meanings() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "emptyExistingSecret":"",
+              "nullExistingSecret":null
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(
+        &fixture,
+        "--set-string",
+        r"retained\.with\.dot.nested\\segment.emptyExistingSecret=",
+    );
+    assert_helm_value_argument(
+        &fixture,
+        "--set",
+        r"retained\.with\.dot.nested\\segment.nullExistingSecret=null",
+    );
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    // Real Helm 3 preserves a null key that has no chart default to coalesce.
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "emptyExistingSecret": "",
+            "nullExistingSecret": null
+        })),
+        "an empty Secret reference and a null Secret reference must remain distinct"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the empty Secret references must not create an unescaped sibling: {rendered}"
+    );
+}
+
+#[test]
+fn malformed_retained_values_refuse_before_helm_upgrade() {
+    let fixture = Fixture::new(r#"{"security":{"allowDevDefaults":true}"#);
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+
+    assert!(
+        !output.status.success(),
+        "malformed retained values succeeded"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "malformed retained values must refuse before Helm upgrade"
+    );
+    assert!(
+        all_output(&output).contains("malformed Helm values JSON"),
+        "the refusal must identify the malformed retained values: {}",
+        all_output(&output)
     );
 }

@@ -43,8 +43,15 @@ async def claim_review_delivery(
     until admission commits makes same-header races adopt one canonical result.
     """
     data = _object(payload)
-    source = _object(data.get("review") if event == "pull_request_review" else data.get("comment"))
-    pr = _object(data.get("issue") if event == "issue_comment" else data.get("pull_request"))
+    if event == "issues":
+        source = _object(data.get("issue"))
+        pr = source
+    elif event == "pull_request_review":
+        source = _object(data.get("review"))
+        pr = _object(data.get("pull_request"))
+    else:
+        source = _object(data.get("comment"))
+        pr = _object(data.get("issue") if event == "issue_comment" else data.get("pull_request"))
     sender = _object(data.get("sender"))
     digest = hashlib.sha256(body).hexdigest()
     login = sender.get("login")
@@ -57,7 +64,19 @@ async def claim_review_delivery(
             event_kind=event,
             body_sha256=digest,
             action=_enum(
-                data.get("action"), {"created", "edited", "deleted", "submitted", "dismissed"}
+                data.get("action"),
+                {
+                    "created",
+                    "edited",
+                    "deleted",
+                    "submitted",
+                    "dismissed",
+                    "labeled",
+                    "unlabeled",
+                    "closed",
+                    "opened",
+                    "reopened",
+                },
             ),
             repository_id=_id(_object(data.get("repository")).get("id")),
             installation_id=_id(_object(data.get("installation")).get("id")),

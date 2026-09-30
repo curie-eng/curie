@@ -8,9 +8,11 @@
 //! Hook Jobs use Helm's documented `helm.sh/hook` annotation:
 //! https://helm.sh/docs/topics/charts_hooks/
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use serde_json::{json, Value};
@@ -26,29 +28,26 @@ fn chart() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie")
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut permissions = fs::metadata(&path).expect("stat fake").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("chmod fake executable");
-}
-
 const FAKE_CLUSTER: &str = r###"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import fcntl, json, os, pathlib, sys
 
 NS = "agent-ns"
 RELEASE = "prod-release"
 
 state_path = pathlib.Path(os.environ["CURIE_TEST_CLUSTER_STATE"])
 log_path = pathlib.Path(os.environ["CURIE_TEST_CLUSTER_LOG"])
+state_lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+state_lock = state_lock_path.open("a")
+fcntl.flock(state_lock.fileno(), fcntl.LOCK_EX)
 state = json.loads(state_path.read_text())
 args = sys.argv[1:]
 with log_path.open("a") as log:
     log.write(pathlib.Path(sys.argv[0]).name + " " + " ".join(args) + "\n")
 
 def save():
-    state_path.write_text(json.dumps(state))
+    temp_path = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(state))
+    os.replace(temp_path, state_path)
 
 def fail(message, code=1):
     print(message, file=sys.stderr)
@@ -136,6 +135,8 @@ if program == "helm":
     if args[:2] == ["get", "manifest"]:
         print('{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"acme-probe"}}')
         raise SystemExit(0)
+    if args and args[0] == "history":
+        fail("Error: release: not found")
     if args and args[0] == "uninstall":
         if state["release_exists"]:
             state["release_exists"] = False
@@ -175,7 +176,8 @@ if args and args[0] == "get" and len(args) >= 2:
     if record is None:
         fail(f'Error from server (NotFound): namespaces "{namespace}" not found')
     selector = option("-l", "--selector")
-    if not selector and resource in state["resources"]:
+    field_selector = option("--field-selector")
+    if not selector and not field_selector and resource in state["resources"]:
         state["inventory_seen"].append(resource)
     if resource in ("jobs", "job", "jobs.batch"):
         items = [item for item in state["jobs"].get(namespace, [])
@@ -267,8 +269,8 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir).expect("create bin dir");
-        write_exec(&bin_dir, "helm", FAKE_CLUSTER);
-        write_exec(&bin_dir, "kubectl", FAKE_CLUSTER);
+        test_executable::install_in(&bin_dir, "helm", FAKE_CLUSTER);
+        test_executable::install_in(&bin_dir, "kubectl", FAKE_CLUSTER);
         let state = temp.path().join("state.json");
         let log = temp.path().join("commands.log");
         fs::write(&log, "").expect("write log");

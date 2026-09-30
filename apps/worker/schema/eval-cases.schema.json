@@ -1,6 +1,7 @@
 {
   "$defs": {
     "EvalCase": {
+      "additionalProperties": false,
       "description": "One eval: an input prompt and the grader that judges the answer.\n\n``shared_history`` is the per-case isolation opt-out (#550). Each case runs\nin a *fresh conversation* by default (``False``): the eval driver resets the\nrunner's conversation before the case so it cannot answer from an earlier\ncase's history instead of actually invoking its tools -- a false green for a\nside-effecting agent (the behavior under test never ran) and a silent, order-\ndependent suite. Set ``True`` to deliberately chain a case onto the prior\ncase's conversation (a multi-turn scenario expressed as ordered cases); the\ndriver then skips the reset so the case inherits that history. On the *first*\ncase it is a no-op-with-caveat: there is no prior case to chain onto, so it\nonly means \"do not reset first\", inheriting whatever state the runner already\nheld (empty on a freshly-booted eval runner). Optional with a ``False``\ndefault, so it is a backward-compatible addition to the frozen eval-case\nschema (ADR-0019): an existing suite that omits it keeps decoding.\n\n``expect_status`` asserts the turn's terminal session status: it defaults to\n``done`` (keeping every pre-existing case unchanged), or ``awaiting-approval``\nto assert an approval gate blocked the action -- so a gate holding is a green\nresult instead of a red one.",
       "properties": {
         "expect_status": {

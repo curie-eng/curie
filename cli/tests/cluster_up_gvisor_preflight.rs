@@ -2,8 +2,10 @@
 //! #1653. Every case drives the real `curie cluster up` entrypoint with fake
 //! Helm and kubectl executables on PATH.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -23,7 +25,7 @@ fn chart() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie")
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}",
@@ -33,14 +35,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -87,7 +82,7 @@ impl Fixture {
         let watch_pid = temp.path().join("watch.pid");
         let event_emitted = temp.path().join("event-emitted");
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -226,6 +221,10 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
         printf '%s\n' 'Error: UPGRADE FAILED: pre-upgrade hooks failed: job target-release-preflight-gvisor failed: DeadlineExceeded' >&2
         exit 1
     fi
+    if [ "$CURIE_TEST_HISTORY_STATUS" = "failed" ] && [ ! -s "$CURIE_TEST_UNINSTALL_LOG" ]; then
+        printf '%s\n' 'Error: UPGRADE FAILED: pre-upgrade hooks failed: job target-release-upgrade-drain failed: secret not found' >&2
+        exit 1
+    fi
     sleep 1
     printf '%s\n' 'Release installed'
     exit 0
@@ -250,9 +249,21 @@ if [ "$1" = "history" ]; then
             printf '%s\n' '[{"revision":1,"status":"superseded","chart":"curie-0.0.0","description":"Upgrade complete"},{"revision":2,"status":"failed","chart":"curie-0.0.0","description":"Upgrade \"target-release\" failed: context canceled"}]'
             exit 0
             ;;
-        *)
+        failed)
             printf '%s\n' '[{"revision":1,"status":"failed","chart":"curie-0.0.0","description":"Release \"target-release\" failed: context canceled"}]'
             exit 0
+            ;;
+        pending-install)
+            printf '%s\n' '[{"revision":1,"status":"pending-install","chart":"curie-0.0.0","description":"Initial install underway"}]'
+            exit 0
+            ;;
+        *)
+            if [ -s "$CURIE_TEST_UPGRADE_LOG" ]; then
+                printf '%s\n' '[{"revision":1,"status":"failed","chart":"curie-0.0.0","description":"Release \"target-release\" failed: context canceled"}]'
+                exit 0
+            fi
+            printf '%s\n' 'Error: release: not found' >&2
+            exit 1
             ;;
     esac
 fi
@@ -273,7 +284,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -353,10 +364,19 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
             printf '%s\n' 'Error from server (Forbidden): events is forbidden at the cluster scope' >&2
             exit 1
             ;;
-        *" -n target-namespace "*) ;;
+        *" -n target-namespace "*|*" -n agent-sandbox-system "*) ;;
         *)
-            printf 'event query was not scoped to target-namespace: %s\n' "$*" >&2
+            printf 'event query was not namespaced to the release or controller namespace: %s\n' "$*" >&2
             exit 64
+            ;;
+    esac
+    case " $* " in
+        *involvedObject.kind=Job*) ;;
+        *)
+            # The general cluster-up admission observer lists namespaced Events
+            # as JSON. Keep this independent from the gVisor preflight stream.
+            printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[]}'
+            exit 0
             ;;
     esac
     watch="false"
@@ -477,7 +497,7 @@ exit 64
             event_mode: event_mode.to_string(),
             singleton_mode: singleton_mode.to_string(),
             credential: credential.to_string(),
-            history_status: "failed".to_string(),
+            history_status: "auto".to_string(),
         }
     }
 
@@ -604,8 +624,8 @@ exit 64
         );
         assert_eq!(
             uninstalls.trim(),
-            "uninstall target-release -n target-namespace",
-            "the discard must reuse cluster down's helm uninstall argv:\n{uninstalls}"
+            "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the discard must helm uninstall --wait so owned namespaces are gone before reinstall:\n{uninstalls}"
         );
         let mutations = self.helm_mutations();
         assert_eq!(
@@ -618,7 +638,7 @@ exit 64
             "the interrupted first attempt must be helm upgrade --install:\n{mutations:?}"
         );
         assert_eq!(
-            mutations[1], "uninstall target-release -n target-namespace",
+            mutations[1], "uninstall target-release -n target-namespace --wait --timeout 60s",
             "the failed revision must be uninstalled before the retry:\n{mutations:?}"
         );
         assert!(
@@ -646,6 +666,72 @@ exit 64
         );
     }
 
+    fn write_apply_plan(&self, gvisor_mode: &str) {
+        fs::write(
+            &self.plan_file,
+            format!(
+                "version: 1\ninstall:\n  namespace: {TARGET_NAMESPACE}\n  release: {TARGET_RELEASE}\ncredentials:\n  model: CURIE_CREDENTIALS\nset:\n  fullnameOverride: acme-runtime\n  security.gvisor.mode: \"{gvisor_mode}\"\n"
+            ),
+        )
+        .expect("write apply plan");
+    }
+
+    /// Issue #2856: a later apply/up against a failed-only history must
+    /// uninstall before `helm upgrade --install`, not fire the pre-upgrade drain.
+    fn assert_failed_only_release_discarded_before_install(&self) {
+        let uninstalls = fs::read_to_string(&self.uninstall_log).unwrap_or_default();
+        assert_eq!(
+            uninstalls.lines().count(),
+            1,
+            "a failed-only history must be uninstalled once before install:\n{uninstalls}"
+        );
+        assert_eq!(
+            uninstalls.trim(),
+            "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the discard must helm uninstall --wait so owned namespaces are gone before reinstall:\n{uninstalls}"
+        );
+        let mutations = self.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            2,
+            "must uninstall then upgrade --install, not upgrade a failed revision:\n{mutations:?}"
+        );
+        assert_eq!(
+            mutations[0], "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the failed revision must be uninstalled before helm upgrade --install:\n{mutations:?}"
+        );
+        assert!(
+            mutations[1].starts_with("upgrade --install"),
+            "install after discard must be helm upgrade --install:\n{mutations:?}"
+        );
+        let sequence = fs::read_to_string(&self.helm_sequence).unwrap_or_default();
+        let history = sequence
+            .lines()
+            .position(|line| {
+                line.starts_with("history ")
+                    && line.contains("target-release")
+                    && line.contains("-n target-namespace")
+                    && line.contains("-o json")
+                    && line.contains("--max")
+                    && line.contains("256")
+            })
+            .expect("must read helm history before deciding to discard");
+        let uninstall = sequence
+            .lines()
+            .position(|line| {
+                line == "uninstall target-release -n target-namespace --wait --timeout 60s"
+            })
+            .expect("must uninstall the failed revision");
+        let upgrade = sequence
+            .lines()
+            .position(|line| line.starts_with("upgrade --install"))
+            .expect("must helm upgrade --install after discard");
+        assert!(
+            history < uninstall && uninstall < upgrade,
+            "history, uninstall, then upgrade --install; got:\n{sequence}"
+        );
+    }
+
     fn assert_event_was_observed_for_rendered_job(&self) {
         assert!(
             self.event_emitted.is_file(),
@@ -656,8 +742,13 @@ exit 64
             invocations.contains(&format!("involvedObject.name={RENDERED_JOB}")),
             "the event selector must use the rendered fullname override:\n{invocations}"
         );
-        let watch_invocations: Vec<&str> = invocations
+        let gvisor_invocations: Vec<&str> = invocations
             .lines()
+            .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
+            .collect();
+        let watch_invocations: Vec<&str> = gvisor_invocations
+            .iter()
+            .copied()
             .filter(|line| line.contains("--watch"))
             .collect();
         assert_eq!(
@@ -674,8 +765,9 @@ exit 64
             "one list and watch stream must cover current and future Events:\n{invocations}"
         );
         if self.event_mode != "fresh-namespace" {
-            let snapshots: Vec<&str> = invocations
-                .lines()
+            let snapshots: Vec<&str> = gvisor_invocations
+                .iter()
+                .copied()
                 .filter(|line| !line.contains("--watch"))
                 .collect();
             assert_eq!(
@@ -691,6 +783,7 @@ exit 64
         assert!(
             invocations
                 .lines()
+                .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
                 .all(|line| line.contains("-n target-namespace")
                     && !line.contains("--all-namespaces")),
             "every event query must use namespaced permissions:\n{invocations}"
@@ -713,8 +806,9 @@ exit 64
         assert!(
             fs::read_to_string(&self.event_log)
                 .unwrap_or_default()
-                .is_empty(),
-            "a nonrendering gVisor preflight must not query Events"
+                .lines()
+                .all(|line| !line.contains("involvedObject.name=")),
+            "a nonrendering gVisor preflight must not query the gVisor preflight Event selector"
         );
         assert!(
             !self.watch_pid.exists(),
@@ -914,14 +1008,19 @@ fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
         "the CLI must create the namespace before Helm emits the event observed by the retry"
     );
     let invocations = fs::read_to_string(&fixture.event_log).unwrap_or_default();
+    let gvisor_invocations: Vec<&str> = invocations
+        .lines()
+        .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
+        .collect();
     assert_eq!(
-        invocations.lines().count(),
+        gvisor_invocations.len(),
         2,
-        "fresh namespace recovery must snapshot once and use one list-and-watch stream:\n{invocations}"
+        "fresh namespace recovery must snapshot once and use one gVisor list-and-watch stream:\n{invocations}"
     );
     assert!(
-        invocations
-            .lines()
+        gvisor_invocations
+            .iter()
+            .copied()
             .any(|line| !line.contains("--watch") && line.contains("{range .items[*]}{.metadata.uid}")),
         "the atomically created namespace must establish a stale Event UID boundary:\n{invocations}"
     );
@@ -933,9 +1032,10 @@ fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
         "the stream must inspect current Events without an EventList resource version:\n{invocations}"
     );
     assert!(
-        invocations
-            .lines()
-            .all(|line| line.contains("-n target-namespace") && !line.contains("--all-namespaces")),
+        invocations.lines().all(|line| {
+            (line.contains("-n target-namespace") || line.contains("-n agent-sandbox-system"))
+                && !line.contains("--all-namespaces")
+        }),
         "fresh namespace retries must retain namespaced permissions:\n{invocations}"
     );
     fixture.assert_failed_revision_discarded_before_retry();
@@ -1083,8 +1183,13 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}: {shown}");
     assert!(shown.contains(RUNTIME_CLASS_REJECTION), "{shown}");
     assert!(
-        shown.contains("curie cluster up --set security.gvisor.mode=off"),
-        "prepared apply must retain the explicit recovery: {shown}"
+        shown.contains("curie apply") && shown.contains("platform.gvisor: off"),
+        "prepared apply must point to the file based recovery: {shown}"
+    );
+    assert!(
+        !shown.contains("curie cluster up --set security.gvisor.mode=off")
+            && !shown.contains("security.gvisor.mode=off"),
+        "prepared apply must not direct the operator to a cluster up override: {shown}"
     );
     assert!(
         !shown.contains("inferred that the cluster has no"),
@@ -1100,6 +1205,27 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
     );
     assert_eq!(fixture.upgrade_count(), 1, "prepared apply must not retry");
     fixture.assert_no_failed_revision_discard();
+    fixture.assert_graceful_helm_interruption();
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn prepared_apply_progress_uses_the_file_recovery_path() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL);
+    let (output, _) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        shown.contains("generated strong per-release secrets")
+            && shown.contains("rerunning `curie apply` reuses them"),
+        "the credential progress line must tell file based installs to rerun apply:\n{shown}"
+    );
+    assert!(
+        shown.contains("platform.egress[].host")
+            && shown.contains("rerun `curie apply`")
+            && !shown.contains("curie cluster up"),
+        "the sealed model warning must use the file based remedy:\n{shown}"
+    );
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
 }
@@ -1216,4 +1342,125 @@ fn gvisor_retry_tolerates_an_absent_release_history() {
     assert_automatic_gvisor_recovery_narration(&shown);
     fixture.assert_failed_revision_discarded_before_retry();
     fixture.assert_children_stopped();
+}
+
+/// Issue #2856: `curie apply` against a failed-only revision 1 must discard
+/// that record and install, not take Helm's upgrade path.
+#[test]
+fn apply_discards_a_failed_only_revision_before_install() {
+    let fixture =
+        Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL).with_history_status("failed");
+    fixture.write_apply_plan("off");
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "apply must converge after discarding the failed revision\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait on the pre-upgrade drain hook, elapsed {elapsed:?}\n{shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        1,
+        "apply must install once:\n{shown}"
+    );
+    fixture.assert_failed_only_release_discarded_before_install();
+    fixture.assert_no_event_watch();
+    assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+}
+
+/// Negative for #2856: a known-good history is an in-place upgrade.
+#[test]
+fn apply_preserves_a_known_good_release() {
+    for status in ["deployed", "superseded"] {
+        let fixture =
+            Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL).with_history_status(status);
+        fixture.write_apply_plan("off");
+        let (output, elapsed) = fixture.run_apply();
+        let shown = stderr(&output);
+
+        assert!(
+            output.status.success(),
+            "{status} history must still apply\nstdout:\n{}\nstderr:\n{shown}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(elapsed < Duration::from_secs(3), "{status}: {elapsed:?}");
+        assert_eq!(fixture.upgrade_count(), 1, "{status}");
+        fixture.assert_no_failed_revision_discard();
+        let mutations = fixture.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            1,
+            "{status}: must upgrade the known-good release, not uninstall it:\n{mutations:?}"
+        );
+        assert!(
+            mutations[0].starts_with("upgrade --install"),
+            "{status}: {mutations:?}"
+        );
+        fixture.assert_no_event_watch();
+        assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+    }
+}
+
+/// Sibling of apply: `cluster up` against a failed-only history must discard
+/// before `helm upgrade --install` even when gVisor is already off.
+#[test]
+fn cluster_up_discards_a_failed_only_revision_before_install() {
+    let fixture = Fixture::new("matching", "absent", "").with_history_status("failed");
+    let (output, elapsed) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "cluster up must converge after discarding the failed revision\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait on the pre-upgrade drain hook, elapsed {elapsed:?}\n{shown}"
+    );
+    assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_failed_only_release_discarded_before_install();
+    fixture.assert_no_event_watch();
+    assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+}
+
+/// In-flight Helm status is not an upgrade target and is not silently discarded.
+#[test]
+fn apply_refuses_a_pending_only_revision() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL)
+        .with_history_status("pending-install");
+    fixture.write_apply_plan("off");
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        !output.status.success(),
+        "pending-install must refuse, not helm upgrade --install\n{shown}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must refuse at once, elapsed {elapsed:?}\n{shown}"
+    );
+    assert!(
+        shown.contains("no deployed revision") && shown.contains("pending-install"),
+        "must name the in-flight status:\n{shown}"
+    );
+    assert!(
+        shown.contains(
+            "curie cluster down --yes --namespace target-namespace --release target-release"
+        ),
+        "must name the teardown command:\n{shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "must not helm upgrade:\n{shown}"
+    );
+    fixture.assert_no_failed_revision_discard();
+    fixture.assert_no_event_watch();
 }

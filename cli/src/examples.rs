@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::commands::{self, DeployOpts, DeployTier};
-use crate::ui::DryRunPlan;
+use crate::ui::{CliOutput, DryRunPlan, Ui};
 
 const OBSERVABILITY_NAMESPACE: &str = "observability";
 const CURIE_NAMESPACE: &str = "curie";
@@ -39,9 +39,12 @@ const MIB: u128 = 1024 * 1024;
 const HELM_TIMEOUT: &str = "10m";
 const MANAGED_HELM_RELEASES: [&str; 4] = ["grafana", "loki", "alloy", "prometheus"];
 const GRAFANA_ADMIN_SECRET: &str = "grafana-admin";
+const GRAFANA_CONNECTOR_SECRET: &str = "curie-grafana-connector";
+const GRAFANA_CONNECTOR_KEY: &str = "GRAFANA_SERVICE_ACCOUNT_TOKEN";
 const GRAFANA_RELEASE: &str = "grafana";
 const READER_IDENTITY: &str = "sre-bot-kubernetes";
 const READER_TOKEN_SECRET: &str = "sre-bot-kubernetes-token";
+const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
 const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
 const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 // The platform-upgrade verb. Stripped like the others on a read-only install:
@@ -50,6 +53,17 @@ const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
 const LATEST_RELEASE_TOOL: &str = "self-upgrade/latest_release";
+// Platform publication and the six Kubernetes mutation verbs are always
+// present in the shipped bundle. Only the self upgrade gates come and go with
+// upgrade_enabled.
+const KUBERNETES_MUTATION_TOOLS: &[&str] = &[
+    "pods_delete",
+    "pods_exec",
+    "pods_run",
+    "resources_create_or_update",
+    "resources_delete",
+    "resources_scale",
+];
 // The platform-upgrade objects this installer renders. Names are fixed rather
 // than configurable: the connector is told the CronJob's name through its own
 // env, and two places free to disagree is how a tool ends up refusing every call
@@ -64,7 +78,6 @@ const UPGRADER_TOKEN_SECRET: &str = "sre-bot-upgrader-token";
 const SELF_UPGRADE_KUBECONFIG_SECRET_KEY: &str = "SELF_UPGRADE_KUBECONFIG";
 const PLATFORM_UPGRADER_IDENTITY: &str = "curie-platform-upgrader";
 const PLATFORM_UPGRADE_CRONJOB_NAME: &str = "platform-upgrade";
-const SELF_UPGRADE_CRONJOB_NAME: &str = "sre-bot-self-upgrade";
 const PLATFORM_UPGRADE_CONFIGMAP: &str = "platform-upgrade";
 // The project whose releases define "newest" for the platform upgrade. Fixed
 // rather than a flag: this installer installs THIS project's example, and an
@@ -226,6 +239,10 @@ pub struct SreBotInstallOpts {
     pub observability_namespace: String,
     /// Repeatable `owner/repo` or `owner/*` entries for `api.githubRepoAllowlist`.
     pub workspace_repo: Vec<String>,
+    /// Slack user IDs bound as the explicit approvers of the `sre-approvals`
+    /// route. Each raw `--approvers` value may be comma separated. At least one
+    /// explicit user is required.
+    pub approvers: Vec<String>,
 }
 
 struct InstallIdentity {
@@ -247,6 +264,45 @@ impl InstallIdentity {
 pub enum SreBotInstallResult {
     DryRun(DryRunPlan),
     Installed(Box<commands::DeployOutput>),
+}
+
+pub struct ObservabilityProvisionOpts {
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+    pub chart: Option<String>,
+    pub dry_run: bool,
+}
+
+pub enum ObservabilityProvisionResult {
+    DryRun(DryRunPlan),
+    Ready(ObservabilityProvisionOutput),
+}
+
+pub struct ObservabilityProvisionOutput {
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+}
+
+impl CliOutput for ObservabilityProvisionOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "secret": GRAFANA_CONNECTOR_SECRET,
+            "key": GRAFANA_CONNECTOR_KEY,
+            "namespace": self.namespace,
+            "release": self.release,
+            "observability_namespace": self.observability_namespace,
+            "ready": true,
+        })
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!(
+            "Secret {GRAFANA_CONNECTOR_SECRET} key {GRAFANA_CONNECTOR_KEY} is ready in namespace {}",
+            self.namespace
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -493,8 +549,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         crate::api::validate_allowlist_entry(entry)
             .map_err(|err| crate::exit::usage(err.to_string()))?;
     }
+    let approvers = parse_approvers(&opts.approvers)?;
 
     let identity = InstallIdentity::from_opts(&opts);
+    let mut model = ModelCredential::resolve()?;
 
     preflight_capacity(&identity.observability_namespace).await?;
 
@@ -519,7 +577,9 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             identity.observability_namespace
         ));
         lines.extend(stack_commands.iter().map(|command| command.display(&chart)));
-        lines.extend(apply_curie_platform(&chart, true, &identity, &opts.workspace_repo).await?);
+        lines.extend(
+            apply_curie_platform(&chart, true, &identity, &opts.workspace_repo, &model).await?,
+        );
         lines.push(integration_command.display(&chart));
         lines.push(read_access_command.display(&chart));
         lines.push(format!(
@@ -530,6 +590,16 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             "build the Kubernetes connector kubeconfig in memory from the ServiceAccount token"
                 .to_string(),
         );
+        let resolution = opts
+            .slack_channel
+            .clone()
+            .unwrap_or_else(|| "<the agent's bound Slack channel>".to_string());
+        lines.push(format!(
+            "bind or rebind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} \
+             (creating the agent if absent): resolution {resolution}, approvers users {} (the \
+             only users, operator principals minted for them included, who may resolve its gates)",
+            approvers.join(",")
+        ));
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
             identity.namespace, identity.release
@@ -561,6 +631,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                 "kubectl apply -f <rendered CronJob {PLATFORM_UPGRADE_CRONJOB_NAME}, suspend: \
                  true> -- never fires on its own; the gated {PLATFORM_UPGRADE_GATE} creates a Job \
                  from it when a human approves one"
+            ));
+            lines.push(format!(
+                "leave {UPGRADE_GATE} unarmed: no self-upgrade CronJob is applied, so \
+                 {SELF_UPGRADE_CRONJOB_ENV} is rendered empty and {UPGRADE_TOOL} is not allowed"
             ));
             lines.push(format!(
                 "kubectl wait --namespace {} --for=jsonpath={{.data.token}} \
@@ -598,14 +672,20 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     }
     // Before the apply, not after: the point is to refuse while the credential
     // still exists.
-    refuse_to_drop_a_recorded_model_credential(&identity).await?;
-    apply_curie_platform(&chart, false, &identity, &opts.workspace_repo).await?;
+    if model.declared.is_none() {
+        refuse_to_drop_a_recorded_model_credential(&identity).await?;
+    } else {
+        carry_recorded_runner_egress(&identity, &mut model).await?;
+    }
+    apply_curie_platform(&chart, false, &identity, &opts.workspace_repo, &model).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
     let kubeconfig = kubernetes_connector_kubeconfig(&identity.namespace).await?;
 
     let bundle_dir = workspace.bundle_dir();
     let connection = resolve_embedded_cluster_connection(&identity).await?;
+    // Before the deploy: it refuses a bundle whose declared routes are unbound.
+    bind_sre_approvals_route(&connection, opts.slack_channel.as_deref(), &approvers).await?;
     let deployed =
         deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
     // ALWAYS after the deploy, never before. `install_sre_bot` orders privileged
@@ -639,6 +719,182 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+pub fn observability_provision_plan(
+    chart: &str,
+    namespace: &str,
+    release: &str,
+    observability_namespace: &str,
+) -> Vec<String> {
+    let identity = InstallIdentity {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        observability_namespace: observability_namespace.to_string(),
+    };
+    let chart = Path::new(chart);
+    let mut lines = vec![
+        format!("create namespace {observability_namespace} when it is absent"),
+        format!(
+            "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
+        ),
+    ];
+    lines.extend(
+        stack_install_commands(observability_namespace)
+            .into_iter()
+            .map(|command| command.display(chart)),
+    );
+    lines.push(curie_integration_command(&identity).display(chart));
+    lines.push(format!(
+        "require Secret {GRAFANA_CONNECTOR_SECRET} in namespace {namespace} to contain key {GRAFANA_CONNECTOR_KEY}"
+    ));
+    lines
+}
+
+pub async fn provision_observability(
+    opts: ObservabilityProvisionOpts,
+) -> Result<ObservabilityProvisionResult> {
+    if opts.dry_run {
+        let chart = opts.chart.as_deref().unwrap_or("charts/curie");
+        return Ok(ObservabilityProvisionResult::DryRun(DryRunPlan {
+            lines: observability_provision_plan(
+                chart,
+                &opts.namespace,
+                &opts.release,
+                &opts.observability_namespace,
+            ),
+        }));
+    }
+
+    require_existing_release(&opts.release, &opts.namespace).await?;
+    let chart = provision_chart(opts.chart.as_deref()).await?;
+    preflight_capacity(&opts.observability_namespace).await?;
+    ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+    let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
+    let identity = InstallIdentity {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        observability_namespace: opts.observability_namespace.clone(),
+    };
+    for command in stack_install_commands(&identity.observability_namespace) {
+        run_install_command(&command, &workspace, &chart).await?;
+    }
+    let integration = curie_integration_command(&identity);
+    run_install_command(&integration, &workspace, &chart).await?;
+    require_grafana_connector_token(&identity.namespace).await?;
+    Ok(ObservabilityProvisionResult::Ready(
+        ObservabilityProvisionOutput {
+            namespace: opts.namespace,
+            release: opts.release,
+            observability_namespace: opts.observability_namespace,
+        },
+    ))
+}
+
+async fn require_existing_release(release: &str, namespace: &str) -> Result<()> {
+    crate::ops::require_on_path("helm")?;
+    let output = tokio::process::Command::new("helm")
+        .args(["status", release, "--namespace", namespace])
+        .output()
+        .await
+        .with_context(|| {
+            format!("failed to run `helm status {release} --namespace {namespace}`")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if crate::ops::failure_reason(&stderr) == "Error: release: not found" {
+        return Err(crate::exit::usage(format!(
+            "release {release} in namespace {namespace} does not exist; run `curie cluster up` before provisioning observability"
+        )));
+    }
+    let reason = crate::ops::failure_reason(&stderr);
+    Err(crate::exit::CliError::failure(format!(
+        "could not read Helm status for release {release} in namespace {namespace}: {reason}"
+    ))
+    .into())
+}
+
+async fn provision_chart(chart: Option<&str>) -> Result<PathBuf> {
+    if let Some(chart) = chart {
+        let path = PathBuf::from(chart);
+        if path.is_dir() {
+            return Ok(path);
+        }
+        return Err(crate::exit::usage(format!(
+            "chart directory {} does not exist",
+            path.display()
+        )));
+    }
+    let resolved = crate::artifacts::resolve_chart(
+        None,
+        crate::artifacts::Channel::current(),
+        crate::artifacts::version(),
+        crate::artifacts::cache_root,
+        Path::new("charts/curie").is_dir(),
+    )?;
+    let path = crate::artifacts::ensure_cached(&resolved).await?;
+    if path.exists() {
+        return Ok(path);
+    }
+    Err(crate::exit::usage(format!(
+        "chart {} does not exist",
+        path.display()
+    )))
+}
+
+async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
+    let output = tokio::process::Command::new("kubectl")
+        .args([
+            "get",
+            "secret",
+            GRAFANA_CONNECTOR_SECRET,
+            "--namespace",
+            namespace,
+            "-o",
+            "json",
+        ])
+        .output()
+        .await
+        .context("reading the Grafana connector Secret")?;
+    let present = output.status.success()
+        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .is_ok_and(|secret| grafana_connector_token_present(&secret));
+    drop(output);
+    if present {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::failure(format!(
+        "key {GRAFANA_CONNECTOR_KEY} is absent from Secret {GRAFANA_CONNECTOR_SECRET} in namespace {namespace}"
+    ))
+    .into())
+}
+
+fn grafana_connector_token_present(secret: &serde_json::Value) -> bool {
+    let Some(encoded) = secret
+        .pointer("/data/GRAFANA_SERVICE_ACCOUNT_TOKEN")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(token) = String::from_utf8(decoded) else {
+        return false;
+    };
+    !token.trim().is_empty()
+}
+
+/// Every object `--platform-upgrade` applies, in apply order. One list so the
+/// armed gate set can be checked against it: #2288 shipped `upgrade_self` armed
+/// while this path never applied the CronJob it starts.
+const UPGRADE_PATH_FILES: [&str; 4] = [
+    "manifests/upgrade-role.yaml",
+    "manifests/platform-upgrade-role.yaml",
+    "manifests/platform-upgrade-configmap.yaml",
+    "manifests/platform-upgrade-cronjob.yaml",
+];
+
 /// Apply the upgrade path's objects and mint the connector's kubeconfig.
 ///
 /// Order within this function matters: the identities come first, then the
@@ -651,12 +907,7 @@ async fn apply_upgrade_path(
     chart: &Path,
     namespace: &str,
 ) -> Result<String> {
-    for file in [
-        "manifests/upgrade-role.yaml",
-        "manifests/platform-upgrade-role.yaml",
-        "manifests/platform-upgrade-configmap.yaml",
-        "manifests/platform-upgrade-cronjob.yaml",
-    ] {
+    for file in UPGRADE_PATH_FILES {
         let command = InstallCommand {
             program: "kubectl",
             args: vec![plain("apply"), plain("-f"), CommandArg::BundleFile(file)],
@@ -682,9 +933,9 @@ async fn apply_upgrade_path(
 /// stayed healthy, and the bot kept answering -- in three milliseconds, from the
 /// fake model, "all done" (#2129).
 ///
-/// So the installer asks first. Refusing costs a re-run with the credential
-/// named; not refusing costs the credential, and there is no signal on the way
-/// out that it went.
+/// So the installer asks first when it declares no credential: with
+/// `CURIE_CREDENTIALS` exported it declares one (#2920) and nothing is dropped.
+/// Without it, refusing prevents an invisible credential loss.
 /// Does this release's recorded values carry a model credential?
 ///
 /// Split out so the decision is testable without a cluster: the read is the part
@@ -717,17 +968,146 @@ async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) 
          on the chart's fakeModel default, healthy in every way except that the agent \
          is no longer a model. That state is hard to see: pods stay Ready and turns \
          still answer.\n\n\
-         Preserve it first, then re-run:\n\n    \
-         helm get values {} -n {} -o yaml > /tmp/values.yaml\n    \
-         # keep the agentSandbox block, then after this installer finishes:\n    \
-         helm upgrade {} <chart> -n {} --reuse-values -f /tmp/values.yaml",
-        identity.release,
-        identity.namespace,
-        identity.release,
-        identity.namespace,
-        identity.release,
-        identity.namespace,
+         Export CURIE_CREDENTIALS before re-running and the installer declares it, \
+         so nothing is cleared. Otherwise use the normal Curie cluster lifecycle for \
+         a release that already records a model credential.",
+        identity.release, identity.namespace,
     )))
+}
+
+/// The model credential this installer declares, read the way `curie cluster up`
+/// reads it.
+///
+/// The platform step used to declare no credential at all, so a
+/// `CURIE_CREDENTIALS` exported before the install was ignored and the release
+/// came up on the fake model (#2920). Declaring it by NAME keeps the value out of
+/// the plan; the provider egress is inferred from the credential prefix, as
+/// `cluster up` infers it, so the real model is reachable rather than sealed.
+struct ModelCredential {
+    declared: Option<crate::installation::Credentials>,
+    egress: Vec<crate::installation::Egress>,
+    /// Explicit runner egress values that stand in for `egress` on a rerun
+    /// over a release that already records its own (see
+    /// [`carry_recorded_runner_egress`]).
+    egress_sets: BTreeMap<String, String>,
+}
+
+const MODEL_CREDENTIAL_ENV: &str = "CURIE_CREDENTIALS";
+
+impl ModelCredential {
+    fn resolve() -> Result<Self> {
+        Ok(Self::from_value(
+            crate::installation::resolve_credential(MODEL_CREDENTIAL_ENV)?.as_deref(),
+        ))
+    }
+
+    /// Split out so the decision is testable without the environment.
+    fn from_value(credential: Option<&str>) -> Self {
+        let Some(credential) = credential.filter(|value| !value.trim().is_empty()) else {
+            return Self {
+                declared: None,
+                egress: Vec::new(),
+                egress_sets: BTreeMap::new(),
+            };
+        };
+        Self {
+            declared: Some(crate::installation::Credentials {
+                model: Some(MODEL_CREDENTIAL_ENV.to_string()),
+                ..Default::default()
+            }),
+            egress: crate::ops::provider_from_credential_prefix(credential)
+                .map(|provider| crate::installation::Egress {
+                    host: provider.to_string(),
+                })
+                .into_iter()
+                .collect(),
+            egress_sets: BTreeMap::new(),
+        }
+    }
+}
+
+const RUNNER_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+
+/// The release's recorded runner egress, flattened to `--set` keys.
+fn recorded_runner_egress(existing: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut flat = BTreeMap::new();
+    crate::installation::flatten_values(existing, "", &mut flat);
+    flat.into_iter()
+        .filter(|(key, _)| key.starts_with(&format!("{RUNNER_EGRESS_KEY}[")))
+        .collect()
+}
+
+/// The recorded entries kept verbatim, then one TCP 443 entry per provider
+/// CIDR, the shape `cluster up` appends for an inferred provider. No dedupe
+/// against recorded CIDRs: a recorded entry for the same address may allow a
+/// different port, and a duplicate rule costs nothing.
+fn carried_runner_egress_sets(
+    recorded: BTreeMap<String, String>,
+    provider_cidrs: &[String],
+) -> BTreeMap<String, String> {
+    let next_index = recorded
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(RUNNER_EGRESS_KEY)?
+                .strip_prefix('[')?
+                .split_once(']')?
+                .0
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |index| index + 1);
+    let mut sets = recorded;
+    for (offset, cidr) in provider_cidrs.iter().enumerate() {
+        let entry = format!("{RUNNER_EGRESS_KEY}[{}]", next_index + offset);
+        sets.insert(format!("{entry}.cidr"), cidr.clone());
+        sets.insert(format!("{entry}.ports[0].protocol"), "TCP".to_string());
+        sets.insert(format!("{entry}.ports[0].port"), "443".to_string());
+    }
+    sets
+}
+
+/// A declared egress host REPLACES the release's recorded runner egress on the
+/// declarative path, so on a rerun the provider route would drop entries an
+/// operator recorded with `cluster up`, and simply not declaring it would leave
+/// a newly selected provider unreachable. When the release records egress,
+/// carry it forward explicitly and append the provider's resolved routes.
+async fn carry_recorded_runner_egress(
+    identity: &InstallIdentity,
+    model: &mut ModelCredential,
+) -> Result<()> {
+    if model.egress.is_empty() {
+        return Ok(());
+    }
+    let opts = crate::ops::CommonOpts {
+        namespace: identity.namespace.clone(),
+        release: identity.release.clone(),
+        dry_run: false,
+    };
+    let Some(existing) = crate::ops::fetch_release_values(&opts).await? else {
+        return Ok(());
+    };
+    let recorded = recorded_runner_egress(&existing);
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    let providers: Vec<String> = model.egress.iter().map(|e| e.host.clone()).collect();
+    let provider_cidrs =
+        crate::ops::resolve_provider_egress_cidrs_for_current_environment(&providers)
+            .context("resolving the model provider's egress hosts")?;
+    model.egress_sets = carried_runner_egress_sets(recorded, &provider_cidrs);
+    model.egress.clear();
+    Ok(())
+}
+
+impl ModelCredential {
+    /// `egress_sets` as typed `--set` arguments, so a port stays an integer.
+    fn typed_egress_sets(&self) -> Vec<String> {
+        self.egress_sets
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    }
 }
 
 fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
@@ -738,24 +1118,38 @@ fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn platform_installation(
+    identity: &InstallIdentity,
+    workspace_repo: &[String],
+    model: &ModelCredential,
+) -> crate::installation::Installation {
+    crate::installation::Installation {
+        version: crate::installation::SUPPORTED_VERSION,
+        install: crate::installation::Install {
+            namespace: identity.namespace.clone(),
+            release: identity.release.clone(),
+            context: None,
+        },
+        platform: crate::installation::Platform {
+            egress: model.egress.clone(),
+            ..Default::default()
+        },
+        credentials: model.declared.clone().unwrap_or_default(),
+        comms: crate::installation::Comms::default(),
+        set: github_repo_allowlist_sets(workspace_repo),
+    }
+}
+
 async fn apply_curie_platform(
     chart: &Path,
     dry_run: bool,
     identity: &InstallIdentity,
     workspace_repo: &[String],
+    model: &ModelCredential,
 ) -> Result<Vec<String>> {
-    let installation = crate::installation::Installation {
-        version: crate::installation::SUPPORTED_VERSION,
-        install: crate::installation::Install {
-            namespace: identity.namespace.clone(),
-            release: identity.release.clone(),
-        },
-        platform: crate::installation::Platform::default(),
-        credentials: crate::installation::Credentials::default(),
-        comms: crate::installation::Comms::default(),
-        set: github_repo_allowlist_sets(workspace_repo),
-    };
-    let local = crate::installation::plan_installation(installation, dry_run)?;
+    let installation = platform_installation(identity, workspace_repo, model);
+    let local = crate::installation::plan_installation(installation, dry_run)?
+        .with_typed_sets(model.typed_egress_sets());
     match crate::installation::apply(crate::installation::ApplyOpts {
         local,
         chart: chart.display().to_string(),
@@ -766,6 +1160,7 @@ async fn apply_curie_platform(
     {
         crate::installation::ApplyOutput::DryRun(plan) => Ok(plan.lines),
         crate::installation::ApplyOutput::Applied { .. } => Ok(Vec::new()),
+        crate::installation::ApplyOutput::WroteStarter { .. } => Ok(Vec::new()),
     }
 }
 
@@ -1391,6 +1786,169 @@ async fn resolve_embedded_cluster_connection(
     })
 }
 
+/// The approval route every shipped Kubernetes mutation gate names.
+const SRE_APPROVALS_ROUTE: &str = "sre-approvals";
+/// The agent the embedded bundle deploys as (its plugin name).
+const SRE_BOT_AGENT: &str = "sre-bot";
+
+/// Split, trim, and validate the raw `--approvers` values. A blank id is a usage
+/// error raised before any cluster work, never silently skipped: dropping it
+/// would bind a narrower approver set than the operator typed.
+fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
+    if raw.is_empty() {
+        return Err(crate::exit::usage(
+            "at least one explicit Slack user ID is required; pass --approvers <USER_IDS>",
+        ));
+    }
+    let mut ids = Vec::new();
+    for value in raw {
+        for id in value.split(',') {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "--approvers {value:?} contains a blank user ID; pass comma separated Slack \
+                     user IDs such as --approvers U0123ABCD,U0456DEFG"
+                )));
+            }
+            if !ids.iter().any(|seen: &String| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn route_binding_as_write(
+    binding: &crate::api::ApprovalRouteBindingResponse,
+) -> crate::api::ApprovalRouteBindingWrite {
+    crate::api::ApprovalRouteBindingWrite {
+        resolution: binding.resolution.clone().into(),
+        // The response omits the notification's transport (endpoint, adapter),
+        // so it cannot be written back faithfully. Callers refuse any bound
+        // notification first (`refuse_unwritable_notifications`).
+        notification: None,
+        approvers: binding.approvers.clone(),
+    }
+}
+
+/// The full-replacement route map the installer writes: every other bound route
+/// is kept as is, while `sre-approvals` is replaced with `channel` and the
+/// explicit approver list.
+///
+/// Notifications do not survive this map; call
+/// [`refuse_unwritable_notifications`] on `existing` before writing it.
+fn sre_approvals_route_map(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+    channel: &str,
+    approvers: &[String],
+) -> BTreeMap<String, crate::api::ApprovalRouteBindingWrite> {
+    let mut map: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    map.insert(
+        SRE_APPROVALS_ROUTE.to_string(),
+        crate::api::ApprovalRouteBindingWrite {
+            resolution: crate::api::ApprovalResolutionWrite::slack(channel),
+            notification: None,
+            approvers: Some(crate::api::ApprovalApprovers {
+                group: None,
+                users: Some(approvers.to_vec()),
+            }),
+        },
+    );
+    map
+}
+
+/// Refuse to rewrite a route map that carries a notification target. The API
+/// response redacts its endpoint and adapter, and a route write replaces the
+/// whole map, so writing it back would silently drop or corrupt that ping.
+fn refuse_unwritable_notifications(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+) -> Result<()> {
+    let with_notification: Vec<&str> = existing
+        .into_iter()
+        .flatten()
+        .filter(|(_, binding)| binding.notification.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if with_notification.is_empty() {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to bind route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}: route(s) {} \
+         carry a notification target whose transport the API does not return, and a route \
+         write replaces the whole map, so this installer cannot keep it. Nothing was deployed.",
+        with_notification.join(", ")
+    ))
+    .with_fix(format!(
+        "write the full route map yourself, including {SRE_APPROVALS_ROUTE} and every \
+         notification, with `curie cluster approvals {SRE_BOT_AGENT} --routes-from <file>`, then \
+         re-run this installer"
+    ))
+    .into())
+}
+
+/// Ensure the `sre-bot` agent exists and its `sre-approvals` route is bound,
+/// writing only when the computed map differs from what is bound.
+async fn bind_sre_approvals_route(
+    connection: &EmbeddedClusterConnection,
+    slack_channel: Option<&str>,
+    approvers: &[String],
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let client = crate::api::ApiClient::new(&connection.api_url, &connection.api_key)?;
+    // The same resolution the deploy performs next: an absent agent is created
+    // on --slack-channel or the platform default channel, so this adds nothing
+    // the deploy would not.
+    let (agent, _, _) = client
+        .resolve_agent(SRE_BOT_AGENT, slack_channel, None)
+        .await?;
+    let existing = agent.approval_routes.as_ref();
+    let channel = match slack_channel {
+        Some(channel) => channel.to_string(),
+        None => agent
+            .channels
+            .iter()
+            .find(|binding| binding.kind == "slack")
+            .map(|binding| binding.address.clone())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "agent {SRE_BOT_AGENT} has no Slack channel binding to resolve route \
+                     {SRE_APPROVALS_ROUTE} on; pass --slack-channel <CHANNEL>"
+                ))
+            })?,
+    };
+    let desired = sre_approvals_route_map(existing, &channel, approvers);
+    let current: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if desired != current {
+        refuse_unwritable_notifications(existing)?;
+        client.set_approval_routes(&agent.id, &desired).await?;
+        let action = if existing.is_some_and(|routes| routes.contains_key(SRE_APPROVALS_ROUTE)) {
+            "rebound"
+        } else {
+            "bound"
+        };
+        ui.note(&format!(
+            "{action} approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}: resolution \
+             {channel}; approvers users {}",
+            approvers.join(",")
+        ));
+    }
+    Ok(())
+}
+
 async fn deploy_embedded_sre_bot(
     bundle_dir: &Path,
     connection: &EmbeddedClusterConnection,
@@ -1408,6 +1966,7 @@ async fn deploy_embedded_sre_bot(
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: bundle_dir.to_path_buf(),
             api_url: connection.api_url.clone(),
             api_key: connection.api_key.clone(),
@@ -1444,11 +2003,7 @@ impl EmbeddedWorkspace {
         std::fs::create_dir(&root)
             .with_context(|| format!("creating embedded SRE bot workspace {}", root.display()))?;
         let workspace = Self { root };
-        for (name, contents) in OBSERVABILITY_FILES {
-            let rendered =
-                rewrite_observability_namespace(contents, &identity.observability_namespace);
-            workspace.write(&Path::new("observability").join(name), &rendered)?;
-        }
+        workspace.write_observability_files(&identity.observability_namespace)?;
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
                 let runtime = runtime_connector_declaration(
@@ -1505,6 +2060,23 @@ impl EmbeddedWorkspace {
         Ok(workspace)
     }
 
+    fn create_observability(observability_namespace: &str) -> Result<Self> {
+        let root = std::env::temp_dir().join(format!(
+            "curie-sre-bot-observability-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).with_context(|| {
+            format!(
+                "creating embedded observability workspace {}",
+                root.display()
+            )
+        })?;
+        let workspace = Self { root };
+        workspace.write_observability_files(observability_namespace)?;
+        Ok(workspace)
+    }
+
     fn write(&self, relative: &Path, contents: &[u8]) -> Result<()> {
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
@@ -1520,6 +2092,14 @@ impl EmbeddedWorkspace {
 
     fn bundle_dir(&self) -> PathBuf {
         self.root.join("bundle")
+    }
+
+    fn write_observability_files(&self, observability_namespace: &str) -> Result<()> {
+        for (name, contents) in OBSERVABILITY_FILES {
+            let rendered = rewrite_observability_namespace(contents, observability_namespace);
+            self.write(&Path::new("observability").join(name), &rendered)?;
+        }
+        Ok(())
     }
 }
 
@@ -1904,11 +2484,14 @@ fn runtime_connector_declaration(
     // an operator's decision made while reading that file, never a side effect
     // of running an installer.
     match upgrade_digest {
-        // Kept, with both CronJob names filled in. The bundle ships
-        // PLATFORM_UPGRADE_CRONJOB empty and SELF_UPGRADE_CRONJOB defaulted, and
-        // an install that hand-edits either finds the worker's connector
-        // reconciler putting the declaration back within the minute -- so the
-        // installer is the only thing that can make these real.
+        // Kept for upgrade_platform only. The bundle ships
+        // PLATFORM_UPGRADE_CRONJOB empty, and an install that hand-edits it finds
+        // the worker's connector reconciler putting the declaration back within
+        // the minute -- so the installer is the only thing that can make it real.
+        // SELF_UPGRADE_CRONJOB is rendered empty on purpose (#2288): this path
+        // never applies the self-upgrade CronJob, so naming it would arm a verb
+        // that spends a human approval and then reports the Job missing. Empty
+        // makes the connector refuse every upgrade_self call.
         Some(digest) => {
             let upgrade = connectors
                 .get_mut("self-upgrade")
@@ -1935,7 +2518,7 @@ fn runtime_connector_declaration(
             );
             env.insert(
                 SELF_UPGRADE_CRONJOB_ENV.to_string(),
-                serde_json::Value::String(SELF_UPGRADE_CRONJOB_NAME.to_string()),
+                serde_json::Value::String(String::new()),
             );
         }
         // Stripped exactly as before this flag existed: inert without the Job,
@@ -1993,14 +2576,20 @@ fn is_self_upgrade_policy_entry(entry: &serde_json::Value) -> bool {
 fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
-    // Pinned, not merely present. The Kubernetes tool policy remains intact;
-    // approvalPolicy only governs the optional self-upgrade connector.
-    let expected_policy = serde_json::json!({
-        "gates": [
-            {"gate": UPGRADE_GATE, "route": "sre-approvals"},
-            {"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}
-        ]
-    });
+    // Pinned, not merely present. approvalPolicy governs platform publication,
+    // the optional self upgrade connector, and the Kubernetes mutations.
+    let mut expected_gates = vec![
+        serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"}),
+        serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}),
+        serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}),
+    ];
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        expected_gates.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
+    }
+    let expected_policy = serde_json::json!({ "gates": expected_gates });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {
         bail!("embedded SRE bot must declare the exact gated write verbs");
     }
@@ -2020,6 +2609,10 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
             bail!("embedded SRE bot toolPolicy.allow must contain {tool}");
         }
     }
+    // upgrade_self is never armed: no install path applies the CronJob it
+    // starts (#2288). Out of allow, the tool policy refuses it before any
+    // approval card is raised.
+    allow.retain(|entry| entry.as_str() != Some(UPGRADE_TOOL));
     if !upgrade_enabled {
         // Default install strips connectors.self-upgrade. Any leftover
         // self-upgrade/* allow entry fails the bundle validator with
@@ -2029,24 +2622,26 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
     // Keep exactly the gates and tool-policy entries whose connectors survived.
     // Either kind of reference to a stripped connector fails bundle validation;
     // a kept connector without both layers would bypass the intended gate.
-    let mut kept: Vec<serde_json::Value> = Vec::new();
+    // Platform publication and the Kubernetes connector are never stripped.
+    // Their gates stay present regardless of upgrade_enabled so their calls
+    // always carry a route that an operator principal can resolve.
+    let mut kept =
+        vec![serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"})];
     if upgrade_enabled {
-        kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
         kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
     }
-    if !kept.is_empty() {
-        // Keep exactly the gate for the connector that stayed. A gate naming a
-        // connector this install removed fails bundle validation for everyone,
-        // and a connector kept without its gate is the ungated write this whole
-        // path exists to avoid -- so the two are decided together, here, from one
-        // condition.
-        manifest.insert(
-            "approvalPolicy".to_string(),
-            serde_json::json!({"gates": kept}),
-        );
-    } else {
-        manifest.remove("approvalPolicy");
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        kept.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
     }
+    // approvalPolicy is never removed because publication and the Kubernetes
+    // gates above are always present.
+    manifest.insert(
+        "approvalPolicy".to_string(),
+        serde_json::json!({"gates": kept}),
+    );
     serde_json::to_vec_pretty(&manifest).context("serializing the SRE bot plugin manifest")
 }
 
@@ -2351,6 +2946,93 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
+    fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {
+        serde_json::from_value(serde_json::json!({
+            "resolution": {"kind": "slack", "address": channel},
+            "approvers": {"users": users},
+        }))
+        .unwrap()
+    }
+
+    fn approvers(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn sre_approvals_route_map_binds_users_when_approvers_given() {
+        let map = sre_approvals_route_map(
+            None,
+            "C0EXAMPLE1",
+            &approvers(&["U0EXAMPLE1", "U0EXAMPLE2"]),
+        );
+        assert_eq!(
+            serde_json::to_value(&map).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"users": ["U0EXAMPLE1", "U0EXAMPLE2"]},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_preserves_other_bound_routes() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "deploys".to_string(),
+            sre_route("C0EXAMPLE2", &["U0EXAMPLE3"]),
+        );
+        let map =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE1", &approvers(&["U0EXAMPLE1"]));
+        let value = serde_json::to_value(&map).unwrap();
+        assert_eq!(
+            value["deploys"],
+            serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE3"]},
+            })
+        );
+        assert_eq!(
+            value["sre-approvals"]["approvers"],
+            serde_json::json!({"users": ["U0EXAMPLE1"]})
+        );
+        assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sre_approvals_route_map_moves_an_existing_binding_and_replaces_approvers() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "sre-approvals".to_string(),
+            sre_route("C0EXAMPLE1", &["U0EXAMPLE1", "U0EXAMPLE2"]),
+        );
+
+        let replaced =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE2", &approvers(&["U0EXAMPLE2"]));
+        assert_eq!(
+            serde_json::to_value(&replaced).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE2"]},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_matches_current_when_binding_is_identical() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "sre-approvals".to_string(),
+            sre_route("C0EXAMPLE2", &["U0EXAMPLE2"]),
+        );
+        let desired =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE2", &approvers(&["U0EXAMPLE2"]));
+        let current = existing
+            .iter()
+            .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(desired, current);
+    }
+
     #[test]
     fn memory_quantities_cover_the_kubernetes_shapes_used_by_nodes_and_pods() {
         assert_eq!(parse_memory_quantity("1Gi").unwrap(), 1024 * 1024 * 1024);
@@ -2379,13 +3061,17 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert!(parsed.get("approvalPolicy").is_none());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(!allow.iter().any(is_self_upgrade_policy_entry));
     }
 
     #[test]
-    fn the_upgrade_path_on_fills_in_both_cronjob_names() {
+    fn the_upgrade_path_on_fills_in_only_the_platform_cronjob_name() {
         // The whole reason this flag exists. The bundle ships
         // PLATFORM_UPGRADE_CRONJOB empty, and the worker's connector reconciler
         // puts that declaration back within the minute over anything set by
@@ -2403,7 +3089,9 @@ mod tests {
             env[PLATFORM_UPGRADE_CRONJOB_ENV],
             PLATFORM_UPGRADE_CRONJOB_NAME
         );
-        assert_eq!(env[SELF_UPGRADE_CRONJOB_ENV], SELF_UPGRADE_CRONJOB_NAME);
+        // #2288: the self-upgrade CronJob is never applied, so its name is
+        // rendered empty and the connector refuses upgrade_self outright.
+        assert_eq!(env[SELF_UPGRADE_CRONJOB_ENV], "");
         // `build:` records a LOCAL image id the cluster tier refuses, so a kept
         // connector without a resolved digest is one that can never start.
         assert!(parsed["connectors"]["self-upgrade"].get("build").is_none());
@@ -2414,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_upgrade_connector_keeps_exactly_its_two_gates() {
+    fn a_kept_upgrade_connector_keeps_exactly_its_platform_gate() {
         // A gate naming a stripped connector fails validation for everyone; a
         // kept connector with no gate is an ungated write. Both are decided from
         // the same condition, so both are asserted here.
@@ -2427,15 +3115,190 @@ mod tests {
             .iter()
             .map(|gate| gate["gate"].as_str().unwrap())
             .collect();
-        assert_eq!(gates, vec![UPGRADE_GATE, PLATFORM_UPGRADE_GATE]);
+        assert!(!gates.contains(&UPGRADE_GATE));
+        assert!(gates.contains(&PLATFORM_UPGRADE_GATE));
+        assert!(gates.contains(&PLATFORM_PUBLISH_GATE));
+        let mut expected = always_retained_gate_set();
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        assert_eq!(routed_gates(&parsed), expected);
+        assert_eq!(gates.len(), 8);
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(allow
             .iter()
             .any(|tool| tool.as_str() == Some(LATEST_RELEASE_TOOL)));
-        assert!(allow.iter().any(|tool| tool.as_str() == Some(UPGRADE_TOOL)));
+        assert!(!allow.iter().any(|tool| tool.as_str() == Some(UPGRADE_TOOL)));
         assert!(allow
             .iter()
             .any(|tool| tool.as_str() == Some(PLATFORM_UPGRADE_TOOL)));
+    }
+
+    #[test]
+    fn every_armed_upgrade_gate_starts_a_cronjob_the_upgrade_path_applies() {
+        // #2288: upgrade_self was armed while apply_upgrade_path never applied
+        // its CronJob. Tie the armed gates, the connector env naming each
+        // CronJob, and the applied file set together so they cannot drift.
+        // Each self-upgrade gate: (env naming its CronJob, applied file, the
+        // rendered object's name when that file is applied).
+        let platform = render_platform_cronjob(
+            PLATFORM_UPGRADE_CRONJOB_YAML,
+            "curie",
+            "curie",
+            PLATFORM_UPGRADE_SOURCE_REPO,
+        )
+        .unwrap();
+        let platform: serde_json::Value = serde_norway::from_slice(&platform).unwrap();
+        let platform_name = platform["metadata"]["name"].as_str().unwrap().to_string();
+        let targets = [
+            (
+                UPGRADE_GATE,
+                SELF_UPGRADE_CRONJOB_ENV,
+                "manifests/self-upgrade-cronjob.yaml",
+                None,
+            ),
+            (
+                PLATFORM_UPGRADE_GATE,
+                PLATFORM_UPGRADE_CRONJOB_ENV,
+                "manifests/platform-upgrade-cronjob.yaml",
+                Some(platform_name),
+            ),
+        ];
+
+        let manifest =
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let armed: BTreeSet<&str> = manifest["approvalPolicy"]["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|gate| gate["gate"].as_str())
+            .filter(|gate| gate.starts_with("mcp__self-upgrade__"))
+            .collect();
+        let allow = manifest["toolPolicy"]["allow"].as_array().unwrap();
+        let connectors = runtime_connector_declaration(
+            bundle_file("connectors.yaml"),
+            "sha256:tempo",
+            OBSERVABILITY_NAMESPACE,
+            Some("sha256:upgrade"),
+        )
+        .unwrap();
+        let connectors: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
+        let env = &connectors["connectors"]["self-upgrade"]["env"];
+
+        for (gate, env_key, file, rendered_name) in &targets {
+            let applied = UPGRADE_PATH_FILES.contains(file);
+            let tool = gate.replacen("mcp__self-upgrade__", "self-upgrade/", 1);
+            let allowed = allow.iter().any(|entry| entry.as_str() == Some(&tool));
+            assert_eq!(
+                armed.contains(gate),
+                applied,
+                "{gate} armed vs {file} applied"
+            );
+            assert_eq!(allowed, applied, "{tool} allowed vs {file} applied");
+            match applied {
+                true => assert_eq!(
+                    env[*env_key].as_str(),
+                    rendered_name.as_deref(),
+                    "{env_key} must name the applied CronJob"
+                ),
+                false => assert_eq!(env[*env_key], "", "{env_key} must be empty"),
+            }
+        }
+        let known: BTreeSet<&str> = targets.iter().map(|target| target.0).collect();
+        assert!(
+            armed.is_subset(&known),
+            "unclassified upgrade gate: {armed:?}"
+        );
+    }
+
+    fn test_identity() -> InstallIdentity {
+        InstallIdentity {
+            namespace: "curie".to_string(),
+            release: "curie".to_string(),
+            observability_namespace: "observability".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_exported_credential_is_declared_with_its_provider_egress() {
+        // #2920: CURIE_CREDENTIALS was set and the installer still declared no
+        // credential, so the release came up on the fake model.
+        let model = ModelCredential::from_value(Some("sk-or-EXAMPLE"));
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert_eq!(
+            installation.credentials.model.as_deref(),
+            Some("CURIE_CREDENTIALS")
+        );
+        assert_eq!(installation.egress_hosts(), vec!["openrouter"]);
+    }
+
+    #[test]
+    fn a_credential_with_no_known_prefix_is_declared_without_guessing_egress() {
+        let model = ModelCredential::from_value(Some("zhipu-EXAMPLE"));
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert_eq!(
+            installation.credentials.model.as_deref(),
+            Some("CURIE_CREDENTIALS")
+        );
+        assert!(installation.egress_hosts().is_empty());
+    }
+
+    #[test]
+    fn no_credential_keeps_the_fake_model_install() {
+        for value in [None, Some(""), Some("  ")] {
+            let model = ModelCredential::from_value(value);
+            assert!(model.declared.is_none());
+            let installation = platform_installation(&test_identity(), &[], &model);
+            assert_eq!(installation.credentials.model, None);
+            assert!(installation.egress_hosts().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_rerun_keeps_recorded_egress_and_adds_the_provider_route() {
+        let existing = serde_json::json!({"security": {"networkPolicy": {"allowedEgress": [
+            {"cidr": "203.0.113.7/32", "ports": [{"protocol": "TCP", "port": 5432}]}
+        ]}}, "api": {"logLevel": "info"}});
+        let recorded = recorded_runner_egress(&existing);
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        let sets = carried_runner_egress_sets(
+            recorded,
+            &["198.51.100.9/32".to_string(), "203.0.113.7/32".to_string()],
+        );
+        let key = |k: &str| {
+            sets.get(&format!("{RUNNER_EGRESS_KEY}{k}"))
+                .map(String::as_str)
+        };
+        assert_eq!(key("[0].cidr"), Some("203.0.113.7/32"));
+        assert_eq!(key("[0].ports[0].port"), Some("5432"));
+        assert_eq!(key("[1].cidr"), Some("198.51.100.9/32"));
+        assert_eq!(key("[1].ports[0].port"), Some("443"));
+        assert_eq!(key("[1].ports[0].protocol"), Some("TCP"));
+        // Same address as the recorded 5432 entry, still gets its own 443 rule.
+        assert_eq!(key("[2].cidr"), Some("203.0.113.7/32"));
+        assert_eq!(key("[2].ports[0].port"), Some("443"));
+
+        let mut model = ModelCredential::from_value(Some("sk-or-EXAMPLE"));
+        model.egress_sets = sets;
+        model.egress.clear();
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert!(installation.egress_hosts().is_empty());
+        assert!(installation.set.is_empty(), "never through --set-string");
+        assert!(model
+            .typed_egress_sets()
+            .contains(&format!("{RUNNER_EGRESS_KEY}[1].ports[0].port=443")));
+    }
+
+    #[test]
+    fn a_release_without_runner_egress_records_none() {
+        for existing in [
+            serde_json::json!({}),
+            serde_json::json!({"security": {"networkPolicy": {"allowedEgress": []}}}),
+        ] {
+            assert!(recorded_runner_egress(&existing).is_empty(), "{existing}");
+        }
     }
 
     #[test]
@@ -2694,7 +3557,11 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert!(parsed.get("approvalPolicy").is_none());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let source: serde_json::Value =
             serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
         assert_eq!(
@@ -2718,6 +3585,73 @@ mod tests {
             .any(|tool| tool.as_str() == Some("grafana/query_loki_logs")));
     }
 
+    const KUBERNETES_MUTATIONS: [&str; 6] = [
+        "pods_delete",
+        "pods_exec",
+        "pods_run",
+        "resources_create_or_update",
+        "resources_delete",
+        "resources_scale",
+    ];
+
+    fn kubernetes_gate_set() -> std::collections::BTreeSet<(String, String)> {
+        KUBERNETES_MUTATIONS
+            .iter()
+            .map(|tool| {
+                (
+                    format!("mcp__kubernetes__{tool}"),
+                    "sre-approvals".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn always_retained_gate_set() -> std::collections::BTreeSet<(String, String)> {
+        let mut gates = kubernetes_gate_set();
+        gates.insert((
+            PLATFORM_PUBLISH_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        gates
+    }
+
+    fn routed_gates(manifest: &serde_json::Value) -> std::collections::BTreeSet<(String, String)> {
+        manifest["approvalPolicy"]["gates"]
+            .as_array()
+            .expect("approvalPolicy.gates must be present")
+            .iter()
+            .map(|gate| {
+                (
+                    gate["gate"].as_str().unwrap().to_string(),
+                    gate["route"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn always_retained_gates_survive_the_transform_with_upgrade_off_and_on() {
+        // #2722: a Kubernetes mutation without a routed gate raises a route-less
+        // approval no operator principal can resolve. Publication uses the same
+        // route, so the installer must keep all seven gates in both modes.
+        let source = bundle_file(".claude-plugin/plugin.json");
+
+        let off = runtime_plugin_manifest(source, false).unwrap();
+        let off: serde_json::Value = serde_json::from_slice(&off).unwrap();
+        assert_eq!(routed_gates(&off), always_retained_gate_set());
+        assert_eq!(off["approvalPolicy"]["gates"].as_array().unwrap().len(), 7);
+
+        let on = runtime_plugin_manifest(source, true).unwrap();
+        let on: serde_json::Value = serde_json::from_slice(&on).unwrap();
+        let mut expected = always_retained_gate_set();
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        assert_eq!(routed_gates(&on), expected);
+        assert_eq!(on["approvalPolicy"]["gates"].as_array().unwrap().len(), 8);
+    }
+
     #[test]
     fn runtime_connector_transform_refuses_an_unknown_connector() {
         let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  self-upgrade: {}\n  mystery: {}\n";
@@ -2728,67 +3662,91 @@ mod tests {
     }
 
     #[test]
-    fn runtime_plugin_transform_requires_the_exact_upgrade_gate_policy() {
-        let exact_upgrade = serde_json::json!({
-            "gate": UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
-        let exact_platform = serde_json::json!({
-            "gate": PLATFORM_UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
+    fn runtime_plugin_transform_requires_the_exact_gate_policy() {
+        let exact: serde_json::Value =
+            serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
+        let mutate_gate = |name: &str, replacement: Option<serde_json::Value>| {
+            let mut manifest = exact.clone();
+            let gates = manifest["approvalPolicy"]["gates"].as_array_mut().unwrap();
+            let index = gates
+                .iter()
+                .position(|gate| gate["gate"] == name)
+                .unwrap_or_else(|| panic!("fixture must declare {name}"));
+            match replacement {
+                Some(replacement) => gates[index] = replacement,
+                None => {
+                    gates.remove(index);
+                }
+            }
+            manifest
+        };
+        let mut missing_policy = exact.clone();
+        missing_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalPolicy");
+        let mut additional_gate = exact.clone();
+        additional_gate["approvalPolicy"]["gates"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "gate": "mcp__other__write",
+                "route": "sre-approvals"
+            }));
         let cases = [
-            (
-                "missing approval policy",
-                serde_json::json!({"name": "sre-bot", "description": "source"}),
-            ),
+            ("missing approval policy", missing_policy),
             (
                 "renamed gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": "mcp__self-upgrade__upgrade_agent",
-                            "route": "sre-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__self-upgrade__upgrade_agent",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            ("additional gate", additional_gate),
+            (
+                "kubernetes mutation gate missing",
+                mutate_gate("mcp__kubernetes__pods_delete", None),
             ),
             (
-                "additional gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        exact_upgrade.clone(),
-                        exact_platform.clone(),
-                        {"gate": "mcp__other__write", "route": "sre-approvals"}
-                    ]}
-                }),
-            ),
-            (
-                "platform gate dropped",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [exact_upgrade.clone()]}
-                }),
+                "platform upgrade gate dropped",
+                mutate_gate(PLATFORM_UPGRADE_GATE, None),
             ),
             (
                 "different route",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": UPGRADE_GATE,
-                            "route": "other-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": UPGRADE_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication gate dropped",
+                mutate_gate(PLATFORM_PUBLISH_GATE, None),
+            ),
+            (
+                "publication gate renamed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__curie__publish_changes_typo",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication route changed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": PLATFORM_PUBLISH_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
             ),
         ];
 

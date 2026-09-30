@@ -150,6 +150,13 @@ including why the instance role and IMDS are deliberately unavailable.
 `WorkspaceObjectPort` is not a slice of `ObjectStore`: a non-S3 backend must also
 provide streaming put/get, delete, list, and presigned reads
 (`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`).
+Its `delete` operation must be idempotent when a key is absent, and `list_keys` must
+be read-after-write consistent for owner records that were just written. Attachment
+retention arbitrates ownership by scanning those records before deleting bytes
+(`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator.discard_prepared`,
+`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator._scan_owners`), so an
+eventually consistent list can miss a live owner's record and delete bytes that turn
+is about to install.
 The Kubernetes `attachments-init` container (`charts/curie/templates/agent-sandbox.yaml`)
 redeems those URLs, so a backend that cannot mint a presigned GET also breaks that path.
 

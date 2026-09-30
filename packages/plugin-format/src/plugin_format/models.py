@@ -76,9 +76,10 @@ class PluginManifest(BaseModel):
     # Curie authoring extension: the vanilla MCP tool policy. Tri-state glob
     # collections over CANONICAL ``"<server>/<tool>"`` tool names -- server
     # qualified and transport-independent, deliberately NOT the SDK's live
-    # ``mcp__...`` name (see ``tool_policy``'s module docstring). DECLARATION-ONLY
-    # today: nothing enforces it at runtime yet, that lane is a BLOCKING
-    # follow-up, and no bundle may ship a real policy until it lands.
+    # ``mcp__...`` name (see ``tool_policy``'s module docstring). Declared here and
+    # ENFORCED BY THE RUNNER (#2119), at both of its interception points through
+    # ``runner/src/curie_runner/approval.py::_decide_gate``; nothing in this
+    # package enforces it, which is why the handshake below exists.
     # ``tool_policy.load_tool_policy`` is the only supported reader -- it refuses
     # to hand a policy to a caller that does not name the enforcement contract,
     # and ``validate_bundle`` rejects a policy-bearing bundle whose caller does
@@ -89,25 +90,31 @@ class PluginManifest(BaseModel):
     toolPolicy: dict[str, Any] | None = None
 
 
-# Trigger types the manifest may declare beyond inbound chat (epic #29). The
-# validator enforces the per-type required field.
+# Trigger types the manifest may declare beyond inbound chat (epic #29).
+# ``validate_bundle`` enforces the per-type shape; the model stays permissive.
 _TRIGGER_TYPES = ("cron", "webhook")
 
 
 class TriggerDeclaration(BaseModel):
     """One trigger that can wake the agent, declared in the bundle (#273/#270).
 
-    ``type`` is ``"cron"`` (requires a ``schedule`` cron expression) or
-    ``"webhook"`` (requires a ``path`` the webhook ingress routes to). Declaring
-    triggers in the bundle keeps an agent's full behavior in one reviewable
-    artifact; the kernel/ingress consumes them (not built here — deploy-time
-    validation only, so a malformed declaration is rejected before ship).
+    ``type`` is ``cron`` or ``webhook``. ``name``, ``timezone``, ``target``, and
+    ``prompt`` are optional. ``validate_bundle`` enforces the ADR-0099 cron shape
+    (non-empty name and prompt, five-field schedule) while a webhook stays
+    ``{type, path}``.
     """
 
     model_config = _LENIENT
 
     type: str
+    name: str | None = None
     schedule: str | None = None
+    # No "UTC" default: an omitted key and an explicit null both parse as None.
+    # Only a missing key means UTC, and validate_bundle does not write it back.
+    timezone: str | None = None
+    # A channel address string. validate_bundle rejects a blank address.
+    target: str | None = None
+    prompt: str | None = None
     path: str | None = None
 
 

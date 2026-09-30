@@ -86,13 +86,32 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives
-  `headers.Authorization: Bearer ${<bearer_secret, or the single declared secret>}` -- the author still writes no `headers:`
-  on a hosted connector (`connectors.hosted_has_headers`) -- and `cluster deploy` binds only that
-  Bearer name into the sandbox alongside any explicit `--secret` so the runner can expand the
-  placeholder at boot and then drop the name from the process env (#2503, #2559; a
-  `SecretRef` value does not reach the sandbox under ADR-0090, and the `url` fallback used by tiers
-  below cluster derives no header, both tracked as follow-ups). A hosted connector with several
-  secrets and no `bearer_secret` is `connectors.bearer_secret_required`. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  `headers.Authorization: Bearer ${<bearer_secret, or the single declared plain string secret>}`.
+  An implicit `SecretRef` is delivered only to the connector pod and derives no header under
+  ADR-0090. An explicit `bearer_secret` naming a `SecretRef` still emits the placeholder, so the
+  runner diagnoses its absent sandbox value honestly. The author still writes no `headers:` on a
+  hosted connector (`connectors.hosted_has_headers`), and `cluster deploy` binds only a plain
+  string Bearer name into the sandbox alongside any explicit `--secret` so the runner can expand
+  the placeholder at boot and then drop the name from the process env (#2503, #2559). `skill up`
+  stages the same name into the runner env and `local deploy` resolves it onto the agent record
+  with no `--secret`, so the `unhosted_url` fallback derives the same header (#2518). A hosted
+  connector with several
+  secrets, any of them a plain string, and no `bearer_secret` is `connectors.bearer_secret_required`;
+  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector may
+  declare `admits`, the agent names whose sandboxes may call it (ADR-0168 decision 7): a missing
+  list admits the deploying agent alone, `[]` refuses everyone, and a list is exact, so it does
+  not add the deploying agent. An entry is either the reserved name `self`, meaning the agent the
+  bundle is deployed as, or a name shaped like `deploy.yaml`'s agent names; either way it may not
+  repeat (`connectors.bad_admits_agent`, `connectors.duplicate_admits`), and a `url` connector
+  cannot declare `admits` at all (`connectors.remote_has_admits`). `self` is itself refused as an
+  agent name (`deploy.bad_agent_name`), since a target genuinely named `self` would be
+  indistinguishable from the sentinel. On an install whose API holds a caller public key, each
+  hosted connector's caller proxy admits exactly the resolved list, `self` becoming the deploying
+  agent's stored name (`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`);
+  an install with no key renders no proxy and enforces no list. A consumer built before the
+  first release carrying #3107 refuses `admits` as `connectors.invalid`: an older API or CLI
+  refuses the bundle, and an older runner mounts none of its connectors. Declare `admits` only once
+  the API, the CLI and every runner image are on that release. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
@@ -101,7 +120,9 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
   only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
-  entry is the authored URL, so its name is not checked), and others). Authored mapping keys are checked for
+  entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
+  hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
+  would render the same Service name), and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
@@ -136,20 +157,52 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   Docker, no registry, no network -- which is what lets the API run it and stay a pure renderer
   (ADR-0087). Delivery is deliberately NOT judged here: a `local-daemon` lock is legitimate for a
   local-tier deploy, and refusing it belongs to the cluster preflight.
+- A layered runner (ADR-0173). `connectors.yaml` may carry an optional top-level `runner:` block,
+  `packages/plugin-format/src/plugin_format/connectors.py::RunnerSpec`, whose only key is a
+  `build` of the same shape and rules as a connector's (`context` inside the bundle, `dockerfile`
+  defaulting to `Dockerfile`, non-empty `platforms`). The runner Dockerfile must declare
+  `ARG CURIE_RUNNER_IMAGE` before its first `FROM`, and that first `FROM` must be
+  `${CURIE_RUNNER_IMAGE}` (optionally `AS name`); a literal base is refused as
+  `connectors.runner_base_not_arg`
+  (`packages/plugin-format/src/plugin_format/connector_lock.py::check_runner_dockerfile`).
+  `curie build --plugin-dir <dir> [--registry <ref>] [--runner-image <ref>]` pins the platform
+  runner (default: the one `curie skill up` runs) to a digest, passes it as that build argument,
+  and records a `runner:` entry in `connectors.lock.yaml`,
+  `packages/plugin-format/src/plugin_format/connector_lock.py::RunnerLockEntry`, carrying
+  `image`, `base`, `delivery`, `platforms` and `source_digest`. Both `image` and `base` obey the
+  digest rule of `delivery`. Intake reports a missing or stale runner entry as
+  `connectors.lock_missing` / `connectors.lock_stale`, and
+  `packages/plugin-format/src/plugin_format/connector_lock.py::resolve_runner_image` is the one
+  resolver a renderer uses: `None` for a bundle with no `runner:`, otherwise exactly the recorded
+  digest.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of
-  `{agent, env, slack_channel}` where `env` is `dev` or `prod`. Validated by
-  `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
+  `{agent, env, identity, slack_channel, connectors}` where `env` is `dev` or `prod`, `identity`
+  names the channel identity (the bot) the target's binding speaks through and defaults to
+  `default`, and `connectors` is an allowlist over the bundle's `connectors.yaml` connectors:
+  absent runs all of them, a list runs only those, `[]` runs none (ADR-0168 decision 8). Validated
+  by `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
   `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
   the target key), `deploy.bad_agent_name`, `deploy.ambiguous_agent_name` (the agent, not the
   connector, must not contain `-mcp-` or END in `-mcp`, since the agent sits immediately left of
   the `-mcp-` join — same collision as `connectors.ambiguous_name`, viewed from the other side of
   the join),
-  `deploy.bad_slack_channel`). Authored mapping keys are
+  `deploy.bad_slack_channel`, `deploy.bad_identity` (shape only: the installation declares its
+  identities and this validator never sees it), `deploy.bad_connector_name` (the `connectors.yaml` name
+  rule), `deploy.duplicate_connector`, `deploy.null_connectors` (an explicit null allowlist,
+  such as a bare `connectors:`, is refused rather than read as all; omit the key or write `[]`),
+  `deploy.unknown_connector` (an allowlist entry `connectors.yaml` does not declare),
+  `deploy.conflicting_connectors` (two targets that bind the same agent with different
+  `connectors`, compared as sets)). Authored
+  mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
-  silently selecting the last YAML value.
+  silently selecting the last YAML value. The allowlist is a property of the agent, not of the
+  target that states it (ADR-0168 decision 8): every target naming that agent must carry the same
+  `connectors`, since the connector objects it narrows are named per agent
+  (`<release>-<agent>-mcp-<connector>`), and it narrows both the connectors route's render and the
+  runner's mount for that agent.
 
 The overlay files are not independent of the manifest, which is the part a second consumer is
 most likely to miss: `connectors.yaml` feeds manifest validation. The set of gate names
@@ -159,6 +212,11 @@ tool is `mcp__plugin_<bundle>_<server>__<tool>`; a connector is mounted directly
 `mcp__<connector>__<tool>` with no infix). A consumer that reads the manifest alone rejects every
 connector gate as `approval_policy.gate_not_namespaced`
 (`packages/plugin-format/src/plugin_format/validate.py::_validate_approval_policy`).
+One gate name comes from neither set: the platform publication tool, accepted by its exact live
+name `mcp__curie__publish_changes` (`plugin_format.PLATFORM_PUBLISH_TOOL_NAME`, #2776) so a
+bundle can bind publication approval to a route. The rest of the `mcp__curie__` namespace is still
+refused. A consumer built before the first release carrying #2776 refuses this gate as
+`approval_policy.gate_not_namespaced`.
 
 A second consumer must accept all of these shapes, the Claude-Code-shaped ones and the Curie-only
 overlay both.
@@ -247,11 +305,11 @@ Code, with the manifest still claiming otherwise. That asymmetry is why the decl
 versioned `enforcement` discriminator, why `validate_bundle` refuses a policy-bearing bundle unless
 its caller states which contract it enforces
 (`packages/plugin-format/src/plugin_format/validate.py::_validate_tool_policy`, code
-`tool_policy.unenforced`), and why bundle adoption is blocked on the runtime lane. **This change is
-declaration and validation only: nothing enforces a `toolPolicy` at runtime today, that is a
-separate blocking follow-up, and no bundle may ship a policy until it lands.** The residual gap that
-no in-package mechanism can close: a platform built before this package version does not model the
-key at all, and the lenient models accept and silently ignore it.
+`tool_policy.unenforced`), and why a caller that cannot enforce it is refused the policy rather
+than handed one it would ignore. **Enforcement lives in the runner (#2119), not in this package:
+nothing `plugin-format` ships applies a policy, which is why that handshake exists.** The residual
+gap that no in-package mechanism can close: a platform built before this package version does not
+model the key at all, and the lenient models accept and silently ignore it.
 
 The two Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
@@ -268,8 +326,12 @@ The outbound gate covers this unevenly, and the gap is worth naming.
 `examples/tests/test_plugin_compat_coverage.py` pins that each of the six manifest extensions
 appears in at least one discovered example bundle, so the gate cannot cover them vacuously, but it
 checks manifest FIELDS only. `connectors.yaml` is exercised incidentally because the weather bundle
-happens to carry one; **no example bundle carries a `deploy.yaml`**, so nothing asserts that Claude
-Code still tolerates that file, and nothing would fail if the weather connector file were removed.
+happens to carry one. `examples/sre-bot` carries a `deploy.yaml`, so the outbound gate validates a
+bundle directory containing that file and proves Claude Code tolerates it. The separate
+`examples/tests/test_sre_bot_hygiene.py` suite also requires that file and validates its Curie
+semantics, so removing it does fail coverage. The remaining unevenness is that the generic plugin
+compatibility coverage pins manifest fields only: neither Curie-only root file belongs to Claude
+Code's manifest model, and this gate does not prove their presence or semantics across bundles.
 
 The `hooks`
 field is no longer dead: as of #272 it is validated at deploy time (`HookMatcherConfig` /
@@ -308,28 +370,62 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   runtime renderer cannot drift. A gate that omits `summary` keeps today's machine
   `summarize_tool_call` string on the card and notice.
 - `triggers` (a list of `cron`/`webhook` declarations for waking the agent beyond chat, #273/#270 —
-  see the [triggers seam](../triggers/INTERFACE.md)) is still **declaration-only**: its validator
-  runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
+  see the [triggers seam](../triggers/INTERFACE.md)) is validated at deploy, and a declared `cron`
+  trigger is **consumed at runtime** by the worker's per-agent cron scheduler
+  (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop`, ADR-0099, #268); see
+  [Cron triggers](../../guides/cron-triggers.md). A declared `webhook` is still declaration-only:
+  no ingress maps its path yet (Epic #29).
+  A cron declaration needs a unique non-empty name, a non-empty prompt, and a five-field schedule;
+  timezone, when present, is an IANA zone name matching an exact key in packaged tzdata, so
+  host only aliases such as `localtime` are rejected; it defaults to UTC only when omitted and is legal only with a schedule; target,
+  when present, is a non-empty channel address string; schedule is forbidden on other types; webhook
+  `{type, path}` is unchanged.
 - `toolPolicy` (`{enforcement, allow, approvalRequired, deny}` glob collections over canonical
   `"<server>/<tool>"` MCP tool names,
-  `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declaration-only and
-  fenced as such**. Precedence is by class — `deny` > `approvalRequired` > `allow` — and an
+  `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declared at deploy and
+  enforced at runtime** (#2119): both of the runner's interception points, the SDK permission
+  callback and the PreToolUse hook, take the policy decision through the one shared
+  `runner/src/curie_runner/approval.py::_decide_gate`. Precedence is by class — `deny` >
+  `approvalRequired` > `allow` — and an
   unmatched tool is DENIED, so server tool-surface drift fails closed. The grammar and pattern
   rules live in one shared module, `packages/plugin-format/src/plugin_format/tool_policy.py`, so
-  the deploy validator and the future runtime loader normalize identically — the #453/#544 lesson
+  the deploy validator and the runtime loader normalize identically — the #453/#544 lesson
   that normalizing separately silently disagrees and ships a fail-open. The deploy validator
   (`packages/plugin-format/src/plugin_format/validate.py::_validate_tool_policy`) calls that
   module's `check_policy_patterns` / `validate_pattern` (grammar, duplicates, cross-collection
   conflicts) and `literal_server_segment` (the declared-server cross-check) today; it never
   classifies a live tool, because at deploy time there is no live tool surface to classify.
   `packages/plugin-format/src/plugin_format/tool_policy.py::classify_tool`, the precedence ladder that turns a policy plus a runtime tool
-  name into allow/approval-required/deny, belongs to the not-yet-built runtime enforcement lane —
+  name into allow/approval-required/deny, belongs to the runtime enforcement lane —
   the deploy validator does not call it. Because a declared-but-unenforced restriction is worse
   than no restriction, `validate_bundle`
   takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
   caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
-  returning a policy such a caller would not apply. Runtime enforcement is a separate **blocking**
-  follow-up, and no bundle may ship a `toolPolicy` until it lands.
+  returning a policy such a caller would not apply.
+  **Curie's own platform-owned MCP servers, `curie` and `curie-state`, are outside `toolPolicy`
+  scope entirely** (#2286, ADR-0139). A bundle cannot declare them as connectors
+  (`packages/plugin-format/src/plugin_format/connectors.py::RESERVED_CONNECTOR_NAMES`), so it
+  cannot express a policy over them, and the runtime exempts the tools those servers actually
+  published through `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
+  `classify_tool` is ever consulted. The exemption is exact live tool names, not the
+  `mcp__<server>__` prefix: `strict_mcp_config` is off, so the CLI also loads ambient project
+  and user MCP servers, and a prefix match would exempt every tool of one keyed `curie__extra`
+  or `curie-state__extra`. It is also scoped to what the session mounted, so the `curie-state`
+  tools are exempt only when the runner had a state URL to mount that server with. The residual
+  it does not close: once a platform server IS mounted, a name-identical impostor is
+  indistinguishable at this seam, and closing that needs `strict_mcp_config` or an
+  ambient-server policy. A policy therefore cannot remove the approval, publication or
+  channel-memory paths, and a literal pattern naming one of those servers that the bundle does
+  not declare is a deploy-time error (`tool_policy.platform_server`). Whether such a path is
+  MOUNTED at all is the platform's decision, not the policy's. The cost, stated rather than
+  hidden: a bundle
+  cannot restrict its agent's use of those tools either, so `deny: ["curie-state/delete"]` is
+  inexpressible and would be inert. ADR-0139 is the authority for accepting that, since bundle
+  configuration may add restrictions but may not hollow out operator or platform controls, and the
+  same predicate decides both directions; platform-scope patterns for an operator-level need would
+  be new semantics and belong to a future `@2` enforcement id. A bundle's own plugin-mounted
+  `mcpServers` entry named `curie` is a different server, carries the `plugin_<bundle>_` infix in
+  its live names, and stays fully in scope.
 
 Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /
 `tool_policy.*` error codes).

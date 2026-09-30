@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +82,101 @@ class TestImageListIsDerivedFromCompose:
         assert "curie-runner" in names
         assert "curie-ui" in names
 
+    def test_required_set_uses_resolved_dispatcher_and_runner_overrides(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        resolved = {
+            "services": {
+                "curie-api": {
+                    "image": "ghcr.io/curie-eng/curie-api:overlay",
+                    "profiles": ["core", "full"],
+                },
+                "curie-worker": {
+                    "image": "ghcr.io/curie-eng/curie-worker-local:overlay",
+                    "profiles": ["core", "full"],
+                    "environment": {
+                        "CURIE_RUNNER_IMAGE": (
+                            "ghcr.io/curie-eng/curie-runner:overlay"
+                        )
+                    },
+                },
+                "curie-dispatcher": {
+                    "image": "ghcr.io/curie-eng/curie-dispatcher:overlay",
+                    "profiles": ["slack"],
+                },
+            }
+        }
+        compose_path = tmp_path / "compose.release.resolved.yaml"
+        compose_path.write_text(yaml.safe_dump(resolved))
+
+        def fake_run(cmd, **kwargs):
+            if cmd[-2:] == ["config", "--images"]:
+                stdout = "\n".join(
+                    (
+                        "ghcr.io/curie-eng/curie-api:overlay",
+                        "ghcr.io/curie-eng/curie-worker-local:overlay",
+                    )
+                )
+            elif "config" in cmd and "json" in cmd:
+                stdout = json.dumps(resolved)
+            else:
+                stdout = yaml.safe_dump(resolved)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(ensure.subprocess, "run", fake_run)
+        images = ensure.required_release_images_from_file(
+            compose_path, profiles=("core",)
+        )
+
+        assert set(images) == {
+            "ghcr.io/curie-eng/curie-api:overlay",
+            "ghcr.io/curie-eng/curie-worker-local:overlay",
+            "ghcr.io/curie-eng/curie-dispatcher:overlay",
+            "ghcr.io/curie-eng/curie-runner:overlay",
+        }
+        assert "ghcr.io/curie-eng/curie-dispatcher:latest" not in images
+        assert "ghcr.io/curie-eng/curie-runner:latest" not in images
+
+    @pytest.mark.parametrize(
+        ("missing", "expected_field"),
+        (
+            ("dispatcher", "services.curie-dispatcher.image"),
+            ("runner", "services.curie-worker.environment.CURIE_RUNNER_IMAGE"),
+        ),
+    )
+    def test_required_set_refuses_a_missing_one_shot_image_identity(
+        self, missing: str, expected_field: str
+    ) -> None:
+        resolved = {
+            "services": {
+                "curie-worker": {
+                    "image": "ghcr.io/curie-eng/curie-worker-local:overlay",
+                    "profiles": ["core", "full"],
+                    "environment": {
+                        "CURIE_RUNNER_IMAGE": (
+                            "ghcr.io/curie-eng/curie-runner:overlay"
+                        )
+                    },
+                },
+                "curie-dispatcher": {
+                    "image": "ghcr.io/curie-eng/curie-dispatcher:overlay",
+                    "profiles": ["slack"],
+                },
+            }
+        }
+        if missing == "dispatcher":
+            del resolved["services"]["curie-dispatcher"]["image"]
+        else:
+            environment = resolved["services"]["curie-worker"]["environment"]
+            environment.pop("CURIE_RUNNER_IMAGE")
+
+        with pytest.raises(SystemExit) as exc:
+            ensure.required_release_images(
+                yaml.safe_dump(resolved), profiles=("core",)
+            )
+
+        assert expected_field in str(exc.value)
+
 
 class TestWorkflowsInvokeTheHelper:
     def test_nightly_local_release_builds_missing_images_from_the_helper(self) -> None:
@@ -89,12 +187,16 @@ class TestWorkflowsInvokeTheHelper:
         assert "--build-missing" in runs
         assert "--profiles" in runs
 
-    def test_ci_local_release_builds_missing_images_from_the_same_helper(self) -> None:
+    def test_ci_local_release_asserts_every_image_from_the_same_helper(self) -> None:
+        # The CI rung loads images the ci-images job built once for the run, so
+        # it must not rebuild any; the helper only proves each one is present.
         source = CI_YAML.read_text()
         assert "compose/ensure_release_images.py" in source
         job = yaml.load(source, Loader=yaml.BaseLoader)["jobs"]["e2e-ladder-release"]
         runs = "\n".join(step.get("run", "") for step in job["steps"])
-        assert "--build-missing" in runs
+        assert "compose/ensure_release_images.py --profiles full" in runs
+        assert "--build-missing" not in runs
+        assert "xargs docker image inspect" in runs
 
     def test_ladder_preflight_calls_the_helper_instead_of_hardcoding_slack(self) -> None:
         text = LADDER.read_text()

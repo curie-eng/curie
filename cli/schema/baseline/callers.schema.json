@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/callers/v1.json",
+  "title": "curie <tier> callers --json",
+  "description": "The agent-facing payload of `curie <tier> callers <agent> --surface KIND=ADDRESS`: the dry-run plan, or the surface and its caller list as the API stored them (ADR 0175). `allowed_callers` is null when the surface carries no list, meaning everyone may talk to the bot through it; otherwise it is the exact caller ids that may, and anyone else gets no reply. `changed` is false for a show (no `--set` or `--clear`) and true when this invocation wrote.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        },
+        "adapter": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The identity this surface speaks through (ADR-0168 decision 3), as the API reads it back: `default` for a Slack surface with none named, or null for a non-Slack surface with no route."
+        },
+        "allowed_callers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "The exact caller ids that may talk to the bot through this surface, or null when everyone may."
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "kind",
+        "address",
+        "adapter",
+        "allowed_callers",
+        "changed"
+      ]
+    }
+  ]
+}

@@ -13,13 +13,13 @@
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.1"
+      "version": "2.3"
     },
     {
       "result": "BudgetOutput",
@@ -34,6 +34,12 @@
       "version": "1.0"
     },
     {
+      "result": "CallersOutput",
+      "kind": "CliOutput",
+      "schema": "callers.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ChannelTokenOutput",
       "kind": "CliOutput",
       "schema": "channel-token.schema.json",
@@ -43,7 +49,7 @@
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "ChartCheckOutput",
@@ -121,7 +127,7 @@
       "result": "DiffOutput",
       "kind": "CliOutput",
       "schema": "diff.schema.json",
-      "version": "2.2"
+      "version": "2.3"
     },
     {
       "result": "DoctorOutput",
@@ -154,6 +160,12 @@
       "version": "1.1"
     },
     {
+      "result": "HookOutput",
+      "kind": "CliOutput",
+      "schema": "hooks.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "InitOutput",
       "kind": "CliOutput",
       "schema": "init.schema.json",
@@ -163,6 +175,12 @@
       "result": "KillOutput",
       "kind": "CliOutput",
       "schema": "kill.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "LintValuesOutput",
+      "kind": "CliOutput",
+      "schema": "lint-values.schema.json",
       "version": "1.0"
     },
     {
@@ -196,22 +214,28 @@
       "version": "1.0"
     },
     {
+      "result": "MemoryGuidanceOutput",
+      "kind": "CliOutput",
+      "schema": "memory.schema.json",
+      "version": "2.1"
+    },
+    {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "MessageOutcomeOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "MigrateStoreOutput",
@@ -232,6 +256,12 @@
       "version": "1.0"
     },
     {
+      "result": "ObservabilityProvisionOutput",
+      "kind": "CliOutput",
+      "schema": "observability-provision.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityRunOutput",
       "kind": "CliOutput",
       "schema": "observability-run.schema.json",
@@ -247,6 +277,12 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
+      "version": "2.0"
+    },
+    {
+      "result": "PublicationPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "publication-policy.schema.json",
       "version": "1.0"
     },
     {
@@ -298,10 +334,28 @@
       "version": "1.1"
     },
     {
+      "result": "SchedulesOutput",
+      "kind": "CliOutput",
+      "schema": "schedules.schema.json",
+      "version": "2.0"
+    },
+    {
+      "result": "HookFireOutput",
+      "kind": "CliOutput",
+      "schema": "hook-fire.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "VersionsOutput",
       "kind": "CliOutput",
       "schema": "versions.schema.json",
       "version": "1.0"
+    },
+    {
+      "result": "WorkItemsOutput",
+      "kind": "CliOutput",
+      "schema": "work-items.schema.json",
+      "version": "1.1"
     },
     {
       "result": "all_targets_deploy_failure_json",
@@ -325,31 +379,37 @@
       "result": "message_awaiting_approval_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "message_dry_run_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "message_enqueued_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
+    },
+    {
+      "result": "message_failed_json",
+      "kind": "builder",
+      "schema": "message.schema.json",
+      "version": "1.3"
     },
     {
       "result": "message_reply_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "message_timeout_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "status_json",
@@ -362,6 +422,12 @@
       "kind": "builder",
       "schema": "sweep.schema.json",
       "version": "1.1"
+    },
+    {
+      "result": "InstallationFile",
+      "kind": "input",
+      "schema": "curie-yaml.schema.json",
+      "version": "1.0"
     }
   ],
   "raw_emit_sites": {

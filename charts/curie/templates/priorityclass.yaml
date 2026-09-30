@@ -1,14 +1,19 @@
 {{/*
-  ADR-0059 decision 5: the control plane (worker, api, dispatcher, data tier)
-  outranks sandbox pods for node-pressure eviction, so the components required
-  to supervise, drain, and reclaim a sandbox are never themselves preferred for
-  eviction over the sandboxes they manage. Priority is a ranking and preemption
-  lever, not immunity -- a node fully out of a resource (e.g. disk) can still
-  take anything down regardless of priority.
+  ADR-0059 decision 5: the platform (worker, api, dispatcher, data tier, and
+  per #3182 the observability and UI tier: langfuse web/worker, the OTel
+  collector, the UI, inference, the mail adapter) outranks sandbox pods for
+  node-pressure eviction, so the components required to supervise, drain, and
+  reclaim a sandbox -- and the components that carry its traces and metrics --
+  are never themselves preferred for eviction over the sandboxes they manage.
+  Priority is a ranking and preemption lever, not immunity -- a node fully out
+  of a resource (e.g. disk) can still take anything down regardless of
+  priority.
 
   Both PriorityClasses are cluster-scoped. `priorityClasses.sandbox.name` is
   also the intended `scopeSelector` handle for the sandbox-namespace
-  ResourceQuota (issue #758).
+  ResourceQuota (issue #758). The runner-prewarm DaemonSet deliberately sets
+  neither class: unclassed (priority 0) it stays below the sandbox class as
+  the designated image-cache sacrifice (#3182).
 */}}
 {{- if .Values.priorityClasses.platform.create }}
 apiVersion: scheduling.k8s.io/v1
@@ -21,10 +26,13 @@ metadata:
 value: {{ .Values.priorityClasses.platform.value }}
 globalDefault: false
 description: >-
-  ADR-0059 decision 5: the Curie control plane (worker, api, dispatcher, data
-  tier) outranks sandbox pods for node-pressure eviction, so the components
-  that supervise, drain, and reclaim a sandbox are never themselves evicted
-  ahead of it. Priority is a ranking and preemption lever, not immunity.
+  ADR-0059 decision 5: the Curie platform (worker, api, dispatcher, data
+  tier, and per #3182 the observability and UI tier: langfuse, the OTel
+  collector, the UI, inference, the mail adapter) outranks sandbox pods for
+  node-pressure eviction, so the components that supervise, drain, and
+  reclaim a sandbox -- and the components that carry its traces and metrics --
+  are never themselves evicted ahead of it. Priority is a ranking and
+  preemption lever, not immunity.
 {{- end }}
 {{- if .Values.priorityClasses.sandbox.create }}
 ---

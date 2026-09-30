@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 ROOT = Path(__file__).resolve().parents[3]
 CHECK = ROOT / "tools/sre-contract/check.py"
@@ -52,6 +53,25 @@ def test_observability_policy_mutation_and_restoration(healthy):
     assert run(healthy).returncode == 0
 
 
+def test_only_the_exact_platform_publication_gate_may_omit_a_connector(healthy):
+    path = healthy / ".claude-plugin/plugin.json"
+    manifest = json.loads(path.read_text())
+    gates = manifest["approvalPolicy"]["gates"]
+    gates[:] = [gate for gate in gates if gate["gate"] != PLATFORM_PUBLISH_TOOL_NAME]
+    gates.append({"gate": PLATFORM_PUBLISH_TOOL_NAME, "route": "sre-approvals"})
+    path.write_text(json.dumps(manifest))
+
+    exact = run(healthy)
+    assert exact.returncode == 0, exact.stdout + exact.stderr
+
+    misspelled = f"{PLATFORM_PUBLISH_TOOL_NAME}_typo"
+    gates[-1]["gate"] = misspelled
+    path.write_text(json.dumps(manifest))
+    rejected = run(healthy)
+    assert rejected.returncode == 1, rejected.stdout
+    assert "approval gate names no supported tool" in rejected.stderr
+
+
 @pytest.mark.parametrize(
     "mutation, expected",
     [
@@ -92,7 +112,11 @@ def test_deliberate_mutations_reject_then_restore(healthy, mutation, expected):
     elif mutation == "duplicate-map":
         paths[3].write_text("| `kubernetes/pods_list` | `deny` |\n" + paths[3].read_text())
     elif mutation == "gate":
-        manifest["approvalPolicy"]["gates"] = manifest["approvalPolicy"]["gates"][1:]
+        manifest["approvalPolicy"]["gates"] = [
+            gate
+            for gate in manifest["approvalPolicy"]["gates"]
+            if gate["gate"] != "mcp__self-upgrade__upgrade_self"
+        ]
         paths[0].write_text(json.dumps(manifest))
     elif mutation == "tier":
         del contract["tiers"]["local"]

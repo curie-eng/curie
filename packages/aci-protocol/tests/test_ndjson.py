@@ -173,9 +173,12 @@ def test_unknown_field_is_ignored_on_inbound_read() -> None:
 
 
 def test_compatible_patch_version_is_accepted() -> None:
-    # AC: a same-major-minor patch difference is not an error. Build speaks
-    # 0.4.0; a 0.4.7 line decodes fine.
-    line = json.dumps({"type": "final", "version": "0.4.7", "text": "x", "status": "done"})
+    # AC: a same major and minor patch difference is not an error.
+    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    compatible_version = f"{major}.{minor}.{patch + 1}"
+    line = json.dumps(
+        {"type": "final", "version": compatible_version, "text": "x", "status": "done"}
+    )
     decoded = parse_ndjson_line(line)
     assert isinstance(decoded, Final)
     assert decoded.text == "x"

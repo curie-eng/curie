@@ -1,8 +1,11 @@
 # Common external-process replies for tests focused on pre-installation
 # inference/credentials. The convergence-specific consumer tests independently
 # exercise failure/secondary paths; these callers need a healthy target after
-# their existing successful Helm mutation. No earlier mutation/preflight reply
-# or assertion is changed here.
+# their existing successful Helm mutation. Do not answer helm history here:
+# this file is prepended, and a shared not-found reply would shadow fixtures
+# that classify history (gVisor retry, failed-only discard). Callers answer
+# history in their own helm fake. No earlier mutation/preflight reply or
+# assertion is changed here.
 case "${0##*/}:$1:${2:-}" in
     helm:status:*)
         if [ -f "${0%/*}/convergence-release-failed" ]; then
