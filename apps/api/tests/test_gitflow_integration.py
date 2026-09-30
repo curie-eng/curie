@@ -31,7 +31,10 @@ from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api import bundles, crud
 from curie_api.config import get_settings
 from curie_api.deps import get_eval_queue
+from curie_telemetry import build_resource, configure_meter_provider
 from curie_test_support.scaffold import scaffolded_deploy_yaml
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -722,6 +725,213 @@ def test_notice_marker_lasts_beyond_outbox_retention() -> None:
     from curie_api.deploy_notice import _DEDUP_TTL_SECONDS, _OUTBOX_RETENTION
 
     assert _DEDUP_TTL_SECONDS > _OUTBOX_RETENTION.total_seconds()
+
+
+@pytest.fixture
+def notice_metrics(client: Any) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-notice-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _suppressed_counts(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> dict[str, int]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    counts: dict[str, int] = {}
+    if data is None:
+        return counts
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "curie.deploy_notice.suppressed":
+                    continue
+                for point in metric.data.data_points:
+                    counts[str(point.attributes["reason"])] = int(point.value)
+    return counts
+
+
+def test_an_unmatched_rejection_never_posts_in_a_prod_bound_channel(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """A dev bot and a prod bot share a repository (ADR-0091).
+
+    `git.archive_failed` is decided before the push names its agent, so it may
+    belong to either; it must reach only the dev bot's channel, never the
+    channel of the agent with an active prod deployment.
+    """
+
+    _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert prod["status"] == "promoted", prod
+    assert prod["agent_id"] == prod_id
+    _delete_bare_repo(trusted_clone_base)
+    cursor = _notice_cursor()
+
+    rejected = _post(
+        client, "push", _push_payload("refs/heads/dev", "c" * 40, clone_url)
+    ).json()
+
+    assert rejected["status"] == "rejected", rejected
+    assert rejected["agent_id"] is None, rejected
+    assert {error["code"] for error in rejected["errors"]} == {"git.archive_failed"}
+    assert [
+        (notice["address"], notice["agent_name"]) for notice in _notices_after(cursor)
+    ] == [("C000000D01", "two-agent-dev")]
+    assert _suppressed_counts(notice_metrics) == {}
+
+
+def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One agent serves dev and prod from one channel: that channel is prod.
+
+    The rejection must post nothing there, and it must still be findable: one
+    WARNING naming the repository and code, and one counted suppression.
+    """
+
+    _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    assert _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()[
+        "status"
+    ] == "deployed"
+    assert _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()[
+        "status"
+    ] == "promoted"
+    _delete_bare_repo(trusted_clone_base)
+    cursor = _notice_cursor()
+
+    with caplog.at_level("WARNING", logger="curie_api.deploy_notice"):
+        rejected = _post(
+            client, "push", _push_payload("refs/heads/dev", "d" * 40, clone_url)
+        )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert _notices_after(cursor) == []
+    withheld = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.deploy_notice" and "no non-prod" in record.getMessage()
+    ]
+    assert len(withheld) == 1, withheld
+    assert REPO in withheld[0] and "git.archive_failed" in withheld[0], withheld
+    assert _suppressed_counts(notice_metrics) == {"no_nonprod_recipient": 1}
+
+
+def test_deploy_notices_are_bounded_per_repository(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """At most 20 notices per repository per rolling hour (docs/operations.md).
+
+    Forged rejections for fresh shas are exactly what a webhook-secret holder
+    can send. The 21st is withheld and counted; a redelivered outcome adds
+    nothing and is not counted; another repository keeps its own budget; and
+    notices older than the window stop counting.
+    """
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.schemas import WebhookResult
+    from redis.asyncio import Redis
+
+    _register_agent(client, auth_headers)
+    other = client.post(
+        "/agents",
+        json={
+            "name": "other-repo-agent",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE3"},
+            "repo_full_name": "octo/other-agent",
+        },
+        headers=auth_headers,
+    )
+    assert other.status_code == 201, other.text
+    stream = f"test:deploy-notice:bound:{uuid.uuid4().hex}"
+    rejected = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
+
+    def payload_for(sha: str, repository: str = REPO) -> dict[str, Any]:
+        payload = _push_payload("refs/heads/dev", sha, "file:///unused")
+        payload["repository"]["full_name"] = repository
+        return payload
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        queue = DeployNoticeQueue(valkey, stream)
+        try:
+            async with maker() as session:
+                for n in range(20):
+                    published = await queue.publish(
+                        session, rejected, payload_for(f"{n:040x}"), settings
+                    )
+                    assert published == 1, n
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{20:040x}"), settings
+                ) == 0
+                # A different casing is the same GitHub repository.
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{21:040x}", REPO.upper()), settings
+                ) == 0
+                assert _suppressed_counts(notice_metrics) == {"rate_limited": 2}
+                # Redelivering a recorded outcome adds nothing and is not counted.
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{0:040x}"), settings
+                ) == 0
+                assert _suppressed_counts(notice_metrics) == {"rate_limited": 2}
+                assert await queue.publish(
+                    session, rejected, payload_for("e" * 40, "octo/other-agent"), settings
+                ) == 1
+                assert await valkey.xlen(stream) == 21
+                await session.execute(
+                    text(
+                        "UPDATE curie.deploy_notice_outbox "
+                        "SET created_at = now() - interval '61 minutes' "
+                        "WHERE stream = :stream"
+                    ),
+                    {"stream": stream},
+                )
+                await session.commit()
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{22:040x}"), settings
+                ) == 1
+        finally:
+            await valkey.delete(stream)
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
 
 
 def test_notice_reconciler_is_on_by_default_and_the_suite_turns_it_off(
