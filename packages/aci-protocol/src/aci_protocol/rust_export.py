@@ -28,6 +28,7 @@ from .events import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
 )
 from .service_config import (
@@ -471,6 +472,9 @@ def render_rust() -> str:
             tuple(m.value for m in TurnSource),
             default=TurnSource.SLACK.value,
         ),
+        # No default variant: ToolAccess is only referenced as Option<ToolAccess>
+        # (QueuedTurn.tool_access, Event.tool_access), whose default is None.
+        _string_enum("ToolAccess", tuple(m.value for m in ToolAccess)),
         _struct(Budget),
         _struct(OtelConfig),
         _struct(SessionConfig),

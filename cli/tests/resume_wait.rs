@@ -56,6 +56,7 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         // `resumequeue._build_turn` mints on the Python side.
         source: TurnSource::Slack,
         hook_run: None,
+        tool_access: None,
         // Empty, matching `resumequeue._build_turn`: it replays the original
         // placeholder and endpoint, not the original files. Whether a resumed
         // turn should carry the attachments of the turn it continues is a real

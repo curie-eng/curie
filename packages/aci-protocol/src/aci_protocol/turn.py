@@ -34,7 +34,7 @@ from typing import Protocol
 
 from pydantic import model_validator
 
-from .events import _AciModel
+from .events import ToolAccess, _AciModel
 
 
 class TurnSource(StrEnum):
@@ -314,6 +314,11 @@ class QueuedTurn(_AciModel):
     carry a complete, nonblank ``hook_run`` so the worker has explicit agent and
     scheduled run identity without inventing a reply route. Every targeted turn,
     including cron, keeps the existing reply handle contract unchanged.
+
+    ``tool_access`` restricts what this one turn may execute (TOOL-ACCESS-1);
+    the worker forwards it as ``Event.tool_access`` (TOOL-ACCESS-6). It
+    defaults to ``None``, today's unrestricted turn, so a pre-upgrade producer
+    keeps decoding unchanged. No first-party ingress sets it.
     """
 
     event_id: str
@@ -325,6 +330,7 @@ class QueuedTurn(_AciModel):
     source: TurnSource = TurnSource.SLACK
     attachments: list[Attachment] = []
     hook_run: HookRunRef | None = None
+    tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
 
     @model_validator(mode="after")
     def _validate_targetless_cron_identity(self) -> "QueuedTurn":

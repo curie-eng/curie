@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.7";
+pub const PROTOCOL_VERSION: &str = "0.5.8";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -111,6 +111,12 @@ pub enum TurnSource {
     Webhook,
     #[serde(rename = "cron")]
     Cron,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolAccess {
+    #[serde(rename = "read-only")]
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -307,6 +313,8 @@ pub struct QueuedTurn {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub hook_run: Option<HookRunRef>,
+    #[serde(default)]
+    pub tool_access: Option<ToolAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -398,6 +406,8 @@ pub enum InboundMessage {
         history_ref: Option<String>,
         #[serde(default)]
         publication_context: Option<PublicationContext>,
+        #[serde(default)]
+        tool_access: Option<ToolAccess>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -565,13 +575,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.8","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.9","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.7","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.8","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

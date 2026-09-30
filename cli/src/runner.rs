@@ -113,6 +113,8 @@ impl RunnerClient {
             session_id: None,
             history_ref: None,
             publication_context: None,
+            // `skill` turns are ordinary turns (TOOL-ACCESS-1).
+            tool_access: None,
         };
         let resp = self
             .http
