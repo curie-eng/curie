@@ -18,6 +18,7 @@ something for the control to do.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -73,9 +74,9 @@ def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> No
     receipt = render_receipt(actions)
 
     assert receipt is not None
-    assert receipt.count("Bash") == 1
-    assert "6 Bash calls" in receipt
-    assert "changes not described" in receipt
+    assert receipt.count("Shell request completed") == 1
+    assert "(6 calls)" in receipt
+    assert "changes were not summarized and undo information is incomplete" in receipt
 
 
 def test_large_bash_result_joins_the_generic_call_count() -> None:
@@ -92,8 +93,8 @@ def test_large_bash_result_joins_the_generic_call_count() -> None:
     )
 
     assert receipt is not None
-    assert "2 Bash calls" in receipt
-    assert receipt.count("Bash") == 1
+    assert "(2 calls)" in receipt
+    assert receipt.count("Shell request completed") == 1
 
 
 def test_repeated_bash_noise_keeps_meaningful_summary_and_failure() -> None:
@@ -121,7 +122,8 @@ def test_repeated_bash_noise_keeps_meaningful_summary_and_failure() -> None:
 
     assert receipt is not None
     assert len(receipt.splitlines()) == 4
-    assert "25 Bash calls" in receipt
+    assert "Shell request completed" in receipt
+    assert "(25 calls)" in receipt
     assert "deployed acme service" in receipt
     assert "failed" in receipt
 
@@ -206,7 +208,7 @@ def test_both_kinds_appear_together() -> None:
 
 
 def test_a_failed_call_is_reported_as_maybe_rather_than_done() -> None:
-    """"It may have happened" is the state a human most needs told."""
+    """ "It may have happened" is the state a human most needs told."""
 
     receipt = render_receipt([_action(status="failed", undoable=False, result=None)])
 
@@ -274,8 +276,8 @@ def test_a_long_turn_lists_a_bounded_receipt_and_counts_the_rest() -> None:
 # --- The install's receipt mode (ADR-0180) ------------------------------------
 #
 # The mode changes only what is rendered to the person. Each fixture below is a
-# turn's completed ledger rows; the goldens are the bytes ADR-0117's receipt
-# rendered before ADR-0180, and `all` must keep producing exactly those.
+# turn's completed ledger rows; the goldens pin the current wording under
+# WORKER-RECEIPT-1 while `all` and the default retain the same behavior.
 
 
 def _mixed_turn() -> list[dict[str, Any]]:
@@ -317,7 +319,8 @@ _MIXED_TURN_GOLDEN = (
     "• scaled public/api from 3 to 10 — can be undone (2 calls)\n"
     "• called `restart_deployment` — restarting pods cannot be undone\n"
     "• called `stage_file` — cannot be undone: nothing reported a prior state\n"
-    "• 2 Bash calls; changes not described\n"
+    "• Shell request completed; changes were not summarized and undo information "
+    "is incomplete (2 calls)\n"
     "• filed acme-invoice.pdf — failed — check before retrying\n"
     "• called `Bash` — failed — check before retrying"
 )
@@ -352,8 +355,8 @@ def test_the_default_receipt_bytes_are_pinned() -> None:
     assert render_receipt(_long_turn()) == _LONG_TURN_GOLDEN
 
 
-def test_all_mode_renders_byte_for_byte_what_the_receipt_rendered_before() -> None:
-    """`all` is ADR-0117 as built, so an install that sets nothing sees no change."""
+def test_all_mode_matches_the_default_receipt() -> None:
+    """The install mode preserves the same content, grouping and budgets."""
 
     assert render_receipt(_mixed_turn(), mode="all") == _MIXED_TURN_GOLDEN
     assert render_receipt(_long_turn(), mode="all") == _LONG_TURN_GOLDEN
@@ -496,3 +499,116 @@ def test_generic_detail_does_not_replace_failure_or_undoability(
     )
 
     assert receipt == f"_What I changed:_\n• called `mcp__acme__stage_file` — {verdict}"
+
+
+@pytest.mark.parametrize("tool,noun", [("Skill", "Instruction"), ("Bash", "Shell")])
+@pytest.mark.parametrize(
+    "detail",
+    [
+        None,
+        "non-idempotent tool completed",
+        "non-idempotent tool executed",
+        "tool result too large to record",
+    ],
+)
+def test_generic_native_request_reports_completion_without_guessing_changes(
+    tool: str, noun: str, detail: str | None
+) -> None:
+    # WORKER-RECEIPT-1: success proves completion, not harmless instruction loading
+    # or the absence of a prior snapshot. The call must still be visible.
+    receipt = render_receipt([_action(tool=tool, result=None, undoable=False, detail=detail)])
+
+    assert receipt == (
+        f"_What I changed:_\n• {noun} request completed; "
+        "changes were not summarized and undo information is incomplete"
+    )
+
+
+@pytest.mark.parametrize("tool,noun", [("Skill", "Instruction"), ("Bash", "Shell")])
+def test_native_request_with_prior_snapshot_and_no_target_does_not_deny_prior_state(
+    tool: str, noun: str
+) -> None:
+    action = _action(
+        tool=tool,
+        result={"prior": {"replicas": 2}},
+        prior_state={"replicas": 2},
+        target=None,
+        undoable=False,
+    )
+
+    receipt = render_receipt([action])
+
+    assert receipt == (
+        f"_What I changed:_\n• {noun} request completed; "
+        "changes were not summarized and undo information is incomplete"
+    )
+    assert "nothing reported a prior state" not in receipt
+
+
+@pytest.mark.parametrize("tool", ["Skill", "Bash"])
+@pytest.mark.parametrize(
+    "overrides,line",
+    [
+        ({"status": "failed"}, "called `{tool}` — failed — check before retrying"),
+        ({"undoable": True}, "called `{tool}` — can be undone"),
+        (
+            {"detail": "external changes require manual restoration"},
+            "called `{tool}` — external changes require manual restoration",
+        ),
+        (
+            {"result": {"summary": "updated acme configuration"}},
+            "updated acme configuration — cannot be undone: nothing reported a prior state",
+        ),
+    ],
+)
+def test_native_request_keeps_failure_undoability_custom_detail_and_summary(
+    tool: str, overrides: dict[str, Any], line: str
+) -> None:
+    action = _action(tool=tool, result=None, undoable=False)
+    action.update(overrides)
+
+    assert render_receipt([action]) == "_What I changed:_\n• " + line.format(tool=tool)
+
+
+def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> None:
+    actions = [
+        *[_action(tool="Skill", result=None, undoable=False) for _ in range(3)],
+        *[_action(tool="Bash", result=None, undoable=False) for _ in range(2)],
+        _action(),
+        _action(tool="Skill", result=None, undoable=False, status="failed"),
+        _action(tool="Skill", result=None, undoable=False, status="failed"),
+    ]
+    stored_rows = deepcopy(actions)
+
+    receipt = render_receipt(actions)
+
+    assert receipt == (
+        "_What I changed:_\n"
+        "• Instruction request completed; changes were not summarized and undo information "
+        "is incomplete (3 calls)\n"
+        "• Shell request completed; changes were not summarized and undo information "
+        "is incomplete (2 calls)\n"
+        "• scaled public/api from 3 to 10 — can be undone\n"
+        "• called `Skill` — failed — check before retrying\n"
+        "• called `Skill` — failed — check before retrying"
+    )
+    assert actions == stored_rows
+
+
+@pytest.mark.parametrize("tool", ["mcp__acme__Skill", "mcp__acme__Bash"])
+def test_third_party_native_like_name_is_not_rewritten_or_hidden(tool: str) -> None:
+    assert render_receipt([_action(tool=tool, result=None, undoable=False)]) == (
+        f"_What I changed:_\n• called `{tool}` — cannot be undone: nothing reported a prior state"
+    )
+
+
+def test_native_instruction_request_still_obeys_receipt_modes() -> None:
+    success = _action(tool="Skill", result=None, undoable=False)
+    failure = _action(tool="Skill", result=None, undoable=False, status="failed")
+
+    assert render_receipt([success], mode="all") is not None
+    assert render_receipt([success], mode="failures") is None
+    assert render_receipt([success, failure], mode="failures") == (
+        "_What I changed:_\n• called `Skill` — failed — check before retrying"
+    )
+    assert render_receipt([success, failure], mode="off") is None
