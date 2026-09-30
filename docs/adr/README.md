@@ -207,4 +207,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
 | 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
 | 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
+| 0184 | [Settled stream entries are trimmed; receipts live in Postgres; backlog is counted, not rated](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md) | Draft |
 <!-- END GENERATED: adr-index -->
