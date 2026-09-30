@@ -320,3 +320,112 @@ fn status_reachable_unhealthy_release_without_context_is_a_convergence_failure()
     assert!(err.contains("has not converged"), "{err}");
     assert!(!err.contains("no Kubernetes context"), "{err}");
 }
+
+// #3568: `curie example sre-bot` spawns helm and kubectl against a cluster too, so it
+// must pin the context exactly like `curie cluster`.
+
+#[test]
+fn example_sre_bot_explicit_context_pins_every_helm_and_kubectl_call() {
+    for args in [
+        [
+            "example",
+            "--context",
+            "test-ctx",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            ".",
+        ],
+        [
+            "example",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            ".",
+            "--context",
+            "test-ctx",
+        ],
+    ] {
+        let run = run_curie(&args, Some("prod-ctx"));
+        // The fake kubectl returns no node list, so the capacity preflight stops the
+        // run after the first helm and kubectl calls; both must already be pinned.
+        assert_all_pinned(&run, "test-ctx");
+        let err = run.stderr();
+        assert!(err.contains("test-ctx"), "stderr must name the context: {err}");
+        assert!(
+            err.contains("test-cluster"),
+            "stderr must name the cluster: {err}"
+        );
+    }
+}
+
+#[test]
+fn example_sre_bot_without_context_pins_current_context() {
+    let run = run_curie(
+        &[
+            "example",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            ".",
+        ],
+        Some("test-ctx"),
+    );
+    assert_all_pinned(&run, "prod-ctx");
+}
+
+#[test]
+fn example_sre_bot_unknown_context_refuses_before_any_call() {
+    let run = run_curie(
+        &[
+            "example",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            ".",
+            "--context",
+            "nope",
+        ],
+        None,
+    );
+    assert!(!run.out.status.success(), "unknown context must fail");
+    assert!(run.stderr().contains("nope"), "stderr: {}", run.stderr());
+    assert!(run.log.is_empty(), "no helm or kubectl call may run: {:?}", run.log);
+}
+
+#[test]
+fn example_sre_bot_dry_run_names_the_context_and_prints_the_argv() {
+    let run = run_curie(
+        &[
+            "--json",
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+            "--dry-run",
+            "--context",
+            "test-ctx",
+        ],
+        None,
+    );
+    assert!(run.out.status.success(), "stderr={}", run.stderr());
+    assert!(run.log.is_empty(), "a dry run spawns nothing: {:?}", run.log);
+    let err = run.stderr();
+    assert!(err.contains("test-ctx") && err.contains("test-cluster"), "{err}");
+    let plan: serde_json::Value = serde_json::from_slice(&run.out.stdout).expect("JSON plan");
+    let lines: Vec<&str> = plan["plan"]
+        .as_array()
+        .expect("plan lines")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for expected in [
+        "helm repo add grafana https://grafana.github.io/helm-charts --force-update",
+        "kubectl rollout status statefulset/tempo --namespace observability --timeout=10m",
+    ] {
+        assert!(
+            lines.contains(&expected),
+            "plan must carry the argv {expected:?}: {lines:#?}"
+        );
+    }
+}
