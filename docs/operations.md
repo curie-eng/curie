@@ -762,11 +762,28 @@ promote:
 Git-flow rejections send a top-level Slack notice even when success notices
 are off. A rejection after the push resolved its target agent, such as an
 unbound approval route on a prod promote, goes only to that agent's channels.
-A rejection before the target is known, such as `git.archive_failed`, goes to
-every Slack channel bound to an agent for the pushed repository. The notice
-includes the commit prefix and stable error codes; for `git.archive_failed`,
-check the API's clone credential and repository access. An unrelated
-repository has no bound recipient and remains ignored. To also receive
+A rejection before the target is known, such as `git.archive_failed` or
+`git.repository_case_mismatch`, can belong to any agent built from the
+repository, so it goes only to the Slack channels of the repository's non-prod
+bindings. It never reaches a channel bound to a prod deployment: a Slack channel
+counts as prod when any agent bound to it, through any bot identity, has an
+active prod deployment, and an agent with an active prod deployment has no
+non-prod bindings. When no non-prod channel remains, the rejection posts
+nothing; the API logs it at WARNING with the repository, commit and codes, and
+counts it in `curie.deploy_notice.suppressed` with
+`reason="no_nonprod_recipient"`. The notice includes the commit prefix and
+stable error codes; for `git.archive_failed`, check the API's clone credential
+and repository access. An unrelated repository has no bound recipient and
+remains ignored.
+
+Deploy notices are rate limited per repository, so a holder of the webhook
+secret cannot flood a channel with forged pushes. Each installation records at
+most 20 notices (one notice is one post to one channel) per repository in any
+rolling 60 minutes, matching the repository name case-insensitively. A push
+outcome whose new notices would pass that bound records none of them; the API
+logs it at WARNING and counts it in `curie.deploy_notice.suppressed` with
+`reason="rate_limited"`. A redelivered outcome whose notices are already
+recorded adds nothing and is not counted against the bound. To also receive
 successful deploy and promotion notices, opt each agent in through
 `PATCH /agents/<agent-id>` with `{"deploy_notifications": true}` and the
 normal API key. The default is `false`; this setting does not affect rejection
