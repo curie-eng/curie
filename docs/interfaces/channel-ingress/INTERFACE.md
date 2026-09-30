@@ -80,9 +80,9 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   posted: there the root is quoted ahead of it as untrusted context inside a
   `<prior_assistant_reply>` block
   (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
-  and the worker's repository selection removes that block before reading the
-  person's words
-  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::without_quoted_context`).
+  with root slashes neutralized as XML entities so repository-looking alert
+  text stays inert even to an older worker's raw repository parser during a
+  rolling upgrade.
 
   **Named relay identity contract (INGRESS-CANARY-1).** A disconnected cluster
   message may use `adapter=curie-cluster-message` to select reply delivery and

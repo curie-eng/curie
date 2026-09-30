@@ -172,19 +172,20 @@ For a threaded `app_mention`, after the dedupe claim and before the placeholder,
 `conversations.replies(limit=1)` and quotes it ahead of the person's text only
 when that root is this bot's own post: its `user` is Bolt's authorized bot user,
 or it has no `user` and carries Bolt's authorized `bot_id`. The quote is at most
-4,000 characters, XML-escaped, inside a `<prior_assistant_reply>` block that
+4,000 characters, XML-escaped with root slashes emitted as entities, inside a `<prior_assistant_reply>` block that
 says it is untrusted context and no authorization. Everything else about the
 turn is the person's: `source` stays `slack`, `author` the person, the
-conversation the Slack thread, and no hook state is copied. The worker's
-repository selection removes the quoted block before it parses the person's
-words.
+conversation the Slack thread, and no hook state is copied. Slash neutralization
+makes repository-looking alert text inert even for an older worker during a
+rolling upgrade, while the person's own text is parsed unchanged.
 
 A reply whose `parent_user_id` names someone else asks Slack nothing and is
 unchanged, and so is a reply in a thread whose root turns out to be someone
 else's. When Slack said the parent is this bot's but the root cannot be read or
 verified, the reply instead carries a notice telling the agent not to infer or
 execute the earlier proposal and to ask for it to be restated. The answer about
-each root is cached in Valkey under a digest key, for
+each root is cached in Valkey under a digest of the authorized bot user, bot
+ID, channel, and root timestamp, for
 `CURIE_THREAD_CONTEXT_TTL_SECONDS`, so a restart keeps it and a long thread
 reads Slack once; a root that is not this bot's is cached without its text.
 

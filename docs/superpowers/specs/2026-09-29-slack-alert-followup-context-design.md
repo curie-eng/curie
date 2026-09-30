@@ -5,9 +5,10 @@ Date: 2026-09-29
 Status: Accepted
 
 Accepted with explicit maintainer approval on 2026-09-29. Revised the same
-day, before any test or implementation landed, after two measurements: Slack's
-own event type does not promise `parent_user_id` on `app_mention`, and the
-worker reads a person's turn text as trusted input for repository selection.
+day after measurements and review: Slack's own event type does not promise
+`parent_user_id` on `app_mention`, the worker reads a person's turn text as
+trusted input for repository selection, and dispatcher and worker versions can
+overlap during a rolling upgrade.
 
 ## Purpose
 
@@ -108,20 +109,22 @@ relevance and self-event rules remain unchanged.
 Only the root's derived text is kept, and at most 4,000 characters of it. The
 text is derived by the same `derive_text` the dispatcher applies to an inbound
 event, so a root whose body lives in Block Kit still yields its content. A
-longer root keeps its first and last 2,000 characters around a platform marker
-naming how many characters were left out, because an alert post usually opens
-with the alert and ends with the question a reply answers. The bound applies
-before the text is cached, so the cache value is bounded too.
+longer root splits the available space around a platform marker naming how many
+characters were left out, keeping equal head and tail excerpts because an alert
+post usually opens with the alert and ends with the question a reply answers.
+The complete excerpt, marker included, is at most 4,000 characters before it is
+cached.
 
 ## Context cache and restart behavior
 
 The first validated answer about a root is cached in Valkey under a digest of
-the authorized bot user ID, channel ID, and root timestamp. The value is a
-versioned object carrying those same coordinates, whether the root is this
-bot's, and, only when it is, the bounded root text. Reads revalidate every
-field; corrupt or mismatched values are ignored rather than rendered. A root
-that is not this bot's is cached without any of its text, so a thread rooted by
-someone else costs one lookup rather than one per reply.
+the authorized bot user ID, authorized bot ID, channel ID, and root timestamp.
+The value is a versioned object carrying those same coordinates, whether the
+root is this bot's, and, only when it is, the bounded root text. Reads
+revalidate every field and the 4,000-character bound; corrupt, oversized, or
+mismatched values are ignored rather than rendered. A root that is not this
+bot's is cached without any of its text, so a thread rooted by someone else
+costs one lookup rather than one per reply.
 
 The cache serves three purposes:
 
@@ -168,10 +171,11 @@ stripping. The same holds when the looked-up root is someone else's.
 
 The successful prefix identifies the material as a prior assistant reply from
 this exact Slack thread, says it is context only, and says it may contain
-untrusted alert data. The root text is escaped with the same XML escaping the
-hook route applies to its untrusted payload, so it cannot forge the closing
-marker. The current message follows outside that quoted block and retains its
-normal instruction status.
+untrusted alert data. The root text is XML-escaped so it cannot forge the
+closing marker, and every slash in that root is emitted as an XML entity. The
+entity keeps GitHub URLs and `owner/name` tokens non-lexical to both old and new
+workers during a rolling upgrade. The current message follows outside that
+quoted block and retains its normal instruction status.
 
 The fallback prefix contains no root text and explicitly refuses inference from
 the unavailable message. Neither prefix contains the hook's synthetic ID,
@@ -183,14 +187,14 @@ repository.
 
 The worker reads a `source=slack` turn's text as trusted input when it selects
 a coding repository (`trusted_repository_fact`), and any `owner/name` token or
-GitHub URL in it counts. Quoted alert text is full of such tokens, and two
-GitHub URLs refuse the turn outright. The quoted root is the hook's output, and
-a hook's own text is never trusted for this purpose, so quoting it into a
-person's turn must not make it trusted either. `trusted_repository_fact`
-therefore removes every quoted prior-reply block before it parses. It uses the
-dispatcher's own helper, so the marker the dispatcher writes and the marker the
-worker removes are one definition; the worker already depends on the dispatcher
-package. The person's own words outside the block are parsed exactly as before.
+GitHub URL in it counts. Quoted alert text is full of such tokens. The quoted
+root is hook output, so the dispatcher makes every slash in that root
+non-lexical before the turn reaches the stream. This is safe by construction:
+the old worker's unchanged parser and the new worker both ignore the root's
+repository-looking strings, while the person's own words outside the block are
+parsed exactly as before. No textual marker is treated as authenticated
+provenance, so a person who types the platform header cannot hide a repository
+from conflict detection.
 
 Other exact-text readers of a turn, the behavior pack greeting and help
 matchers, see the prefix and therefore do not fire on a reply in a thread this
@@ -200,17 +204,16 @@ accepted rather than special-cased.
 ## Files and ownership
 
 - `apps/dispatcher/src/curie_dispatcher/thread_context.py` owns root validation,
-  the size bound, cache serialization, Slack lookup, prompt rendering, and the
-  helper that removes the quoted block.
+  the size bound, cache serialization, Slack lookup, prompt rendering, and
+  slash neutralization for mixed-version workers.
 - `apps/dispatcher/src/curie_dispatcher/handlers.py` invokes that helper after
   the event-ID claim and before the shared placeholder/enqueue tail, passing
   Bolt's `bot_user_id` and `bot_id`.
 - `apps/dispatcher/src/curie_dispatcher/config.py` and
   `apps/dispatcher/README.md` own the cache retention and prefix settings.
-- `apps/worker/src/curie_worker/workspace.py` removes the quoted block before
-  repository parsing.
-- Dispatcher and worker tests own the behavior matrix. Slack is faked because it
-  is an external service; Valkey remains real, per repository policy.
+- Dispatcher and worker tests own the behavior matrix, including the old
+  worker's raw repository parser. Slack is faked because it is an external
+  service; Valkey remains real, per repository policy.
 
 No frozen ACI or plugin-format contract changes. No worker kernel, Slack sink,
 runner, API, chart, example bundle, or downstream deployment changes.

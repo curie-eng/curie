@@ -4,7 +4,7 @@
 
 **Goal:** Give a human Slack reply the exact same-bot root message as safe context without joining or inheriting the hook session that authored it.
 
-**Architecture:** The dispatcher detects a threaded mention whose `parent_user_id` does not name someone else, resolves only the exact thread root through a Valkey cache and `conversations.replies(limit=1)`, validates bot/channel/timestamp identity on the root itself, bounds its text, and prepends a non-authorizing context block. The worker's repository selection removes that block before parsing. The existing `QueuedTurn` identity stays human and Slack-scoped; failures produce a safe visible instruction to restate instead of inferring an unavailable proposal.
+**Architecture:** The dispatcher detects a threaded mention whose `parent_user_id` does not name someone else, resolves only the exact thread root through a Valkey cache and `conversations.replies(limit=1)`, validates bot/channel/timestamp identity on the root itself, bounds its text, neutralizes its slashes for mixed-version repository parsers, and prepends a non-authorizing context block. The existing `QueuedTurn` identity stays human and Slack-scoped; failures produce a safe visible instruction to restate instead of inferring an unavailable proposal.
 
 **Tech Stack:** Python 3.12, Slack Bolt/Web API, redis-py with real Valkey tests, Pydantic settings, pytest, Ruff, mypy.
 
@@ -14,7 +14,7 @@
 
 - Target `main`; the normal forward merge carries the fix to `next`.
 - Do not change `packages/aci-protocol` or `packages/plugin-format`.
-- Do not modify the worker kernel, Slack sink, runner, API, chart, SRE example, or any downstream repository/deployment. The one worker change is `trusted_repository_fact` in `workspace.py`, which must not read the quoted root as a person's repository request.
+- Do not modify the worker, runner, API, chart, SRE example, or any downstream repository/deployment. The quoted root itself must be safe for the old worker's unchanged repository parser during rollout.
 - Never copy hook source, author, session, transcript, route, approval state, or credentials onto the human turn.
 - Slack is the only mocked external service; Valkey tests use a real isolated service.
 - Committed examples use only public placeholder identifiers.
@@ -104,14 +104,13 @@ git commit -m "test: pin Slack alert follow-up context"
 - Modify: `apps/dispatcher/src/curie_dispatcher/handlers.py`
 - Modify: `apps/dispatcher/src/curie_dispatcher/config.py`
 - Modify: `apps/dispatcher/README.md`
-- Modify: `apps/worker/src/curie_worker/workspace.py`
 - Test: `apps/dispatcher/tests/test_thread_context.py`
 - Test: `apps/worker/tests/test_workspace.py`
 - Test: `apps/dispatcher/tests/test_queue.py`
 
 **Interfaces:**
 - Consumes: `WebClient.conversations_replies(channel: str, ts: str, limit: int)`, a decode-responses `redis.Redis`, `DispatcherConfig.thread_context_cache_prefix`, and `DispatcherConfig.thread_context_ttl_seconds`.
-- Produces: `SlackThreadContext(redis_client, web_client, config).resolve(*, event: Mapping[str, Any], lane: Lane, bot_user_id: str | None, bot_id: str | None, text: str) -> str`, and `without_quoted_context(text: str) -> str` for the worker.
+- Produces: `SlackThreadContext(redis_client, web_client, config).resolve(*, event: Mapping[str, Any], lane: Lane, bot_user_id: str | None, bot_id: str | None, text: str) -> str`.
 
 - [ ] **Step 1: Add cache settings**
 
@@ -127,12 +126,12 @@ Document both in the dispatcher configuration table and explain that cached cont
 In `thread_context.py`, add a small versioned strict cache model and the `SlackThreadContext` interface above. The resolver must:
 
 1. return `text` unchanged unless this is a threaded mention whose `parent_user_id` is absent or equals `bot_user_id`;
-2. derive a SHA-256 cache key from bot user, channel, and root timestamp without placing raw identifiers or text in the key;
+2. derive a SHA-256 cache key from bot user, authorized bot ID, channel, and root timestamp without placing raw identifiers or text in the key;
 3. accept cached text only when every stored identity field and schema version matches;
 4. otherwise call `conversations_replies(channel=channel, ts=thread_ts, limit=1)`;
 5. accept only the first message with an exact `ts` match whose `user` is the bot user, or which has no `user` and the authorized `bot_id`; cache a root that is someone else's without its text;
 6. cache the validated root for the configured TTL;
-7. bound the derived root text to 4,000 characters (head and tail), escape it, and render the successful non-authorizing prefix;
+7. bound the complete derived root excerpt, including its omission marker, to 4,000 characters (head and tail), XML-escape it, neutralize every root slash as an entity, and render the successful non-authorizing prefix;
 8. catch Slack, cache, and shape failures; render the fail-closed restate prefix without root content or exception detail when `parent_user_id` claimed the root, and return `text` unchanged otherwise.
 
 Include a test comment citing Slack's official `conversations.replies` documentation for the parent-first response shape and required arguments.

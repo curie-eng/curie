@@ -19,12 +19,11 @@ import hashlib
 import html
 import json
 import logging
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from slack_sdk.errors import SlackApiError
 
 from .config import DispatcherConfig
@@ -40,11 +39,6 @@ PRIOR_REPLY_CLOSE = "</prior_assistant_reply>"
 
 #: The size bound on a quoted root (spec: Size bound).
 ROOT_TEXT_MAX_CHARS = 4000
-_ROOT_EDGE_CHARS = ROOT_TEXT_MAX_CHARS // 2
-
-_QUOTED_BLOCK = re.compile(
-    re.escape(PRIOR_REPLY_OPEN) + r".*?" + re.escape(PRIOR_REPLY_CLOSE), re.DOTALL
-)
 
 # Neither wording may contain a slash: the worker reads a person's turn text for
 # owner/name repository tokens, and this text sits outside the quoted block.
@@ -65,17 +59,22 @@ _UNAVAILABLE_NOTICE = (
     "The person's new message follows."
 )
 
-
 def bound_root_text(text: str) -> str:
     """At most ``ROOT_TEXT_MAX_CHARS`` of the root, keeping its head and tail."""
 
     if len(text) <= ROOT_TEXT_MAX_CHARS:
         return text
-    omitted = len(text) - 2 * _ROOT_EDGE_CHARS
-    return (
-        f"{text[:_ROOT_EDGE_CHARS]}\n[{omitted} characters omitted]\n"
-        f"{text[-_ROOT_EDGE_CHARS:]}"
-    )
+    kept = ROOT_TEXT_MAX_CHARS
+    while True:
+        omitted = len(text) - kept
+        marker = f"\n[{omitted} characters omitted]\n"
+        next_kept = ROOT_TEXT_MAX_CHARS - len(marker)
+        if next_kept == kept:
+            break
+        kept = next_kept
+    head = kept // 2
+    tail = kept - head
+    return f"{text[:head]}{marker}{text[-tail:]}"
 
 
 def render_prior_reply(root_text: str, text: str) -> str:
@@ -85,7 +84,11 @@ def render_prior_reply(root_text: str, text: str) -> str:
     root cannot forge ``PRIOR_REPLY_CLOSE`` and end the block early.
     """
 
-    quoted = html.escape(root_text, quote=False)
+    # The slash entity is intentional compatibility hardening: repository
+    # selection in older workers parses the complete turn as raw text. Making
+    # every slash in the untrusted root non-lexical keeps owner/name and GitHub
+    # URLs inert even while dispatcher and worker versions overlap in rollout.
+    quoted = html.escape(root_text, quote=False).replace("/", "&#x2F;")
     return f"{_CONTEXT_HEADER}\n\n{PRIOR_REPLY_OPEN}\n{quoted}\n{PRIOR_REPLY_CLOSE}\n\n{text}"
 
 
@@ -93,16 +96,6 @@ def render_unavailable_notice(text: str) -> str:
     """The person's ``text`` after the fail-closed notice (spec: Failure behavior)."""
 
     return f"{_UNAVAILABLE_NOTICE}\n\n{text}"
-
-
-def without_quoted_context(text: str) -> str:
-    """``text`` with every quoted prior-reply block removed.
-
-    The worker's repository selection calls this (spec: Repository selection),
-    so the marker written here and the marker removed there are one definition.
-    """
-
-    return _QUOTED_BLOCK.sub(" ", text)
 
 
 @dataclass(frozen=True)
@@ -120,10 +113,11 @@ class _CachedRoot(BaseModel):
 
     version: Literal[1]
     bot_user_id: str
+    bot_id: str | None
     channel: str
     thread_ts: str
     owned: bool
-    text: str
+    text: str = Field(max_length=ROOT_TEXT_MAX_CHARS)
 
 
 class _UnreadableRoot(Exception):
@@ -179,6 +173,7 @@ class SlackThreadContext:
 
         channel = event.get("channel")
         thread_ts = event.get("thread_ts")
+        event_ts = event.get("ts")
         if (
             lane != "mention"
             or not bot_user_id
@@ -186,11 +181,15 @@ class SlackThreadContext:
             or not channel
             or not isinstance(thread_ts, str)
             or not thread_ts
-            or thread_ts == event.get("ts")
+            or not isinstance(event_ts, str)
+            or not event_ts
+            or thread_ts == event_ts
         ):
             return text
         parent = event.get("parent_user_id")
-        if isinstance(parent, str) and parent and parent != bot_user_id:
+        if parent is not None and (
+            not isinstance(parent, str) or not parent or parent != bot_user_id
+        ):
             return text
         claimed = parent == bot_user_id
 
@@ -220,9 +219,13 @@ class SlackThreadContext:
     def _root(
         self, *, bot_user_id: str, bot_id: str | None, channel: str, thread_ts: str
     ) -> _Root:
-        key = self._key(bot_user_id, channel, thread_ts)
+        key = self._key(bot_user_id, bot_id, channel, thread_ts)
         cached = self._read_cache(
-            key, bot_user_id=bot_user_id, channel=channel, thread_ts=thread_ts
+            key,
+            bot_user_id=bot_user_id,
+            bot_id=bot_id,
+            channel=channel,
+            thread_ts=thread_ts,
         )
         if cached is not None:
             return cached
@@ -234,6 +237,7 @@ class SlackThreadContext:
             _CachedRoot(
                 version=1,
                 bot_user_id=bot_user_id,
+                bot_id=bot_id,
                 channel=channel,
                 thread_ts=thread_ts,
                 owned=root.owned,
@@ -242,14 +246,22 @@ class SlackThreadContext:
         )
         return root
 
-    def _key(self, bot_user_id: str, channel: str, thread_ts: str) -> str:
+    def _key(
+        self, bot_user_id: str, bot_id: str | None, channel: str, thread_ts: str
+    ) -> str:
         digest = hashlib.sha256(
-            json.dumps([bot_user_id, channel, thread_ts]).encode("utf-8")
+            json.dumps([bot_user_id, bot_id, channel, thread_ts]).encode("utf-8")
         ).hexdigest()
         return f"{self._prefix}{digest}"
 
     def _read_cache(
-        self, key: str, *, bot_user_id: str, channel: str, thread_ts: str
+        self,
+        key: str,
+        *,
+        bot_user_id: str,
+        bot_id: str | None,
+        channel: str,
+        thread_ts: str,
     ) -> _Root | None:
         try:
             stored = self._redis.get(key)
@@ -264,6 +276,7 @@ class SlackThreadContext:
             return None
         if (
             value.bot_user_id != bot_user_id
+            or value.bot_id != bot_id
             or value.channel != channel
             or value.thread_ts != thread_ts
             or (not value.owned and value.text)
