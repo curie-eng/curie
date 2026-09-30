@@ -1022,7 +1022,9 @@ def test_the_caller_token_rides_with_the_connector_scope() -> None:
 def test_no_caller_token_is_rendered_when_none_was_minted(token: str | None) -> None:
     # An install with no signing key mints nothing, and its boot env is the
     # one it had before the key existed.
-    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in _worker_env(**_SCOPE, connector_caller_token=token)
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in _worker_env(
+        **_SCOPE, connector_caller_token=token
+    )
 
 
 def test_the_caller_token_survives_the_worker_render_and_the_consumer_parse() -> None:
@@ -1125,6 +1127,14 @@ def test_from_env_reads_the_memory_writes_flag(raw: str, parsed: bool) -> None:
     env = BootEnv(session=_boot_session()).to_env()
     env["CURIE_MEMORY_WRITES"] = raw
     assert BootEnv.from_env(env).memory_writes is parsed
+
+
+@pytest.mark.parametrize("raw", ["yes", "2", "on", "off", "garbage"])
+def test_from_env_reads_an_unknown_memory_writes_value_as_off(raw: str) -> None:
+    # None means "an old worker, a ref means writes on", which would fail open.
+    env = BootEnv(session=_boot_session(), channel_memory_ref=_CHANNEL_MEMORY_REF).to_env()
+    env["CURIE_MEMORY_WRITES"] = raw
+    assert BootEnv.from_env(env).memory_writes is False
 
 
 def test_from_env_reads_an_absent_or_empty_memory_writes_flag_as_unset() -> None:

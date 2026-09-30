@@ -43,7 +43,9 @@ from pydantic import ValidationError
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
 # (`cli/src/queue.rs::queued_turn_matches_cross_language_golden`, T-A3). Read from
 # disk rather than inlined, so this test and that one cannot drift apart.
-_GOLDEN = Path(__file__).resolve().parents[1] / "schema" / "queued-turn.fixture.json"
+_GOLDEN = (
+    Path(__file__).resolve().parents[1] / "schema" / "queued-turn.fixture.json"
+)
 
 
 def _turn_payload_with_unknown_fields() -> dict[str, object]:
@@ -284,7 +286,9 @@ def test_reply_handle_without_placeholder_raises() -> None:
 
 
 def test_reply_handle_with_null_placeholder_succeeds() -> None:
-    handle = ReplyHandle.model_validate({"kind": "slack", "channel": "C1", "placeholder": None})
+    handle = ReplyHandle.model_validate(
+        {"kind": "slack", "channel": "C1", "placeholder": None}
+    )
     assert handle.placeholder is None
 
 
@@ -449,7 +453,9 @@ def test_a_partial_hook_run_is_rejected(missing_field: str) -> None:
             conversation_id="c1",
             author="u1",
             text="hi",
-            reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="1.0"),
+            reply_handle=ReplyHandle(
+                kind="slack", channel="C1", placeholder="1.0"
+            ),
             received_at="20260922T030000Z",
             source=TurnSource.CRON,
             hook_run=hook_run,
@@ -475,7 +481,9 @@ def _targetless_cron_payload() -> dict[str, object]:
     }
 
 
-def _construct_or_parse_targetless(payload: dict[str, object], reader: str) -> QueuedTurn:
+def _construct_or_parse_targetless(
+    payload: dict[str, object], reader: str
+) -> QueuedTurn:
     if reader == "constructor":
         return QueuedTurn(**payload)  # type: ignore[arg-type]
     return parse_queued_turn(json.dumps(payload))
@@ -688,7 +696,9 @@ def test_a_slack_turn_with_no_adapter_matches_the_stored_default_row() -> None:
     default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
     other_pair = _Row(kind="slack", address="C0EXAMPLE2", adapter=None, endpoint=None)
 
-    assert matching_routes([default_row, other_pair], "slack", "C0EXAMPLE1", None) == [default_row]
+    assert matching_routes([default_row, other_pair], "slack", "C0EXAMPLE1", None) == [
+        default_row
+    ]
 
 
 def test_a_slack_turn_with_adapter_default_matches_the_same_null_row() -> None:
