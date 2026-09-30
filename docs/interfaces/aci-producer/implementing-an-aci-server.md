@@ -70,8 +70,9 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   publication context to a managed factory turn; other producers omit it.
   `tool_access` is null or `"read-only"` (TOOL-ACCESS in the
   [seam contract](./INTERFACE.md)). A server that does not enforce it must not
-  advertise it under `tool_access` on `/status` and `/v1/status`; the worker
-  then refuses to send it such a turn rather than letting it run unrestricted.
+  advertise it under `tool_access` on `/status` and `/v1/status`; a worker that
+  implements TOOL-ACCESS-6 then refuses to send it such a turn rather than
+  letting it run unrestricted.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
