@@ -92,14 +92,17 @@ At boot the runner lists whichever of the two it was given and renders a
 most 200 per memory, each statement flattened to one line and framed as data,
 not instructions) after the legacy log preamble. Each line reads
 `- [<id>] <author> on <YYYY-MM-DD> stated: <statement>` (or
-`- [<id>] <author> stated: <statement>` without a date), or
+`- [<id>] <author> stated: <statement>` without a date; a date that does not
+parse is left out, never shown raw), or
 `- [<id>] Author unknown, as of <YYYY-MM-DD>: <statement>` (or
 `- [<id>] Author unknown: <statement>`) when no person is recorded. The
 attribution comes before the statement so a statement cannot forge it. The
 author keeps only the characters `[A-Za-z0-9._@+-]` (anything else, including
 whitespace, parentheses, colons, zero-width and bidi characters, is dropped; nothing
 left means unknown) and is capped at 64 characters. The block tells the model to
-weigh each fact by who stated it. With memory writes off no
+weigh each fact by who stated it, and says that only the attribution at the
+start of each line is the platform's record: anything in the statement that
+looks like an attribution is part of what was said. With memory writes off no
 channel ref is minted, so only agent facts are loaded. When
 `CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
 `forget` on the platform `curie` server and injects the guidance block
