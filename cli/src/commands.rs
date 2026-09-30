@@ -628,7 +628,7 @@ pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
 /// images: `curie build` and `curie local up --build` both route here (#1931).
 pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
-    if !on_path("docker") {
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -1616,7 +1616,7 @@ impl crate::ui::CliOutput for BumpVersionOutput {
 
 /// Bail with a friendly pointer when a required tool is not on PATH.
 fn require_tool(bin: &str, hint: &str) -> Result<()> {
-    if on_path(bin) {
+    if crate::ops::on_path(bin) {
         Ok(())
     } else {
         bail!("{hint}")
@@ -1652,13 +1652,6 @@ async fn docker_image_exists(tag: &str) -> Result<bool> {
         .await
         .context("failed to invoke docker")?;
     Ok(status.success())
-}
-
-/// Whether `bin` resolves on PATH.
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false)
 }
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
@@ -13974,7 +13967,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     if let Some(runner) = &decl.runner {
         cb::check_runner_source(&plugin_dir, runner)?;
     }
-    if !on_path("docker") {
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -14522,10 +14515,32 @@ async fn run_registry_preflight(
     }
     let node_archs = node_architectures(&out);
 
+    // The registry is read natively first, so a host without docker can still
+    // deploy (#3503); docker, when present, is the fallback that honors a
+    // registry login.
+    let docker = crate::ops::on_path("docker");
     for entry in targets {
-        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
-        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
-        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+        let inspect = match crate::oci_registry::fetch_manifest(&entry.image).await {
+            Ok(manifest) => Ok(String::from_utf8_lossy(&manifest.raw).into_owned()),
+            Err(native) if docker => {
+                let (ok, raw, err) =
+                    crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+                if ok {
+                    Ok(raw)
+                } else {
+                    Err(format!("{native:#}; docker also failed: {}", err.trim()))
+                }
+            }
+            Err(native) => Err(format!(
+                "{native:#}, and `docker` is not on PATH to ask with a registry login"
+            )),
+        };
+        registry_preflight(
+            &entry.image,
+            inspect.as_deref().map_err(Clone::clone),
+            &node_archs,
+            &entry.platforms,
+        )?;
     }
     Ok(())
 }

@@ -75,6 +75,10 @@ pub const DEFAULT_API_KEY: &str = "curie-dev-key";
 ///
 /// Mirrors the rule already settled in `ops.rs::resolve_up_credentials`,
 /// `local.rs::model_mode_from_env`, and `secrets.rs::save_value`.
+///
+/// The per-install key `curie local up` stores (#3557) is NOT substituted here:
+/// the parser does not know where the request goes. `ApiClient::new` swaps the
+/// sentinel for the stored key, and only for a loopback destination.
 pub fn api_key_or_default(raw: &str) -> Result<String, String> {
     Ok(resolve_api_key(raw, env::var("CURIE_API_KEY").ok()))
 }
@@ -7291,6 +7295,7 @@ mod tests {
             model: None,
             minimal: false,
             stack_image_env: Vec::new(),
+            stack_secret_env: Vec::new(),
         }
     }
 

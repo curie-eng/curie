@@ -192,6 +192,19 @@ def test_publication_schema_refuses_github_workflow_changes() -> None:
         PublicationCreate.model_validate(payload)
 
 
+def test_publication_schema_refuses_github_metadata_changes() -> None:
+    for path in (
+        ".github/actions/build/action.yml",
+        ".github/CODEOWNERS",
+        ".GITHUB/CODEOWNERS",
+    ):
+        payload = _publication_payload(str(uuid.uuid4()))
+        payload["changed_paths"] = [path]
+
+        with pytest.raises(ValidationError, match="GitHub metadata changes cannot be published"):
+            PublicationCreate.model_validate(payload)
+
+
 def test_publication_schema_accepts_the_builtin_reply_adapter_without_an_endpoint() -> None:
     reply_ref = str(uuid.uuid4())
     payload = _publication_payload(str(uuid.uuid4()))
@@ -2350,6 +2363,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: model,
         ceiling=10_000,
         tracer=RunTracer(None),

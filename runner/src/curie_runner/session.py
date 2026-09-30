@@ -76,6 +76,7 @@ from .memory import (
 )
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
+from .redact import OutboundRedactor
 from .side_effects import SideEffectClassifier
 from .tool_access import (
     ENFORCED_TOOL_ACCESS,
@@ -284,6 +285,7 @@ class SessionRunner:
         tracer: RunTracer,
         classifier: SideEffectClassifier,
         trace_name: str,
+        held_secrets: frozenset[str],
         session_id: str | None = None,
         model: str | None = None,
         memory_store: MemoryStore | None = None,
@@ -303,6 +305,7 @@ class SessionRunner:
         tool_access: TurnToolAccess | None = None,
     ) -> None:
         self._factory = session_factory
+        self._held_secrets = held_secrets
         # The per-turn tool access every call decision reads (RUNNER-TOOL-ACCESS-2).
         # None means this session cannot enforce one, so it refuses a restricted
         # turn rather than run it unrestricted (RUNNER-TOOL-ACCESS-5).
@@ -917,6 +920,27 @@ class SessionRunner:
         driving task, and ``aclosing`` requires the ``aclose`` a generator has.
         """
 
+        redactor = OutboundRedactor(self._held_secrets)
+        async with contextlib.aclosing(
+            self._run_turn(
+                event, parent=parent, turn_epoch=turn_epoch, admission_required=admission_required
+            )
+        ) as stream:
+            async for line in stream:
+                for scrubbed in redactor.push(line):
+                    yield scrubbed
+            pending = redactor.finish()
+            if pending is not None:
+                yield pending
+
+    async def _run_turn(
+        self,
+        event: Event,
+        *,
+        parent: Context | None,
+        turn_epoch: str | None,
+        admission_required: bool,
+    ) -> AsyncGenerator[str]:
         if self._session is None:
             raise RuntimeError("session not started")
 

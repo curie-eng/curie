@@ -1183,14 +1183,15 @@ api:
     # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
     annotations: {}
   # Deploy environment the API boots as (`dev` or `prod`), rendered as
-  # ENVIRONMENT on the api container. `prod` arms the API production boot gate,
-  # which refuses to start on the dev-default `apiKey`/`githubWebhookSecret`
-  # below -- so this backs up the render-time secret gate as defense in depth.
+  # ENVIRONMENT on the api container. The API refuses blank API keys in every
+  # environment. `prod` also refuses the published `apiKey`/`githubWebhookSecret`
+  # defaults below, backing up the render credential gate at boot.
   # Left at `dev` so a bare `helm install` and the dev overlays boot without
   # real secrets; set to `prod` (with real secrets) for a production install.
   environment: dev
-  # Single shared API key the UI and CLI authenticate with. Dev default; override
-  # (or point at an existingSecret) in any shared deployment.
+  # Single shared API key the UI and CLI authenticate with. Sealed installs
+  # generate and retain a key; a nonblank override replaces it. Blank values are
+  # refused. Dev mode keeps the published default.
   apiKey: curie-dev-key
   # Dedicated HMAC secret shared only by the Slack dispatcher (which attests a
   # click's authenticated user/channel) and API (which verifies it). It MUST
@@ -1904,6 +1905,10 @@ worker:
     reconcileMaxAttempts: 10
     jobActiveDeadlineSeconds: 300
     gitCommandTimeoutSeconds: 120
+    # Repository-relative paths publication refuses in addition to `.github/`.
+    # Each entry matches that exact path and anything under it. The worker
+    # receives the list as a JSON array, so a path may contain a comma.
+    protectedPaths: []
     # GitHub publishes these address sets from https://api.github.com/meta.
     # Override for GitHub Enterprise or refresh when GitHub changes the set.
     githubHttpsCidrs:
@@ -2757,16 +2762,14 @@ security:
   gvisor:
     # Tri-state, default `auto`:
     #   auto    - at install/upgrade time the chart looks up the `runtimeClassName`
-    #             RuntimeClass. If present, runner pods run under it; if absent,
-    #             pods run with NO runtimeClassName (isolation OFF) and NOTES.txt
-    #             prints a prominent warning. NOTE: Helm's `lookup` returns empty
-    #             under `helm template`/--dry-run, so a templated render always
-    #             shows the no-gvisor shape. This graceful degradation applies ONLY
-    #             to the fake-model/dev default; enabling a real model
-    #             (agentSandbox.runner.fakeModel=false or local inference.deploy)
-    #             makes `auto` render the blocking enforcement preflight, so a
-    #             runsc-less real-model install fails closed instead of silently
-    #             running on the host kernel.
+    #             RuntimeClass. A real model (agentSandbox.runner.fakeModel=false
+    #             or inference.deploy) stamps that class even when lookup is empty
+    #             (helm template, Argo CD, Flux) and renders the blocking
+    #             enforcement preflight, so a runsc-less real-model install fails
+    #             closed instead of silently running on the host kernel. Fake-model
+    #             auto still omits the class when lookup is empty (NOTES.txt warns);
+    #             when lookup finds the class, those pods use it. That path never
+    #             blocks a bare install.
     #   require - always stamp the runtimeClassName AND run the enforcement
     #             preflight as a blocking hook; a missing or downgraded runtime
     #             fails the install (the fail-hard, production posture).
