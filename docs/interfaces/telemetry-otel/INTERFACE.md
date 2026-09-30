@@ -119,13 +119,18 @@ than an open bag of `gen_ai.*` names.
   for any other `mcp__` tool, and `builtin` for a CLI tool. A result without `is_error`
   is `success`. An `is_error` result is `cancelled` when an operator stop cut the call
   off, since the CLI then answers the call itself; `awaiting_approval` when the runner's
-  approval gate held the call; and `error` otherwise. A connector `error` is therefore
-  any `is_error` result on a non-platform `mcp__` tool that the approval gate did not
-  hold and no operator stop cut off. That covers a connector's `isError` result and a
-  JSON-RPC error, a call the turn deadline cut off (a connector that holds a call until
-  the deadline is failing), and, rarely, a call that never reached the connector: a
-  runtime `toolPolicy` deny or grant-argument mismatch refused by the runner, or the
-  CLI's answer for an unknown tool name (#3489 tracks keying those by call id). A
+  approval gate held that call; `refused` when the gate rejected it through `toolPolicy`
+  or an approval grant's argument check; and `unavailable` when the CLI's exact
+  unknown-tool envelope names a tool absent from its init catalog. The catalog
+  check prevents a connector's identical error text from being misclassified;
+  absent or malformed catalog evidence leaves the result as `error`. The gate
+  matches result call IDs, not tool names: a same-name sibling that reached the
+  connector can still be an `error`. A connector `error` covers its `isError`
+  result, a JSON-RPC error, and a call the turn deadline cut off (a connector
+  that holds a call until the deadline is failing). Two runner-side denials
+  outside the approval gate still count as a connector `error`: a bundle's own
+  PreToolUse deny, and the connector exclusion deny for a connector whose
+  startup probe failed (#3580 tracks keying them by call ID). A
   connector that reports failure inside a success-shaped payload counts as `success`.
   The metric carries no connector or tool name, so each connector `error` also logs one
   WARNING naming the server and the tool, never the call's arguments or its result.
