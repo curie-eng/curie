@@ -442,7 +442,7 @@ impl crate::ui::CliOutput for InitOutput {
 }
 
 /// Scaffold and drive the existing local skill path for one first reply.
-pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
+pub async fn try_first_run(keep: bool, image: String) -> Result<SkillMessageOutput> {
     const DEMO_NAME: &str = "curie-demo";
     const DEMO_PROMPT: &str = "hello, are you there?";
 
@@ -546,36 +546,27 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     .await;
     let teardown = stop(None, &dir).await;
 
-    let classified_failure = match message {
-        Ok(classified_failure) => classified_failure,
-        Err(message_err) => {
-            if let Err(cleanup_err) = &teardown {
-                ui.warn(&format!(
-                    "could not tear down the demo at {}: {cleanup_err}",
-                    dir.display()
-                ));
-            } else if !keep {
-                if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-                    ui.warn(&format!(
-                        "could not remove temporary demo at {}: {cleanup_err}",
-                        dir.display()
-                    ));
-                }
-            }
-            return Err(message_err);
-        }
-    };
-
     if let Err(cleanup_err) = teardown {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        let message = format!(
             "could not tear down the demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        ui.note(&format!(
+        );
+        let remedy = format!(
             "recover with: cd {} && curie skill down",
-            dir.display()
+            crate::ops::shell_quote(&dir.display().to_string())
+        );
+        let payload = serde_json::json!({ "error": &message, "fix": &remedy });
+        let failure = crate::exit::CliError::failure(message.clone())
+            .with_fix(remedy.clone())
+            .into();
+        return Err(crate::exit::operator_context(
+            crate::exit::with_json_payload(failure, payload),
+            message,
+            Some(remedy),
         ));
-        std::process::exit(1);
     }
 
     if keep {
@@ -586,19 +577,19 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
         };
         ui.note(&format!("kept ./curie-demo; next: {next}"));
     } else if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        return Err(crate::exit::CliError::failure(format!(
             "could not remove temporary demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        std::process::exit(1);
+        ))
+        .into());
     } else {
         ui.note(&format!("removed temporary demo at {}", dir.display()));
     }
 
-    if classified_failure {
-        std::process::exit(1);
-    }
-    Ok(())
+    message
 }
 
 /// Tags `docker build` applies for one platform image.
@@ -3980,7 +3971,7 @@ pub async fn send(
     event_type: EventType,
     url: Option<String>,
     r#continue: bool,
-) -> Result<bool> {
+) -> Result<SkillMessageOutput> {
     let url = resolve_url(url)?;
     let saved = state::load(Path::new(".")).unwrap_or(None);
     let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
@@ -3998,10 +3989,8 @@ pub async fn send(
             .context("resetting the runner conversation before message")?;
     }
 
-    // Under `--json`, answer tokens are suppressed on stdout (they route through
-    // `ui.answer`), so a streamed turn would exit 0 with empty stdout (#485).
-    // Accumulate the full reply and emit one JSON object at the end instead. The
-    // human path is unchanged: it streams live and this buffer is never emitted.
+    // Buffer the reply for the caller's typed result while the human path
+    // streams live. Callers emit success only after their cleanup has finished.
     let json = ui.json();
     let mut reply = String::new();
 
@@ -4035,9 +4024,8 @@ pub async fn send(
                 // pace with no per-delta newline. Track mid-line state so a later
                 // note closes an un-terminated line first.
                 Some(TurnPart::Token(token)) => {
-                    if json {
-                        reply.push_str(&token);
-                    } else {
+                    reply.push_str(&token);
+                    if !json {
                         ui.answer(&token);
                     }
                     streamed = true;
@@ -4074,34 +4062,32 @@ pub async fn send(
         step.clear();
     }
 
-    if let Some(final_event @ OutboundEvent::Final { status, .. }) = events.last() {
-        // Under `--json`, project the real final frame into one buffered turn
-        // object (reply, status, and approval metadata) rather than the
-        // streamed/human trailer (#485, #2108). Emit BEFORE any exit so a
-        // classified failure still carries its data to the consumer.
-        if json {
-            let output = SkillMessageOutput::from_final(std::mem::take(&mut reply), final_event)
-                .expect("the matched outbound event is final");
-            ui.emit(&output);
-            return Ok(*status == SessionStatus::ClassifiedFailure);
-        }
+    if let Some(final_event @ OutboundEvent::Final { status, text, .. }) = events.last() {
         // Close the streamed answer on stdout only if the last thing written was
         // un-terminated token text; if a note already added its own newline (or
         // the last token ended in one) skip it to avoid a blank line. The status
-        // trailer is a diagnostic -> stderr.
+        // trailer is rendered by the caller after success.
         if streamed && !at_line_start {
             ui.print_tokens("\n");
         }
-        ui.note(&format!("-- final ({})", status_str(status)));
-        return Ok(*status == SessionStatus::ClassifiedFailure);
+        if *status == SessionStatus::ClassifiedFailure {
+            let detail = text.trim();
+            let message = if detail.is_empty() {
+                "runner turn ended with classified-failure".to_string()
+            } else {
+                format!("runner turn ended with classified-failure: {detail}")
+            };
+            return Err(crate::exit::CliError::failure(message).into());
+        }
+        return SkillMessageOutput::from_final(reply, final_event)
+            .context("runner stream ended without a final frame");
     }
-    Ok(false)
+    bail!("runner stream ended without a final frame")
 }
 
-/// Output of `skill message` under `--json`: the full buffered reply, final
-/// session status, and approval metadata copied from the runner's final frame.
-/// The human path streams tokens live and never builds this; it exists so
-/// `--json` emits one complete object instead of empty stdout (#485, #2108).
+/// Successful streamed turn result with the full reply, final session status,
+/// and approval metadata. Human answer tokens already streamed in send, so
+/// rendering this result adds only the final status.
 #[derive(Debug)]
 pub struct SkillMessageOutput {
     pub reply: String,
@@ -4177,7 +4163,6 @@ impl crate::ui::CliOutput for SkillMessageOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        ui.answer(&self.reply);
         ui.note(&format!("-- final ({})", self.status));
     }
 }
@@ -9489,7 +9474,11 @@ pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
 }
 
 /// `skill hook fire`: run the named hook against the local runner. No run row.
-pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+pub async fn skill_hook_fire(
+    plugin_dir: &Path,
+    name: &str,
+    url: Option<String>,
+) -> Result<SkillMessageOutput> {
     let prompt = hook_prompt(plugin_dir, name)?;
     send(&prompt, "hook", SendType::Job.into(), url, false).await
 }

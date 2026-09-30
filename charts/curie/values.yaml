@@ -2674,10 +2674,10 @@ agentSandbox:
     # forwards external names upstream, so real-model egress is unaffected. Set to
     # "" only with fully external S3 and a collector reached by IP or allowlist.
     dnsPolicy: ClusterFirst
-    # Rail 2: the runner ServiceAccount. Least privilege: no secret list/get on
-    # its own. The per-agent secret Role (resourceNames-scoped to that agent's
-    # credential Secret) is created per agent by the control plane, not the chart
-    # -- the chart ships the isolation MODEL, the control plane binds it per SA.
+    # Rail 2: the release runner ServiceAccount has no bound Role. Connector
+    # credentials enter each agent's template through secretKeyRef env entries;
+    # the control plane does not create per agent Roles. A runner can inspect
+    # credentials injected into its own process, including shared model keys.
     serviceAccount:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.

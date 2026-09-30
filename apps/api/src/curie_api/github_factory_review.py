@@ -108,11 +108,13 @@ async def factory_owns(session: AsyncSession, event: str, payload: Any) -> bool:
     return await _owner(session, *claimed) is not None
 
 
-def is_actionable_feedback(event: str, payload: Any, delivery_id: str) -> bool:
+def is_actionable_feedback(
+    event: str, payload: Any, delivery_id: str, *, github_html_base: str
+) -> bool:
     """True when the payload parses as human PR feedback (routing only)."""
 
     try:
-        parse_feedback(event, payload, delivery_id)
+        parse_feedback(event, payload, delivery_id, github_html_base=github_html_base)
     except FeedbackIgnored:
         return False
     return True
@@ -120,7 +122,7 @@ def is_actionable_feedback(event: str, payload: Any, delivery_id: str) -> bool:
 
 def _objective(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
     fragment = feedback.url.split("#", 1)[1]
-    url = feedback_url(settings.github_clone_base, repo_full_name, feedback.pr_number, fragment)
+    url = feedback_url(settings.github_html_base, repo_full_name, feedback.pr_number, fragment)
     provenance = feedback_provenance(feedback)
     return (
         f"{url}\n\n"
@@ -260,7 +262,9 @@ async def handle_factory_review_delivery(
         await session.commit()
         return _ignored(audit.reason)
     try:
-        feedback = parse_feedback(event, payload, delivery_id)
+        feedback = parse_feedback(
+            event, payload, delivery_id, github_html_base=settings.github_html_base
+        )
         outcome = await _admit(session, feedback, settings=settings, client=client)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)

@@ -49,6 +49,7 @@ def validated_identity(
     repository: Any,
     pull_request: Any,
     *,
+    github_html_base: str,
     installation_id: int,
     repo_full_name: str,
     pr_number: int,
@@ -74,7 +75,7 @@ def validated_identity(
         or not node_id
         or len(node_id) > 256
         or str(pull_request.get("html_url", "")).casefold()
-        != f"https://github.com/{repo_full_name}/pull/{pr_number}".casefold()
+        != f"{github_html_base}/{repo_full_name}/pull/{pr_number}".casefold()
         or not isinstance(head, dict)
         or not isinstance(base, dict)
         or head.get("ref") != branch
@@ -165,6 +166,7 @@ async def verify_publication_identity(
         raise AuthorityUnavailable("publication GitHub identity could not be verified") from None
     return validated_identity(
         *payloads,
+        github_html_base=settings.github_html_base,
         installation_id=installation_id,
         repo_full_name=lineage.repo_full_name,
         pr_number=data.pr_number,

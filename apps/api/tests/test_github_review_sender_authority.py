@@ -52,7 +52,9 @@ class PermissionTruth(GitHubTruth):
 def test_contributor_parsing_retains_a_claim_without_granting_permission():
     payload = feedback_payload()
     payload["comment"]["author_association"] = "CONTRIBUTOR"
-    assert parse_feedback("issue_comment", payload, DELIVERY).author_association == "CONTRIBUTOR"
+    assert parse_feedback(
+        "issue_comment", payload, DELIVERY, github_html_base="https://github.com"
+    ).author_association == "CONTRIBUTOR"
 
 
 @pytest.mark.parametrize("event", [

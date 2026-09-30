@@ -34,6 +34,7 @@ def validate(repo: dict, pr: dict):
         branch="curie/publication-example",
         head_sha="a" * 40,
         state="open",
+        github_html_base="https://github.com",
     )
 
 
@@ -87,3 +88,55 @@ def test_provider_identity_cannot_overflow_bigint_authority() -> None:
     repo["id"] = pr["head"]["repo"]["id"] = pr["base"]["repo"]["id"] = 2**63
     with pytest.raises(AuthorityRefused):
         validate(repo, pr)
+
+
+@pytest.mark.parametrize(
+    "html_url",
+    [
+        "https://github.example.com/forge/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/forge/ACME-CORP/ACME-BOT/pull/123",
+    ],
+)
+def test_enterprise_identity_uses_the_configured_html_origin(html_url: str) -> None:
+    repo, pr = identity_payloads()
+    pr["html_url"] = html_url
+
+    proof = validated_identity(
+        repo,
+        pr,
+        installation_id=41,
+        repo_full_name="acme-corp/acme-bot",
+        pr_number=123,
+        branch="curie/publication-example",
+        head_sha="a" * 40,
+        state="open",
+        github_html_base="https://github.example.com/forge",
+    )
+
+    assert proof.repository_id == 9001
+
+
+@pytest.mark.parametrize(
+    "html_url",
+    [
+        "https://github.com/acme-corp/acme-bot/pull/123",
+        "https://other.example.com/forge/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/acme-corp/acme-bot/pull/123",
+    ],
+)
+def test_enterprise_identity_refuses_a_different_html_origin(html_url: str) -> None:
+    repo, pr = identity_payloads()
+    pr["html_url"] = html_url
+
+    with pytest.raises(AuthorityRefused):
+        validated_identity(
+            repo,
+            pr,
+            installation_id=41,
+            repo_full_name="acme-corp/acme-bot",
+            pr_number=123,
+            branch="curie/publication-example",
+            head_sha="a" * 40,
+            state="open",
+            github_html_base="https://github.example.com/forge",
+        )

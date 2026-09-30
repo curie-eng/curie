@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from channel_protocol import work_item_events
+from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api import factory_ci, workitems
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
@@ -29,10 +31,7 @@ ISSUE_URL = "https://github.com/acme-corp/acme-bot/issues/9101"
 PUBLISHED = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
 DEADLINE = PUBLISHED + timedelta(seconds=1800)
 CONTRACT_MARKER = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
-WORKER_EVENT_RE = re.compile(
-    r"^work-item-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-ci-([23])$"
-)
+CI_ROUNDS = range(work_item_events.CI_FIRST_FIX_ROUND, work_item_events.CI_MAX_ROUNDS + 1)
 
 PERMANENT = [
     "app_not_configured",
@@ -144,18 +143,24 @@ def test_ci_causes_match_the_literal_set_in_workitems() -> None:
 
 def test_continuation_event_id_is_the_worker_contract() -> None:
     request_id = uuid.uuid4()
-    for round_ in (2, 3):
+    for round_ in CI_ROUNDS:
         event_id = factory_ci.continuation_event_id(request_id, round_)
-        assert event_id == f"work-item-{request_id}-ci-{round_}"
-        matched = WORKER_EVENT_RE.fullmatch(event_id)
-        assert matched is not None
-        assert matched.group(2) == str(round_)
+        assert parse_work_item_event_id(event_id) == WorkItemEventId(request_id, "ci", round_)
+
+
+def test_the_round_bound_and_key_are_the_shared_ones() -> None:
+    request_id = uuid.uuid4()
+    assert factory_ci.CI_MAX_ROUNDS is work_item_events.CI_MAX_ROUNDS
+    assert factory_ci.ci_key(request_id, 2) == work_item_events.ci_round_key(request_id, 2)
 
 
 def test_marker_is_the_bundle_contract() -> None:
-    line = f"Curie wait_ci round 2 of 3: the checks on {PR_URL} failed at {HEAD}."
-    assert factory_ci.MARKER.match(line) is not None
-    assert CONTRACT_MARKER.match(line) is not None
+    for round_ in CI_ROUNDS:
+        text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, round_, _failing_detail())
+        assert factory_ci.MARKER.match(text.split("\n")[1]) is not None
+    for round_ in (work_item_events.CI_FIRST_FIX_ROUND - 1, factory_ci.CI_MAX_ROUNDS + 1):
+        line = f"Curie wait_ci round {round_} of {factory_ci.CI_MAX_ROUNDS}: the checks failed."
+        assert factory_ci.MARKER.match(line) is None
 
 
 def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:

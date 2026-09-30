@@ -1187,11 +1187,18 @@ sandbox and renders whenever an in-chart store is deployed.
 | Rail | What ships | Values |
 |---|---|---|
 | 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock. Arbitrary internet AND `169.254.169.254` are denied by construction. | `security.networkPolicy.*` |
-| 2. Per-agent secret isolation | Least-privilege runner ServiceAccount (no secret get/list, token not mounted). The per-agent `resourceNames`-scoped Role is bound by the control plane per agent. | `agentSandbox.runner.serviceAccount.*` |
+| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries. The release runner ServiceAccount has no bound Role or mounted Kubernetes API token by default. The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
 | 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
+
+**Credential access.** A sandbox can inspect credentials injected into its own
+process, including any explicitly configured shared model credential. Operators
+who add credentials, mount a Kubernetes API token, or grant runner RBAC change
+the default boundary. Claim 2 of the security probe uses two real SandboxClaims
+and their bound runners to verify scoped connector delivery, absence of an API
+token, and explicit Kubernetes rejection of Secret GET and list requests.
 
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares

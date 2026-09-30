@@ -2,15 +2,12 @@
 {{/*
 Rail 2 (secret isolation), part 1: the runner ServiceAccount.
 
-Least privilege by construction -- this SA is granted NOTHING (no Role/
-RoleBinding here), so a runner cannot list or read any Secret via the K8s API,
-and its token is not even mounted (automountServiceAccountToken: false on the
-pod). The per-agent credential Role -- a Role scoped with
-`resourceNames: [<that agent's Secret>]` and bound to a per-agent SA -- is
-created by the control plane when an agent is deployed, not by this chart: the
-chart ships the isolation MODEL and the least-privilege baseline; the control
-plane binds one narrowly-scoped Role per agent on top. The A2 probe proves that
-model holds (agent-a can get its own Secret, cannot get agent-b's, cannot list).
+The release runner SA has no bound Role or RoleBinding, and its Kubernetes
+API token is not mounted by default. Connector credentials are delivered as
+secretKeyRef environment entries in each agent's SandboxTemplate, without
+control plane created per agent Roles. A runner can inspect credentials
+injected into its own process, including a configured shared model credential.
+Claim 2 tests this delivery path through real claims and bound runners.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -23,8 +20,8 @@ metadata:
   # Where a key-free object store binds the bundle-fetch identity (#1325): an
   # IRSA install annotates this SA with `eks.amazonaws.com/role-arn`. The
   # projected web-identity token is a separate volume from the SA's own API
-  # token, so this composes with `automountToken: false` below -- the runner
-  # still cannot reach the Kubernetes API.
+  # token, so this composes with `automountToken: false` below. It does not
+  # grant the runner a Kubernetes API identity.
   #
   # Scope this role to the bundle bucket, read-only. NetworkPolicy selects pods
   # and not containers, so any identity reachable by the bundle-fetch init
