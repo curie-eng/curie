@@ -673,3 +673,11 @@ def test_direct_caller_migration_rejects_unknown_or_meaningful_differences(tmp_p
             harness_replay=checkpoint,
             system_prompt="current attachment unavailable",
         )
+
+
+def test_pending_overlap_requires_same_proven_group_not_merely_populated_tokens(tmp_path):
+    # Design item 6: B is not evidence that B's request belongs to pending A.
+    # The valid result-A -> group-B dependent sequence is covered separately.
+    messages = (_call(1, GROUP), _call(2, OTHER), _result(1), _result(2))
+    with pytest.raises(HistoryError, match="(?i)group"):
+        _entries(messages, tmp_path)
