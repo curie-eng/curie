@@ -22,6 +22,7 @@ the connector's address.
 
 import logging
 import uuid
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func
@@ -190,7 +191,7 @@ async def _refuse(
     code: int,
     authorizer: str = "conflict-check",
     evidence: dict[str, object] | None = None,
-) -> None:
+) -> NoReturn:
     """Record the refusal, then raise it.
 
     Committed before the exception, so the reason outlives the HTTP response

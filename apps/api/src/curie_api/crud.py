@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from sqlalchemy import delete, func, literal, or_, select, text, tuple_, update
+from sqlalchemy import delete, func, literal, null, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2306,12 +2306,15 @@ async def complete_action(
     state a restore is about to replay. Returned unchanged.
     """
 
+    # A Core UPDATE would bind Python None into these JSONB columns as the JSON
+    # value ``null``; an unreported field must stay SQL NULL, as it was when
+    # the record opened, so a SQL ``IS NULL`` test agrees with ``undoable``.
     values: dict[str, Any] = {
         "status": ActionStatus.failed if data.failed else ActionStatus.succeeded,
-        "result": data.result,
-        "prior_state": data.prior_state,
-        "post_state": data.post_state,
-        "target": data.target,
+        "result": null() if data.result is None else data.result,
+        "prior_state": null() if data.prior_state is None else data.prior_state,
+        "post_state": null() if data.post_state is None else data.post_state,
+        "target": null() if data.target is None else data.target,
         "completed_at": datetime.now(UTC).replace(tzinfo=None),
     }
     if data.detail is not None:
