@@ -4853,7 +4853,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
+              "help": "Target environment. Infers the sole active deployment on redeploy, or defaults to dev on a first deploy. A `--target` supplies it instead, and an explicit value wins over the target",
               "id": "env",
               "long": "env",
               "positional": false,

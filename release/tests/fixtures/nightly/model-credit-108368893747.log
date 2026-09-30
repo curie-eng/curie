@@ -1,0 +1,15 @@
+2026-09-26T08:16:40.4026685Z 
+2026-09-26T08:16:40.4027651Z === #1087 AC1: edit the source after boot, confirm the running container keeps the ORIGINAL snapshot ===
+2026-09-26T08:16:40.4791318Z confirmed: the running container's /plugin mount does not see the post-boot host edit (skills/weather/SKILL.md)
+2026-09-26T08:16:40.5085597Z confirmed: bundle_digest is unchanged by the post-boot host edit (5a1002070f5485efb434fc7325666789a91618420bf868d8bd9616b90ab9a07f)
+2026-09-26T08:16:40.5086825Z 
+2026-09-26T08:16:40.5087099Z === curie skill message (synthetic event, streamed NDJSON reply) ===
+2026-09-26T08:16:40.5126146Z ⚠ warn  editable bundle differs from the running snapshot. Run `curie skill up` to load the changes.
+2026-09-26T08:16:41.7558837Z ✗ error [model-credit-exhausted]: model error: unknown: API Error: 402 This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 23036. To increase, visit
+2026-09-26T08:16:41.7598996Z -- final (classified-failure)
+2026-09-26T08:16:41.7600330Z API Error: 402 This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 23036. To increase, visit
+2026-09-26T08:16:41.7630215Z cleanup: restored /tmp/tmp.YMr8wwVLJU/bundle/skills/weather/SKILL.md from the pre-mutation backup (content and mtime)
+2026-09-26T08:16:41.9135853Z ##[error]Process completed with exit code 1.
+2026-09-26T08:16:41.9248881Z Post job cleanup.
+2026-09-26T08:16:42.1737063Z ##[group]Generating build summary
+2026-09-26T08:16:42.2360535Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-AC7zuQ/export

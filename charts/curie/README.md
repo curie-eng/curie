@@ -426,6 +426,18 @@ overlay is not proof that a live Collector is exporting, and a disposable
 runtime proof is not proof the permanent soak overlay is deployed; see
 `examples/sre-bot/docs/METRICS-ROLLOUT.md`.
 
+The `awsemf` Collector exporter in contrib 0.119.0 rejects the
+`retry_on_failure` and `sending_queue` fields because they do not use
+exporterhelper. An operator can list an already configured `awsemf` exporter under
+`otelCollector.exportersWithoutExporterHelper`, with a nonblank reason naming
+the exporter and the Collector version whose schema was checked. Only that
+exporter is exempt from the chart's helper retry and queue requirements; the
+exporter's own durability controls remain the operator's responsibility. Helm
+rejects a stale or empty exemption, and refuses exemptions for other exporter
+types. Adding another exporter type requires a chart change and a schema/runtime
+proof for its native durability controls. All other network exporters still need
+the bounded retry and persistent queue configuration.
+
 Built-in exporter names (`otlphttp/langfuse`, `nop/logs`, `nop/metrics`, and
 `debug`) are reserved and cannot be overridden through `extraExporters`.
 Sensitive header names such as `Authorization`, tokens, API keys, secrets,

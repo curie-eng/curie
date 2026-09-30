@@ -1,0 +1,21 @@
+2026-09-10T08:16:12.7919099Z === curie try --keep (refuse an existing graduated project) ===
+2026-09-10T08:16:12.8013007Z   Error: refusing to recreate curie-demo: directory exists and is not empty
+2026-09-10T08:16:12.8041716Z confirmed: a second --keep refuses and preserves the graduated plugin manifest
+2026-09-10T08:16:12.8042490Z 
+2026-09-10T08:16:12.8042738Z === curie try --keep (refuse an unowned nonempty directory) ===
+2026-09-10T08:16:12.8143720Z   Error: refusing to recreate curie-demo: directory exists and is not empty
+2026-09-10T08:16:12.8172290Z confirmed: try --keep refuses an unowned nonempty directory and leaves user files untouched
+2026-09-10T08:16:12.8172899Z 
+2026-09-10T08:19:01.7448139Z 
+2026-09-10T08:19:01.7448520Z === curie --json local deploy ===
+2026-09-10T08:19:01.7779810Z deploying sre-bot (103087 bytes) to http://localhost:28000 [dev]
+2026-09-10T08:19:02.0879477Z deploying sre-bot as sre-bot: failed (failed) (0.3s)
+2026-09-10T08:19:02.0896278Z 
+2026-09-10T08:19:02.0902814Z === teardown: curie local down ===
+2026-09-10T08:19:14.3873783Z stopping stack: ok (12.3s)
+2026-09-10T08:19:14.4111008Z volumes kept (fast restart with `curie local up`)
+2026-09-10T08:19:14.4111540Z dev stack stopped
+2026-09-10T08:19:14.7757660Z ##[error]Process completed with exit code 1.
+2026-09-10T08:19:14.7883597Z Post job cleanup.
+2026-09-10T08:19:15.0366147Z ##[group]Generating build summary
+2026-09-10T08:19:15.0951815Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-bxthiw/export

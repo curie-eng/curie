@@ -5113,7 +5113,8 @@ pub struct DeployOpts {
     /// the workspace field so the server can carry the previous value forward.
     pub workspace: WorkspaceIntent,
     /// None means the caller did not pass --env, so a declared target may
-    /// supply it. An explicit flag still wins (ADR-0089).
+    /// supply it. Without a target, cluster deploy infers the sole active
+    /// environment. An explicit flag still wins (ADR-0089).
     pub env: Option<DeployEnv>,
     pub label: Option<String>,
     /// Per-agent connector secret NAMES to bind on deploy (ADR-0009, #429). Each
@@ -5603,19 +5604,12 @@ async fn prepare_deploy_with_commit_sha(
         None => None,
     };
 
-    // A target states its environment, which is the point: the flag's `dev`
-    // default is what let a prod workflow deploy to dev in silence (#1166).
-    let env_owned = opts
+    // A target states its environment. An explicit flag still wins, and an
+    // omitted environment is resolved after the agent lookup below (#3504).
+    let requested_env = opts
         .env
         .map(|e| e.as_str().to_string())
-        .or_else(|| resolved.as_ref().map(|r| r.env.clone()))
-        .unwrap_or_else(|| "dev".to_string());
-    let env = env_owned.as_str();
-    ui.note(&format!(
-        "deploying {plugin_name} ({} bytes) to {} [{env}]",
-        archive.len(),
-        opts.api_url,
-    ));
+        .or_else(|| resolved.as_ref().map(|r| r.env.clone()));
 
     // Resolve each --secret NAME to a value (env wins, else the host vault) so
     // the connector secret is bound on the agent for the worker to forward into
@@ -5734,6 +5728,70 @@ async fn prepare_deploy_with_commit_sha(
             &channel,
             opts.tier,
         )?;
+        let env = if opts.tier == DeployTier::Cluster && (opts.env.is_some() || resolved.is_none())
+        {
+            let deployments = client.list_deployments(&agent.id).await?;
+            let active_environments: BTreeSet<&str> = deployments
+                .iter()
+                .filter(|deployment| deployment.status == "active")
+                .map(|deployment| deployment.environment.as_str())
+                .collect();
+            match requested_env {
+                Some(env) => {
+                    if !active_environments.is_empty()
+                        && !active_environments.contains(env.as_str())
+                    {
+                        let current = active_environments
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let additional = if active_environments.len() == 1 {
+                            "a second environment"
+                        } else {
+                            "another environment"
+                        };
+                        ui.note(&format!(
+                            "explicit environment {env} differs from the current active \
+                             environment {current} of agent {agent_name}; creating {additional}"
+                        ));
+                    }
+                    env
+                }
+                None => match active_environments.len() {
+                    0 => "dev".to_string(),
+                    1 => {
+                        let env = active_environments
+                            .first()
+                            .expect("one active environment")
+                            .to_string();
+                        ui.note(&format!(
+                            "inferred environment {env} from the active deployments of agent \
+                             {agent_name}"
+                        ));
+                        env
+                    }
+                    _ => {
+                        return Err(crate::exit::usage(format!(
+                            "agent {agent_name} has active deployments in multiple environments \
+                             ({}); pass --env or --target to choose the deployment environment",
+                            active_environments
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                },
+            }
+        } else {
+            requested_env.unwrap_or_else(|| "dev".to_string())
+        };
+        ui.note(&format!(
+            "deploying {plugin_name} ({} bytes) to {} [{env}]",
+            archive.len(),
+            opts.api_url,
+        ));
         client
             .prepare_deploy(
                 agent,
@@ -5747,10 +5805,11 @@ async fn prepare_deploy_with_commit_sha(
                 opts.workspace,
             )
             .await
+            .map(|outcome| (outcome, env))
     }
     .await;
-    let outcome = match prepared {
-        Ok(outcome) => outcome,
+    let (outcome, env) = match prepared {
+        Ok(prepared) => prepared,
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
@@ -5766,7 +5825,7 @@ async fn prepare_deploy_with_commit_sha(
         outcome,
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         requested_repo: opts.repo,
         deploy_targets_yaml,
         connect_hint: opts.connect_hint,
