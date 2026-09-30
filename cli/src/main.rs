@@ -4272,7 +4272,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Try { keep }) => {
             let image =
                 artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
-            commands::try_first_run(keep, image).await
+            emit(commands::try_first_run(keep, image).await?)
         }
         Some(Command::Init {
             name,
@@ -4688,14 +4688,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     name,
                     plugin_dir,
                     url,
-                } => {
-                    let classified_failure =
-                        commands::skill_hook_fire(&plugin_dir, &name, url).await?;
-                    if classified_failure {
-                        std::process::exit(1);
-                    }
-                    Ok(())
-                }
+                } => emit(commands::skill_hook_fire(&plugin_dir, &name, url).await?),
             },
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
@@ -4706,14 +4699,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 event_type,
                 url,
                 r#continue,
-            } => {
-                let classified_failure =
-                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
-                if classified_failure {
-                    std::process::exit(1);
-                }
-                Ok(())
-            }
+            } => emit(commands::send(&text, &user, event_type.into(), url, r#continue).await?),
             SkillAction::Eval {
                 cases,
                 case_id,
