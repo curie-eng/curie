@@ -11,7 +11,7 @@ production deployments.
 """
 
 from functools import lru_cache
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -193,6 +193,16 @@ class Settings(BaseSettings):
     # a private repository cannot deploy at all (#1058). Sent as a scoped
     # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
+
+    @property
+    def github_html_base(self) -> str:
+        """Derive the forge HTML base from its configured API endpoint."""
+
+        parts = urlsplit(self.github_api_url.rstrip("/"))
+        authority = "github.com" if parts.netloc == "api.github.com" else parts.netloc
+        path = parts.path.removesuffix("/api/v3")
+        return urlunsplit((parts.scheme, authority, path, "", ""))
+
     github_token: str = ""
     # GitHub App identity (ADR-0092). When both are set the platform mints a
     # one-hour token scoped to the single repository being cloned, instead of

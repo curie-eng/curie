@@ -137,7 +137,9 @@ def _human(value: Any) -> tuple[int, str]:
     return _positive(user.get("id"), "non_human_sender"), login
 
 
-def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeedback:
+def parse_feedback(
+    event: str, payload: Any, delivery_id: str, *, github_html_base: str
+) -> UnverifiedFeedback:
     """Retain actionable human feedback claims or return an explicit refusal.
 
     Actions/fields follow the provider's webhook-event documentation:
@@ -246,10 +248,10 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
         review_id = _positive(feedback.get("pull_request_review_id"), "invalid_review_context")
     separator = "" if fragment_kind == "discussion_r" else "-"
     fragment = f"{fragment_kind}{separator}{feedback_id}"
-    url = f"https://github.com/{repo}/pull/{pr_number}#{fragment}"
+    url = f"{github_html_base}/{repo}/pull/{pr_number}#{fragment}"
     claimed_urls = {url.casefold()}
     if event == "issue_comment":
-        claimed_urls.add(f"https://github.com/{repo}/issues/{pr_number}#{fragment}".casefold())
+        claimed_urls.add(f"{github_html_base}/{repo}/issues/{pr_number}#{fragment}".casefold())
     claimed_url = feedback.get("html_url")
     if not isinstance(claimed_url, str) or claimed_url.casefold() not in claimed_urls:
         raise FeedbackIgnored("invalid_feedback_url")
