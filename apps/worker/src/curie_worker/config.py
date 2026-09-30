@@ -37,13 +37,14 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
-from pydantic import AliasChoices, BeforeValidator, Field, model_validator
+from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
 
 from . import caller_token
+from .publication_validation import normalize_protected_publication_paths
 from .receipt import TurnReceiptMode
 
 
@@ -130,6 +131,37 @@ def _parse_trusted_origins(value: object) -> object:
 # env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
 TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
+
+
+def _parse_publication_protected_paths(value: object) -> object:
+    """Parse ``CURIE_PUBLICATION_PROTECTED_PATHS`` as a JSON array of strings.
+
+    A comma-separated string is rejected. A path may itself contain a comma, and
+    splitting on that comma would protect different paths from the ones the
+    operator listed.
+    """
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings"
+            ) from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError("CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings")
+        return tuple(parsed)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(part) for part in value)
+    return value
+
+
+PublicationProtectedPaths = Annotated[
+    tuple[str, ...], NoDecode, BeforeValidator(_parse_publication_protected_paths)
+]
 
 # Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
 # three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
@@ -861,9 +893,7 @@ class WorkerConfig(BaseSettings):
     # value is deliberate standalone and Compose compatibility: those surfaces
     # have no Helm installation boundary and keep using the legacy key. Cluster
     # workers receive a nonblank value from the chart managed Secret.
-    installation_id: str = Field(
-        default="", validation_alias="CURIE_INSTALLATION_ID"
-    )
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
     # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
     # worker processes only read marker state, so this hook-only value may be
     # absent there. An explicitly supplied revision must be positive.
@@ -900,9 +930,7 @@ class WorkerConfig(BaseSettings):
         default=600.0,
         gt=0.0,
         le=MAX_DELIVERY_BUDGET_S,
-        validation_alias=AliasChoices(
-            "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
-        ),
+        validation_alias=AliasChoices("CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"),
     )
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
@@ -964,9 +992,7 @@ class WorkerConfig(BaseSettings):
     workspace_bucket: str = Field(
         default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
     )
-    workspace_enabled: bool = Field(
-        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
-    )
+    workspace_enabled: bool = Field(default=True, validation_alias="CURIE_WORKSPACE_ENABLED")
     workspace_object_prefix: str = Field(
         default="private/workspaces",
         validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
@@ -1030,9 +1056,7 @@ class WorkerConfig(BaseSettings):
     # today: text only, files ignored, no error. Mirrored by
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
-    attachment_enabled: bool = Field(
-        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
-    )
+    attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1046,9 +1070,7 @@ class WorkerConfig(BaseSettings):
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
-    publication_enabled: bool = Field(
-        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
-    )
+    publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
     publication_namespace: str = Field(
         default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
     )
@@ -1076,6 +1098,19 @@ class WorkerConfig(BaseSettings):
         gt=0,
         validation_alias="CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
     )
+    # Repository-relative paths publication refuses in addition to `.github/`.
+    # An entry matches that path and anything under it. The whole `.github/`
+    # tree is refused even when this list is empty.
+    publication_protected_paths: PublicationProtectedPaths = Field(
+        default=(),
+        validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
+    )
+
+    @field_validator("publication_protected_paths")
+    @classmethod
+    def _repository_relative_protected_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return normalize_protected_publication_paths(value)
+
     publication_github_api_url: str = Field(
         default="https://api.github.com",
         validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",

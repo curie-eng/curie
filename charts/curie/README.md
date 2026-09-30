@@ -1690,6 +1690,15 @@ approval is the default. An operator can set one agent's publication policy to
 automatic, and publication still runs outside the sandbox. No GitHub credential
 is mounted into the sandbox.
 
+Publication refuses every change under `.github/`, including workflows,
+composite actions, and `CODEOWNERS`, plus any extra repository-relative path
+in `worker.publication.protectedPaths` (`CURIE_PUBLICATION_PROTECTED_PATHS`
+on the worker). The publication job pushes the branch to the base repository,
+not a fork, so a `push` or `pull_request` workflow in that repository runs
+the changed files with the repository's Actions secrets before a person
+reviews the pull request. Keep those secrets in GitHub environments that
+require reviewers.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL
