@@ -88,6 +88,17 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   named relay producers must not be enabled. For ordinary Slack turns,
   `adapter` remains the identity and `identity` is absent. The two fields have
   separate purposes only when the relay adapter occupies `adapter`.
+
+  **Per-turn tool access (TOOL-ACCESS-1, TOOL-ACCESS-6).** A producer may set
+  the optional top-level `tool_access` on `QueuedTurn` to `"read-only"` to
+  restrict that one turn to tools the runner classifies as read-only, with no
+  approval ever requested. The contract, including what the worker and the
+  runner must do with it, is stated once, under TOOL-ACCESS in the
+  [ACI producer seam](../aci-producer/INTERFACE.md). No first-party ingress
+  (the Slack dispatcher, the wire ingress, the API resume queue) sets it; an
+  operator's own synthetic producer, such as a canary on the disconnected
+  cluster-message relay, is the intended caller. An absent value is today's
+  turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral

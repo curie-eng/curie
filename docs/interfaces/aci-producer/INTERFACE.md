@@ -69,6 +69,43 @@ Setup is read from the environment via `SessionConfig.from_env`
 `CURIE_*` mapping in `to_env` (`packages/aci-protocol/src/aci_protocol/session.py::SessionConfig.to_env`).
 Conformance is proven by `run_conformance(<your producer>)`, which must return `passed=True`.
 
+### Per-turn tool access (TOOL-ACCESS)
+
+A producer can restrict what one turn may execute, for example a synthetic
+availability probe that must never act. The restriction travels with the turn,
+not with the sandbox, so ordinary turns on the same install are untouched.
+
+- **TOOL-ACCESS-1:** `QueuedTurn` and `Event` each carry an optional
+  `tool_access`, a `ToolAccess` string or null, defaulting to null. The one
+  value is `read-only`. An absent or null value means the turn runs exactly as
+  it did before the field existed: no tool is added, removed, denied or gated
+  differently, and approvals behave as before.
+- **TOOL-ACCESS-2:** `tool_access` is an enum, not free text. A consumer decoding
+  the wire rejects an unknown value; it never reads one as null. A value added
+  later is therefore a breaking change under the change-class table in
+  `packages/CLAUDE.md`, decided on its own.
+- **TOOL-ACCESS-3:** `read-only` means that, for the whole turn, including any
+  steer delivered into it, only tools the ACI server explicitly classifies as
+  read-only may execute. Every other tool, including one the server has no
+  classification for, is denied before it executes, and the model is told it
+  was denied. The turn never requests an approval and never ends
+  `awaiting-approval`: a tool that would need approval is denied like any other
+  write, and the model's approval request tool is denied too.
+- **TOOL-ACCESS-4:** An ACI server that enforces tool access advertises the
+  values it enforces as a JSON list under the key `tool_access` on
+  `GET /status` and `GET /v1/status`. A server that omits the key enforces
+  none. A consumer must not deliver an `Event` carrying a `tool_access` value
+  the server does not advertise, because a server that predates the field
+  ignores it and would run the turn unrestricted. It refuses that turn instead.
+- **TOOL-ACCESS-5:** `POST /v1/steer` joins the live turn only when the steer
+  frame's `tool_access` equals the live turn's. Otherwise it answers `409`, so
+  the caller opens its own turn and neither message runs under the other's
+  access.
+- **TOOL-ACCESS-6:** The worker consumes `QueuedTurn.tool_access` and forwards
+  it as `Event.tool_access` under TOOL-ACCESS-4. A worker that predates the
+  field ignores it, so a producer must not set it until every worker reading
+  its stream forwards it.
+
 ## Implementations today
 
 One producer (the runner, `runner/src/curie_runner/adapter.py`, a `ModelSession` wrapping
