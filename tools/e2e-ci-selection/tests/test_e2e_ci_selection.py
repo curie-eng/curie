@@ -1115,6 +1115,7 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
 
 AGGREGATE_EXPRESSIONS = {
     "changes_result": "${{ needs.changes.result }}",
+    "event_name": "${{ github.event_name }}",
     "skill_selected": "${{ needs.changes.outputs.skill }}",
     "local_selected": "${{ needs.changes.outputs.local }}",
     "local_release_selected": "${{ needs.changes.outputs.local_release }}",
@@ -1125,6 +1126,7 @@ AGGREGATE_EXPRESSIONS = {
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "cluster_chart_result": "${{ needs.e2e-cluster-chart-regressions.result }}",
+    "rollout_recovery_result": "${{ needs.e2e-cluster-rollout-recovery.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": (
         "${{ needs.e2e-released-upgrade-negative.result }}"
@@ -1756,6 +1758,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-release",
         "e2e-ladder-cluster",
         "e2e-cluster-chart-regressions",
+        "e2e-cluster-rollout-recovery",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -1793,6 +1796,7 @@ def _run_aggregate(
         script = script_transform(script)
     state = {
         "changes_result": "success",
+        "event_name": "push",
         "skill_selected": "false",
         "local_selected": "false",
         "local_release_selected": "false",
@@ -1803,6 +1807,7 @@ def _run_aggregate(
         "local_release_result": "skipped",
         "cluster_result": "skipped",
         "cluster_chart_result": "skipped",
+        "rollout_recovery_result": "skipped",
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
@@ -1863,6 +1868,21 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
             "local_release_result": "success",
             "cluster_result": "success",
             "cluster_chart_result": "success",
+            "rollout_recovery_result": "success",
+        },
+        {
+            "event_name": "pull_request",
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "success",
+            "rollout_recovery_result": "skipped",
+        },
+        {
+            "event_name": "workflow_dispatch",
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "success",
+            "rollout_recovery_result": "success",
         },
         {
             "released_upgrade_selected": "true",
@@ -2006,6 +2026,66 @@ def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
     assert completed.returncode != 0
 
 
+@pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
+@pytest.mark.parametrize("result", ["failure", "skipped", "cancelled"])
+def test_aggregate_requires_rollout_recovery_success_when_selected(
+    event_name: str, result: str
+) -> None:
+    # failure is the 2026-09-29 next dispatch run 36551160014 shape: the
+    # rollout recovery job failed while E2E required stayed green.
+    completed = _run_aggregate(
+        event_name=event_name,
+        cluster_selected="true",
+        cluster_result="success",
+        cluster_chart_result="success",
+        rollout_recovery_result=result,
+    )
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("result", ["success", "failure"])
+def test_aggregate_rollout_recovery_must_skip_when_not_expected(result: str) -> None:
+    on_pull_request = _run_aggregate(
+        event_name="pull_request",
+        cluster_selected="true",
+        cluster_result="success",
+        cluster_chart_result="success",
+        rollout_recovery_result=result,
+    )
+    assert on_pull_request.returncode != 0
+    unselected = _run_aggregate(
+        event_name="push",
+        cluster_selected="false",
+        rollout_recovery_result=result,
+    )
+    assert unselected.returncode != 0
+
+
+def test_negative_control_covers_rollout_recovery_result() -> None:
+    state = {
+        "event_name": "push",
+        "cluster_selected": "true",
+        "cluster_result": "success",
+        "cluster_chart_result": "success",
+        "rollout_recovery_result": "success",
+    }
+    unmutated = _run_aggregate(**state)
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+
+    rollout_result_check = (
+        '"$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||'
+    )
+
+    def accept_rollout_drift(script: str) -> str:
+        assert script.count(rollout_result_check) == 1
+        return script.replace(rollout_result_check, "", 1)
+
+    completed = _run_aggregate(script_transform=accept_rollout_drift, **state)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "Selected and skipped negative control failed" in output
+
+
 def test_aggregate_negative_control_runs_before_real_results() -> None:
     completed = _run_aggregate()
     output = completed.stdout + completed.stderr
@@ -2105,4 +2185,4 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
         "${{ github.event_name != 'pull_request' && "
         "needs.changes.outputs.cluster == 'true' }}"
     )
-    assert "e2e-cluster-rollout-recovery" not in jobs["e2e-required"]["needs"]
+    assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]

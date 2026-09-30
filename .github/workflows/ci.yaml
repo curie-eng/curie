@@ -3219,7 +3219,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -3228,6 +3228,7 @@ jobs:
       - name: Require exact selected outcomes
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          EVENT_NAME: ${{ github.event_name }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
@@ -3238,6 +3239,7 @@ jobs:
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
+          ROLLOUT_RECOVERY_RESULT: ${{ needs.e2e-cluster-rollout-recovery.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -3250,6 +3252,7 @@ jobs:
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
                   "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
+                  "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -3283,6 +3286,11 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
           fi
+          # Mirrors the rollout recovery job's if: pushes and dispatches only.
+          rollout_recovery_expected="skipped"
+          if [[ "$CLUSTER_SELECTED" == "true" && "$EVENT_NAME" != "pull_request" ]]; then
+            rollout_recovery_expected="success"
+          fi
           # Full runs include pushes, dispatches, and PRs editing an upgrade
           # job. Ordinary PRs selecting released-upgrade run one smoke shard.
           # The matrix reports success only when all selected shards succeed.
@@ -3300,34 +3308,20 @@ jobs:
             exit 1
           fi
 
-          negative_skill_local_result="$skill_local_expected"
-          negative_local_release_result="$local_release_expected"
-          negative_cluster_result="$cluster_expected"
-          negative_released_upgrade_result="$released_upgrade_expected"
-          negative_upgrade_matrix_result="$upgrade_matrix_expected"
-          if [[ "$skill_local_expected" == "success" ]]; then
-            negative_skill_local_result="skipped"
-          elif [[ "$local_release_expected" == "success" ]]; then
-            negative_local_release_result="skipped"
-          elif [[ "$cluster_expected" == "success" ]]; then
-            negative_cluster_result="skipped"
-          elif [[ "$released_upgrade_expected" == "success" ]]; then
-            negative_released_upgrade_result="skipped"
-          elif [[ "$upgrade_matrix_expected" == "success" ]]; then
-            negative_upgrade_matrix_result="skipped"
-          else
-            negative_skill_local_result="success"
-          fi
-
-          if SKILL_LOCAL_RESULT="$negative_skill_local_result" \
-            LOCAL_RELEASE_RESULT="$negative_local_release_result" \
-            CLUSTER_RESULT="$negative_cluster_result" \
-            RELEASED_UPGRADE_RESULT="$negative_released_upgrade_result" \
-            UPGRADE_MATRIX_RESULT="$negative_upgrade_matrix_result" \
-            validate_selected_outcomes; then
-            echo "Selected and skipped negative control failed" >&2
-            exit 1
-          fi
+          # Flip every checked result in turn. Each flipped verdict must be
+          # rejected, so no dependency can drop out of the validator unnoticed.
+          for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
+            CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT RELEASED_UPGRADE_RESULT \
+            RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
+            flipped="success"
+            if [[ "${!name}" == "success" ]]; then
+              flipped="skipped"
+            fi
+            if ( printf -v "$name" '%s' "$flipped"; validate_selected_outcomes ); then
+              echo "Selected and skipped negative control failed for $name" >&2
+              exit 1
+            fi
+          done
           echo "Selected and skipped negative control passed"
 
           echo "E2E required passed"
