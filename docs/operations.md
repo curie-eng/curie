@@ -779,7 +779,10 @@ remains ignored.
 Deploy notices are rate limited per repository, so a holder of the webhook
 secret cannot flood a channel with forged pushes. Each installation records at
 most 20 notices (one notice is one post to one channel) per repository in any
-rolling 60 minutes, matching the repository name case-insensitively. A push
+rolling 60 minutes, matching the repository name case-insensitively. Concurrent
+pushes serialize their budget check and outbox insertion under a transaction
+scoped PostgreSQL advisory lock keyed by an unambiguous text encoding of the
+installation stream and canonical repository name. A push
 outcome whose new notices would pass that bound records none of them; the API
 logs it at WARNING and counts it in `curie.deploy_notice.suppressed` with
 `reason="rate_limited"`. A redelivered outcome whose notices are already
