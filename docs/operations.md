@@ -759,20 +759,26 @@ promote:
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
 
-Git-flow rejections send a top-level Slack notice to every Slack channel bound
-to an agent for the pushed repository, even when success notices are off.
-The notice includes the commit prefix and stable error codes; for
-`git.archive_failed`, check the API's clone credential and repository access.
-An unrelated repository has no bound recipient and remains ignored. To also
-receive successful deploy and promotion notices, opt each agent in through
+Git-flow rejections send a top-level Slack notice even when success notices
+are off. A rejection after the push resolved its target agent, such as an
+unbound approval route on a prod promote, goes only to that agent's channels.
+A rejection before the target is known, such as `git.archive_failed`, goes to
+every Slack channel bound to an agent for the pushed repository. The notice
+includes the commit prefix and stable error codes; for `git.archive_failed`,
+check the API's clone credential and repository access. An unrelated
+repository has no bound recipient and remains ignored. To also receive
+successful deploy and promotion notices, opt each agent in through
 `PATCH /agents/<agent-id>` with `{"deploy_notifications": true}` and the
 normal API key. The default is `false`; this setting does not affect rejection
-notices. Multiple Slack bindings each receive a notice through their configured
+notices. A success notice follows each deployment that changes the active
+version in its environment, a rollback to an earlier sha included; a
+redelivered push for the version already active changes nothing and posts
+nothing. Multiple Slack bindings each receive a notice through their configured
 bot identity. Notice delivery uses the worker's bounded retry and dead-letter
 path. The API first records selected recipients in a durable PostgreSQL outbox;
 its reconciler retries Valkey publication after a transient outage or API
 restart. An unavailable outbox returns HTTP 503 to the webhook instead of a
-false success. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
+false success, with the push's own result under `detail.result`. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
 stream if Slack delivery keeps failing. The stream follows the configured runs
 stream and installation ID, so installations sharing Valkey remain isolated.
 

@@ -27,7 +27,9 @@ _CAP_SCAN_PAGE = 1000
 class DeployNotice(BaseModel):
     """The server-selected route and stable outcome, without a provider secret."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    # ``ignore``, not ``forbid``: during a roll the API can be newer than this
+    # worker, and a field it does not know must not dead-letter the notice.
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     address: str = Field(min_length=1)
     identity: str = Field(min_length=1, max_length=64)
@@ -49,9 +51,13 @@ def render_notice(notice: DeployNotice) -> str:
             if "git.archive_failed" in notice.codes
             else "Check the GitHub webhook delivery response and API logs."
         )
-        return f"⚠️ {notice.agent_name} — push {commit} rejected: {codes}{environment}\n{guidance}"
+        return (
+            f":warning: {notice.agent_name} push {commit} rejected: {codes}{environment}"
+            f"\n{guidance}"
+        )
     verb = "promoted" if notice.status == "promoted" else "deployed"
-    return f"🚀 {notice.agent_name} — {verb} {commit}{environment}"
+    # Slack renders the shortcode in chat.postMessage text.
+    return f":rocket: {notice.agent_name} {verb} {commit}{environment}"
 
 
 class DeployNoticeConsumer(StreamConsumer):

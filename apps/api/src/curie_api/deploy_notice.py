@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from . import crud
 from .config import Settings
 from .gitflow import environment_for_ref
-from .models import DeployNoticeOutbox
+from .models import Deployment, DeployNoticeOutbox
 from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,31 @@ local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[2])
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 return stream_id
 """
+
+
+async def _changes_the_active_version(session: AsyncSession, result: WebhookResult) -> bool:
+    """Whether this deployment replaced a different version in its environment.
+
+    Git-flow appends an active row per push, so a redelivery of the active push
+    deploys the same version again. Nothing changed underneath the channel, and
+    nothing is announced. A first deployment, or one without the ids to compare,
+    is a change.
+    """
+
+    if result.deployment_id is None or result.version_id is None or result.environment is None:
+        return True
+    previous = await session.scalar(
+        select(Deployment.version_id)
+        .where(
+            Deployment.agent_id == result.agent_id,
+            Deployment.environment == result.environment,
+            Deployment.status == "active",
+            Deployment.id != result.deployment_id,
+        )
+        .order_by(Deployment.deployed_at.desc(), Deployment.id.desc())
+        .limit(1)
+    )
+    return previous != result.version_id
 
 
 class DeployNoticeQueue:
@@ -76,7 +101,13 @@ class DeployNoticeQueue:
         ):
             return 0
 
-        if result.status == "rejected":
+        if result.status == "rejected" and result.agent_id is not None:
+            # Rejected after the push resolved its target: that agent alone.
+            # One repository builds several agents (ADR-0091), and a sibling's
+            # channel can be a different audience.
+            agent = await crud.get_agent(session, result.agent_id)
+            agents = [agent] if agent is not None else []
+        elif result.status == "rejected":
             agents = await crud.get_agents_by_repo(session, full_name)
             if not agents and any(
                 error.get("code") == "git.repository_case_mismatch"
@@ -85,6 +116,8 @@ class DeployNoticeQueue:
                 agents = await crud.get_agents_by_repo_casefold(session, full_name)
         else:
             if result.agent_id is None:
+                return 0
+            if not await _changes_the_active_version(session, result):
                 return 0
             agent = await crud.get_agent(session, result.agent_id)
             agents = [agent] if agent is not None else []
@@ -114,7 +147,14 @@ class DeployNoticeQueue:
                     "codes": codes,
                 }
                 encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
-                identity = f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}\0{encoded}"
+                # A success notice is keyed by its deployment, so a rollback to
+                # an announced sha is announced again; retries of the same
+                # deployment keep one key. A rejection has no deployment row.
+                deployment = result.deployment_id or ""
+                identity = (
+                    f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}"
+                    f"\0{deployment}\0{encoded}"
+                )
                 digest = hashlib.sha256(identity.encode()).hexdigest()
                 notice["notice_key"] = digest
                 encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
