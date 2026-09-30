@@ -847,6 +847,23 @@ _BUNDLE_HOOKS = {
 }
 
 
+def _is_tool_access_front(matcher: HookMatcher) -> bool:
+    """The per-turn tool access front every real session now carries first.
+
+    RUNNER-TOOL-ACCESS-2 registers it on every session, gated or not, and it
+    abstains on an unrestricted turn; ``test_tool_access.py`` pins what it
+    decides. These wiring tests only need to see past it.
+    """
+
+    return (
+        matcher.matcher is None
+        and len(matcher.hooks) == 1
+        and getattr(matcher.hooks[0], "__qualname__", "").endswith(
+            "front_pre_tool_use_hooks.<locals>.front"
+        )
+    )
+
+
 def test_boot_merges_the_approval_matcher_ahead_of_bundle_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -860,11 +877,13 @@ def test_boot_merges_the_approval_matcher_ahead_of_bundle_hooks(
     options = _options_from_boot(monkeypatch, config)
 
     matchers = options.hooks["PreToolUse"]
-    assert len(matchers) == 2
-    # The approval matcher is first and unscoped; the bundle's keeps its own
+    assert len(matchers) == 3
+    assert _is_tool_access_front(matchers[0])
+    # The approval matcher is next and unscoped; the bundle's keeps its own
     # matcher string, proving it was preserved rather than rebuilt.
-    assert matchers[0].matcher is None
-    assert matchers[1].matcher == "Bash"
+    assert matchers[1].matcher is None
+    assert not _is_tool_access_front(matchers[1])
+    assert matchers[2].matcher == "Bash"
     # Defense in depth: the callback stays wired too, so an ungated tool that
     # falls through the hook is still decided by the approval callback.
     assert options.can_use_tool is not None
@@ -881,7 +900,9 @@ def test_boot_wires_the_approval_matcher_when_the_bundle_declares_no_hooks(
     options = _options_from_boot(monkeypatch, config)
 
     assert options.hooks is not None
-    assert [m.matcher for m in options.hooks["PreToolUse"]] == [None]
+    matchers = options.hooks["PreToolUse"]
+    assert _is_tool_access_front(matchers[0])
+    assert [m.matcher for m in matchers[1:]] == [None]
 
 
 def test_boot_adds_no_approval_matcher_when_nothing_is_gated(
@@ -894,7 +915,9 @@ def test_boot_adds_no_approval_matcher_when_nothing_is_gated(
 
     options = _options_from_boot(monkeypatch, config)
 
-    assert [m.matcher for m in options.hooks["PreToolUse"]] == ["Bash"]
+    matchers = options.hooks["PreToolUse"]
+    assert _is_tool_access_front(matchers[0])
+    assert [m.matcher for m in matchers[1:]] == ["Bash"]
     assert options.can_use_tool is None
 
 

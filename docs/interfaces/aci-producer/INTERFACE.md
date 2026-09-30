@@ -123,8 +123,9 @@ ordinary turns on the same install are untouched.
 
 ## Implementations today
 
-TOOL-ACCESS is contract only so far: the reference runner advertises no
-`tool_access` and the worker does not forward it.
+The reference runner enforces and advertises `read-only` (RUNNER-TOOL-ACCESS
+in [`runner/README.md`](../../../runner/README.md)); the worker does not forward
+`tool_access` yet, so a queued turn's value does not reach it.
 
 One producer (the runner, `runner/src/curie_runner/adapter.py`, a `ModelSession` wrapping
 `ClaudeSDKClient`) plus the in-library `reference_producer` used by the conformance suite. The

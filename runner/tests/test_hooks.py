@@ -99,7 +99,14 @@ def test_factory_foreground_guard_is_absent_without_both_progress_credentials(
         progress_token=progress_token,
     )
 
-    assert options.hooks is None
+    # Only the per-turn tool access front (RUNNER-TOOL-ACCESS-2), which every
+    # session carries; no factory foreground guard.
+    assert options.hooks is not None
+    (matcher,) = options.hooks["PreToolUse"]
+    assert matcher.matcher is None
+    assert [callback.__qualname__ for callback in matcher.hooks] == [
+        "front_pre_tool_use_hooks.<locals>.front"
+    ]
 
 
 @pytest.mark.parametrize(

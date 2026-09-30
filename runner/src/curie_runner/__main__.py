@@ -31,6 +31,7 @@ from .adapter import (
 )
 from .approval import (
     APPROVAL_SERVER_NAME,
+    ApprovalGate,
     ApprovalPolicyError,
     assert_gates_not_shadowed,
     build_approval_gate,
@@ -93,6 +94,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .usage_report import USAGE_PATH, UsageReporter
 from .verification import KNOWN_BLOCKER_NAMES, preflight_workspace_verification
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
@@ -433,6 +435,21 @@ def _merge_pre_tool_use_hooks(
     return merged or None
 
 
+def _readonly_tools(
+    harness: HarnessContribution,
+    observed_readonly_tools: frozenset[str],
+    approval_gate: ApprovalGate | None,
+) -> frozenset[str]:
+    """The one read-only set RUNNER-TOOL-ACCESS-1 names, for both its readers."""
+
+    observed = (
+        observed_readonly_tools - approval_gate.required
+        if approval_gate is not None
+        else observed_readonly_tools
+    )
+    return harness.readonly_tools | observed
+
+
 def build_runner(
     config: RunnerConfig,
     *,
@@ -640,6 +657,18 @@ def build_runner(
 
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
+
+    def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
+        # @spec RUNNER-TOOL-ACCESS-1: the classifier's set, built once per boot.
+        return TurnToolAccess(
+            _readonly_tools(harness, observed, approval_gate),
+            requires_approval=(
+                approval_gate.requires_approval if approval_gate is not None else None
+            ),
+        )
+
+    # The fake tier probes nothing, so it keeps the harness's declaration alone.
+    tool_access = session_tool_access(observed_readonly_tools)
     capability = mcp_capability
     connector_availability: ConnectorAvailability | None = None
     connector_reprobe: ConnectorReprobe | None = None
@@ -648,9 +677,10 @@ def build_runner(
         # MCP surface. Probe even when an explicit gate already pages: exact
         # readOnlyHint=true observations also drive receipt and retry
         # classification. Missing hints, uninspectable declarations, and probe
-        # failures preserve the historical fail-closed behavior. The annotation
-        # remains a non-authoritative hint: it never authorizes or denies tool
-        # execution.
+        # failures preserve the historical fail-closed behavior. On an
+        # unrestricted turn the annotation never authorizes or denies a call; on
+        # a read-only turn it is the connector's own classification of which
+        # tools may run (RUNNER-TOOL-ACCESS-1).
         if capability is None:
             capability = anyio.run(
                 probe_mcp_tool_capability,
@@ -659,6 +689,7 @@ def build_runner(
                 sdk_env,
             )
         observed_readonly_tools = capability.readonly_tools
+        tool_access = session_tool_access(observed_readonly_tools)
         boot_connector_failures = connector_failures or capability.connector_failures
         if boot_connector_failures:
             # A failed declared connector no longer halts every turn (#2634).
@@ -679,15 +710,21 @@ def build_runner(
 
         # The connector exclusion FRONTS the approval hook in one callback
         # (#2634) so an excluded gated tool never records a pending approval or
-        # spends a grant; bundle hooks stay siblings, as before. No gate and no
-        # failed connector keeps the wiring byte-identical to before.
-        session_hooks = _merge_pre_tool_use_hooks(
-            build_gated_pre_tool_use_hooks(
-                build_approval_hook(approval_gate) if approval_gate is not None else None,
-                connector_availability,
+        # spends a grant; bundle hooks stay siblings, as before.
+        #
+        # Per-turn tool access fronts ALL of them (RUNNER-TOOL-ACCESS-2): a call a
+        # read-only turn may not make reaches no approval, bundle or factory
+        # callback. On an unrestricted turn every front abstains.
+        session_hooks = front_pre_tool_use_hooks(
+            _merge_pre_tool_use_hooks(
+                build_gated_pre_tool_use_hooks(
+                    build_approval_hook(approval_gate) if approval_gate is not None else None,
+                    connector_availability,
+                ),
+                bundle_hooks,
+                build_factory_foreground_hooks() if progress_url and progress_token else None,
             ),
-            bundle_hooks,
-            build_factory_foreground_hooks() if progress_url and progress_token else None,
+            tool_access,
         )
         policy_hidden_tools = (
             policy_disallowed_tools(approval_gate, capability.observed_tools)
@@ -773,7 +810,14 @@ def build_runner(
                     derived=derived_mcp_servers,
                 ),
             },
-            can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
+            # Fronted only when a gate exists: with no callback the session keeps
+            # bypassPermissions, where the PreToolUse front above is the refusal
+            # layer (RUNNER-TOOL-ACCESS-7).
+            can_use_tool=(
+                front_can_use_tool(build_can_use_tool(approval_gate), tool_access)
+                if approval_gate is not None
+                else None
+            ),
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
@@ -791,14 +835,18 @@ def build_runner(
             # they shell out and would break the fake's offline no-op guarantee
             # (the can_use_tool gate is a pure membership check, so it is safe).
             return FakeModelSession(
-                can_use_tool=(
-                    build_can_use_tool(approval_gate) if approval_gate is not None else None
+                # Always fronted: the fake has no permission modes, and an
+                # abstaining front allows exactly what the bare gate allowed.
+                can_use_tool=front_can_use_tool(
+                    build_can_use_tool(approval_gate) if approval_gate is not None else None,
+                    tool_access,
                 ),
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
                 disallowed_tools=config.disallowed_tools,
+                tool_access=tool_access,
             )
         assert real_options is not None
         nonlocal sdk_generation
@@ -840,12 +888,7 @@ def build_runner(
             ceiling=config.ceiling,
             tracer=RunTracer(provider),
             classifier=SideEffectClassifier(
-                readonly_tools=harness.readonly_tools
-                | (
-                    observed_readonly_tools - approval_gate.required
-                    if approval_gate is not None
-                    else observed_readonly_tools
-                )
+                readonly_tools=_readonly_tools(harness, observed_readonly_tools, approval_gate)
             ),
             trace_name=f"curie-run:{config.session.session_id}",
             session_id=config.session.session_id,
@@ -865,6 +908,7 @@ def build_runner(
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
+            tool_access=tool_access,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
