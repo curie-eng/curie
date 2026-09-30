@@ -104,9 +104,12 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
             "reply_handle",
             "source",
             "text",
+            // TOOL-ACCESS-1: optional, null on every operator lane turn.
+            "tool_access",
         ]
     );
     assert!(value["hook_run"].is_null());
+    assert!(value["tool_access"].is_null());
     assert!(
         decoded.event_id.starts_with("EvSIM-"),
         "synthetic id keeps its collision-proof prefix on the wire"
