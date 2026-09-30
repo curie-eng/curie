@@ -304,6 +304,11 @@ class SessionRunner:
         # None means this session cannot enforce one, so it refuses a restricted
         # turn rather than run it unrestricted (RUNNER-TOOL-ACCESS-5).
         self._tool_access = tool_access
+        # Whether this SDK session has accepted a steer (RUNNER-TOOL-ACCESS-4).
+        # A late steer can be answered by the CLI as a turn of its own, after
+        # this runner has moved on, so a steered session never runs a
+        # restricted turn. Cleared only by a new SDK session (reset).
+        self._steered = False
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
@@ -489,6 +494,26 @@ class SessionRunner:
         if self._tool_access is None:
             return ()
         return tuple(access.value for access in ENFORCED_TOOL_ACCESS)
+
+    def _tool_access_refusal(self, event: Event) -> str | None:
+        """Why this session will not run ``event``'s restricted turn, or None."""
+
+        access = event.tool_access
+        if access is None:
+            return None
+        if self._tool_access is None or access not in ENFORCED_TOOL_ACCESS:
+            return f"this runner cannot enforce tool access {access.value!r}; the turn was not run"
+        if self._steered:
+            return (
+                f"this session has accepted a steer, so it cannot run a {access.value} "
+                "turn; the turn was not run"
+            )
+        if event.text.lstrip().startswith("/"):
+            return (
+                f"a {access.value} turn cannot start with a slash command, which can run "
+                "shell with no tool call; the turn was not run"
+            )
+        return None
 
     @property
     def live_tool_access(self) -> ToolAccess | None:
@@ -727,6 +752,8 @@ class SessionRunner:
             self._session = self._factory()
             await self._session.connect()
             self._result_pending = False
+            # A new SDK session carries no steered prompt (RUNNER-TOOL-ACCESS-4).
+            self._steered = False
             self._interrupt_requested = False
             self._timeout_requested = False
             self._timeout_interrupt_settled = None
@@ -750,8 +777,15 @@ class SessionRunner:
 
         if self._session is None or not self._turn_open or not self._turn_ready:
             return False
-        if self._active_state is None or self._active_state.tool_access != tool_access:
+        if (
+            self._active_state is None
+            or self._active_state.tool_access is not None
+            or tool_access is not None
+        ):
+            # @spec RUNNER-TOOL-ACCESS-4: a restricted turn accepts no steer,
+            # and a restricted steer joins no turn.
             return False
+        self._steered = True
         await self._session.query(text)
         if self._active_state is not None:
             self._active_state.history_messages.append(
@@ -877,7 +911,9 @@ class SessionRunner:
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
-                self._approval_gate.reset()
+                # @spec RUNNER-TOOL-ACCESS-10: a restricted turn leaves the boot
+                # grant for the next turn that may spend it.
+                self._approval_gate.reset(grant_eligible=event.tool_access is None)
                 self._approval_gate.bind_publication_context(event.publication_context)
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
@@ -948,14 +984,13 @@ class SessionRunner:
                                 )
                                 return
                             self._admission_gate = None
-                        if event.tool_access is not None and (
-                            self._tool_access is None
-                            or event.tool_access not in ENFORCED_TOOL_ACCESS
-                        ):
-                            # @spec RUNNER-TOOL-ACCESS-5: a restricted turn this
-                            # session cannot enforce never reaches a connector
-                            # or the model; running it unrestricted is the one
-                            # outcome TOOL-ACCESS-4 exists to prevent.
+                        access_refusal = self._tool_access_refusal(event)
+                        if access_refusal is not None:
+                            # @spec RUNNER-TOOL-ACCESS-4 RUNNER-TOOL-ACCESS-5
+                            # RUNNER-TOOL-ACCESS-9: a restricted turn this session
+                            # cannot enforce never reaches a connector or the
+                            # model; running it unrestricted is the one outcome
+                            # TOOL-ACCESS-4 exists to prevent.
                             self._turn_open = False
                             self._turn_ready = False
                             self._status = SessionStatus.CLASSIFIED_FAILURE
@@ -967,10 +1002,7 @@ class SessionRunner:
                             terminal_for_log = True
                             yield to_ndjson_line(
                                 ErrorEvent(
-                                    message=(
-                                        f"this runner cannot enforce tool access "
-                                        f"{event.tool_access.value!r}; the turn was not run"
-                                    ),
+                                    message=access_refusal,
                                     classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
                                 )
                             )

@@ -440,12 +440,7 @@ def _readonly_tools(
     observed_readonly_tools: frozenset[str],
     approval_gate: ApprovalGate | None,
 ) -> frozenset[str]:
-    """The tools this session classifies read-only (RUNNER-TOOL-ACCESS-1).
-
-    One set for the side-effect classifier and for per-turn tool access: the
-    harness's declared read-only tools plus the live MCP tools observed
-    ``readOnlyHint=true``, less any MCP tool an approval gate names.
-    """
+    """The one read-only set RUNNER-TOOL-ACCESS-1 names, for both its readers."""
 
     observed = (
         observed_readonly_tools - approval_gate.required
@@ -682,9 +677,10 @@ def build_runner(
         # MCP surface. Probe even when an explicit gate already pages: exact
         # readOnlyHint=true observations also drive receipt and retry
         # classification. Missing hints, uninspectable declarations, and probe
-        # failures preserve the historical fail-closed behavior. The annotation
-        # remains a non-authoritative hint: it never authorizes or denies tool
-        # execution.
+        # failures preserve the historical fail-closed behavior. On an
+        # unrestricted turn the annotation never authorizes or denies a call; on
+        # a read-only turn it is the connector's own classification of which
+        # tools may run (RUNNER-TOOL-ACCESS-1).
         if capability is None:
             capability = anyio.run(
                 probe_mcp_tool_capability,
@@ -714,8 +710,7 @@ def build_runner(
 
         # The connector exclusion FRONTS the approval hook in one callback
         # (#2634) so an excluded gated tool never records a pending approval or
-        # spends a grant; bundle hooks stay siblings, as before. No gate and no
-        # failed connector keeps the wiring byte-identical to before.
+        # spends a grant; bundle hooks stay siblings, as before.
         #
         # Per-turn tool access fronts ALL of them (RUNNER-TOOL-ACCESS-2): a call a
         # read-only turn may not make reaches no approval, bundle or factory

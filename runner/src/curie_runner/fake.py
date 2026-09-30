@@ -308,8 +308,8 @@ class FakeModelSession:
         deny records the block on the shared ``ApprovalGate`` (flipping the turn to
         awaiting-approval). The block is delivered unchanged either way -- the real
         SDK emits the ``tool_use`` before the permission decision, so a denied call
-        still surfaces as a tool note. A no-op unless a gate is configured, keeping
-        the un-gated fake unchanged.
+        still surfaces as a tool note. A no-op unless a gate or a tool access is
+        configured, keeping the un-gated, unrestricted fake unchanged.
 
         The callback's return value is READ, not discarded (#1852): a
         ``PermissionResultDeny`` with ``interrupt=True`` is forwarded by the SDK

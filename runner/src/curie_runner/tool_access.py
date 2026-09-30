@@ -41,6 +41,10 @@ ENFORCED_TOOL_ACCESS: tuple[ToolAccess, ...] = (ToolAccess.READ_ONLY,)
 TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
 
 _UNNAMED_TOOL = "this tool call"
+_DECISION_FAILED = (
+    "This tool call was not run: its tool access could not be decided, so it is "
+    "refused. Do not retry it."
+)
 
 
 class TurnToolAccess:
@@ -110,6 +114,25 @@ def _tool_name(hook_input: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _safe_refusal(
+    access: TurnToolAccess,
+    tool_name: str | None,
+    tool_use_id: str | None,
+    *,
+    record: bool,
+) -> str | None:
+    """The decision, failing closed: a raising decision is a refusal.
+
+    @spec RUNNER-TOOL-ACCESS-2: the CLI reports a raising PreToolUse callback as
+    a hook error and then RUNS the call, so an exception here must never escape.
+    """
+
+    try:
+        return access.refuse(tool_name, tool_use_id) if record else access.refusal(tool_name)
+    except Exception:  # noqa: BLE001 - any failure to decide is a refusal
+        return _DECISION_FAILED
+
+
 def _deny(reason: str) -> dict[str, Any]:
     # No ``continue_: False``: the model is told and the turn carries on.
     return {
@@ -131,12 +154,12 @@ def front_pre_tool_use_hooks(
     """
 
     async def front(hook_input: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
-        reason = access.refuse(_tool_name(hook_input), tool_use_id)
+        reason = _safe_refusal(access, _tool_name(hook_input), tool_use_id, record=True)
         return _deny(reason) if reason is not None else {}
 
     def wrap(callback: Any) -> Any:
         async def fronted(hook_input: Any, tool_use_id: str | None, context: Any) -> Any:
-            reason = access.refusal(_tool_name(hook_input))
+            reason = _safe_refusal(access, _tool_name(hook_input), tool_use_id, record=False)
             if reason is not None:
                 return _deny(reason)
             return await callback(hook_input, tool_use_id, context)
@@ -172,7 +195,7 @@ def front_can_use_tool(inner: CanUseTool | None, access: TurnToolAccess) -> CanU
         tool_input: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        reason = access.refuse(tool_name, context.tool_use_id)
+        reason = _safe_refusal(access, tool_name, context.tool_use_id, record=True)
         if reason is not None:
             return PermissionResultDeny(message=reason, interrupt=False)
         if inner is None:

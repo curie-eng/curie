@@ -762,7 +762,14 @@ class ApprovalGate:
             or _tool_policy_outcome(self, tool_name) is ToolPolicyDecision.APPROVAL_REQUIRED
         )
 
-    def reset(self) -> None:
+    def reset(self, *, grant_eligible: bool = True) -> None:
+        """Clear one turn's gate state before the next turn runs.
+
+        ``grant_eligible`` False is a turn that may not spend the boot grant (a
+        read-only turn, RUNNER-TOOL-ACCESS-10): it neither expires the grant
+        nor counts as the boot turn, so the next eligible turn still can.
+        """
+
         self.pending_summary = None
         self.pending_display = None
         self.pending_route = None
@@ -786,6 +793,8 @@ class ApprovalGate:
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
         # expire any unspent grant on the second and later resets so it never
         # leaks into a subsequent turn.
+        if not grant_eligible:
+            return
         if self._boot_turn_seen:
             self.grant_tool = None
             self.grant_arguments = None

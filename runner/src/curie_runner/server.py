@@ -289,10 +289,13 @@ async def _steer(request: web.Request) -> web.Response:
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
-    if runner.turn_active and frame.tool_access != runner.live_tool_access:
-        # @spec RUNNER-TOOL-ACCESS-4: the caller opens its own turn instead.
+    if runner.turn_active and (
+        frame.tool_access is not None or runner.live_tool_access is not None
+    ):
+        # @spec RUNNER-TOOL-ACCESS-4: a restricted turn takes no steer, and a
+        # restricted steer joins no turn; the caller opens its own turn instead.
         return web.json_response(
-            {"error": "the live turn runs under a different tool access; open a new /v1/event"},
+            {"error": "a restricted turn takes no steer; open a new /v1/event"},
             status=409,
         )
     delivered = await runner.steer(frame.text, tool_access=frame.tool_access)
