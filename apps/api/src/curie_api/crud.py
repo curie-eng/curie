@@ -2471,6 +2471,54 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
 # turns. A chain is one approval per hop, so this is far past any real run; it
 # only bounds the walk against a corrupt row whose dedupe_key loops.
 _RERAISE_CHAIN_LIMIT = 64
+_DISPLAY_REQUESTER_CHAIN_LIMIT = 64
+
+
+async def approval_display_requester(session: AsyncSession, approval: Approval) -> str | None:
+    """Read the requester of a validated resume chain for display only.
+
+    The current row's author remains the actor of its own turn. No result from
+    this walk participates in resolution or grant authorization.
+    """
+
+    current = approval
+    seen = {approval.id}
+    reads = 0
+    while True:
+        prior_id = parse_resume_event_id(current.dedupe_key)
+        if prior_id is None:
+            # A malformed reserved resume id cannot prove a fresh human turn.
+            if current.dedupe_key.startswith("approval-") and current.dedupe_key.endswith(
+                "-resolved"
+            ):
+                return None
+            return current.author
+        if prior_id in seen or reads >= _DISPLAY_REQUESTER_CHAIN_LIMIT:
+            return None
+        seen.add(prior_id)
+        reads += 1
+        prior = await session.get(Approval, prior_id)
+        if prior is None or (
+            prior.agent_id != current.agent_id
+            or prior.conversation_id != current.conversation_id
+            or prior.reply_kind != current.reply_kind
+            or prior.reply_channel != current.reply_channel
+            or prior.reply_endpoint != current.reply_endpoint
+            or route_identity(prior.reply_kind, prior.reply_adapter)
+            != route_identity(current.reply_kind, current.reply_adapter)
+        ):
+            return None
+        if prior.status == ApprovalStatus.expired:
+            expected_actor = "system"
+        elif prior.status in {ApprovalStatus.approved, ApprovalStatus.rejected}:
+            if not prior.resolved_by:
+                return None
+            expected_actor = prior.resolved_by
+        else:
+            return None
+        if current.author != expected_actor:
+            return None
+        current = prior
 
 
 def _same_approval(prior: Approval, data: "ApprovalRequest") -> bool:

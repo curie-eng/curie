@@ -5393,3 +5393,180 @@ def test_approvers_on_a_requesting_surface_route_asked_in_slack_still_apply(
             assert len(h.sink.posts) == 1
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "metadata,requester,known",
+    [
+        ({}, None, False),
+        ({"requested_by": None}, None, True),
+        ({"requested_by": "U0EXAMPLE1"}, "U0EXAMPLE1", True),
+    ],
+)
+def test_approval_create_decoder_distinguishes_unavailable_from_older_api(
+    metadata: dict, requester: str | None, known: bool
+) -> None:
+    async def go() -> None:
+        def handle(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/approvals"
+            return httpx.Response(201, json={"id": "appr-1", "status": "pending", **metadata})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.com",
+                api_key="test-key", client=http, read_timeout_s=1.0
+            )
+            created = await client.create(
+                ApprovalRequest(
+                    conversation_id="thread-example",
+                    author="U0EXAMPLE2",
+                    summary="Next action",
+                    reply_kind="slack",
+                    reply_channel="C0EXAMPLE1",
+                    reply_placeholder=None,
+                    dedupe_key="approval-11111111-1111-4111-8111-111111111111-resolved",
+                )
+            )
+            assert created.requested_by == requester
+            assert created.requester_known is known
+
+    asyncio.run(go())
+
+
+class DerivedRequesterApprovals(RecordingApprovals):
+    def __init__(self, requester: str | None, *, known: bool = True) -> None:
+        super().__init__()
+        self.requester = requester
+        self.known = known
+
+    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        created = await super().create(request)
+        if not self.known:
+            return created  # The real old API shape has no attribution metadata.
+        return CreatedApproval(
+            id=created.id,
+            status=created.status,
+            requested_by=self.requester,
+            requester_known=self.known,
+        )
+
+
+def test_three_gate_requester_survives_restart_and_consumed_cards(make_harness) -> None:
+    # The API fixture supplies independently tested durable attribution. Real
+    # Valkey carries card identity; each harness replaces all in-memory state.
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals("U0EXAMPLE1")
+        thread = "th-requester-chain"
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("First action")
+            await h.kernel.process_event(
+                _qevent("Do three actions", thread=thread).model_copy(
+                    update={"author": "U0EXAMPLE1"}
+                )
+            )
+            assert h.sink.posts[0][2] == "U0EXAMPLE1"
+        for index, actor in enumerate(("U0EXAMPLE2", "U0EXAMPLE3"), 1):
+            reader = RecordingReader(
+                SettledApproval(
+                    status="approved",
+                    resolved_by=actor,
+                    resolution_note="U0EXAMPLE4 requested it",
+                    resolved_at=datetime(2026, 9, 30, 10, index, tzinfo=UTC),
+                )
+            )
+            async with make_harness(approvals=approvals, approval_reader=reader) as h:
+                h.runner.default_script = _awaiting_script(f"Next action {index}")
+                await h.kernel.process_event(
+                    _resume_turn(
+                        "Untrusted display prose names U0EXAMPLE4",
+                        thread=thread,
+                        approval_id=f"appr-{index}",
+                        author=actor,
+                    )
+                )
+                assert approvals.requests[-1].author == actor
+                assert h.sink.posts[-1][2] == "U0EXAMPLE1"
+                assert len(h.sink.card_updates) == 1
+                settled = h.sink.card_updates[0][-1]
+                assert settled is not None
+                assert settled.requested_by == "U0EXAMPLE1"
+                assert settled.resolver == actor
+                from curie_worker.approvals import decided_at
+
+                assert decided_at(h.sink.card_updates[0][2]) == reader.records[0].resolved_at
+                assert not await h.async_redis.exists(h.config.approval_card_key(f"appr-{index}"))
+                ref = await _peek_card_ref(h, f"appr-{index + 1}")
+                assert ref is not None and ref["requested_by"] == "U0EXAMPLE1"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("known", [True, False])
+@pytest.mark.parametrize("actor", ["U0EXAMPLE2", "system"])
+def test_unavailable_or_legacy_resume_never_labels_resolver_as_requester(
+    make_harness, known: bool, actor: str
+) -> None:
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals(None, known=known)
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Next action")
+            await h.kernel.process_event(
+                _resume_turn(
+                    "U0EXAMPLE1 supposedly asked",
+                    thread="th-unknown-requester",
+                    approval_id="appr-prior",
+                    author=actor,
+                )
+            )
+            assert approvals.requests[0].author == actor
+            assert h.sink.posts[0][2] == ""
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            ref = await _peek_card_ref(h, "appr-1")
+            assert ref is not None and ref["requested_by"] == ""
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("known,expected", [(False, "U0EXAMPLE4"), (True, "")])
+def test_fresh_human_request_fallback_only_for_older_api(make_harness, known, expected) -> None:
+    async def go() -> None:
+        async with make_harness(approvals=DerivedRequesterApprovals(None, known=known)) as h:
+            h.runner.default_script = _awaiting_script("Fresh action")
+            await h.kernel.process_event(
+                _qevent("New ask", thread="th-fresh-requester").model_copy(
+                    update={"author": "U0EXAMPLE4"}
+                )
+            )
+            assert h.sink.posts[0][2] == expected
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+
+    asyncio.run(go())
+
+
+def test_routed_requester_is_used_in_card_memory_and_notification_metadata(make_harness) -> None:
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals("U0EXAMPLE1")
+        async with make_harness(
+            approvals=approvals, binding=RoutedBinding(_split_approval_routes())
+        ) as h:
+            h.runner.default_script = _awaiting_routed_script("Next bounded action", "managers")
+            await h.kernel.process_event(
+                _resume_turn(
+                    "approved",
+                    thread="th-requester-notification",
+                    approval_id="appr-prior",
+                    author="U0EXAMPLE2",
+                )
+            )
+            posts = [
+                event
+                for event, _route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost)
+            ]
+            assert len(posts) == 2
+            assert [event.requested_by for event in posts] == ["U0EXAMPLE1", "U0EXAMPLE1"]
+            assert posts[0].message.interaction is not None
+            assert posts[1].message.interaction is None
+            assert approvals.requests[0].author == "U0EXAMPLE2"
+
+    asyncio.run(go())

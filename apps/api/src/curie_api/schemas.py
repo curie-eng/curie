@@ -2446,6 +2446,12 @@ class ApprovalOut(BaseModel):
     resolved_at: datetime | None
 
 
+class ApprovalCreateOut(ApprovalOut):
+    """Display attribution for creation, separate from the durable turn author."""
+
+    requested_by: str | None = None
+
+
 class ActionRecord(BaseModel):
     """The opening frame of a side-effecting call, as the worker forwards it.
 
