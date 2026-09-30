@@ -104,6 +104,12 @@ the existing Alertmanager heartbeat to detect a broken notification path.
 
 ## Configuration
 
+Before scanning or posting a placeholder, startup fetches the running API's
+OpenAPI description without a hook signature and requires both `conversation_id`
+and `placeholder` query parameters on `POST /hooks/{agent_id}/{hook}`. Missing,
+unreadable, or incompatible descriptions stop startup before any hook can enqueue.
+This checks reply-target support, not runtime read-only tool enforcement.
+
 The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
 
 - `SLACK_BOT_TOKEN`
@@ -117,7 +123,9 @@ The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
 
 Optional keys are `SLACK_EMAIL_SOURCE_BOT_ID`, `CURIE_SLACK_ADAPTER`,
 `POLL_SECONDS`, `PLACEHOLDER_STALE_SECONDS`, and `HTTP_TIMEOUT_SECONDS`.
-`PLACEHOLDER_STALE_SECONDS` must be greater than two poll intervals.
+`PLACEHOLDER_STALE_SECONDS` must be greater than two poll intervals. Timing
+values must be finite positive numbers; timestamp bounds must be finite
+nonnegative numbers so an invalid bound or retry fallback cannot disable scanning.
 
 The Slack app needs permission to read the configured channel and its thread
 replies, download the private email file, and post in the thread. Downloading a
