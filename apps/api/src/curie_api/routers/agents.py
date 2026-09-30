@@ -303,6 +303,10 @@ async def update_agent(
         # Binds this agent to a repository so git-flow can route pushes to it
         # (ADR-0091). Several agents may share one, so this cannot collide.
         agent = await crud.update_agent_repo(session, agent, data.repo_full_name)
+    if data.deploy_notifications is not None:
+        agent = await crud.update_agent_deploy_notifications(
+            session, agent, data.deploy_notifications
+        )
     if data.secrets is not None:
         # Omitted leaves the secrets unchanged; an explicit {} clears them (#429).
         agent = await crud.update_agent_secrets(session, agent, data.secrets)

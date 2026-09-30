@@ -49,6 +49,7 @@ from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from .cron_loop import BundleTriggerSource, CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
+from .deploy_notice import DeployNoticeConsumer
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
@@ -130,6 +131,7 @@ class Runtime:
     publication_loop: PublicationReconcileLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
+    deploy_notice_consumer: DeployNoticeConsumer | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -603,6 +605,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         ),
         repo_lookup=binding,
     )
+    deploy_notice_consumer = DeployNoticeConsumer(
+        redis=eval_redis,
+        sink=sink,
+        config=config,
+        leases=DeliveryLeaseStore(eval_redis, config),
+        drain=drain_gate,
+    )
     publication_loop = _build_publication_loop(
         config,
         env,
@@ -615,6 +624,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         consumer=consumer,
         killswitch=killswitch,
         eval_consumer=eval_consumer,
+        deploy_notice_consumer=deploy_notice_consumer,
         runner=runner,
         sink=sink,
         async_redis=async_redis,
@@ -1058,6 +1068,11 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             _supervise("runs", rt.consumer.run, shutdown, **policy),
             _supervise("killswitch", rt.killswitch.run, shutdown, **policy),
             _supervise("evals", rt.eval_consumer.run, shutdown, **policy),
+            *(
+                [_supervise("deploy-notices", rt.deploy_notice_consumer.run, shutdown, **policy)]
+                if rt.deploy_notice_consumer is not None
+                else []
+            ),
             _supervise(
                 "heartbeat",
                 lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),

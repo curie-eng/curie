@@ -388,6 +388,7 @@ class CommitPoller:
         store: Any,
         settings: Settings,
         eval_queue: Any,
+        notice_queue: Any | None = None,
         tips: BranchTip,
         interval_seconds: float,
         clock: Callable[[], float] = time.monotonic,
@@ -396,6 +397,7 @@ class CommitPoller:
         self._store = store
         self._settings = settings
         self._eval_queue = eval_queue
+        self._notice_queue = notice_queue
         self._tips = tips
         self._interval = interval_seconds
         # Monotonic, not wall clock: a backoff window must not be skipped or
@@ -587,6 +589,14 @@ class CommitPoller:
             # rejection as "deployed" at INFO is #1066 again, and this is the
             # lane with no GitHub delivery UI to fall back on.
             gitflow.log_push_outcome(result, move.as_push_payload(), source="commit poll")
+            if self._notice_queue is not None:
+                try:
+                    async with self._session_factory() as notice_session:
+                        await self._notice_queue.publish(
+                            notice_session, result, move.as_push_payload(), self._settings
+                        )
+                except Exception:
+                    logger.exception("could not enqueue git-flow deploy notice from commit poll")
 
             if result.status in ("deployed", "promoted"):
                 # A Deployment row exists now, so the database is the memory

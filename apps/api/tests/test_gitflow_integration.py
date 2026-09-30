@@ -247,6 +247,34 @@ class _RecordingEvalQueue:
         return f"0-{len(self.jobs)}"
 
 
+def _notice_cursor() -> str:
+    """Remember the private Valkey stream tail without erasing another test's rows."""
+
+    settings = get_settings()
+    with redis.Redis(
+        host=settings.valkey_host,
+        port=settings.valkey_port,
+        password=settings.valkey_password,
+    ) as valkey:
+        info = (
+            valkey.xinfo_stream("curie:deploy-notices")
+            if valkey.exists("curie:deploy-notices")
+            else None
+        )
+        return str(info["last-generated-id"], "ascii") if info is not None else "0-0"
+
+
+def _notices_after(cursor: str) -> list[dict[str, Any]]:
+    settings = get_settings()
+    with redis.Redis(
+        host=settings.valkey_host,
+        port=settings.valkey_port,
+        password=settings.valkey_password,
+    ) as valkey:
+        entries = valkey.xrange("curie:deploy-notices", min=f"({cursor}")
+    return [json.loads(fields[b"payload"]) for _, fields in entries]
+
+
 def _delete_bare_repo(base_dir: Path, repo_full_name: str = REPO) -> None:
     """Make the remote unreachable, the way a dead PAT or a deleted repo does.
 
@@ -374,6 +402,107 @@ def test_signed_push_rejects_an_invalid_legacy_repository_binding(
         client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
         == []
     )
+
+
+def test_case_only_repository_binding_miss_is_a_rejection(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A canonical-casing error must be visible in GitHub's delivery body."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    payload["repository"]["full_name"] = "Octo/Demo-Agent"
+    cursor = _notice_cursor()
+
+    response = _post(client, "push", payload)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert {error["code"] for error in response.json()["errors"]} == {
+        "git.repository_case_mismatch"
+    }
+    assert [notice["codes"] for notice in _notices_after(cursor)] == [
+        ["git.repository_case_mismatch"]
+    ]
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+
+    payload["repository"]["full_name"] = "octo/unrelated"
+    unrelated = _post(client, "push", payload)
+    assert unrelated.status_code == 200
+    assert unrelated.json()["status"] == "ignored"
+
+
+def test_success_notice_requires_opt_in_and_is_deduplicated(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    assert _notices_after(cursor) == []
+
+    changed = client.patch(
+        f"/agents/{agent_id}",
+        json={"deploy_notifications": True},
+        headers=auth_headers,
+    )
+    assert changed.status_code == 200
+    assert changed.json()["deploy_notifications"] is True
+
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    notices = _notices_after(cursor)
+    assert len(notices) == 1
+    assert notices[0]["address"] == "C000000G01"
+    assert notices[0]["identity"] == "default"
+    assert notices[0]["agent_name"] == "gitflow-agent"
+    assert notices[0]["status"] == "deployed"
+    assert notices[0]["sha"] == sha
+
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    assert _notices_after(cursor) == []
+
+
+def test_archive_rejection_notifies_without_success_opt_in(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    added = client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    _delete_bare_repo(trusted_clone_base)
+    cursor = _notice_cursor()
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    notices = _notices_after(cursor)
+    assert {(notice["address"], notice["identity"]) for notice in notices} == {
+        ("C000000G01", "default"),
+        ("C0EXAMPLE2", "default"),
+    }
+    assert all(notice["status"] == "rejected" for notice in notices)
+    assert all(notice["codes"] == ["git.archive_failed"] for notice in notices)
+    assert all(notice["sha"] == sha for notice in notices)
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
 
 
 def test_patched_repo_binding_routes_a_push(
@@ -1457,6 +1586,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
     }
     _, sha = _build_bare_repo(trusted_clone_base, REPO, files)
     settings = get_settings()
+    notice_cursor = _notice_cursor()
 
     class Tips:
         def sha_for(self, repo_full_name: str, branch: str) -> str | None:
@@ -1468,13 +1598,18 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             pass
 
     async def exercise() -> str:
+        from curie_api.deploy_notice import DeployNoticeQueue
+        from redis.asyncio import Redis
+
         engine = create_async_engine(settings.database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
+        notice_redis = Redis.from_url(settings.valkey_dsn())
         poller = CommitPoller(
             session_factory=maker,
             store=client.app.state.bundle_store,
             settings=settings,
             eval_queue=NoopEvalQueue(),
+            notice_queue=DeployNoticeQueue(notice_redis),
             tips=Tips(),
             interval_seconds=60,
         )
@@ -1491,6 +1626,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
                         name="repairedagent",
                         channel=ChannelBinding(kind="slack", address="C000000R02"),
                         repo_full_name=REPO,
+                        deploy_notifications=True,
                     ),
                 )
 
@@ -1498,6 +1634,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             assert [move.sha for move in second] == [sha]
             return str(repaired.id)
         finally:
+            await notice_redis.aclose()
             await engine.dispose()
 
     repaired_id = asyncio.run(exercise())
@@ -1507,6 +1644,11 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
     assert len(deployments) == 1, deployments
     assert deployments[0]["commit_sha"] == sha
     assert deployments[0]["environment"] == "dev"
+    notices = _notices_after(notice_cursor)
+    assert {(notice["status"], notice["address"]) for notice in notices} == {
+        ("rejected", "C000000R01"),
+        ("deployed", "C000000R02"),
+    }
 
 
 def test_the_commit_poller_promotes_a_stored_bundle_with_the_remote_deleted(

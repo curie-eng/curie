@@ -275,6 +275,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             )
         ],
         repo_full_name=data.repo_full_name,
+        deploy_notifications=data.deploy_notifications,
         model=data.model,
         thinking=data.thinking,
         behavior_packs=(
@@ -924,6 +925,15 @@ async def update_agent_repo(session: AsyncSession, agent: Agent, repo_full_name:
     return agent
 
 
+async def update_agent_deploy_notifications(
+    session: AsyncSession, agent: Agent, enabled: bool
+) -> Agent:
+    agent.deploy_notifications = enabled
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def get_agents_by_repo(session: AsyncSession, repo_full_name: str) -> list[Agent]:
     """Every agent built from this repository (ADR-0091).
 
@@ -935,6 +945,17 @@ async def get_agents_by_repo(session: AsyncSession, repo_full_name: str) -> list
 
     result = await session.scalars(
         select(Agent).where(Agent.repo_full_name == repo_full_name).order_by(Agent.name)
+    )
+    return list(result)
+
+
+async def get_agents_by_repo_casefold(session: AsyncSession, repo_full_name: str) -> list[Agent]:
+    """Find a binding whose only difference from GitHub's name is ASCII casing."""
+
+    result = await session.scalars(
+        select(Agent)
+        .where(func.lower(Agent.repo_full_name) == repo_full_name.lower())
+        .order_by(Agent.name)
     )
     return list(result)
 

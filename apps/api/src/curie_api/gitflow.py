@@ -453,6 +453,15 @@ async def process_push(
     # solely to narrow `str | None` to `str` for the origin derivation below.
     repo_agents = [a for a in repo_agents if a.repo_full_name is not None]
     if not repo_agents:
+        casing_matches = await crud.get_agents_by_repo_casefold(session, full_name)
+        if casing_matches:
+            return WebhookResult(
+                status="rejected",
+                errors=[{
+                    "code": "git.repository_case_mismatch",
+                    "message": "the push repository casing differs from the stored agent binding",
+                }],
+            )
         return WebhookResult(status="ignored")
 
     # The trust model does not move (ADR-0091). The origin is still derived from

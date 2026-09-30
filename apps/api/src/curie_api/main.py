@@ -107,6 +107,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
+    from .deploy_notice import DeployNoticeQueue
+
+    app.state.deploy_notice_queue = DeployNoticeQueue(valkey)
     # resume_dead_letter_stream stays the narrower override that wins when set;
     # its fallback is now the unified graveyard name (which honors
     # CURIE_DEAD_LETTER_STREAM / CURIE_STREAM via the shared derivation, #668)
@@ -214,6 +217,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             store=app.state.bundle_store,
             settings=settings,
             eval_queue=app.state.eval_queue,
+            notice_queue=app.state.deploy_notice_queue,
             tips=GitHubBranchTip(settings, credentials_for(settings)),
             interval_seconds=settings.commit_poll_interval_s,
         )

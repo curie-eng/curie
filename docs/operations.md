@@ -733,10 +733,10 @@ promote:
    warning naming the repository it kept, so `--repo` never silently
    reroutes which repository's pushes deploy an agent. The match is
    case sensitive, so the stored `repo_full_name` must match GitHub's
-   canonical owner and repository casing exactly, or the lookup finds
-   no agent, the push is silently ignored, and (unlike a rejection)
-   nothing is logged, so the only symptom is a green delivery in GitHub
-   with nothing deployed.
+   canonical owner and repository casing exactly. A case-only mismatch
+   is rejected with `git.repository_case_mismatch`; an unrelated repo
+   remains ignored. Correct the agent's repo binding rather than changing
+   the incoming payload.
 2. **GitHub can reach the Curie API.** Add a webhook, in the repo's GitHub
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
@@ -758,6 +758,19 @@ promote:
    silently from GitHub's side. The default covers github.com with no extra setup; set
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
+
+Git-flow rejections send a top-level Slack notice to every Slack channel bound
+to an agent for the pushed repository, even when success notices are off.
+The notice includes the commit prefix and stable error codes; for
+`git.archive_failed`, check the API's clone credential and repository access.
+An unrelated repository has no bound recipient and remains ignored. To also
+receive successful deploy and promotion notices, opt each agent in through
+`PATCH /agents/<agent-id>` with `{"deploy_notifications": true}` and the
+normal API key. The default is `false`; this setting does not affect rejection
+notices. Multiple Slack bindings each receive a notice through their configured
+bot identity. Notice delivery uses the worker's bounded retry and dead-letter
+path; inspect the `curie:deploy-notices:dead` stream if Slack delivery keeps
+failing.
 
 ### Accepting review feedback from GitHub
 

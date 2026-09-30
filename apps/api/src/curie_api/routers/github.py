@@ -225,4 +225,8 @@ async def github_webhook(
 
     result = await process_push(session, store, settings, eval_queue, payload)
     log_push_outcome(result, payload, source="github webhook")
+    try:
+        await request.app.state.deploy_notice_queue.publish(session, result, payload, settings)
+    except Exception:
+        logger.exception("could not enqueue git-flow deploy notice")
     return result

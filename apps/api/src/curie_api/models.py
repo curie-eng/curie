@@ -120,6 +120,9 @@ class Agent(Base):
     # sharing a repository is intended, two sharing a channel is silent
     # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
+    # Success notices are opt-in; a rejected push is always reported to bound
+    # Slack channels because no deployment row may exist to inspect afterward.
+    deploy_notifications: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     @validates("repo_full_name")
     def _validate_repo_full_name(self, _key: str, value: str | None) -> str | None:

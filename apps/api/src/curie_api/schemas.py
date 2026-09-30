@@ -1368,6 +1368,7 @@ class AgentCreate(BaseModel):
     # the subresource, never here.
     channel: ChannelBindingWrite
     repo_full_name: RepoFullName | None = None
+    deploy_notifications: bool = False
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
@@ -1481,6 +1482,7 @@ class AgentUpdate(BaseModel):
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
     repo_full_name: RepoFullName | None = None
+    deploy_notifications: bool | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
     # Whether the runner mounts its memory tools (#1461). Omitted (None) leaves
@@ -1527,6 +1529,7 @@ class AgentOut(BaseModel):
     # lives on the relationship too (`models.Agent.channels`, lazy="selectin").
     channels: list[ChannelBindingOut]
     repo_full_name: str | None
+    deploy_notifications: bool
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
