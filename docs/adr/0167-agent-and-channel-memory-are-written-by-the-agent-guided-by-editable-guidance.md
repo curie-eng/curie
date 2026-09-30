@@ -123,7 +123,7 @@ model reads, not a list the platform matches against.
   sender, because memory is used far from where it was said and the source
   keeps it accountable. The model cannot set the author.
 - **At boot,** the session gets agent memory and this channel's memory, with
-  each fact's id, who stated it, and the date it was stated.
+  each fact's id and the date it was stated.
 - **Size** is bounded by the state store's existing limits. A save that would
   exceed them is refused and reported to the agent as refused. Keeping memory
   within them as it grows is what the packages above are for.
