@@ -95,7 +95,7 @@ class MailAdapterConfig(BaseSettings):
     egress_secret: str = Field(default="", validation_alias="CURIE_EGRESS_SECRET")
     # The adapter principal credential (ADR-0156), scoped to this adapter's
     # bindings. Set, it turns on ADR-0177: the adapter renders an approval card
-    # as an email a requester can answer, and carries that answer to the
+    # as an email a listed approver can answer, and carries that answer to the
     # platform's resolver. Empty keeps approvals as they were: shown, never
     # answerable by email, expiring.
     adapter_principal: str = Field(default="", validation_alias="CURIE_ADAPTER_PRINCIPAL")

@@ -69,14 +69,15 @@ def _is_caller_refusal(status: int, body: Any) -> bool:
 #
 # A random single-use reference links a reply to the approval it answers. It is
 # not proof of identity: every reply quotes it, and anyone copied can see it.
-# Who may answer is decided by the requester check here and, authoritatively, by
-# the platform's RequesterOnly approver set.
+# Who may answer is the platform's decision (ADR 0183): the adapter carries the
+# sender its inbound gate verified, and the platform admits it only when the
+# binding's allowed_callers admit it and it is on the route's approver emails.
 APPROVAL_REF_PATTERN = re.compile(r"curie-approval-[A-Za-z0-9_-]{24}")
 # The ReplyAck ref of a rendered card, so the worker can settle this card later.
 APPROVAL_CARD_REF_PREFIX = "approval-card:"
 APPROVAL_INSTRUCTIONS = (
     "To answer, reply to this email with APPROVE or REJECT on the first line. "
-    "Anything after it is your note. Only the person who asked can answer."
+    "Anything after it is your note. Only an approver listed for this request can answer."
 )
 APPROVAL_REF_LABEL = "Approval reference:"
 APPROVAL_NOTE_MAX_CHARS = 4000
@@ -654,11 +655,15 @@ class MailAdapter:
         back, and the return value is ``handle_inbound``'s.
 
         A message counts as an answer only when all of these hold (ADR-0177
-        decision 5). The first is established before this runs: the provider's
-        SPF, DKIM and DMARC verdict and the ``labels`` gate in ``handle_inbound``.
-        Then: it names a reference issued in this thread, that reference is still
-        live, it was issued to this sender, the message was not sent
-        automatically, and the first line of its new text is one decision word.
+        decision 5). The first two are established before this runs, in
+        ``handle_inbound``: the provider's SPF, DKIM and DMARC verdict with the
+        ``labels`` gate, then ``CURIE_MAIL_ALLOWED_SENDERS``, so a sender the
+        mailbox does not admit never reaches this (ADR 0183 decision 2). Then:
+        it names a reference issued in this thread, that reference is still
+        live, the message was not sent automatically, and the first line of its
+        new text is one decision word. Who may answer is not decided here: the
+        verified sender is carried to the platform, which checks the binding's
+        ``allowed_callers`` and the route's approver emails.
         """
         refs = self.state.approval_refs_in(conversation_id)
         if not refs:
@@ -685,15 +690,13 @@ class MailAdapter:
             self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
         elif ref["state"] != "live":
             self._notify(message_id, "This approval has already been answered.", correlation)
-        elif _bare_address(sender) != ref["requester"]:
-            logger.info("approval reply correlation=%s refused: not the requester", correlation)
-            self._notify(
-                message_id, "Only the person who asked can answer this approval.", correlation
-            )
         else:
             decision, note = _parse_decision(full)
             if decision is None:
                 self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
+            # The bare address the inbound gate verified, lowercased, never the
+            # display name from the From header: that is the only part of it
+            # anyone vouched for, and the form the platform's lists are in.
             elif self._carry_answer(ref, _bare_address(sender), decision, note, message_id) == (
                 "retry"
             ):
@@ -752,6 +755,14 @@ class MailAdapter:
                 if result.status == 409
                 else "This approval expired before it was answered."
             )
+        elif _is_caller_refusal(result.status, result.body):
+            # The binding's allowed_callers do not admit this sender (ADR 0175
+            # decision 3): a refused caller gets nothing back, on an answer
+            # exactly as on a turn.
+            logger.info("approval answer correlation=%s refused: caller not allowed", correlation)
+            return "not_an_answer"
+        elif result.status == 403:
+            text = "You are not an approver for this request."
         else:
             text = "Your answer could not be accepted for this approval."
         self._notify(message_id, text, correlation)
@@ -773,7 +784,6 @@ class MailAdapter:
         self,
         conversation_id: str,
         approval_id: str,
-        requester: str,
         text: str,
     ) -> tuple[int, str | None]:
         """Render an approval card into the pending reply, with a fresh reference.
@@ -783,7 +793,7 @@ class MailAdapter:
         exactly as before, and no ref is returned: nothing here could carry an
         answer, so nothing invites one.
         """
-        if not self.config.adapter_principal or not requester:
+        if not self.config.adapter_principal:
             return self.record_text(conversation_id, None, text, append=True), None
         refs = self.state.live_reply_refs(conversation_id)
         if len(refs) != 1:
@@ -798,7 +808,6 @@ class MailAdapter:
             approval_id,
             conversation_id,
             reply_ref,
-            _bare_address(requester) or requester,
             f"curie-approval-{secrets.token_urlsafe(18)}",
         )
         card = f"{text}\n\n{APPROVAL_INSTRUCTIONS}\n{APPROVAL_REF_LABEL} {reference}"
@@ -852,8 +861,27 @@ class MailAdapter:
         append: bool = False,
     ) -> int:
         """Persist text against the exact reply ref; return the HTTP ack status."""
+        return self.record_text_at(conversation_id, reply_ref, text, append=append)[0]
+
+    def record_text_at(
+        self,
+        conversation_id: str,
+        reply_ref: str | None,
+        text: str | None,
+        *,
+        append: bool = False,
+    ) -> tuple[int, str | None]:
+        """``record_text``, also naming the ref the text was recorded at.
+
+        Text with no ``reply_ref`` lands on the conversation's one live reply
+        owner. Naming it lets the ack hand that ref back, so the worker keeps
+        the rest of the turn, and its completion, on the same message. That is
+        how a resumed approval turn, which drops the replayed placeholder to
+        answer after the card (ADR-0179 decision 3), is still mailed as a reply
+        to the asking message. None when nothing was recorded.
+        """
         if not conversation_id or not text:
-            return 200
+            return 200, None
         chosen_ref = reply_ref
         if not chosen_ref:
             refs = self.state.live_reply_refs(conversation_id)
@@ -863,7 +891,7 @@ class MailAdapter:
                     _correlation(conversation_id),
                     len(refs),
                 )
-                return 503
+                return 503, None
             chosen_ref = refs[0]
         outcome = self.state.record_text(
             conversation_id,
@@ -873,14 +901,14 @@ class MailAdapter:
             max_bytes=self.config.max_reply_bytes,
         )
         if outcome == "too_large":
-            return 413
+            return 413, None
         if outcome == "missing":
             logger.info(
                 "reply update deferred: no active admitted owner for correlation=%s",
                 _correlation(f"{conversation_id}\0{chosen_ref}"),
             )
-            return 503
-        return 200
+            return 503, None
+        return 200, chosen_ref
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)

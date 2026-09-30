@@ -135,15 +135,16 @@ silent.
 
 ## Approvals by email
 
-With `CURIE_ADAPTER_PRINCIPAL` set, a person can answer an approval raised in
-their email thread by replying to it (ADR-0177). Without it, nothing below
-happens: the card's text is mailed as before and the approval can only expire.
+With `CURIE_ADAPTER_PRINCIPAL` set, a listed approver can answer an approval
+raised in an email thread by replying to it (ADR-0177, ADR-0183). Without it,
+nothing below happens: the card's text is mailed as before and the approval can
+only expire.
 
 **The request.** When the worker posts the approval card into the thread, the
 adapter adds the instructions ("reply with APPROVE or REJECT on the first line;
-anything after it is your note; only the person who asked can answer") and a
-random single-use reference, and keeps that reference with the approval id, the
-thread and the requester. The card's ack carries a ref, so the worker can settle
+anything after it is your note; only an approver listed for this request can
+answer") and a random single-use reference, and keeps that reference with the
+approval id and the thread. The card's ack carries a ref, so the worker can settle
 this card later. The reference links a reply to its approval. It proves nothing
 about who sent the reply: every reply quotes it.
 
@@ -151,9 +152,9 @@ about who sent the reply: every reply quotes it.
 It is an answer only when all of these hold:
 
 - it passed the inbound gate above (the provider's SPF, DKIM and DMARC verdict
-  and the `labels` check);
+  and the `labels` check), then `CURIE_MAIL_ALLOWED_SENDERS`. A sender either
+  refuses is dropped before any approval logic, and gets nothing back;
 - it names a reference issued in this thread, and that reference is still live;
-- its sender is the requester the reference was issued to;
 - it was not sent automatically: no `Auto-Submitted` other than `no` (RFC 3834),
   no `X-Autoreply`-style header, no `Precedence: bulk`, `junk`, `list` or
   `auto_reply`, not a delivery report, not from `mailer-daemon` or `postmaster`.
@@ -163,11 +164,14 @@ It is an answer only when all of these hold:
   the note.
 
 The adapter then calls `POST /approvals/{id}/resolve` with its credential and
-the sender as `X-Curie-Approval-Actor`, and the platform decides (its
-requester-only approver set admits only this adapter's sender, and only when it
-is the approval's author). A reply that is not an answer gets the instructions
-back; a copied person is told only the person who asked can answer; a reply to a
-spent reference is told it was already answered. An automatic message gets no
+the sender's bare address (lowercased, never the display name) as
+`X-Curie-Approval-Actor`, and the platform decides: the binding's
+`allowed_callers` must admit the sender, and the address must be on the route's
+approver `emails` (ADR-0183). The person who asked is not admitted by default. A
+reply that is not an answer gets the instructions back; a sender the platform
+does not list is told they are not an approver; a sender the binding's
+`allowed_callers` refuse gets nothing back; a reply to a spent reference is told
+it was already answered. An automatic message gets no
 response at all, so nothing loops. If the platform cannot be reached, or rejects
 this adapter's credential, the message stays pending and a later pass carries
 the same answer again.
@@ -180,10 +184,10 @@ thread.
 
 **What this does not authenticate.** Read the inbound security section above:
 nothing here authenticates an individual mailbox. DMARC binds the sending
-domain, so anyone who can send authenticated mail for the requester's domain and
-has seen the thread's reference could send an answer as the requester. Approvals
-by email are a confirmation step by the requester, not a second person's
-sign-off. Keep a fixed Slack route for an approval that needs one.
+domain, so anyone who can send authenticated mail for a listed address's domain and
+has seen the thread's reference could send an answer as a listed address in
+that domain. List only addresses whose domain you trust to that degree, and
+keep a fixed Slack route for an approval that needs a stronger sign-off.
 
 The adapter principal is not rotated by the adapter yet. Re-mint it with `POST
 /approvals/principals/adapter` before it expires, the same operator step as

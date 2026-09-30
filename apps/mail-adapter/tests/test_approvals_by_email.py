@@ -5,10 +5,13 @@ request email leaves through the fake AgentMail, the requester's reply comes in
 through the real poll path, and the answer leaves as a resolve call to the fake
 platform. Nothing inside the adapter is patched.
 
-Each rule the ADR sets for accepting a reply is pinned by a refusal: a copied
-person, an auto-reply, a reply without headers, a decision only in the quote,
-a spent reference, and a reply naming no reference. None of them resolves, and
-none of them starts a turn.
+Each rule the ADR sets for accepting a reply is pinned by a refusal: a sender
+the inbound gate did not verify, a sender the mailbox does not admit, an
+auto-reply, a reply without headers, a decision only in the quote, a spent
+reference, and a reply naming no reference. None of them resolves, and none of
+them starts a turn. Who may answer is the platform's decision (ADR 0183): the
+adapter carries the verified sender's bare address, and the fake platform's
+refusals pin what the adapter then tells the sender.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from _support import (
     approval_card,
     completed,
     post_event,
+    reply_post,
     settled_card,
     update,
 )
@@ -98,7 +102,7 @@ def _notices(mail: MailState, message_id: str) -> list[str]:
 # --- the whole loop ------------------------------------------------------------
 
 
-def test_the_requester_answers_by_reply_and_the_thread_gets_one_follow_up(
+def test_an_answer_by_reply_is_carried_and_the_thread_gets_one_follow_up(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
     reference = _ask(mail, approvals_adapter, url)
@@ -161,15 +165,110 @@ def test_expiry_sends_the_expired_follow_up_and_spends_the_reference(
 # --- each acceptance rule, refused ---------------------------------------------
 
 
-def test_a_person_copied_on_the_thread_cannot_answer(
+def test_any_admitted_sender_is_carried_and_the_platform_decides(
+    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    """The adapter no longer keeps the answer to the person who asked: a listed
+    approver is often someone else on the thread. It carries the sender, and a
+    platform refusal is told plainly."""
+
+    reference = _ask(mail, approvals_adapter, url)
+    ingress.resolve_responses = [
+        (403, {"detail": "you are not an approver: this approval's route is bound to "
+               "an explicit list of approver email addresses"})
+    ]
+
+    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
+
+    (resolve,) = ingress.resolves
+    assert resolve[1]["X-Curie-Approval-Actor"] == COPIED
+    assert _notices(mail, "msg-2") == ["You are not an approver for this request."]
+    assert ingress.delivery_ids() == ["msg-1"]
+
+
+def test_the_actor_is_the_verified_bare_address_never_the_display_name(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
     reference = _ask(mail, approvals_adapter, url)
 
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
+    _reply(
+        mail,
+        approvals_adapter,
+        "msg-2",
+        "APPROVE",
+        reference=reference,
+        sender="Approver Person <Copied@Example.COM>",
+    )
+
+    (resolve,) = ingress.resolves
+    assert resolve[1]["X-Curie-Approval-Actor"] == COPIED
+
+
+@pytest.mark.parametrize("label", ["unauthenticated", "spam", "blocked"])
+def test_a_listed_address_the_inbound_gate_did_not_verify_is_never_carried(
+    mail: MailState,
+    ingress: IngressState,
+    approvals_adapter: MailAdapter,
+    url: str,
+    label: str,
+) -> None:
+    """ADR 0183 decision 2, step 1: the provider's SPF, DKIM and DMARC verdict
+    comes first. A forged message from an address the route lists never reaches
+    the approval logic, gets nothing back, and is never a turn. The fake serves
+    the labeled message, as a provider whose default filtering widened would, so
+    the adapter's own label gate is what refuses it."""
+
+    reference = _ask(mail, approvals_adapter, url)
+    mail.leak_labeled = True
+    full = f"APPROVE\n\n> Approval reference: {reference}"
+    mail.add_inbound(
+        "msg-2",
+        "thr-1",
+        sender=ALLOWED_SENDER,
+        text="APPROVE",
+        full_text=full,
+        headers=HUMAN_HEADERS,
+        labels=[label],
+    )
+    approvals_adapter.poll_once()
 
     assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == ["Only the person who asked can answer this approval."]
+    assert _notices(mail, "msg-2") == []
+    assert ingress.delivery_ids() == ["msg-1"]
+
+
+def test_a_sender_the_mailbox_does_not_admit_is_refused_before_any_approval_logic(
+    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    """ADR 0183 decision 2, step 2: the inbound allowlist comes before the
+    reference, the reply rules and the approver list."""
+
+    reference = _ask(mail, approvals_adapter, url)
+
+    _reply(
+        mail, approvals_adapter, "msg-2", "APPROVE", reference=reference,
+        sender="stranger@example.net",
+    )
+
+    assert ingress.resolves == []
+    assert _notices(mail, "msg-2") == []
+    assert ingress.delivery_ids() == ["msg-1"]
+
+
+def test_a_platform_caller_refusal_gets_nothing_back(
+    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    """The binding's allowed_callers refused the sender (ADR 0175): as on a turn,
+    a refused caller is told nothing, and the answer is not retried."""
+
+    reference = _ask(mail, approvals_adapter, url)
+    ingress.resolve_responses = [(403, {"detail": "caller_not_allowed"})]
+
+    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
+    approvals_adapter.poll_once()
+
+    assert len(ingress.resolves) == 1
+    assert _notices(mail, "msg-2") == []
     assert ingress.delivery_ids() == ["msg-1"]
 
 
@@ -327,7 +426,8 @@ def test_a_platform_outage_keeps_the_answer_pending_and_a_later_pass_carries_it(
     [
         (409, "This approval has already been answered."),
         (410, "This approval expired before it was answered."),
-        (403, "Your answer could not be accepted for this approval."),
+        (403, "You are not an approver for this request."),
+        (422, "Your answer could not be accepted for this approval."),
     ],
 )
 def test_a_refused_answer_is_told_why(
@@ -402,6 +502,32 @@ def test_a_lost_answer_response_still_gets_its_follow_up_and_the_resumed_reply(
     assert post_event(url, update("Sent the quote.", reply_ref="msg-1"))[0] == 200
     assert post_event(url, completed("ev-2"))[0] == 200
     assert mail.replies_to("msg-1")[-1].startswith("Sent the quote.")
+
+
+def test_a_resumed_turn_that_posts_after_the_card_answers_the_asking_message(
+    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    """ADR-0179 decision 3: the resumed turn drops the replayed placeholder, so
+    its first delivery names no ref. The ack names the asking message, the
+    worker keeps the turn there, and the answer is mailed in the same thread."""
+
+    reference = _ask(mail, approvals_adapter, url)
+    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
+    assert post_event(url, settled_card(CARD_REF, decision="approved"))[0] == 200
+
+    status, ack = post_event(url, update("Sent the", reply_ref=None))
+    assert (status, ack) == (200, {"ref": "msg-1"})
+    assert post_event(url, update("Sent the quote.", reply_ref=ack["ref"]))[0] == 200
+    assert post_event(url, completed("ev-2", reply_ref=ack["ref"]))[0] == 200
+    assert mail.replies_to("msg-1")[-1].startswith("Sent the quote.")
+
+
+def test_a_ref_less_post_is_acked_with_the_reply_owner_it_landed_on(
+    mail: MailState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    mail.add_inbound("msg-1", "thr-1", text="Please send the quote")
+    approvals_adapter.poll_once()
+    assert post_event(url, reply_post("A note from the platform."))[1] == {"ref": "msg-1"}
 
 
 def test_concurrent_settlements_send_one_follow_up(

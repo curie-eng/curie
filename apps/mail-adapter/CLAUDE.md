@@ -48,13 +48,18 @@ the enforceable-rule summary.
   an attacker-controlled `From` header. **Never describe the allow-list as
   authenticating a sender** in code, comments, docs or chart values: Curie
   performs no sender authentication.
-- **An approval answer is never a turn, and is accepted only on every ADR-0177
-  rule** (README "Approvals by email"): a live reference issued in this thread
-  to this exact sender, not sent automatically (missing headers count as
-  automatic), and the decision word on the first line of `extracted_text`
-  only, never the full body. The reference links a reply to its approval; it
-  is not proof of identity, and nothing here authenticates a mailbox. Never
-  respond to an automatic message. A settled card spends its reference.
+- **An approval answer is never a turn, and is carried only on every ADR-0177
+  rule** (README "Approvals by email"): after both inbound checks, a live
+  reference issued in this thread, not sent automatically (missing headers
+  count as automatic), and the decision word on the first line of
+  `extracted_text` only, never the full body. The reference links a reply to
+  its approval; it is not proof of identity, and nothing here authenticates a
+  mailbox. **Who may answer is the platform's decision** (ADR 0183): the actor
+  is the sender's bare lowercased address, never a display name, and the
+  platform checks the binding's `allowed_callers` and the route's approver
+  `emails`. Do not add a local approver or requester filter. A
+  `caller_not_allowed` refusal gets nothing back. Never respond to an automatic
+  message. A settled card spends its reference.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's

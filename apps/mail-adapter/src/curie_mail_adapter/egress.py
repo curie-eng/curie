@@ -227,8 +227,10 @@ class EgressHandler(BaseHTTPRequestHandler):
     def dispatch(self, event: ReplyEvent) -> tuple[int, str | None]:
         """Apply one validated neutral reply event; return the status and any ref.
 
-        The only ref returned is an approval card's (ADR-0177), which the worker
-        remembers so the resume can settle that card.
+        Two refs are returned: an approval card's (ADR-0177), which the worker
+        remembers so the resume can settle that card, and the reply owner a
+        ref-less update or post was placed on, so the rest of that turn stays
+        on it.
         """
         conversation_id = event.target.conversation_id or ""
         if isinstance(event, ReplyUpdate | ReplyPost) and event.progress is not None:
@@ -241,11 +243,15 @@ class EgressHandler(BaseHTTPRequestHandler):
             if event.settled is not None and reply_ref.startswith(APPROVAL_CARD_REF_PREFIX):
                 return self.adapter.settle_approval_card(reply_ref, event.settled), None
             text = event.text or (event.message.text if event.message else None)
-            return self.adapter.record_text(
+            status, recorded_at = self.adapter.record_text_at(
                 conversation_id,
                 event.target.reply_ref,
                 text,
-            ), None
+            )
+            # A placeholderless turn's first update names no ref and was placed
+            # on the one live reply owner; hand that ref back so the rest of the
+            # turn, and its completion, stay on it.
+            return status, recorded_at if event.target.reply_ref is None else None
         if isinstance(event, ReplyPost):
             interaction = event.message.interaction
             if isinstance(interaction, ConfirmIntent) and conversation_id:
@@ -254,12 +260,14 @@ class EgressHandler(BaseHTTPRequestHandler):
                     interaction.id,
                     event.message.text,
                 )
-            return self.adapter.record_text(
+            status, recorded_at = self.adapter.record_text_at(
                 conversation_id,
                 event.target.reply_ref,
                 event.message.text,
                 append=True,
-            ), None
+            )
+            # Likewise for a post that named no ref.
+            return status, recorded_at if event.target.reply_ref is None else None
         if isinstance(event, TurnCompleted):
             return self.adapter.send_reply(
                 event.event_id,

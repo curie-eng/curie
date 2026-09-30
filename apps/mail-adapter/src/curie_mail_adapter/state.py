@@ -191,8 +191,8 @@ class MailState:
         if version < 3:
             # ADR-0177: one random single-use reference per approval card this
             # adapter rendered. It links a reply to its approval; it proves
-            # nothing about who sent the reply, which is why the requester is
-            # kept beside it and checked separately.
+            # nothing about who sent the reply, which the platform decides from
+            # the verified sender (ADR 0183).
             self.connection.executescript(
                 """
                 BEGIN IMMEDIATE;
@@ -201,7 +201,6 @@ class MailState:
                     approval_id TEXT NOT NULL UNIQUE,
                     conversation_id TEXT NOT NULL,
                     reply_ref TEXT NOT NULL,
-                    requester TEXT NOT NULL,
                     state TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -595,7 +594,6 @@ class MailState:
         approval_id: str,
         conversation_id: str,
         reply_ref: str,
-        requester: str,
         reference: str,
     ) -> str:
         """Keep ``reference`` for this approval, or return the one already kept.
@@ -612,9 +610,9 @@ class MailState:
                 return str(row[0])
             connection.execute(
                 "INSERT INTO approval_refs(reference, approval_id, conversation_id, "
-                "reply_ref, requester, state, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, 'live', ?, ?)",
-                (reference, approval_id, conversation_id, reply_ref, requester, now, now),
+                "reply_ref, state, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, 'live', ?, ?)",
+                (reference, approval_id, conversation_id, reply_ref, now, now),
             )
             return reference
 
@@ -622,7 +620,7 @@ class MailState:
         """Every reference this adapter issued in one conversation, any state."""
         with self.lock:
             rows = self.connection.execute(
-                "SELECT reference, approval_id, reply_ref, requester, state "
+                "SELECT reference, approval_id, reply_ref, state "
                 "FROM approval_refs WHERE conversation_id=? ORDER BY created_at",
                 (conversation_id,),
             ).fetchall()
@@ -632,8 +630,7 @@ class MailState:
                 "approval_id": row[1],
                 "conversation_id": conversation_id,
                 "reply_ref": row[2],
-                "requester": row[3],
-                "state": row[4],
+                "state": row[3],
             }
             for row in rows
         ]
@@ -641,7 +638,7 @@ class MailState:
     def approval_ref_for(self, approval_id: str) -> dict[str, str] | None:
         with self.lock:
             row = self.connection.execute(
-                "SELECT reference, conversation_id, reply_ref, requester, state "
+                "SELECT reference, conversation_id, reply_ref, state "
                 "FROM approval_refs WHERE approval_id=?",
                 (approval_id,),
             ).fetchone()
@@ -651,8 +648,7 @@ class MailState:
             "reference": row[0],
             "conversation_id": row[1],
             "reply_ref": row[2],
-            "requester": row[3],
-            "state": row[4],
+            "state": row[3],
         }
 
     def set_approval_ref_state(self, reference: str, state: ApprovalRefState) -> None:
