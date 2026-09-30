@@ -732,6 +732,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
 
+      # Prove worker.maxConcurrency (issue #760): it reaches the worker env as
+      # CURIE_WORKER_MAX_CONCURRENCY exactly once, the schema holds it to 1
+      # through 256, and NOTES prints replicas x maxConcurrency beside the
+      # sandbox quota ceiling (lookup stubbed to a fixture node).
+      - name: helm render assertions (worker maxConcurrency)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-max-concurrency-assertions.sh
+
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat
       # under a measured 1120Mi working set, so every install OOMKilled in a
