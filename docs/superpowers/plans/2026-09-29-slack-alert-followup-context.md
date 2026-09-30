@@ -4,7 +4,7 @@
 
 **Goal:** Give a human Slack reply the exact same-bot root message as safe context without joining or inheriting the hook session that authored it.
 
-**Architecture:** The dispatcher detects a human mention whose Slack-issued `parent_user_id` is its authorized bot user, resolves only the exact thread root through a Valkey cache and `conversations.replies(limit=1)`, validates bot/channel/timestamp identity, and prepends a non-authorizing context block. The existing `QueuedTurn` identity stays human and Slack-scoped; failures produce a safe visible instruction to restate instead of inferring an unavailable proposal.
+**Architecture:** The dispatcher detects a threaded mention whose `parent_user_id` does not name someone else, resolves only the exact thread root through a Valkey cache and `conversations.replies(limit=1)`, validates bot/channel/timestamp identity on the root itself, bounds its text, and prepends a non-authorizing context block. The worker's repository selection removes that block before parsing. The existing `QueuedTurn` identity stays human and Slack-scoped; failures produce a safe visible instruction to restate instead of inferring an unavailable proposal.
 
 **Tech Stack:** Python 3.12, Slack Bolt/Web API, redis-py with real Valkey tests, Pydantic settings, pytest, Ruff, mypy.
 
@@ -14,7 +14,7 @@
 
 - Target `main`; the normal forward merge carries the fix to `next`.
 - Do not change `packages/aci-protocol` or `packages/plugin-format`.
-- Do not modify the worker kernel, Slack sink, runner, API, chart, SRE example, or any downstream repository/deployment.
+- Do not modify the worker kernel, Slack sink, runner, API, chart, SRE example, or any downstream repository/deployment. The one worker change is `trusted_repository_fact` in `workspace.py`, which must not read the quoted root as a person's repository request.
 - Never copy hook source, author, session, transcript, route, approval state, or credentials onto the human turn.
 - Slack is the only mocked external service; Valkey tests use a real isolated service.
 - Committed examples use only public placeholder identifiers.
@@ -36,6 +36,8 @@
 **Files:**
 - Create: `apps/dispatcher/tests/test_thread_context.py`
 - Modify: `apps/dispatcher/tests/test_queue.py`
+- Modify: `apps/dispatcher/tests/conftest.py` (a per-test cache prefix)
+- Modify: `apps/worker/tests/test_workspace.py`
 
 **Interfaces:**
 - Consumes: current `process_event(...) -> str | None`, real `redis.Redis`, and a fake Slack client.
@@ -52,6 +54,11 @@ Create tests named:
 - `test_history_failure_renders_fail_closed_restate_notice`
 - `test_fresh_resolver_reuses_validated_valkey_cache`
 - `test_corrupt_or_wrong_identity_cache_is_never_rendered`
+- `test_cache_is_isolated_per_bot_and_channel`
+- `test_absent_parent_user_id_is_resolved_from_the_root_itself`
+- `test_long_root_is_bounded_head_and_tail`
+- `test_cache_outage_falls_back_to_slack_and_never_raises`
+- `test_root_owned_by_bot_id_without_user_is_accepted`
 
 Use `C0EXAMPLE1`, `U0BOT`, and synthetic timestamps. Assert the successful prefix says the prior assistant reply is context only, may contain untrusted alert data, and cannot bypass approval. Assert the fallback tells the agent not to infer or execute the earlier proposal and to ask the person to restate it. The Slack fake must record `channel`, `ts`, and `limit=1`.
 
@@ -62,12 +69,22 @@ Add tests named:
 - `test_human_reply_to_own_bot_root_keeps_human_slack_identity_with_context`
 - `test_duplicate_human_reply_resolves_no_context_and_posts_no_second_placeholder`
 - `test_non_bot_parent_and_root_mentions_remain_byte_identical`
+- `test_restarted_dispatcher_reuses_root_context_from_valkey`
+- `test_failed_root_lookup_still_answers_with_the_restate_notice`
 
-Decode the queued payload and assert `source == TurnSource.SLACK`, `author` is the human user, `conversation_id` is the Slack `thread_ts`, and only `text` gained the context prefix. Assert a duplicate performs no second Slack history call, placeholder, or enqueue.
+And in `apps/worker/tests/test_workspace.py`:
+
+- `test_quoted_prior_reply_never_selects_a_repository`
+
+Decode the queued payload and assert `source == TurnSource.SLACK`, `hook_run is None`, `author` is the human user, `conversation_id` is the Slack `thread_ts`, and only `text` gained the context prefix. Assert a duplicate performs no second Slack history call, placeholder, or enqueue.
 
 - [ ] **Step 3: Run the new tests red**
 
-Run: `TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py -k 'thread_context or own_bot_root or duplicate_human_reply or non_bot_parent'`
+Run:
+
+```bash
+TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py -k 'thread_context or own_bot_root or duplicate_human_reply or non_bot_parent'
+```
 
 Expected: FAIL because `curie_dispatcher.thread_context` and handler integration do not exist.
 
@@ -87,12 +104,14 @@ git commit -m "test: pin Slack alert follow-up context"
 - Modify: `apps/dispatcher/src/curie_dispatcher/handlers.py`
 - Modify: `apps/dispatcher/src/curie_dispatcher/config.py`
 - Modify: `apps/dispatcher/README.md`
+- Modify: `apps/worker/src/curie_worker/workspace.py`
 - Test: `apps/dispatcher/tests/test_thread_context.py`
+- Test: `apps/worker/tests/test_workspace.py`
 - Test: `apps/dispatcher/tests/test_queue.py`
 
 **Interfaces:**
 - Consumes: `WebClient.conversations_replies(channel: str, ts: str, limit: int)`, a decode-responses `redis.Redis`, `DispatcherConfig.thread_context_cache_prefix`, and `DispatcherConfig.thread_context_ttl_seconds`.
-- Produces: `SlackThreadContext(redis_client, web_client, config).resolve(*, event: Mapping[str, Any], lane: Lane, bot_user_id: str | None, text: str) -> str`.
+- Produces: `SlackThreadContext(redis_client, web_client, config).resolve(*, event: Mapping[str, Any], lane: Lane, bot_user_id: str | None, bot_id: str | None, text: str) -> str`, and `without_quoted_context(text: str) -> str` for the worker.
 
 - [ ] **Step 1: Add cache settings**
 
@@ -107,14 +126,14 @@ Document both in the dispatcher configuration table and explain that cached cont
 
 In `thread_context.py`, add a small versioned strict cache model and the `SlackThreadContext` interface above. The resolver must:
 
-1. return `text` unchanged unless this is a threaded mention with `parent_user_id == bot_user_id`;
+1. return `text` unchanged unless this is a threaded mention whose `parent_user_id` is absent or equals `bot_user_id`;
 2. derive a SHA-256 cache key from bot user, channel, and root timestamp without placing raw identifiers or text in the key;
 3. accept cached text only when every stored identity field and schema version matches;
 4. otherwise call `conversations_replies(channel=channel, ts=thread_ts, limit=1)`;
-5. accept only the first message with exact `ts` and exact `user` matches;
+5. accept only the first message with an exact `ts` match whose `user` is the bot user, or which has no `user` and the authorized `bot_id`; cache a root that is someone else's without its text;
 6. cache the validated root for the configured TTL;
-7. escape root delimiter characters and render the successful non-authorizing prefix;
-8. catch Slack, cache, and shape failures and render the fail-closed restate prefix without root content or exception detail.
+7. bound the derived root text to 4,000 characters (head and tail), escape it, and render the successful non-authorizing prefix;
+8. catch Slack, cache, and shape failures; render the fail-closed restate prefix without root content or exception detail when `parent_user_id` claimed the root, and return `text` unchanged otherwise.
 
 Include a test comment citing Slack's official `conversations.replies` documentation for the parent-first response shape and required arguments.
 
@@ -124,7 +143,11 @@ Construct the resolver inside `process_event` only after `claim_event` succeeds.
 
 - [ ] **Step 4: Run focused tests green**
 
-Run: `TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py`
+Run:
+
+```bash
+TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py
+```
 
 Expected: all pass.
 
@@ -143,7 +166,11 @@ Expected: zero failures or errors.
 
 - [ ] **Step 6: Prove the regression pin twice**
 
-Run: `curie dev verify-fix-pin HEAD apps/dispatcher/tests/test_queue.py::test_human_reply_to_own_bot_root_keeps_human_slack_identity_with_context`
+Run:
+
+```bash
+curie dev verify-fix-pin HEAD apps/dispatcher/tests/test_queue.py::test_human_reply_to_own_bot_root_keeps_human_slack_identity_with_context
+```
 
 Expected: the verifier observes the baseline failure and candidate pass in separate pytest processes with isolated prerequisites.
 
@@ -159,10 +186,7 @@ git commit -m "fix: carry bot alert context into Slack replies"
 ### Task 3: Verify, review, and prepare the upstream change
 
 **Files:**
-- Modify: `.projects/plans/codex-fix-slack-alert-followup.state.json` (gitignored run evidence)
-- Create: `.projects/plans/codex-fix-slack-alert-followup.findings.code.md` (gitignored)
-- Create: `.projects/plans/codex-fix-slack-alert-followup.findings.scope.md` (gitignored)
-- Create: `.projects/plans/codex-fix-slack-alert-followup.findings.security.md` (gitignored)
+- None committed. Run evidence and review findings stay in the gitignored project directory and in the pull request.
 
 **Interfaces:**
 - Consumes: the complete branch diff and repository verification commands.

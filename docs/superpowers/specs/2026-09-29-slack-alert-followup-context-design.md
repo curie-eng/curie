@@ -4,7 +4,10 @@ Date: 2026-09-29
 
 Status: Accepted
 
-Accepted with explicit maintainer approval on 2026-09-29.
+Accepted with explicit maintainer approval on 2026-09-29. Revised the same
+day, before any test or implementation landed, after two measurements: Slack's
+own event type does not promise `parent_user_id` on `app_mention`, and the
+worker reads a person's turn text as trusted input for repository selection.
 
 ## Purpose
 
@@ -44,19 +47,19 @@ whether or not those `next` changes are present.
 
 ## Decision
 
-The dispatcher will enrich a human mention that replies directly to a message
-authored by the same Curie bot. It will read only the root message of that exact
-Slack thread and prepend the root text to the current human message inside a
-platform-authored, explicitly untrusted context block.
+The dispatcher will enrich a mention that replies in a thread whose root
+message this same Curie bot posted. It will read only that exact root message
+and prepend its text to the current message inside a platform-authored,
+explicitly untrusted context block.
 
 The queued turn keeps all of its existing identity and authority fields:
 
 - `source` remains `slack`.
-- `author` remains the human's Slack user ID.
+- `author` remains the sender's Slack user ID.
 - `conversation_id` remains the Slack root timestamp.
-- The reply handle remains the placeholder posted for this human event.
-- No hook ID, hook author, hook source, sandbox route, transcript reference, or
-  approval state is copied to the human turn.
+- The reply handle remains the placeholder posted for this event.
+- `hook_run` stays absent. No hook ID, hook author, hook source, sandbox route,
+  transcript reference, or approval state is copied to the turn.
 
 The worker and runner therefore treat the reply exactly like every other human
 Slack turn. Existing permission gates remain authoritative. The context block
@@ -66,30 +69,59 @@ tool call still requires the agent's configured approval path.
 
 ## Admission and identity checks
 
-Enrichment is attempted only when all of these Slack-issued facts are present:
+Enrichment is considered only when all of these hold:
 
 1. the event is on the `app_mention` lane;
-2. the event has a nonempty `thread_ts`, so it is a reply rather than a root;
-3. `parent_user_id` equals Bolt's authorized `bot_user_id` for this request;
-4. the Slack history response contains a first message whose `ts` equals that
-   exact `thread_ts` and whose `user` equals the same `bot_user_id`.
+2. the event has a nonempty `thread_ts` that differs from its own `ts`, so it
+   is a reply rather than a root;
+3. Bolt's authorization supplied a `bot_user_id` for this request;
+4. the event's `parent_user_id`, when present, equals that `bot_user_id`.
+
+`parent_user_id` is a hint, never the proof. Slack's own `AppMentionEvent` type
+in its [Node SDK types package](https://github.com/slackapi/node-slack-sdk/blob/main/packages/types/src/events/app.ts),
+read on 2026-09-29, lists `thread_ts` and no `parent_user_id`, and Slack's
+[`app_mention` reference](https://docs.slack.dev/reference/events/app_mention/)
+shows neither. When the field is present and names
+someone else, Slack has already said the root is not ours, so no lookup is
+made. When it is absent, the root is looked up. The proof of ownership is
+always the root message itself.
 
 The dispatcher calls `conversations.replies(channel=<event channel>,
-ts=<event thread_ts>, limit=1)`. Slack documents that this method returns the
-parent first, followed by replies; `limit=1` deliberately excludes every other
-participant message. The returned channel is fixed by the current event and is
-never accepted from message text or cached content.
+ts=<event thread_ts>, limit=1)`. Slack's reference for that method says the
+parent message is returned first; `limit=1` deliberately excludes every other
+participant message. The channel is fixed by the current event and is never
+accepted from message text or cached content.
 
-A foreign bot, a human-authored root, a mismatched root timestamp, a mismatched
-root author, an empty result, or malformed response never contributes context.
-The ordinary relevance and self-event rules remain unchanged.
+The root is this bot's when the first returned message has a `ts` equal to the
+event's `thread_ts` and either its `user` equals `bot_user_id`, or it carries no
+`user` and its `bot_id` equals Bolt's authorized `bot_id`. The second form is
+the one Bolt's own self-event filter accepts, because a bot message may carry
+`bot_id` without `user`. A message with a `user` that is someone else is never
+ours, whatever its `bot_id`.
+
+A foreign bot, a human-authored root, a mismatched root timestamp, an empty
+result, or a malformed response never contributes context. The ordinary
+relevance and self-event rules remain unchanged.
+
+## Size bound
+
+Only the root's derived text is kept, and at most 4,000 characters of it. The
+text is derived by the same `derive_text` the dispatcher applies to an inbound
+event, so a root whose body lives in Block Kit still yields its content. A
+longer root keeps its first and last 2,000 characters around a platform marker
+naming how many characters were left out, because an alert post usually opens
+with the alert and ends with the question a reply answers. The bound applies
+before the text is cached, so the cache value is bounded too.
 
 ## Context cache and restart behavior
 
-The first validated root is cached in Valkey under a digest of the authorized
-bot ID, channel ID, and root timestamp. The value contains a versioned object
-with those same coordinates and the root text. Reads revalidate every field;
-corrupt or mismatched values are ignored rather than rendered.
+The first validated answer about a root is cached in Valkey under a digest of
+the authorized bot user ID, channel ID, and root timestamp. The value is a
+versioned object carrying those same coordinates, whether the root is this
+bot's, and, only when it is, the bounded root text. Reads revalidate every
+field; corrupt or mismatched values are ignored rather than rendered. A root
+that is not this bot's is cached without any of its text, so a thread rooted by
+someone else costs one lookup rather than one per reply.
 
 The cache serves three purposes:
 
@@ -100,8 +132,9 @@ The cache serves three purposes:
 - Slack's history rate limit is not paid once per turn in a long conversation.
 
 The default retention is 30 days, matching the ordinary idle transcript
-window. The setting is explicit in dispatcher configuration and documentation.
-Cache keys contain only a digest, never message content or raw identifiers.
+window. The retention and the key prefix are explicit in dispatcher
+configuration and documentation. Cache keys contain only a digest, never
+message content or raw identifiers. A lookup that failed is not cached.
 
 Event deduplication stays authoritative. The dispatcher takes the existing
 event-ID claim before resolving context. A duplicate event exits before Slack
@@ -111,43 +144,73 @@ placeholder posting.
 
 ## Failure behavior
 
-If the event claims to reply to this bot but the root cannot be loaded and
-validated, the dispatcher does not silently treat the human's short reply as a
+If Slack said the parent is this bot's (`parent_user_id` equals `bot_user_id`)
+but the root cannot be loaded and validated, or the loaded root is not this
+bot's after all, the dispatcher does not silently treat the short reply as a
 self-contained instruction. It prepends a platform notice saying that prior
 context was unavailable, that the earlier proposal must not be inferred or
 executed, and that the agent should ask the person to restate the request.
 
-This fail-closed turn still follows the ordinary placeholder and enqueue path,
-so the person receives an answer and the event is neither silently dropped nor
-reclassified as a hook. The failure is logged without root text, credentials,
-or identifiers beyond the existing bounded event/channel metadata policy.
+When `parent_user_id` was absent and the lookup fails, nothing says the root is
+ours, so the message stays ordinary input. Adding the notice there would put it
+on every threaded mention in every thread whenever the history read fails, for
+example on an install whose app lacks a history scope.
 
-If `parent_user_id` does not identify this bot, no lookup is attempted and the
-message remains byte-for-byte ordinary Slack input after existing self-mention
-stripping. This avoids changing unrelated threaded conversations.
+The notice turn still follows the ordinary placeholder and enqueue path, so the
+person receives an answer and the event is neither silently dropped nor
+reclassified as a hook. Failures are logged without root text or credentials.
+
+If `parent_user_id` names someone else, no lookup is attempted and the message
+remains byte-for-byte ordinary Slack input after existing self-mention
+stripping. The same holds when the looked-up root is someone else's.
 
 ## Prompt shape
 
 The successful prefix identifies the material as a prior assistant reply from
 this exact Slack thread, says it is context only, and says it may contain
-untrusted alert data. The root text is delimiter-escaped before insertion so it
-cannot forge the closing marker. The current human text follows outside that
-quoted block and retains its normal instruction status.
+untrusted alert data. The root text is escaped with the same XML escaping the
+hook route applies to its untrusted payload, so it cannot forge the closing
+marker. The current message follows outside that quoted block and retains its
+normal instruction status.
 
 The fallback prefix contains no root text and explicitly refuses inference from
 the unavailable message. Neither prefix contains the hook's synthetic ID,
 delivery ID, signature, binding endpoint, or any other execution credential.
+Neither contains a slash, so the platform wording itself can never read as a
+repository.
+
+## Repository selection
+
+The worker reads a `source=slack` turn's text as trusted input when it selects
+a coding repository (`trusted_repository_fact`), and any `owner/name` token or
+GitHub URL in it counts. Quoted alert text is full of such tokens, and two
+GitHub URLs refuse the turn outright. The quoted root is the hook's output, and
+a hook's own text is never trusted for this purpose, so quoting it into a
+person's turn must not make it trusted either. `trusted_repository_fact`
+therefore removes every quoted prior-reply block before it parses. It uses the
+dispatcher's own helper, so the marker the dispatcher writes and the marker the
+worker removes are one definition; the worker already depends on the dispatcher
+package. The person's own words outside the block are parsed exactly as before.
+
+Other exact-text readers of a turn, the behavior pack greeting and help
+matchers, see the prefix and therefore do not fire on a reply in a thread this
+bot rooted; the model answers such a reply instead, with the context. That is
+accepted rather than special-cased.
 
 ## Files and ownership
 
 - `apps/dispatcher/src/curie_dispatcher/thread_context.py` owns root validation,
-  cache serialization, Slack lookup, and prompt rendering.
+  the size bound, cache serialization, Slack lookup, prompt rendering, and the
+  helper that removes the quoted block.
 - `apps/dispatcher/src/curie_dispatcher/handlers.py` invokes that helper after
-  the event-ID claim and before the shared placeholder/enqueue tail.
+  the event-ID claim and before the shared placeholder/enqueue tail, passing
+  Bolt's `bot_user_id` and `bot_id`.
 - `apps/dispatcher/src/curie_dispatcher/config.py` and
-  `apps/dispatcher/README.md` own the cache-retention setting.
-- Dispatcher tests own the behavior matrix. Slack is mocked because it is an
-  external service; Valkey remains real, per repository policy.
+  `apps/dispatcher/README.md` own the cache retention and prefix settings.
+- `apps/worker/src/curie_worker/workspace.py` removes the quoted block before
+  repository parsing.
+- Dispatcher and worker tests own the behavior matrix. Slack is faked because it
+  is an external service; Valkey remains real, per repository policy.
 
 No frozen ACI or plugin-format contract changes. No worker kernel, Slack sink,
 runner, API, chart, example bundle, or downstream deployment changes.
@@ -157,22 +220,27 @@ runner, API, chart, example bundle, or downstream deployment changes.
 Focused tests will prove:
 
 - a same-bot, same-channel root is included and a dependent `yes please` reply
-  remains human-authored `source=slack`;
+  remains human-authored `source=slack` with no `hook_run`;
 - only the root is read and rendered, even when the Slack response attempts to
-  include later messages;
+  include later messages, and a long root is bounded;
 - another bot, another channel, another root timestamp, malformed cache data,
-  and mismatched Slack results cannot leak history;
-- root content cannot close the context delimiter or turn itself into
-  authorization;
-- a missing or failed history read produces the fail-closed visible prompt;
+  and mismatched Slack results cannot leak history, and one bot's or channel's
+  cached root is never served to another;
+- a reply without `parent_user_id` is enriched when the root is ours and left
+  unchanged when it is not;
+- root content cannot close the context delimiter, turn itself into
+  authorization, or select a repository;
+- a missing or failed history read produces the fail-closed visible prompt when
+  the parent was claimed as ours, and ordinary input when it was not, and a
+  Valkey outage never raises;
 - a dispatcher restart can reuse the Valkey cache;
 - a duplicate Slack event produces no second lookup, placeholder, or queued
   turn;
 - ordinary root mentions and replies to non-Curie roots remain unchanged.
 
-The focused dispatcher suite runs against real Valkey. Repository lint, typing,
-docs checks, the required fix-pin verifier for the selected regression test, and
-the full Python baseline provide integration evidence. No live Slack mutation,
+The focused suites run against real Valkey. Repository lint, typing, docs
+checks, the fix-pin verifier for the selected regression test, and the full
+Python baseline provide integration evidence. No live Slack mutation,
 production deployment, or workload restart is required for the upstream PR;
 live deployment acceptance remains a separate release gate.
 
