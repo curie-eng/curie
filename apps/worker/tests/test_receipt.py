@@ -612,3 +612,19 @@ def test_native_instruction_request_still_obeys_receipt_modes() -> None:
         "_What I changed:_\n• called `Skill` — failed — check before retrying"
     )
     assert render_receipt([success, failure], mode="off") is None
+
+
+@pytest.mark.parametrize(
+    "snapshot_fields",
+    [{"prior_state": {"replicas": 3}, "result": None}, {"result": {"prior": {"replicas": 3}}}],
+)
+def test_unknown_action_with_prior_snapshot_does_not_claim_it_was_absent(
+    snapshot_fields: dict[str, Any],
+) -> None:
+    receipt = render_receipt(
+        [_action(tool="third_party_action", undoable=False, **snapshot_fields)]
+    )
+    assert receipt is not None
+    assert "third_party_action" in receipt
+    assert "undo information is incomplete" in receipt
+    assert "nothing reported a prior state" not in receipt
