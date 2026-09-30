@@ -19,6 +19,7 @@ def _turn(
     *,
     conversation_id: str = "1700000000.000100",
     endpoint: str | None = None,
+    identity: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id="EvSIM-identity",
@@ -31,6 +32,7 @@ def _turn(
             placeholder="p-1",
             endpoint=endpoint,
             adapter=adapter,
+            identity=identity,
         ),
         received_at="2026-07-05T00:00:00+00:00",
     )
@@ -59,6 +61,22 @@ def test_a_cluster_message_relay_turn_keeps_its_pre_identity_key() -> None:
         _thread_key_for(_turn("slack", "C0EXAMPLE1", "curie-cluster-message"))
         == "slack:C0EXAMPLE1:1700000000.000100"
     )
+
+
+def test_named_cluster_message_uses_a_separate_thread_key() -> None:
+    # @spec WORKER-CANARY-3: a named relay cannot adopt the default sandbox.
+    assert _thread_key_for(
+        _turn("slack", "C0EXAMPLE1", "curie-cluster-message", identity="sre-bot")
+    ) == "slack:sre-bot:C0EXAMPLE1:1700000000.000100"
+
+
+@pytest.mark.parametrize("identity", ["", " ", "SRE Bot", "sre/bot", "default "])
+def test_invalid_relay_identity_cannot_reach_a_default_thread(identity: str) -> None:
+    # @spec WORKER-CANARY-2: invalid input may never share default state.
+    with pytest.raises(ValueError, match="identity"):
+        _thread_key_for(
+            _turn("slack", "C0EXAMPLE1", "curie-cluster-message", identity=identity)
+        )
 
 
 def test_a_named_mail_route_keys_its_thread_by_its_adapter() -> None:
