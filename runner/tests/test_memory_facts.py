@@ -1518,3 +1518,137 @@ def test_a_statement_copying_the_leading_attribution_renders_after_the_real_auth
     [line] = [text for text in block.splitlines() if text.startswith(f"- [{A_NEW}] ")]
     assert line.startswith(f"- [{A_NEW}] UMALLORY9 on 2026-09-30 stated: "), line
     assert line == f"- [{A_NEW}] UMALLORY9 on 2026-09-30 stated: {statement}", line
+
+
+# #3624: a save past the boot limit is refused, not silently aged out -----------
+
+
+def _seed_facts(api: FakeStateApi, ns: str, count: int) -> list[str]:
+    """Seed ``count`` facts with distinct, increasing timestamps; return their ids."""
+
+    from datetime import timedelta
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    ids = [f"fact-{i:032x}" for i in range(count)]
+    for i, fact_id in enumerate(ids):
+        stamp = (start + timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
+        api.seed(ns, fact_id, _fact_value(f"fact {i}", stamp))
+    return ids
+
+
+def test_add_is_refused_when_the_memory_holds_the_boot_limit() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY, MemoryFull
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            with pytest.raises(MemoryFull):
+                await _store(server).add(statement="one too many", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert api.writes() == []
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_add_is_refused_when_the_memory_holds_more_than_the_boot_limit() -> None:
+    # A memory already past the limit (saved before the refusal existed) stays
+    # refused: the check is "at or over", not "exactly at".
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY, MemoryFull
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY + 6)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            with pytest.raises(MemoryFull):
+                await _store(server).add(statement="x", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert api.writes() == []
+
+
+def test_add_succeeds_one_below_the_boot_limit_and_reaches_it() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            fact_id = await _store(server).add(
+                statement="the last one", author="U1", session_id="s"
+            )
+            assert FACT_KEY.match(fact_id), fact_id
+
+    anyio.run(go)
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_the_reserved_keys_do_not_count_toward_the_boot_limit() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+    api.seed(AGENT_NS, "log", [{"content": "legacy"}])
+    api.seed(AGENT_NS, "guidance", {"text": "operator guidance"})
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            await _store(server).add(statement="still fits", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_remember_is_refused_when_memory_holds_the_boot_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The case from #3624: past the limit the oldest fact would silently leave
+    # the prompt, so the save is refused and reported to the agent instead.
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    ids = _seed_facts(api, CHANNEL_NS, MAX_FACTS_PER_MEMORY)
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "channel", "statement": "the mailbox is ap-inbox"})],
+    )
+    text = _text(result)
+    assert _is_error(result), text
+    assert "Refused" in text, text
+    assert "Nothing was saved" in text, text
+    assert "forget" in text.lower(), text
+    assert set(_facts(api, CHANNEL_NS)) == set(ids)
+    assert len(_facts(api, CHANNEL_NS)) == MAX_FACTS_PER_MEMORY
+    assert not any(m == "PUT" for m, _p in api.writes()), api.writes()
+
+
+def test_update_and_forget_still_work_at_the_boot_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    ids = _seed_facts(api, CHANNEL_NS, MAX_FACTS_PER_MEMORY)
+    kept, dropped = ids[0], ids[1]
+    results = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [
+            (UPDATE, {"memory": "channel", "id": kept, "statement": "rewritten"}),
+            (FORGET, {"memory": "channel", "id": dropped}),
+            # Forgetting made room, so the next save fits.
+            (REMEMBER, {"memory": "channel", "statement": "now it fits"}),
+        ],
+    )
+    assert not any(_is_error(r) for r in results), [_text(r) for r in results]
+    facts = _facts(api, CHANNEL_NS)
+    assert facts[kept]["statement"] == "rewritten"
+    assert dropped not in facts
+    assert len(facts) == MAX_FACTS_PER_MEMORY
+    assert "now it fits" in {v["statement"] for v in facts.values()}
