@@ -148,8 +148,14 @@ class Settings(BaseSettings):
     # Git flow (J1). The webhook secret authenticates inbound GitHub events; the
     # two bot identities are the routing targets recorded on each deployment.
     github_webhook_secret: str = "dev-webhook-secret"
-    # Durable git-flow notice outbox retry cadence; unlike optional ingress
-    # lanes, this cannot be disabled without abandoning pending notices.
+    # Durable git-flow notice outbox retry cadence. Production keeps the
+    # reconciler on: turning it off abandons notices whose first publish
+    # failed. The API test suite turns it off, as it does the work-item
+    # reconciler, and drives reconcile_once directly.
+    deploy_notice_reconciler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED"),
+    )
     deploy_notice_reconciler_interval_s: float = Field(default=5.0, gt=0)
     # Review-feedback ingress is separately gated from push handling. Keep it
     # off unless the GitHub App identity, webhook HMAC, and reconciler cadence

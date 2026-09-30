@@ -112,8 +112,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.deploy_notice_queue = DeployNoticeQueue(
         valkey, settings.deploy_notice_stream_name(), app.state.sessionmaker
     )
-    app.state.deploy_notice_reconciler_task = asyncio.create_task(
-        app.state.deploy_notice_queue.run_forever(settings.deploy_notice_reconciler_interval_s)
+    app.state.deploy_notice_reconciler_task = (
+        asyncio.create_task(
+            app.state.deploy_notice_queue.run_forever(
+                settings.deploy_notice_reconciler_interval_s
+            )
+        )
+        if settings.deploy_notice_reconciler_enabled
+        else None
     )
     # resume_dead_letter_stream stays the narrower override that wins when set;
     # its fallback is now the unified graveyard name (which honors
@@ -253,11 +259,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         notice_task = app.state.deploy_notice_reconciler_task
-        notice_task.cancel()
-        try:
-            await notice_task
-        except asyncio.CancelledError:
-            pass
+        if notice_task is not None:
+            notice_task.cancel()
+            try:
+                await notice_task
+            except asyncio.CancelledError:
+                pass
         review_task = getattr(app.state, "github_review_reconciler_task", None)
         if review_task is not None:
             review_task.cancel()
