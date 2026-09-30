@@ -535,7 +535,7 @@ def test_the_access_in_force_is_the_last_prompts() -> None:
     assert anyio.run(go) == [ToolAccess.READ_ONLY, None]
 
 
-def test_a_steer_joins_only_a_turn_under_the_same_access() -> None:
+def test_a_read_only_turn_accepts_no_steer_and_joins_no_other_turn() -> None:
     # @spec RUNNER-TOOL-ACCESS-4
     access = _access()
     runner, session = _fake_runner(default_turn, gate=None, access=access)
@@ -558,14 +558,190 @@ def test_a_steer_joins_only_a_turn_under_the_same_access() -> None:
             await runner.close()
         return ordinary, restricted, into_ordinary
 
-    assert anyio.run(go) == (False, True, False)
-    assert session.queries == ["first", "restricted", "second"]
+    assert anyio.run(go) == (False, False, False)
+    assert session.queries == ["first", "second"]
+
+
+def _refused_before_the_model(frames: list[Any], session: FakeModelSession) -> None:
+    final = _final(frames)
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    errors = [f for f in frames if isinstance(f, ErrorEvent)]
+    assert [e.classification for e in errors] == ["tool-access-unenforced"]
+    assert "read-only" not in session.queries
+
+
+def test_a_session_that_accepted_a_steer_refuses_a_read_only_turn() -> None:
+    # @spec RUNNER-TOOL-ACCESS-4: the steered prompt may still be pending in
+    # the CLI, and would run under whatever access the next prompt set.
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    async def go() -> list[Any]:
+        await runner.start()
+        try:
+            gen = runner.run_turn(_event("first"))
+            await gen.__anext__()
+            assert await runner.steer("ordinary follow-up") is True
+            async for _ in gen:
+                pass
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    _event("read-only", tool_access=ToolAccess.READ_ONLY)
+                )
+            ]
+        finally:
+            await runner.close()
+        return list(parse_ndjson("".join(lines)))
+
+    frames = anyio.run(go)
+    _refused_before_the_model(frames, session)
+    assert session.queries == ["first", "ordinary follow-up"]
+
+
+def test_an_unsteered_session_still_runs_a_read_only_turn_after_an_ordinary_one() -> None:
+    # @spec RUNNER-TOOL-ACCESS-4: the control for the test above.
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    turns = _drive(runner, _event("first"), _event("read-only", tool_access=ToolAccess.READ_ONLY))
+
+    assert _final(turns[1]).status is SessionStatus.DONE
+    assert session.queries == ["first", "read-only"]
+
+
+@pytest.mark.parametrize("text", ["/acme-bot:probe", "  /acme-bot:probe now", "\n/compact"])
+def test_a_read_only_slash_command_is_refused_before_the_model(text: str) -> None:
+    # @spec RUNNER-TOOL-ACCESS-9
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    [frames] = _drive(runner, _event(text, tool_access=ToolAccess.READ_ONLY))
+
+    _refused_before_the_model(frames, session)
+    assert session.queries == []
+
+
+def test_an_ordinary_slash_command_is_still_sent() -> None:
+    # @spec RUNNER-TOOL-ACCESS-7 RUNNER-TOOL-ACCESS-9: the refusal is read-only only.
+    runner, session = _fake_runner(default_turn, gate=None, access=_access())
+
+    [frames] = _drive(runner, _event("/acme-bot:probe"))
+
+    assert _final(frames).status is SessionStatus.DONE
+    assert session.queries == ["/acme-bot:probe"]
+
+
+def test_a_read_only_turn_leaves_the_boot_grant_for_the_next_turn() -> None:
+    # @spec RUNNER-TOOL-ACCESS-10: the resumed turn after a read-only one still
+    # gets to run the action a human approved, once.
+    gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
+    access = _access(requires_approval=gate.requires_approval)
+    runner, _ = _fake_runner(default_turn, gate=gate, access=access)
+
+    read_only, resumed = _drive(
+        runner, _event("probe", tool_access=ToolAccess.READ_ONLY), _event("resume")
+    )
+
+    assert _final(read_only).status is SessionStatus.DONE
+    final = _final(resumed)
+    assert final.status is SessionStatus.DONE, "the approved call was re-gated"
+    closing = [f for f in resumed if isinstance(f, SideEffectFlag) and f.failed is not None]
+    assert [(f.tool, f.failed) for f in closing] == [("Bash", False)]
+
+
+def test_a_decision_that_fails_denies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # @spec RUNNER-TOOL-ACCESS-2: a raising hook is reported and the call
+    # PROCEEDS on the CLI, so the front must never raise.
+    access = _read_only(_access())
+
+    def broken(_tool: str | None) -> str | None:
+        raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr(access, "refusal", broken)
+    fronted, approval_calls, bundle_calls = _fronted(access)
+    for matcher in fronted["PreToolUse"]:
+        assert _is_deny(_run(matcher.hooks[0], "Read"))
+    assert approval_calls == []
+    assert bundle_calls == []
+
+    async def go() -> Any:
+        return await front_can_use_tool(None, access)(
+            "Read", {}, ToolPermissionContext(tool_use_id="toolu_acme05")
+        )
+
+    assert isinstance(anyio.run(go), PermissionResultDeny)
+
+
+def test_a_read_only_tool_an_operator_gated_is_refused_on_the_booted_runner(
+    tmp_path: Path, reader: InMemoryMetricReader
+) -> None:
+    # @spec RUNNER-TOOL-ACCESS-1 RUNNER-TOOL-ACCESS-3: Read is read-only, but a
+    # gate names it, and the approval it needs cannot be asked for.
+    runner = build_runner(
+        _config(tmp_path, CURIE_APPROVAL_REQUIRED_TOOLS="Read"), fake_model=True
+    )
+    script = [
+        _assistant(ToolUseBlock(id="t1", name="Read", input={"file_path": "/tmp/x"})),
+        _tool_result("t1", "contents"),
+        _result(text="read it"),
+    ]
+    runner._factory = _scripted(runner._factory, script)  # type: ignore[method-assign]
+
+    [frames] = _drive(runner, _event(tool_access=ToolAccess.READ_ONLY))
+
+    final = _final(frames)
+    assert final.status is SessionStatus.DONE
+    _no_approval(final)
+    assert _tool_result_points(reader) == {("builtin", "refused"): 1}
+
+
+def _scripted(factory: Any, script: list[Any]) -> Any:
+    """The booted fake session with its script swapped, and nothing else."""
+
+    def build() -> Any:
+        session = factory()
+        session._script_factory = lambda: list(script)
+        return session
+
+    return build
+
+
+def test_translation_captures_no_request_on_a_read_only_turn() -> None:
+    # @spec RUNNER-TOOL-ACCESS-3: the wire-level capture, on its own.
+    from curie_runner.translate import TurnState, translate_message
+    from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+
+    message = _assistant(
+        ToolUseBlock(id="t1", name=APPROVAL_TOOL_NAME, input={"summary": "deploy"}),
+        ToolUseBlock(id="t2", name=PLATFORM_PUBLISH_TOOL_NAME, input={"title": "t"}),
+    )
+    restricted = TurnState(tool_access=ToolAccess.READ_ONLY)
+    ordinary = TurnState()
+
+    translate_message(message, restricted, SideEffectClassifier(), None)
+    translate_message(message, ordinary, SideEffectClassifier(), None)
+
+    assert restricted.approval_summary is None
+    assert restricted.publication_calls == []
+    assert ordinary.approval_summary == "deploy"
+    assert [call_id for call_id, _ in ordinary.publication_calls] == ["t2"]
+
+
+def test_the_final_never_flips_to_awaiting_approval_on_a_read_only_turn() -> None:
+    # @spec RUNNER-TOOL-ACCESS-3: the terminal guard, on its own.
+    from curie_runner.session import _apply_approval_override
+    from curie_runner.translate import TurnState
+
+    done = Final(text="done", status=SessionStatus.DONE)
+    restricted = TurnState(tool_access=ToolAccess.READ_ONLY, approval_summary="deploy")
+    ordinary = TurnState(approval_summary="deploy")
+
+    assert _apply_approval_override(done, restricted) == done
+    assert _apply_approval_override(done, ordinary).status is SessionStatus.AWAITING_APPROVAL
 
 
 # --- the HTTP surface and the boot wiring -----------------------------------------
 
 
-def _config(tmp_path: Path) -> RunnerConfig:
+def _config(tmp_path: Path, **extra: str) -> RunnerConfig:
     plugin_dir = tmp_path / "bundle"
     (plugin_dir / ".claude-plugin").mkdir(parents=True)
     (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
@@ -577,6 +753,7 @@ def _config(tmp_path: Path) -> RunnerConfig:
             "CURIE_SESSION_ID": "session-acme-read-only",
             "CURIE_SANDBOX_ID": "sandbox-acme-read-only",
             "CURIE_BUDGET": _BUDGET,
+            **extra,
         }
     )
 
