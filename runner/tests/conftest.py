@@ -9,4 +9,31 @@ own virtualenv, and must never be imported or run by this repository's pytest.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+import pytest
+
+# Shared helper modules (``runner_*_support``) live beside the tests; the
+# importlib import mode does not put this directory on sys.path by itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+@pytest.fixture(autouse=True)
+def _zero_probe_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep real probe-failure tests off the retry backoff sleeps (#2945).
+
+    The boot capability probe retries a failed dial with a bounded backoff;
+    tests that dial a genuinely failing server (a missing stdio command)
+    would otherwise sleep the backoff on every attempt. Only the retry tests
+    assert on the backoff itself and override this in their own body.
+    ``raising=False`` keeps this a no-op against a source without the retry,
+    so the fix-pin gate stays intact.
+    """
+
+    from curie_runner import mcp_tool_capability
+
+    monkeypatch.setattr(mcp_tool_capability, "_PROBE_RETRY_BACKOFF_SECONDS", 0.0, raising=False)
+
+
 collect_ignore_glob = ["fixtures/**"]

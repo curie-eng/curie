@@ -128,6 +128,11 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Resolve a store credential Secret, defaulting to the chart Secret. */}}
+{{- define "curie.storeSecretName" -}}
+{{- .store.existingSecret | default (include "curie.secretName" .root) -}}
+{{- end -}}
+
 {{/* Dedicated namespace for short-lived publication resources. */}}
 {{- define "curie.publicationNamespace" -}}
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
@@ -481,7 +486,7 @@ http
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- include "curie.secretName" . -}}
 {{- else -}}
-{{- .Values.langfuse.existingSecret | default (include "curie.secretName" .) -}}
+{{- include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) -}}
 {{- end -}}
 {{- end -}}
 
@@ -517,6 +522,10 @@ http
 {{- fail (printf "otelCollector.%s references undefined exporter %q. Add it under otelCollector.extraExporters." $valueName $exporter) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
+{{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
@@ -584,12 +593,29 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+{{- if $eventsEnabled }}
+  # Kubernetes Events for the release namespace (#2954), watched so each new
+  # or updated Event becomes one log record in the logs pipeline.
+  k8sobjects/events:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        group: events.k8s.io
+        mode: watch
+        namespaces: [{{ .Release.Namespace | quote }}]
+{{- end }}
 processors:
   memory_limiter:
     check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
     limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
     spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
+  transform/runner_identity:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - 'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) where resource.attributes["service.name"] == "curie-runner"'
 exporters:
   otlphttp/langfuse:
     endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
@@ -639,12 +665,12 @@ service:
       processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
-      receivers: [otlp]
+      receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]
       exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/runner_identity, batch]
       exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
@@ -692,6 +718,13 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not (empty $protocol)) (not (or (eq $protocol "http/protobuf") (eq $protocol "grpc") (eq $protocol "http/json"))) -}}
 {{- fail "otelCollector.protocol must be grpc, http/protobuf, or http/json." -}}
 {{- end -}}
+{{- $temporality := "delta" -}}
+{{- if hasKey $otel "metricsTemporalityPreference" -}}
+{{- $temporality = get $otel "metricsTemporalityPreference" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $temporality) (has $temporality (list "delta" "cumulative" "lowmemory"))) -}}
+{{- fail "otelCollector.metricsTemporalityPreference must be delta, cumulative, or lowmemory." -}}
+{{- end -}}
 {{- if and .Values.security.checkDefaultCredentials (not $otel.deploy) (not $otel.telemetryDisabled) (empty $otel.endpoint) -}}
 {{- fail "security.checkDefaultCredentials is on but neither a chart-managed collector nor otelCollector.endpoint is configured. Set otelCollector.endpoint to the external collector, keep otelCollector.deploy true, or set otelCollector.telemetryDisabled=true to acknowledge that telemetry is disabled." -}}
 {{- end -}}
@@ -706,13 +739,16 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- $hasEndpoint := false -}}
 {{- $hasProtocol := false -}}
 {{- $hasHeaders := false -}}
+{{- $hasMetricsTemporalityPreference := false -}}
 {{- range $extra -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" -}}{{- $hasEndpoint = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" -}}{{- $hasProtocol = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_HEADERS" -}}{{- $hasHeaders = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" -}}{{- $hasMetricsTemporalityPreference = true -}}{{- end -}}
 {{- end -}}
 {{- $endpoint := include "curie.otel.endpoint" .root | trim -}}
 {{- $protocol := .root.Values.otelCollector.protocol | default "http/protobuf" -}}
+{{- $temporality := .root.Values.otelCollector.metricsTemporalityPreference | default "delta" -}}
 {{- if and (not $hasEndpoint) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ $endpoint | quote }}
@@ -720,6 +756,10 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not $hasProtocol) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_PROTOCOL
   value: {{ $protocol | quote }}
+{{- end }}
+{{- if and (not $hasMetricsTemporalityPreference) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+  value: {{ $temporality | quote }}
 {{- end }}
 {{- if and (not $hasHeaders) (not .root.Values.otelCollector.deploy) (not .root.Values.otelCollector.telemetryDisabled) (ne $endpoint "") }}
 {{- if not (empty .root.Values.otelCollector.headersExistingSecret) }}
@@ -773,7 +813,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      (hence the general name) once its design pass lands. */}}
 {{- define "curie.checkDefaultCredentials" -}}
 {{- if .Values.security.checkDefaultCredentials -}}
-{{- if eq (.Values.langfuse.existingSecret | default (include "curie.secretName" .)) (include "curie.secretName" .) -}}
+{{- if eq (include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse)) (include "curie.secretName" .) -}}
 {{- if eq .Values.langfuse.init.projectSecretKey "sk-lf-curie-dev" -}}
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.projectSecretKey is still the published dev default \"sk-lf-curie-dev\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- this key also feeds the OTel Collector auth header." -}}
 {{- end -}}
@@ -987,7 +1027,7 @@ before contacting Valkey.
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql+asyncpg://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "asyncpg") }}
@@ -1009,7 +1049,7 @@ before contacting Valkey.
 - name: VALKEY_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 - name: VALKEY_TLS
   value: {{ include "curie.valkey.tls" . | quote }}
@@ -1421,19 +1461,19 @@ livenessProbe:
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "prisma") }}
 - name: SALT
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseSalt
 - name: ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseEncryptionKey
 - name: TELEMETRY_ENABLED
   value: {{ .Values.langfuse.telemetryEnabled | quote }}
@@ -1464,7 +1504,7 @@ livenessProbe:
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.clickhouse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.clickhouse) }}
       key: clickhousePassword
 - name: CLICKHOUSE_CLUSTER_ENABLED
   value: {{ .Values.clickhouse.clusterEnabled | quote }}
@@ -1475,7 +1515,7 @@ livenessProbe:
 - name: REDIS_AUTH
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 {{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
        first-party apps cannot disagree about the transport of the one store
@@ -1504,7 +1544,7 @@ livenessProbe:
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 {{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
@@ -1528,7 +1568,7 @@ livenessProbe:
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
@@ -1665,16 +1705,19 @@ key: {{ .defaultKey }}
 {{- end -}}
 
 {{/* ---- Dispatcher gating ----
-     The Slack dispatcher only deploys when it has both tokens; without them it
-     would crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command).
-     A token counts as present whether it arrives as the plain value or via its
-     *ExistingSecret (issue #1759) -- a dispatcher configured entirely through
-     BYO Secrets must still deploy. */}}
+     The Slack dispatcher only deploys when the identity `default` has both
+     tokens: from dispatcher.slack, where a token counts as present whether it
+     arrives as the plain value or via its *ExistingSecret (issue #1759), or
+     from a dispatcher.slack.identities entry named `default`. A non-empty list
+     is enough here because curie.slack.identities fails the render unless the
+     list leaves `default` with both. Without them the dispatcher would
+     crash-loop the reconnect supervisor forever, so a token-less default
+     install skips the Deployment entirely (NOTES prints the connect command). */}}
 {{- define "curie.dispatcher.enabled" -}}
 {{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
 {{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
-{{- if and .Values.dispatcher.deploy $appTokenSet $botTokenSet -}}
+{{- $listed := .Values.dispatcher.slack.identities -}}
+{{- if and .Values.dispatcher.deploy (or (and $appTokenSet $botTokenSet) $listed) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -1709,25 +1752,21 @@ securityContext:
 {{- end -}}
 
 {{/* ---- ADR-0131 drain-budget relationship (worker) ----
-     `worker.terminationGracePeriodSeconds` must cover
+     The worker's termination grace must cover
      `worker.deliveryBudgetSeconds` + `worker.deliveryShutdownReserveSeconds`.
-     The chart renders that same grace value BOTH onto the Pod's
-     `spec.terminationGracePeriodSeconds` and into the worker's
-     `CURIE_TERMINATION_GRACE_PERIOD_S`, where `WorkerConfig` re-checks the
-     inequality at boot -- and that check raises before `asyncio.run`, so the
-     supervisor cannot catch it and the pod CrashLoopBackOffs.
+     Since #3071 the chart DERIVES the effective grace as
+     max(`worker.terminationGracePeriodSeconds`, budget + reserve), so the
+     invariant holds by construction: raising the budget (up to 10800 s)
+     raises the grace with it instead of failing the render. The configured
+     value is a floor an operator may raise, never a cap that can undercut the
+     budget. This one helper feeds BOTH the Pod's
+     `spec.terminationGracePeriodSeconds` and the worker's
+     `CURIE_TERMINATION_GRACE_PERIOD_S`, so the worker's boot validator (the
+     backstop for Compose and bare env) always sees a value that satisfies it. */}}
+{{- define "curie.worker.terminationGrace" -}}
+{{- max (int64 .Values.worker.terminationGracePeriodSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
+{{- end -}}
 
-     Without this render-time guard, an existing install that overrides
-     `worker.terminationGracePeriodSeconds` to any value the schema accepts but
-     the inequality rejects `helm upgrade`s CLEANLY and then takes the entire
-     turn plane down: a silent breaking upgrade. `values.schema.json` cannot
-     close it -- JSON Schema has no cross-field arithmetic -- and the CI
-     render-assertion never sees operator values. So the fence has to be here,
-     where `helm template`/`install`/`upgrade` all pass through it.
-
-     This does NOT replace the worker's boot validator, which remains the
-     backstop for the non-Helm substrates (Compose, bare env). It only moves the
-     Helm-shaped failure from pod boot to render time, where it is actionable. */}}
 {{/* Drop extraEnv entries whose names collide with first-class worker timeout
      and delivery-budget env. A v0.8.4 retained worker.extraEnv override of
      CURIE_RUNNER_TOTAL_TIMEOUT_S used to render a second copy next to the
@@ -1745,6 +1784,7 @@ securityContext:
   "CURIE_DELIVERY_LEASE_HEARTBEAT_S" true
   "CURIE_DELIVERY_SHUTDOWN_RESERVE_S" true
   "CURIE_TERMINATION_GRACE_PERIOD_S" true
+  "CURIE_WORK_ITEM_MAX_TURNS" true
 -}}
 {{- $kept := list -}}
 {{- range .Values.worker.extraEnv }}
@@ -1754,16 +1794,6 @@ securityContext:
 {{- end -}}
 {{- if $kept -}}
 {{- toYaml $kept -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "curie.worker.validateDrainBudget" -}}
-{{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
-{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
-{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
-{{- $required := add $budget $reserve -}}
-{{- if lt $grace $required -}}
-{{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1820,32 +1850,36 @@ securityContext:
      already promised it; a gate that refuses upgrades during ordinary traffic
      is a gate that gets switched off in its first week.
 
-     The quiesce TTL is then derived above that, because the worker's OWN boot
-     validator refuses a TTL that does not outlast the wait -- so a rendered
-     pair the app would reject is a green `helm upgrade` followed by a
-     CrashLoopBackOff, the same failure `validateDrainBudget` above exists to
-     prevent.
-
-     What IS refused is the one pair an operator writes together and can only
-     get wrong by contradicting themselves: a `quiesceTtlSeconds` at or below
-     the `timeoutSeconds` they set beside it. Silently raising that one would
-     hide a stated intent rather than an unrelated default. */}}
+     The quiesce TTL is the ROLL HOLD written after a clean drain, and it is
+     capped AT the effective wait (#3127). While waiting, the gate holds the
+     marker as a short lease renewed every poll, so the hold no longer has to
+     outlast the wait; a hold longer than the wait would only strand a paused
+     fleet for longer than the upgrade could ever have waited when the roll
+     never follows. */}}
 {{- define "curie.worker.upgradeDrain.timeout" -}}
 {{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
 {{- end -}}
 
-{{/* Headroom over the effective wait, so the flag cannot lapse in the moments
-     between the gate's last poll and the roll it clears the way for. */}}
-{{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
-{{- max (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 60) -}}
+{{/* The drain Job may run for 120 seconds beyond its effective wait. */}}
+{{- define "curie.worker.upgradeDrain.jobDeadline" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 120 -}}
 {{- end -}}
 
-{{- define "curie.worker.validateUpgradeDrain" -}}
-{{- $timeout := int64 .Values.worker.upgradeDrain.timeoutSeconds -}}
-{{- $quiesce := int64 .Values.worker.upgradeDrain.quiesceTtlSeconds -}}
-{{- if le $quiesce $timeout -}}
-{{- fail (printf "worker.upgradeDrain.quiesceTtlSeconds (%d) must be strictly greater than worker.upgradeDrain.timeoutSeconds (%d) (issue #2010). As set, the fleet-wide quiesce flag lapses while the gate is still waiting, so the replicas resume claiming into a roll that is about to interrupt them -- and the gate would still report a clean drain. Fix: raise worker.upgradeDrain.quiesceTtlSeconds above %d, or lower worker.upgradeDrain.timeoutSeconds below %d." $quiesce $timeout $timeout $quiesce) -}}
+{{/* The upgrade timeout covers the complete drain Job deadline, one worker
+     termination grace, and 60 seconds for scheduling and Helm operations. */}}
+{{- define "curie.worker.minimumHelmTimeoutSeconds" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.jobDeadline" .)) (int64 (include "curie.worker.terminationGrace" .)) 60 -}}
 {{- end -}}
+
+{{/* The roll hold: min(quiesceTtlSeconds, effective wait). */}}
+{{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
+{{- min (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (int64 (include "curie.worker.upgradeDrain.timeout" .)) -}}
+{{- end -}}
+
+{{/* No ordering rule between quiesceTtlSeconds and timeoutSeconds remains
+     (#3127): the hold is capped at the wait above, and the schema keeps both
+     positive. Kept as a hook for the templates that include it. */}}
+{{- define "curie.worker.validateUpgradeDrain" -}}
 {{- end -}}
 
 {{/* ---- Langfuse Postgres startup gate (issues #1853, #2330) ----
@@ -2096,4 +2130,14 @@ carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
      Args: dict "key" <env var name> "container" <this init container's name>. */}}
 {{- define "curie.sandbox.claimEnvNoOpNotice" -}}
 no {{ .key }} in this container's env: nothing to stage. This is expected for a warm or unbound pod. If you set {{ .key }} on a SandboxClaim and expected staging, note that a spec.env entry with no containerName reaches the RUNNER container only -- repeat it with containerName: {{ .container }}.
+{{- end -}}
+
+{{/*
+Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
+array: every connectorSecrets agent, every registryEgress agent (#3083), and
+every runnerImages agent (ADR-0173).
+*/}}
+{{- define "curie.agentSandboxPoolAgents" -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) -}}
+{{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}

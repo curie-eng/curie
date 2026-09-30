@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
+from ..config import get_settings
 from ..deps import SessionDep
 from ..workitem_dispatch import DispatchConflict
 from ..workitems import WorkItemConflict, WorkItemOutcome
@@ -62,10 +64,17 @@ class HeartbeatBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
 
 
+class OwnerLostBody(BaseModel):
+    owner: str = Field(min_length=1)
+    runtime_epoch: int = Field(ge=1)
+
+
 class FinishBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
     outcome: Literal["completed", "failed"]
     cause: str = Field(min_length=1)
+    # The provider's own failure message (#3073). The API redacts and clips it.
+    detail: str | None = Field(default=None, max_length=4000)
 
 
 class TerminationClaimBody(BaseModel):
@@ -75,6 +84,14 @@ class TerminationClaimBody(BaseModel):
 class TerminationBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
     observation: str = Field(min_length=1)
+
+
+class RunningWorkItemRequest(BaseModel):
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    runtime_epoch: int
+    execution_deadline: datetime
+    status: Literal["running"]
 
 
 def _raise_conflict(result: object) -> None:
@@ -105,10 +122,10 @@ async def admit_work_item(
     raise HTTPException(status.HTTP_409_CONFLICT, {"code": "not_found"})
 
 
-@router.get("/running")
+@router.get("/running", response_model=RunningWorkItemRequest)
 async def running_work_item_request(
     conversation_id: str, session: SessionDep
-) -> dict[str, Any]:
+) -> RunningWorkItemRequest:
     state, row = await workitem_dispatch.running_for_conversation(
         session, conversation_id
     )
@@ -118,11 +135,31 @@ async def running_work_item_request(
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
     if row.execution_deadline is None:
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
+    return RunningWorkItemRequest(
+        work_item_id=row.work_item_id,
+        request_id=row.id,
+        runtime_epoch=row.runtime_epoch,
+        execution_deadline=row.execution_deadline,
+        status="running",
+    )
+
+
+@router.get("/runtime-owners")
+async def list_work_item_runtime_owners(
+    session: SessionDep, after: uuid.UUID | None = None
+) -> dict[str, Any]:
+    rows = await workitem_dispatch.list_runtime_owners(
+        session, limit=get_settings().work_item_batch_limit, after=after
+    )
     return {
-        "request_id": str(row.id),
-        "runtime_epoch": row.runtime_epoch,
-        "execution_deadline": row.execution_deadline.isoformat(),
-        "status": row.status,
+        "requests": [
+            {
+                "request_id": str(row.request_id),
+                "runtime_owner": row.runtime_owner,
+                "runtime_epoch": row.runtime_epoch,
+            }
+            for row in rows
+        ]
     }
 
 
@@ -171,6 +208,7 @@ async def acquire_work_item_request(
         "work_item_id": result.work_item_id,
         "conversation_id": result.conversation_id,
         "wait_deadline": result.wait_deadline,
+        "repo_full_name": result.repo_full_name,
     }
 
 
@@ -252,6 +290,19 @@ async def hold_work_item_for_approval(
     }
 
 
+@router.post("/requests/{request_id}/owner-lost")
+async def declare_work_item_owner_lost(
+    request_id: uuid.UUID, body: OwnerLostBody, session: SessionDep
+) -> dict[str, Any]:
+    result = await workitem_dispatch.declare_owner_lost(
+        session, request_id, owner=body.owner, runtime_epoch=body.runtime_epoch
+    )
+    if isinstance(result, DispatchConflict):
+        _raise_conflict(result)
+    assert not isinstance(result, DispatchConflict)
+    return {"status": result.status, "terminal_cause": result.terminal_cause}
+
+
 @router.post("/requests/{request_id}/finish")
 async def finish_work_item_request(
     request_id: uuid.UUID, body: FinishBody, session: SessionDep
@@ -262,6 +313,7 @@ async def finish_work_item_request(
         runtime_epoch=body.runtime_epoch,
         outcome=body.outcome,
         cause=body.cause,
+        detail=body.detail,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

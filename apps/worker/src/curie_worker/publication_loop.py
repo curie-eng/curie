@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, Protocol, cast
 
 from channel_protocol import MESSAGE_VERSION, Action, ConfirmIntent, OutboundMessage
@@ -21,6 +22,7 @@ from channel_protocol.reply import (
 )
 
 from .approval_cards import ApprovalCardRef, ApprovalCardStore
+from .approvals import decided_field
 from .publication_k8s import (
     PublicationJobSettings,
     PublicationPayload,
@@ -37,6 +39,7 @@ _PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)
 _PR_STATE_MARKER = re.compile(r"^CURIE_PR_STATE=(closed|merged)$", re.MULTILINE)
+_PR_UPDATED_MARKER = re.compile(r"^CURIE_PR_UPDATED_AT=([^\s]+)$", re.MULTILINE)
 # How many CONSECUTIVE unavailable identity reads one publication may escape
 # reconcile() uncharged before it falls back to the ordinary bounded path.
 # publication_authority.py maps 401, 403, 404, 429 and every 5xx onto
@@ -115,11 +118,15 @@ class PublicationWork:
     branch: str
     pr_number: int | None
     pr_url: str | None
+    github_repository_id: int | None
+    github_pr_node_id: str | None
     expected_prior_head: str
     expected_remote_head: str | None
     base_sha: str
     patch: bytes
     changed_paths: tuple[str, ...]
+    observed_title_sha256: str | None
+    observed_body_sha256: str | None
     title: str
     body: str
     target: ReplyTarget
@@ -163,6 +170,7 @@ class PublicationStore(Protocol):
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None | Awaitable[None]: ...
 
     def pending_result(self, publication_id: uuid.UUID | None = None) -> Any: ...
@@ -182,6 +190,8 @@ class PublicationStore(Protocol):
     def retry(
         self, publication_id: uuid.UUID, *, error: str
     ) -> None | Awaitable[None]: ...
+
+    def release(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
     def mark_lineage_terminal(
         self,
@@ -218,6 +228,7 @@ class PublicationLineageAuthority(Protocol):
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        metadata_updated_at: datetime | None,
     ) -> None | Awaitable[None]: ...
 
 
@@ -321,6 +332,17 @@ def _marker_commit(logs: str) -> str | None:
 def _marker_state(logs: str) -> Literal["closed", "merged"] | None:
     match = _PR_STATE_MARKER.search(logs)
     return cast(Literal["closed", "merged"], match.group(1)) if match else None
+
+
+def _marker_updated_at(logs: str) -> datetime | None:
+    match = _PR_UPDATED_MARKER.search(logs)
+    if match is None:
+        return None
+    try:
+        value = datetime.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    return value if value.tzinfo is not None else None
 
 
 def _validated_pr_url(work: PublicationWork, url: str | None) -> str | None:
@@ -489,6 +511,7 @@ class PublicationReconciler:
         outcome: str,
         pr_url: str | None = None,
         error: str | None = None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         await _resolve(
             self._store.persist_result(
@@ -496,6 +519,7 @@ class PublicationReconciler:
                 outcome=outcome,
                 pr_url=pr_url,
                 error=error,
+                metadata_updated_at=metadata_updated_at,
             )
         )
         # Terminal: this publication is never reconciled again, so its escape
@@ -518,6 +542,7 @@ class PublicationReconciler:
             decision = None
         resolver = result.resolved_by if decision is not None else None
         note = result.resolution_note if decision is not None else None
+        decided = result.resolved_at if decision is not None else None
         if decision is not None and (
             not isinstance(resolver, str) or not resolver.strip()
         ):
@@ -534,7 +559,12 @@ class PublicationReconciler:
                     conversation_id=result.target.conversation_id,
                     reply_ref=ref.ts,
                 ),
-                message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
+                message=OutboundMessage(
+                    version=MESSAGE_VERSION,
+                    text=ref.summary,
+                    # The click's decision time, so the rebuild keeps it (ADR-0179).
+                    fields=[decided_field(decided)] if decided is not None else [],
+                ),
                 settled=SettledOutcome(
                     requested_by=ref.requested_by,
                     decision=decision,
@@ -544,7 +574,10 @@ class PublicationReconciler:
             ),
             route=TargetRoute(
                 endpoint=ref.endpoint,
-                adapter=ref.adapter if ref.kind else result.route.adapter,
+                # An empty kind is a pre-identity ref. Its card was posted by
+                # the historical default transport, never by the later result
+                # route's identity.
+                adapter=ref.adapter if ref.kind else None,
             ),
             best_effort_unreachable=False,
         )
@@ -712,23 +745,31 @@ class PublicationReconciler:
         pr_number: int | None = None,
         new_head: str | None = None,
         names: PublicationResourceNames,
+        metadata_updated_at: datetime | None,
     ) -> None:
         # The durable outcome is the source of truth. Resource cleanup and reply
         # delivery are independent outboxes; result claims remain gated until
         # cleanup has durably completed.
+        if outcome == "published" and not work.patch and metadata_updated_at is None:
+            raise PublicationReconcileError("metadata-only publication has no GitHub update time")
         if new_head is not None:
             if pr_url is None or pr_number is None:
                 raise PublicationReconcileError(
                     "publication success omitted pull request identity"
                 )
             await self._advance_lineage(
-                work, pr_url=pr_url, pr_number=pr_number, new_head=new_head
+                work,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                new_head=new_head,
+                metadata_updated_at=metadata_updated_at,
             )
         await self._persist_result(
             work,
             outcome=outcome,
             pr_url=pr_url,
             error=error,
+            metadata_updated_at=metadata_updated_at,
         )
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
@@ -740,10 +781,15 @@ class PublicationReconciler:
         pr_url: str,
         pr_number: int,
         new_head: str,
+        metadata_updated_at: datetime | None,
     ) -> None:
         # ADR 0143: the API verifies GitHub identity and advances the lineage
         # with the publication outcome in one compare-and-set, fenced by this
         # worker's claimed publication version and lease.
+        if (not work.patch) != (metadata_updated_at is not None):
+            raise PublicationReconcileError(
+                "a GitHub update time is required only for metadata only publications"
+            )
         try:
             await _resolve(
                 self._lineage.advance(
@@ -755,6 +801,7 @@ class PublicationReconciler:
                     pr_number=pr_number,
                     pr_url=pr_url,
                     head_sha=new_head,
+                    metadata_updated_at=metadata_updated_at,
                 )
             )
         except PublicationRemoteTerminalError as terminal:
@@ -858,8 +905,12 @@ class PublicationReconciler:
             branch=work.branch,
             pr_number=work.pr_number,
             pr_url=work.pr_url,
+            github_repository_id=work.github_repository_id,
+            github_pr_node_id=work.github_pr_node_id,
             title=work.title,
             body=work.body,
+            observed_title_sha256=work.observed_title_sha256,
+            observed_body_sha256=work.observed_body_sha256,
             open_as_draft=work.open_as_draft,
             branch_prefix=work.branch_prefix,
         )
@@ -899,14 +950,23 @@ class PublicationReconciler:
         observation: PublicationJobObservation,
         names: PublicationResourceNames,
     ) -> bool:
-        if observation.phase in {"pending", "running"}:
-            return False
         pr_url = _validated_pr_url(
             work, observation.pr_url or _marker_url(observation.logs)
         )
         pr_number = observation.pr_number or _marker_number(observation.logs)
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
         pr_state = observation.pr_state or _marker_state(observation.logs)
+        if observation.phase in {"pending", "running"} and (
+            pr_state is not None
+            or pr_url is None
+            or pr_number is None
+            or commit_sha is None
+        ):
+            # The commit marker is the script's final line, so a complete
+            # success triple already proves the pull request exists. Settle it
+            # now instead of waiting on pod exit and Job status (#3074). Any
+            # other in-flight shape waits for the terminal phase.
+            return False
         if pr_state is not None:
             if pr_url is None or pr_number is None or commit_sha is None:
                 raise PublicationReconcileError(
@@ -949,6 +1009,9 @@ class PublicationReconciler:
                 pr_number=pr_number,
                 new_head=commit_sha,
                 names=names,
+                metadata_updated_at=(
+                    _marker_updated_at(observation.logs) if not work.patch else None
+                ),
             )
             return True
         # Jobs created by the immediately preceding release emitted only the
@@ -961,6 +1024,7 @@ class PublicationReconciler:
                 outcome="published",
                 pr_url=pr_url,
                 names=names,
+                metadata_updated_at=None,
             )
             return True
         if observation.phase == "failed":
@@ -1023,6 +1087,19 @@ class PublicationReconciler:
                 await self._bounded_setup_failure(work, exc)
                 return
             if observation.phase in {"pending", "running"}:
+                try:
+                    if await self._finish_observation(
+                        work, observation, probe_resources.names
+                    ):
+                        return
+                except PublicationIdentityUnavailable as identity_exc:
+                    await self._identity_unavailable(work, identity_exc)
+                    return
+                except Exception as exc:
+                    if await _resolve(self._store.is_terminal(work.publication_id)):
+                        raise
+                    await self._bounded_setup_failure(work, exc)
+                    return
                 if not allow_launch:
                     await _resolve(
                         self._store.persist_result(
@@ -1030,8 +1107,11 @@ class PublicationReconciler:
                             outcome="failed",
                             pr_url=None,
                             error="the factory run already ended",
+                            metadata_updated_at=None,
                         )
                     )
+                    return
+                await self._release_in_flight(work)
                 return
             marker_url = observation.pr_url or _marker_url(observation.logs)
             marker_number = observation.pr_number or _marker_number(observation.logs)
@@ -1068,6 +1148,7 @@ class PublicationReconciler:
                     outcome="failed",
                     pr_url=None,
                     error="the factory run already ended",
+                    metadata_updated_at=None,
                 )
             )
             return
@@ -1148,6 +1229,7 @@ class PublicationReconciler:
                         pr_number=recovered.number,
                         new_head=recovered.head_sha,
                         names=names,
+                        metadata_updated_at=None,
                     )
                     return
             if pull is not None and pull.state != "open":
@@ -1223,6 +1305,7 @@ class PublicationReconciler:
                     pr_url=pull.url,
                     pr_number=pull.number,
                     new_head=pull.head_sha,
+                    metadata_updated_at=None,
                 )
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
@@ -1235,6 +1318,7 @@ class PublicationReconciler:
                 outcome="published",
                 pr_url=pull.url,
                 names=names,
+                metadata_updated_at=None,
             )
             return
 
@@ -1263,7 +1347,8 @@ class PublicationReconciler:
                     "ask again to request a new publication approval."
                 )
                 await self._terminalize(
-                    work, outcome="failed", error=error, names=names
+                    work, outcome="failed", error=error, names=names,
+                    metadata_updated_at=None,
                 )
                 return
             try:
@@ -1300,12 +1385,13 @@ class PublicationReconciler:
                 observation = await _cluster_call(
                     self._cluster.observe, resources.names.job
                 )
-                if observation.exists and observation.phase in {"pending", "running"}:
-                    return
-                if observation.exists and await self._finish_observation(
-                    work, observation, resources.names
-                ):
-                    return
+                in_flight = False
+                if observation.exists:
+                    if await self._finish_observation(
+                        work, observation, resources.names
+                    ):
+                        return
+                    in_flight = observation.phase in {"pending", "running"}
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
                 return
@@ -1319,6 +1405,9 @@ class PublicationReconciler:
                     ),
                 )
                 return
+            if in_flight:
+                await self._release_in_flight(work)
+                return
             await self._bounded_setup_failure(work, apply_exc)
             return
 
@@ -1326,7 +1415,9 @@ class PublicationReconciler:
             observation = await _cluster_call(
                 self._cluster.observe, resources.names.job
             )
-            await self._finish_observation(work, observation, resources.names)
+            finished = await self._finish_observation(
+                work, observation, resources.names
+            )
         except PublicationIdentityUnavailable as identity_exc:
             await self._identity_unavailable(work, identity_exc)
             return
@@ -1335,6 +1426,15 @@ class PublicationReconciler:
                 raise
             await self._bounded_setup_failure(work, exc)
             return
+        if not finished:
+            await self._release_in_flight(work)
+
+    async def _release_in_flight(self, work: PublicationWork) -> None:
+        # The Job is still in flight. Release the lease uncharged so the next
+        # pass observes it promptly instead of waiting out the lease. A
+        # re-claim adopts the deterministic Job and never re-redeems, because
+        # redeem runs only when no Job exists.
+        await _resolve(self._store.release(work.publication_id))
 
 
 class PublicationReconcileLoop:
@@ -1346,12 +1446,16 @@ class PublicationReconcileLoop:
         store: Any,
         reconciler: PublicationReconciler,
         interval_seconds: float = 2.0,
+        batch_limit: int = 16,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("publication reconciliation interval must be positive")
+        if batch_limit <= 0:
+            raise ValueError("publication reconciliation batch limit must be positive")
         self._store = store
         self._reconciler = reconciler
         self._interval = interval_seconds
+        self._batch_limit = batch_limit
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         while not shutdown.is_set():
@@ -1372,16 +1476,25 @@ class PublicationReconcileLoop:
                 # error escaped. Publication mutation remains terminal and is
                 # never repeated because a reply transport is unavailable.
                 logger.exception("publication result delivery failed")
-            try:
-                work = await self._store.claim_next()
-            except Exception as exc:
-                logger.exception(
-                    "publication claim_next failed cause=%s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                raise
-            if work is not None:
+            # Drain claimable work each pass so concurrent publications do not
+            # serialize one per interval, bounded so outboxes still run. An
+            # in-flight Job releases its lease, so the claim excludes what this
+            # pass already reconciled instead of returning the oldest one again
+            # and starving the rest behind it.
+            seen: set[uuid.UUID] = set()
+            for _ in range(self._batch_limit):
+                try:
+                    work = await self._store.claim_next(exclude=seen)
+                except Exception as exc:
+                    logger.exception(
+                        "publication claim_next failed cause=%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                if work is None:
+                    break
+                seen.add(work.publication_id)
                 try:
                     if not work.owner_running:
                         # Observe a pull request the job already opened.

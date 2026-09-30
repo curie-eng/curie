@@ -34,6 +34,7 @@ def test_route_record_round_trips_token() -> None:
             token="tok-20",
             workspace_materialized_head="a" * 40,
             publication_visible_outcome_revision=2,
+            max_turns="1000",
         )
     )
     restored = RouteRecord.from_json(record.to_json())
@@ -41,6 +42,7 @@ def test_route_record_round_trips_token() -> None:
     assert restored.handle.token == "tok-20"
     assert restored.handle.workspace_materialized_head == "a" * 40
     assert restored.handle.publication_visible_outcome_revision == 2
+    assert restored.handle.max_turns == "1000"
     assert restored.handle == record.handle
 
 
@@ -62,3 +64,26 @@ def test_route_record_legacy_payload_without_token_defaults_empty() -> None:
     assert record.handle.token == ""
     assert record.handle.workspace_materialized_head is None
     assert record.handle.publication_visible_outcome_revision == 0
+    assert record.handle.max_turns is None
+
+
+# @spec ADR-0168 d7
+def test_a_route_record_keeps_whether_its_runner_carries_a_caller_token() -> None:
+    record = RouteRecord(handle=_handle(carries_caller_token=True))
+    assert RouteRecord.from_json(record.to_json()).handle.carries_caller_token is True
+
+
+# @spec ADR-0168 d7
+def test_a_route_written_before_the_caller_token_reads_as_carrying_none() -> None:
+    # Which is what replaces a pre-key runner on its thread's next turn.
+    legacy = {
+        "thread_key": "t",
+        "claim_name": "c",
+        "sandbox_name": "s",
+        "namespace": "n",
+        "service_fqdn": "s.n.svc.cluster.local",
+        "port": 8080,
+        "session_id": "sess",
+        "state": "live",
+    }
+    assert RouteRecord.from_json(json.dumps(legacy)).handle.carries_caller_token is False

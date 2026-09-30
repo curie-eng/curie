@@ -18,7 +18,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import workitem_dispatch
+from . import crud, workitem_dispatch
 from .config import Settings
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import (
@@ -38,12 +38,12 @@ from .models import Agent, AgentChannel, WorkItem
 from .repo_full_name import repo_url_path
 from .schemas import WebhookResult
 from .workitem_dispatch import DispatchConflict
-from .workitems import WorkItemConflict, WorkItemOutcome
+from .workitems import GITHUB_CHANNEL_KIND, WorkItemConflict, WorkItemOutcome, github_reply_route
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
-_CHANNEL_KIND = "github"
+_CHANNEL_KIND = GITHUB_CHANNEL_KIND
 _IGNORED = {
     "unsupported_action",
     "unsupported_event",
@@ -112,7 +112,7 @@ def _label_names(issue: dict[str, Any]) -> set[str]:
     return names
 
 
-async def _verify_current(
+async def verify_current(
     notice: FactoryNotice,
     *,
     settings: Settings,
@@ -212,6 +212,10 @@ def _issue_lock_keys(repository_id: int, issue_number: int) -> tuple[int, int]:
 
 
 async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
+    await lock_issue(session, notice.repository_id, notice.issue_number)
+
+
+async def lock_issue(session: AsyncSession, repository_id: int, issue_number: int) -> None:
     """Hold one issue until this transaction commits.
 
     Admission and cancellation both re-read GitHub before they touch the
@@ -220,7 +224,7 @@ async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
     not see again.
     """
 
-    classid, objid = _issue_lock_keys(notice.repository_id, notice.issue_number)
+    classid, objid = _issue_lock_keys(repository_id, issue_number)
     await session.execute(
         text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
         {"classid": classid, "objid": objid},
@@ -228,18 +232,37 @@ async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
 
 
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    binding = await session.scalar(
-        select(AgentChannel)
-        .join(Agent, Agent.id == AgentChannel.agent_id)
-        .where(
-            AgentChannel.kind == _CHANNEL_KIND,
-            AgentChannel.address == notice.repo_full_name,
-            Agent.repo_full_name == notice.repo_full_name,
+    # `agent_channels_route_key` (migration 0070) lets one repository pair
+    # hold several routes, so the query can return more than one row. The
+    # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
+    # belongs to some OTHER agent's repo, e.g. a stale rename), not what
+    # narrows multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never
+    # Slack, and this notice names no adapter, so `crud.matching_bindings`
+    # with `adapter=None` keeps every row -- shared with every other reader
+    # of a route rather than a fourth copy of the same rule.
+    rows = list(
+        await session.scalars(
+            select(AgentChannel)
+            .join(Agent, Agent.id == AgentChannel.agent_id)
+            .where(
+                AgentChannel.kind == _CHANNEL_KIND,
+                AgentChannel.address == notice.repo_full_name,
+                Agent.repo_full_name == notice.repo_full_name,
+            )
         )
     )
-    if binding is None:
+    matches = crud.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
+    if not matches:
         raise FactoryRefused("binding_missing")
-    return binding
+    if len(matches) > 1:
+        # Two routes on one repository under this repo's agents: never pick one.
+        logger.warning(
+            "github factory refused %s: %d routes are bound to it",
+            notice.repo_full_name,
+            len(matches),
+        )
+        raise FactoryRefused("binding_missing")
+    return matches[0]
 
 
 def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> _Facts:
@@ -247,11 +270,14 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
     objective = f"{base}/{notice.repo_full_name}/issues/{notice.issue_number}"
     if notice.disposition == "mention":
         objective = f"{objective}#issuecomment-{notice.comment_id}"
+    kind, address, reply_conversation_id = github_reply_route(
+        notice.repo_full_name, notice.issue_number
+    )
     return _Facts(
         agent_id=binding.agent_id,
-        kind=_CHANNEL_KIND,
-        address=notice.repo_full_name,
-        reply_conversation_id=f"issue-{notice.issue_number}",
+        kind=kind,
+        address=address,
+        reply_conversation_id=reply_conversation_id,
         repo_full_name=notice.repo_full_name,
         github_repository_id=notice.repository_id,
         github_issue_number=notice.issue_number,
@@ -262,11 +288,13 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
     )
 
 
-async def _work_item(session: AsyncSession, notice: FactoryNotice) -> WorkItem | None:
+async def work_item_for(
+    session: AsyncSession, repository_id: int, issue_number: int
+) -> WorkItem | None:
     found: WorkItem | None = await session.scalar(
         select(WorkItem).where(
-            WorkItem.github_repository_id == notice.repository_id,
-            WorkItem.github_issue_number == notice.issue_number,
+            WorkItem.github_repository_id == repository_id,
+            WorkItem.github_issue_number == issue_number,
         )
     )
     return found
@@ -274,10 +302,15 @@ async def _work_item(session: AsyncSession, notice: FactoryNotice) -> WorkItem |
 
 def _admission_result(
     result: WorkItemOutcome | WorkItemConflict | DispatchConflict,
+    request_id: uuid.UUID,
 ) -> WebhookResult:
     if isinstance(result, WorkItemOutcome):
         if result.replayed:
             return WebhookResult(status="factory_duplicate")
+        if result.request is not None and result.request.status == "queued":
+            return WebhookResult(status="factory_queued")
+        if result.request is not None and result.request.id != request_id:
+            return WebhookResult(status="factory_readmit_pending")
         return WebhookResult(status="factory_admitted")
     code = result.code
     if code in _IGNORED:
@@ -285,22 +318,26 @@ def _admission_result(
     return _ignored(code)
 
 
-async def _admit(
+async def admit_notice(
     session: AsyncSession,
     notice: FactoryNotice,
     settings: Settings,
 ) -> WebhookResult:
     binding = await _binding(session, notice)
     if notice.disposition == "mention":
-        existing = await _work_item(session, notice)
+        existing = await work_item_for(session, notice.repository_id, notice.issue_number)
         if existing is None:
             raise FactoryRefused("not_admitted")
-    result = await workitem_dispatch.admit(session, _facts(notice, binding, settings))
-    return _admission_result(result)
+    facts = _facts(notice, binding, settings)
+    if notice.disposition == "mention":
+        result = await workitem_dispatch.admit_revision(session, facts)
+    else:
+        result = await workitem_dispatch.readmit(session, facts)
+    return _admission_result(result, facts.request_id)
 
 
 async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
-    item = await _work_item(session, notice)
+    item = await work_item_for(session, notice.repository_id, notice.issue_number)
     if item is None:
         raise FactoryRefused("work_item_absent")
     if (
@@ -370,11 +407,11 @@ async def handle_factory_delivery(
         if not repository_is_allowed(notice.repo_full_name, settings.github_repo_allowlist):
             raise FactoryRefused("repository_not_allowed")
         await _lock_issue(session, notice)
-        await _verify_current(notice, settings=settings, client=client)
+        await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "cancel":
             outcome = await _cancel(session, notice)
         else:
-            outcome = await _admit(session, notice, settings)
+            outcome = await admit_notice(session, notice, settings)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

@@ -1416,55 +1416,85 @@ mod tests {
     }
 
     #[test]
-    fn reap_report_clean_when_nothing_remains() {
-        // Both candidates removed, re-list empty: a clean teardown, no error.
-        let r = reap_report("abc123\ndef456\n", None, Vec::new());
-        assert_eq!(r.removed, 2);
-        assert!(r.still_present.is_empty());
-        assert_eq!(r.error, None);
-    }
-
-    #[test]
-    fn reap_report_discloses_a_partial_failure() {
-        // rm exited nonzero and a container is still present: NOT a clean
-        // teardown. The count reflects what was confirmed gone; the leftover and
-        // the docker error are surfaced so `local down` cannot report success.
-        let r = reap_report(
-            "abc123\n",
-            Some("docker rm -f exited 1: permission denied".into()),
-            vec!["def456".into()],
-        );
-        assert_eq!(r.removed, 1);
-        assert_eq!(r.still_present, vec!["def456".to_string()]);
-        assert_eq!(
-            r.error.as_deref(),
-            Some("docker rm -f exited 1: permission denied")
-        );
-    }
-
-    #[test]
-    fn reap_report_treats_a_raced_away_container_as_clean() {
-        // `docker rm -f` exited nonzero because a candidate vanished between the
-        // list and the remove ("No such container"), but the re-list is empty:
-        // nothing is actually left, so the teardown is clean despite the nonzero.
-        let r = reap_report(
-            "abc123\n",
-            Some("docker rm -f exited 1: No such container: def456".into()),
-            Vec::new(),
-        );
-        assert_eq!(r.removed, 1);
-        assert!(r.still_present.is_empty());
-        assert_eq!(r.error, None);
-    }
-
-    #[test]
-    fn reap_report_flags_leftovers_even_without_an_rm_error() {
-        // A container remains but `rm` reported success (e.g. it was recreated by
-        // a restart policy): still disclosed with a generated message.
-        let r = reap_report("abc123\n", None, vec!["ghi789".into()]);
-        assert_eq!(r.removed, 1);
-        assert_eq!(r.still_present, vec!["ghi789".to_string()]);
-        assert!(r.error.unwrap().contains("still running"));
+    fn reap_report_cases() {
+        enum ErrExp {
+            None,
+            Exact(&'static str),
+            Contains(&'static str),
+        }
+        struct Case {
+            name: &'static str,
+            rm_stdout: &'static str,
+            rm_error: Option<&'static str>,
+            relist: &'static [&'static str],
+            removed: usize,
+            still_present: &'static [&'static str],
+            error: ErrExp,
+        }
+        let cases = [
+            // Both candidates removed, re-list empty: a clean teardown, no error.
+            Case {
+                name: "clean_when_nothing_remains",
+                rm_stdout: "abc123\ndef456\n",
+                rm_error: None,
+                relist: &[],
+                removed: 2,
+                still_present: &[],
+                error: ErrExp::None,
+            },
+            // rm exited nonzero and a container is still present: NOT a clean
+            // teardown. The count reflects what was confirmed gone; the leftover and
+            // the docker error are surfaced so `local down` cannot report success.
+            Case {
+                name: "discloses_a_partial_failure",
+                rm_stdout: "abc123\n",
+                rm_error: Some("docker rm -f exited 1: permission denied"),
+                relist: &["def456"],
+                removed: 1,
+                still_present: &["def456"],
+                error: ErrExp::Exact("docker rm -f exited 1: permission denied"),
+            },
+            // `docker rm -f` exited nonzero because a candidate vanished between the
+            // list and the remove ("No such container"), but the re-list is empty:
+            // nothing is actually left, so the teardown is clean despite the nonzero.
+            Case {
+                name: "treats_a_raced_away_container_as_clean",
+                rm_stdout: "abc123\n",
+                rm_error: Some("docker rm -f exited 1: No such container: def456"),
+                relist: &[],
+                removed: 1,
+                still_present: &[],
+                error: ErrExp::None,
+            },
+            // A container remains but `rm` reported success (e.g. it was recreated by
+            // a restart policy): still disclosed with a generated message.
+            Case {
+                name: "flags_leftovers_even_without_an_rm_error",
+                rm_stdout: "abc123\n",
+                rm_error: None,
+                relist: &["ghi789"],
+                removed: 1,
+                still_present: &["ghi789"],
+                error: ErrExp::Contains("still running"),
+            },
+        ];
+        for c in cases {
+            let r = reap_report(
+                c.rm_stdout,
+                c.rm_error.map(String::from),
+                c.relist.iter().map(|s| s.to_string()).collect(),
+            );
+            assert_eq!(r.removed, c.removed, "{}", c.name);
+            assert_eq!(r.still_present, c.still_present, "{}", c.name);
+            match c.error {
+                ErrExp::None => assert_eq!(r.error, None, "{}", c.name),
+                ErrExp::Exact(e) => assert_eq!(r.error.as_deref(), Some(e), "{}", c.name),
+                ErrExp::Contains(e) => {
+                    let err = r.error.unwrap_or_default();
+                    assert!(err.contains(e), "{}: {err}", c.name);
+                }
+            }
+        }
     }
 
     fn spec() -> StartSpec {
@@ -1505,24 +1535,64 @@ mod tests {
     // reference with shell metacharacters defeated it: `missing; true #` ended the
     // probe's `test -e` early and left a `true`, so the probe exited 0, the guard
     // reported the model present, and `compose up` performed the download.
+    //
+    // #1363. Every character in `..` is on the allowlist, so the #1254 grammar
+    // waved it through -- but `..` is a path OPERATOR, not a name, and the probe's
+    // `test -e` resolves it against the real filesystem. That let any existing
+    // path answer "the model is already pulled" and skip the disclosure ADR-0093
+    // calls the ONLY place the download is named before it would be spent.
+    //
+    // A segment made only of punctuation is never a model name, and each spelling
+    // of it is another way to reach the same escape. The rule is positive -- a
+    // name has to contain a letter or a digit -- so it holds for spellings nobody
+    // has thought of yet, which a denylist of `.`/`..` would not.
     #[test]
-    fn a_model_ref_with_shell_metacharacters_is_rejected() {
-        for payload in [
-            "missing; true #",     // the reported payload, verbatim
-            "$(touch /tmp/pwned)", // command substitution
-            "`id`",                // the backtick spelling of the same
-            "a && b",
-            "a | b",
-            "a > /tmp/x",
-            "a\nb",
-            "a b", // a bare space is not a reference either
-            "'quoted'",
-            "a\\b",
-        ] {
-            assert!(
-                validate_model_ref(payload).is_err(),
-                "must reject {payload:?}"
-            );
+    fn invalid_model_refs_are_rejected() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "shell_metacharacters",
+                &[
+                    "missing; true #",     // the reported payload, verbatim
+                    "$(touch /tmp/pwned)", // command substitution
+                    "`id`",                // the backtick spelling of the same
+                    "a && b",
+                    "a | b",
+                    "a > /tmp/x",
+                    "a\nb",
+                    "a b", // a bare space is not a reference either
+                    "'quoted'",
+                    "a\\b",
+                ],
+            ),
+            (
+                "empty_refs_and_segments",
+                &["", ":", "qwen3:", "/qwen3", "a//b:1"],
+            ),
+            (
+                "path_operator_segments",
+                &[
+                    "../../../../etc:hostname", // the reported payload, verbatim
+                    "..:..",                    // both halves, the minimal spelling
+                    "x/../../../../../etc:passwd",
+                    "..",          // a bare traversal with the implicit `latest` tag
+                    "qwen3:..",    // only the tag is an operator
+                    "../qwen3:4b", // only a leading name segment is
+                    ".",           // `.` resolves to the parent dir, which also exists
+                    "qwen3:.",
+                ],
+            ),
+            (
+                "no_letter_or_digit_segment",
+                &["...", "-", "_", "._-", "qwen3:...", "a/-/b:1"],
+            ),
+        ];
+        for (name, payloads) in cases {
+            for payload in *payloads {
+                assert!(
+                    validate_model_ref(payload).is_err(),
+                    "{name}: must reject {payload:?}"
+                );
+            }
         }
     }
 
@@ -1560,51 +1630,6 @@ mod tests {
             "a_b.c-d:e_f.g-h",
         ] {
             assert!(validate_model_ref(good).is_ok(), "must accept {good:?}");
-        }
-    }
-
-    #[test]
-    fn empty_refs_and_empty_segments_are_rejected() {
-        for bad in ["", ":", "qwen3:", "/qwen3", "a//b:1"] {
-            assert!(validate_model_ref(bad).is_err(), "must reject {bad:?}");
-        }
-    }
-
-    // #1363. Every character in `..` is on the allowlist, so the #1254 grammar
-    // waved it through -- but `..` is a path OPERATOR, not a name, and the probe's
-    // `test -e` resolves it against the real filesystem. That let any existing
-    // path answer "the model is already pulled" and skip the disclosure ADR-0093
-    // calls the ONLY place the download is named before it would be spent.
-    #[test]
-    fn a_model_ref_whose_segments_are_path_operators_is_rejected() {
-        for payload in [
-            "../../../../etc:hostname", // the reported payload, verbatim
-            "..:..",                    // both halves, the minimal spelling
-            "x/../../../../../etc:passwd",
-            "..",          // a bare traversal with the implicit `latest` tag
-            "qwen3:..",    // only the tag is an operator
-            "../qwen3:4b", // only a leading name segment is
-            ".",           // `.` resolves to the parent dir, which also exists
-            "qwen3:.",
-        ] {
-            assert!(
-                validate_model_ref(payload).is_err(),
-                "must reject {payload:?}"
-            );
-        }
-    }
-
-    // A segment made only of punctuation is never a model name, and each spelling
-    // of it is another way to reach the same escape. The rule is positive -- a
-    // name has to contain a letter or a digit -- so it holds for spellings nobody
-    // has thought of yet, which a denylist of `.`/`..` would not.
-    #[test]
-    fn a_segment_with_no_letter_or_digit_is_rejected() {
-        for payload in ["...", "-", "_", "._-", "qwen3:...", "a/-/b:1"] {
-            assert!(
-                validate_model_ref(payload).is_err(),
-                "must reject {payload:?}"
-            );
         }
     }
 
@@ -1694,46 +1719,54 @@ mod tests {
         assert_eq!(args.iter().filter(|a| a.contains("true #")).count(), 1);
     }
 
-    #[test]
-    fn model_manifest_path_mirrors_ollama_layout() {
-        assert_eq!(
-            model_manifest_path("qwen3:4b"),
-            "models/manifests/registry.ollama.ai/library/qwen3/4b"
-        );
-        assert_eq!(
-            model_manifest_path("qwen3-coder:30b"),
-            "models/manifests/registry.ollama.ai/library/qwen3-coder/30b"
-        );
-        // No tag is `latest`, the same default `ollama pull` applies.
-        assert_eq!(
-            model_manifest_path("qwen3"),
-            "models/manifests/registry.ollama.ai/library/qwen3/latest"
-        );
-        // A namespace displaces `library`, not the registry.
-        assert_eq!(
-            model_manifest_path("myorg/mymodel:v1"),
-            "models/manifests/registry.ollama.ai/myorg/mymodel/v1"
-        );
-        // Three or more segments carry their own registry host.
-        assert_eq!(
-            model_manifest_path("hf.co/org/repo:q4"),
-            "models/manifests/hf.co/org/repo/q4"
-        );
-    }
-
     // A colon in a registry host's PORT is not a tag. Splitting on the first
     // colon instead of the last would silently look for a model named after the
     // host, always miss, and refuse a machine that has the model.
     #[test]
-    fn model_manifest_path_does_not_mistake_a_host_port_for_a_tag() {
-        assert_eq!(
-            model_manifest_path("localhost:5000/org/repo"),
-            "models/manifests/localhost:5000/org/repo/latest"
-        );
-        assert_eq!(
-            model_manifest_path("localhost:5000/org/repo:v2"),
-            "models/manifests/localhost:5000/org/repo/v2"
-        );
+    fn model_manifest_path_cases() {
+        let cases = [
+            (
+                "mirrors_ollama_layout",
+                "qwen3:4b",
+                "models/manifests/registry.ollama.ai/library/qwen3/4b",
+            ),
+            (
+                "mirrors_ollama_layout_hyphenated",
+                "qwen3-coder:30b",
+                "models/manifests/registry.ollama.ai/library/qwen3-coder/30b",
+            ),
+            // No tag is `latest`, the same default `ollama pull` applies.
+            (
+                "untagged_is_latest",
+                "qwen3",
+                "models/manifests/registry.ollama.ai/library/qwen3/latest",
+            ),
+            // A namespace displaces `library`, not the registry.
+            (
+                "namespace_displaces_library",
+                "myorg/mymodel:v1",
+                "models/manifests/registry.ollama.ai/myorg/mymodel/v1",
+            ),
+            // Three or more segments carry their own registry host.
+            (
+                "three_segments_carry_registry_host",
+                "hf.co/org/repo:q4",
+                "models/manifests/hf.co/org/repo/q4",
+            ),
+            (
+                "host_port_is_not_a_tag_untagged",
+                "localhost:5000/org/repo",
+                "models/manifests/localhost:5000/org/repo/latest",
+            ),
+            (
+                "host_port_is_not_a_tag_tagged",
+                "localhost:5000/org/repo:v2",
+                "models/manifests/localhost:5000/org/repo/v2",
+            ),
+        ];
+        for (name, model, expected) in cases {
+            assert_eq!(model_manifest_path(model), expected, "{name}");
+        }
     }
 
     // The refusal message is the ONLY place the download is disclosed before it
@@ -1963,41 +1996,31 @@ mod tests {
     }
 
     #[test]
-    fn plan_container_name_proceeds_when_the_name_is_free() {
-        assert_eq!(
-            plan_container_name(
-                "curie-runner-local",
-                Some(7245),
-                false,
-                false,
-                ConflictContext::SkillUp
-            ),
-            Ok(NamePlan::Proceed)
-        );
-        assert_eq!(
-            plan_container_name(
-                "curie-runner-local",
-                Some(7245),
+    fn plan_container_name_cases() {
+        // (name, exists, replace, expected)
+        let cases = [
+            ("proceeds_when_free", false, false, NamePlan::Proceed),
+            (
+                "proceeds_when_free_even_with_replace",
                 false,
                 true,
-                ConflictContext::SkillUp
+                NamePlan::Proceed,
             ),
-            Ok(NamePlan::Proceed)
-        );
-    }
-
-    #[test]
-    fn plan_container_name_replaces_only_when_asked() {
-        assert_eq!(
-            plan_container_name(
-                "curie-runner-local",
-                Some(7245),
-                true,
-                true,
-                ConflictContext::SkillUp
-            ),
-            Ok(NamePlan::Replace)
-        );
+            ("replaces_only_when_asked", true, true, NamePlan::Replace),
+        ];
+        for (name, exists, replace, expected) in cases {
+            assert_eq!(
+                plan_container_name(
+                    "curie-runner-local",
+                    Some(7245),
+                    exists,
+                    replace,
+                    ConflictContext::SkillUp
+                ),
+                Ok(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2162,33 +2185,39 @@ driver failed programming external connectivity: port is already allocated."
     }
 
     #[test]
-    fn model_is_forwarded_only_when_set() {
-        let mut s = spec();
-        s.model = None;
-        assert!(!s.run_args().join(" ").contains("CURIE_MODEL"));
-
-        s.model = Some("claude-opus-4-8".into());
-        assert!(s
-            .run_args()
-            .join(" ")
-            .contains("-e CURIE_MODEL=claude-opus-4-8"));
-    }
-
-    #[test]
-    fn model_base_url_is_forwarded_when_set() {
-        let mut s = spec();
-        s.model_base_url = Some("http://x-ollama:11434".into());
-        assert!(s
-            .run_args()
-            .join(" ")
-            .contains("-e ANTHROPIC_BASE_URL=http://x-ollama:11434"));
-    }
-
-    #[test]
-    fn model_base_url_is_omitted_when_unset() {
-        let mut s = spec();
-        s.model_base_url = None;
-        assert!(!s.run_args().join(" ").contains("ANTHROPIC_BASE_URL"));
+    fn model_env_is_forwarded_only_when_set() {
+        // (name, model, model_base_url, needle, present)
+        let cases = [
+            ("model_unset", None, None, "CURIE_MODEL", false),
+            (
+                "model_set",
+                Some("claude-opus-4-8"),
+                None,
+                "-e CURIE_MODEL=claude-opus-4-8",
+                true,
+            ),
+            (
+                "model_base_url_set",
+                None,
+                Some("http://x-ollama:11434"),
+                "-e ANTHROPIC_BASE_URL=http://x-ollama:11434",
+                true,
+            ),
+            (
+                "model_base_url_unset",
+                None,
+                None,
+                "ANTHROPIC_BASE_URL",
+                false,
+            ),
+        ];
+        for (name, model, base_url, needle, present) in cases {
+            let mut s = spec();
+            s.model = model.map(String::from);
+            s.model_base_url = base_url.map(String::from);
+            let joined = s.run_args().join(" ");
+            assert_eq!(joined.contains(needle), present, "{name}: {joined}");
+        }
     }
 
     #[test]

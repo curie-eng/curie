@@ -12,13 +12,12 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows, stamped_revision
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.deps import get_session
 from curie_api.main import create_app
@@ -26,7 +25,7 @@ from curie_api.models import WorkflowStateEntry
 from curie_worker.binding import BindingResolver, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 from fastapi.testclient import TestClient
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -34,9 +33,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.pool import NullPool
-from sqlalchemy.sql import text
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0036"
 REVISION = "0037"
 SCHEMA = "curie"
@@ -46,41 +43,15 @@ ADDRESS = "C0EXAMPLE1"
 _UNSET = object()
 
 
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
-    async def go() -> list[Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as conn:
-                result = await conn.execute(text(statement), params or {})
-                return list(result.all()) if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(go())
-
-
-def _stamped_revision() -> str:
-    rows = _sql("SELECT version_num FROM curie.alembic_version")
-    assert len(rows) == 1
-    revision: str = rows[0][0]
-    return revision
-
-
 def _seed_agent(name: str, *, memory: bool | None = None) -> uuid.UUID:
     agent_id = uuid.uuid4()
     if memory is None:
-        _sql(
+        sql_rows(
             "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
             {"id": agent_id, "name": name},
         )
     else:
-        _sql(
+        sql_rows(
             "INSERT INTO curie.agents (id, name, memory) VALUES (:id, :name, :memory)",
             {"id": agent_id, "name": name, "memory": memory},
         )
@@ -88,7 +59,7 @@ def _seed_agent(name: str, *, memory: bool | None = None) -> uuid.UUID:
 
 
 def _seed_binding(agent_id: uuid.UUID, *, address: str = ADDRESS) -> None:
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
         "VALUES (:id, :agent_id, :kind, :address)",
         {
@@ -102,7 +73,7 @@ def _seed_binding(agent_id: uuid.UUID, *, address: str = ADDRESS) -> None:
 
 def _seed_active_deployment(agent_id: uuid.UUID) -> None:
     version_id = uuid.uuid4()
-    _sql(
+    sql_rows(
         "INSERT INTO curie.agent_versions "
         "(id, agent_id, version_label, bundle_ref, created_by) "
         "VALUES (:id, :agent_id, :label, :bundle_ref, :created_by)",
@@ -114,7 +85,7 @@ def _seed_active_deployment(agent_id: uuid.UUID) -> None:
             "created_by": "test",
         },
     )
-    _sql(
+    sql_rows(
         "INSERT INTO curie.deployments "
         "(id, agent_id, version_id, environment, status) "
         "VALUES (:id, :agent_id, :version_id, "
@@ -153,7 +124,7 @@ def _seed_state(
         "value": json.dumps(value),
     }
     if binding_scope is _UNSET:
-        _sql(
+        sql_rows(
             "INSERT INTO curie.workflow_state_entries "
             "(id, agent_id, namespace, key, value) "
             "VALUES (:id, :agent_id, :namespace, :key, CAST(:value AS jsonb))",
@@ -161,7 +132,7 @@ def _seed_state(
         )
     else:
         params["binding_scope"] = binding_scope
-        _sql(
+        sql_rows(
             "INSERT INTO curie.workflow_state_entries "
             "(id, agent_id, binding_scope, namespace, key, value) "
             "VALUES (:id, :agent_id, :binding_scope, :namespace, :key, "
@@ -172,13 +143,13 @@ def _seed_state(
 
 
 def _memory_by_name() -> dict[str, bool]:
-    return {row[0]: row[1] for row in _sql("SELECT name, memory FROM curie.agents")}
+    return {row[0]: row[1] for row in sql_rows("SELECT name, memory FROM curie.agents")}
 
 
 def _state_rows(agent_id: uuid.UUID) -> list[tuple[Any, ...]]:
     return [
         tuple(row)
-        for row in _sql(
+        for row in sql_rows(
             "SELECT id::text, binding_scope, namespace, key, value::text, version "
             "FROM curie.workflow_state_entries WHERE agent_id = :agent_id "
             "ORDER BY id",
@@ -264,17 +235,17 @@ def _api_get(url: str) -> Any:
 
 
 def test_legacy_state_runner_url_and_value_survive_upgrade(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, "0030")
+    cfg = alembic_config()
+    isolated_migration_db.at("0030")
     legacy_id = _seed_runnable_agent("legacy-state-owner")
     _seed_agent("fresh-no-state-agent")
     legacy_value = {"step": "approved", "attempts": [1, 2]}
     _seed_state(legacy_id, "workflow", "legacy-key", legacy_value)
 
     command.upgrade(cfg, BELOW)
-    assert _stamped_revision() == BELOW
+    assert stamped_revision() == BELOW
     assert _memory_by_name() == {
         "fresh-no-state-agent": False,
         "legacy-state-owner": False,
@@ -285,14 +256,14 @@ def test_legacy_state_runner_url_and_value_survive_upgrade(
     hidden = _api_get(f"{isolated_url}/workflow/legacy-key")
     assert hidden.status_code == 404
     assert hidden.json() == {"detail": "state entry not found"}
-    assert _sql(
+    assert sql_rows(
         "SELECT binding_scope IS NULL FROM curie.workflow_state_entries "
         "WHERE agent_id = :agent_id AND namespace = 'workflow' AND key = 'legacy-key'",
         {"agent_id": legacy_id},
     ) == [(True,)]
 
     command.upgrade(cfg, REVISION)
-    assert _stamped_revision() == REVISION
+    assert stamped_revision() == REVISION
     assert _memory_by_name() == {
         "fresh-no-state-agent": False,
         "legacy-state-owner": True,
@@ -307,10 +278,10 @@ def test_legacy_state_runner_url_and_value_survive_upgrade(
 
 
 def test_legacy_unscoped_general_state_deliberately_flips_when_provenance_is_ambiguous(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent("ambiguous-provenance-owner", memory=False)
     original_value = {"policy": "operator-or-legacy", "sequence": [3, 1, 4]}
     _seed_state(
@@ -332,10 +303,10 @@ def test_legacy_unscoped_general_state_deliberately_flips_when_provenance_is_amb
 
 
 def test_downgrade_keeps_repaired_memory_and_restores_null_distinct_identity(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, "0030")
+    cfg = alembic_config()
+    isolated_migration_db.at("0030")
     agent_id = _seed_agent("downgrade-repaired-owner")
     original_value = {"survives": "forward-and-back"}
     _seed_state(
@@ -353,10 +324,10 @@ def test_downgrade_keeps_repaired_memory_and_restores_null_distinct_identity(
 
     command.downgrade(cfg, BELOW)
 
-    assert _stamped_revision() == BELOW
+    assert stamped_revision() == BELOW
     assert _memory_by_name() == {"downgrade-repaired-owner": True}
     assert _state_rows(agent_id) == before
-    assert _sql(
+    assert sql_rows(
         """
         SELECT backing_index.indnullsnotdistinct
         FROM pg_constraint AS catalog_constraint
@@ -376,7 +347,7 @@ def test_downgrade_keeps_repaired_memory_and_restores_null_distinct_identity(
         {"second-null-row": True},
         binding_scope=None,
     )
-    assert _sql(
+    assert sql_rows(
         "SELECT count(*) FROM curie.workflow_state_entries "
         "WHERE agent_id = :agent_id AND binding_scope IS NULL "
         "AND namespace = 'workflow' AND key = 'durable-key'",
@@ -385,10 +356,10 @@ def test_downgrade_keeps_repaired_memory_and_restores_null_distinct_identity(
 
 
 def test_reserved_only_legacy_state_does_not_flip_memory(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent("reserved-only", memory=False)
     _seed_state(agent_id, "memory", "summary", {"text": "remembered"}, binding_scope=None)
     _seed_state(
@@ -407,10 +378,10 @@ def test_reserved_only_legacy_state_does_not_flip_memory(
 
 
 def test_reserved_shared_plus_scoped_general_state_stays_isolated(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent("healthy-isolated", memory=False)
     _seed_binding(agent_id)
     reserved_value = {"summary": "agent-wide"}
@@ -441,10 +412,10 @@ def test_reserved_shared_plus_scoped_general_state_stays_isolated(
 
 
 def test_memory_true_mixed_scope_general_state_remains_supported(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_runnable_agent("already-shared", memory=True)
     shared_value = {"mode": "shared"}
     scoped_value = {"mode": "old-isolated"}
@@ -484,10 +455,10 @@ def test_memory_true_mixed_scope_general_state_remains_supported(
 @pytest.mark.parametrize("namespace", ["memory", "workflow"], ids=("reserved", "general"))
 def test_duplicate_null_identity_is_refused_atomically(
     namespace: str,
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent(f"duplicate-{namespace}", memory=False)
     _seed_state(agent_id, namespace, "same-key", {"winner": 1}, binding_scope=None)
     _seed_state(agent_id, namespace, "same-key", {"winner": 2}, binding_scope=None)
@@ -505,16 +476,16 @@ def test_duplicate_null_identity_is_refused_atomically(
     assert namespace in message
     assert "same-key" in message
     assert "merge or delete" in lowered
-    assert _stamped_revision() == BELOW
+    assert stamped_revision() == BELOW
     assert _memory_by_name() == before_memory
     assert _state_rows(agent_id) == before_rows
 
 
 def test_false_mixed_scope_flip_candidate_is_refused_atomically(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent("ambiguous-false-owner", memory=False)
     _seed_state(
         agent_id,
@@ -544,20 +515,20 @@ def test_false_mixed_scope_flip_candidate_is_refused_atomically(
     assert "isolated" in lowered
     assert "move" in lowered
     assert "merge" in lowered
-    assert _stamped_revision() == BELOW
+    assert stamped_revision() == BELOW
     assert _memory_by_name() == before_memory
     assert _state_rows(agent_id) == before_rows
 
 
 def test_duplicate_null_constraint_catalog_and_scoped_controls(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = _alembic_config()
-    command.upgrade(cfg, BELOW)
+    cfg = alembic_config()
+    isolated_migration_db.at(BELOW)
     agent_id = _seed_agent("identity-controls", memory=True)
     command.upgrade(cfg, REVISION)
 
-    assert _sql(
+    assert sql_rows(
         """
         SELECT backing_index.indnullsnotdistinct
         FROM pg_constraint AS catalog_constraint
@@ -575,7 +546,7 @@ def test_duplicate_null_constraint_catalog_and_scoped_controls(
     with pytest.raises(IntegrityError) as caught:
         _seed_state(agent_id, "workflow", "shared-key", {"writer": 2}, binding_scope=None)
     assert "uq_state_agent_scope_ns_key" in str(caught.value)
-    assert _sql(
+    assert sql_rows(
         "SELECT count(*) FROM curie.workflow_state_entries "
         "WHERE agent_id = :agent_id AND binding_scope IS NULL "
         "AND namespace = 'workflow' AND key = 'shared-key'",
@@ -590,7 +561,7 @@ def test_duplicate_null_constraint_catalog_and_scoped_controls(
             {"scope": scope},
             binding_scope=scope,
         )
-    assert _sql(
+    assert sql_rows(
         "SELECT binding_scope FROM curie.workflow_state_entries "
         "WHERE agent_id = :agent_id AND namespace = 'workflow' "
         "AND key = 'isolated-key' ORDER BY binding_scope",

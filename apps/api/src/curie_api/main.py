@@ -55,23 +55,27 @@ from .routers import (
     deploy_targets,
     deployments,
     evals,
+    factory_status,
     gitflow_routing,
     github,
     github_reviews,
+    hook_fire,
     hooks,
     memory,
     observability,
     provider_installations,
+    publication_precheck,
     publications,
     runs,
+    schedules,
     state,
+    turn_progress,
     work_item_outcomes,
     work_items,
     workspaces,
 )
 from .schema_compat import assert_servable
-from .slack_approvers import SlackApproverSetSelector
-from .slack_usergroups import SlackUserGroupClient
+from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
@@ -119,6 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sessionmaker,
         valkey,
         settings,
+        http_client,
     )
     app.state.github_review_reconciler_task = (
         asyncio.create_task(app.state.github_review_reconciler.run_forever())
@@ -128,24 +133,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. The usergroup
-    # client shares the app's httpx client and is None when no bot token is
-    # configured, which is the normal Slack-free deployment -- a route that
-    # declares an approvers group then fails closed at resolve time rather than
-    # silently widening.
-    usergroups = (
-        SlackUserGroupClient(
-            http_client,
-            token=settings.slack_bot_token,
-            ttl_s=settings.slack_usergroup_cache_ttl_s,
-        )
-        if settings.slack_bot_token
-        else None
-    )
-    app.state.approver_sets = SlackApproverSetSelector(usergroups)
+    # resolve endpoint depend on ports rather than on a provider. Each Slack
+    # identity's usergroup client shares the app's httpx client (ADR-0168
+    # decision 5); with no bot token there is none, the normal Slack-free
+    # deployment, and a route that declares an approvers group then fails
+    # closed at resolve time rather than silently widening.
+    app.state.approver_sets = build_approver_set_selector(http_client, settings)
     # Today's static Slack app as one provider installation (#2909), behind the
     # same token gate: a Slack-free install gets no row. Never fails boot; if
-    # this image started below 0053 it keeps retrying in the background.
+    # this image started below this migration it keeps retrying in the
+    # background. identities.py still reads CURIE_SLACK_IDENTITIES directly
+    # (ADR-0168) until it is wired to this table.
     app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
         app.state.sessionmaker, settings
     )
@@ -195,9 +193,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.resume_queue,
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
-                publication_patch_retention_seconds=(
-                    settings.publication_patch_retention_seconds
-                ),
+                publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
             )
         )
     else:
@@ -427,6 +423,8 @@ def create_app() -> FastAPI:
     app.include_router(control.router)
     app.include_router(evals.router)
     app.include_router(runs.router)
+    app.include_router(schedules.router)
+    app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
@@ -434,9 +432,12 @@ def create_app() -> FastAPI:
     app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
     app.include_router(work_items.router)
+    app.include_router(factory_status.router)
+    app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)

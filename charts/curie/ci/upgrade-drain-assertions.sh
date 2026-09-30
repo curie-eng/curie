@@ -13,8 +13,10 @@
 #     cluster that is not claiming;
 #   * `hook-failed` in the delete policy would destroy the only log naming which
 #     deliveries held the upgrade back;
-#   * a quiesce TTL that does not outlast the wait lapses mid-drain, so the
-#     replicas resume claiming into the roll AND the gate still reports success;
+#   * a roll-hold quiesce TTL longer than the drain wait strands a paused
+#     fleet for longer than the upgrade could ever have waited (#3127): the
+#     marker is a renewed lease while waiting, and the hold written after a
+#     clean drain is capped at the effective wait;
 #   * a wait shorter than the delivery budget refuses upgrades over turns that
 #     are still inside the budget ADR-0131 already promised them, which is a
 #     gate that gets switched off in its first week.
@@ -63,11 +65,14 @@ assert_render_fails() {
   echo "OK: $label is refused at render time"
 }
 
-assert_render_fails \
-  "a quiesce TTL that does not outlast the drain wait" \
-  "must be strictly greater than worker.upgradeDrain.timeoutSeconds" \
+# #3127: a quiesce TTL at or below the wait is no longer refused. The wait is
+# held by a renewed lease, so the roll hold may be shorter than the wait.
+helm template t "$CHART" \
   --set worker.upgradeDrain.timeoutSeconds=900 \
-  --set worker.upgradeDrain.quiesceTtlSeconds=900
+  --set worker.upgradeDrain.quiesceTtlSeconds=900 > "$TMP/equal-ttl.yaml"
+helm template t "$CHART" \
+  --set worker.upgradeDrain.timeoutSeconds=900 \
+  --set worker.upgradeDrain.quiesceTtlSeconds=600 > "$TMP/short-ttl.yaml"
 
 # The cross-family relationship is DERIVED, not refused: raising the delivery
 # budget is a decision made for unrelated reasons, and failing the render for a
@@ -76,7 +81,7 @@ assert_render_fails \
 # rather than a constant.
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
-  --set worker.terminationGracePeriodSeconds=1860 > "$TMP/raised.yaml"
+  --set worker.terminationGracePeriodSeconds=2400 > "$TMP/raised.yaml"
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=60 \
   --set worker.runnerTotalTimeoutSeconds=60 \
@@ -84,15 +89,17 @@ helm template t "$CHART" \
   --set worker.upgradeDrain.timeoutSeconds=120 \
   --set worker.upgradeDrain.quiesceTtlSeconds=300 > "$TMP/small.yaml"
 
-python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" <<'PY'
+python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" "$TMP/equal-ttl.yaml" "$TMP/short-ttl.yaml" <<'PY'
 import sys
 
 import yaml
 
 default_path, disabled_path, no_worker_path, small_path, raised_path = sys.argv[1:6]
+equal_ttl_path, short_ttl_path = sys.argv[6:8]
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
+ATTEST = "upgrade-drain-attest"
 
 
 def load(path):
@@ -108,7 +115,7 @@ def jobs_by_component(docs):
         component = (doc.get("metadata") or {}).get("labels", {}).get(
             "app.kubernetes.io/component"
         )
-        if component in (DRAIN, RELEASE):
+        if component in (DRAIN, RELEASE, ATTEST):
             out.setdefault(component, []).append(doc)
     return out
 
@@ -128,7 +135,7 @@ for path, label in ((disabled_path, "upgradeDrain.enabled=false"), (no_worker_pa
 
 # --- the default render ------------------------------------------------------
 jobs = jobs_by_component(load(default_path))
-for component in (DRAIN, RELEASE):
+for component in (DRAIN, RELEASE, ATTEST):
     check(
         len(jobs.get(component, [])) == 1,
         f"expected exactly one {component} Job, found {len(jobs.get(component, []))}",
@@ -137,9 +144,11 @@ for component in (DRAIN, RELEASE):
 if not failures:
     drain = jobs[DRAIN][0]
     release = jobs[RELEASE][0]
+    attest = jobs[ATTEST][0]
 
     drain_ann = (drain.get("metadata") or {}).get("annotations", {})
     release_ann = (release.get("metadata") or {}).get("annotations", {})
+    attest_ann = (attest.get("metadata") or {}).get("annotations") or {}
 
     # The hook phases. `pre-upgrade` ONLY: a fresh install has nothing in flight
     # and no Valkey to ask, so `pre-install` would fail every first install.
@@ -160,6 +169,42 @@ if not failures:
     check(
         "before-hook-creation" in drain_ann.get("helm.sh/hook-delete-policy", ""),
         "the drain Job is not cleared before the next attempt",
+    )
+    # Attest is the second pre-upgrade refusal. It runs only after a recorded
+    # drain, so Helm must not treat deleting the drain Job as success.
+    check(
+        attest_ann.get("helm.sh/hook") == "pre-upgrade",
+        f"attest hook is {attest_ann.get('helm.sh/hook')!r}, expected exactly 'pre-upgrade'",
+    )
+    check(
+        attest_ann.get("helm.sh/hook-weight") == "-9",
+        f"attest hook weight is {attest_ann.get('helm.sh/hook-weight')!r}, expected '-9'",
+    )
+    attest_delete = attest_ann.get("helm.sh/hook-delete-policy", "")
+    check(
+        "before-hook-creation" in attest_delete,
+        "the attest Job is not cleared before the next attempt",
+    )
+    check(
+        "hook-failed" not in attest_delete,
+        "the attest Job is auto-deleted on failure, destroying the refusal's evidence",
+    )
+    check(
+        "curie.ai/minimum-helm-timeout-seconds" not in attest_ann,
+        "the attest Job carries curie.ai/minimum-helm-timeout-seconds; "
+        "that annotation belongs to the drain Job only",
+    )
+    attest_spec = attest.get("spec") or {}
+    check(
+        attest_spec.get("backoffLimit") == 0,
+        f"attest backoffLimit is {attest_spec.get('backoffLimit')!r}, expected 0",
+    )
+    # The deadline starts at Job creation, so it has to cover the worker image
+    # pull. 60s timed out after a clean drain and left the roll hold set.
+    check(
+        attest_spec.get("activeDeadlineSeconds") == 300,
+        f"attest activeDeadlineSeconds is {attest_spec.get('activeDeadlineSeconds')!r}, "
+        "expected 300 so a slow image pull cannot fail attest after a clean drain",
     )
 
     drain_spec = drain.get("spec") or {}
@@ -183,7 +228,11 @@ if not failures:
         "expected greater than the 900s default drain wait",
     )
 
-    for component, doc, mode in ((DRAIN, drain, "drain"), (RELEASE, release, "release")):
+    for component, doc, mode in (
+        (DRAIN, drain, "drain"),
+        (RELEASE, release, "release"),
+        (ATTEST, attest, "attest"),
+    ):
         pod = (doc.get("spec") or {}).get("template", {}).get("spec", {})
         check(
             pod.get("restartPolicy") == "Never",
@@ -216,18 +265,18 @@ if not failures:
         env = {e["name"]: e for e in container.get("env", []) if isinstance(e, dict)}
         for required in ("VALKEY_HOST", "VALKEY_PORT", "VALKEY_PASSWORD"):
             check(required in env, f"{component} is missing {required}")
-        # Both Jobs build the same WorkerConfig, whose validator refuses a
-        # quiesce TTL that does not outlast the wait. A release Job missing
-        # these would construct a config the gate could not.
+        # Both Jobs build the same WorkerConfig. The roll hold is capped at the
+        # effective wait (#3127): min(quiesceTtlSeconds 1800, wait 900) = 900.
         check(
             env.get("CURIE_UPGRADE_DRAIN_TIMEOUT_S", {}).get("value") == "900",
             f"{component} CURIE_UPGRADE_DRAIN_TIMEOUT_S is "
             f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '900'",
         )
         check(
-            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1800",
+            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "900",
             f"{component} CURIE_UPGRADE_QUIESCE_TTL_S is "
-            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800'",
+            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '900' "
+            "(min of quiesceTtlSeconds and the effective drain wait)",
         )
 
     drain_env = {
@@ -265,15 +314,14 @@ if env is not None:
         f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}",
     )
     check(
-        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "300",
-        "a quiesce TTL already above the wait was not left at the configured value: "
+        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "120",
+        "a quiesce TTL above the wait was not capped at the wait (expected '120'): "
         f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}",
     )
 
-# Raising deliveryBudgetSeconds to its 1800s maximum, with the grace ADR-0131
-# requires, must still render -- and must carry the gate up with it rather than
-# leaving a 900s wait that would refuse every upgrade during ordinary traffic.
-# 1800 + 60 reserve = 1860, and the quiesce TTL is derived above that.
+# Raising deliveryBudgetSeconds to 1800s and raising the worker
+# grace must still render, with the gate raised to cover the delivery budget.
+# 1800 + 60 reserve = 1860; the roll hold is min(1800, 1860) = 1800.
 env = drain_env(raised_path, "raised-budget")
 if env is not None:
     check(
@@ -282,10 +330,93 @@ if env is not None:
         f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '1860'",
     )
     check(
-        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1920",
-        "the quiesce TTL was not derived above the raised wait, so the worker "
-        "would refuse it at boot: "
-        f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1920'",
+        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1800",
+        "the roll hold was not min(quiesceTtlSeconds, effective wait): "
+        f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800'",
+    )
+
+
+# The published minimum includes the actual drain Job deadline, the rendered
+# worker grace, and 60 seconds for scheduling and Helm operations.
+for path, label, expected_wait, expected_grace, expected_minimum in (
+    (default_path, "default", 900, 1860, 2940),
+    (raised_path, "raised-budget-and-grace", 1860, 2400, 4440),
+):
+    docs = load(path)
+    jobs = jobs_by_component(docs)
+    workers = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment"
+        and (doc.get("metadata") or {}).get("labels", {}).get("app.kubernetes.io/component")
+        == "worker"
+    ]
+    if len(jobs.get(DRAIN, [])) != 1 or len(workers) != 1:
+        failures.append(f"the {label} render lacks one drain Job or worker Deployment")
+        continue
+    job = jobs[DRAIN][0]
+    deadline = (job.get("spec") or {}).get("activeDeadlineSeconds")
+    grace = ((workers[0].get("spec") or {}).get("template") or {}).get("spec", {}).get(
+        "terminationGracePeriodSeconds"
+    )
+    minimum = (job.get("metadata") or {}).get("annotations", {}).get(
+        "curie.ai/minimum-helm-timeout-seconds"
+    )
+    check(
+        deadline == expected_wait + 120,
+        f"the {label} drain Job deadline is {deadline!r}, expected {expected_wait + 120}",
+    )
+    check(grace == expected_grace, f"the {label} worker grace is {grace!r}, expected {expected_grace}")
+    check(
+        isinstance(minimum, str) and minimum.isdecimal(),
+        f"the {label} minimum Helm timeout annotation is not a decimal string: {minimum!r}",
+    )
+    if isinstance(minimum, str) and minimum.isdecimal():
+        check(
+            int(minimum) == expected_minimum,
+            f"the {label} minimum Helm timeout is {minimum}, expected {expected_minimum}",
+        )
+        if isinstance(deadline, int) and isinstance(grace, int):
+            check(
+                int(minimum) == deadline + grace + 60,
+                f"the {label} minimum Helm timeout does not cover the drain Job deadline, "
+                "worker grace, and 60 second margin",
+            )
+
+# A configured hold below the wait renders and is kept; an equal one too.
+for path, label, expected in (
+    (short_ttl_path, "short-ttl", "600"),
+    (equal_ttl_path, "equal-ttl", "900"),
+):
+    env = drain_env(path, label)
+    if env is not None:
+        check(
+            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == expected,
+            f"the {label} render's CURIE_UPGRADE_QUIESCE_TTL_S is "
+            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, "
+            f"expected {expected!r}",
+        )
+
+# The invariant on every render: the hold never outlasts the drain wait.
+for path, label in (
+    (default_path, "default"),
+    (small_path, "smaller-budget"),
+    (raised_path, "raised-budget"),
+    (equal_ttl_path, "equal-ttl"),
+    (short_ttl_path, "short-ttl"),
+):
+    env = drain_env(path, label)
+    if env is None:
+        continue
+    try:
+        ttl = float(env["CURIE_UPGRADE_QUIESCE_TTL_S"]["value"])
+        wait = float(env["CURIE_UPGRADE_DRAIN_TIMEOUT_S"]["value"])
+    except (KeyError, TypeError, ValueError):
+        failures.append(f"the {label} render lacks a numeric quiesce TTL or wait")
+        continue
+    check(
+        ttl <= wait,
+        f"the {label} render holds the marker {ttl}s, longer than the {wait}s wait",
     )
 
 if failures:
@@ -318,6 +449,7 @@ default_path, fresh_second_path, client_upgrade_path, byo_path = map(
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
+ATTEST = "upgrade-drain-attest"
 
 
 def load(path):
@@ -394,7 +526,7 @@ def assert_identity_render(docs, *, observed, legacy):
     revisions = []
     identities = []
     legacy_values = []
-    for component, mode in ((DRAIN, "drain"), (RELEASE, "release")):
+    for component, mode in ((DRAIN, "drain"), (RELEASE, "release"), (ATTEST, "attest")):
         hook = one(docs, kind="Job", component=component)
         container, env = container_env(hook)
         assert container.get("command") == [
@@ -426,12 +558,14 @@ def assert_identity_render(docs, *, observed, legacy):
         revisions.append(revision["value"])
         legacy_values.append(legacy_entry["value"])
 
-    assert identities == [installation_id, installation_id], (
+    assert identities == [installation_id, installation_id, installation_id], (
         "managed Secret and hook installation identities do not match within one render"
     )
-    assert len(set(revisions)) == 1, "drain and release hooks carry different revisions"
-    assert legacy_values == [legacy, legacy], (
-        "drain and release hooks disagree on legacy compatibility"
+    assert len(set(revisions)) == 1, (
+        "drain, release, and attest hooks carry different revisions"
+    )
+    assert legacy_values == [legacy, legacy, legacy], (
+        "drain, release, and attest hooks disagree on legacy compatibility"
     )
     return installation_id, managed_name, worker_env
 
@@ -480,7 +614,7 @@ assert installation_ref.get("name") == managed_name, (
 
 print(
     "OK: one memoized installation identity reaches the managed Secret, worker and "
-    "both hooks; fresh installs rotate it; client-only upgrades are marked unobserved; "
-    "BYO credential Secrets cannot replace it"
+    "the drain, release, and attest hooks; fresh installs rotate it; client-only "
+    "upgrades are marked unobserved; BYO credential Secrets cannot replace it"
 )
 PY

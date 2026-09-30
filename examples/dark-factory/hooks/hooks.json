@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task|.*publish_changes|.*add_issue_comment",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task|.*add_issue_comment",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
+        ]
+      }
+    ]
+  }
+}

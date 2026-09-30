@@ -21,6 +21,7 @@
 //! `chat.update` edits land at this stub instead of real Slack. No Slack token,
 //! channel, or real Slack HTTP on the CLI side.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -106,6 +107,21 @@ pub(crate) fn capped(budget: Duration, deadline: Instant) -> Duration {
 /// therefore red rather than a silently blind detection (#1079).
 pub const APPROVE_ACTION_ID_PREFIX: &str = "curie-approval-approve";
 
+/// The `block_id` prefix on every block of the worker's Slack progress card
+/// (`apps/worker/src/curie_worker/blocks.py::progress_card`, ADR-0130).
+///
+/// A progress card is posted and edited like any message, and it can be the
+/// first post of a turn, which is exactly what [`observe_reply`] follows as a
+/// resumed answer. These prefixes are how the stub tells it apart, so they are
+/// frozen with the worker in `tests/vectors/progress-blocks.json` and checked
+/// in `tests::progress_block_ids_match_the_frozen_vector` below.
+pub const PROGRESS_CARD_BLOCK_ID_PREFIX: &str = "curie-progress-card:";
+
+/// The `block_id` prefix on every block of a progress milestone
+/// (`apps/worker/src/curie_worker/blocks.py::progress_milestone`); see
+/// [`PROGRESS_CARD_BLOCK_ID_PREFIX`].
+pub const PROGRESS_MILESTONE_BLOCK_ID_PREFIX: &str = "curie-progress-milestone:";
+
 /// One captured Slack Web API call at the stub.
 #[derive(Debug, Clone)]
 pub struct SlackCall {
@@ -120,14 +136,65 @@ pub struct SlackCall {
     /// payload contains a valid id. This is independent of placeholder edit
     /// ordering, so a card that arrives before its notice can still be resumed.
     pub approval_id: Option<String>,
+    /// The ts this stub answered a `chat.postMessage` with, so a wait can follow
+    /// a reply the worker posted as a new message (ADR-0179). `None` for every
+    /// other method.
+    pub posted_ts: Option<String>,
+    /// True when a block of the call carries a progress `block_id` prefix: the
+    /// worker posted or edited a progress card or milestone (ADR-0130). Such a
+    /// call is a status line at most and never the turn's reply.
+    pub progress: bool,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
+///
+/// A progress edit is never that text, even of the placeholder's own ts: a
+/// progress body is not an answer (ADR-0130 decision 5).
 pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) -> Option<&'a str> {
-    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) {
+    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) && !call.progress
+    {
         call.text.as_deref()
     } else {
         None
+    }
+}
+
+/// Follow the message this wait reports as the reply, then observe its edits.
+///
+/// The tracked message starts as the placeholder. A resumed answer below an
+/// in-thread approval card is posted as a new message instead (ADR-0179), so a
+/// post that is not an approval card, arriving before this wait has seen any
+/// edit, becomes the tracked message and its text the first snapshot. Once the
+/// placeholder carries the reply, a later post never takes its place.
+fn observe_reply(
+    call: &SlackCall,
+    tracked_ts: &mut String,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) -> bool {
+    if call.progress {
+        // A status line at most (ADR-0130). Not consumed, so a call the
+        // approval wait defers still reaches the resume wait in order.
+        if let Some(text) = call.text.as_deref() {
+            observer(text);
+        }
+        return false;
+    }
+    if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
+        if let Some(posted) = call.posted_ts.as_deref() {
+            *tracked_ts = posted.to_string();
+            if let Some(text) = call.text.as_deref() {
+                observer(text);
+                *latest = Some(text.to_string());
+            }
+            return true;
+        }
+    }
+    if placeholder_update_text(call, tracked_ts).is_some() {
+        observe_placeholder_update(call, tracked_ts, latest, observer);
+        true
+    } else {
+        false
     }
 }
 
@@ -177,13 +244,48 @@ pub fn extract_fields(
     (find("channel"), find("ts"), find("text"))
 }
 
+/// Whether a Slack call body carries a worker progress block (ADR-0130).
+///
+/// Structured, never a raw-body substring: the prefix must be the start of a
+/// block's `block_id`, so answer text that mentions it is not progress. The
+/// blocks ride the JSON body, or a JSON string in the `blocks` form field.
+pub fn is_progress_call(content_type: &str, body: &str) -> bool {
+    fn is_progress_block(block: &serde_json::Value) -> bool {
+        block
+            .get("block_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| {
+                id.starts_with(PROGRESS_CARD_BLOCK_ID_PREFIX)
+                    || id.starts_with(PROGRESS_MILESTONE_BLOCK_ID_PREFIX)
+            })
+    }
+
+    let blocks = if content_type.contains("application/json") {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|root| root.get("blocks").cloned())
+    } else {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
+        pairs
+            .iter()
+            .find(|(key, _)| key == "blocks")
+            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+    };
+    blocks
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| blocks.iter().any(is_progress_block))
+}
+
 /// Extract a validated durable approval id from a structured approval card.
 ///
-/// The worker puts the same UUID in the card's `client_msg_id` and approval
-/// action `value`. Neither copy is authoritative alone: both must be valid UUIDs
-/// and equal, and the action id must start with [`APPROVE_ACTION_ID_PREFIX`].
-/// This keeps incomplete, inconsistent, or ordinary Slack posts from being
-/// mistaken for approval control data.
+/// The approval action `value` is authoritative: reply-wire 1.1 uses its
+/// distinct `delivery_id` as `client_msg_id`, while 1.0 historically reuses the
+/// approval UUID there. The action must be structured, carry an action id that
+/// starts with [`APPROVE_ACTION_ID_PREFIX`], and hold a valid UUID value. The
+/// `client_msg_id` must also be present and UUID-valid, but need not equal the
+/// action value. This keeps incomplete, malformed, or ordinary Slack posts from
+/// becoming approval control data.
 pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     fn valid_uuid(value: &str) -> Option<String> {
         uuid::Uuid::parse_str(value).ok().map(|_| value.to_string())
@@ -254,9 +356,7 @@ pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     };
 
     match (card_seen, action_id, client_msg_id) {
-        (true, Some(action_id), Some(client_msg_id)) if action_id == client_msg_id => {
-            Some(action_id)
-        }
+        (true, Some(action_id), Some(_client_msg_id)) => Some(action_id),
         _ => None,
     }
 }
@@ -273,6 +373,7 @@ struct StubState {
 pub struct SlackStub {
     base_api_url: String,
     calls: mpsc::UnboundedReceiver<SlackCall>,
+    deferred_calls: VecDeque<SlackCall>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -327,6 +428,7 @@ impl SlackStub {
         Ok(Self {
             base_api_url: format!("http://{advertise_host}:{}/api/", addr.port()),
             calls,
+            deferred_calls: VecDeque::new(),
             server,
         })
     }
@@ -338,7 +440,17 @@ impl SlackStub {
 
     /// Await the next captured call, or `None` if the stub has shut down.
     pub async fn recv(&mut self) -> Option<SlackCall> {
-        self.calls.recv().await
+        match self.deferred_calls.pop_front() {
+            Some(call) => Some(call),
+            None => self.calls.recv().await,
+        }
+    }
+
+    /// Put calls back ahead of the live receiver for the next logical turn.
+    fn restore_calls(&mut self, calls: Vec<SlackCall>) {
+        for call in calls.into_iter().rev() {
+            self.deferred_calls.push_front(call);
+        }
     }
 }
 
@@ -358,11 +470,13 @@ async fn handle_call(
     // awaiting-approval turn is detectable regardless of encoding (#529).
     let approval_card = body.contains(APPROVE_ACTION_ID_PREFIX);
     let approval_id = approval_card_id(content_type, &body);
+    let progress = is_progress_call(content_type, &body);
     // chat.update echoes the existing ts; a hypothetical new-message call has no
     // ts, so synthesize one so the response still looks like Slack.
     let ts_out = ts
         .clone()
         .unwrap_or_else(|| synthetic_thread_and_placeholder().0);
+    let posted_ts = (method == "chat.postMessage").then(|| ts_out.clone());
     let _ = state.tx.send(SlackCall {
         method,
         channel: channel.clone(),
@@ -370,14 +484,35 @@ async fn handle_call(
         text: text.clone(),
         approval_card,
         approval_id,
+        posted_ts,
+        progress,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
+}
+
+/// First line of a failed turn's delivered reply (#3401). Frozen with the
+/// worker writer in `tests/vectors/turn-failure-reply.json`.
+pub const TURN_FAILURE_REPLY_PREFIX: &str = "curie-turn-failure:";
+
+/// The failure class on a delivered reply, or `None` when the text is not a
+/// failed turn. Only a first line of `curie-turn-failure: <token>` counts. A
+/// later mention, or a token that contains whitespace, is model text.
+pub fn failure_class_from_reply(text: &str) -> Option<&str> {
+    let line = text.trim_start_matches('\n').lines().next()?.trim();
+    let rest = line.strip_prefix(TURN_FAILURE_REPLY_PREFIX)?.trim();
+    if rest.is_empty() || rest.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    Some(rest)
 }
 
 #[derive(Debug)]
 pub enum Outcome {
     /// The worker finished the turn; the final placeholder text.
     Replied(String),
+    /// The worker delivered a reply for a failed runner turn. `class` is the
+    /// platform failure token. This is not a successful task reply (#3401).
+    Failed { reply: String, class: String },
     /// The worker finished the turn but never edited the placeholder.
     CompletedNoEdit,
     /// The turn parked awaiting human approval: the worker posted an approval
@@ -411,8 +546,17 @@ fn completed_turn_outcome(
             reply: latest,
             approval_id,
         }
+    } else if let Some(text) = latest.as_deref() {
+        if let Some(class) = failure_class_from_reply(text) {
+            Outcome::Failed {
+                reply: text.to_string(),
+                class: class.to_string(),
+            }
+        } else {
+            Outcome::Replied(text.to_string())
+        }
     } else {
-        latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied)
+        Outcome::CompletedNoEdit
     }
 }
 
@@ -448,10 +592,17 @@ pub async fn await_reply(
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
     let mut latest: Option<String> = None;
+    // The message whose edits are the reply: the placeholder, unless the turn
+    // posts its reply as a new message (see `observe_reply`).
+    let mut tracked_ts = placeholder_ts.to_string();
     // Whether the worker posted an approval card during this turn: the turn parked
     // awaiting approval rather than finalizing normally (#529).
     let mut awaiting_approval = false;
     let mut card_approval_id: Option<String> = None;
+    // A fast approval resolution can enqueue and deliver the resume before this
+    // wait has returned from the parked turn. Keep calls that do not belong to
+    // this turn and replay them to await_resume instead of losing them here.
+    let mut deferred_calls = Vec::new();
     let mut poll = tokio::time::interval(ACK_POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -461,7 +612,10 @@ pub async fn await_reply(
                     if call.approval_id.is_some() {
                         card_approval_id = call.approval_id.clone();
                     }
-                    observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                    let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                    if awaiting_approval && !call.approval_card && !consumed {
+                        deferred_calls.push(call);
+                    }
                 }
             }
             _ = poll.tick() => {
@@ -484,16 +638,23 @@ pub async fn await_reply(
                         if call.approval_id.is_some() {
                             card_approval_id = call.approval_id.clone();
                         }
-                        observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                        let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                        if awaiting_approval && !call.approval_card && !consumed {
+                            deferred_calls.push(call);
+                        }
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
                     // text (the route-bound case, where no card reaches us).
-                    return completed_turn_outcome(
+                    let outcome = completed_turn_outcome(
                         latest,
                         awaiting_approval,
                         card_approval_id,
                     );
+                    if matches!(outcome, Outcome::AwaitingApproval { .. }) {
+                        stub.restore_calls(deferred_calls);
+                    }
+                    return outcome;
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -778,6 +939,165 @@ mod tests {
         );
     }
 
+    /// The frozen progress block-id vector, parsed strictly for the same reason
+    /// as [`ActionIdVector`]. The Python lane rejects unknown keys via
+    /// `_EXPECTED_PROGRESS_VECTOR_KEYS` in `apps/worker/tests/test_blocks_progress.py`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProgressBlockVector {
+        #[serde(rename = "comment")]
+        _comment: String,
+        card_block_id_prefix: String,
+        milestone_block_id_prefix: String,
+    }
+
+    /// The Rust half of the worker vs CLI progress-block gate (ADR-0130). The
+    /// worker's constants and builders are checked against the same file by
+    /// `test_progress_block_ids_match_the_frozen_vector` in
+    /// `apps/worker/tests/test_blocks_progress.py`. The rule lives in the file.
+    #[test]
+    fn progress_block_ids_match_the_frozen_vector() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/progress-blocks.json"
+        ))
+        .expect("read tests/vectors/progress-blocks.json");
+        let parsed: ProgressBlockVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/progress-blocks.json: {err}\n\
+                 An unknown field is rejected on purpose. Teach a new key to \
+                 ProgressBlockVector here, to _EXPECTED_PROGRESS_VECTOR_KEYS in \
+                 apps/worker/tests/test_blocks_progress.py, and to both lanes' assertions."
+            )
+        });
+
+        assert_eq!(
+            parsed.card_block_id_prefix, PROGRESS_CARD_BLOCK_ID_PREFIX,
+            "the stub would read a progress card as the turn's answer"
+        );
+        assert_eq!(
+            parsed.milestone_block_id_prefix, PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
+            "the stub would read a milestone as the turn's answer"
+        );
+    }
+
+    fn card_blocks(block_id: &str) -> String {
+        format!(
+            r#"[{{"type":"section","block_id":"{block_id}","text":{{"type":"plain_text","text":"Task status: Testing","emoji":false}}}}]"#
+        )
+    }
+
+    /// ADR-0130: a progress call is told apart by the block ids the worker
+    /// stamps, in either encoding slack_sdk may send, and by nothing else.
+    #[test]
+    fn progress_blocks_are_detected_by_block_id_in_either_encoding() {
+        let card = format!(
+            r#"{{"channel":"C0EXAMPLE1","text":"Task status: Testing. x","blocks":{}}}"#,
+            card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state"))
+        );
+        assert!(is_progress_call("application/json; charset=utf-8", &card));
+
+        let milestone_blocks = card_blocks(&format!("{PROGRESS_MILESTONE_BLOCK_ID_PREFIX}1:class"));
+        let form = serde_urlencoded::to_string([
+            ("channel", "C0EXAMPLE1"),
+            ("text", "Milestone: Scope changed. y"),
+            ("blocks", milestone_blocks.as_str()),
+        ])
+        .expect("encode a form body");
+        assert!(is_progress_call("application/x-www-form-urlencoded", &form));
+
+        // The negatives: the prefix in answer text, an ordinary structured
+        // reply, an approval card, and a body that is not JSON at all.
+        let in_text = format!(
+            r#"{{"text":"see {PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state","blocks":{}}}"#,
+            card_blocks("reply-1")
+        );
+        assert!(!is_progress_call("application/json", &in_text));
+        let answer = r#"{"text":"the answer","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"the answer"}}]}"#;
+        assert!(!is_progress_call("application/json", answer));
+        let approval = format!(
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"x"}}]}}]}}"#
+        );
+        assert!(!is_progress_call("application/json", &approval));
+        assert!(!is_progress_call("application/json", "not json"));
+    }
+
+    /// A progress card posted before the placeholder is edited is not the reply
+    /// the way a resumed answer post is: it is a status line, and its later
+    /// edits are status lines too.
+    #[test]
+    fn a_progress_post_and_its_edits_are_never_the_reply() {
+        let (latest, seen) = replay(&[
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("card"),
+                "Task status: Queued. x",
+            ),
+            progress_call("chat.update", Some("card"), None, "Task status: Testing. y"),
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("m1"),
+                "Milestone: Scope changed. z",
+            ),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+        assert_eq!(
+            seen,
+            vec![
+                "Task status: Queued. x",
+                "Task status: Testing. y",
+                "the answer",
+                "Milestone: Scope changed. z",
+            ]
+        );
+    }
+
+    /// The negative for the tracked message itself: a progress edit of the ts
+    /// the wait follows still does not replace the answer.
+    #[test]
+    fn a_progress_edit_of_the_tracked_message_is_not_the_answer() {
+        let edit = progress_call("chat.update", Some("ph"), None, "Task complete. done");
+        assert_eq!(placeholder_update_text(&edit, "ph"), None);
+
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            edit,
+        ]);
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// The stub marks what it captured, so the wait never has to re-parse.
+    #[tokio::test]
+    async fn the_stub_marks_a_captured_progress_call() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"channel":"C0EXAMPLE1","text":"Task status: Queued. x","blocks":{}}}"#,
+                card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r1:state"))
+            ))
+            .send()
+            .await
+            .expect("the stub answers");
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C0EXAMPLE1"), ("text", "the answer")])
+            .send()
+            .await
+            .expect("the stub answers");
+
+        assert!(stub.recv().await.expect("the progress post").progress);
+        assert!(!stub.recv().await.expect("the answer post").progress);
+    }
+
     #[test]
     fn extract_fields_reads_form_and_json_bodies() {
         let (channel, ts, text) = extract_fields(
@@ -798,13 +1118,28 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_id_requires_equal_structured_uuid_copies() {
-        let id = "00000000-0000-4000-8000-000000000220";
+    fn a_failure_marked_placeholder_is_not_a_successful_reply() {
+        let reply = "curie-turn-failure: history-persistence-error\n\nrun failed";
+        match completed_turn_outcome(Some(reply.into()), false, None) {
+            Outcome::Failed { class, .. } => {
+                assert_eq!(class, "history-persistence-error");
+            }
+            outcome => panic!("expected Failed, got {outcome:?}"),
+        }
+        match completed_turn_outcome(Some("the answer is PONG".into()), false, None) {
+            Outcome::Replied(text) => assert_eq!(text, "the answer is PONG"),
+            outcome => panic!("expected Replied, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_card_id_reads_the_structured_action_value() {
+        let approval_id = "00000000-0000-4000-8000-000000000220";
         let body = format!(
-            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{id}"}}]}}]}}"#
+            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{approval_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
         );
         let captured = approval_card_id("application/json", &body);
-        assert_eq!(captured.as_deref(), Some(id));
+        assert_eq!(captured.as_deref(), Some(approval_id));
 
         // The card can win the Slack-call race while the latest placeholder is
         // still ordinary text. Preserve that text for output, but carry the
@@ -812,7 +1147,10 @@ mod tests {
         match completed_turn_outcome(Some("working".into()), true, captured) {
             Outcome::AwaitingApproval { reply, approval_id } => {
                 assert_eq!(reply.as_deref(), Some("working"));
-                assert_eq!(approval_id.as_deref(), Some(id));
+                assert_eq!(
+                    approval_id.as_deref(),
+                    Some("00000000-0000-4000-8000-000000000220")
+                );
             }
             outcome => panic!("approval card was not classified as awaiting: {outcome:?}"),
         }
@@ -839,27 +1177,86 @@ mod tests {
         }
     }
 
+    fn approval_card_body(
+        content_type: &str,
+        client_msg_id: Option<&str>,
+        approval_id: &str,
+    ) -> String {
+        let blocks = serde_json::json!([{
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "action_id": APPROVE_ACTION_ID_PREFIX,
+                "value": approval_id,
+            }],
+        }]);
+        if content_type.contains("application/json") {
+            let mut body = serde_json::json!({"blocks": blocks});
+            if let Some(client_msg_id) = client_msg_id {
+                body["client_msg_id"] = serde_json::json!(client_msg_id);
+            }
+            return serde_json::to_string(&body).expect("encode approval card JSON");
+        }
+
+        let blocks = serde_json::to_string(&blocks).expect("encode approval card blocks");
+        let mut pairs = vec![("blocks", blocks.as_str())];
+        if let Some(client_msg_id) = client_msg_id {
+            pairs.push(("client_msg_id", client_msg_id));
+        }
+        serde_urlencoded::to_string(pairs).expect("encode approval card form")
+    }
+
     #[test]
-    fn approval_card_id_rejects_mismatched_or_missing_uuid_copies() {
-        let client_id = "00000000-0000-4000-8000-000000000220";
-        let action_id = "00000000-0000-4000-8000-000000000221";
-        let mismatched = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
-        );
-        let missing_client = format!(
-            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
-        );
+    fn approval_card_id_accepts_equal_or_distinct_valid_client_keys() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
+        let approval_id = "00000000-0000-4000-8000-000000000221";
+
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [approval_id, delivery_id] {
+                let body = approval_card_body(content_type, Some(client_msg_id), approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body).as_deref(),
+                    Some(approval_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_missing_or_invalid_client_keys() {
+        let approval_id = "00000000-0000-4000-8000-000000000221";
+
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [None, Some("not-a-uuid")] {
+                let body = approval_card_body(content_type, client_msg_id, approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body),
+                    None,
+                    "{content_type} accepted client_msg_id={client_msg_id:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_a_missing_action_value() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
         let missing_action_value = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
+            r#"{{"client_msg_id":"{delivery_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
         );
 
-        for body in [&mismatched, &missing_client, &missing_action_value] {
-            assert!(body.contains(APPROVE_ACTION_ID_PREFIX));
-            assert_eq!(approval_card_id("application/json", body), None);
-            match completed_turn_outcome(None, true, approval_card_id("application/json", body)) {
-                Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
-                outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
-            }
+        assert!(missing_action_value.contains(APPROVE_ACTION_ID_PREFIX));
+        assert_eq!(
+            approval_card_id("application/json", &missing_action_value),
+            None
+        );
+        match completed_turn_outcome(
+            None,
+            true,
+            approval_card_id("application/json", &missing_action_value),
+        ) {
+            Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+            outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
         }
     }
 
@@ -872,6 +1269,8 @@ mod tests {
             text: Some("the answer".into()),
             approval_card: false,
             approval_id: None,
+            posted_ts: None,
+            progress: false,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).
@@ -882,6 +1281,153 @@ mod tests {
             ..update.clone()
         };
         assert_eq!(placeholder_update_text(&post, "1.2"), None);
+    }
+
+    fn stub_call(method: &str, ts: Option<&str>, posted: Option<&str>, text: &str) -> SlackCall {
+        SlackCall {
+            method: method.into(),
+            channel: Some("C1".into()),
+            ts: ts.map(str::to_string),
+            text: Some(text.into()),
+            approval_card: false,
+            approval_id: None,
+            posted_ts: posted.map(str::to_string),
+            progress: false,
+        }
+    }
+
+    fn progress_call(
+        method: &str,
+        ts: Option<&str>,
+        posted: Option<&str>,
+        text: &str,
+    ) -> SlackCall {
+        SlackCall {
+            progress: true,
+            ..stub_call(method, ts, posted, text)
+        }
+    }
+
+    fn replay(calls: &[SlackCall]) -> (Option<String>, Vec<String>) {
+        let mut tracked = "ph".to_string();
+        let mut latest = None;
+        let mut seen = Vec::new();
+        for call in calls {
+            observe_reply(call, &mut tracked, &mut latest, &mut |text| {
+                seen.push(text.to_string())
+            });
+        }
+        (latest, seen)
+    }
+
+    /// ADR-0179 decision 3: a resumed answer below an in-thread card is a NEW
+    /// message, so the wait follows the post instead of the placeholder above
+    /// the card. The settled card's own edit is not the reply.
+    #[test]
+    fn a_resumed_answer_posted_below_the_card_is_the_reply() {
+        let (latest, seen) = replay(&[
+            stub_call("chat.update", Some("card-ts"), None, "Approved"),
+            stub_call("chat.postMessage", None, Some("p1"), "Starting up"),
+            stub_call("chat.update", Some("p1"), None, "Filed report-v1.md"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("Filed report-v1.md"));
+        assert_eq!(seen, vec!["Starting up", "Filed report-v1.md"]);
+    }
+
+    /// ADR-0179 decision 3: a fast resume can post before the first wait finishes
+    /// draining the approval turn. That post belongs to the NEXT wait, not the
+    /// already-populated pause notice.
+    #[test]
+    fn a_fast_resumed_post_is_preserved_for_the_resume_wait() {
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let mut first_tracked = "ph".to_string();
+        let mut pause = Some("Approval requested. See the card below.".to_string());
+        let mut seen = Vec::new();
+
+        assert!(!observe_reply(
+            &post,
+            &mut first_tracked,
+            &mut pause,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(
+            pause.as_deref(),
+            Some("Approval requested. See the card below.")
+        );
+
+        let mut resume_tracked = "ph".to_string();
+        let mut resumed = None;
+        assert!(observe_reply(
+            &post,
+            &mut resume_tracked,
+            &mut resumed,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(resumed.as_deref(), Some("Starting up"));
+    }
+
+    /// Calls drained from an approval turn are replayed in wire order when the
+    /// resume wait starts, so the new post is seen before edits to its minted ts.
+    #[tokio::test]
+    async fn deferred_calls_are_replayed_in_wire_order() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let update = stub_call("chat.update", Some("p1"), None, "Done");
+
+        stub.restore_calls(vec![post, update]);
+
+        assert_eq!(stub.recv().await.unwrap().method, "chat.postMessage");
+        assert_eq!(stub.recv().await.unwrap().method, "chat.update");
+    }
+
+    /// The negative: once the placeholder carries the reply, a later post (a
+    /// second message the turn happens to send) does not take its place.
+    #[test]
+    fn a_post_after_the_placeholder_was_edited_is_not_the_reply() {
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            stub_call("chat.postMessage", None, Some("p2"), "something else"),
+            stub_call("chat.update", Some("p2"), None, "something else, edited"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// An approval card is never the reply, even when it is the first post.
+    #[test]
+    fn an_approval_card_post_is_never_followed_as_the_reply() {
+        let mut card = stub_call("chat.postMessage", None, Some("p1"), "Approval required: x");
+        card.approval_card = true;
+        let (latest, seen) = replay(&[card, stub_call("chat.update", Some("p1"), None, "edited")]);
+
+        assert_eq!(latest, None);
+        assert!(seen.is_empty());
+    }
+
+    /// The stub reports the ts it answered a post with, which is what lets the
+    /// wait follow a reply posted as a new message.
+    #[tokio::test]
+    async fn the_stub_reports_the_ts_it_answered_a_post_with() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C1"), ("thread_ts", "1.0"), ("text", "hello")])
+            .send()
+            .await
+            .expect("the stub answers")
+            .json()
+            .await
+            .expect("the stub answers JSON");
+        let call = stub.recv().await.expect("the stub records the call");
+
+        assert_eq!(call.method, "chat.postMessage");
+        assert_eq!(call.posted_ts.as_deref(), response["ts"].as_str());
+        assert!(call.posted_ts.is_some());
     }
 
     #[test]

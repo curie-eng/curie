@@ -18,6 +18,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# util-linux flock, with its exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 SELF_TEST=0
 FORCE=0
 KEEP=0
@@ -180,7 +182,7 @@ release_identities_match() {
     [[ -f "$chart" && -f "$cargo" ]] || return 1
     chart_identity="$(chart_version "$chart")"
     cli_identity="$(cli_version "$cargo")"
-    [[ "$chart_identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$chart_identity" == "$cli_identity" ]]
+    [[ "$chart_identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ && "$chart_identity" == "$cli_identity" ]]
 }
 
 parse_args() {
@@ -1413,7 +1415,7 @@ if (( SELF_TEST )); then
 fi
 load_env_file
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! "$GNU_PROCESS" flock -n 9; then
     die "another upgrade-drill holds $LOCK_FILE"
 fi
 run_matrix

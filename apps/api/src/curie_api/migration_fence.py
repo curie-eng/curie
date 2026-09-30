@@ -106,10 +106,20 @@ FENCED_TABLES = (f"{SCHEMA}.{CHANNELS}", f"{SCHEMA}.{APPROVALS}")
 LOCK_MODE = "ACCESS EXCLUSIVE"
 
 #: The one reply kind whose egress identity is legitimately implicit: Slack
-#: replies go back through the worker's configured Slack origin, so NULL is the
-#: correct -- and the only correct -- adapter for a Slack row. Named here
-#: because `load_declarations` enforces the pair rule the document states.
+#: replies go back through the worker's configured Slack origin, so a Slack
+#: row's adapter names its identity (`DEFAULT_IDENTITY` below), never an
+#: egress credential. Named here because `load_declarations` enforces the rule
+#: the document states.
 SLACK_KIND = "slack"
+
+#: The name of a Slack row's default identity (ADR-0168 decision 3), and the
+#: stored form a honored Slack declaration takes. A declaration is an OPERATOR
+#: document, so it may also say null, which means the same. This module may import
+#: only the standard library, `sqlalchemy` and `alembic` (module docstring),
+#: so this is a second copy of `aci_protocol.turn.DEFAULT_IDENTITY` rather
+#: than an import of it -- the same reason `SLACK_KIND` above is a second copy
+#: of `aci_protocol.turn.SLACK_KIND`.
+DEFAULT_IDENTITY = "default"
 
 #: The worker is already quiesced at hook weight -10, so the only remaining
 #: contenders are ordinary API requests whose budgets are sub-second. 15 s
@@ -145,7 +155,7 @@ AUDIT_COLUMNS_AT_0013 = frozenset(
 #: Every field is required. The point of the document is that a human vouched
 #: for the row, so an anonymous or unexplained declaration is not a weaker
 #: declaration, it is not one at all. `reply_adapter` is required as a KEY and
-#: may be null as a VALUE, because NULL is the correct adapter for a Slack row.
+#: may be null as a VALUE for a Slack row, where it means the default identity.
 REQUIRED_FIELDS = ("approval_id", "reply_kind", "actor", "reason")
 OPTIONAL_NULLABLE_FIELDS = ("reply_adapter",)
 
@@ -156,7 +166,10 @@ class Declaration:
 
     approval_id: str
     reply_kind: str
+    #: The stored form: `default` for any Slack declaration.
     reply_adapter: str | None
+    #: What the operator wrote, kept for the audit record.
+    reply_adapter_as_written: str | None
     actor: str
     reason: str
 
@@ -381,18 +394,21 @@ def load_declarations() -> dict[str, Declaration]:
         # egress identity that raised the guard was still missing, the migration
         # succeeded, and the eventual reply failed for want of a credential --
         # the exact latent failure the guard exists to stop, now laundered
-        # through a declaration. Slack is the mirror image: an adapter on a
-        # Slack row names a credential the Slack egress never consults, and
-        # would breach 0024's `agent_channels_route_pair_ck` reasoning about
-        # what a complete route is.
+        # through a declaration. Slack is the mirror image: a Slack reply's
+        # adapter is its identity, never an egress credential.
+        #
+        # A Slack declaration may name only the default identity, as null or
+        # `'default'`. Declarations are honored only by 0022 and 0024, whose
+        # unreconstructable rows predate ADR-0168, so no named Slack identity
+        # can have raised one.
         kind = str(entry["reply_kind"]).strip()
-        if kind == SLACK_KIND and adapter is not None:
+        if kind == SLACK_KIND and adapter not in (None, DEFAULT_IDENTITY):
             raise _declaration_refusal(
                 raw_path,
                 f"{label} declares reply_kind {SLACK_KIND!r} with a 'reply_adapter' of "
                 f"{adapter!r}; a Slack reply goes back through the worker's configured "
-                "Slack origin and names no egress credential, so its adapter must be "
-                "null",
+                "Slack origin and names only its default identity, so "
+                f"'reply_adapter' must be null or {DEFAULT_IDENTITY!r}",
             )
         if kind != SLACK_KIND and adapter is None:
             raise _declaration_refusal(
@@ -405,10 +421,13 @@ def load_declarations() -> dict[str, Declaration]:
                 "has to be named",
             )
 
+        stored_adapter = DEFAULT_IDENTITY if kind == SLACK_KIND else str(adapter).strip()
+
         declarations[approval_id] = Declaration(
             approval_id=approval_id,
             reply_kind=kind,
-            reply_adapter=None if adapter is None else str(adapter).strip(),
+            reply_adapter=stored_adapter,
+            reply_adapter_as_written=None if adapter is None else str(adapter),
             actor=str(entry["actor"]).strip(),
             reason=str(entry["reason"]).strip(),
         )
@@ -446,7 +465,8 @@ def _already_honored(conn: Connection, *, declaration: Declaration) -> bool:
             WHERE approval_id = CAST(:id AS uuid)
               AND action = CAST(:action AS text)
               AND evidence ->> 'declared_reply_kind' = CAST(:kind AS text)
-              AND (evidence ->> 'declared_reply_adapter')
+              AND COALESCE(evidence ->> 'declared_reply_adapter',
+                           CASE WHEN CAST(:kind AS text) = 'slack' THEN 'default' END)
                   IS NOT DISTINCT FROM CAST(:adapter AS text)
             LIMIT 1
             """
@@ -584,13 +604,16 @@ def honor_declarations(
             ),
             {"id": approval_id},
         ).one()
-        if (resulting_kind == SLACK_KIND) != (resulting_adapter is None):
+        slack_reply = resulting_kind == SLACK_KIND
+        if (slack_reply and resulting_adapter not in (None, DEFAULT_IDENTITY)) or (
+            not slack_reply and resulting_adapter is None
+        ):
             raise _declaration_refusal(
                 path,
                 f"honoring the declaration for {approval_id} would leave reply_kind "
                 f"{resulting_kind!r} with reply_adapter {resulting_adapter!r}, which "
-                "does not satisfy this revision's routing obligation: exactly a Slack "
-                "reply has no adapter",
+                "does not satisfy this revision's routing obligation: a Slack reply "
+                "names the default identity; any other reply names its adapter",
             )
         _append_audit_entry(
             conn,
@@ -619,6 +642,7 @@ def _append_audit_entry(
         {
             "declared_reply_kind": declaration.reply_kind,
             "declared_reply_adapter": declaration.reply_adapter,
+            "declared_reply_adapter_as_written": declaration.reply_adapter_as_written,
             "revision": revision,
             "preflight_reason": preflight_reason,
             # What this revision already knew, so the record says which half of
@@ -711,8 +735,8 @@ def identity_report(rows: Sequence[UnreconstructableRow], *, revision: str) -> s
         f"{len(rows)} approval(s) whose reply identity could not be reconstructed:\n"
         f"{listing}\n\n"
         "Fill in one declaration per row below, stating the identity each approval "
-        "was RAISED on (every field is required; reply_adapter may be null, and "
-        "only null, for a Slack row), put it in a Secret, and supply it to the "
+        "was RAISED on (every field is required; reply_adapter may be null or "
+        f"{DEFAULT_IDENTITY!r} for a Slack row), put it in a Secret, and supply it to the "
         f"migration through {DECLARATIONS_ENV}:\n\n"
         f"{declaration_skeleton(rows)}\n"
     )

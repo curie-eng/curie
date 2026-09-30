@@ -14,7 +14,7 @@
 #
 # `valkey.tls` is threaded to all of it through ONE shared helper
 # (`curie.valkey.tls`), included from both `curie.env.valkey` (api, worker,
-# dispatcher, both upgrade-hook Jobs) and `curie.langfuse.env` (both Langfuse
+# dispatcher, the upgrade-hook Jobs) and `curie.langfuse.env` (both Langfuse
 # Deployments). The bug class this repo has hit twice (#2052, #2327) is exactly
 # "two consumer groups read the same `valkey.*` field and only one of them was
 # updated" -- silent and asymmetric: the render stays healthy, some consumers
@@ -24,18 +24,18 @@
 # Asserts:
 #
 #   1. `byo-tls` (deploy=false + host + tls=true): VALKEY_TLS == "true" on the
-#      api, worker and dispatcher containers, AND on both worker-upgrade-drain
-#      hook Job containers (drain and release -- resolved by their `--mode`
-#      arg, the way `upgrade-drain-assertions.sh` does, not by container name
-#      alone); REDIS_TLS_ENABLED == "true" on both Langfuse Deployment
-#      containers. All seven checked in ONE render, so a fix applied to one
+#      api, worker and dispatcher containers, AND on the worker-upgrade-drain
+#      hook Job containers (drain, release, and attest -- resolved by their
+#      `--mode` arg, the way `upgrade-drain-assertions.sh` does, not by
+#      container name alone); REDIS_TLS_ENABLED == "true" on both Langfuse
+#      Deployment containers. All eight checked in ONE render, so a fix applied to one
 #      include site and not its sibling fails this gate.
 #   2. `byo-tls` transport/identity parity, in the SAME render: VALKEY_HOST /
 #      REDIS_HOST still resolve to the BYO host, and VALKEY_PASSWORD /
 #      REDIS_AUTH still resolve to their `secretKeyRef`. Prevents "fixing" TLS
 #      by breaking the BYO host or credential path.
 #   3. `byo-plain` (the same BYO shape, `valkey.tls` left at its default):
-#      every one of the seven containers carries the var with the LITERAL
+#      every one of the eight containers carries the var with the LITERAL
 #      value "false" -- present, and false. This is what makes assertion 1
 #      non-vacuous: without it, a template that emitted "true" unconditionally
 #      would pass.
@@ -47,7 +47,7 @@
 #      stderr names BOTH `valkey.tls` and `valkey.deploy`. Asserting only the
 #      exit code would pass against any unrelated template error. The in-chart
 #      `valkey/valkey:8-alpine` StatefulSet serves no TLS listener, so
-#      rendering TLS against it would break all seven consumers at once with a
+#      rendering TLS against it would break all eight consumers at once with a
 #      perfectly healthy-looking manifest.
 #   6. NEGATIVE CONTROL -- string coercion: `--set-string valkey.tls=false` on
 #      a BYO render still yields "false" everywhere and does not trip the
@@ -194,7 +194,7 @@ def all_containers(manifest_path):
 def mode_of(container):
     """The value following `--mode` in a container's command, or None.
 
-    Both worker-upgrade-drain hook Job containers live in the SAME manifest
+    The worker-upgrade-drain hook Job containers live in the SAME manifest
     file and are told apart by which mode they run, not by container identity
     alone -- the same signal upgrade-drain-assertions.sh checks.
     """
@@ -284,6 +284,11 @@ def tls_consumers(templates_dir):
             by_mode(f"{templates_dir}/worker-upgrade-drain.yaml", "release"),
         ),
         (
+            "upgrade-drain (attest)",
+            "VALKEY_TLS",
+            by_mode(f"{templates_dir}/worker-upgrade-drain.yaml", "attest"),
+        ),
+        (
             "langfuse-web",
             "REDIS_TLS_ENABLED",
             by_name(f"{templates_dir}/langfuse.yaml", "langfuse-web"),
@@ -296,7 +301,7 @@ def tls_consumers(templates_dir):
     ]
 
 
-# ---- 1: byo-tls, all seven consumer containers carry TLS == "true". --------
+# ---- 1: byo-tls, all eight consumer containers carry TLS == "true". --------
 for label, env_name, containers in tls_consumers(BYO_TLS_DIR):
     check_literal("1", containers, label, env_name, "true", "byo-tls render")
 
@@ -362,7 +367,7 @@ if failures:
     print(f"{len(failures)} python-side assertion(s) failed", file=sys.stderr)
     sys.exit(1)
 
-print("  [1] byo-tls: VALKEY_TLS/REDIS_TLS_ENABLED == true on all seven consumer containers: OK")
+print("  [1] byo-tls: VALKEY_TLS/REDIS_TLS_ENABLED == true on all eight consumer containers: OK")
 print("  [2] byo-tls: VALKEY_HOST/REDIS_HOST and VALKEY_PASSWORD/REDIS_AUTH parity preserved: OK")
 print("  [3] byo-plain: every consumer carries the literal \"false\": OK")
 print("  [4] default: every consumer carries \"false\" and templates/valkey.yaml still renders: OK")
@@ -375,7 +380,7 @@ echo "=== Rendering (guard: valkey.tls=true with valkey.deploy left at its defau
 # NEGATIVE CONTROL, asserted by EXECUTING the rejected configuration, not by
 # reading the helper: a guard that has never been seen refusing is a guard
 # nobody has tested. The in-chart valkey/valkey:8-alpine StatefulSet serves no
-# TLS listener, so rendering TLS against it would break all seven consumers at
+# TLS listener, so rendering TLS against it would break all eight consumers at
 # once with a perfectly healthy-looking manifest and no failing preflight.
 GUARD_OUT="$(helm template rel "$CHART" --set valkey.tls=true 2>&1)" && {
   fail "[5] valkey.tls=true with valkey.deploy left true rendered successfully; expected a render-time refusal"
@@ -391,7 +396,7 @@ done
 echo "  [5] negative control: valkey.tls=true + valkey.deploy=true is refused at render time, naming both keys: OK"
 
 echo
-echo "PASS: valkey.tls reaches every consumer (api, worker, dispatcher, both"
-echo "      upgrade-hook Jobs, both Langfuse Deployments), the default and"
+echo "PASS: valkey.tls reaches every consumer (api, worker, dispatcher, the"
+echo "      drain, attest, and release hook Jobs, both Langfuse Deployments), the default and"
 echo "      BYO-plain renders stay cleartext, and the deploy+tls guard refuses"
 echo "      the one configuration that would break all of it silently."

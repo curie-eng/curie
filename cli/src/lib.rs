@@ -16,6 +16,7 @@ pub mod comms;
 pub mod completion_outbox;
 pub mod config_migrate;
 pub mod connector_build;
+pub mod connector_caller;
 pub mod connectors;
 pub mod credcheck;
 pub mod delivery;
@@ -59,6 +60,10 @@ pub mod spec;
 pub mod state;
 pub mod ui;
 pub(crate) mod worker_claims;
+
+#[cfg(test)]
+#[path = "../tests/support/executable.rs"]
+pub(crate) mod test_executable;
 
 pub use retired::retired_hint;
 

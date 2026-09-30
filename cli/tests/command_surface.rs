@@ -313,25 +313,6 @@ fn process_dev_help_lists_the_plugin_compat_gate() {
     );
 }
 
-/// `curie dev sre-demo-e2e` is the operator-facing name of the #2246 / #2854
-/// nightly SRE demo assertions. If the verb stops being reachable, the
-/// workflow still calls the script but nobody can run the skip/prereq check
-/// locally.
-#[test]
-fn process_dev_help_lists_sre_demo_e2e() {
-    let output = run_help(&["dev"]);
-    assert!(
-        output.status.success(),
-        "expected success for dev help\n{}",
-        output_text(&output)
-    );
-    let text = output_text(&output);
-    assert!(
-        help_lists_subcommand(&text, "sre-demo-e2e"),
-        "missing sre-demo-e2e\n{text}"
-    );
-}
-
 /// `curie dev two-release-approval-e2e` is the operator-facing name of the
 /// #2307 two-release owner-only Slack approval fixture. If the verb stops
 /// being reachable, the workflow still calls the script but nobody can run
@@ -702,21 +683,33 @@ fn cluster_namespace_env_reaches_every_cluster_verb() {
         let name = subcommand["name"]
             .as_str()
             .expect("cluster subcommand has a name");
-        let namespace_args: Vec<_> = subcommand["args"]
-            .as_array()
-            .expect("cluster subcommand has arguments")
-            .iter()
-            .filter(|arg| arg["id"] == "namespace")
-            .collect();
-        assert_eq!(
-            namespace_args.len(),
-            1,
-            "cluster {name} must expose exactly one namespace argument"
-        );
-        assert_eq!(
-            namespace_args[0]["env"], "CURIE_NAMESPACE",
-            "cluster {name} must read CURIE_NAMESPACE"
-        );
+        let leaves: Vec<_> = if subcommand["args"].as_array().is_some() {
+            vec![subcommand]
+        } else {
+            subcommand["subcommands"]
+                .as_array()
+                .expect("cluster command has arguments or nested actions")
+                .iter()
+                .collect()
+        };
+        for leaf in leaves {
+            let leaf_name = leaf["name"].as_str().expect("cluster leaf has a name");
+            let namespace_args: Vec<_> = leaf["args"]
+                .as_array()
+                .expect("cluster leaf has arguments")
+                .iter()
+                .filter(|arg| arg["id"] == "namespace")
+                .collect();
+            assert_eq!(
+                namespace_args.len(),
+                1,
+                "cluster {name} {leaf_name} must expose exactly one namespace argument"
+            );
+            assert_eq!(
+                namespace_args[0]["env"], "CURIE_NAMESPACE",
+                "cluster {name} {leaf_name} must read CURIE_NAMESPACE"
+            );
+        }
     }
 }
 
@@ -958,5 +951,67 @@ fn retired_hint_returns_none_for_valid_starts_help_and_message_bodies() {
 
     for argv in cases.iter().copied() {
         assert_hint_none(argv);
+    }
+}
+
+fn collect_command_paths(node: &serde_json::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
+    for sub in node["subcommands"].as_array().into_iter().flatten() {
+        let mut path = prefix.to_vec();
+        path.push(sub["name"].as_str().expect("subcommand name").to_owned());
+        out.push(path.clone());
+        collect_command_paths(sub, &path, out);
+    }
+}
+
+/// #2982: `--help` must never print the value of `CURIE_API_KEY`. Every
+/// command path is swept, so a new API key argument declared with `env` but
+/// without `hide_env_values` fails here instead of leaking the platform key.
+#[test]
+fn help_never_discloses_the_curie_api_key_value() {
+    const SENTINEL: &str = "sentinel-api-key-2982-do-not-print";
+    let mut paths = Vec::new();
+    collect_command_paths(&live_command_manifest(), &[], &mut paths);
+    assert!(
+        paths.iter().any(|p| p == &["local", "message"])
+            && paths.iter().any(|p| p == &["cluster", "message"])
+            && paths.iter().any(|p| p == &["doctor"]),
+        "manifest walk lost the #2982 commands: {paths:?}"
+    );
+
+    let mut leaks = Vec::new();
+    for path in &paths {
+        let output = Command::new(bin())
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL)
+            .output()
+            .expect("run curie --help");
+        let text = output_text(&output);
+        if text.contains(SENTINEL) {
+            leaks.push(path.join(" "));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "--help printed CURIE_API_KEY for: {leaks:?}"
+    );
+
+    for path in [
+        &["local", "message"][..],
+        &["cluster", "message"],
+        &["doctor"],
+    ] {
+        let mut command = Command::new(bin());
+        command
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL);
+        let output = command.output().expect("run curie --help");
+        let text = output_text(&output);
+        assert!(output.status.success(), "{path:?} --help failed\n{text}");
+        assert!(
+            text.contains("--api-key") && text.contains("CURIE_API_KEY"),
+            "{path:?} help lost the --api-key flag or its env name\n{text}"
+        );
     }
 }

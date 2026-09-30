@@ -164,7 +164,10 @@ PY
 if grep -qE '^kind: ClusterRole' <<<"$ENABLED"; then
   fail f "the worker template rendered a ClusterRole; connector RBAC must stay namespaced"
 fi
-if grep -q "pods" <<<"$ENABLED_RULES"; then
+# The base Role's exact-pod read (#3169) is not the connector's grant: check
+# only the lines the reconciler flag adds.
+CONNECTOR_RULES="$(comm -13 <(sort <<<"$DISABLED_RULES") <(sort <<<"$ENABLED_RULES"))"
+if grep -q "pods" <<<"$CONNECTOR_RULES"; then
   fail f "the connector Role mentions pods; it manages objects, never pods directly"
 fi
 

@@ -253,6 +253,20 @@ if program == "kubectl":
                 # Live k3s Node.status.images cap omits BusyBox and ClickHouse.
                 # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
                 images = [{"names": ["docker.io/library/unrelated:1"]}]
+            if scenario.startswith("alias-shorter-truncated"):
+                # #3352: kubelet reports only the largest nodeStatusMaxImages
+                # (default 50) entries, so a long-lived node omits ClickHouse
+                # and BusyBox from a full inventory.
+                # https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/
+                images = [
+                    {
+                        "names": [
+                            f"docker.io/library/unrelated-{index}:1",
+                            f"docker.io/library/unrelated-{index}@sha256:" + f"{index:064x}",
+                        ]
+                    }
+                    for index in range(50)
+                ]
             if scenario == "alias-shorter-separate-digest":
                 images = [
                     {"names": ["docker.io/library/busybox:1.36.1"]},
@@ -475,6 +489,12 @@ if program == "kubectl":
             pods[0]["status"]["containerStatuses"][0]["imageID"] = ""
             pods[0]["status"]["initContainerStatuses"][0]["imageID"] = ""
             pods[1]["status"]["containerStatuses"][0]["imageID"] = ""
+        if scenario == "alias-shorter-truncated-wrong-repository":
+            pods[1]["status"]["containerStatuses"][0]["imageID"] = clickhouse_id.replace(
+                "clickhouse-server", "other-server"
+            )
+        if scenario == "alias-shorter-truncated-opaque":
+            pods[1]["status"]["containerStatuses"][0]["imageID"] = "containerd://sha256:" + "c" * 64
         if scenario == "alias-shorter-omitted-opaque":
             # Opaque runtime id is not a repository digest.
             # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#ContainerStatus

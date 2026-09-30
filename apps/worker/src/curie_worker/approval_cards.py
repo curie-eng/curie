@@ -78,10 +78,12 @@ class ApprovalCardRef:
     may not even share a transport with), so the settle path must re-use the
     whole destination rather than rebuild two thirds of it from the resume turn.
     ``kind`` is the discriminator for a pre-upgrade entry: ``""`` means the
-    destination was never recorded, and the kernel falls back to the resume
-    turn's kind and route exactly as it did before. A non-empty ``kind`` means
-    the triple is authoritative, and ``adapter=None`` there means the worker's
-    default transport for that kind rather than "unknown".
+    destination kind and identity were never recorded. The kernel falls back to
+    the resume turn's kind, but keeps the historical default transport identity:
+    those cards predate identity-aware routes and were posted by that default.
+    A non-empty ``kind`` means the triple is authoritative, and ``adapter=None``
+    there means the worker's default transport for that kind rather than
+    "unknown".
     """
 
     channel: str
@@ -258,6 +260,26 @@ class ApprovalCardStore:
             raise ValueError("approval_id is required to remember a notice ref")
         await self._redis.set(
             self._config.approval_notice_ref_key(approval_id), ref, ex=self._ttl_s
+        )
+
+    async def remember_reply_below_card(self, approval_id: str) -> None:
+        """Remember that this approval's resume answers below its card (ADR-0179).
+
+        Kept apart from the card ref, which settling consumes, so a redelivered
+        resume still finds it. Same TTL as the card.
+        """
+
+        if not approval_id:
+            raise ValueError("approval_id is required to remember a reply placement")
+        await self._redis.set(
+            self._config.approval_reply_below_card_key(approval_id), b"1", ex=self._ttl_s
+        )
+
+    async def replies_below_card(self, approval_id: str) -> bool:
+        """Whether this approval's resume answers below its card (ADR-0179)."""
+
+        return bool(
+            await self._redis.exists(self._config.approval_reply_below_card_key(approval_id))
         )
 
     async def read_notice_ref(self, approval_id: str) -> str | None:

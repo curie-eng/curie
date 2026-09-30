@@ -4,6 +4,12 @@ Date: 2026-08-21
 
 Status: Accepted
 
+**Amended by [ADR-0180](0180-the-turn-receipt-is-an-install-choice.md)**
+(back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 7's receipt is now an install choice. `all`, the default, renders it
+as built; `failures` renders only the failed actions; `off` renders none. The
+rest of this ADR stands.
+
 Issue: #1861
 
 Completes the pair [ADR-0010](0010-approval-gates-and-human-in-the-loop.md)

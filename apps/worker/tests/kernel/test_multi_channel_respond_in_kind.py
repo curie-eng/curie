@@ -31,13 +31,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import itertools
-import time
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, SessionStatus, TextDelta
 from channel_protocol.reply import (
     ReplyAck,
     ReplyEvent,
@@ -47,6 +49,14 @@ from channel_protocol.reply import (
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, ResolvedDeployment
 from curie_worker.reply_sink import TargetRoute
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until  # noqa: E402
+
+_wait_until = functools.partial(wait_until, timeout=10.0)
 
 DONE = SessionStatus.DONE
 
@@ -87,7 +97,9 @@ class OneAgentTwoBindings:
             adapter=None,
         )
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
         self.resolve_calls.append((kind, address))
         if (kind, address) in (("slack", CHANNEL_A), ("slack", CHANNEL_B)):
             return self._deployment()
@@ -200,10 +212,15 @@ class RecordingSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         fresh_only: bool = False,
     ) -> Any:
         handle = self._inner.claim(
-            thread_key, env=env, agent_name=agent_name, fresh_only=fresh_only
+            thread_key,
+            env=env,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            fresh_only=fresh_only,
         )
         self.claims.append((thread_key, handle.sandbox_name))
         return handle
@@ -267,32 +284,6 @@ def _record_identity(harness: Any) -> tuple[RecordingSubstrate, RecordingLock]:
     harness.kernel._substrate = substrate
     harness.kernel._lock = lock
     return substrate, lock
-
-
-def _qevent(text: str, *, channel: str, thread: str, placeholder: str) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind="slack",
-            channel=channel,
-            placeholder=placeholder,
-            endpoint=None,
-            adapter=None,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], what: str, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting for: {what}")
 
 
 def test_two_concurrent_turns_for_one_agent_each_reply_to_their_own_channel(

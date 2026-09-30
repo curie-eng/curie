@@ -10,7 +10,7 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{plain, run_capture, CommonOpts, OpsCommand};
+use super::{plain, run_capture, CommonOpts, OpsCommand, UpInvocation};
 
 /// Which convergence property an observed issue actually disproves.
 ///
@@ -40,13 +40,16 @@ pub(super) enum Facet {
     Rollout,
 }
 
-/// The #2010 worker drain gate, by the hook names
-/// `charts/curie/templates/worker-upgrade-drain.yaml` renders (the pre-upgrade
-/// quiesce Job and its post-upgrade release). A refusal there means accepted
-/// work had not settled when the roll began, which `cluster upgrade` reports
-/// separately from every other hook.
+/// The Drain facet is the worker drain Job, its post-upgrade release, and the
+/// attest Job (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
+/// there means accepted work had not settled, or no successful drain is
+/// recorded for this revision, which `cluster upgrade` reports separately from
+/// every other hook. Schema-migrate stays [`Facet::Hook`].
 fn hook_facet(name: &str) -> Facet {
-    if name.ends_with("-upgrade-drain") || name.ends_with("-upgrade-drain-release") {
+    if name.ends_with("-upgrade-drain")
+        || name.ends_with("-upgrade-drain-release")
+        || name.ends_with("-upgrade-drain-attest")
+    {
         Facet::Drain
     } else {
         Facet::Hook
@@ -358,10 +361,21 @@ fn unique_repository_identity(node: &Value, repo: &str) -> Option<String> {
     identities.next().is_none().then_some(identity)
 }
 
+/// Kubelet's nodeStatusMaxImages default. A Node.status.images list this long
+/// may have dropped any smaller image, so an absent name is unknown there.
+/// https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/
+const NODE_STATUS_MAX_IMAGES: usize = 50;
+
+fn inventory_truncated(node: &Value) -> bool {
+    array(node, "/status/images").len() >= NODE_STATUS_MAX_IMAGES
+}
+
 /// Bind a tagged request or kubelet alias to the running imageID digest.
 /// Prefer a unique digest on matching inventory entries; if those entries are
 /// digest-less, a unique same-repository digest on the node that equals the
-/// running identity. A missing name is unbound. Do not infer across repositories.
+/// running identity. A missing name is unbound unless the inventory is at the
+/// kubelet cap, where the running digest in the same repository binds it (#3352).
+/// Do not infer across repositories.
 /// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
 fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> Option<String> {
     match matching_inventory_identities(node, reference) {
@@ -371,7 +385,8 @@ fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> O
             (identity == running).then_some(identity)
         }
         Some(_) => unique_inventory_identity(node, reference),
-        None => None,
+        None => (inventory_truncated(node) && repository(running) == repository(reference))
+            .then(|| running.to_owned()),
     }
 }
 
@@ -881,6 +896,7 @@ pub(super) async fn observe(opts: &CommonOpts) -> Result<Observation> {
 pub(super) async fn installation_failure(
     opts: &CommonOpts,
     original: anyhow::Error,
+    invocation: UpInvocation,
 ) -> anyhow::Error {
     if let Ok(observation) = observe(opts).await {
         if !observation.issues.is_empty() {
@@ -888,16 +904,23 @@ pub(super) async fn installation_failure(
                 "Helm installation failed; observed rollout reasons: {}",
                 observation.issues.join("; ")
             ))
-            .with_fix("run `curie cluster status`, correct the failed hook or workload and retry")
+            .with_fix(match invocation {
+                UpInvocation::ClusterUp => "run `curie cluster status`, correct the failed hook or workload and retry",
+                UpInvocation::Apply => "run `curie cluster status`, correct the failed hook or workload configuration in `curie.yaml`, and rerun `curie apply`",
+            })
             .into();
         }
     }
     original
 }
 
-pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
+pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut last_issues: Vec<String> = Vec::new();
+    let fix = match invocation {
+        UpInvocation::ClusterUp => "run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`",
+        UpInvocation::Apply => "run `curie cluster status` to inspect the failed rollout; correct the target configuration in `curie.yaml` and rerun `curie apply`",
+    };
     loop {
         let observation = tokio::time::timeout_at(deadline, observe(opts))
             .await
@@ -911,7 +934,7 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
                     "{error}; last observed rollout reasons: {}",
                     last_issues.join("; ")
                 ))
-                .with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`")
+                .with_fix(fix)
                 .into());
             }
         };
@@ -919,7 +942,12 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
             return Ok(());
         }
         if result.terminal || tokio::time::Instant::now() + Duration::from_secs(2) >= deadline {
-            return Err(crate::exit::CliError::failure(format!("target release has not converged: {}", result.issues.join("; "))).with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`").into());
+            return Err(crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                result.issues.join("; ")
+            ))
+            .with_fix(fix)
+            .into());
         }
         last_issues = result.issues;
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -932,8 +960,8 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
 /// payload, its failing phase and one fail-forward path) keeps the facts
 /// instead of losing them to `?`.
 ///
-/// Deliberately does not touch [`wait`]: `up.rs` depends on its exact failure
-/// message and its "rerun `curie cluster up`" fix string.
+/// Keeps its verdict separate from [`wait`], which renders the fix for the
+/// command that started the installation.
 ///
 /// A read that fails outright, or a rollout that never settles, comes back as a
 /// terminal observation rather than an `Err` — an unreadable cluster has not

@@ -23,7 +23,8 @@ import asyncio
 import json
 import re
 import socket
-from typing import Any
+import sys
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -45,16 +46,18 @@ from curie_worker.reply_sink import (
     InvalidReplyTargetError,
     MissingAdapterCredentialError,
     OversizedAdapterResponseError,
+    ProviderEgressRefusedError,
     RedirectedAdapterEndpointError,
     RejectedAdapterResponseError,
     TargetRoute,
     build_reply_sink,
 )
-from curie_worker.slack_sink import UntrustedSlackEndpointError
+from curie_worker.slack_sink import UnconfiguredSlackIdentityError, UntrustedSlackEndpointError
 
-# EB-B4: the per-adapter egress credential travels in this header, and only this
-# header. Pinned as a constant so a rename shows up as one failure, not thirty.
-SECRET_HEADER = "X-Curie-Adapter-Secret"
+# importlib import mode does not add this test directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from capture_fixtures import SECRET_HEADER, Capture  # noqa: E402
 
 ADAPTER_A = "agentmail-sandbox"
 ADAPTER_B = "other-adapter"
@@ -64,94 +67,7 @@ SLACK_TOKEN = "xoxb-test-bot-token"
 INTERNAL_WORKER_TOKEN = "worker-only-cluster-message-token"
 SHADOW_CLUSTER_MESSAGE_TOKEN = "must-never-shadow-the-built-in-token"
 CLUSTER_MESSAGE_REPLY_REF = "123e4567-e89b-42d3-a456-426614174000"
-CLUSTER_MESSAGE_REPLY_PATH = (
-    f"/v1/internal/cluster-message-replies/{CLUSTER_MESSAGE_REPLY_REF}"
-)
-
-
-class _Capture:
-    """Records every request that reaches it, whatever the route.
-
-    ``/a`` and ``/b`` are two distinct adapter endpoints; ``/slack/api/`` is the
-    configured Slack origin and ``/slack/dead/`` is a SAME-ORIGIN path whose
-    connection drops, which is the only shape that can still exercise #530's
-    transport fallback once D4.4 refuses cross-origin endpoints.
-    """
-
-    def __init__(self) -> None:
-        self.requests: list[dict[str, Any]] = []
-        self.redirect_cluster_message_replies = False
-        self.app = web.Application()
-        self.app.add_routes(
-            [
-                web.post("/a", self._record_ok),
-                web.post("/b", self._record_ok),
-                web.post(
-                    "/v1/internal/cluster-message-replies/{reply_ref}",
-                    self._record_cluster_message_reply,
-                ),
-                web.post("/slack/api/{method}", self._record_slack),
-                web.post("/slack/dead/{method}", self._drop),
-                web.post("/redirect", self._redirect_to_b),
-            ]
-        )
-
-    async def _capture(self, request: web.Request) -> None:
-        self.requests.append(
-            {
-                "path": request.path,
-                "headers": dict(request.headers),
-                "body": await request.text(),
-            }
-        )
-
-    async def _record_ok(self, request: web.Request) -> web.Response:
-        await self._capture(request)
-        # ``ref`` is the adapter-minted handle a ``reply.post`` ack carries back
-        # (EB-B1's ``ReplyAck``); an adapter with nothing to mint omits it.
-        return web.json_response({"ref": "msg_minted"})
-
-    async def _record_slack(self, request: web.Request) -> web.Response:
-        await self._capture(request)
-        return web.json_response({"ok": True, "ts": "1720000000.000200"})
-
-    async def _record_cluster_message_reply(self, request: web.Request) -> web.Response:
-        await self._capture(request)
-        if self.redirect_cluster_message_replies:
-            return web.Response(status=307, headers={"Location": "/b"})
-        return web.json_response({"ref": request.match_info["reply_ref"]})
-
-    async def _drop(self, request: web.Request) -> web.Response:
-        # Record it (so a test can prove the call was ATTEMPTED here) and then
-        # kill the connection, which the client sees as an aiohttp.ClientError --
-        # the "unreachable" class #530's fallback keys on, as distinct from a
-        # SlackApiError, which means the endpoint answered.
-        await self._capture(request)
-        transport = request.transport
-        assert transport is not None
-        transport.close()
-        return web.Response()
-
-    async def _redirect_to_b(self, request: web.Request) -> web.Response:
-        # A redirecting adapter endpoint: record the attempt, then point the
-        # client at ANOTHER path. aiohttp's default would replay the POST there
-        # with the egress secret still attached, so ``/b`` receiving anything is
-        # the leak this shape exists to catch.
-        await self._capture(request)
-        return web.Response(status=307, headers={"Location": "/b"})
-
-    def paths(self) -> list[str]:
-        return [r["path"] for r in self.requests]
-
-    def secrets(self) -> list[str | None]:
-        return [r["headers"].get(SECRET_HEADER) for r in self.requests]
-
-    def bodies_mentioning(self, needle: str) -> list[dict[str, Any]]:
-        return [
-            r
-            for r in self.requests
-            if needle in r["body"] or needle in json.dumps(r["headers"])
-        ]
+CLUSTER_MESSAGE_REPLY_PATH = f"/v1/internal/cluster-message-replies/{CLUSTER_MESSAGE_REPLY_REF}"
 
 
 def _closed_port() -> int:
@@ -210,7 +126,7 @@ def test_a_non_slack_kind_is_delivered_over_http_and_never_touches_slack() -> No
     # D3: adapter selection is the ONLY place ``kind`` is switched on, and it
     # lives in the router below the seam. The kernel holds one ``ReplySink``.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -219,9 +135,7 @@ def test_a_non_slack_kind_is_delivered_over_http_and_never_touches_slack() -> No
             sink = build_reply_sink(_config(port))
             await sink.emit(
                 _update("email"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A),
             )
             assert capture.paths() == ["/a"]
             # The Slack origin was never dialled: no request reached /slack/api/,
@@ -239,7 +153,7 @@ def test_the_http_adapter_posts_the_serialized_event_as_json() -> None:
     # wire, so the event body -- and nothing about where it was sent -- is what
     # crosses.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -255,9 +169,7 @@ def test_the_http_adapter_posts_the_serialized_event_as_json() -> None:
             )
             await sink.emit(
                 event,
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A),
             )
             assert len(capture.requests) == 1
             sent = capture.requests[0]
@@ -280,7 +192,7 @@ def test_a_reply_post_returns_the_adapters_minted_ref() -> None:
     # (kernel.py:1313-1319 keeps ``card_ts`` today). An adapter that answers with
     # a ref must have it survive the seam, or the card can never be settled.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -295,9 +207,7 @@ def test_a_reply_post_returns_the_adapters_minted_ref() -> None:
                     message=OutboundMessage(version="1.0", text="Deploy this?"),
                     requested_by="U9",
                 ),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A),
             )
             assert ack.ref == "msg_minted"
             assert capture.paths() == ["/a"]
@@ -325,7 +235,7 @@ def test_egress_without_a_credential_raises_and_sends_nothing(
     # an attacker. Sending anonymously is a hole, not a mitigation.
     # Mutation: restore the anonymous-send branch and this fails.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -335,9 +245,7 @@ def test_egress_without_a_credential_raises_and_sends_nothing(
             with pytest.raises(MissingAdapterCredentialError):
                 await sink.emit(
                     _update("email"),
-                    route=TargetRoute(
-                        endpoint=f"http://127.0.0.1:{port}/a", adapter=adapter
-                    ),
+                    route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=adapter),
                 )
             assert capture.requests == [], f"egress must send nothing with {why}"
         finally:
@@ -351,7 +259,7 @@ def test_egress_without_an_endpoint_raises_and_sends_nothing() -> None:
     # NULL is an operator error. The worker fails closed and the turn escalates,
     # rather than silently delivering nowhere.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -379,7 +287,7 @@ def test_each_adapters_secret_reaches_only_its_own_endpoint() -> None:
     # and both halves of this fail -- both bindings would present one secret,
     # which is revision 1's rejected design.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -389,9 +297,7 @@ def test_each_adapters_secret_reaches_only_its_own_endpoint() -> None:
 
             await sink.emit(
                 _update("email", "reply for A"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A),
             )
             assert capture.paths() == ["/a"]
             assert capture.secrets() == [SECRET_A]
@@ -401,9 +307,7 @@ def test_each_adapters_secret_reaches_only_its_own_endpoint() -> None:
 
             await sink.emit(
                 _update("email", "reply for B"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/b", adapter=ADAPTER_B
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/b", adapter=ADAPTER_B),
             )
             assert capture.paths() == ["/a", "/b"]
             assert capture.secrets() == [SECRET_A, SECRET_B]
@@ -424,7 +328,7 @@ def test_the_slack_bot_token_is_never_sent_to_a_non_slack_adapter() -> None:
     # is what a single shared ``self._token`` (slack_sink.py:152-157 today) would
     # do if the HTTP path reused it.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -433,9 +337,7 @@ def test_the_slack_bot_token_is_never_sent_to_a_non_slack_adapter() -> None:
             sink = build_reply_sink(_config(port))
             await sink.emit(
                 _update("email"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/a", adapter=ADAPTER_A),
             )
             assert capture.bodies_mentioning(SLACK_TOKEN) == []
         finally:
@@ -454,13 +356,13 @@ def test_a_slack_endpoint_at_another_origin_is_refused_and_nothing_is_sent() -> 
     # attacker's endpoint captures the platform bot token.
     # Mutation: restore that unconditional client and this fails.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
-            other = _Capture()
+            other = Capture()
             other_server = TestServer(other.app)
             await other_server.start_server()
             other_port = other_server.port
@@ -492,7 +394,7 @@ def test_a_slack_endpoint_at_the_configured_origin_is_accepted() -> None:
     # CONFIGURED dev origin (compose.dev.yaml:517), not a wire-supplied one, so a
     # per-turn endpoint that matches it is trusted and delivered.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -501,9 +403,7 @@ def test_a_slack_endpoint_at_the_configured_origin_is_accepted() -> None:
             sink = build_reply_sink(_config(port))
             await sink.emit(
                 _update("slack"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/slack/api/", adapter=None
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/slack/api/", adapter=None),
             )
             assert capture.paths() == ["/slack/api/chat.update"]
             assert capture.bodies_mentioning(SLACK_TOKEN), (
@@ -523,13 +423,13 @@ def test_a_configured_trusted_dev_origin_is_accepted() -> None:
     # the explicitly CONFIGURED override; it is operator config, never a
     # wire-supplied origin, which is what keeps the test above true.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
-            stub = _Capture()
+            stub = Capture()
             stub_server = TestServer(stub.app)
             await stub_server.start_server()
             stub_port = stub_server.port
@@ -566,21 +466,19 @@ def test_a_portless_trusted_entry_accepts_any_port_on_that_host() -> None:
     # origin can be configured ahead of time. A portless entry
     # (``http://127.0.0.1``) trusts any port on that scheme+host.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
-            stub = _Capture()
+            stub = Capture()
             stub_server = TestServer(stub.app)
             await stub_server.start_server()
             stub_port = stub_server.port
             assert stub_port is not None
             try:
-                sink = build_reply_sink(
-                    _config(port, slack_trusted_origins="http://127.0.0.1")
-                )
+                sink = build_reply_sink(_config(port, slack_trusted_origins="http://127.0.0.1"))
                 await sink.emit(
                     _update("slack"),
                     route=TargetRoute(
@@ -602,15 +500,13 @@ def test_a_portless_trusted_entry_still_refuses_another_host() -> None:
     # Portless widens the PORT, never the host: an endpoint on any other host is
     # refused exactly as before, with nothing sent.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
-            sink = build_reply_sink(
-                _config(port, slack_trusted_origins="http://127.0.0.1")
-            )
+            sink = build_reply_sink(_config(port, slack_trusted_origins="http://127.0.0.1"))
             with pytest.raises(UntrustedSlackEndpointError):
                 await sink.emit(
                     _update("slack"),
@@ -630,13 +526,13 @@ def test_an_exact_trusted_entry_still_refuses_a_port_mismatch() -> None:
     # An entry that NAMES a port keeps exact matching, so the portless form is an
     # opt-in widening rather than a blanket one: same host, other port, refused.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
-            stub = _Capture()
+            stub = Capture()
             stub_server = TestServer(stub.app)
             await stub_server.start_server()
             stub_port = stub_server.port
@@ -665,16 +561,14 @@ def test_an_exact_trusted_entry_still_refuses_a_port_mismatch() -> None:
 
 def test_a_slack_turn_with_no_per_turn_endpoint_uses_the_configured_origin() -> None:
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
             port = server.port
             assert port is not None
             sink = build_reply_sink(_config(port))
-            await sink.emit(
-                _update("slack"), route=TargetRoute(endpoint=None, adapter=None)
-            )
+            await sink.emit(_update("slack"), route=TargetRoute(endpoint=None, adapter=None))
             assert capture.paths() == ["/slack/api/chat.update"]
         finally:
             await server.close()
@@ -702,10 +596,10 @@ def test_cluster_message_adapter_wins_before_slack_kind_and_uses_worker_token(
     """
 
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
-        hostile = _Capture()
+        hostile = Capture()
         hostile_server = TestServer(hostile.app)
         await hostile_server.start_server()
         sink = None
@@ -725,8 +619,7 @@ def test_cluster_message_adapter_wins_before_slack_kind_and_uses_worker_token(
                 internal_worker_token=INTERNAL_WORKER_TOKEN,
             )
             assert (
-                config.adapter_credentials[CLUSTER_MESSAGE_ADAPTER]
-                == SHADOW_CLUSTER_MESSAGE_TOKEN
+                config.adapter_credentials[CLUSTER_MESSAGE_ADAPTER] == SHADOW_CLUSTER_MESSAGE_TOKEN
             ), "the shadow credential must be armed for this proof"
             sink = build_reply_sink(config)
 
@@ -856,7 +749,7 @@ def test_cluster_message_absent_reply_ref_names_absence_not_malformed_uuid(
 
 def test_cluster_message_redirect_is_refused_without_moving_worker_token() -> None:
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         capture.redirect_cluster_message_replies = True
         server = TestServer(capture.app)
         await server.start_server()
@@ -892,7 +785,7 @@ def test_cluster_message_redirect_is_refused_without_moving_worker_token() -> No
 @pytest.mark.parametrize("kind", ["mail", "discord"])
 def test_non_reserved_kinds_keep_the_generic_http_fallback(kind: str) -> None:
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         sink = None
@@ -918,10 +811,16 @@ def test_non_reserved_kinds_keep_the_generic_http_fallback(kind: str) -> None:
 
 
 def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
-    """Only the exact reserved slug may preempt existing kind routing."""
+    """Only the exact reserved slug may preempt existing kind routing.
+
+    A Slack route's ``adapter`` is its identity (ADR-0168 decision 3), so a
+    slug that is also an HTTP adapter's credential stays on the Slack sink,
+    which refuses it as an undeclared identity before any request: neither
+    the adapter's secret nor another bot's token leaves the worker.
+    """
 
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         sink = None
@@ -929,16 +828,15 @@ def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
             port = server.port
             assert port is not None
             sink = build_reply_sink(_config(port))
-            await sink.emit(
-                _update("slack"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/slack/api/",
-                    adapter=ADAPTER_A,
-                ),
-            )
-            assert capture.paths() == ["/slack/api/chat.update"]
-            assert capture.bodies_mentioning(SLACK_TOKEN)
-            assert capture.secrets() == [None]
+            with pytest.raises(UnconfiguredSlackIdentityError, match=f"'{ADAPTER_A}'"):
+                await sink.emit(
+                    _update("slack"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{port}/slack/api/",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert capture.paths() == []
         finally:
             if sink is not None:
                 await sink.aclose()
@@ -957,7 +855,7 @@ def test_an_unreachable_slack_endpoint_falls_back_to_the_configured_default() ->
     # connection drops -- a stub whose path moved or died. The fallback target is
     # the worker's configured default transport, never a wire-named one.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -966,9 +864,7 @@ def test_an_unreachable_slack_endpoint_falls_back_to_the_configured_default() ->
             sink = build_reply_sink(_config(port))
             await sink.emit(
                 _update("slack"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/slack/dead/", adapter=None
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{port}/slack/dead/", adapter=None),
             )
             # Attempted on the dead path, then retried on the configured default.
             assert capture.paths() == [
@@ -989,7 +885,7 @@ def test_a_redirecting_adapter_endpoint_is_refused_and_the_secret_never_moves() 
     # FAILURE, not a hop. Mutation: drop ``allow_redirects=False`` and the secret
     # lands on ``/b``.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -1020,7 +916,7 @@ def test_a_redirect_is_not_swallowed_by_best_effort_delivery() -> None:
     # best-effort resume turn -- otherwise a redirecting adapter both keeps the
     # secret-bounce attempt and reads as a delivered reply.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -1050,7 +946,7 @@ def test_an_unreachable_email_endpoint_raises_and_never_falls_back_to_slack() ->
     # exact hazard #530's issue text flagged. ``HttpReplyAdapter`` therefore has
     # NO transport fallback.
     async def go() -> None:
-        capture = _Capture()
+        capture = Capture()
         server = TestServer(capture.app)
         await server.start_server()
         try:
@@ -1061,9 +957,7 @@ def test_an_unreachable_email_endpoint_raises_and_never_falls_back_to_slack() ->
             with pytest.raises(aiohttp.ClientError):
                 await sink.emit(
                     _update("email"),
-                    route=TargetRoute(
-                        endpoint=f"http://127.0.0.1:{dead}/a", adapter=ADAPTER_A
-                    ),
+                    route=TargetRoute(endpoint=f"http://127.0.0.1:{dead}/a", adapter=ADAPTER_A),
                 )
             assert capture.requests == [], (
                 "an unreachable email adapter must never reach the Slack transport"
@@ -1108,9 +1002,7 @@ def test_the_same_dead_email_endpoint_still_raises_without_the_flag() -> None:
         with pytest.raises(aiohttp.ClientError):
             await sink.emit(
                 _update("email"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{dead}/a", adapter=ADAPTER_A
-                ),
+                route=TargetRoute(endpoint=f"http://127.0.0.1:{dead}/a", adapter=ADAPTER_A),
             )
 
     asyncio.run(go())
@@ -1290,15 +1182,21 @@ def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
 @pytest.mark.parametrize("terminal_response", [True, False])
 @pytest.mark.parametrize("kind", ["email", "discord"])
 def test_only_gone_completion_is_a_terminal_delivery_failure(
-    status: int, completion: bool, terminal_response: bool, kind: str,
+    status: int,
+    completion: bool,
+    terminal_response: bool,
+    kind: str,
 ) -> None:
     from curie_worker.reply_sink import DeletedReplyTargetError
 
     async def go() -> None:
         async def handler(request: web.Request) -> web.Response:
             return web.json_response(
-                {"detail": "thread deleted at provider" if terminal_response
-                 else "provider body must not reach error"},
+                {
+                    "detail": "thread deleted at provider"
+                    if terminal_response
+                    else "provider body must not reach error"
+                },
                 status=status,
             )
 
@@ -1328,6 +1226,71 @@ def test_only_gone_completion_is_a_terminal_delivery_failure(
             if not (completion and status == 410 and terminal_response):
                 assert f"answered {status};" in str(caught.value)
             assert "provider body" not in str(caught.value)
+        finally:
+            await adapter.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "event_kind", "expect_refusal"),
+    [
+        (424, "provider egress refused", "completed", True),
+        (424, "other provider error", "completed", False),
+        (424, "thread deleted at provider", "completed", False),
+        (424, None, "completed", False),
+        (410, "provider egress refused", "completed", False),
+        (502, "provider egress refused", "completed", False),
+        (424, "provider egress refused", "update", False),
+        (424, "provider egress refused", "post", False),
+    ],
+)
+def test_only_exact_refused_completion_classifies_provider_egress(
+    status: int, detail: str | None, event_kind: str, expect_refusal: bool
+) -> None:
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.Response:
+            if detail is None:
+                return web.Response(status=status, text="not json")
+            return web.json_response({"detail": detail}, status=status)
+
+        server = await _serve(handler)
+        adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+        try:
+            event: ReplyUpdate | ReplyPost | TurnCompleted = _update("email")
+            if event_kind == "completed":
+                event = TurnCompleted(
+                    version=REPLY_WIRE_VERSION,
+                    event="turn.completed",
+                    target=event.target,
+                    event_id="ev-refused",
+                    outcome="delivered",
+                )
+            elif event_kind == "post":
+                event = ReplyPost(
+                    version=REPLY_WIRE_VERSION,
+                    event="reply.post",
+                    target=event.target,
+                    message=OutboundMessage(version="1.0", text="answer"),
+                    requested_by="U9",
+                )
+            with pytest.raises(RejectedAdapterResponseError) as caught:
+                await adapter.emit(
+                    event,
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{server.port}/ack",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert isinstance(caught.value, ProviderEgressRefusedError) == expect_refusal
+            if expect_refusal:
+                assert str(caught.value) == ProviderEgressRefusedError.reason
+            else:
+                assert type(caught.value) is RejectedAdapterResponseError
+                assert f"answered {status};" in str(caught.value)
+                if detail is not None:
+                    assert detail not in str(caught.value)
         finally:
             await adapter.aclose()
             await server.close()

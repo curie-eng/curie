@@ -1,6 +1,6 @@
 """Principals, teams and memberships: schema-only slice (#2907).
 
-Migration 0052 adds ``principals``, ``teams`` and ``principal_teams`` with no
+Migration 0057 adds ``principals``, ``teams`` and ``principal_teams`` with no
 callers yet. A principal is keyed by ``(tenant_id, idp_subject)``; email and
 display name are attributes, never the identity. Teams are either mirrored IdP
 groups (which must carry the IdP's ``external_id``) or Curie-managed. A
@@ -187,7 +187,7 @@ def test_principal_team_model_shape() -> None:
     assert version_col.default.arg == 1
     assert version_col.server_default is not None
 
-    # The ORM must declare the index under the same name 0052 creates, so a
+    # The ORM must declare the index under the same name 0057 creates, so a
     # future metadata-vs-migration drift check sees one index, not two.
     assert "ix_principal_teams_team_id" in {index.name for index in PrincipalTeam.__table__.indexes}
 

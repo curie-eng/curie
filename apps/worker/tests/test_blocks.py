@@ -3,31 +3,30 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
+import pytest
 from channel_protocol import Action, ChoiceIntent, ConfirmIntent, OutboundMessage
 from curie_worker.behaviorpacks import NavPack
 from curie_worker.blocks import Reply, _reply_from_message, chunk, parse_reply, render, to_blocks
+
+# The decision instant the settled-card tests pin, and its Slack date token
+# (``<!date^unix^token_string|fallback>``, rendered only in mrkdwn: "Date
+# formatting", https://docs.slack.dev/messaging/formatting-message-text).
+_DECIDED = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+_DECIDED_TOKEN = "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
 
 # An enabled nav pack, same shape as tests/test_behaviorpacks.py.
 _NAV = NavPack(enabled=True, hub_label="Help", hub_command="help")
 
 
 def _action_ids(blocks: list[dict]) -> list[str]:
-    return [
-        e["action_id"]
-        for b in blocks
-        if b["type"] == "actions"
-        for e in b["elements"]
-    ]
+    return [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
 
 
 def _action_labels(blocks: list[dict]) -> list[str]:
-    return [
-        e["text"]["text"]
-        for b in blocks
-        if b["type"] == "actions"
-        for e in b["elements"]
-    ]
+    return [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+
 
 _BLOCK = """Here you go:
 
@@ -166,21 +165,19 @@ def test_parse_reply_maps_versioned_confirmation_to_two_actions() -> None:
     assert reply.buttons == [("Deploy", "deploy"), ("Cancel", "cancel")]
 
 
-def test_versioned_reply_rejects_unknown_channel_native_fields() -> None:
-    assert (
-        parse_reply(
-            '```curie-reply\n{"version":"1.0","text":"x","blocks":[]}\n```'
-        )
-        is None
-    )
-
-
-def test_parse_reply_none_without_a_block() -> None:
-    assert parse_reply("just a normal answer") is None
-
-
-def test_parse_reply_defensive_on_bad_json() -> None:
-    assert parse_reply("```curie-reply\n{not json}\n```") is None
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            '```curie-reply\n{"version":"1.0","text":"x","blocks":[]}\n```',
+            id="versioned-reply-with-channel-native-fields",
+        ),
+        pytest.param("just a normal answer", id="no-block"),
+        pytest.param("```curie-reply\n{not json}\n```", id="bad-json"),
+    ],
+)
+def test_parse_reply_returns_none(raw: str) -> None:
+    assert parse_reply(raw) is None
 
 
 def test_render_complete_block_returns_blocks() -> None:
@@ -192,7 +189,7 @@ def test_render_complete_block_returns_blocks() -> None:
 
 def test_render_hides_half_streamed_block() -> None:
     # Fence opened mid-stream, not yet closed: never show the raw JSON.
-    partial = "Working...\n```curie-reply\n{\"header\": \"T"
+    partial = 'Working...\n```curie-reply\n{"header": "T'
     text, blocks = render(partial)
     assert blocks is None
     assert "curie-reply" not in text
@@ -322,9 +319,9 @@ def test_parse_reply_extracts_links() -> None:
 
 def test_parse_reply_drops_malformed_links() -> None:
     reply = parse_reply(
-        '```curie-reply\n'
+        "```curie-reply\n"
         '{"links": [["only-one"], ["a", "b", "c"], ["Docs", "https://x/y"]], "text": "b"}\n'
-        '```'
+        "```"
     )
     assert reply is not None
     assert reply.links == [("Docs", "https://x/y")]  # 1-elem and 3-elem entries dropped
@@ -398,9 +395,7 @@ def test_action_id_clamped_to_255() -> None:
 
 def test_section_fields_capped_at_10() -> None:
     reply = Reply(text="body", fields=[(f"k{i}", f"v{i}") for i in range(15)])
-    section = next(
-        b for b in to_blocks(reply) if b["type"] == "section" and "fields" in b
-    )
+    section = next(b for b in to_blocks(reply) if b["type"] == "section" and "fields" in b)
     assert len(section["fields"]) == 10
 
 
@@ -512,7 +507,11 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     So: render a live card, settle it both ways, compare block for block.
     """
 
-    from curie_dispatcher.approval_actions import _resolved_card_blocks, settled_verdict_line
+    from curie_dispatcher.approval_actions import (
+        _resolved_card_blocks,
+        settled_card_header,
+        settled_verdict_line,
+    )
     from curie_worker.blocks import approval_card, resolved_approval_card
 
     summary = "Give ACME a 20% discount"
@@ -525,15 +524,21 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     )
 
     verdict = settled_verdict_line(
-        decision="approved", resolver="U_MANAGER", note="approved for Q3"
+        decision="approved",
+        resolver="U_MANAGER",
+        note="approved for Q3",
+        resolved_at=_DECIDED,
     )
-    edited = _resolved_card_blocks({"blocks": live}, verdict)
+    edited = _resolved_card_blocks(
+        {"blocks": live}, verdict, header=settled_card_header("approved")
+    )
     _rebuilt_text, rebuilt = resolved_approval_card(
         summary=summary,
         requested_by=requested_by,
         decision="approved",
         resolver="U_MANAGER",
         note="approved for Q3",
+        resolved_at=_DECIDED,
     )
 
     assert rebuilt == edited, (
@@ -543,6 +548,38 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     )
     # And the thing that makes it a SETTLED card in the first place.
     assert not any(b.get("type") == "actions" for b in rebuilt)
+    # ADR-0179: both paths head the card with the outcome and stamp the time.
+    assert rebuilt[0]["text"]["text"] == "Approved"
+    assert _DECIDED_TOKEN in rebuilt[-1]["elements"][0]["text"]
+
+
+def test_a_settled_card_heads_with_its_outcome() -> None:
+    """ADR-0179 decision 1: the header says how the approval ended.
+
+    Only the settled forms change. The live card still asks, so a reader can
+    tell a waiting card from a decided one by its first line.
+    """
+
+    from curie_worker.blocks import approval_card, expired_approval_card, resolved_approval_card
+
+    _fallback, live = approval_card(
+        approval_id="appr-1", summary="Refund order 42", requested_by="U_AE"
+    )
+    assert live[0]["text"]["text"] == "Approval required"
+
+    for decision, header in (("approved", "Approved"), ("rejected", "Rejected")):
+        _text, settled = resolved_approval_card(
+            summary="Refund order 42",
+            requested_by="U_AE",
+            decision=decision,
+            resolver="U_MANAGER",
+            note=None,
+        )
+        assert settled[0]["type"] == "header"
+        assert settled[0]["text"]["text"] == header
+
+    _text, expired = expired_approval_card(summary="Refund order 42", requested_by="U_AE")
+    assert expired[0]["text"]["text"] == "Expired"
 
 
 def test_a_settled_card_without_a_remembered_requester_omits_the_line() -> None:
@@ -583,9 +620,7 @@ def test_approval_card_keeps_interpolated_markdown_literal() -> None:
         {"title": "[Review](https://evil.example.com)"},
     )
     assert rendered is not None
-    _fallback, live = approval_card(
-        approval_id="appr-1", summary=rendered, requested_by="U_AE"
-    )
+    _fallback, live = approval_card(approval_id="appr-1", summary=rendered, requested_by="U_AE")
     section = live[1]["text"]["text"]
     assert "<https://evil.example.com|" not in section
     assert "evil.example.com|Review" not in section
@@ -631,9 +666,7 @@ def test_resolved_card_with_a_human_sentence_puts_the_verdict_first() -> None:
 def test_approval_card_clamps_oversized_summary() -> None:
     from curie_worker.blocks import approval_card
 
-    fallback, card = approval_card(
-        approval_id="appr-2", summary="x" * 10000, requested_by="U1"
-    )
+    fallback, card = approval_card(approval_id="appr-2", summary="x" * 10000, requested_by="U1")
     # Section mrkdwn stays under Slack's 3000-char cap; fallback under 40k.
     assert len(card[1]["text"]["text"]) <= 2900
     assert len(fallback) <= 39000
@@ -649,6 +682,22 @@ def test_expired_approval_card_drops_buttons_and_marks_expired() -> None:
     assert card[0]["type"] == "header"
     assert "Give ACME a 20% discount" in card[1]["text"]["text"]
     assert all(block.get("type") != "actions" for block in card)
+    assert "expired" in str(card[-1]).lower()
+    # A card remembered without its requester omits the line, as a resolved one does.
+    assert not any("Requested by" in str(block) for block in card)
+
+
+def test_an_expired_card_still_names_its_requester() -> None:
+    """ADR-0179 decision 1: the expired record keeps who asked, like a resolved one."""
+
+    from curie_worker.blocks import expired_approval_card
+
+    _fallback, card = expired_approval_card(summary="Refund order 42", requested_by="U_AE")
+
+    assert {
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "Requested by <@U_AE>"}],
+    } in card
     assert "expired" in str(card[-1]).lower()
 
 

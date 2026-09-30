@@ -55,6 +55,28 @@ def test_read_only_tool_notes_without_flag() -> None:
     assert [e.type for e in events] == ["tool_note"]
 
 
+def test_the_progress_tool_notes_without_flag() -> None:
+    """ADR 0130: a deliberate progress update acts on nothing, so it is never a
+    side effect and never lands on the turn's receipt."""
+
+    from curie_runner.approval import TURN_PROGRESS_TOOL_NAME
+
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="1",
+                name=TURN_PROGRESS_TOOL_NAME,
+                input={"update_id": "u1", "state": "testing", "summary": "Verified it"},
+            )
+        ],
+        model="m",
+    )
+    events = _translate(msg, state)
+    assert [e.type for e in events] == ["tool_note"]
+    assert not state.side_effect_emitted
+
+
 def test_tool_search_notes_without_flag() -> None:
     """#2130: Claude's tool-discovery read is not a receipt mutation."""
 
@@ -191,6 +213,88 @@ def test_sdk_abort_result_is_error_then_classified_final(
     assert "run failed" in events[0].message
     assert isinstance(events[1], Final)
     assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_sdk_max_turns_result_is_classified_max_turns() -> None:
+    """#3071: the SDK's error_max_turns subtype is a known, named failure (the
+    turn budget ran out), not an unclassified one."""
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_max_turns",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=5,
+        session_id="s",
+        result=None,
+    )
+
+    events = _translate(msg, state)
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "max-turns"
+    assert state.error_classification == "max-turns"
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_sdk_usd_budget_result_is_classified_budget_exceeded() -> None:
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_max_budget_usd",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=5,
+        session_id="s",
+        result=None,
+    )
+
+    events = _translate(msg, state)
+
+    # The SDK documents this subtype in its official budget example:
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "budget-exceeded"
+    assert events[0].message == "run failed"
+    assert state.error_classification == "budget-exceeded"
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_unknown_sdk_result_subtype_stays_unclassified() -> None:
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_future_budget",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result="run failed",
+    )
+
+    events = _translate(msg, state)
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "unclassified"
+    assert "error_future_budget" in events[0].message
+    assert state.error_classification is None
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_budget_named_assistant_error_stays_unclassified() -> None:
+    msg = AssistantMessage(content=[], model="m", error="error_max_budget_usd")
+
+    events = _translate(msg)
+
+    assert [event.type for event in events] == ["error"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "unclassified"
 
 
 def test_assistant_error_field_emits_error_event() -> None:
@@ -376,3 +480,48 @@ def test_a_call_whose_result_never_arrives_leaves_its_opening_frame() -> None:
     assert len(flags) == 1
     assert flags[0].result is None
     assert state.pending_actions == {"1": "Bash"}
+
+
+# --- Provider credit exhaustion (#3073) ---------------------------------------
+
+_OPENROUTER_KEY = "sk-or-v1-" + "0123456789abcdef" * 4
+# Observed 2026-09-24: the bundled claude_agent_sdk, pointed at a stub that
+# answers OpenRouter's HTTP 402 body, emitted exactly
+# AssistantMessage(content=[TextBlock(text="API Error: 402 This request requires
+# more credits, ...")], model="<synthetic>", error="unknown"). The key is
+# appended here only to prove the provider text is redacted.
+_OPENROUTER_402 = (
+    "API Error: 402 This request requires more credits, or fewer max_tokens. You "
+    "requested up to 32000 tokens, but can only afford 1200. To increase, visit "
+    "https://openrouter.ai/settings/credits and upgrade to a paid account "
+    f"key={_OPENROUTER_KEY}"
+)
+
+
+def test_openrouter_402_is_credit_exhausted_with_redacted_provider_message() -> None:
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[TextBlock(text=_OPENROUTER_402)], model="<synthetic>", error="unknown"
+    )
+    errors = [e for e in _translate(msg, state) if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].classification == "model-credit-exhausted"
+    assert state.error_classification == "model-credit-exhausted"
+    assert "requires more credits" in errors[0].message
+    assert _OPENROUTER_KEY not in errors[0].message
+    assert "[REDACTED" in errors[0].message
+
+
+def test_sdk_billing_error_is_credit_exhausted() -> None:
+    msg = AssistantMessage(content=[], model="m", error="billing_error")
+    events = _translate(msg)
+    assert events[0].classification == "model-credit-exhausted"
+
+
+def test_unknown_error_without_credit_text_stays_unclassified() -> None:
+    msg = AssistantMessage(
+        content=[TextBlock(text="API Error: 500 upstream exploded")], model="m", error="unknown"
+    )
+    errors = [e for e in _translate(msg) if isinstance(e, ErrorEvent)]
+    assert errors[0].classification == "unclassified"
+    assert "upstream exploded" in errors[0].message

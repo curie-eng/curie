@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/message/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/message/v1.3.json",
   "title": "curie local|cluster message --json",
-  "description": "The agent-facing payload of `curie local message --json` and `curie cluster message --json`. Exactly one of five terminal-state shapes is emitted per invocation: a reply object (the model's final reply text, the thread the turn ran under, and whether a reply was captured), an awaiting-approval object (the turn parked on a human approval gate), a timeout object (no reply captured before the deadline), a dry-run descriptor (what a real run would enqueue), or an enqueued object (the turn was enqueued onto the real Valkey stream in connected transport mode and the CLI did not wait for a reply). All keys are CLI-owned and locked.",
+  "description": "The agent-facing payload of `curie local message --json` and `curie cluster message --json`. Exactly one of six terminal-state shapes is emitted per invocation: a reply object (the model's final reply text, the thread the turn ran under, and whether a reply was captured), a failed-turn object (a delivered reply for a failed runner turn, with its failure class), an awaiting-approval object (the turn parked on a human approval gate), a timeout object (no reply captured before the deadline), a dry-run descriptor (what a real run would enqueue), or an enqueued object (the turn was enqueued onto the real Valkey stream in connected transport mode and the CLI did not wait for a reply). All keys are CLI-owned and locked.",
   "oneOf": [
     {
       "title": "reply",
@@ -26,6 +26,37 @@
         },
         "finalized": {
           "type": "boolean"
+        }
+      }
+    },
+    {
+      "title": "failed-turn",
+      "description": "A failed runner turn whose delivered reply exposes the failure. `failed` is true and `failure_class` is the platform classification token. When the worker wrote the marker, `reply` starts with `curie-turn-failure: <failure_class>`; an escalation that arrived without that marker still uses this shape with class `unclassified`. `finalized` is false so a consumer that treats a finalized reply as task success cannot score this turn as successful. The process exits 1.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reply",
+        "thread",
+        "finalized",
+        "failed",
+        "failure_class"
+      ],
+      "properties": {
+        "reply": {
+          "type": "string"
+        },
+        "thread": {
+          "type": "string"
+        },
+        "finalized": {
+          "const": false
+        },
+        "failed": {
+          "const": true
+        },
+        "failure_class": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },

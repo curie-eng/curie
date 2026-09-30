@@ -101,6 +101,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
         "CURIE_BOOTING_TEXT",
+        # Read by the worker capacity wait store, which bounds how long a
+        # queued chat turn may wait. It is never sent to a sandbox.
+        "CURIE_CAPACITY_WAIT_BUDGET_S",
         "CURIE_CONSUMER_GROUP",
         "CURIE_CONSUMER_CAPABILITY_TTL_MS",
         "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
@@ -120,6 +123,15 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # exactly like CURIE_BOOTING_TEXT above. Read from the worker's env by
         # WorkerConfig; never a sandbox boot key.
         "CURIE_TURN_NOT_STARTED_TEXT",
+        # The install's receipt mode (ADR-0180), read from the WORKER's env by
+        # WorkerConfig and consumed where the kernel assembles the final reply.
+        # It decides what the person is shown, never what a sandbox boots with.
+        "CURIE_TURN_RECEIPT",
+        # The temporary deliberate progress rendering switch (ADR 0130), read
+        # from the WORKER's env by WorkerConfig and consumed by the kernel's
+        # progress pump. It decides whether progress reaches an adapter, never
+        # what a sandbox boots with.
+        "CURIE_PROGRESS_RENDER",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -211,6 +223,19 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runs agent-authored code.
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        # The connector caller signing key (ADR-0168 decision 7), read from the
+        # WORKER's env by WorkerConfig to sign CURIE_CONNECTOR_CALLER_TOKEN, which
+        # IS a declared boot key. The key itself never enters a sandbox: holding
+        # it, agent-authored code could mint a token naming any agent.
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
+        # The connector caller proxy's own config (ADR-0168 decision 7), read
+        # by curie_connector_proxy.server from env the connector render writes
+        # into the proxy container. It runs in a connector pod, never in a
+        # sandbox, and nothing here reaches a boot env.
+        "CURIE_CALLER_PROXY_PORT",
+        "CURIE_CALLER_PROXY_UPSTREAM_PORT",
+        "CURIE_CALLER_PROXY_PUBLIC_KEYS",
+        "CURIE_CALLER_PROXY_ADMITS",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",
@@ -249,10 +274,20 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # Cron scheduler tick (#268), read by the worker process only.
+        "CURIE_CRON_TICK_INTERVAL_S",
+        # Cron hook run claim lease (#2931), read by the worker process only.
+        "CURIE_HOOK_CLAIM_LEASE_S",
+        # WorkItem orphan sweep cadence (#3076), read by the worker process only.
+        "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",
+        # Agents with a per-agent pool (#3083, #2943), substrate only.
+        "CURIE_AGENT_SANDBOX_POOLS",
+        # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
+        "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side
@@ -275,6 +310,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the ambient ones by name. Renaming a BootEnv key cannot move these.
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        # The Claude SDK consumes this background model setting for session
+        # titles. The runner passes it to the SDK, outside the BootEnv contract.
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.
@@ -296,6 +334,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
+        # sandbox boot fact is instead frozen across both declaration sites by
+        # tests/vectors/turn-progress-capability.json.
+        "CURIE_TURN_PROGRESS_ENABLED",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
@@ -323,6 +365,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        # The factory turn budget (#3071): a worker setting whose VALUE the
+        # worker writes into a work-item claim under the BootEnv key
+        # CURIE_MAX_TURNS. This name itself never enters a sandbox.
+        "CURIE_WORK_ITEM_MAX_TURNS",
         "CURIE_RUNNER_TOTAL_TIMEOUT_S",
         "CURIE_DELIVERY_LEASE_TTL_S",
         "CURIE_DELIVERY_LEASE_HEARTBEAT_S",

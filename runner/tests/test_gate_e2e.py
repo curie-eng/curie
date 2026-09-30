@@ -257,6 +257,7 @@ def _block_publication_on_boot_path(tmp_path, plugin_dir: str):
     )
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
+    gate.bind_publication_context(None)
     hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
 
     async def go() -> None:
@@ -265,7 +266,7 @@ def _block_publication_on_boot_path(tmp_path, plugin_dir: str):
                 "tool_name": PLATFORM_PUBLISH_TOOL_NAME,
                 "tool_input": {"title": "Fix the README", "body": ""},
             },
-            None,
+            "toolu_publication_test",
             None,
         )
         assert result["hookSpecificOutput"]["permissionDecision"] == "deny"

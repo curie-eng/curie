@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use curie::api::DEFAULT_SLACK_IDENTITY;
 use curie::chat::{resolve_targets, SlackStub};
 use curie::message::{enqueue_over_connected_transport, MessageOpts};
 use curie::queue::{diagnostics, entry_acked, synthetic_turn, xadd, WORKER_GROUP};
@@ -146,8 +147,12 @@ async fn explicit_channel_and_thread_land_verbatim_on_the_wire() {
     let decoded = drain_one_turn(&mut conn, &stream).await;
 
     assert!(!stream_id.is_empty(), "XADD returned an id");
+    let reply_handle = decoded
+        .reply_handle
+        .as_ref()
+        .expect("chat turns are targeted");
     assert_eq!(
-        decoded.reply_handle.channel, "CSIM12345",
+        reply_handle.channel, "CSIM12345",
         "the XADD'd payload keeps the exact channel the worker binds on"
     );
     assert_eq!(
@@ -190,10 +195,14 @@ async fn absent_channel_and_thread_fall_back_to_synthetic() {
     let decoded = drain_one_turn(&mut conn, &stream).await;
 
     assert!(!stream_id.is_empty(), "XADD returned an id");
+    let reply_handle = decoded
+        .reply_handle
+        .as_ref()
+        .expect("chat turns are targeted");
     assert!(
-        decoded.reply_handle.channel.starts_with("C-SIM-"),
+        reply_handle.channel.starts_with("C-SIM-"),
         "synthetic channel on the wire: {}",
-        decoded.reply_handle.channel
+        reply_handle.channel
     );
     assert_eq!(
         decoded.conversation_id, thread_ts,
@@ -570,23 +579,29 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
          on conversation_id, and Slack drops a card threaded under a ts that names \
          no message"
     );
+    let reply_handle = turn
+        .reply_handle
+        .as_ref()
+        .expect("connected turns are targeted");
     assert_eq!(
-        turn.reply_handle.placeholder.as_deref(),
+        reply_handle.placeholder.as_deref(),
         Some(turn.conversation_id.as_str()),
         "the two coordinates on one turn must agree; #954 was exactly their disagreement"
     );
     assert_eq!(
-        turn.reply_handle.channel, "C-REAL-CONNECTED",
+        reply_handle.channel, "C-REAL-CONNECTED",
         "the real channel rides the wire verbatim"
     );
     assert_eq!(
-        turn.reply_handle.endpoint, None,
+        reply_handle.endpoint, None,
         "connected mode carries no per-turn endpoint, so the reply rides the \
          workspace transport"
     );
     assert_eq!(
-        turn.reply_handle.adapter, None,
-        "connected mode must not opt into the built-in disconnected cluster-message relay"
+        reply_handle.adapter.as_deref(),
+        Some(DEFAULT_SLACK_IDENTITY),
+        "connected mode speaks as the default identity, never the built-in \
+         disconnected cluster-message relay"
     );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
@@ -622,19 +637,25 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
         turn.conversation_id, NAMED_THREAD,
         "an explicit --thread is the conversation_id verbatim"
     );
+    let reply_handle = turn
+        .reply_handle
+        .as_ref()
+        .expect("connected turns are targeted");
     assert_eq!(
-        turn.reply_handle.placeholder.as_deref(),
+        reply_handle.placeholder.as_deref(),
         Some(IN_THREAD_TS),
         "the reply handle still points at the real message Slack created inside \
          that thread, so the worker edits the right message"
     );
     assert_eq!(
-        turn.reply_handle.endpoint, None,
+        reply_handle.endpoint, None,
         "connected replies keep using the workspace transport, never a per-turn endpoint"
     );
     assert_eq!(
-        turn.reply_handle.adapter, None,
-        "--continue coordinates in connected mode must not acquire the disconnected relay adapter"
+        reply_handle.adapter.as_deref(),
+        Some(DEFAULT_SLACK_IDENTITY),
+        "--continue coordinates in connected mode keep the default identity, never the \
+         disconnected relay adapter"
     );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();

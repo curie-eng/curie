@@ -525,7 +525,7 @@ fn agent_list_with_overrides() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true}}]"##
         ),
     )
 }
@@ -541,6 +541,8 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -550,11 +552,19 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             agent,
             model,
             thinking,
+            execution_deadline_seconds: _,
+            runner_resources: _,
+            memory_writes,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");
             assert_eq!(model.as_deref(), Some("kimi-k2"));
             assert_eq!(thinking.as_deref(), Some("adaptive"));
+            // #1461: the inspect reports the memory-writes switch as stored.
+            assert!(
+                memory_writes,
+                "inspect must report memory_writes as the API stored it"
+            );
             assert!(!changed, "an inspect must not report itself as a write");
         }
         other => panic!("expected Done, got {other:?}"),
@@ -583,6 +593,8 @@ async fn overrides_set_patches_only_the_field_named() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("enabled:2000".to_string()),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -631,6 +643,8 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Clear,
         commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -679,10 +693,695 @@ async fn overrides_dry_run_makes_no_request_on_either_path() {
             commands::OverrideChange::Set("adaptive".to_string()),
         ),
     ] {
-        let out = commands::overrides(opts(&server.base_url, "deal-desk", true), model, thinking)
-            .await
-            .unwrap();
+        let out = commands::overrides(
+            opts(&server.base_url, "deal-desk", true),
+            model,
+            thinking,
+            commands::OverrideChange::Unchanged,
+            commands::OverrideChange::Unchanged,
+        )
+        .await
+        .unwrap();
         assert!(matches!(out, commands::OverridesOutput::DryRun(_)));
     }
     assert!(server.recorded().is_empty());
+}
+
+// --- `<tier> overrides`: execution deadline (issue #3071) -------------------
+//
+// Same three-way contract as model/thinking, plus the one thing those two
+// don't have: the PATCH body carries `execution_deadline_seconds` as a JSON
+// NUMBER, so a body assertion here has to check for an unquoted int, not a
+// string, or it would pass even if the CLI sent `"120"`.
+
+#[tokio::test]
+async fn overrides_set_execution_deadline_patches_only_that_field() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":120,"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Set("120".to_string()),
+        commands::OverrideChange::Unchanged,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let rec = server.recorded();
+    let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""execution_deadline_seconds":120"#),
+        "execution_deadline_seconds must be an unquoted JSON number: {body}"
+    );
+    assert!(
+        !body.contains("model") && !body.contains("thinking"),
+        "an unmentioned override must be omitted, not nulled: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_clear_execution_deadline_sends_explicit_null_not_an_empty_string() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list_with_overrides(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let patch = server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""execution_deadline_seconds":null"#),
+        "body: {body}"
+    );
+}
+
+// --- `<tier> overrides`: runner resources (issue #3209) ---------------------
+//
+// Same three-way contract as model, thinking, and the execution deadline.
+// `runner_resources` is a JSON object on the wire, not a string: a set sends
+// that object and nothing else, and a clear sends JSON null rather than ""
+// or an omitted key. A null on read is the platform default. The API's 422
+// detail is the command error. Contradictory flags, a blank value, and
+// malformed JSON are usage errors and do not call the API.
+
+/// The resources block both tiers accept for `--runner-resources`.
+const RUNNER_RESOURCES_JSON: &str = r#"{"requests":{"cpu":"500m","memory":"1Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"1","memory":"2Gi","ephemeral-storage":"4Gi"}}"#;
+
+/// Quota refusal text the fake API returns. The command must show this, not a
+/// replacement.
+const QUOTA_REFUSAL_DETAIL: &str =
+    "cpu request 1500m cannot fit the quota hard 1; lower the override or raise resourceQuota.hard";
+
+fn runner_resources_object() -> serde_json::Value {
+    serde_json::from_str(RUNNER_RESOURCES_JSON).expect("runner resources fixture is JSON")
+}
+
+#[tokio::test]
+async fn overrides_set_runner_resources_patches_only_that_field() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"runner_resources":{RUNNER_RESOURCES_JSON},"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let runner_resources = commands::OverrideChange::resolve_runner_resources(
+        Some(RUNNER_RESOURCES_JSON.to_string()),
+        false,
+    )
+    .expect("--runner-resources must accept the resources object");
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        runner_resources,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let rec = server.recorded();
+    let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("PATCH body must be JSON: {err}; {body}"));
+    assert_eq!(
+        parsed,
+        serde_json::json!({ "runner_resources": runner_resources_object() }),
+        "PATCH body must contain only runner_resources as that object; model, thinking, and execution_deadline_seconds must be absent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_clear_runner_resources_sends_explicit_null_not_an_empty_string() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list_with_overrides(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let runner_resources = commands::OverrideChange::resolve_runner_resources(None, true)
+        .expect("--clear-runner-resources must be accepted");
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        runner_resources,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let patch = server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("PATCH body must be JSON: {err}; {body}"));
+    assert_eq!(
+        parsed,
+        serde_json::json!({ "runner_resources": null }),
+        "clear must send runner_resources null, not an empty string and not an omitted field: {body}"
+    );
+    assert!(
+        !body.contains(r#":"""#),
+        "clear must be null, not an empty string: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
+    use curie::ui::CliOutput;
+
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            &format!(
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false}}]"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+    )
+    .await
+    .unwrap();
+
+    let curie::commands::OverridesOutput::Done {
+        agent,
+        model,
+        thinking,
+        execution_deadline_seconds,
+        runner_resources,
+        memory_writes,
+        changed,
+    } = &out
+    else {
+        panic!("expected Done, got {out:?}");
+    };
+    assert!(!changed, "an inspect must not report itself as a write");
+    assert!(
+        runner_resources.is_none(),
+        "null runner_resources is the platform default"
+    );
+
+    let json = out.to_json();
+    assert_eq!(json["agent"], "deal-desk");
+    assert_eq!(json["model"], "kimi-k2");
+    assert_eq!(json["thinking"], "adaptive");
+    assert!(
+        json.as_object()
+            .is_some_and(|obj| obj.contains_key("execution_deadline_seconds")),
+        "inspect JSON must keep execution_deadline_seconds: {json}"
+    );
+    assert!(json["execution_deadline_seconds"].is_null());
+    // #1461: memory_writes is a plain boolean in the inspect JSON, never null.
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(false)),
+        "inspect JSON must include memory_writes false: {json}"
+    );
+    assert!(!memory_writes);
+    assert_eq!(
+        json.get("runner_resources").map(serde_json::Value::is_null),
+        Some(true),
+        "inspect JSON must include runner_resources null: {json}"
+    );
+
+    let line = commands::overrides_summary(
+        agent,
+        model,
+        thinking,
+        execution_deadline_seconds,
+        runner_resources,
+        *memory_writes,
+        *changed,
+    );
+    assert_eq!(
+        line,
+        "overrides for deal-desk: model kimi-k2, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
+    );
+
+    let rec = server.recorded();
+    assert_eq!(rec.len(), 1, "inspect must issue exactly one request");
+    assert_eq!(rec[0].method, "GET");
+}
+
+#[tokio::test]
+async fn overrides_error_includes_the_api_quota_refusal_detail() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            &format!(
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"runner_resources":null}}]"##
+            ),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(422, &format!(r#"{{"detail":"{QUOTA_REFUSAL_DETAIL}"}}"#))
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let runner_resources = commands::OverrideChange::resolve_runner_resources(
+        Some(RUNNER_RESOURCES_JSON.to_string()),
+        false,
+    )
+    .expect("--runner-resources must accept the resources object before the API answers");
+
+    let err = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        runner_resources,
+    )
+    .await
+    .expect_err("a quota 422 must fail the command");
+
+    let rendered = format!("{err:#}");
+    let payload = curie::exit::error_json(&err).to_string();
+    assert!(
+        rendered.contains(QUOTA_REFUSAL_DETAIL) || payload.contains(QUOTA_REFUSAL_DETAIL),
+        "the command error output must contain the API quota detail, not swallow it; rendered: {rendered}; payload: {payload}"
+    );
+    assert!(
+        server.recorded().iter().any(|r| r.method == "PATCH"),
+        "the refusal detail comes from the API, so the command must have called it"
+    );
+}
+
+#[tokio::test]
+async fn runner_resources_and_clear_runner_resources_together_is_a_usage_error() {
+    let server = serve(|req| {
+        panic!("--runner-resources and --clear-runner-resources must not call the API: {req:?}")
+    });
+
+    let err = commands::OverrideChange::resolve_runner_resources(
+        Some(RUNNER_RESOURCES_JSON.to_string()),
+        true,
+    )
+    .expect_err("--runner-resources and --clear-runner-resources must contradict each other");
+    assert_eq!(
+        curie::exit::classify(&err).0,
+        curie::exit::ExitClass::Usage,
+        "{err}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("--runner-resources"), "{msg}");
+    assert!(msg.contains("--clear-runner-resources"), "{msg}");
+    assert!(
+        server.recorded().is_empty(),
+        "a usage error must not call the API"
+    );
+}
+
+#[tokio::test]
+async fn blank_runner_resources_is_a_usage_error_and_does_not_call_the_api() {
+    let server = serve(|req| panic!("a blank --runner-resources must not call the API: {req:?}"));
+    for blank in ["", "   ", "\t"] {
+        let err =
+            commands::OverrideChange::resolve_runner_resources(Some(blank.to_string()), false)
+                .expect_err("a blank --runner-resources must be a usage error");
+        assert_eq!(
+            curie::exit::classify(&err).0,
+            curie::exit::ExitClass::Usage,
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blank"),
+            "a blank --runner-resources must be refused as blank, not forwarded: {msg}"
+        );
+        assert!(
+            msg.contains("--clear-runner-resources"),
+            "the refusal must name the flag that clears: {msg}"
+        );
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "a usage error must not call the API"
+    );
+}
+
+#[tokio::test]
+async fn malformed_runner_resources_json_is_a_usage_error_and_does_not_call_the_api() {
+    let server = serve(|req| panic!("malformed --runner-resources must not call the API: {req:?}"));
+    for raw in ["{", "not-json", "{\"requests\":"] {
+        let err = commands::OverrideChange::resolve_runner_resources(Some(raw.to_string()), false)
+            .expect_err("malformed runner resources JSON must be a usage error");
+        assert_eq!(
+            curie::exit::classify(&err).0,
+            curie::exit::ExitClass::Usage,
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--runner-resources"),
+            "the usage error must name the flag: {msg}"
+        );
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "a usage error must not call the API"
+    );
+}
+
+// --- memory writes and guidance (issue #1461) -------------------------------
+//
+// Driven through the built binary against the wire-level test server, so the
+// clap flag, the handler and the HTTP call are all on the path: the request
+// the server records is the one an operator's command would send. Unexpected
+// requests get a 404 rather than a panic so a wrong call shows up as a failed
+// assertion on what was recorded.
+
+fn curie_against(base_url: &str, rest: &[&str]) -> std::process::Output {
+    let mut argv: Vec<&str> = rest.to_vec();
+    argv.extend(["--api-url", base_url, "--api-key", "k", "--json"]);
+    std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(&argv)
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")))
+}
+
+fn agent_json_with_memory_writes(memory_writes: bool) -> String {
+    format!(
+        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":{memory_writes}}}"##
+    )
+}
+
+fn not_found() -> Response {
+    Response::json(404, r#"{"detail":"not found"}"#)
+}
+
+#[test]
+fn overrides_memory_writes_on_patches_a_json_true() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(false)))
+        }
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent_json_with_memory_writes(true))
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &["local", "overrides", "deal-desk", "--memory-writes", "on"],
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rec = server.recorded();
+    let patches: Vec<_> = rec.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(patches.len(), 1, "exactly one PATCH: {rec:?}");
+    assert_eq!(patches[0].path, format!("/agents/{AGENT_ID}"));
+    assert_eq!(patches[0].header("x-api-key"), Some("k"));
+    let body: serde_json::Value =
+        serde_json::from_slice(&patches[0].body).expect("PATCH body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"memory_writes": true}),
+        "only memory_writes, as a JSON boolean"
+    );
+}
+
+#[test]
+fn overrides_memory_writes_off_patches_a_json_false() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(true)))
+        }
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent_json_with_memory_writes(false))
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &["local", "overrides", "deal-desk", "--memory-writes", "off"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rec = server.recorded();
+    let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
+    let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("JSON body");
+    assert_eq!(body, serde_json::json!({"memory_writes": false}));
+}
+
+#[test]
+fn memory_guidance_from_puts_the_file_text_to_the_guidance_endpoint() {
+    let text = "Remember customer preferences.\nNever record secrets or credentials.";
+    let path = std::env::temp_dir().join(format!("curie-guidance-{}.md", uuid::Uuid::new_v4()));
+    std::fs::write(&path, text).expect("write guidance file");
+
+    let stored = serde_json::json!({"text": text, "source": "operator"}).to_string();
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(true)))
+        }
+        ("PUT", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => {
+            Response::json(200, &stored)
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => {
+            Response::json(200, &stored)
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "local",
+            "memory",
+            "deal-desk",
+            "--guidance-from",
+            path.to_str().unwrap(),
+        ],
+    );
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        output.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rec = server.recorded();
+    let puts: Vec<_> = rec.iter().filter(|r| r.method == "PUT").collect();
+    assert_eq!(puts.len(), 1, "exactly one PUT: {rec:?}");
+    assert_eq!(puts[0].path, format!("/agents/{AGENT_ID}/memory/guidance"));
+    assert_eq!(puts[0].header("x-api-key"), Some("k"));
+    let body: serde_json::Value = serde_json::from_slice(&puts[0].body).expect("PUT body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"text": text}),
+        "the file's text, verbatim"
+    );
+    assert!(
+        !rec.iter()
+            .any(|r| r.method == "PATCH" || r.method == "POST" || r.method == "DELETE"),
+        "--guidance-from writes only the guidance: {rec:?}"
+    );
+}
+
+#[test]
+fn memory_guidance_from_an_empty_file_is_refused_before_any_write() {
+    let path = std::env::temp_dir().join(format!("curie-guidance-{}.md", uuid::Uuid::new_v4()));
+    std::fs::write(&path, "   \n").expect("write guidance file");
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(true)))
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => {
+            Response::json(200, r#"{"text":"default","source":"default"}"#)
+        }
+        _ => not_found(),
+    });
+
+    // Anchor: the guidance flags must exist, so the refusal below is about the
+    // empty file and not about an unknown flag.
+    let anchor = curie_against(
+        &server.base_url,
+        &["local", "memory", "deal-desk", "--guidance"],
+    );
+    assert!(
+        anchor.status.success(),
+        "--guidance must be a known flag; stderr: {}",
+        String::from_utf8_lossy(&anchor.stderr)
+    );
+
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "local",
+            "memory",
+            "deal-desk",
+            "--guidance-from",
+            path.to_str().unwrap(),
+        ],
+    );
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !output.status.success(),
+        "an empty guidance file must be refused"
+    );
+    assert!(
+        !server.recorded().iter().any(|r| r.method == "PUT"),
+        "no PUT for an empty guidance file"
+    );
+}
+
+#[test]
+fn memory_guidance_shows_the_effective_text_and_its_source() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(true)))
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => Response::json(
+            200,
+            r#"{"text":"guidance-sentinel-7f3a","source":"operator"}"#,
+        ),
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &["local", "memory", "deal-desk", "--guidance"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("guidance-sentinel-7f3a"),
+        "text shown: {stdout}"
+    );
+    assert!(stdout.contains("operator"), "source shown: {stdout}");
+    let rec = server.recorded();
+    assert!(
+        rec.iter().all(|r| r.method == "GET"),
+        "--guidance only reads: {rec:?}"
+    );
+    assert!(rec
+        .iter()
+        .any(|r| r.path == format!("/agents/{AGENT_ID}/memory/guidance")));
+}
+
+#[test]
+fn memory_reset_guidance_deletes_the_guidance_endpoint() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_with_memory_writes(true)))
+        }
+        ("DELETE", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => Response {
+            status: 204,
+            content_type: "application/json".into(),
+            body: Vec::new(),
+        },
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/memory/guidance") => {
+            Response::json(200, r#"{"text":"default","source":"default"}"#)
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &["local", "memory", "deal-desk", "--reset-guidance"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rec = server.recorded();
+    let deletes: Vec<_> = rec.iter().filter(|r| r.method == "DELETE").collect();
+    assert_eq!(deletes.len(), 1, "exactly one DELETE: {rec:?}");
+    assert_eq!(
+        deletes[0].path,
+        format!("/agents/{AGENT_ID}/memory/guidance")
+    );
 }

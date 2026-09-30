@@ -1,5 +1,5 @@
 {
-  "comment": "Single source of truth for the thread-reset Valkey SET the API, worker, and CLI share. The API SADDs an operator reset (`apps/api/src/curie_api/threadreset.py`), the worker drains it (`apps/worker/src/curie_worker/consumer.py`), and `curie local eval` / `curie cluster eval` SADDs each eval-owned thread key onto the same set so the next turn (or the maintenance tick) releases that case's sandbox (#1534). SET members are the worker's internal thread key (percent-encoded kind:channel:conversation_id, matching `_thread_key_for`), not the bare conversation_id: a colon in an eval-isolate id encodes as %3A (#2259). The three lanes cannot share code across Python/Rust, so the literals are frozen here: changing one language without this file fails that language's test. Read by apps/api/tests/test_thread_reset_vector.py, apps/worker/tests/test_thread_reset_vector.py, and the test module in cli/src/queue.rs. An unknown top-level key is rejected so a new key one lane cannot see cannot pass vacuously.",
+  "comment": "Single source of truth for the thread-reset Valkey SET the API, worker, and CLI share. The API SADDs an operator reset (`apps/api/src/curie_api/threadreset.py`), the worker drains it (`apps/worker/src/curie_worker/consumer.py`), and `curie local eval` / `curie cluster eval` SADDs each eval-owned thread key onto the same set so the next turn (or the maintenance tick) releases that case's sandbox (#1534). SET members are the worker's internal thread key, not the bare conversation_id: percent-encoded kind:channel:conversation_id, with the route's identity as its own segment after kind unless route_identity(kind, adapter) is null or `default` (ADR-0168 decision 4), matching `_thread_key_for`. A colon in an eval-isolate id encodes as %3A (#2259). An example's optional `adapter` is the reply handle's raw adapter; absent means null. The three lanes cannot share code across Python/Rust, so the literals are frozen here: changing one language without this file fails that language's test. Read by apps/api/tests/test_thread_reset_vector.py, apps/worker/tests/test_thread_reset_vector.py, and the test module in cli/src/queue.rs. An unknown top-level or example key is rejected so a new key one lane cannot see cannot pass vacuously.",
   "thread_reset_set": "curie:thread-reset-requests",
   "thread_reset_inflight_set": "curie:thread-reset-inflight",
   "thread_key_examples": [
@@ -14,6 +14,61 @@
       "channel": "C-SIM-abc",
       "conversation_id": "eval:1720000000.000100",
       "thread_key": "slack:C-SIM-abc:eval%3A1720000000.000100"
+    },
+    {
+      "kind": "slack",
+      "adapter": "default",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:C0EXAMPLE1:1700000000.000100"
+    },
+    {
+      "kind": "slack",
+      "adapter": "second-bot",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:second-bot:C0EXAMPLE1:1700000000.000100"
+    },
+    {
+      "kind": "slack",
+      "adapter": "",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:C0EXAMPLE1:1700000000.000100"
+    },
+    {
+      "kind": "email",
+      "adapter": "agentmail-sandbox",
+      "channel": "agent@example.test",
+      "conversation_id": "thread/9",
+      "thread_key": "email:agentmail-sandbox:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "email",
+      "adapter": "mail:sandbox",
+      "channel": "agent@example.test",
+      "conversation_id": "thread/9",
+      "thread_key": "email:mail%3Asandbox:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "email",
+      "channel": "agent@example.test",
+      "conversation_id": "thread/9",
+      "thread_key": "email:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "email",
+      "adapter": "default",
+      "channel": "agent@example.test",
+      "conversation_id": "thread/9",
+      "thread_key": "email:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "slack",
+      "adapter": "curie-cluster-message",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:C0EXAMPLE1:1700000000.000100"
     }
   ]
 }

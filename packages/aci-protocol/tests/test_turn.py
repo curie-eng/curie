@@ -16,11 +16,13 @@ sites are asserted by T-A17 (dispatcher), T-A18 (resume) and T-C2 (ingress).
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from aci_protocol import (
     PROTOCOL_VERSION,
+    HookRunRef,
     QueuedTurn,
     ReplyHandle,
     TurnSource,
@@ -28,6 +30,14 @@ from aci_protocol import (
     parse_queued_turn,
 )
 from aci_protocol.events import _READER_CONTEXT_KEY
+from aci_protocol.turn import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DEFAULT_IDENTITY,
+    SLACK_KIND,
+    matching_routes,
+    route_identity,
+    slack_speaking_identity,
+)
 from pydantic import ValidationError
 
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
@@ -256,9 +266,11 @@ def test_the_attachments_field_is_a_patch_bump() -> None:
     traffic for a field nobody is required to send.
     """
 
-    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
-    assert (major, minor) == (0, 4)
-    assert patch >= 3
+    before = tuple(int(part) for part in "0.4.2".split("."))
+    with_attachments = tuple(int(part) for part in "0.4.3".split("."))
+
+    assert with_attachments[:2] == before[:2]
+    assert with_attachments[2] == before[2] + 1
 
 
 def test_a_patch_difference_is_compatible_in_both_directions() -> None:
@@ -271,10 +283,22 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
     being a tautology about any two version strings.
     """
 
-    assert is_compatible("0.4.2", PROTOCOL_VERSION) is True
-    assert is_compatible(PROTOCOL_VERSION, "0.4.2") is True
-    assert is_compatible("0.3.9", PROTOCOL_VERSION) is False
-    assert is_compatible(PROTOCOL_VERSION, "0.3.9") is False
+    assert is_compatible("0.4.2", "0.4.3") is True
+    assert is_compatible("0.4.3", "0.4.2") is True
+    assert is_compatible("0.3.9", "0.4.3") is False
+    assert is_compatible("0.4.3", "0.3.9") is False
+
+
+def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
+    assert PROTOCOL_VERSION == "0.5.7"
+    assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
+    assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
+
+
+def test_publication_context_uses_a_compatible_patch_version() -> None:
+    assert is_compatible("0.5.1", PROTOCOL_VERSION) is True
+    assert is_compatible(PROTOCOL_VERSION, "0.5.1") is True
+    assert is_compatible("0.6.0", PROTOCOL_VERSION) is False
 
 
 def test_a_payload_written_before_attachments_existed_decodes_with_none() -> None:
@@ -394,3 +418,320 @@ def test_a_partial_hook_run_is_rejected(missing_field: str) -> None:
 
     locations = {tuple(error["loc"]) for error in exc_info.value.errors()}
     assert ("hook_run", missing_field) in locations
+
+
+def _targetless_cron_payload() -> dict[str, object]:
+    return {
+        "event_id": "e1",
+        "conversation_id": "c1",
+        "author": "cron",
+        "text": "run the nightly report",
+        "received_at": "20260922T030000Z",
+        "source": "cron",
+        "hook_run": {
+            "agent_id": "00000000000040008000000000000001",
+            "name": "acme_nightly",
+            "slot_utc": "20260922T030000Z",
+        },
+    }
+
+
+def _construct_or_parse_targetless(
+    payload: dict[str, object], reader: str
+) -> QueuedTurn:
+    if reader == "constructor":
+        return QueuedTurn(**payload)  # type: ignore[arg-type]
+    return parse_queued_turn(json.dumps(payload))
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted", "null"])
+def test_a_targetless_cron_turn_round_trips_with_complete_identity(
+    explicit_null: bool,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    if explicit_null:
+        payload["reply_handle"] = None
+
+    turn = _construct_or_parse_targetless(payload, reader)
+
+    assert turn.reply_handle is None
+    assert turn.hook_run == HookRunRef(
+        agent_id="00000000000040008000000000000001",
+        name="acme_nightly",
+        slot_utc="20260922T030000Z",
+    )
+    assert parse_queued_turn(turn.model_dump_json()) == turn
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+def test_a_targetless_cron_turn_without_run_identity_is_rejected(
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    payload["hook_run"] = None
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+def test_a_targetless_cron_turn_with_omitted_run_identity_is_rejected(
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    del payload["hook_run"]
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("missing_field", ["agent_id", "name", "slot_utc"])
+def test_a_targetless_cron_turn_with_partial_identity_is_rejected(
+    missing_field: str,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    hook_run = dict(payload["hook_run"])  # type: ignore[arg-type]
+    del hook_run[missing_field]
+    payload["hook_run"] = hook_run
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("field", ["agent_id", "name", "slot_utc"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("", id="empty"),
+        pytest.param(" \t", id="whitespace"),
+        pytest.param(7, id="nonstring"),
+    ],
+)
+def test_a_targetless_cron_turn_with_invalid_identity_is_rejected(
+    field: str,
+    invalid_value: object,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    hook_run = dict(payload["hook_run"])  # type: ignore[arg-type]
+    hook_run[field] = invalid_value
+    payload["hook_run"] = hook_run
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(None, id="default_slack"),
+        pytest.param(TurnSource.SLACK.value, id="slack"),
+        pytest.param(TurnSource.WEBHOOK.value, id="webhook"),
+    ],
+)
+def test_only_cron_may_be_targetless(source: str | None, reader: str) -> None:
+    payload = _targetless_cron_payload()
+    if source is None:
+        del payload["source"]
+    else:
+        payload["source"] = source
+    payload["reply_handle"] = None
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [TurnSource.SLACK, TurnSource.WEBHOOK, TurnSource.CRON],
+)
+def test_a_targeted_turn_still_round_trips_for_every_source(
+    source: TurnSource,
+) -> None:
+    hook_run = (
+        HookRunRef(
+            agent_id="00000000000040008000000000000001",
+            name="acme_nightly",
+            slot_utc="20260922T030000Z",
+        )
+        if source is TurnSource.CRON
+        else None
+    )
+    turn = QueuedTurn(
+        event_id="e1",
+        conversation_id="c1",
+        author="u1",
+        text="hi",
+        reply_handle=ReplyHandle(
+            kind="slack",
+            channel="C1",
+            placeholder="1.0",
+        ),
+        received_at="20260922T030000Z",
+        source=source,
+        hook_run=hook_run,
+    )
+
+    restored = parse_queued_turn(turn.model_dump_json())
+
+    assert restored == turn
+    assert restored.reply_handle == turn.reply_handle
+    assert restored.source is source
+
+
+def test_a_slack_route_without_an_adapter_is_the_default_identity() -> None:
+    # A handle queued before ADR-0168 decision 3, or an approval row decision 5
+    # has not backfilled yet, still carries NULL. It means the one Slack app.
+    assert route_identity(SLACK_KIND, None) == DEFAULT_IDENTITY == "default"
+
+
+def test_a_named_slack_identity_is_kept() -> None:
+    assert route_identity("slack", "support-bot") == "support-bot"
+
+
+def test_another_kind_keeps_its_adapter_or_its_absence() -> None:
+    assert route_identity("email", "agentmail-sandbox") == "agentmail-sandbox"
+    # A route-less non-Slack binding stays route-less: NULL is not an identity.
+    assert route_identity("email", None) is None
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint", "expected"),
+    [
+        (None, None, DEFAULT_IDENTITY),
+        ("default", None, DEFAULT_IDENTITY),
+        ("support-bot", None, "support-bot"),
+        # An empty endpoint is no endpoint: the route is the configured Slack.
+        ("support-bot", "", "support-bot"),
+        (CLUSTER_MESSAGE_ADAPTER, None, DEFAULT_IDENTITY),
+        # A CLI stub turn carries a per-turn Slack origin (#19); it still
+        # speaks as its identity.
+        ("ops-bot", "http://cli-stub.test/api/", "ops-bot"),
+        (None, "http://127.0.0.1:1", DEFAULT_IDENTITY),
+    ],
+)
+def test_a_slack_route_speaks_as_its_resolved_identity(
+    adapter: str | None, endpoint: str | None, expected: str
+) -> None:
+    assert slack_speaking_identity(SLACK_KIND, adapter, endpoint) == expected
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint"),
+    [("agentmail-sandbox", "https://mail.example.test/"), (None, None)],
+)
+def test_another_kinds_slack_calls_speak_as_the_default_identity(
+    adapter: str | None, endpoint: str | None
+) -> None:
+    # A mail route's `adapter` names a mail adapter, never a Slack identity, so
+    # a Slack call made for it (an approver group lookup) keeps the default app.
+    assert slack_speaking_identity("email", adapter, endpoint) == DEFAULT_IDENTITY
+
+
+@dataclass(frozen=True)
+class _Row:
+    """A minimal stand-in for any row `matching_routes` can read: an ORM
+    object, a SQLAlchemy `Row`, or a plain object -- the function only ever
+    touches kind, address and adapter; `endpoint` lets a case carry one."""
+
+    kind: str
+    address: str
+    adapter: str | None
+    endpoint: str | None
+
+
+def test_a_slack_turn_with_no_adapter_matches_the_stored_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    other_pair = _Row(kind="slack", address="C0EXAMPLE2", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row, other_pair], "slack", "C0EXAMPLE1", None) == [
+        default_row
+    ]
+
+
+def test_a_slack_turn_with_adapter_default_matches_the_same_null_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "default") == [default_row]
+
+
+def test_a_slack_turn_with_a_named_adapter_does_not_match_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "second") == []
+
+
+def test_an_omitted_slack_adapter_never_reaches_a_named_identitys_row() -> None:
+    # ADR-0168 decision 3: an omitted Slack adapter is the default identity and
+    # nothing else, whatever else is bound on the pair.
+    named = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+    legacy = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes([named, legacy], "slack", "C0EXAMPLE1", None) == []
+    assert matching_routes([named, legacy], "slack", "C0EXAMPLE1", "curie-cluster-message") == []
+
+
+def test_two_identities_on_one_slack_channel_each_match_their_own_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="default", endpoint=None)
+    named = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes([default_row, named], "slack", "C0EXAMPLE1", None) == [default_row]
+    assert matching_routes([default_row, named], "slack", "C0EXAMPLE1", "second") == [named]
+
+
+# `curie cluster message` relays a turn with the worker's built-in reply
+# adapter. That adapter picks where the reply is delivered, not which binding
+# answers: the turn is still the channel's own Slack turn.
+_CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
+
+def test_the_cluster_message_relay_adapter_is_not_an_identity() -> None:
+    assert route_identity(SLACK_KIND, _CLUSTER_MESSAGE_ADAPTER) == DEFAULT_IDENTITY
+
+
+def test_a_cluster_message_relay_turn_matches_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    named_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes(
+        [default_row, named_row], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [default_row]
+
+
+def test_a_non_slack_turn_with_an_adapter_matches_only_its_own_row() -> None:
+    named = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    other = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "acme") == [
+        named
+    ]
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "missing") == []
+
+
+def test_a_non_slack_turn_with_no_adapter_matches_every_row_on_the_pair() -> None:
+    # Migration 0069's triple key allows this, and the omitted selector's
+    # semantics are "every row on the pair", not "none".
+    first = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    second = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([first, second], "webhook", "https://example.test/hook", None) == [
+        first,
+        second,
+    ]

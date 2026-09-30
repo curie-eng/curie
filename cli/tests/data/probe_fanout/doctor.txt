@@ -8,7 +8,7 @@ ok    Cluster                    doctor-stub-context (reached)
 ok    Curie release              curie (curie-0.8.2)
 --    Mail channel token         mail adapter not deployed
 ok    Completion delivery        completion outbox: state empty; count 0; inflight 0; retry 0; terminal 0; oldest age 0s
---    Slack                      no tokens recorded; reachable with `curie cluster message`
+--    Slack                      no tokens recorded; reachable with `curie cluster message` and `curie cluster eval`
 MISS  Clone credential           none — a private repo cannot be cloned, so git-push deploys will fail
       → curie cluster github-app --namespace curie --release curie --app-id <id> --private-key ./key.pem
 ok    Push delivery              NodePort 30800 — Curie does not create the GitHub webhook, so this is an exposed API, not a confirmed push path

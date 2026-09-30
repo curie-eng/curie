@@ -75,6 +75,10 @@
 #      ENCRYPTION_KEY. ENCRYPTION_KEY is the sharpest of the set: the operator's
 #      `langfuseEncryptionKey` was silently unused, so a later regeneration of
 #      the chart Secret left previously written encrypted columns undecryptable.
+#   8. With every store's existingSecret set to a distinct name, discover its
+#      keys from the rendered chart Secret and inspect every secretKeyRef in
+#      every rendered manifest. A new consumer of any existing store key must
+#      use that store's external Secret, even when its env name is unfamiliar.
 #
 # Every render goes through `--output-dir`, never a stdout pipe: piping
 # `helm template` in this environment silently truncates a large render at
@@ -126,6 +130,15 @@ echo "=== Rendering Langfuse (langfuse.existingSecret=byo-langfuse) ==="
 render byo-langfuse --set langfuse.existingSecret=byo-langfuse
 BYO_LF_DIR="$RENDER_DIR/curie/templates"
 
+echo "=== Rendering all stores with distinct existing Secrets ==="
+render all-byo \
+  --set postgres.existingSecret=acme-postgres-external \
+  --set valkey.existingSecret=acme-valkey-external \
+  --set clickhouse.existingSecret=acme-clickhouse-external \
+  --set rustfs.existingSecret=acme-rustfs-external \
+  --set langfuse.existingSecret=acme-langfuse-external
+ALL_BYO_DIR="$RENDER_DIR/curie/templates"
+
 # ---------------------------------------------------------------------- 4a
 # A missing manifest file is --output-dir's signal that the whole template
 # rendered nothing (the same check direct-passthrough-existing-secret-
@@ -135,9 +148,10 @@ if [[ -s "$BYO_FULL_DIR/valkey.yaml" ]]; then
 fi
 echo "  [4a] valkey.deploy=false renders no in-chart valkey manifest: OK"
 
-# -------------------------------------------------- 1, 2, 3, 4b, 5, 6, 7
+# -------------------------------------------------- 1, 2, 3, 4b, 5, 6, 7, 8
 DEFAULT_DIR="$DEFAULT_DIR" BYO_DIR="$BYO_DIR" BYO_FULL_DIR="$BYO_FULL_DIR" \
 BYO_PG_DIR="$BYO_PG_DIR" BYO_LF_DIR="$BYO_LF_DIR" \
+ALL_BYO_DIR="$ALL_BYO_DIR" \
 python3 <<'PY'
 import os
 import sys
@@ -149,6 +163,7 @@ BYO_DIR = os.environ["BYO_DIR"]
 BYO_FULL_DIR = os.environ["BYO_FULL_DIR"]
 BYO_PG_DIR = os.environ["BYO_PG_DIR"]
 BYO_LF_DIR = os.environ["BYO_LF_DIR"]
+ALL_BYO_DIR = os.environ["ALL_BYO_DIR"]
 
 # `helm template rel <chart>` -> fullname `rel-curie`, so the chart's own
 # Secret is `rel-curie-secrets`. Hardcoded rather than derived: the point of
@@ -356,15 +371,82 @@ for prefix, env_name, secret_key in LANGFUSE_SHARED_DEFAULTS:
                   env_name, CHART_SECRET_NAME, secret_key,
                   f"default render, {c}")
 
+
+# ---- 8: every store owned key follows its store's distinct external Secret.
+# Discover keys from the chart Secret rather than maintaining a list of env
+# names or keys. The five store prefixes are also the top level values blocks
+# with existingSecret; a capital after the prefix marks their camelCase keys.
+STORE_SECRETS = {
+    "postgres": "acme-postgres-external",
+    "valkey": "acme-valkey-external",
+    "clickhouse": "acme-clickhouse-external",
+    "rustfs": "acme-rustfs-external",
+    "langfuse": "acme-langfuse-external",
+}
+chart_secrets = [d for d in load_docs(f"{DEFAULT_DIR}/secrets.yaml")
+                 if d.get("kind") == "Secret"]
+if len(chart_secrets) != 1:
+    failures.append(f"[8] default render has {len(chart_secrets)} chart Secrets, expected 1")
+else:
+    chart_secret = chart_secrets[0]
+    chart_secret_name = chart_secret.get("metadata", {}).get("name")
+    if not chart_secret_name:
+        failures.append("[8] default chart Secret has no metadata.name")
+    chart_keys = set(chart_secret.get("data") or {}) | set(chart_secret.get("stringData") or {})
+    owned_keys = {}
+    for store in STORE_SECRETS:
+        keys = {key for key in chart_keys
+                if key.startswith(store) and len(key) > len(store)
+                and key[len(store)].isupper()}
+        if not keys:
+            failures.append(f"[8] chart Secret has no keys owned by {store}")
+        for key in keys:
+            if key in owned_keys:
+                failures.append(f"[8] chart Secret key {key!r} belongs to multiple stores")
+            owned_keys[key] = store
+
+    seen_stores = set()
+
+    def inspect_refs(node, location):
+        if isinstance(node, dict):
+            ref = node.get("secretKeyRef")
+            if isinstance(ref, dict):
+                key = ref.get("key")
+                owner = owned_keys.get(key)
+                if owner:
+                    seen_stores.add(owner)
+                    expected = STORE_SECRETS[owner]
+                    if ref.get("name") != expected:
+                        failures.append(
+                            f"[8] {location}.secretKeyRef selects {ref.get('name')!r} "
+                            f"for {owner} key {key!r}; expected {expected!r} "
+                            f"instead of the chart Secret {chart_secret_name!r} "
+                            "or another store's Secret")
+            for field, value in node.items():
+                inspect_refs(value, f"{location}.{field}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                inspect_refs(value, f"{location}[{index}]")
+
+    manifest_count = 0
+    for root, _dirs, files in os.walk(ALL_BYO_DIR):
+        for filename in sorted(files):
+            if not filename.endswith((".yaml", ".yml")):
+                continue
+            path = os.path.join(root, filename)
+            for index, document in enumerate(load_docs(path)):
+                manifest_count += 1
+                inspect_refs(document, f"{path} document {index + 1}")
+    if not manifest_count:
+        failures.append("[8] all store render contains no manifests")
+    for store in STORE_SECRETS:
+        if store not in seen_stores:
+            failures.append(f"[8] no rendered secretKeyRef uses a {store} key")
+
 if failures:
     for msg in failures:
         print(f"FAIL {msg}", file=sys.stderr)
-    # 35 = 25 check_ref call sites + 10 negative-control loop iterations
-    # ([5] 2 dirs x 2 containers = 4, [6e] 2 containers = 2, [7h] 2 env names x
-    # 2 containers = 4). Bash-side [4a] is outside this count, hence "python-
-    # side"; a single check_ref site can emit 2 failures (name and key both
-    # wrong), so len(failures) is not capped at 35.
-    print(f"{len(failures)} of 35 python-side assertions failed", file=sys.stderr)
+    print(f"{len(failures)} rendered secret assertions failed", file=sys.stderr)
     sys.exit(1)
 
 print("  [1] default render: REDIS_AUTH -> chart Secret on web + worker: OK")
@@ -377,8 +459,8 @@ print("  [6] postgres.existingSecret: POSTGRES_PASSWORD -> BYO Secret on langfus
 print("  [7] langfuse.existingSecret: SALT + ENCRYPTION_KEY (web + worker) and "
       "NEXTAUTH_SECRET + the two LANGFUSE_INIT_* keys (web) -> BYO Secret, with "
       "negative control and default no-regression: OK")
+print("  [8] all store owned keys resolve to their distinct existing Secrets: OK")
 PY
 
 echo
-echo "PASS: valkey, postgres and langfuse existingSecret each reach every consumer,"
-echo "      Langfuse included (#2052, #2327)."
+echo "PASS: every store owned key follows its existing Secret across all rendered manifests."

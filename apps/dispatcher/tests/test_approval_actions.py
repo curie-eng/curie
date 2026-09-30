@@ -9,7 +9,6 @@ resolved by X", and the ordinary-button catch-all never double-handles an
 approval click.
 """
 
-import ast
 import base64
 import hashlib
 import hmac
@@ -17,6 +16,7 @@ import json
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -46,7 +46,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize, deliver_once, deliver_until_acked
+from .conftest import FakeSocketClient, ScriptedResolver, _authorize, deliver_once
 from .test_approval_note_dialog import (
     _assert_ownership_miss_ephemeral,
     _note_click,
@@ -118,47 +118,6 @@ _COULD_NOT_VERIFY_GROUP_REASON = (
 )
 
 
-class ScriptedResolver:
-    """Stands in for the platform API: returns a scripted outcome per call."""
-
-    def __init__(self, outcome: ResolveOutcome) -> None:
-        self.outcome = outcome
-        self.calls: list[dict[str, str]] = []
-
-    def resolve(
-        self,
-        approval_id: str,
-        *,
-        decision: str,
-        attested_user: str,
-        attested_channel: str,
-        note: str | None = None,
-    ) -> ResolveOutcome:
-        # `note` is recorded, not ignored: the dialog path's whole point is that
-        # the approver's reason reaches the record, and a stand-in that dropped
-        # it would let that regress silently (#1053).
-        self.calls.append(
-            {
-                "approval_id": approval_id,
-                "decision": decision,
-                "attested_user": attested_user,
-                "attested_channel": attested_channel,
-                "note": note,
-            }
-        )
-        return self.outcome
-
-    def exists(self, approval_id: str) -> bool | None:
-        # Mirror the production ownership probe: only the exact API row-miss
-        # is "not this release". Any other outcome means this release has a
-        # row (or the probe failed open).
-        del approval_id
-        return not (
-            self.outcome.status_code == 404
-            and self.outcome.detail.strip().casefold() == "approval not found"
-        )
-
-
 def _build(
     config: DispatcherConfig, redis_client: redis.Redis, resolver: ScriptedResolver
 ) -> tuple[App, WebClient]:
@@ -213,13 +172,6 @@ def _stub_dialog_web(web_client: WebClient) -> None:
     web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
         return_value={"messages": [_CARD_MESSAGE]},
     )
-
-
-_ONESHOT_TWO_RELEASE_TESTS = (
-    "test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action",
-    "test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog",
-    "test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission",
-)
 
 
 def test_authorized_click_resolves_and_stamps_the_card(
@@ -278,64 +230,141 @@ def test_reject_button_resolves_with_rejected_decision(
     assert "Rejected by <@U_MANAGER>" in web_client.chat_update.call_args.kwargs["text"]
 
 
-def test_two_releases_only_the_owner_resolves_an_immediate_action(
+# The decision instant the settled-card tests pin, and the Slack date token it
+# renders as. Slack documents the token as ``<!date^unix^token_string|fallback>``,
+# rendered in the reader's own time zone and only inside ``mrkdwn`` text objects
+# ("Date formatting", https://docs.slack.dev/messaging/formatting-message-text).
+_DECIDED = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+_DECIDED_TOKEN = "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
+
+
+@pytest.mark.parametrize(
+    ("action_id", "decision", "header"),
+    [(APPROVE_ACTION_ID, "approved", "Approved"), (REJECT_ACTION_ID, "rejected", "Rejected")],
+)
+def test_a_click_heads_the_card_with_its_outcome_and_stamps_the_decision_time(
     redis_client: redis.Redis,
     config: DispatcherConfig,
-    caplog: pytest.LogCaptureFixture,
+    action_id: str,
+    decision: str,
+    header: str,
 ) -> None:
-    """One fake Slack app, two dispatchers: only the owner consumes the click (#2248).
+    """ADR-0179 decision 1: once resolved, the card is a record, not a request.
 
-    Slack delivers the same envelope to the non-owner first. That release must
-    leave the envelope unacked (so Slack retries) and must not mutate the card.
-    It posts an ephemeral telling the clicker to disconnect the extra client.
-    The retry reaches the owner, who acks and stamps with no extra ephemeral.
+    The header states the outcome, the summary stays, and the verdict line
+    carries the time the API recorded, so a reader later can tell from the card
+    alone whether it was approved, by whom and when.
     """
 
-    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
-    owner = ScriptedResolver(
-        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=200,
+            resolved_by="U_MANAGER",
+            decision=decision,
+            resolved_at=_DECIDED,
+        )
     )
-    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
-    owner_app, owner_web = _build(config, redis_client, owner)
-    non_owner_socket = FakeSocketClient()
-    owner_socket = FakeSocketClient()
-    click = _approval_click("env-shared-immediate", action_id=APPROVE_ACTION_ID)
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
 
-    acked_by = deliver_until_acked(
-        [
-            (
-                SocketModeHandler(non_owner_app, app_token="xapp-test"),
-                non_owner_socket,
-                non_owner_app,
-            ),
-            (
-                SocketModeHandler(owner_app, app_token="xapp-test"),
-                owner_socket,
-                owner_app,
-            ),
+    handler.handle(FakeSocketClient(), _approval_click("env-t1", action_id=action_id))
+    _drain(app)
+
+    blocks = web_client.chat_update.call_args.kwargs["blocks"]
+    assert blocks[0]["type"] == "header"
+    assert blocks[0]["text"]["text"] == header
+    assert blocks[1]["text"]["text"] == "Discount for ACME", "the summary must survive"
+    assert blocks[-1] == {
+        "type": "context",
+        "elements": [
+            {"type": "mrkdwn", "text": f"{header} by <@U_MANAGER> on {_DECIDED_TOKEN}"}
         ],
-        click,
+    }
+
+
+def test_a_claim_race_refresh_keeps_the_header_it_read(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The secondary path of ADR-0179 decision 1: a 409 names who won, not how.
+
+    The refresh exists to take stale buttons down. Without the outcome in hand it
+    must not invent a header, so it leaves the one it read.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=409, detail="already resolved by U_FIRST (approved)")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(
+        FakeSocketClient(),
+        _approval_click("env-l2", action_id=APPROVE_ACTION_ID, user="U_SECOND"),
+    )
+    _drain(app)
+
+    blocks = web_client.chat_update.call_args.kwargs["blocks"]
+    assert blocks[0]["text"]["text"] == "Approval required"
+
+
+class _ResolvedAtResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+
+class _ResolvedAtClient:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def post(
+        self, url: str, *, json: dict[str, Any], headers: dict[str, str]
+    ) -> _ResolvedAtResponse:
+        return _ResolvedAtResponse(self._body)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # ``ApprovalOut.resolved_at`` is the row's naive UTC instant, which the
+        # API serializes with no offset: ``crud.py`` writes ``func.now()`` into a
+        # ``timestamp without time zone`` column, like every instant on that row.
+        ("2026-09-21T14:13:20", _DECIDED),
+        ("2026-09-21T14:13:20.250000", _DECIDED.replace(microsecond=250000)),
+        ("2026-09-21T16:13:20+02:00", _DECIDED),
+        (None, None),
+        ("not a time", None),
+    ],
+)
+def test_resolve_reads_the_decision_time_off_the_response(
+    raw: str | None, expected: datetime | None
+) -> None:
+    body: dict[str, Any] = {"status": "approved", "resolved_by": "U_MANAGER"}
+    if raw is not None:
+        body["resolved_at"] = raw
+    resolver = ApprovalResolveClient(
+        api_base_url="https://api.example.test",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        client=_ResolvedAtClient(body),  # type: ignore[arg-type]
     )
 
-    assert acked_by is owner_socket
-    assert non_owner_socket.acked_envelope_ids == []
-    assert owner_socket.acked_envelope_ids == ["env-shared-immediate"]
-    assert len(non_owner.calls) == 1
-    assert len(owner.calls) == 1
-    non_owner_web.chat_update.assert_not_called()
-    non_owner_web.chat_postMessage.assert_not_called()
-    _assert_ownership_miss_ephemeral(non_owner_web)
-    owner_web.chat_update.assert_called_once()
-    assert "Approved by <@U_MANAGER>" in owner_web.chat_update.call_args.kwargs["text"]
-    owner_web.chat_postEphemeral.assert_not_called()
-    assert any(
-        "may be owned by another Curie release" in record.getMessage() for record in caplog.records
+    outcome = resolver.resolve(
+        APPROVAL_ID, decision="approved", attested_user="U_MANAGER", attested_channel="C_MGRS"
     )
+
+    assert outcome.resolved_at == expected
 
 
 def test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action(
     redis_client: redis.Redis,
     config: DispatcherConfig,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """One delivery to the non-owner, then one to the owner. No retry loop (#2307)."""
 
@@ -366,6 +395,9 @@ def test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action(
     owner_web.chat_update.assert_called_once()
     assert "Approved by <@U_MANAGER>" in owner_web.chat_update.call_args.kwargs["text"]
     owner_web.chat_postEphemeral.assert_not_called()
+    assert any(
+        "may be owned by another Curie release" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog(
@@ -435,29 +467,14 @@ def test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission(
     deliver_once(owner_handler, owner_socket, owner_app, submit)
 
     assert owner_socket.acked_envelope_ids == ["env-oneshot-note-submit"]
+    assert owner_socket.ack_payload_for("env-oneshot-note-submit") is None
+    non_owner_web.conversations_replies.assert_not_called()
     assert len(non_owner.calls) == 1
     assert len(owner.calls) == 1
     assert owner.calls[0]["note"] == "approved for Q3"
     owner_web.chat_update.assert_called_once()
     assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
     owner_web.chat_postEphemeral.assert_not_called()
-
-
-def test_oneshot_two_release_tests_do_not_call_deliver_until_acked() -> None:
-    """Retry-loop-only is not the #2307 proof: inspect the one-shot sources."""
-
-    source = Path(__file__).read_text()
-    tree = ast.parse(source)
-    funcs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-    assert "test_two_releases_only_the_owner_resolves_an_immediate_action" in funcs
-    for name in _ONESHOT_TWO_RELEASE_TESTS:
-        node = funcs.get(name)
-        assert node is not None, f"missing one-shot test {name}"
-        func_src = ast.get_source_segment(source, node) or ""
-        assert "deliver_until_acked" not in func_src, (
-            f"{name} must not call deliver_until_acked; retry-loop-only is insufficient"
-        )
-        assert "deliver_once(" in func_src, f"{name} must deliver via deliver_once"
 
 
 def test_a_proxy_404_still_consumes_the_envelope(
@@ -1146,3 +1163,28 @@ def test_a_plain_note_is_unchanged() -> None:
     line = settled_verdict_line(decision="rejected", resolver="U1", note="discount exceeds policy")
 
     assert "Note: discount exceeds policy" in line
+
+
+def test_the_verdict_line_names_the_resolver_and_the_decision_time() -> None:
+    """ADR-0179 decision 1: who decided, and when, as Slack's date token."""
+    line = settled_verdict_line(
+        decision="approved", resolver="U_MANAGER", note="approved for Q3", resolved_at=_DECIDED
+    )
+
+    assert line == f"Approved by <@U_MANAGER> on {_DECIDED_TOKEN}\nNote: approved for Q3"
+
+
+def test_a_naive_decision_time_is_read_as_utc() -> None:
+    """The approval row stores naive UTC, so a naive instant must not shift."""
+    naive = settled_verdict_line(
+        decision="rejected", resolver="U1", note=None, resolved_at=_DECIDED.replace(tzinfo=None)
+    )
+
+    assert naive == f"Rejected by <@U1> on {_DECIDED_TOKEN}"
+
+
+def test_a_verdict_with_no_decision_time_keeps_the_bare_attribution() -> None:
+    """No readable time is shown as none, never as an invented one."""
+    line = settled_verdict_line(decision="approved", resolver="U1", note=None, resolved_at=None)
+
+    assert line == "Approved by <@U1>"

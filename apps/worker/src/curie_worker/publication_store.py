@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
@@ -34,6 +35,7 @@ class PublicationResult:
     error: str | None
     resolved_by: str | None
     resolution_note: str | None
+    resolved_at: datetime | None
     target: ReplyTarget
     route: TargetRoute
     attempt: int
@@ -329,16 +331,20 @@ class PostgresPublicationStore:
                     {"approval_id": row["approval_id"]},
                 )
 
-    async def claim_next(self) -> PublicationWork | None:
+    async def claim_next(
+        self, *, exclude: Collection[uuid.UUID] = ()
+    ) -> PublicationWork | None:
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
                    p.lineage_id, p.revision_number, p.expected_prior_head,
                    p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body,
+                   p.observed_title_sha256, p.observed_body_sha256,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
                    l.pr_url, l.head_sha,
+                   l.github_repository_id, l.github_pr_node_id,
                    a.conversation_id,
                    (
                      p.execution_request_id IS NULL
@@ -358,6 +364,7 @@ class PostgresPublicationStore:
                AND p.reconcile_attempts < :max_attempts
                AND p.reconcile_dead_lettered_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+               AND NOT (p.id = ANY(CAST(:exclude AS uuid[])))
                AND (
                     p.execution_request_id IS NULL
                     OR EXISTS (
@@ -375,7 +382,11 @@ class PostgresPublicationStore:
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
-                    statement, {"max_attempts": self._reconcile_max_attempts}
+                    statement,
+                    {
+                        "max_attempts": self._reconcile_max_attempts,
+                        "exclude": [str(item) for item in exclude],
+                    },
                 )
             ).mappings().first()
             if row is None:
@@ -428,6 +439,14 @@ class PostgresPublicationStore:
             branch=str(row["branch"]),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
+            github_repository_id=(
+                int(row["github_repository_id"])
+                if row["github_repository_id"] is not None else None
+            ),
+            github_pr_node_id=(
+                str(row["github_pr_node_id"])
+                if row["github_pr_node_id"] is not None else None
+            ),
             expected_prior_head=str(row["expected_prior_head"]),
             expected_remote_head=(
                 str(row["head_sha"])
@@ -437,6 +456,8 @@ class PostgresPublicationStore:
             base_sha=str(row["base_sha"]),
             patch=patch,
             changed_paths=tuple(str(path) for path in paths),
+            observed_title_sha256=row["observed_title_sha256"],
+            observed_body_sha256=row["observed_body_sha256"],
             title=str(row["title"]),
             body=str(row["body"]),
             target=ReplyTarget(
@@ -580,12 +601,14 @@ class PostgresPublicationStore:
         self, publication_id: uuid.UUID, *, outcome: str, pr_url: str | None
     ) -> None:
         await self.persist_result(
-            publication_id, outcome=outcome, pr_url=pr_url, error=None
+            publication_id, outcome=outcome, pr_url=pr_url, error=None,
+            metadata_updated_at=None,
         )
 
     async def fail(self, publication_id: uuid.UUID, *, error: str) -> None:
         await self.persist_result(
-            publication_id, outcome="failed", pr_url=None, error=error
+            publication_id, outcome="failed", pr_url=None, error=error,
+            metadata_updated_at=None,
         )
 
     async def persist_result(
@@ -595,6 +618,7 @@ class PostgresPublicationStore:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         """Persist the outcome and clear private work before any reply attempt.
 
@@ -617,6 +641,7 @@ class PostgresPublicationStore:
             status=status,
             result_url=pr_url,
             error=error[:2000] if error else None,
+            metadata_updated_at=metadata_updated_at,
         )
 
     async def pending_result(
@@ -633,7 +658,8 @@ class PostgresPublicationStore:
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
                    COALESCE(p.workspace_conversation_id, l.conversation_id)
                        AS workspace_conversation_id,
-                   a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note
+                   a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note,
+                   a.resolved_at
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               LEFT JOIN {self._lineages} l ON l.id = p.lineage_id
@@ -731,6 +757,12 @@ class PostgresPublicationStore:
                 str(row["resolution_note"])
                 if row["resolution_note"] is not None
                 else None
+            ),
+            # The row's naive UTC instant, made aware for the settled card.
+            resolved_at=(
+                row["resolved_at"].replace(tzinfo=UTC)
+                if row["resolved_at"] is not None and row["resolved_at"].tzinfo is None
+                else row["resolved_at"]
             ),
             target=ReplyTarget(
                 kind=str(row["reply_kind"]),
@@ -1008,6 +1040,41 @@ class PostgresPublicationStore:
             raise PublicationStoreError("publication retry CAS was lost")
         self._versions.pop(publication_id, None)
 
+    async def release(self, publication_id: uuid.UUID) -> None:
+        """Release an owned reconcile lease without charging an attempt.
+
+        Used while the deterministic Job is still in flight, so the next pass
+        observes it promptly instead of waiting out the lease.
+        """
+
+        version = self._versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET lease_owner = NULL,
+                               lease_expires_at = NULL,
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :id AND version = :version AND lease_owner = :owner
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "version": version,
+                        "owner": self._lease_owner,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication release CAS was lost")
+        self._versions.pop(publication_id, None)
+
     async def _terminal_cas(
         self,
         publication_id: uuid.UUID,
@@ -1015,6 +1082,7 @@ class PostgresPublicationStore:
         status: str,
         result_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         version = self._versions.get(publication_id)
         if version is None:
@@ -1028,6 +1096,7 @@ class PostgresPublicationStore:
                            SET status = :status,
                                result_url = :result_url,
                                error = :error,
+                               metadata_updated_at = :metadata_updated_at,
                                patch_bytes = NULL,
                                lease_owner = NULL,
                                lease_expires_at = NULL,
@@ -1044,6 +1113,7 @@ class PostgresPublicationStore:
                         "status": status,
                         "result_url": result_url,
                         "error": error,
+                        "metadata_updated_at": metadata_updated_at,
                         "id": publication_id,
                         "version": version,
                         "owner": self._lease_owner,

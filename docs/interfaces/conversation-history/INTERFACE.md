@@ -51,10 +51,20 @@ conversation, reconstructed through the selected harness adapter.
   other scheme (an old SDK-resume id, `s3://` …) is reserved for a future loader
   and rejected loudly.
 - **Load side.** `load()` returns prior turns/summaries oldest-first (empty when
-  none). At boot `build_conversation_replay` reconstructs the ordered portable
-  prefix. The Claude adapter prefers an optional native checkpoint so its exact
+  none). The state API advertises its configured transcript value cap on both
+  a successful GET and a missing transcript response. The runner requires that
+  cap and uses it for every history bound; it does not assume a local default.
+  The API default is 16 MiB (chart value `api.transcriptMaxThreadBytes`,
+  env `TRANSCRIPT_MAX_THREAD_BYTES`), sized for a whole factory turn. At boot `build_conversation_replay`
+  reconstructs the ordered portable prefix. The Claude adapter prefers an
+  optional native checkpoint so its exact
   cache-breakpoint shape survives; without one it materializes deterministic
-  provider-local entries from role/content. The fake consumes the same portable prefix, and a
+  provider-local entries from role/content. It restores a checkpoint only when
+  every system prompt the checkpoint recorded is the one this boot composed:
+  the Claude CLI resends a recorded prompt on resume instead of the one it is
+  given, so a checkpoint from an earlier prompt would hide this turn's
+  attachments, new memory, or a redeployed bundle prompt. A checkpoint recorded
+  under another prompt is set aside and the portable prefix is materialized. The fake consumes the same portable prefix, and a
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
@@ -80,9 +90,11 @@ conversation, reconstructed through the selected harness adapter.
   `SummaryRecord`; ordinary appends retain the exact prefix until the next
   boundary. Compaction deliberately drops the old native checkpoint; the first
   turn over the new portable summary writes a fresh one, while later turns append
-  only deltas. One active turn never makes a summary: there is nothing to
-  compact, so its replay stays plain however large it is. A 413 while boot
-  appends its summary makes boot rewrite the value it loaded with a
+  only deltas. Within one active turn, older completed tool exchanges can be
+  replaced with a deterministic marker when the turn exceeds the bound. The
+  first user message, final answer, recent tool call and result pairs, and any
+  pending approval remain intact. A 413 while boot appends its summary makes
+  boot rewrite the value it loaded with a
   compare-and-set `PUT` to the compacted value, then reload and rebuild the
   replay from what is stored. A write after that load returns 409 and boot
   reloads instead of writing a stale view, for at most three passes. Only when
@@ -149,9 +161,12 @@ unplanned-restart case needs no special worker/kernel branch.
   `compact_transcript_value`, and the `PUT` carries `expected_version`, which
   the state API checks under the same row lock an append takes, so a concurrent
   append is never overwritten. The runner still refuses when publication
-  markers and the summary alone leave no room for the latest turn. There is no
-  other automatic data retention or deletion policy for the stored source. For
-  a value cap the runner cannot recover, quiesce
+  markers and the summary alone leave no room for the latest bounded turn. A
+  single turn that cannot be bounded under the cap fails the run with an error
+  naming the turn's compacted size and the cap. A
+  terminal capacity notice tells the operator to inspect the affected work and
+  retry the run. There is no other automatic data retention or deletion policy
+  for the stored source. For a value cap the runner cannot recover, quiesce
   and release the affected thread, export and verify its owned key,
   including version, digest, and records, then delete it with
   `DELETE .../state/transcript/<thread_key>?expected_version=<exported version>`.

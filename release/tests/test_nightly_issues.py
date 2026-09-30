@@ -397,3 +397,97 @@ class TestFilingPathWithEscapedLogs:
             [{"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG}]
         )[0]
         assert nightly.signature_marker(expected.signature_id) in body
+
+
+class TestEveryRedRungIsFiled:
+    """#2868: a red rung with no issue created or updated fails the run."""
+
+    def _jobs_payload(self, *jobs: tuple[int, str]) -> str:
+        return json.dumps(
+            {
+                "jobs": [
+                    {"id": job_id, "name": name, "conclusion": "failure"}
+                    for job_id, name in jobs
+                ]
+            }
+        )
+
+    def test_a_failed_log_fetch_still_files_with_the_log_omitted(
+        self, monkeypatch, capsys
+    ) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            joined = " ".join(args)
+            if joined.endswith("/jobs"):
+                return FakeCompleted(stdout=self._jobs_payload((77, "cluster")))
+            if "/logs" in joined:
+                raise nightly.subprocess.CalledProcessError(
+                    1, args, output="", stderr="HTTP 410: log expired"
+                )
+            if "label" in args and "list" in args:
+                return FakeCompleted(stdout=json.dumps([{"name": nightly.NIGHTLY_LABEL}]))
+            if "issue" in args and "list" in args:
+                return FakeCompleted(stdout="[]")
+            return FakeCompleted(stdout="")
+
+        monkeypatch.setattr(nightly.subprocess, "run", fake_run)
+        assert nightly.file_issues("curie-eng/curie", "42", "http://run") == 0
+
+        created = [c for c in calls if "issue" in c and "create" in c]
+        assert len(created) == 1, calls
+        body = created[0][created[0].index("--body") + 1]
+        title = created[0][created[0].index("--title") + 1]
+        assert "cluster" in title
+        assert "Log omitted" in body
+        assert "HTTP 410: log expired" in body
+
+    def test_a_red_rung_whose_issue_create_fails_fails_the_run_and_names_it(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(nightly, "_ensure_label", lambda repo: None)
+        monkeypatch.setattr(
+            nightly,
+            "_failed_job_logs",
+            lambda repo, run_id: [
+                {"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG},
+                {"name": "cluster", "conclusion": "failure", "log": CLUSTER_LOG},
+            ],
+        )
+        monkeypatch.setattr(nightly, "_open_nightly_issues", lambda repo: [])
+
+        def fake_gh(args):
+            if "create" in args and any("timed out" in a for a in args):
+                raise nightly.subprocess.CalledProcessError(
+                    1, ["gh"], output="", stderr="gh: validation failed"
+                )
+            return ""
+
+        monkeypatch.setattr(nightly, "_gh", fake_gh)
+        rc = nightly.file_issues("curie-eng/curie", "1", "http://run")
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "::error" in out
+        assert "cluster" in out
+        assert "local-release" not in out.split("::", 2)[-1].split("gh errors")[0]
+        assert "created issue" in out
+
+    def test_duplicate_signatures_across_rungs_count_as_filed(self, monkeypatch) -> None:
+        monkeypatch.setattr(nightly, "_ensure_label", lambda repo: None)
+        monkeypatch.setattr(
+            nightly,
+            "_failed_job_logs",
+            lambda repo, run_id: [
+                {"name": "a", "conclusion": "failure", "log": DISPATCHER_LOG},
+                {"name": "b", "conclusion": "failure", "log": DISPATCHER_LOG},
+            ],
+        )
+        monkeypatch.setattr(nightly, "_open_nightly_issues", lambda repo: [])
+        monkeypatch.setattr(nightly, "_gh", lambda args: "")
+        assert nightly.file_issues("curie-eng/curie", "1", "http://run") == 0
+
+    def test_the_filing_job_can_fail_the_workflow_run(self) -> None:
+        workflow = yaml.load(NIGHTLY_YAML.read_text(), Loader=yaml.BaseLoader)
+        job = workflow["jobs"]["file-failures"]
+        assert (job.get("continue-on-error") or "false") == "false"

@@ -71,9 +71,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `apps/api/src/curie_api/resumequeue.py`, and the Rust CLI through the generated constant in
   `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
   the literal.
-  For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
-  ts, `author` is the Slack user id, and `reply_handle` carries the `slack` kind, Slack
-  channel, and placeholder ts.
+  For the Slack adapter, `event_id` is the Slack event id (suffixed `:<identity>`
+  on any Slack identity but `default`), `conversation_id` is the thread ts,
+  `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
+  Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
+  the delivery arrived on (ADR-0168 decisions 2 and 3).
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
@@ -108,6 +110,28 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `_ClusterMessageReplyAdapter`
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`), selected by
   `ReplySinkRouter` for the reserved `curie-cluster-message` adapter name.
+- **Admission**: each binding may carry `allowed_callers`, an optional list of the
+  exact caller ids that may start a turn through it (ADR 0175); none means everyone.
+  One function decides, `admit`
+  (`apps/api/src/curie_api/admission.py::admit`), before any turn, placeholder or
+  reply. The wire ingress runs it inside `POST /channels/turns` after verifying the
+  token and before claiming the delivery, and answers a refused `author` with 403
+  and `{"detail": "caller_not_allowed"}`, which every adapter treats as final (a
+  403 without that code stays retryable). The Slack dispatcher has no database, so it
+  asks `POST /channels/admission` (platform key only) through `AdmissionGate`
+  (`apps/dispatcher/src/curie_dispatcher/admission.py::AdmissionGate`) after its
+  own filters and before `claim_event`, on mentions, direct messages and
+  turn-starting clicks, with the sender (plus the bot id when a bot sent it) or the
+  clicking user. It caches answers per route for 30 seconds in memory and in
+  Valkey (so a restart keeps them), keeps using an expired answer for up to 5
+  minutes while the API cannot answer, and refuses a cold miss during an outage
+  unless its last answer, within those 5 minutes, said no binding on the install
+  carries a list. An API that predates the admission route (FastAPI's route-miss
+  404) has no lists, so the dispatcher admits. A refused caller gets no placeholder and no reply;
+  the dispatcher logs `caller_not_allowed` or `admission_unavailable`, and both
+  services count `curie.turn.refused`. The list is set with
+  `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
+  and so the adapter's token, alone.
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
   `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   Both halves are required, with no address-only fallback, and uniqueness is on the same
@@ -161,6 +185,8 @@ tests assert the two sets equal in both directions.
 | `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. An exact operator-trusted sender/channel pair may bypass this refusal; self-event suppression remains mandatory. |
 | `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |
 | `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
+| `CALLER_NOT_ALLOWED` | The binding this delivery arrived on carries a list of who may talk to the bot, and the platform API said the caller is not on it (ADR 0175), so no placeholder is posted and no turn is minted: a polite refusal would tell a stranger the bot exists. |
+| `ADMISSION_UNAVAILABLE` | The platform API could not answer whether the caller may talk to the bot and no usable answer was cached, so the delivery is refused rather than admitted unchecked (ADR 0175 fails closed). This is an outage signal, not a list typo: the route may carry no list at all. |
 | `NO_ACTION_IN_PAYLOAD` | A block-action payload carrying no actions names no command and addresses nothing, so there is no turn to mint from it. |
 | `EMPTY_ACTION_COMMAND` | A clicked button carrying neither a value nor a usable action id names no command, so the turn text would be empty. |
 | `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
@@ -224,7 +250,10 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
   an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
   `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above, unless the event's
-  exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST`; on the DM lane bot
+  exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST` or its `bot_id`
+  belongs to another of this installation's own identities (ADR-0168 decision 6), whose
+  bot user then becomes the turn's `author` so the worker's sibling limit can count it;
+  exercised in `apps/dispatcher/tests/test_sibling_admission.py`; on the DM lane bot
   authorship is not consulted at all. The allowlist defaults to empty and malformed
   entries fail dispatcher configuration. Only trust a dedicated sender that does not
   automatically respond to Curie: an allowlisted second Curie installation could loop.

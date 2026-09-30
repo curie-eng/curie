@@ -36,11 +36,15 @@ from aci_protocol.service_config import (
     derive_dead_letter_stream_name,
     warn_if_deprecated_api_url_env,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from pydantic import AliasChoices, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
+
+from . import caller_token
+from .receipt import TurnReceiptMode
 
 
 def _default_consumer_name() -> str:
@@ -127,11 +131,27 @@ def _parse_trusted_origins(value: object) -> object:
 TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 
+# Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
+# three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
+# chart schema carries the same maximum.
+MAX_DELIVERY_BUDGET_S = 10800.0
+
+
+class CallerSigningKeyError(RuntimeError):
+    """The connector caller signing key cannot sign.
+
+    Not a ``ValueError``: pydantic wraps one of those in a ``ValidationError``
+    that prints the whole settings input, which would put the key in the boot
+    log.
+    """
+
 
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -165,6 +185,10 @@ class WorkerConfig(BaseSettings):
 
     # Slack
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot; `slack_tokens` reads each
+    # one's bot token for its replies and file downloads (decision 5).
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
     # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
     # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)
@@ -257,6 +281,14 @@ class WorkerConfig(BaseSettings):
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
 
+    # The Ed25519 seed that signs each sandbox's connector caller token
+    # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
+    # renders it only from `connectorCaller.existingSecret`, and it never
+    # enters a sandbox (`sandbox.types.HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
+    connector_caller_signing_key: str = Field(
+        default="", validation_alias="CURIE_CONNECTOR_CALLER_SIGNING_KEY", repr=False
+    )
+
     # The shimmer caption, kept SEPARATE from the dispatcher's placeholder text
     # because the two surfaces have different grammar. Slack renders an
     # assistant-thread status as "<App Name> <status>" and inserts the app name
@@ -314,6 +346,21 @@ class WorkerConfig(BaseSettings):
         default="Working on it...",
         validation_alias="CURIE_BOOTING_TEXT",
     )
+
+    # What the receipt beneath a turn's reply shows (ADR-0180): every action
+    # (``all``, the ADR-0117 receipt as built), only the failed ones, or none.
+    # Any other value refuses boot rather than falling back to a mode nobody
+    # chose. It changes only what the person is shown, never what the action
+    # ledger records or what the no-retry rule reads.
+    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+
+    # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
+    # exists until the rendering change lands, and the chart does not set it.
+    # Off, the kernel's progress pump records each command's state and
+    # milestone reservation and removes the deliveries it enqueued, so nothing
+    # is shown and nothing is left owed. This worker has no progress deliverer,
+    # so ``_progress_render_needs_a_deliverer`` refuses it on.
+    progress_render: Bool = Field(default=False, validation_alias="CURIE_PROGRESS_RENDER")
 
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
@@ -391,6 +438,22 @@ class WorkerConfig(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
+        """Refuse to start with progress rendering on (ADR 0130).
+
+        Nothing in this worker delivers progress to an adapter. Accepting the
+        switch would claim a rendering that does not happen, and leaving each
+        owed delivery in the outbox for a later deliverer would replay a
+        backlog of stale cards into old threads the day one exists.
+        """
+        if self.progress_render:
+            raise ValueError(
+                "CURIE_PROGRESS_RENDER=true needs progress rendering, which this worker "
+                "does not include; leave it unset"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _reject_self_targeting_graveyard(self) -> WorkerConfig:
         """Fail at construction if the graveyard points back at the source stream.
 
@@ -440,6 +503,24 @@ class WorkerConfig(BaseSettings):
                 "is unset; connector object names are derived from these, so "
                 "the reconciler would manage a parallel set under wrong names"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
+        """Fail at construction on a signing key that cannot sign.
+
+        Otherwise every scoped boot would raise at mint time, one turn at a
+        time.
+        """
+
+        if not self.connector_caller_signing_key.strip():
+            return self
+        try:
+            caller_token.signing_key(self.connector_caller_signing_key)
+        except ValueError as exc:
+            raise CallerSigningKeyError(
+                f"CURIE_CONNECTOR_CALLER_SIGNING_KEY is unusable: {exc}"
+            ) from None
         return self
 
     @model_validator(mode="after")
@@ -550,6 +631,30 @@ class WorkerConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _hook_claim_lease_covers_the_budget(self) -> WorkerConfig:
+        """Fail at construction if a cron claim's lease is shorter than a turn.
+
+        The next fire reclaims a claim past its lease (ADR-0099, #2931). A
+        lease shorter than the overall delivery budget would reclaim a turn
+        that is still running and let a second fire of the hook start beside it.
+        """
+        lease = self.hook_claim_lease_s
+        if lease is not None and lease < self.delivery_budget_s:
+            raise ValueError(
+                f"CURIE_HOOK_CLAIM_LEASE_S ({lease!r}) must be at least "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a shorter "
+                "lease reclaims a scheduled turn that is still running"
+            )
+        return self
+
+    @property
+    def effective_hook_claim_lease_s(self) -> float:
+        """The cron claim lease; the delivery budget when none is configured."""
+        if self.hook_claim_lease_s is None:
+            return self.delivery_budget_s
+        return self.hook_claim_lease_s
+
+    @model_validator(mode="after")
     def _runner_request_fits_the_budget(self) -> WorkerConfig:
         """Fail at construction if the per-request ceiling exceeds the budget.
 
@@ -565,29 +670,6 @@ class WorkerConfig(BaseSettings):
                 f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a "
                 "per-request ceiling above the overall budget is dead "
                 "configuration, since the budget always expires first"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _quiesce_outlives_the_drain_wait(self) -> WorkerConfig:
-        """Fail at construction if the quiesce flag can lapse mid-drain.
-
-        The gate sets the flag once and then waits up to
-        ``upgrade_drain_timeout_s`` for the in-flight deliveries to settle. A
-        TTL at or below that wait expires the flag while the gate is still
-        waiting, so the replicas resume claiming into an upgrade that is about
-        to roll them -- re-creating the very interruption the gate exists to
-        prevent, and doing it silently (the gate would still report a clean
-        drain). Strictly greater, so there is real headroom.
-        """
-        if self.upgrade_quiesce_ttl_s <= self.upgrade_drain_timeout_s:
-            raise ValueError(
-                "CURIE_UPGRADE_QUIESCE_TTL_S "
-                f"({self.upgrade_quiesce_ttl_s!r}) must be strictly greater than "
-                "CURIE_UPGRADE_DRAIN_TIMEOUT_S "
-                f"({self.upgrade_drain_timeout_s!r}): a flag that lapses mid-drain "
-                "lets the replicas resume claiming into a roll that is about to "
-                "interrupt them"
             )
         return self
 
@@ -616,6 +698,12 @@ class WorkerConfig(BaseSettings):
 
     # Markers
     idempotency_ttl_s: int = 86400
+    capacity_wait_budget_s: float = Field(
+        default=86400.0,
+        ge=1.0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_CAPACITY_WAIT_BUDGET_S",
+    )
 
     # The completion outbox (ADR-0096 EB-B6). ``grace`` keeps the sweeper out of
     # the kernel's own emit window, so the normal path is not racing a sweeper on
@@ -737,9 +825,21 @@ class WorkerConfig(BaseSettings):
     # the delivery. The lease is the renewable proof of ownership that makes a
     # healthy long turn un-reclaimable and a dead owner's turn recoverable
     # after a bounded expiry, replacing the old dead pair of a flat HTTP
-    # timeout and a 900s idle-based steal window.
+    # timeout and a 900s idle-based steal window. Both this budget and the
+    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (three hours, #3071).
     delivery_budget_s: float = Field(
-        default=600.0, ge=60.0, le=1800.0, validation_alias="CURIE_DELIVERY_BUDGET_S"
+        default=600.0,
+        ge=60.0,
+        le=MAX_DELIVERY_BUDGET_S,
+        validation_alias="CURIE_DELIVERY_BUDGET_S",
+    )
+    # How long a cron hook run claim holds before the hook's next fire may
+    # reclaim it (ADR-0099, #2931). ``None`` means the delivery budget: the
+    # budget bounds the whole delivery, so a turn past it is dead by
+    # construction. Set it higher when turns wait long on the stream before a
+    # worker claims them; it can never be lower than the budget.
+    hook_claim_lease_s: float | None = Field(
+        default=None, gt=0, validation_alias="CURIE_HOOK_CLAIM_LEASE_S"
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
@@ -771,10 +871,13 @@ class WorkerConfig(BaseSettings):
     upgrade_drain_poll_interval_s: float = Field(
         default=5.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S"
     )
-    # How long the quiesce flag lives. FINITE on purpose: an upgrade that is
-    # killed between the gate and the post-upgrade release must not leave the
-    # fleet permanently unable to claim, so the flag lapses on its own. It must
-    # also outlast the drain wait, which is what the validator below enforces.
+    # The roll hold: how long the quiesce flag lives after a CLEAN drain, while
+    # the roll runs and until the post-upgrade release clears it. FINITE on
+    # purpose: an upgrade that is killed between the gate and the release must
+    # not leave the fleet permanently unable to claim. It need not outlast the
+    # drain wait (#3127): while waiting, the gate holds the flag as a short lease
+    # renewed every poll (``upgrade_drain.quiesce_lease_s``), and the chart caps
+    # this hold at the effective drain wait.
     upgrade_quiesce_ttl_s: float = Field(
         default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
     )
@@ -782,9 +885,7 @@ class WorkerConfig(BaseSettings):
     # value is deliberate standalone and Compose compatibility: those surfaces
     # have no Helm installation boundary and keep using the legacy key. Cluster
     # workers receive a nonblank value from the chart managed Secret.
-    installation_id: str = Field(
-        default="", validation_alias="CURIE_INSTALLATION_ID"
-    )
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
     # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
     # worker processes only read marker state, so this hook-only value may be
     # absent there. An explicitly supplied revision must be positive.
@@ -808,15 +909,20 @@ class WorkerConfig(BaseSettings):
         default=None, validation_alias="CURIE_TERMINATION_GRACE_PERIOD_S"
     )
 
+    # Turn budget for a work-item (factory) delivery (#3071). A work-item
+    # execution writes this into the sandbox boot env as CURIE_MAX_TURNS; every
+    # other delivery carries none and keeps the runner's short chat default.
+    work_item_max_turns: int = Field(
+        default=1000, gt=0, validation_alias="CURIE_WORK_ITEM_MAX_TURNS"
+    )
+
     # Runner HTTP timeouts
     runner_connect_timeout_s: float = 10.0
     runner_total_timeout_s: float = Field(
         default=600.0,
         gt=0.0,
-        le=1800.0,
-        validation_alias=AliasChoices(
-            "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
-        ),
+        le=MAX_DELIVERY_BUDGET_S,
+        validation_alias=AliasChoices("CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"),
     )
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
@@ -878,9 +984,7 @@ class WorkerConfig(BaseSettings):
     workspace_bucket: str = Field(
         default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
     )
-    workspace_enabled: bool = Field(
-        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
-    )
+    workspace_enabled: bool = Field(default=True, validation_alias="CURIE_WORKSPACE_ENABLED")
     workspace_object_prefix: str = Field(
         default="private/workspaces",
         validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
@@ -944,9 +1048,7 @@ class WorkerConfig(BaseSettings):
     # today: text only, files ignored, no error. Mirrored by
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
-    attachment_enabled: bool = Field(
-        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
-    )
+    attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -960,9 +1062,7 @@ class WorkerConfig(BaseSettings):
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
-    publication_enabled: bool = Field(
-        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
-    )
+    publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
     publication_namespace: str = Field(
         default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
     )
@@ -1090,6 +1190,15 @@ class WorkerConfig(BaseSettings):
     )
     connector_reconcile_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
+    )
+    # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
+    # A slot fires on the first tick at or after it, so the tick bounds lateness.
+    cron_tick_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_CRON_TICK_INTERVAL_S"
+    )
+    # How often the worker looks for WorkItem runs whose owner died (#3076).
+    work_item_orphan_sweep_interval_s: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built
@@ -1226,6 +1335,35 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
+    def progress_key(self, progress_id: str) -> str:
+        # One logical turn chain's progress record (ADR 0130); see the worker
+        # README's "Deliberate progress" section for its fields and expiry.
+        return f"{self.key_prefix}:progress:{progress_id}"
+
+    def progress_delivery_key(self, delivery_id: str) -> str:
+        # One pending progress delivery, keyed by its derived reply-wire id.
+        return f"{self.key_prefix}:progress:delivery:{delivery_id}"
+
+    def progress_pending_key(self) -> str:
+        # The progress sweep index: a SET, for the reason completions_pending_key
+        # gives.
+        return f"{self.key_prefix}:progress:pending"
+
+    def progress_chain_key(self, event_id: str) -> str:
+        # The pointer an approval resume event follows back to its chain's record.
+        return f"{self.key_prefix}:progress:chain:{event_id}"
+
+    def progress_inbox_key(self, progress_id: str) -> str:
+        # The chain's inbox stream. The API appends to it under the same
+        # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
+        # tests/vectors/turn-progress-capability.json.
+        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+
+    def progress_inbox_pending_key(self) -> str:
+        # Durable discovery for commands accepted after a live pump stops or
+        # while every worker is restarting.
+        return f"{self.key_prefix}:progress:inbox:pending"
+
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation
         # (#2374), shared by every replica in that installation. Standalone and
@@ -1235,6 +1373,19 @@ class WorkerConfig(BaseSettings):
         if not self.installation_id:
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
+
+    def upgrade_drain_success_key(self) -> str:
+        """The record that this revision's drain finished cleanly (#3360).
+
+        Written only after a clean drain, read by the attest hook, and deleted
+        by the post-upgrade release. An unset hook revision is zero, matching
+        the marker revision the gate already uses.
+        """
+        revision = 0 if self.upgrade_revision is None else self.upgrade_revision
+        key = f"{self.key_prefix}:upgrade:drain-succeeded:{revision}"
+        if self.installation_id:
+            return f"{key}:{self.installation_id}"
+        return key
 
     def upgrade_legacy_quiesce_key(self) -> str:
         """The pre-#2374 global key used only by standalone or the bridge."""
@@ -1254,6 +1405,11 @@ class WorkerConfig(BaseSettings):
         # row was persisted without one (#2721). A distinct segment from the card
         # key so the card store's legacy migration scan never sees these entries.
         return f"{self.key_prefix}:approval-notice-ref:{approval_id}"
+
+    def approval_reply_below_card_key(self, approval_id: str) -> str:
+        # Present when this approval's resume answers below its card (ADR-0179).
+        # Its own segment for the same reason as the notice ref's.
+        return f"{self.key_prefix}:approval-reply-below-card:{approval_id}"
 
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.

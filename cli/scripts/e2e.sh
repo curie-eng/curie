@@ -580,7 +580,13 @@ echo "=== curie skill eval --json (the bundle's own evals/cases.json) ==="
 # no second env var. --json puts the payload on stdout and the human report on
 # stderr, so ONE run gives both the readable output and the machine-readable
 # rows the assertions below read.
-EVAL_JSON="$("$BIN" --json skill eval)"
+# On failure, print what came back: --json reports an error on stdout, and
+# the bare assignment under set -e would otherwise exit without a word.
+EVAL_JSON="$("$BIN" --json skill eval)" || {
+    status=$?
+    printf 'error: curie skill eval exited %d; its output was:\n%s\n' "$status" "$EVAL_JSON" >&2
+    exit "$status"
+}
 printf '%s\n' "$EVAL_JSON"
 # The skill tier is the one rung that reads its case ids back directly: its rows
 # carry `id` even on the fake model, because a fake turn is reported as the

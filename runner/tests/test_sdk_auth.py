@@ -46,10 +46,7 @@ ALT_TOKEN_KEY = "ANTHROPIC_AUTH_TOKEN_ALT"
 MY_CRED_KEY = "MY_CRED"
 
 _PROVIDER_REGISTRY = (
-    Path(__file__).resolve().parents[2]
-    / "tests"
-    / "vectors"
-    / "model-provider-registry.json"
+    Path(__file__).resolve().parents[2] / "tests" / "vectors" / "model-provider-registry.json"
 )
 _PROVIDER_REGISTRY_KEYS = frozenset(
     {"providers", "unknown_provider_names", "rejected_credential_examples"}
@@ -103,8 +100,7 @@ def _load_provider_registry(raw: str | None = None) -> _ProviderRegistryDocument
         assert isinstance(provider["credential_examples"], list)
         assert provider["credential_examples"]
         assert all(
-            isinstance(example, str) and example
-            for example in provider["credential_examples"]
+            isinstance(example, str) and example for example in provider["credential_examples"]
         )
 
     for key in ("unknown_provider_names", "rejected_credential_examples"):
@@ -121,20 +117,20 @@ def test_anthropic_api_key_maps_to_api_key_env() -> None:
     assert OAUTH_TOKEN_ENV not in env
 
 
-def test_oauth_token_with_sk_ant_oat_prefix_maps_to_oauth_env() -> None:
-    # Claude Code OAuth tokens begin with sk-ant-oat and share the sk-ant-
-    # prefix with API keys; they must route to the OAuth var, not the API key.
-    env = {CREDENTIALS_ENV: "sk-ant-oatPLACEHOLDER"}
+@pytest.mark.parametrize(
+    "token",
+    [
+        # Claude Code OAuth tokens begin with sk-ant-oat and share the sk-ant-
+        # prefix with API keys; they must route to the OAuth var, not the API key.
+        pytest.param("sk-ant-oatPLACEHOLDER", id="sk-ant-oat-prefix"),
+        # A Claude Code OAuth token is not an sk- key.
+        pytest.param("oauth-PLACEHOLDER-token", id="non-sk-token"),
+    ],
+)
+def test_oauth_token_maps_to_oauth_env(token: str) -> None:
+    env = {CREDENTIALS_ENV: token}
     resolve_model_credential(env)
-    assert env[OAUTH_TOKEN_ENV] == "sk-ant-oatPLACEHOLDER"
-    assert API_KEY_ENV not in env
-
-
-def test_oauth_token_maps_to_oauth_env() -> None:
-    # A Claude Code OAuth token is not an sk- key.
-    env = {CREDENTIALS_ENV: "oauth-PLACEHOLDER-token"}
-    resolve_model_credential(env)
-    assert env[OAUTH_TOKEN_ENV] == "oauth-PLACEHOLDER-token"
+    assert env[OAUTH_TOKEN_ENV] == token
     assert API_KEY_ENV not in env
 
 
@@ -279,13 +275,9 @@ def test_provider_registry_matches_runner_authority() -> None:
 
     assert len(by_name) == len(providers)
     assert set(by_name) == {"anthropic", *PROVIDER_BASE_URLS}
-    assert [row["name"] for row in providers if row["base_url"] is None] == [
-        "anthropic"
-    ]
+    assert [row["name"] for row in providers if row["base_url"] is None] == ["anthropic"]
     assert {
-        name: row["base_url"]
-        for name, row in by_name.items()
-        if row["base_url"] is not None
+        name: row["base_url"] for name, row in by_name.items() if row["base_url"] is not None
     } == PROVIDER_BASE_URLS
 
     for provider in providers:
@@ -321,6 +313,7 @@ def test_provider_registry_inferred_prefixes_match_runtime_routing() -> None:
                 credential,
                 routed_provider,
             )
+
 
 @pytest.mark.parametrize(
     "base_url",
@@ -542,17 +535,26 @@ def test_openrouter_credential_survives_explicit_messages_backend() -> None:
 # hardcoded CURIE_CREDENTIALS name.
 
 
-def test_parse_env_keys_bare_string_is_one_element_tuple() -> None:
-    assert parse_env_keys("A") == ("A",)
-
-
-def test_parse_env_keys_json_array_preserves_order() -> None:
-    assert parse_env_keys('["A","B"]') == ("A", "B")
-
-
-def test_parse_env_keys_drops_blank_array_entries() -> None:
-    # Hand-written config picks up stray empty entries; they carry no meaning.
-    assert parse_env_keys('["A","","  ","B"]') == ("A", "B")
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param('["A","B"]', ("A", "B"), id="json-array-preserves-order"),
+        # Hand-written config picks up stray empty entries; they carry no meaning.
+        pytest.param('["A","","  ","B"]', ("A", "B"), id="drops-blank-array-entries"),
+        # Sourcing from a provider-native var is the whole point of the feature; the
+        # issue's own cited example (grok-build) is exactly this pair. Non-CURIE_
+        # names must stay allowed or the fence has eaten the feature.
+        pytest.param(
+            '["ANTHROPIC_AUTH_TOKEN","LC_ANTHROPIC_AUTH_TOKEN"]',
+            ("ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"),
+            id="provider-native-names-allowed",
+        ),
+        pytest.param("A", ("A",), id="bare-string-is-one-element"),
+        pytest.param("MY_PROVIDER_KEY", ("MY_PROVIDER_KEY",), id="bare-non-curie-name-allowed"),
+    ],
+)
+def test_parse_env_keys(raw: str, expected: tuple[str, ...]) -> None:
+    assert parse_env_keys(raw) == expected
 
 
 def test_parse_env_keys_bare_string_that_is_not_json_falls_back() -> None:
@@ -561,7 +563,7 @@ def test_parse_env_keys_bare_string_that_is_not_json_falls_back() -> None:
     assert parse_env_keys(MY_CRED_KEY) == (MY_CRED_KEY,)
 
 
-@pytest.mark.parametrize("raw", ['[1,2]', '{"a":1}', "[]", '["", "  "]', "5"])
+@pytest.mark.parametrize("raw", ["[1,2]", '{"a":1}', "[]", '["", "  "]', "5"])
 def test_parse_env_keys_invalid_raises(raw: str) -> None:
     # Valid JSON of the wrong shape (non-string array members, a mapping, a bare
     # number) and arrays that reduce to nothing are all config errors.
@@ -587,25 +589,30 @@ def test_resolve_credential_skips_unset_key_and_takes_next() -> None:
     assert resolve_credential(env) == "sk-ant-PLACEHOLDER"
 
 
-def test_resolve_credential_skips_empty_key_and_takes_next() -> None:
-    # THE key assertion (the #229 empty-string gotcha, made explicit): a key that
-    # is present but empty must be SKIPPED, not win. An empty credential silently
-    # beating a real one downstream is exactly the failure this guards.
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        # THE key assertion (the #229 empty-string gotcha, made explicit): a key that
+        # is present but empty must be SKIPPED, not win. An empty credential silently
+        # beating a real one downstream is exactly the failure this guards.
+        pytest.param("", "sk-ant-PLACEHOLDER", "sk-ant-PLACEHOLDER", id="empty-key-skipped"),
+        pytest.param(
+            "sk-ant-FIRST-PLACEHOLDER",
+            "sk-ant-SECOND-PLACEHOLDER",
+            "sk-ant-FIRST-PLACEHOLDER",
+            id="first-set-key-wins",
+        ),
+    ],
+)
+def test_resolve_credential_takes_first_non_empty_key(
+    first: str, second: str, expected: str
+) -> None:
     env = {
         MODEL_ENV_KEY_ENV: f'["{ALT_TOKEN_KEY}","{MY_CRED_KEY}"]',
-        ALT_TOKEN_KEY: "",
-        MY_CRED_KEY: "sk-ant-PLACEHOLDER",
+        ALT_TOKEN_KEY: first,
+        MY_CRED_KEY: second,
     }
-    assert resolve_credential(env) == "sk-ant-PLACEHOLDER"
-
-
-def test_resolve_credential_first_set_key_wins_on_order() -> None:
-    env = {
-        MODEL_ENV_KEY_ENV: f'["{ALT_TOKEN_KEY}","{MY_CRED_KEY}"]',
-        ALT_TOKEN_KEY: "sk-ant-FIRST-PLACEHOLDER",
-        MY_CRED_KEY: "sk-ant-SECOND-PLACEHOLDER",
-    }
-    assert resolve_credential(env) == "sk-ant-FIRST-PLACEHOLDER"
+    assert resolve_credential(env) == expected
 
 
 def test_resolve_credential_returns_empty_when_no_key_matches() -> None:
@@ -697,20 +704,6 @@ def test_parse_env_keys_one_bad_name_poisons_the_whole_declaration() -> None:
     # the operator confront what they wrote.
     with pytest.raises(InvalidEnvKeyError):
         parse_env_keys(f'["{MEMORY_TOKEN_KEY}","{MY_CRED_KEY}"]')
-
-
-def test_parse_env_keys_still_allows_provider_native_names() -> None:
-    # Sourcing from a provider-native var is the whole point of the feature; the
-    # issue's own cited example (grok-build) is exactly this pair. Non-CURIE_
-    # names must stay allowed or the fence has eaten the feature.
-    assert parse_env_keys('["ANTHROPIC_AUTH_TOKEN","LC_ANTHROPIC_AUTH_TOKEN"]') == (
-        "ANTHROPIC_AUTH_TOKEN",
-        "LC_ANTHROPIC_AUTH_TOKEN",
-    )
-
-
-def test_parse_env_keys_still_allows_a_bare_non_curie_name() -> None:
-    assert parse_env_keys("MY_PROVIDER_KEY") == ("MY_PROVIDER_KEY",)
 
 
 def test_resolve_credential_env_keys_rejects_curie_prefixed_target() -> None:

@@ -53,6 +53,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from aci_protocol import BootEnv
 from plugin_format import (
@@ -113,6 +114,7 @@ class _NoAttachments(Exception):
     today's container spec, with no mount and no staged directory, so the empty
     case is indistinguishable from a turn that never carried the key at all.
     """
+
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,22 @@ class RunnerHardening:
         return args
 
 
+def _without_flags(args: list[str], flags: tuple[str, ...]) -> list[str]:
+    """Drop ``flags`` and the value that follows each one. Other flags stay."""
+
+    kept: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in flags:
+            skip = True
+            continue
+        kept.append(arg)
+    return kept
+
+
 class DockerError(SandboxError):
     """A ``docker`` CLI invocation failed.
 
@@ -363,6 +381,8 @@ class DockerSandboxClient:
         pool: str,  # noqa: ARG002 -- no warm pool in Docker; kept for the seam.
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, Any] | None = None,
+        agent_name: str | None = None,  # noqa: ARG002 -- naming is a cluster concern.
     ) -> None:
         env = filter_agent_child_env(env)
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
@@ -383,6 +403,15 @@ class DockerSandboxClient:
         # CURIE_DOCKER_NETWORK). This is local trusted-bundle defense-in-depth,
         # not the K8s security boundary.
         args += self._hardening.run_args()
+        if runner_resources is not None:
+            from .resources import docker_limit_args
+
+            args = _without_flags(args, ("--memory", "--cpus"))
+            args += docker_limit_args(
+                runner_resources,
+                self._hardening.memory_limit,
+                self._hardening.cpu_limit,
+            )
         for key, value in (labels or {}).items():
             args += ["--label", f"{key}={value}"]
         if self._network:
@@ -492,9 +521,7 @@ class DockerSandboxClient:
             self._cleanup_attachments(name)
             raise
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         deadline = time.monotonic() + request_timeout_seconds
         inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
@@ -542,18 +569,14 @@ class DockerSandboxClient:
         names = [line.strip() for line in out.splitlines() if line.strip()]
         views: list[ClaimView] = []
         for cname in names:
-            view = self.get_claim(
-                cname, request_timeout_seconds=_LIST_INSPECTION_TIMEOUT_S
-            )
+            view = self.get_claim(cname, request_timeout_seconds=_LIST_INSPECTION_TIMEOUT_S)
             if view is not None:
                 views.append(view)
         return views
 
     # -- sandbox lifecycle ----------------------------------------------------
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         deadline = time.monotonic() + request_timeout_seconds
         inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
@@ -590,6 +613,13 @@ class DockerSandboxClient:
     ) -> bool:
         del rejection, request_timeout_seconds
         return False
+
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        # A Docker runner has no scheduler; it starts or fails.
+        del name, request_timeout_seconds
+        return None
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         # Docker has no cold suspend; pause freezes the process while keeping the
@@ -866,9 +896,7 @@ class DockerSandboxClient:
         ip = entry.get("IPAddress") if isinstance(entry, dict) else None
         return ip or None
 
-    def _dial_endpoint(
-        self, name: str, *, deadline: float
-    ) -> tuple[str, int] | None:
+    def _dial_endpoint(self, name: str, *, deadline: float) -> tuple[str, int] | None:
         """(host, port) the worker reaches the runner on, or None if not yet
         dialable. Prefer the container's shared-network address (reachable from
         a Docker Desktop VM netns); fall back to the Docker-assigned loopback
@@ -919,9 +947,7 @@ class DockerSandboxClient:
             )
         except subprocess.TimeoutExpired as exc:
             # Never echo args: they may carry CURIE_CREDENTIALS.
-            raise DockerError(
-                f"docker {args[0]} exceeded its request timeout"
-            ) from exc
+            raise DockerError(f"docker {args[0]} exceeded its request timeout") from exc
         if proc.returncode != 0:
             if check:
                 stderr = proc.stderr.strip()

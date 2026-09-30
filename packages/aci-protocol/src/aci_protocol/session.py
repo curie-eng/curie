@@ -22,12 +22,15 @@ It is deliberately not an extension of SessionConfig -- see ADR-0049 and the
 class docstring.
 """
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 
 from .events import _AciModel
+
+_JSON_OBJECT = TypeAdapter(dict[str, Any])
 
 
 class Budget(_AciModel):
@@ -320,6 +323,17 @@ class BootEnv(_AciModel):
     memory_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MEMORY_TOKEN", "worker")
     )
+    # This turn's channel memory (#3389, for #1461): the agent's memory
+    # namespace scoped to the turn's channel binding on the same state API
+    # (``.../agents/<id>/state/bindings/<kind>/<address>/memory``), minted from
+    # the runner-facing API base like ``memory_ref`` and read and written with
+    # ``memory_token``. The worker sets it only when an operator has turned
+    # memory writes on for the agent and the turn has a binding, and never for
+    # an eval-isolated turn, which carries no memory at all. Its presence is
+    # also the runner's signal to mount the memory tools.
+    channel_memory_ref: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CHANNEL_MEMORY_REF", "worker")
+    )
     # The durable state store exposed to bundle code (#249, epic #23). state_url
     # is the agent's state namespace base on the API state router
     # (``.../agents/<id>/state``); the auto-mounted ``curie-state`` MCP server
@@ -331,15 +345,31 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
+    # The live factory status card's report_progress port (#3077): the
+    # request-bound URL and scoped token the runner uses to POST phase reports.
+    # A kernel-authored knob like the approval markers above -- the worker's
+    # resume overlay mints it per-request, never the binding -- not part of the
+    # frozen ACI SessionConfig.
+    progress_url: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_PROGRESS_URL", "kernel")
+    )
+    progress_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_PROGRESS_TOKEN", "kernel")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
     )
-    # One-shot post-approval allowance (#430, ADR-0035) and the authority-free
-    # turn-end reconciliation marker (#544). Both are the kernel resume overlay's:
-    # the binding never writes them, only the resume path does.
+    # One use grant after approval (#430, ADR-0035), canonical arguments of
+    # the denied call (#3255), and the authority free turn end reconciliation
+    # marker (#544). All are the kernel resume overlay's: the binding never
+    # writes them, only the resume path does. The arguments remain an object,
+    # including an empty object, and are never reconstructed from the summary.
     approval_grant_tool: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_TOOL", "kernel")
+    )
+    approval_grant_arguments: dict[str, Any] | None = Field(
+        default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_ARGUMENTS", "kernel")
     )
     approval_resumed_kind: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_RESUMED_KIND", "kernel")
@@ -382,6 +412,12 @@ class BootEnv(_AciModel):
     connector_namespace: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_CONNECTOR_NAMESPACE", "worker")
     )
+    # The signed caller token this sandbox presents to its hosted connectors
+    # (ADR-0168 decision 7). Emitted only with the connector scope above, since
+    # only a scoped boot mounts a hosted connector to present it to.
+    connector_caller_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONNECTOR_CALLER_TOKEN", "worker")
+    )
     # Substrate-authoritative; see the class docstring's anti-clobber note.
     port: int | None = Field(default=None, json_schema_extra=_env("CURIE_RUNNER_PORT", "substrate"))
     # Worker-authoritative with a chart fallback default.
@@ -409,11 +445,24 @@ class BootEnv(_AciModel):
     thinking: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_THINKING", "worker")
     )
+    # The active deployment's environment (``prod`` or ``dev``, #3166). The
+    # runner's telemetry maps it onto the ``deployment.environment.name``
+    # resource attribute, which Langfuse stores as the trace ``environment``
+    # that environment-filtered metrics query on. Unset, traces land in the
+    # backend's default environment, as before.
+    deployment_environment: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_DEPLOYMENT_ENVIRONMENT", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
     model_env_key: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MODEL_ENV_KEY", "worker")
+    )
+    # The chart sets this on runner sandboxes for push metrics exporters.
+    metrics_temporality_preference: str | None = Field(
+        default=None,
+        json_schema_extra=_env("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "substrate"),
     )
     # Operator-owned bounds, reachable through the chart's ``runner.extraEnv``
     # and docker ``-e``. No code producer emits them, and they hold no default
@@ -524,15 +573,18 @@ class BootEnv(_AciModel):
         base_url: str | None = None,
         api_backend: str | None = None,
         thinking: str | None = None,
+        deployment_environment: str | None = None,
         model_env_key: str | None = None,
         history_token: str | None = None,
         memory_token: str | None = None,
+        channel_memory_ref: str | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
         connector_release: str | None = None,
         connector_agent: str | None = None,
         connector_namespace: str | None = None,
+        connector_caller_token: str | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -581,6 +633,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("api_backend")] = api_backend
         if thinking:
             env[cls.env_key("thinking")] = thinking
+        if deployment_environment:
+            env[cls.env_key("deployment_environment")] = deployment_environment
         if model_env_key:
             env[cls.env_key("model_env_key")] = model_env_key
         if model:
@@ -589,6 +643,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("history_token")] = history_token
         if memory_token:
             env[cls.env_key("memory_token")] = memory_token
+        if channel_memory_ref:
+            env[cls.env_key("channel_memory_ref")] = channel_memory_ref
         if state_url:
             env[cls.env_key("state_url")] = state_url
         if state_token:
@@ -600,6 +656,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("connector_release")] = connector_release
             env[cls.env_key("connector_agent")] = connector_agent
             env[cls.env_key("connector_namespace")] = connector_namespace
+            if connector_caller_token:
+                env[cls.env_key("connector_caller_token")] = connector_caller_token
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -631,20 +689,35 @@ class BootEnv(_AciModel):
             env[self.env_key("history_token")] = self.history_token
         if self.memory_token is not None:
             env[self.env_key("memory_token")] = self.memory_token
+        if self.channel_memory_ref is not None:
+            env[self.env_key("channel_memory_ref")] = self.channel_memory_ref
         if self.connector_release is not None:
             env[self.env_key("connector_release")] = self.connector_release
         if self.connector_agent is not None:
             env[self.env_key("connector_agent")] = self.connector_agent
         if self.connector_namespace is not None:
             env[self.env_key("connector_namespace")] = self.connector_namespace
+        if self.connector_caller_token is not None:
+            env[self.env_key("connector_caller_token")] = self.connector_caller_token
         if self.state_url is not None:
             env[self.env_key("state_url")] = self.state_url
         if self.state_token is not None:
             env[self.env_key("state_token")] = self.state_token
+        if self.progress_url is not None:
+            env[self.env_key("progress_url")] = self.progress_url
+        if self.progress_token is not None:
+            env[self.env_key("progress_token")] = self.progress_token
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
             env[self.env_key("approval_grant_tool")] = self.approval_grant_tool
+        if self.approval_grant_arguments is not None:
+            env[self.env_key("approval_grant_arguments")] = json.dumps(
+                self.approval_grant_arguments,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
         if self.approval_resumed_kind is not None:
             env[self.env_key("approval_resumed_kind")] = self.approval_resumed_kind
         if self.approval_decision is not None:
@@ -659,8 +732,14 @@ class BootEnv(_AciModel):
             env[self.env_key("api_backend")] = self.api_backend
         if self.thinking is not None:
             env[self.env_key("thinking")] = self.thinking
+        if self.deployment_environment is not None:
+            env[self.env_key("deployment_environment")] = self.deployment_environment
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
+        if self.metrics_temporality_preference is not None:
+            env[self.env_key("metrics_temporality_preference")] = (
+                self.metrics_temporality_preference
+            )
         if self.max_turns is not None:
             env[self.env_key("max_turns")] = str(self.max_turns)
         if self.history_max_turns is not None:
@@ -694,16 +773,25 @@ class BootEnv(_AciModel):
             history_ref=_str_or_none(env.get("CURIE_HISTORY_REF")),
             history_token=_str_or_none(env.get("CURIE_HISTORY_TOKEN")),
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
+            channel_memory_ref=_str_or_none(env.get("CURIE_CHANNEL_MEMORY_REF")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
+            progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),
+            progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
+            approval_grant_arguments=(
+                _JSON_OBJECT.validate_json(env["CURIE_APPROVAL_GRANT_ARGUMENTS"])
+                if "CURIE_APPROVAL_GRANT_ARGUMENTS" in env
+                else None
+            ),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),
             approval_decision=_stripped_or_none(env.get("CURIE_APPROVAL_DECISION")),
             connector_secret_keys=_list_or_none(env.get("CURIE_CONNECTOR_SECRET_KEYS")),
             connector_release=_str_or_none(env.get("CURIE_CONNECTOR_RELEASE")),
             connector_agent=_str_or_none(env.get("CURIE_CONNECTOR_AGENT")),
             connector_namespace=_str_or_none(env.get("CURIE_CONNECTOR_NAMESPACE")),
+            connector_caller_token=_str_or_none(env.get("CURIE_CONNECTOR_CALLER_TOKEN")),
             port=_required_int(env.get("CURIE_RUNNER_PORT")),
             base_url=_str_or_none(env.get("ANTHROPIC_BASE_URL")),
             # Empty is "not declared" for both, matching sdk_auth's own
@@ -713,7 +801,11 @@ class BootEnv(_AciModel):
             # Empty is "not declared" here too: an unset or blank knob leaves the
             # runner sending no thinking configuration at all (ADR-0098).
             thinking=_str_or_none(env.get("CURIE_THINKING")),
+            deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
+            metrics_temporality_preference=_str_or_none(
+                env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")
+            ),
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
             history_max_bytes=_tolerant_int(env.get("CURIE_HISTORY_MAX_BYTES")),

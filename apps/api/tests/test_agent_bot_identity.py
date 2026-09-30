@@ -119,8 +119,8 @@ async def _insert_installation(conn: AsyncConnection, tenant_id: uuid.UUID) -> u
 
 _INSERT_CHANNEL = (
     "INSERT INTO curie.agent_channels "
-    "(id, agent_id, tenant_id, kind, address, provider_installation_id) "
-    "VALUES (:id, :agent_id, :tenant_id, 'slack', :address, :installation_id)"
+    "(id, agent_id, tenant_id, kind, address, adapter, provider_installation_id) "
+    "VALUES (:id, :agent_id, :tenant_id, 'slack', :address, 'default', :installation_id)"
 )
 
 

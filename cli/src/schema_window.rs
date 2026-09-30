@@ -18,6 +18,7 @@ const CATALOG_JSON: &str = include_str!("application_schema_windows.json");
 #[derive(Debug, Deserialize)]
 struct Catalog {
     revisions: Vec<String>,
+    candidate: Window,
     windows: std::collections::BTreeMap<String, Window>,
 }
 
@@ -57,6 +58,11 @@ pub fn window_for(app_version: &str) -> Option<Window> {
         .windows
         .get(&normalize_app_version(app_version))
         .cloned()
+}
+
+/// The schema window of this source tree before it is published as a version.
+pub fn source_candidate_window() -> Window {
+    catalog().candidate.clone()
 }
 
 fn revision_index(revision: &str) -> Option<usize> {
@@ -104,17 +110,35 @@ pub fn live_in_window(live: &str, window: &Window) -> bool {
     live_idx >= min_idx && live_idx <= head_idx
 }
 
-fn version_key(version: &str) -> Vec<u32> {
-    normalize_app_version(version)
-        .split('.')
-        .map(|part| {
-            part.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        })
-        .collect()
+type VersionKey = (u64, u64, u64, u8, u64);
+
+fn version_key(version: &str) -> Option<VersionKey> {
+    let normalized = normalize_app_version(version);
+    let (core, release_candidate) = match normalized.split_once("-rc.") {
+        Some((core, rc)) => (core, Some(rc)),
+        None => (normalized.as_str(), None),
+    };
+    let parse_number = |part: &str| {
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let mut parts = core.split('.');
+    let major = parse_number(parts.next()?)?;
+    let minor = parse_number(parts.next()?)?;
+    let patch = parse_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (stable, rc) = match release_candidate {
+        Some(value) => (0, parse_number(value)?),
+        None => (1, 0),
+    };
+    Some((major, minor, patch, stable, rc))
 }
 
 /// Newest catalogued application version in `candidates` whose window contains
@@ -129,6 +153,9 @@ pub fn newest_fail_forward<'a>(
         if version.is_empty() {
             continue;
         }
+        let Some(key) = version_key(&version) else {
+            continue;
+        };
         let Some(window) = window_for(&version) else {
             continue;
         };
@@ -137,7 +164,7 @@ pub fn newest_fail_forward<'a>(
         }
         match &best {
             None => best = Some(version),
-            Some(current) if version_key(&version) > version_key(current) => {
+            Some(current) if Some(key) > version_key(current) => {
                 best = Some(version);
             }
             Some(_) => {}
@@ -377,17 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
-        let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
-        let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
+    fn released_v100_and_v101_keep_their_0058_window() {
+        let n = window_for("0.10.0").expect("0.10.0 is catalogued");
+        let n1 = window_for("0.10.1").expect("0.10.1 is catalogued");
         assert_eq!(n.schema_min, "0045");
-        assert_eq!(n.schema_head, "0054");
+        assert_eq!(n.schema_head, "0058");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);
+        assert_eq!(n1.schema_head, "0058");
         check_target_schema(
             "0.10.0",
             &n,
-            "0054",
+            "0058",
             &["0.10.0".to_string(), "0.10.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
@@ -397,12 +425,52 @@ mod tests {
             &n.schema_head,
             &["0.8.7".to_string(), "0.10.0".to_string()],
         )
-        .expect_err("0.8.7 cannot start on this tree's head");
+        .expect_err("0.8.7 cannot start on the released 0.10.0 head");
         assert!(
             err.message.contains("0.8.7") && err.message.contains("schema"),
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
+        let candidate = source_candidate_window();
+        assert_eq!(candidate.schema_min, "0070");
+        assert_eq!(
+            candidate.schema_head.as_str(),
+            catalog().revisions.last().unwrap()
+        );
+
+        let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
+            .expect("candidate bounds are catalogued and ordered");
+        assert_eq!(retained.schema_min, "0070");
+        assert_eq!(retained.schema_head, "0073");
+        assert!(live_in_window("0070", &retained));
+        assert!(live_in_window("0071", &retained));
+        assert!(live_in_window("0072", &retained));
+        assert!(!live_in_window("0069", &retained));
+
+        assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
+        let prior = window_for("0.10.2").expect("0.10.2 remains catalogued");
+        assert_eq!(prior.schema_min, "0060");
+        assert_eq!(prior.schema_head, "0062");
+        let current = window_for("0.10.3").expect("0.10.3 remains catalogued");
+        assert_eq!(current.schema_min, "0063");
+        assert_eq!(current.schema_head, "0063");
+        let released = window_for("0.11.0").expect("0.11.0 remains catalogued");
+        assert_eq!(released.schema_min, "0070");
+        assert_eq!(released.schema_head, "0070");
+    }
+
+    #[test]
+    fn unreleased_patch_093_keeps_the_092_schema_window() {
+        let previous = window_for("0.9.2").expect("0.9.2 schema window");
+        let patch = window_for("0.9.3").expect("0.9.3 schema window");
+        assert_eq!(patch.schema_min, previous.schema_min);
+        assert_eq!(patch.schema_head, previous.schema_head);
+        assert_eq!(patch.schema_min, "0045");
+        assert_eq!(patch.schema_head, "0045");
     }
 
     #[test]
@@ -425,12 +493,16 @@ mod tests {
             !chart_window.artifact_identity_ambiguous,
             "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
         );
-
-        let (newest_catalog_version, newest_window) = catalog()
-            .windows
-            .iter()
-            .max_by_key(|(version, _)| version_key(version))
-            .expect("catalog has at least one schema window");
+        assert_eq!(
+            chart_window.schema_min,
+            catalog().candidate.schema_min,
+            "Chart.yaml appVersion {app_version} minimum must match the candidate"
+        );
+        assert_eq!(
+            chart_window.schema_head,
+            catalog().candidate.schema_head,
+            "Chart.yaml appVersion {app_version} head must match the candidate"
+        );
 
         let mut found = Vec::new();
         let mut down_of = Vec::new();
@@ -475,9 +547,9 @@ mod tests {
             "catalog revisions missing this tree's alembic head {tree_head}"
         );
         assert_eq!(
-            newest_window.schema_head,
+            catalog().candidate.schema_head,
             *tree_head,
-            "newest catalog appVersion {newest_catalog_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
+            "candidate window head must match this tree's Alembic head {tree_head}"
         );
     }
 }

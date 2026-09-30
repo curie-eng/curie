@@ -18,9 +18,11 @@
 //! binary, so one such test here is race-free, and it saves and restores the
 //! original PATH. The pure tests below never touch PATH, so they cannot race it.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use curie::exit::classify;
@@ -255,15 +257,6 @@ fn parse_helm_history_refuses_malformed_output_without_panicking() {
 // Layer 2: the wiring, through a fake `helm` on PATH.
 // ---------------------------------------------------------------------------
 
-/// Write `body` to `dir/name` and mark it executable (0o755).
-fn write_exec(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write fake executable");
-    let mut perms = fs::metadata(&path).expect("stat fake").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod fake executable");
-}
-
 /// Prepend `dir` to the current process PATH so its fake binaries win resolution.
 fn prepend_path(dir: &Path) {
     let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -327,7 +320,7 @@ async fn rollback_hands_helm_the_selected_revision() {
     let rollback_log = dir.path().join("rollback-argv.log");
     std::env::set_var("FAKE_HELM_HISTORY", &history_json);
     std::env::set_var("FAKE_HELM_ROLLBACK_LOG", &rollback_log);
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         "#!/bin/sh\n\
@@ -337,7 +330,7 @@ async fn rollback_hands_helm_the_selected_revision() {
          *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
          esac\n",
     );
-    write_exec(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
+    test_executable::install_in(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
     prepend_path(dir.path());
 
     // ----- The default path: no --revision -----
@@ -412,7 +405,7 @@ async fn rollback_hands_helm_the_selected_revision() {
     );
 
     // ----- AC6: a release helm cannot find fails HERE, not as "no eligible revision" -----
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         "#!/bin/sh\necho 'Error: release: not found' >&2\nexit 1\n",
@@ -616,7 +609,7 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let history = dir.path().join("history.json");
     fs::write(&history, history_json).expect("write fake history");
-    write_exec(
+    test_executable::install_in(
         dir.path(),
         "helm",
         &format!(
@@ -631,7 +624,7 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
             history = history.display(),
         ),
     );
-    write_exec(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
+    test_executable::install_in(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
     dir
 }
 

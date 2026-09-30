@@ -23,7 +23,7 @@ from .queue import (
     from_stream_fields,
     to_stream_fields,
 )
-from .supervisor import BackoffPolicy, Connection, Supervisor
+from .supervisor import BackoffPolicy, Connection, Supervisor, SupervisorGroup
 
 __version__ = "0.0.0"
 
@@ -34,6 +34,7 @@ __all__ = [
     "DispatcherConfig",
     "SocketModeConnection",
     "Supervisor",
+    "SupervisorGroup",
     "__version__",
     "build_app",
     "build_redis",

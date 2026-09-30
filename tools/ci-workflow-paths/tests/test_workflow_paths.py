@@ -1229,13 +1229,13 @@ def test_working_directory_precedence_is_applied_in_order() -> None:
     )
     step_level = (
         "ci.yaml",
-        "rust",
+        "rust-lint",
         "Version consistency",
         "scripts/check-version-consistency.sh",
     )
     assert swept.get(step_level) == "scripts/check-version-consistency.sh", (
         "ci.yaml's `Version consistency` step sets its own `working-directory` "
-        "precisely to override the `rust` job's `cli` default and get back to the "
+        "precisely to override the `rust-lint` job's `cli` default and get back to the "
         "repository root. Its token no longer resolves there, so a step level "
         "declaration is no longer winning over the job level one, and every such "
         "override is now being resolved at the wrong level. Prefix seen: "

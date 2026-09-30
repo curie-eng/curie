@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 
+import pytest
 from curie_telemetry.redact import RedactingLogFilter, redact_text
 
 # Hoisted synthetic values. The check-secrets hook false-positives on inline
@@ -23,9 +24,7 @@ FAKE_HEADER_VALUE = "FAKEFAKEFAKEHEADERVALUE0000"
 # https://docs.discord.com/developers/reference
 # These synthetic segments mirror its example's 24/6/27 lengths only to keep
 # the positive representative; the lengths are not part of the asserted grammar.
-FAKE_DISCORD_BOT_TOKEN = (
-    "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
-)
+FAKE_DISCORD_BOT_TOKEN = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 FAKE_DISCORD_BOT_AUTHORIZATION = "Authorization: Bot " + FAKE_DISCORD_BOT_TOKEN
 FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + FAKE_DISCORD_BOT_TOKEN
 # Shape-valid synthetic bot token: first segment starts with M (a base64
@@ -53,630 +52,473 @@ FAKE_DISCORD_WEBHOOK_TOKEN_AM = "am_" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 BENIGN_EVENT_ID = "chn-7f3-a1b2c3d4e5f60718"
 
 
-def test_basic_authorization_value_is_removed() -> None:
-    encoded = "ZmFrZS11c2VyOmZha2UtcGFzc3dvcmQ="
-
-    redacted = redact_text(f"Authorization: Basic {encoded}")
-
-    assert encoded not in redacted
-    assert "Authorization: [REDACTED:basic_auth]" == redacted
-
-
-def test_dsn_userinfo_is_removed_while_host_and_database_remain_diagnostic() -> None:
-    password = "fake-password"
-
-    redacted = redact_text(
-        f"connection failed postgresql://fake-user:{password}@db.example.com:5432/acme"
-    )
-
-    assert "fake-user" not in redacted
-    assert password not in redacted
-    assert "postgresql://[REDACTED:dsn_userinfo]@db.example.com:5432/acme" in redacted
-
-
-def test_slack_app_level_token_is_removed() -> None:
-    token = "xapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE"
-
-    redacted = redact_text(f"app credential {token}")
-
-    assert token not in redacted
-    assert "[REDACTED:slack_token]" in redacted
+# A Discord-shaped token embedded in a header or assignment value, followed
+# by trailing non-token text, must be redacted whole by the whole-value rule
+# (bearer_token / x_api_key / secret_assignment), which runs before the
+# Discord rules; otherwise the Discord placeholder's ``(?!\[REDACTED:)``
+# guard blocks the whole-value rule and leaks the suffix.
+FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX = FAKE_SHAPED_DISCORD_BOT_TOKEN + "/FAKE_SUFFIX"
+# Channel token whose signature segment happens to contain an api_key-style
+# ``am_`` prefix.
+FAKE_CHANNEL_TOKEN_AM_SIG = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "am_" + "A" * 24
+FAKE_BASIC_AUTH = "ZmFrZS11c2Vy" + "OmZha2UtcGFzc3dvcmQ="
+FAKE_SLACK_APP_TOKEN = "xapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE"
+FAKE_AWS_SECRET = "FAKE" + "AWSSECRETACCESS0000"
+FAKE_WEBHOOK_PATH = "/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/"
+FAKE_DISCORD_WEBHOOK_URL = (
+    "https://discord.com/api" + FAKE_WEBHOOK_PATH + FAKE_DISCORD_WEBHOOK_TOKEN
+)
+FAKE_DISCORD_HEADERS = {"Authorization": "Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN}
+REDACTED_DISCORD_HEADERS = "{'Authorization': 'Bot [REDACTED:discord_bot_token]'}"
+TWO_SEGMENTS = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00"
+FOUR_SEGMENTS = FAKE_DISCORD_BOT_TOKEN + "." + "FAKE_EXTRA-0000"
+_FIRST, _MIDDLE, _LAST = FAKE_SHAPED_DISCORD_BOT_TOKEN.split(".")
 
 
-def test_bare_channel_token_shape_is_redacted() -> None:
-    redacted = redact_text(f"adapter credential {FAKE_CHANNEL_TOKEN}")
-
-    assert FAKE_CHANNEL_TOKEN not in redacted
-    assert "[REDACTED:channel_token]" in redacted
-    assert "adapter credential " in redacted
-
-
-def test_channel_event_id_is_not_treated_as_a_credential() -> None:
-    line = f"inbound admitted event_id={BENIGN_EVENT_ID}"
-
-    assert redact_text(line) == line
-
-
-def test_curie_channel_token_assignment_is_redacted() -> None:
-    value = FAKE_HEADER_VALUE
-    redacted = redact_text(f"boot CURIE_CHANNEL_TOKEN={value} ready")
-
-    assert value not in redacted
-    assert "CURIE_CHANNEL_TOKEN=" in redacted
-    assert "[REDACTED:secret_assignment]" in redacted
-    assert "boot " in redacted
-    assert " ready" in redacted
-
-
-def test_curie_egress_secret_assignment_is_redacted() -> None:
-    redacted = redact_text(f"boot CURIE_EGRESS_SECRET={FAKE_EGRESS_SECRET} ready")
-
-    assert FAKE_EGRESS_SECRET not in redacted
-    assert "CURIE_EGRESS_SECRET=" in redacted
-    assert "[REDACTED:secret_assignment]" in redacted
-
-
-def test_unprefixed_secret_without_assignment_or_header_context_is_not_redacted() -> None:
-    # CURIE_EGRESS_SECRET has no unique prefix. A regex that claimed to
-    # recognize the value itself would also redact ordinary diagnostic text.
-    line = f"retry after {FAKE_EGRESS_SECRET} milliseconds"
-
-    assert redact_text(line) == line
-
-
-def test_discord_bot_authorization_is_redacted() -> None:
-    redacted = redact_text(
-        f"request used {FAKE_DISCORD_BOT_AUTHORIZATION} and was rejected"
-    )
-
-    assert FAKE_DISCORD_BOT_TOKEN not in redacted
-    assert redacted == (
-        "request used Authorization: Bot "
-        "[REDACTED:discord_bot_authorization] and was rejected"
+def _bot_token(first_len: int = 24, middle_len: int = 6, last_len: int = 27) -> str:
+    """A Discord bot-token shape with the given segment lengths, first starting M."""
+    return (
+        "M"
+        + ("FAKE" * 8)[: first_len - 1]
+        + "."
+        + ("FAKE" * 2)[:middle_len]
+        + "."
+        + ("FAKE" * 10)[:last_len]
     )
 
 
-def test_discord_bot_authorization_is_matched_case_insensitively() -> None:
-    mixed_case_authorization = "aUtHoRiZaTiOn: bOt " + FAKE_DISCORD_BOT_TOKEN
-
-    redacted = redact_text(f"request used {mixed_case_authorization} and was rejected")
-
-    assert FAKE_DISCORD_BOT_TOKEN not in redacted
-    assert redacted == (
-        "request used aUtHoRiZaTiOn: bOt "
-        "[REDACTED:discord_bot_authorization] and was rejected"
-    )
-
-
-def test_discord_bot_token_assignments_are_redacted() -> None:
-    redacted = redact_text(f"boot {FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT} ready")
-
-    assert FAKE_DISCORD_BOT_TOKEN not in redacted
-    assert redacted == (
-        "boot DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment] ready"
-    )
-
-
-def test_three_segment_value_without_discord_shape_or_context_is_not_redacted() -> None:
-    # FAKE_DISCORD_BOT_TOKEN's first segment starts with F, so it lacks the
-    # bot-token shape (id segment starting M, N or O). With no Authorization or
-    # DISCORD_BOT_TOKEN= context either, nothing identifies it as a credential.
-    for line in (
-        FAKE_DISCORD_BOT_TOKEN,
-        f"provider diagnostic value={FAKE_DISCORD_BOT_TOKEN}",
-    ):
-        assert redact_text(line) == line
-
-
-def test_bare_shaped_discord_bot_token_is_redacted() -> None:
-    assert redact_text(FAKE_SHAPED_DISCORD_BOT_TOKEN) == "[REDACTED:discord_bot_token]"
-    assert redact_text(
-        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN} failed."
-    ) == "gateway login with [REDACTED:discord_bot_token] failed."
-
-
-def test_shaped_discord_bot_token_in_dict_repr_is_redacted() -> None:
-    headers = {"Authorization": "Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN}
-
-    for text in (
-        str(headers),
-        repr(headers),
-        f"HTTPException: 401 Unauthorized request headers={headers!r}",
-    ):
-        redacted = redact_text(text)
-
-        assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-        assert "[REDACTED:discord_bot_token]" in redacted
-        assert "'Authorization': 'Bot [REDACTED:discord_bot_token]'" in redacted
-
-
-def test_shaped_discord_bot_token_with_context_keeps_the_context_placeholder() -> None:
-    assert redact_text("Authorization: Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN) == (
-        "Authorization: Bot [REDACTED:discord_bot_authorization]"
-    )
-    assert redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN) == (
-        "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"
-    )
-
-
-def test_shaped_discord_bot_token_with_am_hmac_prefix_is_fully_redacted() -> None:
+# Each case: input text, exact redacted output. Every output must also be a
+# fixed point of redaction (idempotence).
+REDACTED_CASES = [
+    pytest.param(
+        f"Authorization: Basic {FAKE_BASIC_AUTH}",
+        "Authorization: [REDACTED:basic_auth]",
+        id="basic_authorization_value_is_removed",
+    ),
+    pytest.param(
+        "connection failed postgresql://fake-user:fake-password@db.example.com:5432/acme",
+        "connection failed postgresql://[REDACTED:dsn_userinfo]@db.example.com:5432/acme",
+        id="dsn_userinfo_is_removed_while_host_and_database_remain_diagnostic",
+    ),
+    pytest.param(
+        f"app credential {FAKE_SLACK_APP_TOKEN}",
+        "app credential [REDACTED:slack_token]",
+        id="slack_app_level_token_is_removed",
+    ),
+    pytest.param(
+        f"adapter credential {FAKE_CHANNEL_TOKEN}",
+        "adapter credential [REDACTED:channel_token]",
+        id="bare_channel_token_shape_is_redacted",
+    ),
+    pytest.param(
+        f"boot CURIE_CHANNEL_TOKEN={FAKE_HEADER_VALUE} ready",
+        "boot CURIE_CHANNEL_TOKEN=[REDACTED:secret_assignment] ready",
+        id="curie_channel_token_assignment_is_redacted",
+    ),
+    pytest.param(
+        f"boot CURIE_EGRESS_SECRET={FAKE_EGRESS_SECRET} ready",
+        "boot CURIE_EGRESS_SECRET=[REDACTED:secret_assignment] ready",
+        id="curie_egress_secret_assignment_is_redacted",
+    ),
+    pytest.param(
+        f"AWS_SECRET_ACCESS_KEY={FAKE_AWS_SECRET}\nMY_PRIVATE_KEY=FAKE" + "PRIVATEKEYVALUE0000",
+        "AWS_SECRET_ACCESS_KEY=[REDACTED:secret_assignment]\n"
+        "MY_PRIVATE_KEY=[REDACTED:secret_assignment]",
+        id="generic_key_assignments_keep_names_and_remove_values",
+    ),
+    pytest.param(
+        f"step failed AWS_SECRET_ACCESS_KEY: {FAKE_AWS_SECRET} exit code 1",
+        "step failed AWS_SECRET_ACCESS_KEY: [REDACTED:secret_assignment] exit code 1",
+        id="named_secret_colon_field_keeps_diagnostic_context",
+    ),
+    pytest.param(
+        '{"AWS_SECRET_ACCESS_KEY": "FAKE' + 'JSONSECRETACCESS0000", "status": "failed"}',
+        '{"AWS_SECRET_ACCESS_KEY": "[REDACTED:secret_assignment]", "status": "failed"}',
+        id="named_secret_json_field_keeps_other_fields",
+    ),
+    pytest.param(
+        "{'AWS_SECRET_ACCESS_KEY': 'FAKE" + "DICTSECRETACCESS0000', 'status': 'failed'}",
+        "{'AWS_SECRET_ACCESS_KEY': '[REDACTED:secret_assignment]', 'status': 'failed'}",
+        id="named_secret_dict_field_keeps_other_fields",
+    ),
+    pytest.param(
+        "database rejected DB_CREDENTIAL=FAKE" + "DATABASECREDENTIAL0000 connection",
+        "database rejected DB_CREDENTIAL=[REDACTED:secret_assignment] connection",
+        id="credential_assignment_is_redacted",
+    ),
+    pytest.param(
+        f"request used {FAKE_DISCORD_BOT_AUTHORIZATION} and was rejected",
+        "request used Authorization: Bot [REDACTED:discord_bot_authorization] and was rejected",
+        id="discord_bot_authorization_is_redacted",
+    ),
+    pytest.param(
+        f"request used aUtHoRiZaTiOn: bOt {FAKE_DISCORD_BOT_TOKEN} and was rejected",
+        "request used aUtHoRiZaTiOn: bOt [REDACTED:discord_bot_authorization] and was rejected",
+        id="discord_bot_authorization_is_matched_case_insensitively",
+    ),
+    pytest.param(
+        f"boot {FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT} ready",
+        "boot DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment] ready",
+        id="discord_bot_token_assignments_are_redacted",
+    ),
+    pytest.param(
+        FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        "[REDACTED:discord_bot_token]",
+        id="bare_shaped_discord_bot_token_is_redacted-bare",
+    ),
+    pytest.param(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN} failed.",
+        "gateway login with [REDACTED:discord_bot_token] failed.",
+        id="bare_shaped_discord_bot_token_is_redacted-in_sentence",
+    ),
+    pytest.param(
+        str(FAKE_DISCORD_HEADERS),
+        REDACTED_DISCORD_HEADERS,
+        id="shaped_discord_bot_token_in_dict_repr_is_redacted-repr",
+    ),
+    pytest.param(
+        f"HTTPException: 401 Unauthorized request headers={FAKE_DISCORD_HEADERS!r}",
+        f"HTTPException: 401 Unauthorized request headers={REDACTED_DISCORD_HEADERS}",
+        id="shaped_discord_bot_token_in_dict_repr_is_redacted-exception",
+    ),
+    pytest.param(
+        "Authorization: Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        "Authorization: Bot [REDACTED:discord_bot_authorization]",
+        id="shaped_discord_bot_token_with_context_keeps_the_context_placeholder-header",
+    ),
+    pytest.param(
+        "DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]",
+        id="shaped_discord_bot_token_with_context_keeps_the_context_placeholder-assignment",
+    ),
     # Before the Discord rules moved ahead of api_key, the "am_" prefix inside
-    # the HMAC segment let api_key consume part of the token first, leaving
-    # the rest of the shape (and part of the token) unredacted.
-    redacted = redact_text(
-        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC} failed."
-    )
-
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC not in redacted
-    assert redacted == "gateway login with [REDACTED:discord_bot_token] failed."
-
-
-def test_shaped_discord_bot_token_with_sk_hmac_infix_is_fully_redacted() -> None:
-    redacted = redact_text(
-        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC} failed."
-    )
-
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC not in redacted
-    assert redacted == "gateway login with [REDACTED:discord_bot_token] failed."
-
-
-def test_discord_webhook_token_with_am_prefix_is_fully_redacted() -> None:
-    prefix = "https://discord.com/api/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/"
-    url = prefix + FAKE_DISCORD_WEBHOOK_TOKEN_AM
-
-    redacted = redact_text(f"POST {url} returned 404")
-
-    assert FAKE_DISCORD_WEBHOOK_TOKEN_AM not in redacted
-    assert redacted == f"POST {prefix}[REDACTED:discord_webhook_url] returned 404"
-
-
-def test_discord_bot_token_first_segment_boundary_is_redacted() -> None:
-    middle = "FAKE00"
-    last = ("FAKE" * 7)[:27]  # valid minimum last-segment length
-    for total_len in (24, 28):  # M + 23, M + 27
-        first = "M" + ("FAKE" * 8)[: total_len - 1]
-        assert len(first) == total_len
-        token = first + "." + middle + "." + last
-
-        assert redact_text(token) == "[REDACTED:discord_bot_token]"
-
-
-def test_discord_bot_token_first_segment_out_of_range_is_not_redacted() -> None:
-    middle = "FAKE00"
-    last = ("FAKE" * 7)[:27]
-    for total_len in (23, 29):  # one below min (23), one above max (28)
-        first = "M" + ("FAKE" * 8)[: total_len - 1]
-        assert len(first) == total_len
-        token = first + "." + middle + "." + last
-
-        assert redact_text(token) == token
-
-
-def test_discord_bot_token_middle_segment_wrong_length_is_not_redacted() -> None:
-    first = "M" + ("FAKE" * 6)[:23]
-    last = ("FAKE" * 7)[:27]
-    for middle_len in (5, 7):
-        middle = ("FAKE" * 2)[:middle_len]
-        token = first + "." + middle + "." + last
-
-        assert redact_text(token) == token
-
-
-def test_discord_bot_token_last_segment_boundary_is_redacted() -> None:
-    first = "M" + ("FAKE" * 6)[:23]
-    middle = "FAKE00"
-    for total_len in (27, 38):
-        last = ("FAKE" * 10)[:total_len]
-        assert len(last) == total_len
-        token = first + "." + middle + "." + last
-
-        assert redact_text(token) == "[REDACTED:discord_bot_token]"
-
-
-def test_discord_bot_token_last_segment_too_short_is_not_redacted() -> None:
-    first = "M" + ("FAKE" * 6)[:23]
-    middle = "FAKE00"
-    last = ("FAKE" * 7)[:26]
-    token = first + "." + middle + "." + last
-
-    assert redact_text(token) == token
-
-
-def test_discord_bot_token_last_segment_too_long_fails_trailing_lookahead() -> None:
-    # The quantifier is greedy and takes at most 38 chars, then the trailing
-    # negative lookahead ``(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])`` requires the
-    # character right after the match to not continue the same charset. With
-    # a 39-char last segment made of one uniform charset, every possible
-    # match length from 27 to 38 is immediately followed by one more
-    # charset character, so the lookahead fails at every backtrack position
-    # and the token is left untouched.
-    first = "M" + ("FAKE" * 6)[:23]
-    middle = "FAKE00"
-    last = ("FAKE" * 10)[:39]
-    token = first + "." + middle + "." + last
-
-    assert redact_text(token) == token
-
-
-def test_discord_bot_token_shape_near_matches_are_not_redacted() -> None:
-    first, middle, last = FAKE_SHAPED_DISCORD_BOT_TOKEN.split(".")
-    for line in (
-        # First segment must start with M, N or O.
-        "P" + first[1:] + "." + middle + "." + last,
-        # Middle segment must be exactly six characters.
-        first + "." + middle + "0" + "." + last,
-        first + "." + middle[:-1] + "." + last,
-        # First segment too short, last segment too short or too long.
-        first[:-1] + "." + middle + "." + last,
-        first + "." + middle + "." + last[:-1],
-        first + "." + middle + "." + last + "FAKEFAKEFAKE",
-        # Embedded in a longer run, or part of a four-segment value.
-        "FAKE" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
-        "FAKE-" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
-        FAKE_SHAPED_DISCORD_BOT_TOKEN + "." + "FAKE00",
-        "FAKE00" + "." + FAKE_SHAPED_DISCORD_BOT_TOKEN,
-    ):
-        assert redact_text(line) == line
-
-
-def test_discord_webhook_url_token_is_redacted_and_url_stays_diagnostic() -> None:
-    path = "/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/"
-    for prefix, suffix in (
-        ("https://discord.com/api" + path, ""),
-        ("https://discordapp.com/api" + path, ""),
-        ("https://canary.discord.com/api/v10" + path, ""),
-        ("https://discord.com/api" + path, "?wait=true"),
-    ):
-        url = prefix + FAKE_DISCORD_WEBHOOK_TOKEN + suffix
-
-        redacted = redact_text(f"POST {url} returned 404")
-
-        assert FAKE_DISCORD_WEBHOOK_TOKEN not in redacted
-        assert redacted == (
-            f"POST {prefix}[REDACTED:discord_webhook_url]{suffix} returned 404"
+    # the HMAC segment let api_key consume part of the token first.
+    pytest.param(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC} failed.",
+        "gateway login with [REDACTED:discord_bot_token] failed.",
+        id="shaped_discord_bot_token_with_am_hmac_prefix_is_fully_redacted",
+    ),
+    pytest.param(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC} failed.",
+        "gateway login with [REDACTED:discord_bot_token] failed.",
+        id="shaped_discord_bot_token_with_sk_hmac_infix_is_fully_redacted",
+    ),
+    pytest.param(
+        "POST https://discord.com/api"
+        + FAKE_WEBHOOK_PATH
+        + FAKE_DISCORD_WEBHOOK_TOKEN_AM
+        + " returned 404",
+        "POST https://discord.com/api"
+        + FAKE_WEBHOOK_PATH
+        + "[REDACTED:discord_webhook_url] returned 404",
+        id="discord_webhook_token_with_am_prefix_is_fully_redacted",
+    ),
+    *(
+        pytest.param(
+            _bot_token(first_len=n),
+            "[REDACTED:discord_bot_token]",
+            id=f"discord_bot_token_first_segment_boundary_is_redacted-{n}",
         )
-
-
-def test_non_discord_webhook_url_is_not_redacted() -> None:
-    for line in (
-        "https://example.com/api/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/FAKE00",
-        "https://discord.com/api/webhooks/FAKE00/FAKE00",
-    ):
-        assert redact_text(line) == line
-
-
-def test_discord_shape_redaction_is_idempotent() -> None:
-    webhook = (
-        "https://discord.com/api/webhooks/"
-        + FAKE_DISCORD_WEBHOOK_ID
-        + "/"
-        + FAKE_DISCORD_WEBHOOK_TOKEN
-    )
-    for secret in (FAKE_SHAPED_DISCORD_BOT_TOKEN, webhook):
-        assert redact_text(redact_text(secret)) == redact_text(secret)
-
-
-def test_ordinary_three_segment_diagnostic_is_not_redacted() -> None:
-    for line in (
-        "retry route=worker.us-east-1.stable after backoff",
-        "bot 1.0.0 started",
-        "the Bot v1.2.3 worker is healthy",
-    ):
-        assert redact_text(line) == line
-
-
-def test_discord_bot_token_near_matches_are_not_redacted() -> None:
-    two_segments = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00"
-    four_segments = FAKE_DISCORD_BOT_TOKEN + "." + "FAKE_EXTRA-0000"
-
-    for line in (
-        two_segments,
-        four_segments,
-        "Authorization: Bot " + two_segments,
-        "Authorization: Bot " + four_segments,
-    ):
-        assert redact_text(line) == line
-
-
-def test_discord_bot_assignment_near_matches_use_generic_redaction() -> None:
-    two_segments = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00"
-    four_segments = FAKE_DISCORD_BOT_TOKEN + "." + "FAKE_EXTRA-0000"
-
-    for malformed_value in (two_segments, four_segments):
-        redacted = redact_text("DISCORD_BOT_TOKEN=" + malformed_value)
-
-        assert malformed_value not in redacted
-        assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:secret_assignment]"
-        assert "[REDACTED:discord_bot_token_assignment]" not in redacted
-
-
-def test_discord_bot_redaction_is_idempotent() -> None:
-    for secret in (
-        FAKE_DISCORD_BOT_AUTHORIZATION,
-        FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
-    ):
-        assert redact_text(redact_text(secret)) == redact_text(secret)
-
-
-def test_x_api_key_header_value_is_redacted() -> None:
-    redacted = redact_text(f"upstream X-API-Key: {FAKE_HEADER_VALUE} rejected")
-
-    assert FAKE_HEADER_VALUE not in redacted
-    assert "X-API-Key:" in redacted
-    assert "[REDACTED:x_api_key]" in redacted
-    assert "upstream " in redacted
-    assert " rejected" in redacted
-
-
-def test_x_api_key_header_is_matched_case_insensitively() -> None:
-    redacted = redact_text(f"x-api-key: {FAKE_HEADER_VALUE}")
-
-    assert FAKE_HEADER_VALUE not in redacted
-    assert "[REDACTED:x_api_key]" in redacted
-
-
-def test_agentmail_api_key_prefix_is_redacted() -> None:
-    # AgentMail documents the `am_` prefix
-    # (https://docs.agentmail.to/knowledge-base/getting-api-key.md).
-    redacted = redact_text(f"provider credential {FAKE_AGENTMAIL_API_KEY}")
-
-    assert FAKE_AGENTMAIL_API_KEY not in redacted
-    assert "[REDACTED:api_key]" in redacted
-
-
-def test_short_am_prefix_is_not_treated_as_an_api_key() -> None:
-    line = "label am_short stays visible"
-
-    assert redact_text(line) == line
-
-
-def test_alphanumeric_token_suffix_is_not_an_assignment() -> None:
-    line = "mytoken=" + FAKE_EGRESS_SECRET
-
-    assert redact_text(line) == line
-
-
-def test_benign_near_matches_are_preserved() -> None:
-    line = f"session token_count=12 channel=email event_id={BENIGN_EVENT_ID} X-Request-Id: abc"
-
-    assert redact_text(line) == line
-
-
-def test_installed_filter_redacts_formatted_args() -> None:
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.addFilter(RedactingLogFilter())
-    logger = logging.getLogger("curie.telemetry.redact.args")
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    try:
-        logger.info("ingress X-API-Key: %s", FAKE_CHANNEL_TOKEN)
-    finally:
-        logger.removeHandler(handler)
-
-    out = stream.getvalue()
-    assert FAKE_CHANNEL_TOKEN not in out
-    assert "[REDACTED:" in out
-    assert "ingress " in out
-
-
-def test_exception_text_carrying_a_channel_token_assignment_is_redacted() -> None:
-    traceback_text = (
+        for n in (24, 28)
+    ),
+    *(
+        pytest.param(
+            _bot_token(last_len=n),
+            "[REDACTED:discord_bot_token]",
+            id=f"discord_bot_token_last_segment_boundary_is_redacted-{n}",
+        )
+        for n in (27, 38)
+    ),
+    *(
+        pytest.param(
+            f"POST {prefix}{FAKE_DISCORD_WEBHOOK_TOKEN}{suffix} returned 404",
+            f"POST {prefix}[REDACTED:discord_webhook_url]{suffix} returned 404",
+            id=f"discord_webhook_url_token_is_redacted_and_url_stays_diagnostic-{variant}",
+        )
+        for variant, prefix, suffix in (
+            ("discord", "https://discord.com/api" + FAKE_WEBHOOK_PATH, ""),
+            ("discordapp", "https://discordapp.com/api" + FAKE_WEBHOOK_PATH, ""),
+            ("canary_v10", "https://canary.discord.com/api/v10" + FAKE_WEBHOOK_PATH, ""),
+            ("query", "https://discord.com/api" + FAKE_WEBHOOK_PATH, "?wait=true"),
+        )
+    ),
+    *(
+        pytest.param(
+            "DISCORD_BOT_TOKEN=" + value,
+            "DISCORD_BOT_TOKEN=[REDACTED:secret_assignment]",
+            id=f"discord_bot_assignment_near_matches_use_generic_redaction-{variant}",
+        )
+        for variant, value in (("two_segments", TWO_SEGMENTS), ("four_segments", FOUR_SEGMENTS))
+    ),
+    pytest.param(
+        f"upstream X-API-Key: {FAKE_HEADER_VALUE} rejected",
+        "upstream X-API-Key: [REDACTED:x_api_key] rejected",
+        id="x_api_key_header_value_is_redacted",
+    ),
+    pytest.param(
+        f"x-api-key: {FAKE_HEADER_VALUE}",
+        "x-api-key: [REDACTED:x_api_key]",
+        id="x_api_key_header_is_matched_case_insensitively",
+    ),
+    pytest.param(
+        f"provider credential {FAKE_AGENTMAIL_API_KEY}",
+        "provider credential [REDACTED:api_key]",
+        id="agentmail_api_key_prefix_is_redacted",
+    ),
+    pytest.param(
         "Traceback (most recent call last):\n"
         '  File "adapter.py", line 1, in handle\n'
-        f"RuntimeError: CURIE_CHANNEL_TOKEN={FAKE_CHANNEL_TOKEN}"
-    )
-
-    redacted = redact_text(traceback_text)
-
-    assert FAKE_CHANNEL_TOKEN not in redacted
-    assert "Traceback (most recent call last):" in redacted
-    assert "RuntimeError:" in redacted
-    assert "CURIE_CHANNEL_TOKEN=" in redacted
-    assert "[REDACTED:channel_token]" in redacted
-
-
-# Regression for the header-ordering bug: a Discord-shaped token embedded in a
-# header value, followed by trailing non-token text, must be redacted whole by
-# the whole-value header rule (bearer_token / x_api_key), which now runs
-# before the Discord rules. Previously the Discord rule ran first, replaced
-# only the token portion with a placeholder, and the placeholder's
-# ``(?!\[REDACTED:)`` guard then blocked the header rule from matching the
-# rest of the value -- leaking the trailing suffix.
-FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX = FAKE_SHAPED_DISCORD_BOT_TOKEN + "/FAKE_SUFFIX"
-
-
-def test_bearer_header_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
-    redacted = redact_text(f"Bearer {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
-
-    assert redacted == "[REDACTED:bearer_token]"
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-    assert "FAKE_SUFFIX" not in redacted
-
-
-def test_x_api_key_header_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
-    redacted = redact_text(f"X-API-Key: {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
-
-    assert redacted == "X-API-Key: [REDACTED:x_api_key]"
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-    assert "FAKE_SUFFIX" not in redacted
-
-
-def test_bearer_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> None:
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.addFilter(RedactingLogFilter())
-    logger = logging.getLogger("curie.telemetry.redact.discord_bearer_suffix")
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    try:
-        logger.info("upstream Bearer %s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
-    finally:
-        logger.removeHandler(handler)
-
-    out = stream.getvalue()
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
-    assert "FAKE_SUFFIX" not in out
-    assert "[REDACTED:bearer_token]" in out
-
-
-def test_x_api_key_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
-    None
-):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.addFilter(RedactingLogFilter())
-    logger = logging.getLogger("curie.telemetry.redact.discord_x_api_key_suffix")
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    try:
-        logger.info("upstream X-API-Key: %s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
-    finally:
-        logger.removeHandler(handler)
-
-    out = stream.getvalue()
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
-    assert "FAKE_SUFFIX" not in out
-    assert "[REDACTED:x_api_key]" in out
+        f"RuntimeError: CURIE_CHANNEL_TOKEN={FAKE_CHANNEL_TOKEN}",
+        "Traceback (most recent call last):\n"
+        '  File "adapter.py", line 1, in handle\n'
+        "RuntimeError: CURIE_CHANNEL_TOKEN=[REDACTED:channel_token]",
+        id="exception_text_carrying_a_channel_token_assignment_is_redacted",
+    ),
+    pytest.param(
+        f"Bearer {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}",
+        "[REDACTED:bearer_token]",
+        id="bearer_header_with_discord_shaped_token_and_suffix_is_fully_redacted",
+    ),
+    pytest.param(
+        f"X-API-Key: {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}",
+        "X-API-Key: [REDACTED:x_api_key]",
+        id="x_api_key_header_with_discord_shaped_token_and_suffix_is_fully_redacted",
+    ),
+    pytest.param(
+        f"token={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}",
+        "token=[REDACTED:secret_assignment]",
+        id="token_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted",
+    ),
+    pytest.param(
+        f"password={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}",
+        "password=[REDACTED:secret_assignment]",
+        id="password_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted",
+    ),
+    # A value followed by any non-space suffix is not eligible for the named
+    # Discord placeholder and falls through whole to secret_assignment.
+    pytest.param(
+        "DISCORD_BOT_TOKEN=" + FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX,
+        "DISCORD_BOT_TOKEN=[REDACTED:secret_assignment]",
+        id="discord_bot_token_assignment_with_trailing_suffix_falls_through_to_secret_assignment",
+    ),
+    # No trailing suffix: the ``(?!\S)`` lookahead still matches at end of string.
+    pytest.param(
+        "DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]",
+        id="bare_discord_bot_token_assignment_still_uses_named_placeholder",
+    ),
+    # channel_token cannot cross the ``/``, so its placeholder would be left
+    # with a trailing suffix; secret_assignment must consume the whole value.
+    pytest.param(
+        "token=" + FAKE_CHANNEL_TOKEN_AM_SIG + "/FAKE_SUFFIX",
+        "token=[REDACTED:secret_assignment]",
+        id="channel_token_with_am_signature_and_suffix_falls_through_to_secret_assignment",
+    ),
+    pytest.param(
+        "token=" + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX",
+        "token=[REDACTED:secret_assignment]",
+        id="channel_token_assignment_with_suffix_falls_through_to_secret_assignment",
+    ),
+    pytest.param(
+        "X-API-Key: " + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX",
+        "X-API-Key: [REDACTED:x_api_key]",
+        id="x_api_key_header_with_channel_token_and_suffix_falls_through_to_x_api_key",
+    ),
+    pytest.param(
+        "CURIE_CHANNEL_TOKEN=" + FAKE_CHANNEL_TOKEN,
+        "CURIE_CHANNEL_TOKEN=[REDACTED:channel_token]",
+        id="channel_token_assignment_is_idempotent",
+    ),
+]
 
 
-# Regression for the ruling above: secret_assignment now runs before the
-# Discord shape rule, so a ``token=``/``password=`` value carrying a
-# Discord-shaped token plus a trailing suffix is redacted whole rather than
-# leaving the suffix exposed after a narrower placeholder.
-def test_token_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
-    redacted = redact_text(f"token={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
-
-    assert redacted == "token=[REDACTED:secret_assignment]"
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-    assert "FAKE_SUFFIX" not in redacted
+@pytest.mark.parametrize(("text", "expected"), REDACTED_CASES)
+def test_redaction(text: str, expected: str) -> None:
+    assert redact_text(text) == expected
+    assert redact_text(expected) == expected
 
 
-def test_password_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
-    redacted = redact_text(f"password={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
+# Each case: text that carries no credential and must pass through unchanged.
+PRESERVED_CASES = [
+    pytest.param(
+        f"inbound admitted event_id={BENIGN_EVENT_ID}",
+        id="channel_event_id_is_not_treated_as_a_credential",
+    ),
+    # CURIE_EGRESS_SECRET has no unique prefix. A regex that claimed to
+    # recognize the value itself would also redact ordinary diagnostic text.
+    pytest.param(
+        f"retry after {FAKE_EGRESS_SECRET} milliseconds",
+        id="unprefixed_secret_without_assignment_or_header_context_is_not_redacted",
+    ),
+    # FAKE_DISCORD_BOT_TOKEN's first segment starts with F, so it lacks the
+    # bot-token shape (id segment starting M, N or O) and has no context.
+    pytest.param(
+        FAKE_DISCORD_BOT_TOKEN,
+        id="three_segment_value_without_discord_shape_or_context_is_not_redacted-bare",
+    ),
+    pytest.param(
+        f"provider diagnostic value={FAKE_DISCORD_BOT_TOKEN}",
+        id="three_segment_value_without_discord_shape_or_context_is_not_redacted-value",
+    ),
+    *(
+        pytest.param(
+            _bot_token(first_len=n),
+            id=f"discord_bot_token_first_segment_out_of_range_is_not_redacted-{n}",
+        )
+        for n in (23, 29)
+    ),
+    *(
+        pytest.param(
+            _bot_token(middle_len=n),
+            id=f"discord_bot_token_middle_segment_wrong_length_is_not_redacted-{n}",
+        )
+        for n in (5, 7)
+    ),
+    pytest.param(
+        _bot_token(last_len=26),
+        id="discord_bot_token_last_segment_too_short_is_not_redacted",
+    ),
+    # The greedy quantifier takes at most 38 chars, then the trailing negative
+    # lookahead ``(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])`` fails at every backtrack
+    # position of a 39-char uniform-charset last segment.
+    pytest.param(
+        _bot_token(last_len=39),
+        id="discord_bot_token_last_segment_too_long_fails_trailing_lookahead",
+    ),
+    *(
+        pytest.param(line, id=f"discord_bot_token_shape_near_matches_are_not_redacted-{variant}")
+        for variant, line in (
+            ("first_not_mno", "P" + _FIRST[1:] + "." + _MIDDLE + "." + _LAST),
+            ("middle_long", _FIRST + "." + _MIDDLE + "0" + "." + _LAST),
+            ("middle_short", _FIRST + "." + _MIDDLE[:-1] + "." + _LAST),
+            ("first_short", _FIRST[:-1] + "." + _MIDDLE + "." + _LAST),
+            ("last_short", _FIRST + "." + _MIDDLE + "." + _LAST[:-1]),
+            ("last_long", _FIRST + "." + _MIDDLE + "." + _LAST + "FAKEFAKEFAKE"),
+            ("embedded", "FAKE" + FAKE_SHAPED_DISCORD_BOT_TOKEN),
+            ("embedded_dash", "FAKE-" + FAKE_SHAPED_DISCORD_BOT_TOKEN),
+            ("four_segments_after", FAKE_SHAPED_DISCORD_BOT_TOKEN + "." + "FAKE00"),
+            ("four_segments_before", "FAKE00" + "." + FAKE_SHAPED_DISCORD_BOT_TOKEN),
+        )
+    ),
+    pytest.param(
+        "https://example.com/api/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/FAKE00",
+        id="non_discord_webhook_url_is_not_redacted-other_host",
+    ),
+    pytest.param(
+        "https://discord.com/api/webhooks/FAKE00/FAKE00",
+        id="non_discord_webhook_url_is_not_redacted-short_id",
+    ),
+    *(
+        pytest.param(line, id=f"ordinary_three_segment_diagnostic_is_not_redacted-{variant}")
+        for variant, line in (
+            ("route", "retry route=worker.us-east-1.stable after backoff"),
+            ("version", "bot 1.0.0 started"),
+            ("bot_version", "the Bot v1.2.3 worker is healthy"),
+        )
+    ),
+    *(
+        pytest.param(line, id=f"discord_bot_token_near_matches_are_not_redacted-{variant}")
+        for variant, line in (
+            ("two_segments", TWO_SEGMENTS),
+            ("four_segments", FOUR_SEGMENTS),
+            ("header_two_segments", "Authorization: Bot " + TWO_SEGMENTS),
+            ("header_four_segments", "Authorization: Bot " + FOUR_SEGMENTS),
+        )
+    ),
+    pytest.param("label am_short stays visible", id="short_am_prefix_is_not_treated_as_an_api_key"),
+    pytest.param(
+        "mytoken=" + FAKE_EGRESS_SECRET, id="alphanumeric_token_suffix_is_not_an_assignment"
+    ),
+    pytest.param(
+        f"session token_count=12 channel=email event_id={BENIGN_EVENT_ID} X-Request-Id: abc",
+        id="benign_near_matches_are_preserved",
+    ),
+    pytest.param(
+        "token=[REDACTED:secret_assignment]",
+        id="secret_assignment_placeholder_is_idempotent",
+    ),
+]
 
-    assert redacted == "password=[REDACTED:secret_assignment]"
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-    assert "FAKE_SUFFIX" not in redacted
+
+@pytest.mark.parametrize("line", PRESERVED_CASES)
+def test_preserved(line: str) -> None:
+    assert redact_text(line) == line
 
 
-def test_token_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
-    None
-):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.addFilter(RedactingLogFilter())
-    logger = logging.getLogger("curie.telemetry.redact.discord_token_assignment_suffix")
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    try:
-        logger.info("upstream token=%s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
-    finally:
-        logger.removeHandler(handler)
-
-    out = stream.getvalue()
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
-    assert "FAKE_SUFFIX" not in out
-    assert "[REDACTED:secret_assignment]" in out
-
-
-def test_password_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
-    None
-):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.addFilter(RedactingLogFilter())
-    logger = logging.getLogger("curie.telemetry.redact.discord_password_assignment_suffix")
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    try:
-        logger.info("upstream password=%s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
-    finally:
-        logger.removeHandler(handler)
-
-    out = stream.getvalue()
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
-    assert "FAKE_SUFFIX" not in out
-    assert "[REDACTED:secret_assignment]" in out
-
-
-def test_discord_bot_token_assignment_with_trailing_suffix_falls_through_to_secret_assignment() -> (
-    None
-):
-    # The lookahead narrowing (step 2 of the ruling): a value followed by any
-    # non-space suffix is no longer eligible for the named Discord placeholder
-    # and instead falls through whole to secret_assignment.
-    redacted = redact_text("DISCORD_BOT_TOKEN=" + FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
-
-    assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:secret_assignment]"
-    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
-    assert "FAKE_SUFFIX" not in redacted
-    assert "[REDACTED:discord_bot_token_assignment]" not in redacted
-
-
-def test_bare_discord_bot_token_assignment_still_uses_named_placeholder() -> None:
-    # No trailing suffix: the value ends at end-of-string, so the narrowed
-    # ``(?!\S)`` lookahead still matches and the named placeholder holds.
-    redacted = redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN)
-
-    assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"
-
-
-# Channel token whose signature segment happens to contain an api_key-style
-# ``am_`` prefix, mirroring the finding's exact shape.
-FAKE_CHANNEL_TOKEN_AM_SIG = (
-    "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "am_" + "A" * 24
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param(
+            FAKE_SHAPED_DISCORD_BOT_TOKEN, id="discord_shape_redaction_is_idempotent-token"
+        ),
+        pytest.param(FAKE_DISCORD_WEBHOOK_URL, id="discord_shape_redaction_is_idempotent-webhook"),
+        pytest.param(
+            FAKE_DISCORD_BOT_AUTHORIZATION, id="discord_bot_redaction_is_idempotent-authorization"
+        ),
+        pytest.param(
+            FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT, id="discord_bot_redaction_is_idempotent-assignment"
+        ),
+    ],
 )
+def test_redaction_is_idempotent(secret: str) -> None:
+    once = redact_text(secret)
 
-
-def test_channel_token_with_am_signature_and_suffix_falls_through_to_secret_assignment() -> (
-    None
-):
-    # channel_token consumes only up to the signature (it cannot cross the
-    # ``/``), so its placeholder is left with a trailing suffix. The widened
-    # secret_assignment guard must still consume the whole value.
-    redacted = redact_text("token=" + FAKE_CHANNEL_TOKEN_AM_SIG + "/FAKE_SUFFIX")
-
-    assert redacted == "token=[REDACTED:secret_assignment]"
-    assert "FAKE_SUFFIX" not in redacted
-    assert "[REDACTED:channel_token]" not in redacted
-
-
-def test_channel_token_assignment_with_suffix_falls_through_to_secret_assignment() -> None:
-    redacted = redact_text("token=" + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX")
-
-    assert redacted == "token=[REDACTED:secret_assignment]"
-    assert "FAKE_SUFFIX" not in redacted
-    assert "[REDACTED:channel_token]" not in redacted
-
-
-def test_x_api_key_header_with_channel_token_and_suffix_falls_through_to_x_api_key() -> None:
-    redacted = redact_text("X-API-Key: " + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX")
-
-    assert redacted == "X-API-Key: [REDACTED:x_api_key]"
-    assert "FAKE_SUFFIX" not in redacted
-    assert "[REDACTED:channel_token]" not in redacted
-
-
-def test_secret_assignment_placeholder_is_idempotent() -> None:
-    once = "token=[REDACTED:secret_assignment]"
-
+    assert once != secret
     assert redact_text(once) == once
 
 
-def test_channel_token_assignment_is_idempotent() -> None:
-    once = redact_text("CURIE_CHANNEL_TOKEN=" + FAKE_CHANNEL_TOKEN)
-    twice = redact_text(once)
+# Each case: a log format and argument, the exact line the installed
+# RedactingLogFilter lets through. The argument is interpolated only at format
+# time, so this proves the filter redacts formatted args, not just msg.
+FILTER_CASES = [
+    pytest.param(
+        "ingress X-API-Key: %s",
+        FAKE_CHANNEL_TOKEN,
+        "ingress X-API-Key: [REDACTED:x_api_key]",
+        id="installed_filter_redacts_formatted_args",
+    ),
+    pytest.param(
+        "upstream Bearer %s rejected",
+        FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX,
+        "upstream [REDACTED:bearer_token] rejected",
+        id="bearer_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter",
+    ),
+    pytest.param(
+        "upstream X-API-Key: %s rejected",
+        FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX,
+        "upstream X-API-Key: [REDACTED:x_api_key] rejected",
+        id="x_api_key_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter",
+    ),
+    pytest.param(
+        "upstream token=%s rejected",
+        FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX,
+        "upstream token=[REDACTED:secret_assignment] rejected",
+        id="token_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter",
+    ),
+    pytest.param(
+        "upstream password=%s rejected",
+        FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX,
+        "upstream password=[REDACTED:secret_assignment] rejected",
+        id="password_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter",
+    ),
+]
 
-    assert once == "CURIE_CHANNEL_TOKEN=[REDACTED:channel_token]"
-    assert twice == once
+
+@pytest.mark.parametrize(("fmt", "arg", "expected"), FILTER_CASES)
+def test_installed_filter_redacts(
+    fmt: str, arg: str, expected: str, request: pytest.FixtureRequest
+) -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger(f"curie.telemetry.redact.{request.node.callspec.id}")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info(fmt, arg)
+    finally:
+        logger.removeHandler(handler)
+
+    assert stream.getvalue() == expected + "\n"

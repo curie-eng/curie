@@ -167,17 +167,25 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     require_on_path("helm")?;
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
-    if !agent
+    // The identity travels with the mint (ADR-0168 decision 3), copied from
+    // the resolved binding rather than asked for again: this verb already
+    // names the pair, and the binding is the one place that pair's identity
+    // is recorded. `named_adapter` leaves out the default Slack identity, the
+    // one value the omission already means, so an API pod that predates the
+    // mint request's `adapter` field still accepts a default-identity mint.
+    let adapter = agent
         .channels
         .iter()
-        .any(|binding| binding.kind == kind && binding.address == address)
-    {
-        return Err(crate::exit::usage(format!(
-            "agent {} has no {kind}:{address} surface; add it with \
-             `curie cluster surfaces {} --add {kind}={address}` before minting a token",
-            agent.name, agent.name
-        )));
-    }
+        .find(|binding| binding.kind == kind && binding.address == address)
+        .ok_or_else(|| {
+            crate::exit::usage(format!(
+                "agent {} has no {kind}:{address} surface; add it with \
+                 `curie cluster surfaces {} --add {kind}={address}` before minting a token",
+                agent.name, agent.name
+            ))
+        })?
+        .named_adapter()
+        .map(str::to_string);
     let ui = crate::ui::ui();
     let cl = ui.checklist();
     // Resolve the Secret BEFORE minting. The mint is a rotation write: the API
@@ -211,7 +219,10 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     let (secret_name, secret_key) = live_token_secret(&opts.common, Some(&values)).await?;
     preflight_token_secret(&cl, &opts.common, &secret_name).await?;
     let mint_step = cl.step(&format!("minting channel token for {kind}:{address}"));
-    let token = match client.mint_channel_token(&kind, &address, ttl_s).await {
+    let token = match client
+        .mint_channel_token(&kind, &address, adapter.as_deref(), ttl_s)
+        .await
+    {
         Ok(token) => {
             mint_step.done("minted");
             token
