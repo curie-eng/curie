@@ -5612,13 +5612,6 @@ mod tests {
     }
 
     #[test]
-    fn ui_api_url_nodeport_with_host_builds_proxy_url() {
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":31234}]}}"#;
-        let url = ui_api_url_from_parts(json, Some("10.0.0.5")).expect("should build a proxy URL");
-        assert_eq!(url, "http://10.0.0.5:31234/api");
-    }
-
-    #[test]
     fn node_http_url_brackets_ipv6_and_appends_path() {
         assert_eq!(
             node_http_url("10.0.0.5", 31234, "/api"),
@@ -5638,67 +5631,167 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ui_api_url_ipv6_host_is_bracketed() {
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":31234}]}}"#;
-        let url = ui_api_url_from_parts(json, Some("::1")).expect("should build a proxy URL");
-        assert_eq!(url, "http://[::1]:31234/api");
+    // ---- resolve_api_endpoint (#1130): the one UI-then-API Service resolver
+    // behind both `discover_api_url` and the observability API row.
+
+    /// The api Service as `api.service.type=NodePort` renders it.
+    const API_NODEPORT_SVC: &str =
+        r#"{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30799}]}}"#;
+    const API_CLUSTERIP_SVC: &str = r#"{"spec":{"type":"ClusterIP","ports":[{"port":8000}]}}"#;
+    const UNASSIGNED_NODEPORT_SVC: &str = r#"{"spec":{"type":"NodePort","ports":[{"port":80}]}}"#;
+
+    fn discovered(endpoint: ApiEndpoint) -> Result<String> {
+        discovered_api_url(endpoint, &common(), &fullname())
     }
 
     #[test]
-    fn ui_api_url_nodeport_without_host_errs_mentioning_api_url() {
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":31234}]}}"#;
-        let err = ui_api_url_from_parts(json, None).expect_err("a missing host must error");
-        assert!(err.to_string().contains("--api-url"), "{err}");
+    fn ui_nodeport_resolves_to_the_ui_api_proxy_ahead_of_the_api_nodeport() {
+        assert_eq!(
+            resolve_api_endpoint(Some(NODEPORT_SVC), Some(API_NODEPORT_SVC), Some("10.0.0.5")),
+            ApiEndpoint::UiProxy("http://10.0.0.5:31234/api".to_string())
+        );
+        assert_eq!(
+            resolve_api_endpoint(Some(NODEPORT_SVC), None, Some("::1")),
+            ApiEndpoint::UiProxy("http://[::1]:31234/api".to_string()),
+            "an IPv6 node host is bracketed"
+        );
     }
 
     #[test]
-    fn ui_api_url_nodeport_without_assigned_nodeport_errs_mentioning_api_url() {
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":80}]}}"#;
-        let err = ui_api_url_from_parts(json, Some("10.0.0.5"))
-            .expect_err("an unassigned nodePort must error");
-        assert!(err.to_string().contains("--api-url"), "{err}");
+    fn ui_clusterip_plus_api_nodeport_resolves_to_the_api_nodeport() {
+        // No /api suffix: that path is the UI's proxy, not the API itself.
+        assert_eq!(
+            resolve_api_endpoint(
+                Some(CLUSTERIP_SVC),
+                Some(API_NODEPORT_SVC),
+                Some("10.0.0.5")
+            ),
+            ApiEndpoint::ApiNodePort("http://10.0.0.5:30799".to_string())
+        );
+        assert_eq!(
+            discovered(resolve_api_endpoint(
+                Some(CLUSTERIP_SVC),
+                Some(API_NODEPORT_SVC),
+                Some("10.0.0.5"),
+            ))
+            .unwrap(),
+            "http://10.0.0.5:30799"
+        );
     }
 
     #[test]
-    fn ui_api_url_clusterip_errs_mentioning_no_expose_and_api_url() {
-        let json = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        let err = ui_api_url_from_parts(json, Some("10.0.0.5"))
-            .expect_err("a non-NodePort service must error");
-        let msg = err.to_string();
-        assert!(msg.contains("--no-expose"), "{msg}");
-        assert!(msg.contains("--api-url"), "{msg}");
+    fn every_unusable_ui_service_falls_back_to_the_api_nodeport() {
+        for ui in [
+            None,
+            Some(CLUSTERIP_SVC),
+            Some(UNASSIGNED_NODEPORT_SVC),
+            Some(""),
+        ] {
+            assert_eq!(
+                resolve_api_endpoint(ui, Some(API_NODEPORT_SVC), Some("10.0.0.5")),
+                ApiEndpoint::ApiNodePort("http://10.0.0.5:30799".to_string()),
+                "ui service {ui:?}"
+            );
+        }
     }
 
     #[test]
-    fn api_url_falls_back_to_the_api_service_nodeport() {
-        // ui.deploy=false is a supported way to run a Slack-only bot; when the
-        // UI is absent the api service's own NodePort is still a valid target.
-        // No /api suffix -- that path is the UI's proxy, not the API itself.
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30799}]}}"#;
-        let url = api_url_from_parts(json, Some("10.0.0.5")).expect("should build a direct URL");
-        assert_eq!(url, "http://10.0.0.5:30799");
+    fn no_nodeport_route_names_the_ui_services_state() {
+        for (ui, api, host, expected) in [
+            (
+                Some(CLUSTERIP_SVC),
+                Some(API_CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+                ApiUnreachable::UiNotExposed,
+            ),
+            (
+                Some(UNASSIGNED_NODEPORT_SVC),
+                Some(API_CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+                ApiUnreachable::UiNodePortUnassigned,
+            ),
+            (
+                Some(""),
+                None,
+                Some("10.0.0.5"),
+                ApiUnreachable::UiUnreadable,
+            ),
+            (
+                None,
+                Some(API_CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+                ApiUnreachable::UiAbsent,
+            ),
+            (
+                Some(NODEPORT_SVC),
+                Some(API_NODEPORT_SVC),
+                None,
+                ApiUnreachable::NoHost,
+            ),
+            (None, Some(API_NODEPORT_SVC), None, ApiUnreachable::NoHost),
+        ] {
+            assert_eq!(
+                resolve_api_endpoint(ui, api, host),
+                ApiEndpoint::PortForward(expected),
+                "ui {ui:?}, api {api:?}, host {host:?}"
+            );
+        }
+        assert_eq!(
+            resolve_api_endpoint(None, None, Some("10.0.0.5")),
+            ApiEndpoint::Unreadable
+        );
     }
 
     #[test]
-    fn api_url_fallback_declines_a_clusterip_api_service() {
-        // ClusterIP is unreachable from outside the cluster, so there is no URL
-        // to return; the caller turns this into an actionable error.
-        let json = r#"{"spec":{"type":"ClusterIP","ports":[{"port":8000}]}}"#;
-        assert!(api_url_from_parts(json, Some("10.0.0.5")).is_none());
-    }
-
-    #[test]
-    fn api_url_fallback_declines_without_a_host() {
-        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30799}]}}"#;
-        assert!(api_url_from_parts(json, None).is_none());
-    }
-
-    #[test]
-    fn ui_api_url_malformed_json_errs_mentioning_api_url() {
-        let err =
-            ui_api_url_from_parts("", Some("10.0.0.5")).expect_err("malformed JSON must error");
-        assert!(err.to_string().contains("--api-url"), "{err}");
+    fn discovered_api_url_errors_keep_the_deploy_vocabulary() {
+        for (endpoint, wanted) in [
+            (
+                ApiEndpoint::PortForward(ApiUnreachable::NoHost),
+                "node host",
+            ),
+            (
+                ApiEndpoint::PortForward(ApiUnreachable::UiNodePortUnassigned),
+                "not been assigned a nodePort",
+            ),
+            (
+                ApiEndpoint::PortForward(ApiUnreachable::UiNotExposed),
+                "--no-expose",
+            ),
+            (
+                ApiEndpoint::PortForward(ApiUnreachable::UiUnreadable),
+                "could not read the UI service",
+            ),
+            (
+                ApiEndpoint::PortForward(ApiUnreachable::UiAbsent),
+                "ui.deploy=false",
+            ),
+            (
+                ApiEndpoint::Unreadable,
+                "could not read the curie-ui or curie-api service",
+            ),
+        ] {
+            let error = discovered(endpoint.clone())
+                .expect_err("no NodePort route is an error")
+                .to_string();
+            assert!(error.contains(wanted), "{endpoint:?}: {error}");
+            assert!(error.contains("--api-url"), "{endpoint:?}: {error}");
+        }
+        // Once the UI is ruled out, the error must say the api Service was
+        // tried too, and name the port-forward that does reach it.
+        for reason in [
+            ApiUnreachable::UiNotExposed,
+            ApiUnreachable::UiNodePortUnassigned,
+            ApiUnreachable::UiAbsent,
+        ] {
+            let error = discovered(ApiEndpoint::PortForward(reason))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("curie-api is not NodePort-exposed")
+                    && error.contains("kubectl port-forward svc/curie-api 8000:8000"),
+                "{reason:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -5872,7 +5965,13 @@ mod tests {
     fn api_base_endpoint_maps_ui_service_to_a_non_browsable_api_endpoint() {
         // A NodePort ui service resolves to the UI /api proxy URL (#360) and is
         // NEVER browsable -- it is an agent target, not a webapp.
-        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(
+            &common(),
+            &fullname(),
+            Some(NODEPORT_SVC),
+            None,
+            Some("10.0.0.5"),
+        );
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url.as_deref(), Some("http://10.0.0.5:31234/api"));
         assert_eq!(ep.note, None);
@@ -5883,7 +5982,7 @@ mod tests {
     fn api_base_endpoint_degrades_to_a_note_when_the_ui_service_is_unreadable() {
         // Unreadable ui service: degrade to a note endpoint rather than failing
         // the whole command, and never smuggle the message into `url`.
-        let ep = api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(""), None, Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url, None, "a degraded endpoint must not carry a url");
         assert!(
@@ -5898,9 +5997,12 @@ mod tests {
         // Not "could not read" (the deploy-path wording): the true condition is
         // not-found, and this row must agree with the `ui` row from
         // `service_surface`.
-        let ep = api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), None, None, Some("10.0.0.5"));
         assert_eq!(ep.url, None);
-        assert_eq!(ep.note.as_deref(), Some("service curie-ui not found"));
+        assert_eq!(
+            ep.note.as_deref(),
+            Some("services curie-ui and curie-api not found")
+        );
         assert!(!ep.browsable);
         assert_no_api_url_hint(&ep);
     }
@@ -5914,6 +6016,7 @@ mod tests {
             &common(),
             &fullname(),
             Some(CLUSTERIP_SVC),
+            None,
             Some("10.0.0.5"),
         );
         assert_eq!(ep.url, None);
@@ -5931,15 +6034,16 @@ mod tests {
     fn api_base_endpoint_notes_stay_plain_for_the_json_payload() {
         // `Ui::emit_json` documents the payload as machine-consumed: no ANSI.
         for ep in [
-            api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5")),
+            api_base_endpoint(&common(), &fullname(), None, None, Some("10.0.0.5")),
             api_base_endpoint(
                 &common(),
                 &fullname(),
                 Some(CLUSTERIP_SVC),
+                None,
                 Some("10.0.0.5"),
             ),
-            api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5")),
-            api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None),
+            api_base_endpoint(&common(), &fullname(), Some(""), None, Some("10.0.0.5")),
+            api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None, None),
         ] {
             let note = ep.note.as_deref().unwrap_or("");
             assert!(
@@ -5951,8 +6055,45 @@ mod tests {
     }
 
     #[test]
+    fn observability_api_row_uses_api_nodeport_when_ui_absent() {
+        // ui.deploy=false with api.service.type=NodePort: ordinary cluster
+        // verbs reach the API, so this row must too (#1130).
+        for ui in [None, Some(CLUSTERIP_SVC)] {
+            let ep = api_base_endpoint(
+                &common(),
+                &fullname(),
+                ui,
+                Some(API_NODEPORT_SVC),
+                Some("10.0.0.5"),
+            );
+            assert_eq!(ep.url.as_deref(), Some("http://10.0.0.5:30799"), "{ui:?}");
+            assert_eq!(ep.note, None, "{ui:?}");
+            assert!(!ep.browsable, "the API base is never browsable");
+        }
+    }
+
+    #[test]
+    fn observability_api_row_hints_a_port_forward_when_only_a_clusterip_api_remains() {
+        let ep = api_base_endpoint(
+            &common(),
+            &fullname(),
+            None,
+            Some(API_CLUSTERIP_SVC),
+            Some("10.0.0.5"),
+        );
+        assert_eq!(ep.url, None);
+        assert_eq!(
+            ep.note.as_deref(),
+            Some(
+                "kubectl -n curie port-forward svc/curie-api 8000:8000  then http://localhost:8000"
+            )
+        );
+        assert_no_api_url_hint(&ep);
+    }
+
+    #[test]
     fn api_base_endpoint_hints_a_port_forward_when_the_host_is_unresolvable() {
-        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None);
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None, None);
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -6084,12 +6225,26 @@ mod tests {
     }
 
     #[test]
+    fn observability_dry_run_lists_the_api_service_lookup() {
+        // The live path reads the api Service for the API row, so the plan
+        // must show that read too (#1130).
+        let lines: Vec<String> = observability_commands(&common(), &fullname())
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            lines.contains(&"kubectl get svc curie-api -n curie -o json".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn observability_dry_run_plan_lists_the_read_only_lookups() {
         let lines: Vec<String> = observability_commands(&common(), &fullname())
             .iter()
             .map(|c| c.display())
             .collect();
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("get svc curie-ui")),
             "{lines:?}"
