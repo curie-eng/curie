@@ -32,6 +32,13 @@ as elapsed episode time, but claims that turns were refused throughout a
 duration, or continuously since the start, require covering history of that
 behavior. Without that history, say the continuous impact is unverified.
 
+Describe operational changes from observed action results. A generic receipt
+in an earlier reply does not establish what changed or whether an instruction
+request was harmless. Do not infer that a tool cannot execute work from its
+name, and do not improvise that classification to explain old bookkeeping.
+Unless asked about internal tools, keep those names and bookkeeping out of
+the answer; the platform reports incomplete action information separately.
+
 If the prior reply omitted the exact name, or available tools cannot identify
 that alarm, state that attribution and current state remain unverified. Ask for
 the original payload or provider read instead of substituting another rule.
