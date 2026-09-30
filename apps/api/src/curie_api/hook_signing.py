@@ -23,12 +23,24 @@ trick.
 This is HMAC used as a key-derivation step, which is what ``sandbox_token`` and
 ``channel_token`` already do with the same key; the primitives are imported from
 the first of them rather than copied.
+
+**What a delivery signature covers (#3554).** The signed material is the
+upstream's timestamp, its delivery id and the raw body, in that order:
+``f"{timestamp}.{delivery_id}.".encode() + body``. A signature over the body
+alone left the delivery id, which is the deduplication key, outside the
+authenticated bytes, so a captured signed body resent under a fresh delivery id
+was indistinguishable from a new delivery and ran the agent again. Binding the id
+into the signature ties one signature to one dedupe key; binding a timestamp and
+refusing any outside ``TOLERANCE_S`` bounds how long a captured request is worth
+anything at all. There is one scheme and no body-only fallback: a verifier that
+still accepted the old shape would reopen exactly what this closes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 
 from .sandbox_token import _signature
 
@@ -36,6 +48,20 @@ from .sandbox_token import _signature
 # rather than borrowing GitHub's ``X-Hub-Signature-256``: a hook source is any
 # system, and reusing GitHub's spelling would suggest a GitHub payload shape.
 SIGNATURE_HEADER = "X-Curie-Signature-256"
+
+# The header an upstream names its delivery with, and the header carrying the
+# integer unix-seconds time it signed at. Both are part of the signed material,
+# so they live here beside the signature header where signers and the verifier
+# share one spelling.
+DELIVERY_HEADER = "X-Curie-Delivery-Id"
+TIMESTAMP_HEADER = "X-Curie-Timestamp"
+
+# How far, in seconds, a delivery's signed timestamp may sit from the server's
+# clock in either direction. Five minutes absorbs ordinary clock skew and a
+# retrying upstream's backoff without leaving a captured request replayable for
+# long. Delivery receipts never expire once enqueued (``delivery``), so a
+# retry inside the window that reuses its delivery id is still deduplicated.
+TOLERANCE_S = 300
 
 # The label that separates this derivation from every other use of ``api_key``.
 # Without it a hook secret and some future token derived from the same key over
@@ -58,34 +84,73 @@ def derive(api_key: str, *, agent_id: str, generation: int) -> str:
     return _signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
 
 
-def sign(secret: str, body: bytes) -> str:
-    """The ``sha256=`` header value for ``body`` under ``secret``."""
+def _material(timestamp: str, delivery_id: str, body: bytes) -> bytes:
+    """The exact bytes a delivery signature is computed over."""
 
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return f"{timestamp}.{delivery_id}.".encode() + body
 
 
-def verify(secret: str, body: bytes, header: str | None) -> bool:
-    """Constant-time check of the upstream's signature over the RAW body.
+def sign(secret: str, *, timestamp: str, delivery_id: str, body: bytes) -> str:
+    """The ``sha256=`` header value for one delivery under ``secret``.
+
+    Args:
+        secret: The derived per-agent secret.
+        timestamp: The integer unix-seconds time sent in ``TIMESTAMP_HEADER``.
+        delivery_id: The id sent in ``DELIVERY_HEADER``.
+        body: The exact request body bytes.
+    """
+
+    digest = hmac.new(secret.encode(), _material(timestamp, delivery_id, body), hashlib.sha256)
+    return "sha256=" + digest.hexdigest()
+
+
+def verify(
+    secret: str,
+    *,
+    timestamp: str | None,
+    delivery_id: str,
+    body: bytes,
+    header: str | None,
+    now: float | None = None,
+) -> bool:
+    """Constant-time check of the upstream's signature over one delivery.
+
+    The signature covers the timestamp, the delivery id and the RAW body. The
+    delivery id is signed because it is the deduplication key: left unsigned, a
+    captured body could be resent under a new id and accepted as a new delivery.
+    The timestamp is signed, and refused outside ``TOLERANCE_S`` of ``now``, so a
+    captured request stops being usable at all once the window passes.
 
     The raw bytes are signed, never a re-serialization: any parse-then-dump round
     trip can change whitespace or key order, and a signature checked against
     re-serialized bytes either rejects honest deliveries or, worse, is quietly
     dropped as unworkable.
 
-    Mirrors ``gitflow.verify_signature`` deliberately, including the ``sha256=``
-    prefix, because an operator configuring a hook has almost certainly
-    configured a GitHub webhook before and the two should not differ in shape for
-    no reason.
+    Keeps the ``sha256=`` prefix ``gitflow.verify_signature`` uses, because an
+    operator configuring a hook has almost certainly configured a GitHub webhook
+    before and the header should not differ in shape for no reason.
 
     Args:
         secret: The derived per-agent secret.
+        timestamp: The presented ``TIMESTAMP_HEADER``, or None when absent.
+        delivery_id: The presented delivery id, or ``""`` when absent; the
+            caller still refuses a missing id after this check passes.
         body: The exact request body bytes.
         header: The presented signature header, or None when absent.
+        now: The current unix time; injectable for tests, defaults to the clock.
 
     Returns:
-        True only for a well-formed header that matches.
+        True only for a well-formed, in-window timestamp and a matching header.
     """
 
     if not header or not header.startswith("sha256="):
         return False
-    return hmac.compare_digest(sign(secret, body), header)
+    # ASCII digits only: ``int()`` alone would also take a sign, whitespace,
+    # underscores and non-ASCII digits, each a second spelling of one time.
+    if not timestamp or not (timestamp.isascii() and timestamp.isdigit()):
+        return False
+    current = time.time() if now is None else now
+    if abs(current - int(timestamp)) > TOLERANCE_S:
+        return False
+    expected = sign(secret, timestamp=timestamp, delivery_id=delivery_id, body=body)
+    return hmac.compare_digest(expected, header)
