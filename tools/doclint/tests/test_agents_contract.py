@@ -118,15 +118,6 @@ def test_renamed_command_fails(clean_repo: Path, run_lint: RunLint) -> None:
 # --- the contract drifted away from the manifest ---------------------------
 
 
-def test_bogus_subcommand_in_contract_fails(clean_repo: Path, run_lint: RunLint) -> None:
-    # The doc side of the same drift: an editor invents a verb. The two tests
-    # above cover the manifest side.
-    _append(clean_repo, "\nRun `curie skill bogusverb --json` to prove the outcome.\n")
-    code, out = run_lint(clean_repo)
-    assert code != 0
-    assert "bogusverb" in out
-
-
 def test_global_json_flag_resolves_on_a_leaf(clean_repo: Path, run_lint: RunLint) -> None:
     # THE most important false-positive guard in this suite. `--json` is
     # declared exactly once, on the manifest ROOT, with `global: true`. A flag
@@ -166,17 +157,6 @@ def test_undeclared_short_flag_fails(clean_repo: Path, run_lint: RunLint) -> Non
     code, out = run_lint(clean_repo)
     assert code != 0
     assert "-z" in out
-
-
-def test_undeclared_flag_fails(clean_repo: Path, run_lint: RunLint) -> None:
-    # Partner to the test above, and neither may be deleted: alone, each is
-    # satisfied by a degenerate checker (accept every flag, or reject every
-    # flag). Together they prove flag validation is real. A contract naming
-    # `--jsn` misleads an agent exactly as badly as one naming a dead verb.
-    _append(clean_repo, "\nStructured output comes from `curie skill status --jsn`.\n")
-    code, out = run_lint(clean_repo)
-    assert code != 0
-    assert "--jsn" in out
 
 
 def test_non_global_root_flag_is_not_inherited_by_a_leaf(

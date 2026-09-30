@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v1.1.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -50,7 +50,10 @@
           "type": "string"
         },
         "wait_deadline": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "started_at": {
           "type": [
@@ -253,7 +256,7 @@
         },
         "state": {
           "type": "string",
-          "description": "API-derived state, rendered verbatim. Known values: waiting, running, cancellation_requested, cancelled, expired, failed, awaiting_approval, publishing, published, completed_unpublished; clients must tolerate new values."
+          "description": "API-derived state, rendered verbatim. Known values: queued, waiting, running, cancellation_requested, cancelled, expired, failed, awaiting_approval, publishing, published, completed_unpublished; clients must tolerate new values."
         },
         "actionable_cause": {
           "type": "string"

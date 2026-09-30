@@ -263,7 +263,7 @@ def test_the_conflict_lookup_runs_with_the_row_locks_still_held(
 
     So this one observes from a SECOND connection, at the one instant that
     distinguishes them: `FOR UPDATE NOWAIT` against the mover's rows, taken
-    while the owner lookup runs. `crud.agent_id_for_pair` is wrapped, not
+    while the owner lookup runs. `crud.agent_id_for_route` is wrapped, not
     replaced -- the real function still answers the request; the wrapper only
     marks the moment, because that moment is inside a handler and has no other
     external edge.
@@ -272,10 +272,10 @@ def test_the_conflict_lookup_runs_with_the_row_locks_still_held(
     mover = _create_agent(client, auth_headers, "savepoint-mover", "C0EXAMPLE1")
     _create_agent(client, auth_headers, "savepoint-owner", "C0EXAMPLE2")
     observed: list[str] = []
-    real: Callable[..., Any] = crud.agent_id_for_pair
+    real: Callable[..., Any] = crud.agent_id_for_route
 
     async def probe_then_answer(
-        session: AsyncSession, kind: str, address: str
+        session: AsyncSession, kind: str, adapter: str | None, address: str
     ) -> uuid.UUID | None:
         probe = await asyncpg.connect(**_connect_args())
         try:
@@ -285,10 +285,10 @@ def test_the_conflict_lookup_runs_with_the_row_locks_still_held(
             observed.append("held")
         finally:
             await probe.close()
-        answer: uuid.UUID | None = await real(session, kind, address)
+        answer: uuid.UUID | None = await real(session, kind, adapter, address)
         return answer
 
-    monkeypatch.setattr(crud, "agent_id_for_pair", probe_then_answer)
+    monkeypatch.setattr(crud, "agent_id_for_route", probe_then_answer)
 
     refused = client.patch(
         f"/agents/{mover}/channels",

@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "product-altitude",
+  "defaultVersion": "v0.11.0",
   "versions": [
     {
       "id": "v0.7.1",
@@ -137,6 +137,70 @@
       "date": "2026-09-22",
       "branch": "main",
       "commit": "d92a31f8e4352921f4b4dcbbbc147b30f7c5743f"
+    },
+    {
+      "id": "v0.9.3",
+      "label": "v0.9.3",
+      "file": "snapshots/v0.9.3.json",
+      "date": "2026-09-24",
+      "branch": "main",
+      "commit": "d72611c7292e414ebd31d1450d317149de343abc"
+    },
+    {
+      "id": "v0.10.0-rc.1",
+      "label": "v0.10.0-rc.1",
+      "file": "snapshots/v0.10.0-rc.1.json",
+      "date": "2026-09-24",
+      "branch": "next",
+      "commit": "d02f64e26047c1531163bb7167e7e47fb380135c"
+    },
+    {
+      "id": "v0.10.0-rc.2",
+      "label": "v0.10.0-rc.2",
+      "file": "snapshots/v0.10.0-rc.2.json",
+      "date": "2026-09-25",
+      "branch": "next",
+      "commit": "b9f57874e2ce96c0a5f4a6945b4518fbe04b050c"
+    },
+    {
+      "id": "v0.10.0",
+      "label": "v0.10.0",
+      "file": "snapshots/v0.10.0.json",
+      "date": "2026-09-25",
+      "branch": "main",
+      "commit": "6b1b26c19a0169b815ed81c40ae8e27fc633b33a"
+    },
+    {
+      "id": "v0.10.1",
+      "label": "v0.10.1",
+      "file": "snapshots/v0.10.1.json",
+      "date": "2026-09-25",
+      "branch": "main",
+      "commit": "ea9aeaf7515ec2adc2cdac6a145b3796b59895dd"
+    },
+    {
+      "id": "v0.10.2",
+      "label": "v0.10.2",
+      "file": "snapshots/v0.10.2.json",
+      "date": "2026-09-27",
+      "branch": "main",
+      "commit": "1ad1094b8d744e2c11dd4eec69f18d354c3afed6"
+    },
+    {
+      "id": "v0.10.3",
+      "label": "v0.10.3",
+      "file": "snapshots/v0.10.3.json",
+      "date": "2026-09-28",
+      "branch": "main",
+      "commit": "b78cb95f46d2b944c8850a70caf1d0be8d04480c"
+    },
+    {
+      "id": "v0.11.0",
+      "label": "v0.11.0",
+      "file": "snapshots/v0.11.0.json",
+      "date": "2026-09-29",
+      "branch": "next",
+      "commit": "8bb95c88845473994148de356e560c1c45ec147d"
     }
   ]
 }

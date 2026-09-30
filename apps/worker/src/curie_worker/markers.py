@@ -51,14 +51,16 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from channel_protocol.reply import TurnCompleted
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
-from .reply_sink import TargetRoute
+from .reply_sink import ProviderEgressRefusedError, TargetRoute
+
+DoneMarkerValue = Literal["1", "history_capacity"]
 
 # Stored fields of the completion hash. The done flag is its OWN field rather
 # than a value inside the record JSON so it can be set in the same MULTI as the
@@ -71,12 +73,17 @@ _DONE_FIELD = "done"
 # retry that rewrote the record for the same event id owns a different identity,
 # and clearing that one would discard a completion nobody has delivered.
 _GENERATION_FIELD = "gen"
+_CAUSE_FIELD = "cause"
 
 # Set the done marker and flag the completion record done in ONE round trip.
 # The record is only touched when it still exists, so a sweeper that cleared it
 # concurrently is never resurrected as a payload-less key with no expiry.
 _MARK_DONE_LUA = """
-redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+if ARGV[3] == 'history_capacity' then
+  redis.call('SET', KEYS[1], ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[1])
+end
 if redis.call('EXISTS', KEYS[2]) == 1 then
   redis.call('HSET', KEYS[2], ARGV[2], '1')
 end
@@ -111,14 +118,29 @@ _DELIVERY_GENERATION_FIELD = "gen"
 # script, so the two move together; checking both means a hand-rolled or
 # partially-applied change of authority cannot slip between them.
 #
-# ``_MARK_DONE_LUA`` above is deliberately NOT modified: it still serves the
-# leaseless path (a kernel called without a lease) and the completion sweeper,
-# neither of which is a delivery owner.
+# ``_MARK_DONE_LUA`` above serves the leaseless path (a kernel called without a
+# lease) and the completion sweeper, neither of which is a delivery owner.
 _SETTLE_FENCED_LUA = """
 if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
 if redis.call('HGET', KEYS[5], ARGV[8]) ~= ARGV[9] then return 0 end
+redis.call('HDEL', KEYS[2], ARGV[11])
 redis.call('HSET', KEYS[2], ARGV[3], ARGV[5], ARGV[2], '1', ARGV[4], ARGV[6])
 redis.call('SADD', KEYS[3], ARGV[10])
+if ARGV[12] == 'history_capacity' then
+  redis.call('SET', KEYS[1], ARGV[12])
+else
+  redis.call('SET', KEYS[1], ARGV[12], 'EX', ARGV[1])
+end
+return 1
+"""
+
+# The fenced MARKER-ONLY settlement (#2963): a targetless cron turn owes no
+# ``turn.completed`` (no adapter is waiting), so it writes no outbox record. The
+# two guards are exactly ``_SETTLE_FENCED_LUA``'s, so a fenced-out owner writes
+# nothing here either.
+_SETTLE_FENCED_MARKER_LUA = """
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+if redis.call('HGET', KEYS[3], ARGV[3]) ~= ARGV[4] then return 0 end
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 return 1
 """
@@ -138,6 +160,19 @@ if redis.call('HGET', KEYS[1], ARGV[2]) == ARGV[1] then
   return 1
 end
 return 0
+"""
+
+
+# Attribute or clear the cause only on the generation whose send observed it.
+# A stale emitter cannot change a replacement record or resurrect a cleared one.
+_UPDATE_COMPLETION_CAUSE_LUA = """
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+if ARGV[4] == '' then
+  redis.call('HDEL', KEYS[1], ARGV[3])
+else
+  redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
+end
+return 1
 """
 
 
@@ -199,6 +234,7 @@ class StoredCompletion:
     record: CompletionRecord
     done_flag: bool
     generation: str
+    cause: str | None
 
 
 class Markers:
@@ -232,7 +268,7 @@ class Markers:
             return True
         return _as_str(flag) == "1"
 
-    async def mark_done(self, event_id: str) -> None:
+    async def mark_done(self, event_id: str, *, marker_value: DoneMarkerValue) -> None:
         """Mark the event durably done AND flag its outbox record, in one call.
 
         The two writes are ONE round trip so they cannot diverge: a record
@@ -241,16 +277,19 @@ class Markers:
         behind a guard that can never pass once ``done_key`` expires at
         ``idempotency_ttl_s``.
 
-        There is no marker-only form. Every durable terminal outcome goes through
-        ``Kernel._complete``, which writes the outbox record for THIS event id
-        first, so the record key is always this event's own -- the Lua below is a
-        no-op on the record when the sweeper cleared it concurrently, which is
-        the only case where there is nothing to flag.
+        This is the form for every turn that owes a completion. Every such
+        terminal outcome goes through ``Kernel._complete``, which writes the
+        outbox record for THIS event id first, so the record key is always this
+        event's own -- the Lua below is a no-op on the record when the sweeper
+        cleared it concurrently, which is the only case where there is nothing
+        to flag.
 
         It also widens the MARKER's own TTL to the outbox retention window, for
         the reason ``is_terminal`` states: the outbox proves this turn finished
         for 7 days, so a dedupe state that lapses after 1 day can rerun a turn
-        whose completion has already been delivered.
+        whose completion has already been delivered. A verified review that
+        exceeded history capacity keeps its distinct marker without expiry
+        until the API mirrors the refusal to SQL.
         """
         ttl_s = max(
             self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
@@ -262,7 +301,50 @@ class Markers:
             self._config.completion_key(event_id),
             str(ttl_s),
             _DONE_FIELD,
+            marker_value,
         )
+
+    def _done_ttl_s(self) -> int:
+        return max(
+            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
+        )
+
+    async def mark_done_without_completion(self, event_id: str) -> None:
+        """Leaseless marker-only done, for a targetless turn (#2963).
+
+        The one terminal outcome with no outbox record: no adapter is waiting
+        for a ``turn.completed``. The marker keeps ``mark_done``'s TTL so the
+        dedupe window does not depend on which form settled the turn.
+        """
+        await self._redis.set(self._config.done_key(event_id), "1", ex=self._done_ttl_s())
+
+    async def settle_fenced_without_completion(
+        self,
+        event_id: str,
+        *,
+        stream: str,
+        group: str,
+        entry_id: str,
+        owner: str,
+        generation: int,
+    ) -> bool:
+        """The fenced sibling of ``mark_done_without_completion``.
+
+        Same lease-token and generation fence as ``settle_fenced``; returns
+        False when the fence refused, in which case nothing was written.
+        """
+        settled = await self._redis.eval(
+            _SETTLE_FENCED_MARKER_LUA,
+            3,
+            self._config.done_key(event_id),
+            self._config.delivery_lease_key(stream, group, entry_id),
+            self._config.delivery_state_key(stream, group, entry_id),
+            str(self._done_ttl_s()),
+            owner,
+            _DELIVERY_GENERATION_FIELD,
+            str(generation),
+        )
+        return int(settled) == 1
 
     async def saw_side_effect(self, event_id: str) -> bool:
         return bool(await self._redis.exists(self._config.side_effect_key(event_id)))
@@ -283,6 +365,7 @@ class Markers:
         """
         generation = uuid.uuid4().hex
         async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hdel(self._config.completion_key(event_id), _CAUSE_FIELD)
             pipe.hset(
                 self._config.completion_key(event_id),
                 mapping={
@@ -305,6 +388,7 @@ class Markers:
         entry_id: str,
         owner: str,
         generation: int,
+        marker_value: DoneMarkerValue,
     ) -> str | None:
         """Settle this turn terminally, but only if this owner still holds the fence.
 
@@ -326,7 +410,8 @@ class Markers:
         compare-and-clear the record it wrote, exactly as the leaseless path
         does. Returns ``None`` when the fence refused: this owner's lease has
         moved on, and per ADR-0131 it "may not ACK, dead-letter, clear an outbox
-        record, or emit a terminal result". Nothing was written.
+        record, or emit a terminal result". Nothing was written. The history
+        capacity marker uses the same fence and has no expiry until SQL mirror.
         """
         lease_key = self._config.delivery_lease_key(stream, group, entry_id)
         state_key = self._config.delivery_state_key(stream, group, entry_id)
@@ -352,8 +437,34 @@ class Markers:
             _DELIVERY_GENERATION_FIELD,
             str(generation),
             event_id,
+            _CAUSE_FIELD,
+            marker_value,
         )
         return record_generation if int(settled) == 1 else None
+
+    async def note_provider_egress_refusal(self, event_id: str, *, generation: str) -> bool:
+        """Retain the fixed refusal cause only on the observed outbox generation."""
+        return await self._update_completion_cause(
+            event_id, generation=generation, cause=ProviderEgressRefusedError.reason
+        )
+
+    async def clear_completion_cause(self, event_id: str, *, generation: str) -> bool:
+        """Remove an earlier refusal when this generation fails for another cause."""
+        return await self._update_completion_cause(event_id, generation=generation, cause="")
+
+    async def _update_completion_cause(
+        self, event_id: str, *, generation: str, cause: str
+    ) -> bool:
+        updated = await self._redis.eval(
+            _UPDATE_COMPLETION_CAUSE_LUA,
+            1,
+            self._config.completion_key(event_id),
+            _GENERATION_FIELD,
+            generation,
+            _CAUSE_FIELD,
+            cause,
+        )
+        return bool(updated)
 
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
         """The stored record AS STORED, or None when some emitter cleared it.
@@ -506,6 +617,7 @@ def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | N
         record=record.model_copy(update={"done": done_flag}),
         done_flag=done_flag,
         generation=generation,
+        cause=_as_str(stored.get(_CAUSE_FIELD)),
     )
 
 

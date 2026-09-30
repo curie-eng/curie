@@ -315,6 +315,7 @@ def render_connector_manifests(
     namespace: str,
     app_name: str,
     secret_name: str,
+    proxy: connector_render.ConnectorProxy | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
 
@@ -337,6 +338,7 @@ def render_connector_manifests(
                 connector=name,
                 spec=spec,
                 secret_name=secret_name,
+                proxy=proxy,
             )
         )
     return objects

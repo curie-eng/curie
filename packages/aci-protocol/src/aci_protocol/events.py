@@ -14,11 +14,21 @@ outbound event carries a ``version`` equal to PROTOCOL_VERSION.
 """
 
 from collections.abc import Mapping
+from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from .version import PROTOCOL_VERSION, SEMVER_PATTERN
 
@@ -87,6 +97,46 @@ class SessionStatus(StrEnum):
 # --- Inbound channel messages -------------------------------------------------
 
 
+class PublicationContext(_AciModel):
+    """API issued authority and observation for one execution's publication read.
+
+    The capability authorizes only the publication precheck endpoint. It must
+    stay outside model text, transcripts, workspace files and logs. The queued
+    event identifier is a correlation value, not proof of an active turn.
+    Observation metadata records the API read at dispatch; consumers must make
+    a fresh comparison before handling an empty publication proposal.
+    """
+
+    agent_id: UUID
+    deployment_id: UUID
+    work_item_id: UUID
+    execution_request_id: UUID
+    runtime_epoch: int = Field(gt=0, strict=True)
+    conversation_id: str = Field(min_length=1)
+    lineage_id: UUID
+    lineage_version: int = Field(gt=0, strict=True)
+    expected_head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    queued_event_id: str = Field(min_length=1)
+    precheck_url: str = Field(min_length=1, json_schema_extra={"format": "uri"})
+    capability: str = Field(min_length=1, repr=False)
+    observed_title: str
+    observed_body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: datetime
+
+    @field_validator("precheck_url")
+    @classmethod
+    def _validate_precheck_url(cls, value: str) -> str:
+        HttpUrl(value)
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def _require_observation_timezone(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("publication observation time must include a timezone")
+        return value
+
+
 class Event(_AciModel):
     """An inbound event delivered into a live session (initial or follow-up).
 
@@ -102,6 +152,7 @@ class Event(_AciModel):
     ts: str
     session_id: str | None = None
     history_ref: str | None = None
+    publication_context: PublicationContext | None = None
 
 
 class Interrupt(_AciModel):
@@ -171,6 +222,13 @@ class Final(_OutboundBase):
     ``approval_granted_tool``. Additive optional scalar: a tolerant consumer
     decoding an older producer's ``final`` simply sees it absent.
 
+    ``approval_granted_arguments`` carries the canonical JSON object passed to
+    the permission gate for the denied call (#3255). It is set only with a
+    permission gate's ``approval_granted_tool``; a policy gate carries no tool
+    arguments. An older producer omits it, and an empty object is distinct from
+    an absent argument carrier. The worker persists this object with the
+    approval so the resume boot can bind a later grant to the same call.
+
     ``input_tokens``/``output_tokens`` carry the turn's model token usage when
     the harness reported it (#390): the runner stamps them from the SDK result's
     ``usage`` so a consumer can attribute a dollar cost to the turn (model
@@ -189,6 +247,7 @@ class Final(_OutboundBase):
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_granted_arguments: dict[str, Any] | None = None
     approval_display: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None

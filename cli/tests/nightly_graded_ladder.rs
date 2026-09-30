@@ -27,6 +27,9 @@
 //! existing `ci.yaml` and only breaks if someone arms `ci.yaml`'s fake seal
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -754,15 +757,6 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
     assert!(text.contains("\nassert_collector_metrics_network_policy\n"));
 }
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write harness executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read harness metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("mark harness executable");
-}
-
 /// The cluster ladder may run an otherwise standard `curie` release in an
 /// owned namespace. Its direct worker probe must follow the same
 /// `CURIE_NAMESPACE` setting as the CLI calls around it, or it reads an
@@ -773,7 +767,7 @@ fn cluster_worker_probe_uses_the_configured_namespace() {
 
     let harness = tempfile::tempdir().expect("create cluster probe harness");
     let invocation_log = harness.path().join("kubectl-invocation.log");
-    write_executable(
+    test_executable::install(
         &harness.path().join("kubectl"),
         r#"#!/bin/sh
 set -eu
@@ -1138,6 +1132,21 @@ fn local_rung_honors_isolated_compose_project_and_ordered_files() {
     assert!(
         source.contains("compose.dev.yaml") && local_rung.contains("--build"),
         "isolation must still pin this checkout's compose.dev.yaml with --build"
+    );
+}
+
+#[test]
+fn local_release_teardown_uses_the_same_project_and_override_as_startup() {
+    let rung = ladder_function("rung_local_release");
+    let teardown = rung
+        .split("=== curie local down -f compose.release.yaml ===")
+        .nth(1)
+        .expect("local release teardown must be present");
+    assert!(
+        teardown.contains("local down --project \"$COMPOSE_PROJECT\" -f \"$release_compose\"")
+            && teardown.contains("down_args+=(-f \"${COMPOSE_FILES[$extra_i]}\")")
+            && teardown.contains("\"$BIN\" \"${down_args[@]}\""),
+        "local release teardown must pass the selected project, generated release compose, and every private override to the CLI"
     );
 }
 
@@ -1514,6 +1523,48 @@ fn local_source_build_uses_the_daemon_backed_builder() {
     assert!(
         output.status.success(),
         "the local source build must replace an isolated ambient builder with the Docker daemon builder: {transcript}"
+    );
+}
+
+#[test]
+fn local_source_build_uses_the_current_contexts_daemon_builder() {
+    // Docker Desktop's context is `desktop-linux`. There `docker build`
+    // refuses the `default` builder and `docker compose build` refuses
+    // `desktop-linux`, and `local up --build` runs both. Addressing the
+    // context's daemon through DOCKER_HOST makes `default` its builder for both.
+    let (output, _, _, _) = run_local_observability_control(&[
+        ("BUILDX_BUILDER", "curie-e2e-builder"),
+        ("STUB_REQUIRE_DEFAULT_BUILDER", "1"),
+        (
+            "STUB_DOCKER_ENDPOINT",
+            "unix:///Users/acme/.docker/run/docker.sock",
+        ),
+    ]);
+    let transcript = transcript(&output);
+    assert!(
+        output.status.success(),
+        "the local source build must select the daemon builder of the current Docker context: {transcript}"
+    );
+}
+
+#[test]
+fn local_source_build_refuses_an_unreadable_daemon_endpoint() {
+    // An empty DOCKER_HOST is no DOCKER_HOST: the build would run in the
+    // ambient context, whose builder need not be `default`.
+    let (output, invocations, _, _) =
+        run_local_observability_control(&[("STUB_DOCKER_ENDPOINT_EMPTY", "1")]);
+    let transcript = transcript(&output);
+    assert!(
+        !output.status.success(),
+        "an unreadable daemon endpoint must fail the rung: {transcript}"
+    );
+    assert!(
+        transcript.contains("could not read the current Docker context's daemon endpoint"),
+        "the refusal must say what it could not read: {transcript}"
+    );
+    assert!(
+        !invocations.lines().any(is_current_source_local_up),
+        "the rung must refuse before `local up --build`: {invocations}"
     );
 }
 
@@ -2101,7 +2152,7 @@ fn write_ladder_stubs(dir: &Path) {
     )
     .expect("write deploy provider fixture");
 
-    write_executable(
+    test_executable::install(
         &dir.join("curie"),
         r#"#!/bin/sh
 set -u
@@ -2398,7 +2449,8 @@ print(json.dumps({
         ;;
     "local up --project "*|"local up -f "*/compose.dev.yaml" --build")
         if [ "${STUB_REQUIRE_DEFAULT_BUILDER:-0}" = "1" ] \
-            && [ "${BUILDX_BUILDER:-}" != "default" ]; then
+            && { [ "${BUILDX_BUILDER:-}" != "default" ] \
+                || [ "${DOCKER_HOST:-}" != "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}" ]; }; then
             echo "local source build did not select the Docker daemon builder" >&2
             exit 97
         fi
@@ -2552,7 +2604,7 @@ esac
     // unrecognized invocation returning nothing is the honest default; the
     // reads that carry a real answer (compose-worker selection, env inspect,
     // and the snapshotted SKILL.md) get explicit arms.
-    write_executable(
+    test_executable::install(
         &dir.join("docker"),
         r#"#!/bin/sh
 set -u
@@ -2560,6 +2612,14 @@ if [ -n "${STUB_DOCKER_INVOCATION_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$STUB_DOCKER_INVOCATION_LOG"
 fi
 case "$*" in
+    "context inspect --format {{.Endpoints.docker.Host}}")
+        # The daemon the current context names.
+        if [ "${STUB_DOCKER_ENDPOINT_EMPTY:-0}" = "1" ]; then
+            echo
+        else
+            printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+        fi
+        ;;
     "inspect curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
         # absent in this isolated harness unless a control explicitly says
@@ -2620,7 +2680,7 @@ esac
 "#,
     );
 
-    write_executable(
+    test_executable::install(
         &dir.join("kubectl"),
         r#"#!/bin/sh
 set -u
@@ -2963,7 +3023,7 @@ fn run_approval_seed_route_harness(
 ) -> Output {
     let helper = ladder_function("configure_deterministic_approval_seed_route");
     let curie = harness.join("approval-seed-curie");
-    write_executable(
+    test_executable::install(
         &curie,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -4318,7 +4378,7 @@ fn cluster_ladder_rejects_invalid_worker_budgets_before_enqueue() {
         ("budget_nonliteral", "600", "nonliteral budget"),
         ("valid", "six hundred", "nonnumeric budget"),
         ("valid", "59", "budget below minimum"),
-        ("valid", "1801", "budget above maximum"),
+        ("valid", "10801", "budget above maximum"),
     ];
 
     for (mode, budget, label) in cases {
@@ -4957,23 +5017,71 @@ fn cluster_stream_rows() -> serde_json::Value {
     )
 }
 
+/// How the external Slack phase's receipt sits on disk.
+#[derive(Clone, Copy)]
+enum ReceiptFile {
+    /// Mode 0600, the only shape the consumers accept.
+    Private,
+    /// Mode 0644, readable by every local account.
+    WorldReadable,
+    /// A symlink whose mode-0600 target holds the receipt.
+    SymlinkToPrivate,
+}
+
 fn run_cluster_receipt_consumers(
     receipt: &serde_json::Value,
     coding_tool: &str,
     command: &str,
 ) -> (Output, String, Option<serde_json::Value>) {
+    run_cluster_receipt_consumers_from(receipt, ReceiptFile::Private, coding_tool, command)
+}
+
+fn run_cluster_receipt_consumers_from(
+    receipt: &serde_json::Value,
+    file: ReceiptFile,
+    coding_tool: &str,
+    command: &str,
+) -> (Output, String, Option<serde_json::Value>) {
     let harness = tempfile::tempdir().expect("create cluster receipt harness");
     let receipt_path = harness.path().join("receipt.json");
+    let written_path = match file {
+        ReceiptFile::SymlinkToPrivate => harness.path().join("receipt-target.json"),
+        ReceiptFile::Private | ReceiptFile::WorldReadable => receipt_path.clone(),
+    };
     fs::write(
-        &receipt_path,
+        &written_path,
         serde_json::to_vec(receipt).expect("serialize cluster receipt"),
     )
     .expect("write cluster receipt");
-    let mut receipt_permissions = fs::metadata(&receipt_path)
+    let mut receipt_permissions = fs::metadata(&written_path)
         .expect("read cluster receipt metadata")
         .permissions();
-    receipt_permissions.set_mode(0o600);
-    fs::set_permissions(&receipt_path, receipt_permissions).expect("protect cluster receipt");
+    receipt_permissions.set_mode(match file {
+        ReceiptFile::WorldReadable => 0o644,
+        ReceiptFile::Private | ReceiptFile::SymlinkToPrivate => 0o600,
+    });
+    fs::set_permissions(&written_path, receipt_permissions).expect("protect cluster receipt");
+    if let ReceiptFile::SymlinkToPrivate = file {
+        std::os::unix::fs::symlink(&written_path, &receipt_path).expect("link cluster receipt");
+    }
+
+    // macOS ships BSD stat, which refuses GNU's `-c` exactly like this. Every
+    // run sees it, so a consumer that reads the receipt's mode through one
+    // stat dialect fails on a Linux host too, not only on a Mac.
+    test_executable::install(
+        &harness.path().join("stat"),
+        r#"#!/bin/sh
+case "$1" in
+    -c*)
+        echo "stat: illegal option -- c" >&2
+        echo "usage: stat [-FLnq] [-f format | -l | -r | -s | -x] [-t timefmt] [file ...]" >&2
+        exit 1
+        ;;
+esac
+echo "unexpected stat invocation: $*" >&2
+exit 97
+"#,
+    );
 
     fs::write(
         harness.path().join("stream.json"),
@@ -5052,7 +5160,7 @@ fn run_cluster_receipt_consumers(
         .expect("write trace fixture");
     }
 
-    write_executable(
+    test_executable::install(
         &harness.path().join("curie"),
         r#"#!/bin/sh
 set -eu
@@ -5197,6 +5305,36 @@ printf 'membership=%s\n' "$LAST_QUERY_MEMBERSHIP""#,
         assert!(
             boundaries.is_empty(),
             "a {label} coding digest must fail before stream or telemetry access: {boundaries}"
+        );
+    }
+}
+
+#[test]
+fn cluster_external_ingress_receipt_is_refused_unless_it_is_a_private_file() {
+    let receipt = cluster_external_receipt(true, Some(&correct_cluster_coding_receipt()));
+    for (label, file) in [
+        ("mode 0644", ReceiptFile::WorldReadable),
+        ("symlinked", ReceiptFile::SymlinkToPrivate),
+    ] {
+        let (output, boundaries, _) = run_cluster_receipt_consumers_from(
+            &receipt,
+            file,
+            "Bash",
+            r#"cluster_external_ingress_seed coding "execute_tool""#,
+        );
+        assert!(
+            !output.status.success(),
+            "a {label} receipt must be refused: {}",
+            transcript(&output)
+        );
+        assert!(
+            transcript(&output).contains("the external Slack ingress receipt must be mode 0600"),
+            "a {label} receipt must be refused for its mode: {}",
+            transcript(&output)
+        );
+        assert!(
+            boundaries.is_empty(),
+            "a {label} receipt must be refused before stream or telemetry access: {boundaries}"
         );
     }
 }

@@ -10,6 +10,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# GNU timeout and util-linux setsid, with their exit statuses, on hosts that
+# ship neither (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-k8}"
 NAMESPACE="${CURIE_E2E_NAMESPACE:-test-2714-idle-route-reclamation}"
 RELEASE="${CURIE_E2E_RELEASE:-curie}"
@@ -370,9 +373,9 @@ PY
     printf 'SNAPSHOT\t%s\t%s\t%s\t%s\t%s\n' "$(timestamp_utc)" "$resource_version" "$used" "$status_hard" "$spec_hard" >"$destination"
     template="{{.type}}|{{.object.metadata.resourceVersion}}|{{index .object.status.used \"$QUOTA_RESOURCE\"}}|{{index .object.status.hard \"$QUOTA_RESOURCE\"}}|{{index .object.spec.hard \"$QUOTA_RESOURCE\"}}{{\"\\n\"}}"
     : >"$raw_file"
-    setsid bash -c '
+    "$GNU_PROCESS" setsid bash -c '
         set -o pipefail
-        timeout --foreground "$1s" "$2" --context "$3" -n "$4" get resourcequota "$5" --watch --output-watch-events -o go-template="$6" |
+        "$8" timeout --foreground "$1s" "$2" --context "$3" -n "$4" get resourcequota "$5" --watch --output-watch-events -o go-template="$6" |
             tee -a "$7" |
             while IFS= read -r line; do
                 IFS="|" read -r event_type event_resource_version event_used event_status_hard event_spec_hard extra <<<"$line"
@@ -382,7 +385,7 @@ PY
                     printf "%s\tMALFORMED\t%s\n" "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" "$line"
                 fi
             done
-    ' bash "$WAIT_SECONDS" "$REAL_KUBECTL" "$KUBE_CONTEXT" "$NAMESPACE" "$RESOURCE_QUOTA" "$template" "$raw_file" >>"$destination" 2>>"$error_file" &
+    ' bash "$WAIT_SECONDS" "$REAL_KUBECTL" "$KUBE_CONTEXT" "$NAMESPACE" "$RESOURCE_QUOTA" "$template" "$raw_file" "$GNU_PROCESS" >>"$destination" 2>>"$error_file" &
     QUOTA_WATCH_PID=$!
 }
 
@@ -402,9 +405,9 @@ PY
 )
     printf 'SNAPSHOT\t%s\t%s\t%s\n' "$(timestamp_utc)" "$resource_version" "$uid" >"$destination"
     : >"$raw_file"
-    setsid bash -c '
+    "$GNU_PROCESS" setsid bash -c '
         set -o pipefail
-        timeout --foreground "$1s" "$2" --context "$3" -n "$4" get "$5" "$6" --watch --output-watch-events -o "$7" |
+        "$9" timeout --foreground "$1s" "$2" --context "$3" -n "$4" get "$5" "$6" --watch --output-watch-events -o "$7" |
             tee -a "$8" |
             while IFS= read -r line; do
                 IFS="|" read -r event_type event_resource_version event_uid extra <<<"$line"
@@ -414,7 +417,7 @@ PY
                     printf "%s\tMALFORMED\t%s\n" "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" "$line"
                 fi
             done
-    ' bash "$WAIT_SECONDS" "$REAL_KUBECTL" "$KUBE_CONTEXT" "$NAMESPACE" "$kind" "$name" 'jsonpath={.type}{"|"}{.object.metadata.resourceVersion}{"|"}{.object.metadata.uid}{"\n"}' "$raw_file" >>"$destination" 2>>"$error_file" &
+    ' bash "$WAIT_SECONDS" "$REAL_KUBECTL" "$KUBE_CONTEXT" "$NAMESPACE" "$kind" "$name" 'jsonpath={.type}{"|"}{.object.metadata.resourceVersion}{"|"}{.object.metadata.uid}{"\n"}' "$raw_file" "$GNU_PROCESS" >>"$destination" 2>>"$error_file" &
     printf '%s\n' "$!"
 }
 
@@ -843,7 +846,7 @@ run_message() {
     if [[ -n "$thread" ]]; then
         args+=(--thread "$thread")
     fi
-    if ! timeout "$((MESSAGE_TIMEOUT_SECONDS + 30))" "$BIN" "${args[@]}" \
+    if ! "$GNU_PROCESS" timeout "$((MESSAGE_TIMEOUT_SECONDS + 30))" "$BIN" "${args[@]}" \
         >"$output" 2>"${output%.json}.err"; then
         cat "${output%.json}.err" >&2 || true
         cat "$output" >&2 || true
@@ -856,7 +859,7 @@ reset_thread() {
     thread_key="${route_key#"$ROUTE_PREFIX"}"
     [[ "$thread_key" != "$route_key" && -n "$thread_key" ]] || \
         die "route key does not carry the expected prefix: $route_key"
-    if ! timeout 90 "$BIN" --json cluster reset-thread "$AGENT" \
+    if ! "$GNU_PROCESS" timeout 90 "$BIN" --json cluster reset-thread "$AGENT" \
         --thread-key "$thread_key" --namespace "$NAMESPACE" --release "$RELEASE" \
         --yes >"$output" 2>"${output%.json}.err"; then
         cat "${output%.json}.err" >&2 || true
@@ -1271,7 +1274,9 @@ cleanup() {
     fi
     restore_runner_ingress || cleanup_failed=1
     delete_unrelated_valkey_keys || cleanup_failed=1
-    for pod in "${FILLER_PODS[@]}"; do
+    # Empty when a run fails before the fillers exist, which bash 3.2 refuses
+    # to expand under `set -u` without the `+` guard.
+    for pod in ${FILLER_PODS[@]+"${FILLER_PODS[@]}"}; do
         kube -n "$NAMESPACE" label pod "$pod" "$FILLER_LABEL_NAME-" \
             --overwrite >/dev/null 2>&1 || true
     done
@@ -1293,8 +1298,6 @@ trap 'exit 143' TERM
 require_command kubectl
 require_command helm
 require_command python3
-require_command timeout
-require_command setsid
 REAL_KUBECTL="$(command -v kubectl)"
 [[ "$NAMESPACE" == "test-2714-idle-route-reclamation" ]] || \
     die "CURIE_E2E_NAMESPACE must be the exact throwaway namespace test-2714-idle-route-reclamation"
@@ -1479,7 +1482,11 @@ if value.get("deployment",{}).get("status") != "active":
 PY
 
 echo "=== release routes left by the required cluster ladder ==="
-mapfile -t preexisting_routes < <(route_keys)
+# A read loop, not mapfile: bash 3.2, which macOS ships, has no mapfile.
+preexisting_routes=()
+while IFS= read -r route_key; do
+    preexisting_routes+=("$route_key")
+done < <(route_keys)
 for index in "${!preexisting_routes[@]}"; do
     reset_thread "${preexisting_routes[$index]}" "$WORKDIR/reset-preexisting-$index.json"
     wait_route_gone "${preexisting_routes[$index]}"

@@ -390,7 +390,7 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
     assert len(_requests(number)) == 1
 
 
-def test_authorized_mention_waits_until_the_active_request_finishes(
+def test_authorized_issue_mention_is_queued_while_a_request_is_active(
     factory_app: tuple[TestClient, GitHubAPI],
 ) -> None:
     client, api = factory_app
@@ -403,15 +403,25 @@ def test_authorized_mention_waits_until_the_active_request_finishes(
         == "factory_admitted"
     )
     api.comment_body = f"Please revise @{MENTION}"
+    payload = _comment_event(number, api.comment_body, 7002)
+    delivery = str(uuid.uuid4())
     mention = _post(
         client,
         "issue_comment",
-        _comment_event(number, api.comment_body, 7002),
+        payload,
+        delivery=delivery,
     )
+    same = _post(client, "issue_comment", payload, delivery=delivery)
+    redelivery = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
 
     assert mention.status_code == 200, mention.text
-    assert _code(mention) == "active_request"
-    assert len(_requests(number)) == 1
+    assert mention.json()["status"] == "factory_queued", mention.text
+    assert same.json()["status"] == "factory_duplicate", same.text
+    assert redelivery.json()["status"] == "factory_duplicate", redelivery.text
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["waiting", "queued"]
+    assert rows[1]["work_item_id"] == rows[0]["work_item_id"]
+    assert rows[1]["objective"].endswith("#issuecomment-7002")
 
 
 def test_label_removal_cancels_waiting_work_and_blocks_publication(
@@ -600,7 +610,7 @@ def test_pull_request_comment_stays_on_the_review_arm(
     assert _requests(number) == []
 
 
-def test_concurrent_label_deliveries_create_one_execution(
+def test_concurrent_label_deliveries_leave_one_active_execution(
     factory_app: tuple[TestClient, GitHubAPI],
 ) -> None:
     client, api = factory_app
@@ -624,10 +634,11 @@ def test_concurrent_label_deliveries_create_one_execution(
 
     assert errors == []
     assert [response.status_code for response in responses] == [200, 200]
-    statuses = sorted(response.json()["status"] for response in responses)
-    assert statuses[0] in {"factory_admitted", "factory_duplicate"}
-    assert statuses[1] in {"factory_admitted", "factory_duplicate"}
-    assert len(_requests(number)) == 1
+    statuses = [response.json()["status"] for response in responses]
+    assert statuses == ["factory_admitted", "factory_admitted"]
+    rows = _requests(number)
+    assert len({row["work_item_id"] for row in rows}) == 1
+    assert [row["status"] for row in rows].count("waiting") == 1
 
 
 def _mark_running(request_id: uuid.UUID) -> None:
@@ -680,3 +691,122 @@ def _assert_publication_refused(work_item_id: uuid.UUID) -> None:
             await engine.dispose()
 
     asyncio.run(go())
+
+
+# --- #3097 AC5: a factory push to its own PR starts no execution request.
+#
+# Payload shapes follow GitHub's webhook catalog:
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#push
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#check_run
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#check_suite
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#status
+
+_FIX_HEAD = "b2" * 20
+_LINEAGE_BRANCH = f"curie/publication-{uuid.UUID(int=3097).hex}"
+
+
+def _fix_push_deliveries(number: int) -> list[tuple[str, dict[str, Any]]]:
+    repository = {
+        "id": REPO_ID,
+        "full_name": REPO,
+        "clone_url": f"https://github.com/{REPO}.git",
+    }
+    bot = _sender("Bot", "curie-factory[bot]", 7701)
+    pull_request = {
+        "number": 77,
+        "state": "open",
+        "head": {"ref": _LINEAGE_BRANCH, "sha": _FIX_HEAD},
+        "base": {"ref": "main"},
+        "body": f"Closes #{number}",
+    }
+    installation = {"id": INSTALLATION_ID}
+    return [
+        (
+            "push",
+            {
+                "ref": f"refs/heads/{_LINEAGE_BRANCH}",
+                "before": "a1" * 20,
+                "after": _FIX_HEAD,
+                "repository": repository,
+                "installation": installation,
+                "sender": bot,
+                "commits": [{"id": _FIX_HEAD, "message": "Fix the failing check"}],
+            },
+        ),
+        (
+            "pull_request",
+            {
+                "action": "synchronize",
+                "number": 77,
+                "pull_request": pull_request,
+                "repository": repository,
+                "installation": installation,
+                "sender": bot,
+            },
+        ),
+        (
+            "check_run",
+            {
+                "action": "completed",
+                "check_run": {
+                    "id": 9001,
+                    "name": "unit-tests",
+                    "head_sha": _FIX_HEAD,
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                "repository": repository,
+                "installation": installation,
+                "sender": bot,
+            },
+        ),
+        (
+            "check_suite",
+            {
+                "action": "completed",
+                "check_suite": {
+                    "id": 9101,
+                    "head_sha": _FIX_HEAD,
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                "repository": repository,
+                "installation": installation,
+                "sender": bot,
+            },
+        ),
+        (
+            "status",
+            {
+                "sha": _FIX_HEAD,
+                "state": "failure",
+                "context": "ci/jenkins",
+                "repository": repository,
+                "installation": installation,
+                "sender": bot,
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize("event", ["push", "pull_request", "check_run", "check_suite", "status"])
+def test_a_factory_fix_push_and_its_ci_events_start_no_execution_request(
+    factory_app: tuple[TestClient, GitHubAPI], event: str
+) -> None:
+    """Already true on the base: the CI fix loop relies on it, so it is pinned."""
+
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    admitted = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert admitted.json()["status"] == "factory_admitted"
+    before = _rows("SELECT id FROM curie.execution_requests")
+
+    (payload,) = [body for name, body in _fix_push_deliveries(number) if name == event]
+    response = _post(client, event, payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ignored"
+    assert _rows("SELECT id FROM curie.execution_requests") == before
+    assert len(_requests(number)) == 1

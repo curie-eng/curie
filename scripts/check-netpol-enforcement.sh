@@ -331,14 +331,17 @@ fi
 echo "  ok  allow holds -- the sandbox can resolve DNS"
 
 # Every connector Service is exercised in both directions. A missing Service
-# makes the connector policy check vacuous and is therefore fatal.
+# makes the connector policy check vacuous and is therefore fatal. Connectors
+# are listed by the name label their Services share: behind a caller proxy
+# (ADR-0168 decision 7) a connector also has a direct Service on the server's
+# port, which only an operator policy opens, and it is not a second connector.
 CONNECTORS=()
 while IFS= read -r svc; do
   [ -n "$svc" ] && CONNECTORS+=("$svc")
 done < <(
   kubectl -n "$NS" get svc -l app.kubernetes.io/part-of="$RELEASE" \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-    | grep -- "-mcp-" || true
+    -o jsonpath='{range .items[*]}{.metadata.labels.app\.kubernetes\.io/name}{"\n"}{end}' \
+    2>/dev/null | grep -- "-mcp-" | sort -u || true
 )
 CONNECTOR_COUNT="${#CONNECTORS[@]}"
 (( CONNECTOR_COUNT > 0 )) \

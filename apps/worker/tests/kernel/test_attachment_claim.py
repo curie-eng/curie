@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 import threading
-import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -53,6 +54,30 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
+
+
+def _qevent(
+    text: str,
+    *,
+    thread: str = "th-att",
+    attachments: Sequence[Attachment] = (),
+    event_id: str | None = None,
+    placeholder: str = "p-1",
+) -> QueuedTurn:
+    # This file has always derived a deterministic event id from the turn shape.
+    return qevent(
+        text,
+        thread=thread,
+        attachments=attachments,
+        placeholder=placeholder,
+        event_id=event_id or f"ev-{thread}-{len(text)}-{len(attachments)}",
+    )
 
 DONE = SessionStatus.DONE
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
@@ -91,37 +116,8 @@ WORKSPACES_OFF_REPLY = (
 )
 
 
-def _qevent(
-    text: str,
-    *,
-    thread: str = "th-att",
-    attachments: Sequence[Attachment] = (),
-    event_id: str | None = None,
-    placeholder: str = "p-1",
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or f"ev-{thread}-{len(text)}-{len(attachments)}",
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder=placeholder),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=TurnSource.SLACK,
-        attachments=list(attachments),
-    )
-
-
 def _thread_key(thread: str) -> str:
     return f"slack:C1:{thread}"
-
-
-async def _wait_until(pred: Callable[[], bool], what: str, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting for {what}")
 
 
 class _FakeAttachmentLane:
@@ -227,7 +223,7 @@ class _WorkspaceBinding:
             workspace_enabled=workspace_enabled,
         )
 
-    async def resolve(self, _kind: str, _channel: str) -> _WorkspaceResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _WorkspaceResolved:
         return self.resolved
 
     def boot_env(
@@ -2101,5 +2097,39 @@ def test_workspace_route_live_again_at_adopt_refuses_the_file_turn(
                 ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
             )
             assert h.substrate.lookup(thread_key) == old
+
+    asyncio.run(go())
+
+
+def test_the_lane_is_asked_for_the_identity_the_turn_arrived_on(make_harness) -> None:
+    """ADR-0168 decision 5: a file is fetched with the addressed bot's token."""
+
+    def turn(thread: str, adapter: str | None) -> QueuedTurn:
+        return QueuedTurn(
+            event_id=f"ev-{thread}",
+            conversation_id=thread,
+            author="U1",
+            text="what does this say?",
+            reply_handle=ReplyHandle(
+                kind="slack", channel="C1", placeholder="p-1", adapter=adapter
+            ),
+            received_at="2026-07-05T00:00:00+00:00",
+            source=TurnSource.SLACK,
+            attachments=[Attachment(id="F1", name="report.csv", mime_type="text/csv")],
+        )
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+
+            await h.kernel.process_event(turn("tNamedIdentity", "ops-bot"))
+            await h.kernel.process_event(turn("tStockIdentity", None))
+
+            assert [call["extra"] for call in lane.resolve_calls] == [
+                {"identity": "ops-bot"},
+                {"identity": "default"},
+            ]
 
     asyncio.run(go())

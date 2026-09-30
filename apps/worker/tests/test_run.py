@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -68,9 +69,7 @@ def test_route_ttl_override_is_independent_of_claim_timeout() -> None:
     # reach the DEADLINE but not the ACCUMULATION term, so the only available
     # lever made a doomed turn fail slower instead of reducing how many
     # sandboxes were alive. Setting one must not disturb the other.
-    cfg = _substrate_config(
-        {"CURIE_ROUTE_TTL_SECONDS": "300", "CURIE_CLAIM_TIMEOUT_SECONDS": "45"}
-    )
+    cfg = _substrate_config({"CURIE_ROUTE_TTL_SECONDS": "300", "CURIE_CLAIM_TIMEOUT_SECONDS": "45"})
     assert cfg.route_ttl_seconds == 300
     assert cfg.claim_timeout_seconds == 45.0
     assert cfg.suspended_route_ttl_seconds == 86400
@@ -290,9 +289,7 @@ def test_docker_without_credential_or_fake_fails_loudly() -> None:
 def test_docker_with_sdk_credential_builds_docker_client(monkeypatch) -> None:
     # Keep hermetic: after Stream B, _sandbox_client prewarms the image via
     # DockerSandboxClient.ensure_image; stub it so this test never shells docker.
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(),
         {"CURIE_SANDBOX_SUBSTRATE": "docker", "CLAUDE_CODE_OAUTH_TOKEN": _FAKE_SDK_CRED},
@@ -304,9 +301,7 @@ def test_docker_with_sdk_credential_builds_docker_client(monkeypatch) -> None:
 def test_docker_with_curie_credentials_reference_builds_docker_client(monkeypatch) -> None:
     # CURIE_CREDENTIALS alone is a valid credential: forwarded by name and
     # mapped onto an SDK var by the runner, so the gate must accept it.
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(credentials="sk-ant-PLACEHOLDER"),
         {"CURIE_SANDBOX_SUBSTRATE": "docker"},
@@ -316,9 +311,7 @@ def test_docker_with_curie_credentials_reference_builds_docker_client(monkeypatc
 
 
 def test_docker_with_model_base_url_builds_docker_client_without_credential(monkeypatch) -> None:
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(model_base_url="http://ollama:11434"),
         {"CURIE_SANDBOX_SUBSTRATE": "docker"},
@@ -328,9 +321,7 @@ def test_docker_with_model_base_url_builds_docker_client_without_credential(monk
 
 
 def test_docker_with_explicit_fake_model_builds_docker_client(monkeypatch) -> None:
-    monkeypatch.setattr(
-        DockerSandboxClient, "ensure_image", lambda self: None, raising=False
-    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None, raising=False)
     client = _sandbox_client(
         WorkerConfig(fake_model=True), {"CURIE_SANDBOX_SUBSTRATE": "docker"}, _SUB
     )
@@ -346,7 +337,8 @@ def test_docker_without_otlp_endpoint_warns(caplog) -> None:
         )
     assert isinstance(client, DockerSandboxClient)
     warnings = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
     assert warnings and all(r.levelno == logging.WARNING for r in warnings)
@@ -364,7 +356,8 @@ def test_docker_with_otlp_endpoint_does_not_warn(caplog) -> None:
         )
     assert isinstance(client, DockerSandboxClient)
     assert not [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
 
@@ -408,9 +401,7 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     assert isinstance(client, DockerSandboxClient)
     client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
     assert len(calls) == 1
-    assert not any(
-        arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0]
-    )
+    assert not any(arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0])
     endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
@@ -594,8 +585,18 @@ def test_crashing_supervised_task_does_not_cancel_its_siblings() -> None:
     asyncio.run(go())
 
 
-def test_supervise_emits_restart_metric_and_cause_for_publications(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("lane", "error"),
+    [
+        pytest.param("publications", "claim cas lost", id="publications"),
+        pytest.param("evals", "eval stream closed", id="evals"),
+    ],
+)
+def test_supervise_emits_restart_metric_and_cause(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    error: str,
 ) -> None:
     recorded: list[tuple[str, float, dict[str, str]]] = []
 
@@ -613,19 +614,19 @@ def test_supervise_emits_restart_metric_and_cause_for_publications(
         async def factory() -> None:
             calls["n"] += 1
             if calls["n"] < 3:
-                raise RuntimeError("claim cas lost")
+                raise RuntimeError(error)
             shutdown.set()
 
         with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
             await asyncio.wait_for(
-                _supervise("publications", factory, shutdown, restart_backoff_s=0),
+                _supervise(lane, factory, shutdown, restart_backoff_s=0),
                 timeout=2,
             )
 
         assert calls["n"] == 3
         expected = {
             "service.name": "curie-worker",
-            "operation": "publications",
+            "operation": lane,
             "outcome": "restart",
         }
         assert recorded == [
@@ -640,62 +641,9 @@ def test_supervise_emits_restart_metric_and_cause_for_publications(
         assert len(restarts) == 2
         for rec in restarts:
             message = rec.getMessage()
-            assert "publications" in message
+            assert lane in message
             assert "RuntimeError" in message
-            assert "claim cas lost" in message
-
-    asyncio.run(go())
-
-
-def test_supervise_emits_restart_metric_for_evals(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    recorded: list[tuple[str, float, dict[str, str]]] = []
-
-    def capture(
-        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
-    ) -> None:
-        recorded.append((name, value, dict(attributes or {})))
-
-    monkeypatch.setattr(run, "record_metric", capture)
-
-    async def go() -> None:
-        shutdown = asyncio.Event()
-        calls = {"n": 0}
-
-        async def factory() -> None:
-            calls["n"] += 1
-            if calls["n"] < 3:
-                raise RuntimeError("eval stream closed")
-            shutdown.set()
-
-        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
-            await asyncio.wait_for(
-                _supervise("evals", factory, shutdown, restart_backoff_s=0),
-                timeout=2,
-            )
-
-        assert calls["n"] == 3
-        expected = {
-            "service.name": "curie-worker",
-            "operation": "evals",
-            "outcome": "restart",
-        }
-        assert recorded == [
-            ("curie.worker.supervised.restart", 1, expected),
-            ("curie.worker.supervised.restart", 1, expected),
-        ]
-        restarts = [
-            r
-            for r in caplog.records
-            if r.name == "curie_worker.run" and "crashed; restarting" in r.getMessage()
-        ]
-        assert len(restarts) == 2
-        for rec in restarts:
-            message = rec.getMessage()
-            assert "evals" in message
-            assert "RuntimeError" in message
-            assert "eval stream closed" in message
+            assert error in message
 
     asyncio.run(go())
 
@@ -725,9 +673,7 @@ def test_supervise_idle_heartbeat_does_not_emit_restart(
             )
 
         assert recorded == []
-        assert not any(
-            "crashed; restarting" in r.getMessage() for r in caplog.records
-        )
+        assert not any("crashed; restarting" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
 
@@ -931,6 +877,7 @@ def test_supervise_policy_reads_worker_config() -> None:
         "max_restart_backoff_s": 30.0,
         "max_consecutive_failures": 5,
         "failure_reset_s": 120.0,
+        "boot_grace_s": run._BOOT_GRACE_S,
     }
 
 
@@ -1005,6 +952,24 @@ class _FakeTransport:
         pass
 
 
+class _FakeCronLoop:
+    """Stands in for ``CronSchedulerLoop``. By default it records itself and
+    returns, like the fake consumers; with ``wait_for_stop`` it blocks on the
+    stop event ``_run`` hands it, which is how the cron test proves the loop is
+    wired to the shared shutdown flag rather than to a private one."""
+
+    def __init__(self, events: list[str], *, wait_for_stop: bool = False) -> None:
+        self._events = events
+        self._wait_for_stop = wait_for_stop
+
+    async def run_forever(self, stop: asyncio.Event | None = None) -> None:
+        self._events.append("cron")
+        if self._wait_for_stop:
+            assert stop is not None
+            await stop.wait()
+            self._events.append("cron-stopped")
+
+
 class _FakeRuntime:
     """Exactly the attributes ``_run`` touches -- deliberately not a real
     ``Runtime``, so nothing here reaches Valkey, Postgres, or the substrate."""
@@ -1015,6 +980,7 @@ class _FakeRuntime:
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
         self.connector_loop = None
+        self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
         self.sink = _FakeTransport()
         self.eval_http = _FakeTransport()
@@ -1022,6 +988,7 @@ class _FakeRuntime:
         self.pressure_async_redis = _FakeTransport()
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
+        self.orphan_sweeper = None
 
 
 def _boot(
@@ -1057,6 +1024,39 @@ def _boot(
     # regression that leaves _run blocked must fail this suite, not hang CI.
     asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
     return events
+
+
+def test_run_supervises_the_cron_loop_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cron loop is always on (#268): _run must start it under the same
+    # supervisor as its siblings and hand it the shared shutdown flag, so a
+    # SIGTERM that stops the consumers also stops the scheduler.
+    events: list[str] = []
+    card_store = _FakeCardStore(events)
+    runtime = _FakeRuntime(card_store, events)
+    runtime.cron_loop = _FakeCronLoop(events, wait_for_stop=True)
+
+    async def stopping_heartbeat(_file: Any, _interval: Any, shutdown: asyncio.Event) -> None:
+        # Let the cron loop start first, then request shutdown the way the
+        # signal handler would.
+        while "cron" not in events:
+            await asyncio.sleep(0)
+        shutdown.set()
+
+    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+
+    assert events.count("cron") == 1
+    assert "cron-stopped" in events
+
+
+def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CURIE_CRON_TICK_INTERVAL_S", raising=False)
+    assert WorkerConfig().cron_tick_interval_s == 30
+    monkeypatch.setenv("CURIE_CRON_TICK_INTERVAL_S", "5")
+    assert WorkerConfig().cron_tick_interval_s == 5
 
 
 def test_run_migrates_legacy_card_refs_once_at_boot(
@@ -1117,9 +1117,7 @@ def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the cut-short migration
     cut_short = [
-        r
-        for r in caplog.records
-        if r.name == "curie_worker.run" and "cut short" in r.getMessage()
+        r for r in caplog.records if r.name == "curie_worker.run" and "cut short" in r.getMessage()
     ]
     assert len(cut_short) == 1
     assert cut_short[0].levelno == logging.WARNING
@@ -1145,10 +1143,7 @@ def test_valkey_kwargs_selects_the_plain_connection_by_default() -> None:
     sync_client = redis.Redis(**kwargs)
     assert sync_client.connection_pool.connection_class is redis.connection.Connection
     async_client = redis.asyncio.Redis(**kwargs)
-    assert (
-        async_client.connection_pool.connection_class
-        is redis.asyncio.connection.Connection
-    )
+    assert async_client.connection_pool.connection_class is redis.asyncio.connection.Connection
 
 
 def test_valkey_kwargs_selects_ssl_connection_when_tls_is_set() -> None:
@@ -1156,10 +1151,7 @@ def test_valkey_kwargs_selects_ssl_connection_when_tls_is_set() -> None:
     sync_client = redis.Redis(**kwargs)
     assert sync_client.connection_pool.connection_class is redis.connection.SSLConnection
     async_client = redis.asyncio.Redis(**kwargs)
-    assert (
-        async_client.connection_pool.connection_class
-        is redis.asyncio.connection.SSLConnection
-    )
+    assert async_client.connection_pool.connection_class is redis.asyncio.connection.SSLConnection
 
 
 def test_valkey_kwargs_carries_host_port_password_db_unchanged() -> None:
@@ -1207,9 +1199,7 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
             assert runtime.pressure_async_redis is not runtime.async_redis
             assert runtime.pressure_async_redis is not runtime.eval_redis
 
-            pressure_kwargs = (
-                runtime.pressure_async_redis.connection_pool.connection_kwargs
-            )
+            pressure_kwargs = runtime.pressure_async_redis.connection_pool.connection_kwargs
             assert pressure_kwargs["socket_timeout"] == 1.0
             assert pressure_kwargs["socket_connect_timeout"] == 1.0
             assert pressure_kwargs["retry"].get_retries() == 0
@@ -1228,9 +1218,7 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
                 # no connection handler rather than retaining the input object.
                 assert pressure_connection.maint_notifications_config is None
             finally:
-                await runtime.pressure_async_redis.connection_pool.release(
-                    pressure_connection
-                )
+                await runtime.pressure_async_redis.connection_pool.release(pressure_connection)
         finally:
             affinity_redis.close()
             await runtime.runner.close()
@@ -1263,3 +1251,166 @@ def test_valkey_tls_defaults_false_on_a_clean_env(
     # test.
     monkeypatch.delenv("VALKEY_TLS", raising=False)
     assert WorkerConfig().valkey_tls is False
+
+
+def test_substrate_config_reads_agent_sandbox_pools() -> None:
+    assert _substrate_config({}).agent_pools == frozenset()
+    config = _substrate_config({"CURIE_AGENT_SANDBOX_POOLS": "factory, acme-a,"})
+    assert config.agent_pools == frozenset({"factory", "acme-a"})
+
+
+def test_substrate_config_reads_connector_secret_pools() -> None:
+    assert _substrate_config({}).connector_secret_pools == frozenset()
+    config = _substrate_config({"CURIE_AGENT_CONNECTOR_SECRET_POOLS": "acme-a, acme-b,"})
+    assert config.connector_secret_pools == frozenset({"acme-a", "acme-b"})
+
+
+# -- _supervise: quiet boot while dependencies come up (#3079) ---------------
+
+
+def _crash_twice_then_return(exc: BaseException):  # type: ignore[no-untyped-def]
+    calls = {"n": 0}
+
+    async def factory() -> None:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise exc
+
+    return factory, calls
+
+
+def _supervise_once(factory, clock) -> None:  # type: ignore[no-untyped-def]
+    async def go() -> None:
+        await asyncio.wait_for(
+            _supervise(
+                "runs",
+                factory,
+                asyncio.Event(),
+                restart_backoff_s=0,
+                max_consecutive_failures=0,
+                boot_grace_s=120.0,
+                clock=clock,
+            ),
+            timeout=2,
+        )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        socket.gaierror(-2, "Name or service not known"),
+        ConnectionRefusedError(111, "Connection refused"),
+        redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
+    ],
+    ids=["dns", "refused", "valkey"],
+)
+def test_supervise_logs_dependency_not_ready_during_boot_as_one_line_warning(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+) -> None:
+    """A dependency that is still coming up during the boot window is a one-line
+    warning that says it will retry, with no traceback."""
+    _capture_metrics(monkeypatch)
+    factory, calls = _crash_twice_then_return(exc)
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    assert calls["n"] == 3
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    for record in records:
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        message = record.getMessage()
+        assert "\n" not in message
+        assert "retrying" in message
+        assert type(exc).__name__ in message
+
+
+def test_supervise_quiet_boot_follows_the_exception_chain(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library wrapper whose cause is a connection failure is still expected."""
+    _capture_metrics(monkeypatch)
+    try:
+        try:
+            raise socket.gaierror(-2, "Name or service not known")
+        except OSError as inner:
+            raise RuntimeError("could not reach postgres") from inner
+    except RuntimeError as wrapped:
+        exc = wrapped
+    factory, _ = _crash_twice_then_return(exc)
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING]
+    assert all(r.exc_info is None for r in records)
+
+
+def test_supervise_keeps_tracebacks_for_unexpected_failures_during_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real bug at boot is not a dependency warming up: full traceback."""
+    _capture_metrics(monkeypatch)
+    factory, _ = _crash_twice_then_return(KeyError("latent bug"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+def test_supervise_keeps_tracebacks_for_connection_failures_after_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the boot window has passed, a lost dependency is unexpected again
+    and logs its full traceback."""
+    _capture_metrics(monkeypatch)
+    ticks = iter([0.0] + [500.0] * 20)
+    factory, _ = _crash_twice_then_return(ConnectionRefusedError(111, "refused"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: next(ticks))
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+def test_run_warns_in_one_line_when_valkey_is_not_ready_for_the_boot_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Valkey still coming up on a fresh install is expected at boot (#3079): the
+    migration is skipped with a one-line warning, not a traceback."""
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        events = _boot(
+            monkeypatch,
+            raises=redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
+        )
+
+    assert "runs" in events
+    records = [
+        r for r in caplog.records if r.name == "curie_worker.run" and "migration" in r.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert "not ready" in records[0].getMessage()
+
+
+def test_supervise_keeps_tracebacks_for_local_os_errors_during_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PermissionError is a local fault, not a dependency warming up."""
+    _capture_metrics(monkeypatch)
+    factory, _ = _crash_twice_then_return(PermissionError(13, "Permission denied"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)

@@ -21,6 +21,7 @@ from kubernetes import config as k8s_config
 from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 from .quota import quota_has_live_headroom, quota_rejection_is_valid
+from .resources import prepare_resources_claim
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -241,6 +242,75 @@ class KubernetesSandboxClient:
         self._core_api = k8s_client.CoreV1Api(api_client)
         self._namespace = namespace
 
+    def _resources_pool(
+        self,
+        pool: str,
+        agent_name: str | None,
+        runner_resources: dict[str, Any],
+    ) -> str:
+        """Copy the chart template onto a worker-owned pool and return its name.
+
+        The shared template is read and not written. A missing source template
+        fails the claim instead of falling back to the chart size.
+        """
+
+        if not agent_name:
+            raise ValueError("runner resources require an agent name")
+        source_name = pool[: -len("-pool")] if pool.endswith("-pool") else pool
+        try:
+            source = self._api.get_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                source_name,
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                raise ValueError(f"source template {source_name} is missing") from exc
+            raise
+        templates = {source_name: source.get("spec") or {}}
+        warm_pools: dict[str, Any] = {}
+        owned_pool = prepare_resources_claim(
+            pool, agent_name, runner_resources, templates, warm_pools
+        )
+        owned_template = owned_pool[: -len("-pool")]
+        self._put_extension(
+            "sandboxtemplates",
+            owned_template,
+            "SandboxTemplate",
+            templates[owned_template],
+        )
+        self._put_extension(
+            "sandboxwarmpools",
+            owned_pool,
+            "SandboxWarmPool",
+            warm_pools[owned_pool],
+        )
+        return owned_pool
+
+    def _put_extension(self, plural: str, name: str, kind: str, spec: dict[str, Any]) -> None:
+        body = {
+            "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+            "kind": kind,
+            "metadata": {"name": name},
+            "spec": spec,
+        }
+        try:
+            self._api.get_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, plural, name
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status != 404:
+                raise
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, plural, body
+            )
+            return
+        self._api.patch_namespaced_custom_object(
+            EXT_GROUP, EXT_VERSION, self._namespace, plural, name, body
+        )
+
     # -- SandboxClaim (extensions group) ------------------------------------
 
     def create_claim(
@@ -250,7 +320,11 @@ class KubernetesSandboxClient:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, Any] | None = None,
+        agent_name: str | None = None,
     ) -> None:
+        if runner_resources is not None:
+            pool = self._resources_pool(pool, agent_name, runner_resources)
         env = filter_agent_child_env(env)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
@@ -415,6 +489,28 @@ class KubernetesSandboxClient:
             status_hard=getattr(status, "hard", None),
             status_used=getattr(status, "used", None),
         )
+
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name,
+                self._namespace,
+                _request_timeout=request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - unknown pod state keeps the claim timeout
+            return None
+        status = getattr(pod, "status", None)
+        for condition in getattr(status, "conditions", None) or []:
+            if (
+                getattr(condition, "type", None) == "PodScheduled"
+                and getattr(condition, "status", None) == "False"
+                and getattr(condition, "reason", None) == "Unschedulable"
+            ):
+                message = getattr(condition, "message", None)
+                return message if isinstance(message, str) and message else "Unschedulable"
+        return None
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         self._api.patch_namespaced_custom_object(

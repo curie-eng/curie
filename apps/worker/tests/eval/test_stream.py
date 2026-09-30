@@ -17,10 +17,11 @@ import io
 import json
 import logging
 import os
+import sys
 import tarfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -85,20 +86,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
+
 CONTAINS = GraderKind.CONTAINS
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
 )
 _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 class _StubRepo:
@@ -124,9 +121,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking
+        return self._model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -138,7 +135,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -184,6 +181,8 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
@@ -449,21 +448,67 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                         ).model_dump_json()
                     },
                 )
+
+                async def liveness_ttls() -> tuple[int, int]:
+                    async with client.pipeline(transaction=False) as pipe:
+                        pipe.pttl(alive)
+                        pipe.pttl(capable)
+                        alive_ttl, capable_ttl = await pipe.execute()
+                    return int(alive_ttl), int(capable_ttl)
+
                 task = asyncio.create_task(consumer.run())
+                # One EXISTS per key can observe the 150ms alive lease in its
+                # last milliseconds and fail the following assert. Require both
+                # TTLs in one round trip, with margin, and do not sample again.
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
-                    if await client.exists(alive) and await client.exists(capable):
+                    alive_ttl, capable_ttl = await liveness_ttls()
+                    if alive_ttl > 40 and capable_ttl > 40:
                         break
                     await asyncio.sleep(0.005)
-                assert await client.exists(alive)
-                assert await client.exists(capable)
+                else:
+                    pytest.fail("eval consumer did not publish both liveness markers")
 
                 await _wait_until(lambda: bool(fake.seen))
                 consumer.request_stop()
-                await asyncio.sleep(0.35)
+                # b23d87c9b polled one PTTL sample after a sleep longer than the
+                # 150ms alive lease. That sleep is the other race: a stalled
+                # refresh expires the key and kills the generation before the
+                # sample. A rise in both TTLs is one renewal transaction. A
+                # non-positive sample resets the baselines, so a lapse and a
+                # later republish cannot count as that renewal. The 450ms
+                # capability lease would otherwise still be the original key.
+                low_alive: int | None = None
+                low_capable: int | None = None
+                alive_rose = False
+                capable_rose = False
+                renewal_deadline = time.monotonic() + 2
+                while time.monotonic() < renewal_deadline:
+                    if task.done():
+                        break
+                    alive_ttl, capable_ttl = await liveness_ttls()
+                    if alive_ttl <= 0 or capable_ttl <= 0:
+                        low_alive = None
+                        low_capable = None
+                        alive_rose = False
+                        capable_rose = False
+                        await asyncio.sleep(0.005)
+                        continue
+                    if low_alive is not None and alive_ttl > low_alive:
+                        alive_rose = True
+                    if low_capable is not None and capable_ttl > low_capable:
+                        capable_rose = True
+                    if alive_rose and capable_rose:
+                        break
+                    if low_alive is None or alive_ttl < low_alive:
+                        low_alive = alive_ttl
+                    if low_capable is None or capable_ttl < low_capable:
+                        low_capable = capable_ttl
+                    await asyncio.sleep(0.005)
                 assert not task.done(), "graceful stop must drain the inline eval handler"
-                assert await client.pttl(alive) > 0
-                assert await client.pttl(capable) > 0
+                assert alive_rose and capable_rose, (
+                    "eval consumer did not renew both liveness markers"
+                )
                 release.set()
                 await task
                 assert reports and reports[0]["passed_count"] == 1
@@ -970,6 +1015,8 @@ def test_provisioned_runner_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        runner_resources: dict[str, object] | None = None,
+                        agent_name: str | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
                         super().create_claim(name, pool=pool, env=env, labels=labels)
@@ -1923,6 +1970,9 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="curie-runner-pool",
+            # The chart renders acme-a's pool (CURIE_AGENT_SANDBOX_POOLS, #2943).
+            agent_pools=frozenset({"acme-a"}),
+            connector_secret_pools=frozenset({"acme-a"}),
             claim_timeout_seconds=3.0,
             poll_interval_seconds=0.005,
             key_prefix=sandbox_prefix,
@@ -3256,7 +3306,8 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
         # dead-lettered on the next pass.
         assert (
             await store.release(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner
+                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner,
+                resume_event_id=None,
             )
             is True
         )

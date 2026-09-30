@@ -76,7 +76,7 @@ struct AgentTarget<T: TierDefaults> {
     agent: String,
     #[arg(long, default_value = T::API_URL, env = "CURIE_API_URL")]
     api_url: String,
-    #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+    #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
     api_key: String,
     #[arg(long)]
     dry_run: bool,
@@ -112,6 +112,24 @@ struct ClusterConn {
     namespace: String,
     /// Helm release name. Default: curie.
     #[arg(long, default_value = "curie")]
+    release: String,
+}
+
+/// Same connection as [`ClusterConn`], but the flags are global so they parse
+/// after `cluster hook fire` as well as on `cluster hook`.
+#[derive(Args, Debug, Clone)]
+struct ClusterHookConn {
+    /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
+    #[arg(long, env = "CURIE_API_URL", global = true)]
+    api_url: Option<String>,
+    /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
+    #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, global = true)]
+    api_key: Option<String>,
+    /// Kubernetes namespace of the release. Default: curie.
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE", global = true)]
+    namespace: String,
+    /// Helm release name. Default: curie.
+    #[arg(long, default_value = "curie", global = true)]
     release: String,
 }
 
@@ -347,6 +365,48 @@ struct ClusterAgentTarget {
     conn: ClusterConn,
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum LocalHooksAction {
+    /// Show an agent's hook partition and source binding maps.
+    Show {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+    },
+    /// Replace one or both hook maps from a JSON file. An empty map clears it.
+    Configure {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+    },
+    /// Read the derived hook signing secret for an agent.
+    Secret {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterHooksAction {
+    /// Show an agent's hook partition and source binding maps.
+    Show {
+        #[command(flatten)]
+        target: ClusterAgentTarget,
+    },
+    /// Replace one or both hook maps from a JSON file. An empty map clears it.
+    Configure {
+        #[command(flatten)]
+        target: ClusterAgentTarget,
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+    },
+    /// Read the derived hook signing secret for an agent.
+    Secret {
+        #[command(flatten)]
+        target: ClusterAgentTarget,
+    },
 }
 
 /// Stand up the connectors this version declares, and prune what it dropped.
@@ -703,7 +763,7 @@ enum Command {
         )]
         api_url: String,
         /// Platform API key.
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
         /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
@@ -758,6 +818,10 @@ enum Command {
         /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
+        /// The platform runner a declared runner layer builds on (default: the
+        /// runner `curie skill up` uses). Resolved to a digest before building.
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
@@ -943,7 +1007,7 @@ enum Command {
         api_url: Option<String>,
         /// API key for `--api-url`. Optional: discovered from the release Secret
         /// when omitted.
-        #[arg(long, env = "CURIE_API_KEY")]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
     },
 
@@ -999,7 +1063,11 @@ enum SreBotAction {
         #[arg(long, value_name = "USER_IDS", required = true)]
         approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
-        /// upgrade Job, and the two identities behind them.
+        /// upgrade Job, and the two identities behind them. Applies
+        /// upgrade-role.yaml, platform-upgrade-role.yaml, and the rendered
+        /// platform-upgrade ConfigMap and suspended CronJob. Arms only
+        /// upgrade_platform: no self-upgrade CronJob is applied, so
+        /// upgrade_self stays unarmed.
         ///
         /// CREATES A NAMESPACE-ADMIN-EQUIVALENT IDENTITY for the Job that runs
         /// `helm upgrade`. Read examples/sre-bot/manifests/platform-upgrade-role.yaml
@@ -1023,10 +1091,35 @@ enum SreBotAction {
         #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
         workspace_repo: Vec<String>,
     },
+    /// Provision the observability stack on an existing Curie release and
+    /// require the Grafana connector token. Does not install the platform
+    /// and does not deploy the SRE bot.
+    ProvisionObservability {
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
+        /// Chart directory. When omitted, use the same chart resolution as install.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the ordered plan without calling kubectl or helm.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum DevAction {
+    /// Manage hooks for this source checkout.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
     /// Render-assert the Helm chart: discover and run every executable assertion
@@ -1046,13 +1139,6 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
-    /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
-    /// MCP server and a live provider
-    /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
-    /// `curie cluster message`. Approvals resolve through
-    /// `curie cluster approvals` and an operator principal. Missing the live
-    /// provider skips with the reason in the run summary.
-    SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
     /// Drive the dark factory against a disposable install on a named kube
@@ -1278,6 +1364,12 @@ enum DevAction {
 }
 
 #[derive(Subcommand)]
+enum HooksAction {
+    /// Install the tracked Git hooks in this checkout.
+    Install,
+}
+
+#[derive(Subcommand)]
 enum SecretsAction {
     /// Save a secret in Curie private storage. Prompts with hidden input by default.
     Set {
@@ -1498,6 +1590,16 @@ enum SkillAction {
     },
     #[command(about = format!(
         "Not available at this tier: {}; {}",
+        commands::SCHEDULES_REASON, commands::SCHEDULES_ALT,
+    ))]
+    Schedules {
+        /// Accepts any arguments so every form reaches the exit-4 capability
+        /// refusal instead of a clap usage error.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _rest: Vec<String>,
+    },
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
         commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
     ))]
     Observability {
@@ -1569,6 +1671,12 @@ enum SkillAction {
         #[command(flatten)]
         sampling: EvalSamplingArgs,
     },
+    /// Run a declared cron hook against the local runner, or report that a
+    /// durable schedule or record is unavailable at this tier (ADR-0099).
+    Hook {
+        #[command(subcommand)]
+        action: SkillHookAction,
+    },
     /// Interview to generate a starter `evals/cases.json` (guided eval generation).
     EvalInit {
         /// Where to write the suite (default: evals/cases.json).
@@ -1577,6 +1685,69 @@ enum SkillAction {
         /// Overwrite an existing suite file instead of refusing.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillHookAction {
+    /// Run the named cron hook now against the local runner. No durable record.
+    Fire {
+        /// Trigger name from `.claude-plugin/plugin.json`.
+        name: String,
+        /// Plugin bundle directory.
+        #[arg(long, default_value = ".")]
+        plugin_dir: PathBuf,
+        /// Runner base URL. Default: the URL recorded by `skill up`.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Not available at this tier: there is no scheduler.
+    Schedule,
+    /// Not available at this tier: there is no hook run record.
+    Record,
+}
+
+/// Subcommands of `curie local hook`.
+#[derive(Subcommand)]
+enum LocalHookAction {
+    /// Run one cron hook now, bypassing its schedule, and print the run record.
+    Fire {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// How long to wait for the turn to settle, in seconds.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Subcommands of `curie cluster hook`.
+#[derive(Subcommand)]
+enum ClusterHookAction {
+    /// Run one cron hook now, bypassing its schedule, and print the run record.
+    Fire {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// How long to wait for the turn to settle, in seconds.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1786,6 +1957,11 @@ enum LocalAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -1809,7 +1985,7 @@ enum LocalAction {
         #[arg(long)]
         api_url: Option<String>,
         /// Platform API key for the default-channel lookup.
-        #[arg(long, env = "CURIE_API_KEY", default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Synthetic Slack user id for the enqueued event.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -1843,6 +2019,11 @@ enum LocalAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
         /// CURIE_VALKEY_PASSWORD env var over passing a real secret on the
         /// command line, where it leaks via `ps` and shell history.
@@ -1857,7 +2038,7 @@ enum LocalAction {
         #[arg(long)]
         api_url: Option<String>,
         /// Platform API key for the default-channel lookup.
-        #[arg(long, env = "CURIE_API_KEY", default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Synthetic Slack user id for the enqueued events.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -1913,7 +2094,7 @@ enum LocalAction {
         )]
         api_url: String,
         /// Platform API key.
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
         /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
@@ -1921,6 +2102,12 @@ enum LocalAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -1967,15 +2154,24 @@ enum LocalAction {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
     },
+    /// Manage an agent's hook configuration and signing secret.
+    Hooks {
+        #[command(subcommand)]
+        action: LocalHooksAction,
+    },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -2069,9 +2265,27 @@ enum LocalAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2100,7 +2314,7 @@ enum LocalAction {
         clear_branch_prefix: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2121,13 +2335,46 @@ enum LocalAction {
         /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
         #[arg(long, requires_all = ["add", "adapter"])]
         endpoint: Option<String>,
-        /// Worker credential selector for the reply adapter. Requires --endpoint.
-        #[arg(long, requires_all = ["add", "endpoint"])]
+        /// Identity for a Slack surface (default: default), or the worker
+        /// credential selector for a non-Slack adapter.
+        #[arg(long)]
         adapter: Option<String>,
         /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
         /// agent's final surface.
         #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
         remove: Option<String>,
+    },
+    /// Show, set, or clear who may talk to the bot through one surface
+    /// (`PUT /agents/{id}/channels/callers`, ADR 0175).
+    ///
+    /// With neither `--set` nor `--clear` this shows the list. `--set`
+    /// replaces it with exactly the ids given; `--clear` removes it so
+    /// everyone may talk to the bot again. Anyone not on a list gets no
+    /// reply at all. Editing the list does not revoke the surface's adapter
+    /// token.
+    Callers {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        /// The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        surface: String,
+        /// The Slack identity whose route to select when several share the
+        /// surface (default: the one route on it).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Allow exactly these caller ids, comma separated: Slack user or bot
+        /// ids for a Slack surface, bare email addresses for an email one.
+        /// Replaces the whole list.
+        #[arg(
+            long,
+            value_name = "ID[,ID...]",
+            value_delimiter = ',',
+            conflicts_with = "clear"
+        )]
+        set: Vec<String>,
+        /// Remove the list, so everyone may talk to the bot again.
+        #[arg(long)]
+        clear: bool,
     },
     /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
     Budget {
@@ -2138,7 +2385,7 @@ enum LocalAction {
         limit: f64,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2149,7 +2396,7 @@ enum LocalAction {
         agent: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm the action.
         #[arg(long)]
@@ -2163,7 +2410,7 @@ enum LocalAction {
         agent: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2177,13 +2424,14 @@ enum LocalAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The worker's composed key: kind:channel:thread-ts (e.g.
-        /// slack:C0EXAMPLE1:1700000000.000100).
+        /// The worker's composed key: kind[:identity]:channel:thread-ts, each
+        /// part percent-encoded; identity only when the route names one other
+        /// than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm the action; it interrupts any live turn on the thread.
         #[arg(long)]
@@ -2212,6 +2460,44 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List each cron hook on the in-force deployment (`GET /schedules`).
+    Schedules {
+        /// Scope to one agent (name or id). Omit to list every deployed agent.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        /// Pause one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "resume",
+            requires = "agent"
+        )]
+        pause: Option<String>,
+        /// Resume one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "pause",
+            requires = "agent"
+        )]
+        resume: Option<String>,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    Hook {
+        #[command(subcommand)]
+        action: LocalHookAction,
+    },
     /// Delete an agent via the local platform API.
     Delete {
         /// Agent name or id to delete.
@@ -2222,7 +2508,7 @@ enum LocalAction {
             env = "CURIE_API_URL"
         )]
         api_url: String,
-        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm this destructive action.
         #[arg(long)]
@@ -2235,6 +2521,19 @@ enum LocalAction {
 
 #[derive(Subcommand)]
 enum ClusterAction {
+    /// Report value paths that differ between a release and pending Helm files.
+    /// A nonempty report is advisory and exits successfully.
+    LintValues {
+        /// Pending Helm values files in application order.
+        #[arg(short = 'f', long = "values", required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+    },
     /// Install or upgrade the Curie release via Helm (helm upgrade --install).
     /// By default it puts the UI and Langfuse on node ports for tailnet/LAN
     /// access; pass --no-expose to keep them ClusterIP-only. Set
@@ -2344,6 +2643,16 @@ enum ClusterAction {
         /// rollback window stays intact (#2300).
         #[arg(long = "forward-only")]
         forward_only: bool,
+        /// Install the end to end connector's identity on this release's
+        /// cluster (ADR 0176 decision 4). Pass it only on the owner release of
+        /// a separate TEST cluster. It renders a service account that may
+        /// create and delete only namespaces carrying the connector's prefix
+        /// and ownership label, may act only inside them, and holds no cluster
+        /// scoped write; a ValidatingAdmissionPolicy enforces the prefix and
+        /// label at the API server (Kubernetes 1.30 or newer). A later
+        /// `cluster up` without this flag removes the identity.
+        #[arg(long = "e2e-connector-identity")]
+        e2e_connector_identity: bool,
     },
     /// Uninstall the release and sweep its runtime namespaces, running helm
     /// uninstall followed by kubectl delete namespace. The namespace delete
@@ -2615,6 +2924,11 @@ enum ClusterAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -2659,7 +2973,7 @@ enum ClusterAction {
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
-        #[arg(long, env = "CURIE_API_KEY", value_parser = message::cluster_api_key)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::cluster_api_key)]
         api_key: Option<String>,
         /// Synthetic Slack user id for the enqueued event.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -2698,18 +3012,23 @@ enum ClusterAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name. Default: curie.
         #[arg(long, default_value = "curie")]
         release: String,
-        /// Host the in-cluster worker uses to reach the stub. Omit to auto-detect
-        /// the local IP the kernel would use to reach the cluster.
+        /// Accepted so older command lines still parse. Text-graded cluster eval
+        /// does not use it: replies go through the cluster message relay.
         #[arg(long)]
         listen_host: Option<String>,
-        /// Port the stub binds (0.0.0.0); the worker posts here.
-        /// Default 0 lets the kernel assign an ephemeral port.
+        /// Accepted so older command lines still parse. Text-graded cluster eval
+        /// does not use it: replies go through the cluster message relay.
         #[arg(long, default_value_t = 0)]
         listen_port: u16,
         /// Local port the Valkey port-forward binds.
@@ -2727,13 +3046,14 @@ enum ClusterAction {
             value_parser = message::cluster_valkey_password
         )]
         valkey_password: Option<String>,
-        /// Local port the API port-forward binds (default-channel lookup).
-        /// Default 0 is kernel-assigned, matching `cluster message`.
+        /// Local port the API port-forward binds. The relay poll and a missing
+        /// channel lookup both use it. Default 0 is kernel-assigned, matching
+        /// `cluster message`.
         #[arg(long, default_value_t = 0)]
         api_local_port: u16,
-        /// Platform API key for the default-channel lookup. Omit to read the
-        /// release's own key from its chart Secret.
-        #[arg(long, env = "CURIE_API_KEY", value_parser = message::cluster_api_key)]
+        /// Platform API key. It authenticates the relay poll and a missing-channel
+        /// lookup. Omit to read the release's own key from its chart Secret.
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::cluster_api_key)]
         api_key: Option<String>,
         /// Synthetic Slack user id for the enqueued events.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -2756,8 +3076,8 @@ enum ClusterAction {
         concurrency: usize,
         #[command(flatten)]
         sampling: EvalSamplingArgs,
-        /// Print the kubectl commands, stub URL, and enqueue description that a
-        /// real run would produce, and exit without executing anything.
+        /// Print the kubectl port-forwards and relay poll a real run would use,
+        /// and exit without executing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2778,7 +3098,7 @@ enum ClusterAction {
         /// and forgetting one leaves an agent that exists and never updates.
         /// Ordered dev-first so a run that fails part-way leaves prod on its
         /// previous version rather than ahead of a dev that never landed.
-        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel"])]
+        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel", "identity"])]
         all_targets: bool,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
@@ -2818,6 +3138,12 @@ enum ClusterAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -2907,6 +3233,24 @@ enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -2957,13 +3301,51 @@ enum ClusterAction {
         /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
         #[arg(long, requires_all = ["add", "adapter"])]
         endpoint: Option<String>,
-        /// Worker credential selector for the reply adapter. Requires --endpoint.
-        #[arg(long, requires_all = ["add", "endpoint"])]
+        /// Identity for a Slack surface (default: default), or the worker
+        /// credential selector for a non-Slack adapter.
+        #[arg(long)]
         adapter: Option<String>,
         /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
         /// agent's final surface.
         #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
         remove: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show, set, or clear who may talk to the bot through one surface
+    /// (`PUT /agents/{id}/channels/callers`, ADR 0175).
+    ///
+    /// With neither `--set` nor `--clear` this shows the list. `--set`
+    /// replaces it with exactly the ids given; `--clear` removes it so
+    /// everyone may talk to the bot again. Anyone not on a list gets no
+    /// reply at all. Editing the list does not revoke the surface's adapter
+    /// token.
+    Callers {
+        /// Agent name or id.
+        agent: String,
+        /// The surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        surface: String,
+        /// The Slack identity whose route to select when several share the
+        /// surface (default: the one route on it).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Allow exactly these caller ids, comma separated: Slack user or bot
+        /// ids for a Slack surface, bare email addresses for an email one.
+        /// Replaces the whole list.
+        #[arg(
+            long,
+            value_name = "ID[,ID...]",
+            value_delimiter = ',',
+            conflicts_with = "clear"
+        )]
+        set: Vec<String>,
+        /// Remove the list, so everyone may talk to the bot again.
+        #[arg(long)]
+        clear: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3020,8 +3402,9 @@ enum ClusterAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The worker's composed key: kind:channel:thread-ts (e.g.
-        /// slack:C0EXAMPLE1:1700000000.000100).
+        /// The worker's composed key: kind[:identity]:channel:thread-ts, each
+        /// part percent-encoded; identity only when the route names one other
+        /// than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[command(flatten)]
@@ -3061,20 +3444,63 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List each cron hook on the in-force deployment (`GET /schedules`).
+    Schedules {
+        /// Scope to one agent (name or id). Omit to list every deployed agent.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        /// Pause one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "resume",
+            requires = "agent"
+        )]
+        pause: Option<String>,
+        /// Resume one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "pause",
+            requires = "agent"
+        )]
+        resume: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    Hook {
+        #[command(subcommand)]
+        action: ClusterHookAction,
+        #[command(flatten)]
+        conn: ClusterHookConn,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
         target: ClusterAgentTarget,
     },
+    /// Manage an agent's hook configuration and signing secret.
+    Hooks {
+        #[command(subcommand)]
+        action: ClusterHooksAction,
+    },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: ClusterAgentTarget,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -3149,8 +3575,29 @@ impl ClusterTargetSources {
         let Some(("cluster", cluster_matches)) = matches.subcommand() else {
             return Self::default();
         };
-        let Some((_, action_matches)) = cluster_matches.subcommand() else {
+        let Some((action_name, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
+        };
+        let action_matches = if action_name == "hooks" {
+            let Some((_, hook_matches)) = action_matches.subcommand() else {
+                return Self::default();
+            };
+            hook_matches
+        } else {
+            // `cluster hook fire` carries namespace on the leaf, not on `hook`.
+            match action_matches.subcommand() {
+                Some(("fire", fire_matches))
+                    if action_matches
+                        .try_get_one::<String>("namespace")
+                        .ok()
+                        .flatten()
+                        .is_none()
+                        && fire_matches.try_get_one::<String>("namespace").is_ok() =>
+                {
+                    fire_matches
+                }
+                _ => action_matches,
+            }
         };
         Self {
             namespace_supplied: matches!(
@@ -3169,9 +3616,16 @@ impl ClusterTargetSources {
     }
 }
 
+/// The chart value `cluster up --e2e-connector-identity` sets (ADR 0176
+/// decision 4, #3243). The chart template owns the grant itself.
+const E2E_CONNECTOR_IDENTITY_SET: &str = "e2eConnectorIdentity.enabled=true";
+
 fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>) {
     match action {
-        ClusterAction::Up {
+        ClusterAction::LintValues {
+            namespace, release, ..
+        }
+        | ClusterAction::Up {
             namespace, release, ..
         }
         | ClusterAction::Down {
@@ -3212,11 +3666,16 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::Callers { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
         | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Schedules { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
+        ClusterAction::Hook { conn, .. } => {
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
         ClusterAction::Versions { target }
@@ -3225,6 +3684,17 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
             Some(target.conn.namespace.as_str()),
             Some(target.conn.release.as_str()),
         ),
+        ClusterAction::Hooks { action } => {
+            let target = match action {
+                ClusterHooksAction::Show { target }
+                | ClusterHooksAction::Configure { target, .. }
+                | ClusterHooksAction::Secret { target } => target,
+            };
+            (
+                Some(target.conn.namespace.as_str()),
+                Some(target.conn.release.as_str()),
+            )
+        }
     }
 }
 
@@ -3239,7 +3709,12 @@ fn retarget_cluster_action(
         }
     };
     match action {
-        ClusterAction::Up {
+        ClusterAction::LintValues {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Up {
             namespace: current_namespace,
             release: current_release,
             ..
@@ -3310,17 +3785,32 @@ fn retarget_cluster_action(
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::Callers { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
         | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Schedules { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
+        ClusterAction::Hook { conn, .. } => {
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
         }
         ClusterAction::Versions { target }
         | ClusterAction::Memory { target, .. }
         | ClusterAction::Approvals { target, .. } => {
+            replace(&mut target.conn.namespace, &namespace);
+            replace(&mut target.conn.release, &release);
+        }
+        ClusterAction::Hooks { action } => {
+            let target = match action {
+                ClusterHooksAction::Show { target }
+                | ClusterHooksAction::Configure { target, .. }
+                | ClusterHooksAction::Secret { target } => target,
+            };
             replace(&mut target.conn.namespace, &namespace);
             replace(&mut target.conn.release, &release);
         }
@@ -3525,29 +4015,38 @@ async fn bind_cluster_connector_secrets(
     chart: Option<&str>,
     agent_name: &str,
     secrets: std::collections::BTreeMap<String, String>,
+    runner_image: Option<String>,
 ) -> Result<()> {
-    if secrets.is_empty() {
-        return Ok(());
-    }
-    let resolved = artifacts::resolve_chart(
-        chart,
-        artifacts::Channel::current(),
-        artifacts::version(),
-        artifacts::cache_root,
-        std::path::Path::new("charts/curie").is_dir(),
-    )?;
-    let chart = materialize_artifact(resolved, false, "chart").await?;
-    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
-        common: CommonOpts {
+    // No early return on empty secrets: a redeploy that drops every connector
+    // secret must clear the agent's stale binding (#3021), and a runner image
+    // to set or an earlier one to clear (#3260) is decided by bind_if_changed.
+    //
+    // #3082: a bundle deploy whose connector secrets already match the
+    // release must not helm-upgrade the platform, so the chart is resolved
+    // only when the bind actually changes something.
+    let chart = async {
+        let resolved = artifacts::resolve_chart(
+            chart,
+            artifacts::Channel::current(),
+            artifacts::version(),
+            artifacts::cache_root,
+            std::path::Path::new("charts/curie").is_dir(),
+        )?;
+        materialize_artifact(resolved, false, "chart").await
+    };
+    curie::cluster_secrets::bind_if_changed(
+        CommonOpts {
             namespace: namespace.to_string(),
             release: release.to_string(),
             dry_run: false,
         },
-        chart,
-        agent: agent_name.to_string(),
+        agent_name.to_string(),
         secrets,
-    })
-    .await
+        runner_image,
+        chart,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Bind the sandbox connector secrets for one deployed agent and then apply its
@@ -3556,7 +4055,9 @@ async fn bind_cluster_connector_secrets(
 /// connector plan already resolved for this cluster scope, bound into the
 /// per-agent Helm Secret, and only then are the connector objects applied --
 /// the one order both the single-target and `--all-targets` cluster deploy
-/// paths use.
+/// paths use. The same bind sets or clears the agent's locked runner image
+/// (#3260).
+#[allow(clippy::too_many_arguments)]
 async fn bind_and_apply_cluster_connectors(
     namespace: &str,
     release: &str,
@@ -3564,6 +4065,7 @@ async fn bind_and_apply_cluster_connectors(
     agent_name: &str,
     explicit_secrets: &[String],
     connector_env_secret_names: &[String],
+    runner_image: Option<String>,
     prepared: curie::connectors::PreparedConnectorSync,
 ) -> Result<()> {
     let bind_values = cluster_connector_bind_values(
@@ -3571,7 +4073,15 @@ async fn bind_and_apply_cluster_connectors(
         connector_env_secret_names,
         prepared.owned_secret_values(),
     )?;
-    bind_cluster_connector_secrets(namespace, release, chart, agent_name, bind_values).await?;
+    bind_cluster_connector_secrets(
+        namespace,
+        release,
+        chart,
+        agent_name,
+        bind_values,
+        runner_image,
+    )
+    .await?;
     apply_connectors(prepared).await
 }
 
@@ -3682,6 +4192,59 @@ async fn main() {
     }
 }
 
+/// Run a `<tier> memory --guidance*` action and emit its result: a dry-run
+/// plan through the memory verb's own `MemoryOutput::DryRun`, otherwise the
+/// effective guidance.
+async fn emit_memory_guidance(
+    opts: AgentActionOpts,
+    action: commands::MemoryGuidanceAction,
+) -> Result<()> {
+    match commands::memory_guidance(opts, action).await? {
+        commands::MemoryGuidanceResult::DryRun(plan) => emit(commands::MemoryOutput::DryRun(plan)),
+        commands::MemoryGuidanceResult::Shown(out) => emit(out),
+    }
+}
+
+/// The memory-guidance flags shared by `local memory` and `cluster memory`
+/// (#1461). `--guidance-from` and `--reset-guidance` are two different writes,
+/// and none of them combines with `--add`, which writes the memory log.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct MemoryGuidanceArgs {
+    /// Show the guidance the agent gets beside its memory tools, and whether it
+    /// is the platform default or operator-set
+    /// (`GET /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    guidance: bool,
+    /// Replace the agent's memory guidance with this file's text
+    /// (`PUT /agents/{id}/memory/guidance`). An empty file is refused.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["reset_guidance", "add"]
+    )]
+    guidance_from: Option<std::path::PathBuf>,
+    /// Remove operator guidance so the platform default applies again
+    /// (`DELETE /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    reset_guidance: bool,
+}
+
+impl MemoryGuidanceArgs {
+    /// The one guidance action asked for, or `None` for the plain memory verb.
+    /// A write wins over `--guidance`, whose output it already is.
+    fn action(&self) -> Option<commands::MemoryGuidanceAction> {
+        if let Some(path) = &self.guidance_from {
+            Some(commands::MemoryGuidanceAction::SetFrom(path.clone()))
+        } else if self.reset_guidance {
+            Some(commands::MemoryGuidanceAction::Reset)
+        } else if self.guidance {
+            Some(commands::MemoryGuidanceAction::Show)
+        } else {
+            None
+        }
+    }
+}
+
 /// Route a handler's structured output through the one success-path emit
 /// (`Ui::emit`), mirroring the centralized error emit in `main`. The read verbs
 /// return a `CliOutput` instead of touching stdout themselves, so the
@@ -3717,47 +4280,67 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
-            action:
-                ExampleAction::SreBot {
-                    action:
-                        SreBotAction::Install {
-                            observability,
-                            dry_run,
-                            slack_channel,
-                            platform_upgrade,
-                            namespace,
-                            release,
-                            observability_namespace,
-                            workspace_repo,
-                            approvers,
-                        },
+            action: ExampleAction::SreBot { action },
+        }) => match action {
+            SreBotAction::Install {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            })
+            .await?
+            {
+                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            },
+            SreBotAction::ProvisionObservability {
+                namespace,
+                release,
+                observability_namespace,
+                chart,
+                dry_run,
+            } => match curie::examples::provision_observability(
+                curie::examples::ObservabilityProvisionOpts {
+                    namespace,
+                    release,
+                    observability_namespace,
+                    chart,
+                    dry_run,
                 },
-        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-            observability,
-            dry_run,
-            slack_channel,
-            platform_upgrade,
-            namespace,
-            release,
-            observability_namespace,
-            workspace_repo,
-            approvers,
-        })
-        .await?
-        {
-            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            )
+            .await?
+            {
+                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
+            },
         },
         Some(Command::Build {
             tag,
             plugin_dir,
             registry,
+            runner_image,
             force,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
                     plugin_dir,
                     registry,
+                    runner_image,
                     force,
                 })
                 .await?,
@@ -3797,6 +4380,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             }),
         },
         Some(Command::Dev { action }) => match action {
+            DevAction::Hooks { action } => match action {
+                HooksAction::Install => commands::dev_hooks_install(),
+            },
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
             DevAction::ChartCheck => commands::dev_chart_check().await,
             DevAction::VerifyFixPin { change, selector } => {
@@ -3808,7 +4394,6 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
-            DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
             }
@@ -4081,6 +4666,25 @@ async fn run(command: Option<Command>) -> Result<()> {
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
             SkillAction::WorkItems { .. } => Err(commands::skill_work_items_unavailable()),
+            SkillAction::Schedules { .. } => Err(commands::skill_schedules_unavailable()),
+            SkillAction::Hook { action } => match action {
+                SkillHookAction::Schedule => {
+                    Err(commands::skill_hook_record_unavailable("schedule"))
+                }
+                SkillHookAction::Record => Err(commands::skill_hook_record_unavailable("record")),
+                SkillHookAction::Fire {
+                    name,
+                    plugin_dir,
+                    url,
+                } => {
+                    let classified_failure =
+                        commands::skill_hook_fire(&plugin_dir, &name, url).await?;
+                    if classified_failure {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+            },
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
@@ -4252,6 +4856,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 valkey_password,
@@ -4284,6 +4889,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         timeout_secs,
                         api_url,
                         api_key,
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -4295,6 +4901,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: "curie".into(),
                     release: "curie".into(),
@@ -4318,6 +4925,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 valkey_password,
                 api_url,
                 api_key,
@@ -4333,6 +4941,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace: "curie".into(),
                     release: "curie".into(),
                     listen_host: None,
@@ -4357,6 +4966,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 api_url,
                 api_key,
                 slack_channel,
@@ -4376,6 +4986,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     plugin_dir,
                     agent,
                     target,
+                    identity,
                     api_url,
                     api_key,
                     slack_channel,
@@ -4394,6 +5005,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
+            LocalAction::Hooks { action } => match action {
+                LocalHooksAction::Show { target } => {
+                    emit(commands::hooks_show(target.into()).await?)
+                }
+                LocalHooksAction::Configure { target, file } => {
+                    emit(commands::hooks_configure(target.into(), &file).await?)
+                }
+                LocalHooksAction::Secret { target } => {
+                    emit(commands::hooks_secret(target.into()).await?)
+                }
+            },
             LocalAction::WorkItems {
                 id,
                 agent,
@@ -4412,9 +5034,55 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?
             }),
-            LocalAction::Memory { target, add } => match add {
-                None => emit(commands::memory(target.into()).await?),
-                Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
+            LocalAction::Schedules {
+                agent,
+                pause,
+                resume,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::schedules(commands::SchedulesOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    pause,
+                    resume,
+                    dry_run,
+                })
+                .await?,
+            ),
+            LocalAction::Hook { action } => {
+                let LocalHookAction::Fire {
+                    agent,
+                    name,
+                    wait_secs,
+                    api_url,
+                    api_key,
+                    dry_run,
+                } = action;
+                emit(
+                    commands::hook_fire(commands::HookFireOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        dry_run,
+                        wait_secs,
+                    })
+                    .await?,
+                )
+            }
+            LocalAction::Memory {
+                target,
+                add,
+                guidance,
+            } => match (guidance.action(), add) {
+                (Some(action), _) => emit_memory_guidance(target.into(), action).await,
+                (None, None) => emit(commands::memory(target.into()).await?),
+                (None, Some(content)) => {
+                    emit(commands::memory_add(target.into(), content, "local").await?)
+                }
             },
             LocalAction::Approvals {
                 target,
@@ -4476,11 +5144,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
+                memory_writes,
                 api_url,
                 api_key,
                 dry_run,
             } => emit(
-                commands::overrides(
+                commands::overrides_with_memory_writes(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -4489,6 +5162,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                    commands::OverrideChange::resolve_execution_deadline(
+                        execution_deadline,
+                        clear_execution_deadline,
+                    )?,
+                    commands::OverrideChange::resolve_runner_resources(
+                        runner_resources,
+                        clear_runner_resources,
+                    )?,
+                    commands::memory_writes_flag(memory_writes.as_deref()),
                 )
                 .await?,
             ),
@@ -4528,6 +5210,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 commands::channel_bindings(
                     target.into(),
                     commands::ChannelChange::resolve(add, remove, endpoint, adapter)?,
+                )
+                .await?,
+            ),
+            LocalAction::Callers {
+                target,
+                surface,
+                adapter,
+                set,
+                clear,
+            } => emit(
+                commands::channel_callers(
+                    target.into(),
+                    &surface,
+                    adapter,
+                    commands::CallersChange::resolve(set, clear)?,
                 )
                 .await?,
             ),
@@ -4621,14 +5318,29 @@ async fn run(command: Option<Command>) -> Result<()> {
             ),
         },
         Some(Command::Cluster { action, context }) => {
-            if let Some(target) = curie::kube_context::pin_for_cluster_command(context.as_deref())?
-            {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",
                     target.context, target.cluster
                 ));
             }
             match action {
+            ClusterAction::LintValues {
+                files,
+                namespace,
+                release,
+            } => emit(
+                ops::lint_values(
+                    CommonOpts {
+                        namespace,
+                        release,
+                        dry_run: false,
+                    },
+                    files,
+                )
+                .await?,
+            ),
             ClusterAction::Up {
                 namespace,
                 release,
@@ -4646,10 +5358,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 dev,
                 dry_run,
                 forward_only,
+                e2e_connector_identity,
             } => {
                 let mut set = set;
                 if forward_only {
                     set.push("api.migrate.forwardOnly=true".to_string());
+                }
+                if e2e_connector_identity {
+                    set.push(E2E_CONNECTOR_IDENTITY_SET.to_string());
                 }
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
@@ -4784,11 +5500,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 dry_run,
             } => emit(
-                ops::status(CommonOpts {
-                    namespace,
-                    release,
-                    dry_run,
-                })
+                ops::status(
+                    CommonOpts {
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+                    target.is_some(),
+                )
                 .await?,
             ),
             ClusterAction::Observability {
@@ -4931,6 +5650,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 namespace,
@@ -4975,6 +5695,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key: api_key
                             .clone()
                             .unwrap_or_else(|| message::DEFAULT_API_KEY.to_string()),
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -5012,6 +5733,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: resolved.namespace,
                     release: resolved.release,
@@ -5035,6 +5757,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 namespace,
                 release,
                 listen_host,
@@ -5075,6 +5798,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace,
                     release,
                     listen_host,
@@ -5099,6 +5823,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 all_targets,
                 api_url,
                 namespace,
@@ -5257,6 +5982,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
                     &curie::connector_build::load(&plugin_dir)?,
                 );
+                // The runner layer digest the lock records (#3260); None
+                // clears an earlier value on the release.
+                let runner_image = curie::connector_build::locked_runner_image(&plugin_dir)?;
+                // A layer built on another platform runner is one the worker
+                // may not serve (#3218, ADR 0173 decision 5): refuse it before
+                // anything is posted, naming the `curie build` that fixes it.
+                if runner_image.is_some() {
+                    curie::cluster_secrets::check_layered_runner_base(
+                        &ops::CommonOpts {
+                            namespace: namespace.clone(),
+                            release: release.clone(),
+                            dry_run: false,
+                        },
+                        &plugin_dir,
+                    )
+                    .await?;
+                }
 
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
@@ -5366,6 +6108,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             plugin_dir: plugin_dir.clone(),
                             agent: agent.clone(),
                             target: Some(target.clone()),
+                            identity: None,
                             api_url: api_url.clone(),
                             api_key: api_key.clone(),
                             slack_channel: slack_channel.clone(),
@@ -5424,13 +6167,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                         prepared_targets.push((target, prepared_deploy, prepared_connectors));
                     }
 
-                    // Every target uploads the same packed bundle. The first
-                    // prepared result carries its validated cron advisory, so
-                    // the invocation reports it once before activation begins.
-                    if let Some((_, prepared_deploy, _)) = prepared_targets.first() {
-                        prepared_deploy.emit_cron_trigger_warning();
-                    }
-
                     // Activate and reconcile in the API's declared target order.
                     let mut completed = Vec::new();
                     for (target, prepared_deploy, prepared_connectors) in prepared_targets {
@@ -5457,6 +6193,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             &deployed.agent_name,
                             &secret,
                             &connector_env_secret_names,
+                            runner_image.clone(),
                             prepared_connectors,
                         )
                         .await
@@ -5486,6 +6223,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
+                        identity: identity.clone(),
                         api_url: api_url.clone(),
                         api_key: api_key.clone(),
                         slack_channel: slack_channel.clone(),
@@ -5528,6 +6266,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_name,
                         &secret,
                         &connector_env_secret_names,
+                        runner_image,
                         prepared_connectors,
                     )
                     .await?;
@@ -5578,6 +6317,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
+                memory_writes,
                 conn,
                 dry_run,
             } => {
@@ -5588,10 +6332,18 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
+                let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
+                    execution_deadline,
+                    clear_execution_deadline,
+                )?;
+                let runner_resources = commands::OverrideChange::resolve_runner_resources(
+                    runner_resources,
+                    clear_runner_resources,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
-                    commands::overrides(
+                    commands::overrides_with_memory_writes(
                         AgentActionOpts {
                             api_url,
                             api_key,
@@ -5600,6 +6352,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                        execution_deadline,
+                        runner_resources,
+                        commands::memory_writes_flag(memory_writes.as_deref()),
                     )
                     .await?,
                 )
@@ -5655,6 +6410,35 @@ async fn run(command: Option<Command>) -> Result<()> {
                             agent,
                             dry_run,
                         },
+                        change,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::Callers {
+                agent,
+                surface,
+                adapter,
+                set,
+                clear,
+                conn,
+                dry_run,
+            } => {
+                // Resolved before the connection for the same reason as
+                // `Surfaces`: a malformed id must be a usage error, not a
+                // cluster lookup that then fails for an unrelated reason.
+                let change = commands::CallersChange::resolve(set, clear)?;
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::channel_callers(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        &surface,
+                        adapter,
                         change,
                     )
                     .await?,
@@ -5759,6 +6543,56 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
+            ClusterAction::Schedules {
+                agent,
+                pause,
+                resume,
+                conn,
+                dry_run,
+            } => {
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::schedules(commands::SchedulesOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        pause,
+                        resume,
+                        dry_run,
+                    })
+                    .await?,
+                )
+            }
+            ClusterAction::Hook { action, conn } => {
+                let ClusterHookAction::Fire {
+                    agent,
+                    name,
+                    wait_secs,
+                    dry_run,
+                } = action;
+                let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
+                    ClusterConn {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        namespace: conn.namespace,
+                        release: conn.release,
+                    },
+                    dry_run,
+                )
+                .await?;
+                emit(
+                    commands::hook_fire(commands::HookFireOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        dry_run,
+                        wait_secs,
+                    })
+                    .await?,
+                )
+            }
             ClusterAction::Delete {
                 agent,
                 conn,
@@ -5798,7 +6632,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            ClusterAction::Memory { target, add } => {
+            ClusterAction::Hooks { action } => {
+                let (target, file, verb) = match action {
+                    ClusterHooksAction::Show { target } => (target, None, "show"),
+                    ClusterHooksAction::Configure { target, file } => {
+                        (target, Some(file), "configure")
+                    }
+                    ClusterHooksAction::Secret { target } => (target, None, "secret"),
+                };
                 let ClusterAgentTarget {
                     agent,
                     conn,
@@ -5812,9 +6653,40 @@ async fn run(command: Option<Command>) -> Result<()> {
                     agent,
                     dry_run,
                 };
-                match add {
-                    None => emit(commands::memory(opts).await?),
-                    Some(content) => emit(commands::memory_add(opts, content, "cluster").await?),
+                match verb {
+                    "show" => emit(commands::hooks_show(opts).await?),
+                    "configure" => emit(commands::hooks_configure(
+                        opts,
+                        &file.expect("configure supplies a file"),
+                    ).await?),
+                    "secret" => emit(commands::hooks_secret(opts).await?),
+                    _ => unreachable!(),
+                }
+            }
+            ClusterAction::Memory {
+                target,
+                add,
+                guidance,
+            } => {
+                let ClusterAgentTarget {
+                    agent,
+                    conn,
+                    dry_run,
+                } = target;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                let opts = AgentActionOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    dry_run,
+                };
+                match (guidance.action(), add) {
+                    (Some(action), _) => emit_memory_guidance(opts, action).await,
+                    (None, None) => emit(commands::memory(opts).await?),
+                    (None, Some(content)) => {
+                        emit(commands::memory_add(opts, content, "cluster").await?)
+                    }
                 }
             }
             ClusterAction::Approvals {
@@ -6025,14 +6897,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     ));
                 }
             }
-            if let Some(target) =
-                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+            let selected_context = curie::kube_context::pin_for_cluster_command(
+                curie::installation::resolve_context(
                     context.as_deref(),
                     declared
                         .as_ref()
                         .and_then(|cfg| cfg.install.context.as_deref()),
-                ))?
-            {
+                ),
+            )?;
+            if let Some(target) = &selected_context {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",
                     target.context, target.cluster
@@ -6055,11 +6928,24 @@ async fn run(command: Option<Command>) -> Result<()> {
             // Discover independently. `zip` required both flags, so a bare
             // `curie doctor` never reached the platform API (#1367). Errors
             // are discarded inside `doctor`: gather is failure-tolerant.
+            let matching_file = declared.as_ref().filter(|config| {
+                config.install.namespace == target.namespace
+                    && config.install.release == target.release
+            });
+            let apply_context = matching_file.and_then(|config| {
+                selected_context.as_ref().and_then(|selected| {
+                    (curie::installation::resolve_context(None, config.install.context.as_deref())
+                        != Some(selected.context.as_str()))
+                    .then_some(selected.context.as_str())
+                })
+            });
             let out = curie::doctor::doctor(
                 &target.namespace,
                 &target.release,
                 api_url.as_deref(),
                 api_key.as_deref(),
+                matching_file.is_some(),
+                apply_context,
             )
             .await;
             if out.release_not_serving() {
@@ -6159,6 +7045,23 @@ mod tests {
     #[test]
     fn clap_surface_is_valid() {
         on_parse_stack(|| Cli::command().debug_assert());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn the_drivers_take_an_agent_selector() {
+        for argv in [
+            ["curie", "local", "message", "--agent", "ops", "hi"],
+            ["curie", "cluster", "message", "--agent", "ops", "hi"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        for argv in [
+            ["curie", "local", "eval", "--agent", "ops"],
+            ["curie", "cluster", "eval", "--agent", "ops"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
     }
 
     /// clap's derived parser is deep enough that debug bin tests overflow the
@@ -6911,14 +7814,6 @@ mod tests {
                 action: DevAction::E2eLadder
             })
         ));
-        let cli = try_parse_from(["curie", "dev", "sre-demo-e2e"])
-            .expect("dev sre-demo-e2e should parse");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Dev {
-                action: DevAction::SreDemoE2e
-            })
-        ));
         let cli = try_parse_from(["curie", "dev", "two-release-approval-e2e"])
             .expect("dev two-release-approval-e2e should parse");
         assert!(matches!(
@@ -7481,6 +8376,37 @@ mod tests {
         }
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn deploy_takes_an_identity_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            let cli = try_parse_from(["curie", tier, "deploy", "--identity", "ops-bot"]).unwrap();
+            let identity = match cli.command {
+                Some(Command::Local {
+                    action: LocalAction::Deploy { identity, .. },
+                }) => identity,
+                Some(Command::Cluster {
+                    action: ClusterAction::Deploy { identity, .. },
+                    ..
+                }) => identity,
+                _ => panic!("expected {tier} deploy"),
+            };
+            assert_eq!(identity.as_deref(), Some("ops-bot"));
+        }
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "deploy",
+                "--all-targets",
+                "--identity",
+                "x"
+            ])
+            .is_err(),
+            "every target states its own identity"
+        );
+    }
+
     #[test]
     fn local_short_file_flag_parses_for_all_verbs() {
         let cases = [
@@ -7806,7 +8732,7 @@ mod tests {
         .expect("local memory --add should parse");
         match cli.command {
             Some(Command::Local {
-                action: LocalAction::Memory { target, add },
+                action: LocalAction::Memory { target, add, .. },
             }) => {
                 assert_eq!(target.agent, "translation-bot");
                 assert_eq!(add.as_deref(), Some("ask before translating to French"));
@@ -7828,7 +8754,7 @@ mod tests {
         .expect("cluster memory --add should parse");
         match cli.command {
             Some(Command::Cluster {
-                action: ClusterAction::Memory { target, add },
+                action: ClusterAction::Memory { target, add, .. },
                 ..
             }) => {
                 assert_eq!(target.agent, "translation-bot");

@@ -1,0 +1,5 @@
+{
+  "comment": "Single source of truth for the refusal marker the channel port returns when a binding's caller list does not admit a turn's author (ADR 0175, #3241). POST /channels/turns answers 403 with a JSON body whose detail is exactly this code (apps/api/src/curie_api/routers/channels.py). An adapter settles a delivery for good only on a 403 carrying this code; any other 403, such as one from a proxy or firewall in front of the API, stays retryable (apps/mail-adapter/src/curie_mail_adapter/adapter.py). The two sides cannot share code, so the literal is frozen here: changing one side without this file fails that side's test. Read by apps/api/tests/test_binding_caller_allowlist.py and apps/mail-adapter/tests/test_ingress.py. Both readers reject unknown top-level keys.",
+  "status": 403,
+  "detail": "caller_not_allowed"
+}

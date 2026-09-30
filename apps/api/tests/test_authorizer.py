@@ -37,6 +37,9 @@ def _approval(*, author: str = "U_AE", channel: str = "C_MGRS") -> Approval:
         conversation_id="th-1",
         author=author,
         summary="Discount for ACME",
+        # NOT NULL in the table; every real row names its asking kind, and a
+        # non-Slack one selects the requester-only set instead (ADR-0177).
+        reply_kind="slack",
         reply_channel=channel,
         reply_placeholder="p-1",
         dedupe_key="ev-1",

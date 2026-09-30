@@ -24,8 +24,10 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "fix-pin-ci" / "check.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+FIX_PIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fix-pin.yaml"
 REQUIRED_WORKFLOWS = (
     CI_WORKFLOW,
+    FIX_PIN_WORKFLOW,
     REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
     REPO_ROOT / ".github" / "workflows" / "dependency-audit.yaml",
     REPO_ROOT / ".github" / "workflows" / "gitleaks.yaml",
@@ -41,7 +43,6 @@ LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
 CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
-PR_CONDITION = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
 REPOSITORY = "curie-eng/curie"
 STACK_BRANCH = "task/local-deployment-fix-pin"
 BASE_SHA = "a" * 40
@@ -554,6 +555,37 @@ def test_shell_metacharacters_fail_before_the_verifier_runs(tmp_path: Path) -> N
     assert not marker.exists(), "the declaration must never be interpolated into a shell command"
 
 
+def test_failed_verification_says_rerunning_unchanged_will_not_help(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Fix pin: {VALID_SELECTOR}",
+        verifier_exit=97,
+        verifier_stdout="UNPINNED\n",
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 97
+    assert call_log.exists(), "a valid declaration must reach curie"
+    assert "This failure is deterministic." in output
+    assert "Edit the PR body's `Fix pin:` declaration or add a changed test." in output
+    assert "Rerunning unchanged will not help." in output
+
+
+def test_verifier_error_does_not_claim_a_deterministic_pin_failure(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Fix pin: {VALID_SELECTOR}",
+        verifier_exit=97,
+        verifier_stdout="not inside a git repository\n",
+    )
+
+    assert completed.returncode == 97
+    assert call_log.exists()
+    assert "This failure is deterministic." not in completed.stderr
+
+
 @pytest.mark.parametrize("verifier_stdout", ["", "NOT PINNED\n", "PINNED extra\n"])
 def test_verifier_exit_zero_requires_an_exact_pinned_marker(
     tmp_path: Path, verifier_stdout: str
@@ -709,18 +741,20 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
         assert pull_request.get("branches") == ["main", "next", "task/**"], path.name
 
         push = trigger.get("push")
-        if path.name == "pr-body.yaml":
-            assert push is None, "the PR body guard must remain pull request only"
+        if path.name in {"pr-body.yaml", "fix-pin.yaml"}:
+            assert push is None, f"{path.name} must remain pull request only"
         else:
             assert isinstance(push, dict), f"{path.name} must retain its push trigger"
             assert push.get("branches") == ["main", "next"], path.name
 
 
-def _python_job(document: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _python_job(
+    document: dict[str, Any], job_id: str = "python"
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     jobs = document.get("jobs")
     assert isinstance(jobs, dict), "ci.yaml must declare jobs"
-    job = jobs.get("python")
-    assert isinstance(job, dict), "ci.yaml must retain the python job"
+    job = jobs.get(job_id)
+    assert isinstance(job, dict), f"ci.yaml must retain the {job_id} job"
     steps = job.get("steps")
     assert isinstance(steps, list), "the required Python job must retain steps"
     return job, [step for step in steps if isinstance(step, dict)]
@@ -739,16 +773,12 @@ def _string(step: dict[str, Any], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _pull_request_only(step: dict[str, Any]) -> bool:
-    return bool(PR_CONDITION.search(_string(step, "if")))
-
-
 def _fix_pin_job() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    document = _load_ci()
+    document = _load_workflow(FIX_PIN_WORKFLOW)
     jobs = document.get("jobs")
-    assert isinstance(jobs, dict), "ci.yaml must declare jobs"
+    assert isinstance(jobs, dict), "fix-pin.yaml must declare jobs"
     job = jobs.get("fix-pin")
-    assert isinstance(job, dict), "ci.yaml must retain the fix-pin job"
+    assert isinstance(job, dict), "fix-pin.yaml must retain the fix-pin job"
     steps = job.get("steps")
     assert isinstance(steps, list), "the fix pin job must retain steps"
     return job, [step for step in steps if isinstance(step, dict)]
@@ -776,9 +806,14 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         "reopened",
     }, "CI must rerun required checks on new commits, not on title or body edits"
 
-    job, steps = _python_job(document)
+    job, required_steps = _python_job(document)
     assert job.get("name") == "Python (ruff + mypy + pytest)"
-    assert "needs" not in job, "the required Python check must not be skippable"
+    # The suite runs in the python-pytest shards; the required job only waits
+    # for them to aggregate their results, and always() keeps it from skipping.
+    assert job.get("needs") == "python-pytest"
+    assert job.get("if") == "always()", "the required Python check must not be skippable"
+    shard_job, steps = _python_job(document, "python-pytest")
+    assert "needs" not in shard_job and "if" not in shard_job
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
@@ -824,17 +859,34 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # xdist distribution flags change where tests run, not which tests run, so
     # they are allowed alongside reporting flags. Anything else could filter.
     extra = pytest_command[4:]
-    distribution = ["-n", "4", "--dist", "loadgroup"]
+    # The shard flag and the one rerun are also allowed: the shards partition
+    # the unfiltered collection along xdist groups (asserted in
+    # tools/e2e-ci-selection/tests/test_python_pytest_selection.py), and a rerun
+    # changes how often a failing test runs, never which tests run.
+    distribution = [
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        # shlex splits the matrix expression `${{ matrix.shard }}/3`
+        "${{",
+        "matrix.shard",
+        "}}/3",
+        "--reruns",
+        "1",
+    ]
     if extra[: len(distribution)] == distribution:
         extra = extra[len(distribution) :]
-    assert all(argument.startswith("--durations") for argument in extra), (
-        "the Python suite must run unfiltered: only reporting and xdist "
-        f"distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
+    assert all(argument.startswith("--durations") or argument == "-rR" for argument in extra), (
+        "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
+        f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
     )
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
     # the job whose length is the critical path.
+    steps = steps + required_steps
     assert not any(_is_fix_pin_gate(step) for step in steps), (
         "the fix pin gate must not run inside the Python job again"
     )
@@ -860,10 +912,9 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     """Everything the gate needs must be in the job that now runs it."""
     job, steps = _fix_pin_job()
     assert "needs" not in job, "the required fix pin check must not be skippable"
-    assert _pull_request_only(job), (
-        "only a pull request carries the body this gate reads, so the job is "
-        "pull-request only and its steps no longer each repeat that condition"
-    )
+    assert not _string(job, "if"), "the job must run for every configured pull request event"
+    trigger = _workflow_trigger(_load_workflow(FIX_PIN_WORKFLOW))["pull_request"]
+    assert set(trigger["types"]) == {"opened", "synchronize", "reopened", "edited"}
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the fix pin job must declare job level permissions"
@@ -1027,11 +1078,9 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     ):
         step = steps[_single_step_index(steps, predicate, description)]
         condition = _string(step, "if")
-        # The job carries the pull-request condition now, so the steps state
-        # only what is theirs: the parser's answer.
-        assert _pull_request_only(job), (
-            f"{description} must stay pull-request only"
-        )
+        # The workflow runs only for pull requests, so these steps need only
+        # the parser's answer.
+        assert not _string(job, "if"), f"{description} must run on edited pull requests"
         assert CARGO_NEEDED_GUARD in condition, (
             f"{description} must build only when the parser says the binary "
             f"is needed: {condition!r}"
@@ -1590,7 +1639,6 @@ def test_pull_request_template_documents_the_tier_waiver() -> None:
 
 
 MAIN_MILESTONE = "v0.8.5"
-MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
 
 
 @pytest.mark.parametrize(
@@ -1832,10 +1880,6 @@ def test_valid_prerequisite_does_not_compare_issue_milestone_to_parent_train(
         LOCAL_SELECTOR,
     ]
     _assert_exact_pull_lookup(tmp_path)
-
-
-def test_milestone_mapping_artifact_is_removed() -> None:
-    assert not MAPPING_PATH.exists()
 
 
 def test_agents_md_does_not_describe_milestones_as_a_merge_gate() -> None:

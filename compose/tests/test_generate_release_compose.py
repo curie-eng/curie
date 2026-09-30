@@ -213,9 +213,9 @@ def test_data_tier_pins_agree_across_artifacts():
         assert doc["services"]["valkey"]["image"] == chart_valkey, (
             f"{label} valkey image must match the chart's valkey.image {chart_valkey!r}"
         )
-    workflow_valkey = workflow["jobs"]["rust"]["services"]["valkey"]["image"]
+    workflow_valkey = workflow["jobs"]["rust-test"]["services"]["valkey"]["image"]
     assert workflow_valkey == chart_valkey, (
-        f"ci.yaml jobs.rust.services.valkey.image {workflow_valkey!r} must be the "
+        f"ci.yaml jobs.rust-test.services.valkey.image {workflow_valkey!r} must be the "
         f"chart's valkey.image {chart_valkey!r} so the valkey_or_skip tests cover "
         "the shipped default"
     )

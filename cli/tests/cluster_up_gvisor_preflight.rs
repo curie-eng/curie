@@ -2,8 +2,10 @@
 //! #1653. Every case drives the real `curie cluster up` entrypoint with fake
 //! Helm and kubectl executables on PATH.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -23,7 +25,7 @@ fn chart() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie")
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}",
@@ -33,14 +35,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -87,7 +82,7 @@ impl Fixture {
         let watch_pid = temp.path().join("watch.pid");
         let event_emitted = temp.path().join("event-emitted");
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -289,7 +284,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_converged_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -369,10 +364,19 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
             printf '%s\n' 'Error from server (Forbidden): events is forbidden at the cluster scope' >&2
             exit 1
             ;;
-        *" -n target-namespace "*) ;;
+        *" -n target-namespace "*|*" -n agent-sandbox-system "*) ;;
         *)
-            printf 'event query was not scoped to target-namespace: %s\n' "$*" >&2
+            printf 'event query was not namespaced to the release or controller namespace: %s\n' "$*" >&2
             exit 64
+            ;;
+    esac
+    case " $* " in
+        *involvedObject.kind=Job*) ;;
+        *)
+            # The general cluster-up admission observer lists namespaced Events
+            # as JSON. Keep this independent from the gVisor preflight stream.
+            printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[]}'
+            exit 0
             ;;
     esac
     watch="false"
@@ -738,8 +742,13 @@ exit 64
             invocations.contains(&format!("involvedObject.name={RENDERED_JOB}")),
             "the event selector must use the rendered fullname override:\n{invocations}"
         );
-        let watch_invocations: Vec<&str> = invocations
+        let gvisor_invocations: Vec<&str> = invocations
             .lines()
+            .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
+            .collect();
+        let watch_invocations: Vec<&str> = gvisor_invocations
+            .iter()
+            .copied()
             .filter(|line| line.contains("--watch"))
             .collect();
         assert_eq!(
@@ -756,8 +765,9 @@ exit 64
             "one list and watch stream must cover current and future Events:\n{invocations}"
         );
         if self.event_mode != "fresh-namespace" {
-            let snapshots: Vec<&str> = invocations
-                .lines()
+            let snapshots: Vec<&str> = gvisor_invocations
+                .iter()
+                .copied()
                 .filter(|line| !line.contains("--watch"))
                 .collect();
             assert_eq!(
@@ -773,6 +783,7 @@ exit 64
         assert!(
             invocations
                 .lines()
+                .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
                 .all(|line| line.contains("-n target-namespace")
                     && !line.contains("--all-namespaces")),
             "every event query must use namespaced permissions:\n{invocations}"
@@ -795,8 +806,9 @@ exit 64
         assert!(
             fs::read_to_string(&self.event_log)
                 .unwrap_or_default()
-                .is_empty(),
-            "a nonrendering gVisor preflight must not query Events"
+                .lines()
+                .all(|line| !line.contains("involvedObject.name=")),
+            "a nonrendering gVisor preflight must not query the gVisor preflight Event selector"
         );
         assert!(
             !self.watch_pid.exists(),
@@ -996,14 +1008,19 @@ fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
         "the CLI must create the namespace before Helm emits the event observed by the retry"
     );
     let invocations = fs::read_to_string(&fixture.event_log).unwrap_or_default();
+    let gvisor_invocations: Vec<&str> = invocations
+        .lines()
+        .filter(|line| line.contains(&format!("involvedObject.name={RENDERED_JOB}")))
+        .collect();
     assert_eq!(
-        invocations.lines().count(),
+        gvisor_invocations.len(),
         2,
-        "fresh namespace recovery must snapshot once and use one list-and-watch stream:\n{invocations}"
+        "fresh namespace recovery must snapshot once and use one gVisor list-and-watch stream:\n{invocations}"
     );
     assert!(
-        invocations
-            .lines()
+        gvisor_invocations
+            .iter()
+            .copied()
             .any(|line| !line.contains("--watch") && line.contains("{range .items[*]}{.metadata.uid}")),
         "the atomically created namespace must establish a stale Event UID boundary:\n{invocations}"
     );
@@ -1015,9 +1032,10 @@ fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
         "the stream must inspect current Events without an EventList resource version:\n{invocations}"
     );
     assert!(
-        invocations
-            .lines()
-            .all(|line| line.contains("-n target-namespace") && !line.contains("--all-namespaces")),
+        invocations.lines().all(|line| {
+            (line.contains("-n target-namespace") || line.contains("-n agent-sandbox-system"))
+                && !line.contains("--all-namespaces")
+        }),
         "fresh namespace retries must retain namespaced permissions:\n{invocations}"
     );
     fixture.assert_failed_revision_discarded_before_retry();
@@ -1165,8 +1183,13 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}: {shown}");
     assert!(shown.contains(RUNTIME_CLASS_REJECTION), "{shown}");
     assert!(
-        shown.contains("curie cluster up --set security.gvisor.mode=off"),
-        "prepared apply must retain the explicit recovery: {shown}"
+        shown.contains("curie apply") && shown.contains("platform.gvisor: off"),
+        "prepared apply must point to the file based recovery: {shown}"
+    );
+    assert!(
+        !shown.contains("curie cluster up --set security.gvisor.mode=off")
+            && !shown.contains("security.gvisor.mode=off"),
+        "prepared apply must not direct the operator to a cluster up override: {shown}"
     );
     assert!(
         !shown.contains("inferred that the cluster has no"),
@@ -1182,6 +1205,27 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
     );
     assert_eq!(fixture.upgrade_count(), 1, "prepared apply must not retry");
     fixture.assert_no_failed_revision_discard();
+    fixture.assert_graceful_helm_interruption();
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn prepared_apply_progress_uses_the_file_recovery_path() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL);
+    let (output, _) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        shown.contains("generated strong per-release secrets")
+            && shown.contains("rerunning `curie apply` reuses them"),
+        "the credential progress line must tell file based installs to rerun apply:\n{shown}"
+    );
+    assert!(
+        shown.contains("platform.egress[].host")
+            && shown.contains("rerun `curie apply`")
+            && !shown.contains("curie cluster up"),
+        "the sealed model warning must use the file based remedy:\n{shown}"
+    );
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
 }

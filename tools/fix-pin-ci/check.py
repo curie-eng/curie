@@ -438,6 +438,25 @@ def _required_discovery(
     return max(found, key=lambda tier: TIER_RANK[tier])
 
 
+def _print_verification_failure_guidance() -> None:
+    print(
+        "Fix pin verification failed. This failure is deterministic. Edit the "
+        "PR body's `Fix pin:` declaration or add a changed test. Rerunning "
+        "unchanged will not help.",
+        file=sys.stderr,
+    )
+
+
+def _is_deterministic_pin_failure(stdout: bytes, stderr: bytes) -> bool:
+    return b"UNPINNED" in stdout.splitlines() or any(
+        marker in stderr
+        for marker in (
+            b"selector file was not changed by ",
+            b"selected Rust test node was not changed by ",
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.needs_curie:
@@ -523,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.stderr.buffer.flush()
 
     if completed.returncode != 0:
+        if _is_deterministic_pin_failure(completed.stdout, completed.stderr):
+            _print_verification_failure_guidance()
         return completed.returncode
     if b"PINNED" not in completed.stdout.splitlines():
         print("Fix pin verification error: verifier did not report PINNED", file=sys.stderr)

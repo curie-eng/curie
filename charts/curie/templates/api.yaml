@@ -1,4 +1,8 @@
 {{- $resumeReconcilerGrace := include "curie.api.resumeReconciler.grace" . -}}
+{{- $connectorProxyPullSecrets := list }}
+{{- range .Values.worker.imagePullSecrets }}
+{{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
+{{- end }}
 {{- if .Values.api.deploy }}
 apiVersion: v1
 kind: Service
@@ -120,8 +124,13 @@ spec:
                   # Do not run Alembic here: that is the rollback defect.
                   exit 0
                 fi
+                # Name the probe's error class while waiting, not only at exit:
+                # a restarted container's logs are gone, and "too many clients"
+                # must read differently from "store is down" (#2865).
                 if [ "$attempt" -eq 1 ]; then
-                  echo "Waiting for Postgres readiness"
+                  echo "Waiting for Postgres readiness; probe error class: $probe_error_class"
+                elif [ $((attempt % 10)) -eq 0 ] && [ "$attempt" -lt "$max_attempts" ]; then
+                  echo "Still waiting for Postgres readiness after $attempt of $max_attempts attempts; probe error class: $probe_error_class"
                 fi
                 if [ "$attempt" -lt "$max_attempts" ]; then
                   sleep 2
@@ -158,10 +167,48 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: internalWorkerToken
+            # Mirrors the worker's CURIE_INSTALLATION_ID (#3127): the API scopes
+            # the same per-installation upgrade quiesce key the worker writes.
+            - name: CURIE_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: installationId
+                  optional: false
+            # The connector caller public keys and the proxy image (ADR-0168
+            # decision 7). The API renders a caller proxy into every hosted
+            # connector it renders when the current key is set; the worker
+            # alone holds the signing half. The proxy runs from the worker
+            # image, so it pulls with the worker's policy and pull secrets.
+            - name: CURIE_CONNECTOR_CALLER_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.verifyKeyKey "defaultKey" "connectorCallerVerifyKey") | nindent 18 }}
+            - name: CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY
+              value: {{ .Values.connectorCaller.previousVerifyKey | default "" | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY
+              value: {{ .Values.worker.image.pullPolicy | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS
+              value: {{ join "," $connectorProxyPullSecrets | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
               value: {{ .Values.worker.publication.retentionSeconds | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            # The hard quota the API compares a per-agent runner override to.
+            # All four are set together, or none are. Ephemeral storage is not
+            # on this PriorityClass-scoped quota.
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_CPU
+              value: {{ .Values.resourceQuota.hard.requestsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY
+              value: {{ .Values.resourceQuota.hard.requestsMemory | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_CPU
+              value: {{ .Values.resourceQuota.hard.limitsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_MEMORY
+              value: {{ .Values.resourceQuota.hard.limitsMemory | quote }}
+            {{- end }}
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
@@ -177,6 +224,10 @@ spec:
               value: {{ .Values.api.githubFactoryLabel | quote }}
             - name: GITHUB_FACTORY_MENTION
               value: {{ .Values.api.githubFactoryMention | quote }}
+            - name: GITHUB_FACTORY_CARD_BASE_URL
+              value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
+            - name: GITHUB_FACTORY_CI_WAIT_S
+              value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
@@ -221,6 +272,10 @@ spec:
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
+            # Runner sandboxes are claimed in the release namespace (the
+            # worker's CURIE_NAMESPACE), so the Logs tab's pod list reads there.
+            - name: RUNNER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: COMMIT_POLL_INTERVAL_S
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE
@@ -232,7 +287,7 @@ spec:
             - name: LANGFUSE_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseInitProjectSecretKey
             - name: S3_ENDPOINT_URL
               value: {{ include "curie.rustfs.endpoint" . }}
@@ -242,7 +297,7 @@ spec:
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
                   key: rustfsSecretKey
             {{- end }}
             # Immutable plugin-bundle bucket. Single source of truth with the
@@ -264,15 +319,12 @@ spec:
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
             # Slack bot token for the approval user-group authorizer (#420): the
             # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Same shared secret
-            # reference dispatcher.yaml and worker.yaml resolve (issue #1759,
-            # curie.secretRef), so the three cannot drift apart.
+            # caller-asserted membership claim (ADR-0034). Every Slack identity's
+            # bot token comes from the one helper dispatcher.yaml and worker.yaml
+            # also render (curie.env.slack), so the three cannot drift apart.
             # Rendered unconditionally; a declared approver group with no token
             # then fails closed at resolve time, which is the intended posture.
-            - name: SLACK_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
+            {{- include "curie.env.slack" (dict "root" . "workload" "api") | trim | nindent 12 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default
@@ -288,7 +340,10 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv) | nindent 12 }}
+            # Per-thread conversation transcript cap in bytes (#3301).
+            - name: TRANSCRIPT_MAX_THREAD_BYTES
+              value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000

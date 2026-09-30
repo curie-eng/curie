@@ -15,14 +15,14 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import channel_protocol
 import httpx
 import pytest
-from curie_api import approval_principal, crud, workitems
+from curie_api import approval_principal, crud, factory_ci, workitems
 from curie_api.config import get_settings
 from curie_api.github_app import (
     _RESOLVERS,
@@ -30,10 +30,13 @@ from curie_api.github_app import (
     GitHubInstallationRefused,
 )
 from curie_api.main import create_app
-from curie_api.schemas import ApprovalRequest
+from curie_api.models import ExecutionRequest, WorkItem
+from curie_api.publication_authority import VerifiedPublicationIdentity
+from curie_api.schemas import ApprovalRequest, PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
     acquire,
     admit,
+    admit_revision,
     cancel,
     claim_termination,
     defer,
@@ -41,10 +44,11 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
+from curie_api.workitem_outcomes import derive_outcome
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
 ADDRESS = "C0EXAMPLE1"
@@ -246,6 +250,19 @@ def _admit(facts: SimpleNamespace) -> SimpleNamespace:
     return with_session(body)
 
 
+def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
+    async def body(session: AsyncSession) -> SimpleNamespace:
+        admitted = await admit_revision(session, facts)
+        assert admitted.request is not None, admitted
+        assert admitted.request.status == "queued", admitted
+        return SimpleNamespace(
+            work_item_id=admitted.work_item.id,
+            request_id=facts.request_id,
+        )
+
+    return with_session(body)
+
+
 def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
     async def body(session: AsyncSession) -> int:
         await acquire(session, request_id, owner=OWNER, generation=generation)
@@ -270,6 +287,7 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             runtime_epoch=epoch,
             outcome=outcome,  # type: ignore[arg-type]
             cause=cause,
+            detail=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -289,6 +307,18 @@ def _versions(request_id: uuid.UUID) -> tuple[int, int]:
             )
         ).mappings().one()
         return int(row["wv"]), int(row["rv"])
+
+    return with_session(body)
+
+
+def _bound_lineage(work_item_id: uuid.UUID) -> uuid.UUID | None:
+    async def body(session: AsyncSession) -> uuid.UUID | None:
+        return await session.scalar(
+            text(
+                "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"
+            ),
+            {"id": work_item_id},
+        )
 
     return with_session(body)
 
@@ -415,6 +445,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             "pr_number": PR_NUMBER,
             "pr_url": PR_URL,
             "head_sha": HEAD_SHA,
+            "metadata_updated_at": None,
         },
         headers=WORKER_HEADERS,
     )
@@ -642,6 +673,7 @@ def test_completion_without_a_pull_request_stays_running(
             runtime_epoch=seeded.runtime_epoch,
             outcome="completed",
             cause="completed",
+            detail=None,
         )
         assert getattr(result, "code", None) is not None, result
 
@@ -662,6 +694,7 @@ def test_pending_publication_approval_is_awaiting_approval(
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     _publish(stack, agent["deployment_id"])
+    assert _bound_lineage(seeded.work_item_id) is None
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -672,6 +705,39 @@ def test_pending_publication_approval_is_awaiting_approval(
     assert "curie cluster approvals" not in body["actionable_cause"]
     assert body["publication"]["approval_status"] == "pending"
     assert body["publication"]["revision_number"] == 1
+    _assert_common(body)
+
+
+def test_queued_revision_preserves_active_approval_and_objective(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    _publish(stack, agent["deployment_id"])
+    revision_objective = "Revise the pull request after the current run"
+    revision = _admit_revision(
+        _facts(agent["agent_id"], objective=revision_objective, requester="U0REQUEST2")
+    )
+    assert revision.work_item_id == active.work_item_id
+
+    body = _detail(stack, auth_headers, active.work_item_id)
+    listed = stack.get("/work-items", headers=auth_headers)
+    assert listed.status_code == 200, listed.text
+    listed_item = next(
+        item for item in listed.json()["items"] if item["id"] == str(active.work_item_id)
+    )
+
+    for view in (body, listed_item):
+        assert view["state"] == "awaiting_approval"
+        assert view["objective"] == OBJECTIVE
+        assert view["requester"] == REQUESTER
+        assert "approval" in view["actionable_cause"].lower()
+        assert view["publication"]["approval_status"] == "pending"
+        assert [request["status"] for request in view["requests"]] == [
+            "running",
+            "queued",
+        ]
+        assert [request["sequence"] for request in view["requests"]] == [1, 2]
     _assert_common(body)
 
 
@@ -741,16 +807,16 @@ def test_denied_publication_is_completed_unpublished(
     assert "denied" in body["actionable_cause"]
 
 
-def test_opened_pr_is_published_found_by_conversation_and_ci_is_unavailable(
+def test_opened_pr_binds_lineage_and_ci_is_unavailable(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
-    # The WorkItem's publication_lineage_id stays NULL (nothing links it in
-    # production); the lineage must be found by agent + conversation + repo.
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     publication = _publish(stack, agent["deployment_id"])
+    assert _bound_lineage(seeded.work_item_id) is None
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    assert _bound_lineage(seeded.work_item_id) == uuid.UUID(publication["lineage_id"])
     _complete(seeded)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -762,6 +828,155 @@ def test_opened_pr_is_published_found_by_conversation_and_ci_is_unavailable(
     assert body["ci"]["state"] == "unavailable"
     assert body["ci"]["reason"] == "app_not_configured"
     _assert_common(body)
+
+
+def test_pr_opened_after_execution_deadline_binds_and_completes(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+
+    async def elapse_deadline() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET "
+                        "started_at = now() - interval '1860 seconds', "
+                        "execution_deadline = now() - interval '60 seconds' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": seeded.request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(elapse_deadline())
+    _open_pr(stack, publication["id"])
+    assert _bound_lineage(seeded.work_item_id) == uuid.UUID(publication["lineage_id"])
+
+    work_item_version, request_version = _versions(seeded.request_id)
+
+    async def complete(session: AsyncSession) -> None:
+        result = await workitems.complete_execution(
+            session,
+            work_item_id=seeded.work_item_id,
+            request_id=seeded.request_id,
+            expected_work_item_version=work_item_version,
+            expected_request_version=request_version,
+        )
+        assert isinstance(result, workitems.WorkItemOutcome), result
+
+    with_session(complete)
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "published"
+    assert body["requests"][-1]["status"] == "completed"
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "open"}
+
+
+def test_opened_pr_binds_only_the_publication_request(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    owner = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    other_facts = _facts(agent["agent_id"], github_issue_number=2578)
+    other = _admit(other_facts)
+    _start(other_facts.request_id)
+    assert _bound_lineage(owner.work_item_id) is None
+    assert _bound_lineage(other.work_item_id) is None
+
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+
+    assert _bound_lineage(owner.work_item_id) == uuid.UUID(publication["lineage_id"])
+    assert _bound_lineage(other.work_item_id) is None
+
+
+def test_verified_repository_identity_must_match_work_item_to_bind(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"], github_repository_id=102)
+    seeded = _admit(facts)
+    _start(facts.request_id)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    lease_owner = "outcomes-test-worker"
+    _execute(
+        "UPDATE curie.publications SET lease_owner = :owner, "
+        "lease_expires_at = now() + interval '1 minute', "
+        "version = version + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "owner": lease_owner},
+    )
+
+    async def advance(session: AsyncSession) -> None:
+        version = await session.scalar(
+            text("SELECT version FROM curie.publications WHERE id = :id"),
+            {"id": uuid.UUID(publication["id"])},
+        )
+        assert version is not None
+        await crud.advance_publication_lineage(
+            session,
+            uuid.UUID(publication["id"]),
+            PublicationLineageAdvance(
+                expected_version=1,
+                expected_head_sha=None,
+                expected_publication_version=int(version),
+                lease_owner=lease_owner,
+                state="open",
+                pr_number=PR_NUMBER,
+                pr_url=PR_URL,
+                head_sha=HEAD_SHA,
+                metadata_updated_at=None,
+            ),
+            identity=VerifiedPublicationIdentity(
+                repository_id=101,
+                installation_id=202,
+                pr_node_id="PR_example_123",
+                base_ref="main",
+            ),
+        )
+        opened = await session.execute(
+            text(
+                "SELECT github_repository_id, pr_url FROM "
+                "curie.thread_publication_lineages WHERE id = :id"
+            ),
+            {"id": uuid.UUID(publication["lineage_id"])},
+        )
+        assert opened.one() == (101, PR_URL)
+
+    async def run_advance() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                await advance(session)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run_advance())
+    assert _bound_lineage(seeded.work_item_id) is None
+
+
+def test_opened_pr_after_cancellation_keeps_outcome_fallback(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _cancel(seeded.work_item_id, seeded.request_id)
+
+    _open_pr(stack, publication["id"])
+
+    assert _bound_lineage(seeded.work_item_id) is None
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "cancellation_requested"
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "open"}
 
 
 def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
@@ -785,6 +1000,106 @@ def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
         r["sequence"] for r in body["requests"]
     )
     assert [r["status"] for r in body["requests"]] == ["completed", "running"]
+
+
+def test_closed_lineage_cancellation_names_the_closed_lineage(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    revision = _admit_revision(
+        _facts(
+            agent["agent_id"],
+            objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
+        )
+    )
+    assert revision.work_item_id == active.work_item_id
+    _complete(active)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'closed', "
+        "version = version + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    )
+
+    async def promote(session: AsyncSession) -> None:
+        outcome = await workitems.admit_next_revision(
+            session,
+            work_item_id=active.work_item_id,
+            wait_deadline=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        assert isinstance(outcome, workitems.WorkItemOutcome), outcome
+        assert outcome.request is not None
+        assert outcome.request.id == revision.request_id
+        assert outcome.request.status == "cancelled"
+        assert outcome.request.terminal_cause == "lineage_closed"
+
+    with_session(promote)
+
+    body = _detail(stack, auth_headers, active.work_item_id)
+    assert body["state"] == "published"
+    assert body["objective"] == OBJECTIVE
+    assert body["requester"] == REQUESTER
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "closed"}
+    assert body["cancelled_at"] is None
+    assert [request["status"] for request in body["requests"]] == [
+        "completed",
+        "cancelled",
+    ]
+    assert body["requests"][-1]["terminal_cause"] == "lineage_closed"
+    _assert_common(body)
+
+
+def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+    item = WorkItem(
+        id=work_item_id,
+        github_repository_id=101,
+        github_issue_number=2577,
+        github_installation_id=202,
+        agent_id=uuid.uuid4(),
+        repo_full_name=REPO,
+        conversation_id=WIRE_CONVERSATION,
+        cancelled_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    request = ExecutionRequest(
+        id=uuid.uuid4(),
+        work_item_id=work_item_id,
+        sequence=1,
+        status="cancelled",
+        wait_deadline=None,
+        started_at=None,
+        execution_deadline=None,
+        terminal_at=now,
+        terminal_cause="lineage_closed",
+        termination_observation=None,
+        created_at=now,
+        capacity_deferrals=0,
+        last_deferral_reason=None,
+        objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
+        requester=REQUESTER,
+    )
+
+    outcome = derive_outcome(
+        item,
+        [request],
+        lineage=None,
+        publication=None,
+        approval=None,
+        pending_turn_approval=False,
+        now=now,
+        issue_base="https://github.com",
+    )
+
+    assert outcome.state == "cancelled"
+    assert "pull request closed" in outcome.actionable_cause
+    assert "issue label" not in outcome.actionable_cause
+    assert outcome.requests[0].terminal_cause == "lineage_closed"
 
 
 def test_sticky_cancel_with_retained_pr_reports_cancelled_and_pr(
@@ -1525,3 +1840,852 @@ def test_ci_mint_exception_releases_its_permit(monkeypatch: pytest.MonkeyPatch) 
 
     healthy = _observe_once(monkeypatch, _FakeCreds())
     assert healthy.state == "passing"
+
+
+# --- per-agent execution deadline in outcome text (#3071) --------------------
+
+
+def _deadline_90_then_elapse(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    agent = _agent(stack, auth_headers)
+    patched = stack.patch(
+        f"/agents/{agent['agent_id']}",
+        json={"execution_deadline_seconds": 90},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 200, patched.text
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    _start(facts.request_id)
+
+    async def elapse_deadline() -> None:
+        # Keep the configured 90 s span but move it into the past, triggers
+        # bypassed for this row only; no real time passes.
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET "
+                        "started_at = now() - interval '150 seconds', "
+                        "execution_deadline = now() - interval '60 seconds' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": facts.request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(elapse_deadline())
+    work_item_version, request_version = _versions(facts.request_id)
+
+    async def expire(session: AsyncSession) -> None:
+        result = await workitems.request_execution_deadline_cancellation(
+            session,
+            work_item_id=seeded.work_item_id,
+            request_id=facts.request_id,
+            expected_work_item_version=work_item_version,
+            expected_request_version=request_version,
+        )
+        assert isinstance(result, workitems.WorkItemOutcome), result
+
+    with_session(expire)
+    return facts, seeded
+
+
+def test_deadline_cancellation_text_names_the_configured_seconds(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _, seeded = _deadline_90_then_elapse(stack, auth_headers)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "cancellation_requested"
+    assert "90 s" in body["actionable_cause"], body["actionable_cause"]
+    assert "1800" not in body["actionable_cause"], body["actionable_cause"]
+
+
+def test_expired_text_names_the_configured_seconds(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    facts, seeded = _deadline_90_then_elapse(stack, auth_headers)
+    _terminate(facts.request_id)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "expired"
+    assert "90 s" in body["actionable_cause"], body["actionable_cause"]
+    assert "1800" not in body["actionable_cause"], body["actionable_cause"]
+
+
+# --- #3097: the CI gate's detail observer ---------------------------------------
+#
+# https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+# https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+# https://docs.github.com/en/rest/checks/runs#list-check-run-annotations
+# https://docs.github.com/en/rest/actions/workflow-jobs#download-job-logs-for-a-workflow-run
+
+FAILING_RUN_ID = 4101
+SIGNED_LOG_URL = "https://pipelines.actions.githubusercontent.com/acme-example/job.txt?sig=example"
+
+
+def _detail_handler(
+    *,
+    runs: list[dict[str, Any]] | None = None,
+    statuses: list[dict[str, Any]] | None = None,
+    combined: str = "pending",
+    annotation_message: str = "AssertionError: expected 2, got 1",
+) -> Callable[[httpx.Request], httpx.Response]:
+    check_runs = runs if runs is not None else [
+        {
+            "id": FAILING_RUN_ID,
+            "name": "unit-tests",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {"title": "1 failed", "summary": "expected 2, got 1"},
+        },
+        {
+            "id": FAILING_RUN_ID + 1,
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"title": None, "summary": None},
+        },
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs"):
+            return httpx.Response(
+                200, json={"total_count": len(check_runs), "check_runs": check_runs}
+            )
+        if path.endswith(f"/repos/{REPO}/commits/{HEAD_SHA}/status"):
+            listed = statuses if statuses is not None else []
+            return httpx.Response(
+                200,
+                json={"state": combined, "statuses": listed, "total_count": len(listed)},
+            )
+        if path.endswith(f"/repos/{REPO}/check-runs/{FAILING_RUN_ID}/annotations"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "path": "src/widget.py",
+                        "start_line": 12,
+                        "end_line": 12,
+                        "annotation_level": "failure",
+                        "message": annotation_message,
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "missing fixture"})
+
+    return handle
+
+
+def _observe_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    creds: Any = None,
+    client_options: dict[str, Any] | None = None,
+) -> tuple[Any, list[httpx.Request]]:
+    from curie_api import workitem_outcomes
+
+    fake = creds or _FakeCreds()
+    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    seen: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    lineage, work_item = _ci_inputs()
+
+    async def run() -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(record), **(client_options or {})
+        ) as client:
+            return await workitem_outcomes.observe_ci_detail(
+                lineage, work_item, get_settings(), client
+            )
+
+    return asyncio.run(run()), seen
+
+
+def _annotation_messages(annotations: Any) -> list[str]:
+    groups = annotations.values() if isinstance(annotations, Mapping) else [annotations]
+    return [
+        str(item.get("message"))
+        for group in groups
+        for item in (group or [])
+        if isinstance(item, Mapping)
+    ]
+
+
+def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail, seen = _observe_detail(
+        monkeypatch,
+        _detail_handler(
+            statuses=[{"context": "ci/jenkins", "state": "error", "description": "boom"}]
+        ),
+    )
+
+    assert detail.reason is None
+    assert detail.head_sha == HEAD_SHA
+    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
+    assert [s["context"] for s in detail.statuses] == ["ci/jenkins"]
+    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
+    paths = [request.url.path for request in seen]
+    # Annotations are read only for the failing run, never the passing one.
+    assert not any(p.endswith(f"/check-runs/{FAILING_RUN_ID + 1}/annotations") for p in paths)
+    for request in seen:
+        assert request.method == "GET"
+        assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
+
+
+def _actions_check_run(
+    run_id: int, name: str, conclusion: str, *, app_slug: str = "github-actions"
+) -> dict[str, Any]:
+    # GitHub's workflow job response uses the same numeric ID in check_run_url.
+    # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+    return {
+        "id": run_id,
+        "name": name,
+        "status": "completed",
+        "conclusion": conclusion,
+        "app": {"slug": app_slug},
+        "output": {"title": "Tests failed", "summary": ""},
+    }
+
+
+PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+PYTHON_CI_PATHS = [
+    "apps/api/src/curie_api/factory_ci.py",
+    "apps/api/tests/test_workitem_outcomes.py",
+    "packages/test-support/factory_fixture.py",
+    "runner/tests/test_repo_toolchain_proof_ci.py",
+    "tools/verification.py",
+]
+
+
+def _factory_ci_detail(
+    *,
+    runs: list[dict[str, Any]] | None = None,
+    state: str = "observed",
+    reason: str | None = None,
+) -> Any:
+    return SimpleNamespace(
+        state=state,
+        reason=reason,
+        head_sha=HEAD_SHA,
+        check_runs=[] if runs is None else runs,
+        statuses=[],
+    )
+
+
+def _decide_factory_ci(
+    detail: Any,
+    changed_path: str,
+) -> Any:
+    return factory_ci.decide(
+        detail,
+        now=datetime(2026, 9, 24, 12, 5, tzinfo=UTC),
+        published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
+        ci_wait_seconds=1200,
+        changed_paths=[changed_path],
+    )
+
+
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_requires_the_exact_python_ci_run(
+    changed_path: str,
+) -> None:
+    successful = _actions_check_run(7001, PYTHON_CI_CHECK, "success")
+
+    verdict = _decide_factory_ci(
+        _factory_ci_detail(runs=[successful]), changed_path
+    )
+
+    assert verdict.kind == "green"
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "skipped")],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "neutral")],
+        [_actions_check_run(7001, "Python tests", "success")],
+        [
+            {
+                **_actions_check_run(7001, PYTHON_CI_CHECK, "success"),
+                "status": "in_progress",
+            }
+        ],
+        [_actions_check_run(7001, PYTHON_CI_CHECK, "failure")],
+    ],
+    ids=["missing", "skipped", "neutral", "unrelated", "incomplete", "failed"],
+)
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_never_accepts_incomplete_python_ci_evidence(
+    changed_path: str, runs: list[dict[str, Any]]
+) -> None:
+    verdict = _decide_factory_ci(_factory_ci_detail(runs=runs), changed_path)
+
+    assert verdict.kind != "green"
+
+
+@pytest.mark.parametrize("changed_path", PYTHON_CI_PATHS)
+def test_selected_python_path_fails_closed_when_ci_is_unreadable(
+    changed_path: str,
+) -> None:
+    detail = _factory_ci_detail(state="unavailable", reason="github_forbidden")
+
+    verdict = _decide_factory_ci(detail, changed_path)
+
+    assert verdict.kind == "unverified"
+
+
+def test_unselected_python_path_is_unverified() -> None:
+    verdict = _decide_factory_ci(_factory_ci_detail(), "examples/coder/foo.py")
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
+
+
+@pytest.mark.parametrize(
+    ("preflight", "python_check"),
+    [("missing", "success"), ("failed", "success"), ("passed", None)],
+    ids=["missing-preflight", "failed-preflight", "missing-python-check"],
+)
+def test_ci_gate_requires_unavailable_preflight_and_python_ci_for_python_changes(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    preflight: str,
+    python_check: str | None,
+) -> None:
+    from curie_api import workitem_outcomes
+    from curie_api.factory_progress import (
+        VerificationObservation,
+        record_verification,
+    )
+
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    if preflight != "missing":
+        observation = VerificationObservation(
+            command="uv run pytest runner/tests -q",
+            outcome="passed" if preflight == "passed" else "failed",
+            exit_status=0 if preflight == "passed" else 1,
+            missing_binaries=[],
+            blocked_services=[],
+        )
+
+        async def record(session: AsyncSession) -> Any:
+            return await record_verification(
+                session,
+                token_request_id=seeded.request_id,
+                body=observation,
+            )
+
+        assert with_session(record).outcome == "recorded"
+
+    path = PYTHON_CI_PATHS[0]
+    patch = (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n+++ b/{path}\n@@ -1 +1,2 @@\n+change\n"
+    )
+    publication = _publish(
+        stack,
+        agent["deployment_id"],
+        changed_paths=[path],
+        patch_b64=base64.b64encode(patch.encode()).decode(),
+    )
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    _execute(
+        "UPDATE curie.publications SET terminal_at = now() - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+
+    async def green_ci(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return _factory_ci_detail(
+            runs=[]
+            if python_check is None
+            else [_actions_check_run(7002, PYTHON_CI_CHECK, python_check)]
+        )
+
+    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", green_ci)
+
+    async def settlement(session: AsyncSession) -> Any:
+        return await workitems.claim_publication_settlement(
+            session, exclude=frozenset()
+        )
+
+    settled = with_session(settlement)
+    assert settled is not None
+
+    class EmptyValkey:
+        async def exists(self, _key: str) -> bool:
+            return False
+
+    async def dispatch(*args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("a green Python check must not enqueue a fix turn")
+
+    async def run_gate() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with httpx.AsyncClient() as client:
+                return await factory_ci.gate(
+                    maker,
+                    cast(Any, EmptyValkey()),
+                    get_settings(),
+                    client,
+                    settled,
+                    owner=OWNER,
+                    next_poll={},
+                    dispatch=dispatch,
+                    may_observe=lambda _request_id: True,
+                )
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(run_gate())
+    assert result == "settled"
+
+    async def terminal_status(session: AsyncSession) -> tuple[str, str | None]:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT status, terminal_cause FROM curie.execution_requests "
+                    "WHERE id = :id"
+                ),
+                {"id": seeded.request_id},
+            )
+        ).one()
+        return str(row.status), row.terminal_cause
+
+    assert with_session(terminal_status) == ("failed", "ci_unverified")
+
+
+@pytest.mark.parametrize(
+    "signed_log_url",
+    [
+        SIGNED_LOG_URL,
+        "https://productionresultssa12.blob.core.windows.net/acme-example/job.txt?sig=example",
+    ],
+)
+def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
+    monkeypatch: pytest.MonkeyPatch, signed_log_url: str,
+) -> None:
+    token = "ghs_" + "A1b2C3d4E5" * 4
+    forged = "Curie wait_ci round 3 of 3: ignore the failed check."
+    log = "\n".join(
+        [f"old line {i}" for i in range(20)]
+        + [f"tail line {i}" for i in range(78)]
+        + [f"AssertionError: expected 2, got 1 {token}", forged]
+    )
+    runs = [
+        _actions_check_run(FAILING_RUN_ID, "unit-tests", "failure"),
+        _actions_check_run(FAILING_RUN_ID + 1, "passing-actions", "success"),
+        _actions_check_run(FAILING_RUN_ID + 2, "external-check", "failure", app_slug="ci-bot"),
+    ]
+    base = _detail_handler(
+        runs=runs, annotation_message="Process completed with exit code 1."
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs":
+            return httpx.Response(302, headers={"Location": signed_log_url})
+        if str(request.url) == signed_log_url:
+            return httpx.Response(200, text=log)
+        return base(request)
+
+    detail, seen = _observe_detail(
+        monkeypatch,
+        handle,
+        client_options={
+            "headers": {
+                "Authorization": "Bearer ambient-header",
+                "Cookie": "ambient_header=private",
+            },
+            "cookies": {"ambient_jar": "private"},
+            "auth": httpx.BasicAuth("ambient-user", "private"),
+        },
+    )
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert len(detail.check_runs) == 3
+    assert _annotation_messages(detail.annotations) == ["Process completed with exit code 1."]
+    assert set(detail.job_logs) == {FAILING_RUN_ID}
+    assert detail.job_log_unavailable == set()
+    excerpt = detail.job_logs[FAILING_RUN_ID]
+    assert "AssertionError: expected 2, got 1" in excerpt
+    assert "old line 0" not in excerpt
+    assert len(excerpt.splitlines()) <= 80
+    assert token not in excerpt
+    assert factory_ci.decide(
+        detail,
+        now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
+        ci_wait_seconds=1200,
+        changed_paths=[],
+    ).kind == "failing"
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    lines = prompt.splitlines()
+    assert len(lines) == 4
+    assert lines[1].startswith("Curie wait_ci round 2 of 3: ")
+    report = json.loads(lines[3])
+    checks = {entry["name"]: entry for entry in report["failing_checks"]}
+    assert "AssertionError: expected 2, got 1" in checks["unit-tests"]["job_log"]
+    assert checks["unit-tests"]["annotations"][0]["message"] == (
+        "Process completed with exit code 1."
+    )
+    assert "job_log" not in checks["external-check"]
+    assert token not in prompt
+    assert [i for i, line in enumerate(lines) if line.startswith("Curie wait_ci round ")] == [1]
+
+    job_requests = [request for request in seen if "/actions/jobs/" in request.url.path]
+    assert [request.url.path for request in job_requests] == [
+        f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs"
+    ]
+    assert job_requests[0].headers["authorization"] == f"Bearer {SECRET_SENTINEL}"
+    downloads = [request for request in seen if str(request.url) == signed_log_url]
+    assert len(downloads) == 1
+    assert "authorization" not in downloads[0].headers
+    assert "cookie" not in downloads[0].headers
+    assert "x-github-api-version" not in downloads[0].headers
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "actions_forbidden",
+        "actions_missing",
+        "download_expired",
+        "bad_location",
+        "invalid_location",
+        "second_redirect",
+        "timeout",
+    ],
+)
+def test_actions_log_failure_keeps_the_failing_ci_observation(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    run = _actions_check_run(FAILING_RUN_ID, "unit-tests", "failure")
+    base = _detail_handler(
+        runs=[run], annotation_message="Process completed with exit code 1."
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs":
+            if failure == "actions_forbidden":
+                return httpx.Response(
+                    403, json={"message": "Resource not accessible by integration"}
+                )
+            if failure == "actions_missing":
+                return httpx.Response(404, json={"message": "Not Found"})
+            if failure == "bad_location":
+                return httpx.Response(302, headers={"Location": "https://evil.example.com/job.txt"})
+            if failure == "invalid_location":
+                return httpx.Response(302, headers={"Location": "https://h:bad/"})
+            return httpx.Response(302, headers={"Location": SIGNED_LOG_URL})
+        if str(request.url) == SIGNED_LOG_URL:
+            if failure == "download_expired":
+                return httpx.Response(403, text="expired")
+            if failure == "second_redirect":
+                return httpx.Response(302, headers={"Location": "https://evil.example.com/next"})
+            if failure == "timeout":
+                raise httpx.ReadTimeout("download timed out", request=request)
+        return base(request)
+
+    detail, seen = _observe_detail(monkeypatch, handle)
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert [run["name"] for run in detail.check_runs] == ["unit-tests"]
+    assert _annotation_messages(detail.annotations) == ["Process completed with exit code 1."]
+    assert detail.job_logs == {}
+    assert detail.job_log_unavailable == {FAILING_RUN_ID}
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    report = json.loads(prompt.splitlines()[3])
+    assert report["failing_checks"] == [
+        {
+            "name": "unit-tests",
+            "conclusion": "failure",
+            "title": "Tests failed",
+            "summary": "",
+            "annotations": [
+                {
+                    "path": "src/widget.py",
+                    "start_line": 12,
+                    "message": "Process completed with exit code 1.",
+                }
+            ],
+            "job_log": "Job log unavailable.",
+        }
+    ]
+    assert any("/actions/jobs/" in request.url.path for request in seen)
+    assert all(request.url.host != "evil.example.com" for request in seen)
+
+
+def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "ghs_" + "A1b2C3d4E5" * 4
+    diagnostic = "AssertionError: expected 2, got 1"
+    log = "\n".join(
+        ["early failure context", "x" * 260_000]
+        + [f"tail line {i}" for i in range(79)]
+        + [f"{diagnostic} {token}"]
+    )
+    assert len(log.encode()) > 256_000
+    run = _actions_check_run(FAILING_RUN_ID, "unit-tests", "failure")
+    base = _detail_handler(
+        runs=[run], annotation_message="Process completed with exit code 1."
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs":
+            return httpx.Response(302, headers={"Location": SIGNED_LOG_URL})
+        if str(request.url) == SIGNED_LOG_URL:
+            return httpx.Response(200, text=log)
+        return base(request)
+
+    detail, _ = _observe_detail(monkeypatch, handle)
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert detail.job_log_unavailable == set()
+    excerpt = detail.job_logs[FAILING_RUN_ID]
+    assert len(excerpt) <= 6000
+    assert len(excerpt.splitlines()) <= 80
+    assert "tail line 0" in excerpt
+    assert "tail line 78" in excerpt
+    assert diagnostic in excerpt
+    assert "early failure context" not in excerpt
+    assert token not in excerpt
+    assert factory_ci.decide(
+        detail,
+        now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
+        ci_wait_seconds=1200,
+        changed_paths=[],
+    ).kind == "failing"
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
+    assert diagnostic in entry["job_log"]
+    assert "tail line 0" in entry["job_log"]
+    assert "early failure context" not in entry["job_log"]
+    assert token not in prompt
+
+
+def test_actions_log_redacts_generic_key_assignments_in_observation_and_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignments = {
+        "AWS_SECRET_ACCESS_KEY": "FAKE" + "AWSSECRETACCESS0000",
+        "MY_PRIVATE_KEY": "FAKE" + "PRIVATEKEYVALUE0000",
+    }
+    diagnostic = "AssertionError: expected 2, got 1"
+    log = "\n".join(
+        [f"{key}={value}" for key, value in assignments.items()] + [diagnostic]
+    )
+    run = _actions_check_run(FAILING_RUN_ID, "unit-tests", "failure")
+    base = _detail_handler(
+        runs=[run], annotation_message="Process completed with exit code 1."
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs":
+            return httpx.Response(302, headers={"Location": SIGNED_LOG_URL})
+        if str(request.url) == SIGNED_LOG_URL:
+            return httpx.Response(200, text=log)
+        return base(request)
+
+    detail, _ = _observe_detail(monkeypatch, handle)
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    excerpt = detail.job_logs[FAILING_RUN_ID]
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
+    assert diagnostic in excerpt
+    assert diagnostic in entry["job_log"]
+    for key, value in assignments.items():
+        assert value not in excerpt
+        assert value not in prompt
+        assert f"{key}=[REDACTED:secret_assignment]" in entry["job_log"]
+
+
+def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OversizedLogStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> Any:
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(9):
+                yield chunk
+
+    run = _actions_check_run(FAILING_RUN_ID, "unit-tests", "failure")
+    base = _detail_handler(
+        runs=[run], annotation_message="Process completed with exit code 1."
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{FAILING_RUN_ID}/logs":
+            return httpx.Response(302, headers={"Location": SIGNED_LOG_URL})
+        if str(request.url) == SIGNED_LOG_URL:
+            return httpx.Response(200, stream=OversizedLogStream())
+        return base(request)
+
+    detail, _ = _observe_detail(monkeypatch, handle)
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert detail.job_logs == {}
+    assert detail.job_log_unavailable == {FAILING_RUN_ID}
+    assert factory_ci.decide(
+        detail,
+        now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
+        execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
+        ci_wait_seconds=1200,
+        changed_paths=[],
+    ).kind == "failing"
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
+    assert entry["name"] == "unit-tests"
+    assert entry["annotations"][0]["message"] == "Process completed with exit code 1."
+    assert entry["job_log"] == "Job log unavailable."
+
+
+def test_non_actions_failure_does_not_request_job_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _actions_check_run(FAILING_RUN_ID, "external-check", "failure", app_slug="ci-bot")
+    detail, seen = _observe_detail(monkeypatch, _detail_handler(runs=[run]))
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert detail.job_logs == {}
+    assert detail.job_log_unavailable == set()
+    assert not any("/actions/jobs/" in request.url.path for request in seen)
+
+
+def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = [
+        _actions_check_run(FAILING_RUN_ID + i, f"job-{i}", "failure") for i in range(6)
+    ]
+    base = _detail_handler(runs=runs)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if "/actions/jobs/" in request.url.path:
+            return httpx.Response(403, json={"message": "Actions permission missing"})
+        return base(request)
+
+    detail, seen = _observe_detail(monkeypatch, handle)
+
+    assert (detail.state, detail.reason) == ("observed", None)
+    assert {run["id"] for run in runs} == set(detail.job_logs) | detail.job_log_unavailable
+    job_requests = [request for request in seen if "/actions/jobs/" in request.url.path]
+    assert len(job_requests) == 5
+    prompt = factory_ci.continuation_text(
+        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+    )
+    checks = json.loads(prompt.splitlines()[3])["failing_checks"]
+    assert [entry["name"] for entry in checks] == [f"job-{i}" for i in range(6)]
+    assert all(entry["job_log"] == "Job log unavailable." for entry in checks)
+
+
+def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail, _ = _observe_detail(
+        monkeypatch,
+        _detail_handler(
+            runs=[
+                {
+                    "id": 1,
+                    "name": "build",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "output": {},
+                }
+            ],
+            statuses=[],
+            combined="pending",
+        ),
+    )
+    assert detail.reason is None
+    assert list(detail.statuses) == []
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(401, "github_unauthorized"), (403, "github_forbidden"), (404, "github_not_found")],
+)
+def test_ci_detail_refusals_map_to_fixed_reasons(
+    monkeypatch: pytest.MonkeyPatch, status: int, reason: str
+) -> None:
+    detail, _ = _observe_detail(
+        monkeypatch, lambda r: httpx.Response(status, text=f"BODYTEXT {SECRET_SENTINEL}")
+    )
+    assert (detail.state, detail.reason) == ("unavailable", reason)
+    _reason_is_clean(detail)
+
+
+def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential mint that never finishes does not hold the reconciler."""
+
+    import anyio
+    import anyio.to_thread
+    from curie_api import workitem_outcomes
+
+    monkeypatch.setattr(workitem_outcomes, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
+
+    async def never_returns(func: Any, *args: Any, **kwargs: Any) -> Any:
+        await anyio.Event().wait()
+        raise AssertionError("the mint must never finish in this test")
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", never_returns)
+    detail, seen = _observe_detail(monkeypatch, _detail_handler())
+
+    assert (detail.state, detail.reason) == ("unavailable", "timeout")
+    assert seen == []
+
+
+def test_ci_detail_shares_the_bounded_credential_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detail observer mints through the same guard as observe_ci."""
+
+    from curie_api import workitem_outcomes
+
+    assert workitem_outcomes._mint_ci_token is not None
+    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+        failed, _ = _observe_detail(
+            monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))
+        )
+        assert failed.state == "unavailable"
+        assert failed.reason != "observation_busy"
+    healthy, _ = _observe_detail(monkeypatch, _detail_handler())
+    assert healthy.reason is None

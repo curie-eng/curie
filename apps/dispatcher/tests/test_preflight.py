@@ -47,7 +47,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 from slack_sdk.web.slack_response import SlackResponse
 
-from .conftest import _black_hole_api
+from .conftest import _black_hole_api, _set_run_env, _TestTelemetry
 
 API_URL = "http://curie-api:8000"
 CHANNEL_A = "C0EXAMPLE1"
@@ -492,6 +492,36 @@ def test_the_loop_spends_its_whole_budget_with_production_backoff_ratios() -> No
         f"the error must report the time actually elapsed, not the configured "
         f"deadline; got {str(excinfo.value)!r}"
     )
+
+
+def test_a_budget_clipped_final_probe_keeps_the_real_last_error() -> None:
+    """The tail probe's clipped timeout must not overwrite the API's own answer.
+
+    The last probe is bounded by whatever budget is left, so it can time out
+    only because the budget ran out. Reporting that timeout as ``last error``
+    hides the 503 the API actually returned from the operator.
+    """
+    clock = _FakeClock()
+    answers = iter(["503", "timeout"])
+
+    def unhealthy_then_clipped(request: httpx.Request) -> httpx.Response:
+        if next(answers, "timeout") == "503":
+            clock.sleep(0.15)
+            return httpx.Response(503)
+        # The tail probe spends the rest of its clipped budget, then times out.
+        clock.sleep(0.2 - clock.monotonic())
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(ApiUnreachableError) as excinfo:
+        check_api_reachable(
+            _config(),
+            logger=logging.getLogger("test-preflight"),
+            client=_client(unhealthy_then_clipped),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+    assert "last error: HTTP 503" in str(excinfo.value), str(excinfo.value)
 
 
 def test_the_loop_does_not_probe_past_its_deadline() -> None:
@@ -2121,23 +2151,6 @@ def test_slack_manifest_declares_the_preflight_scope() -> None:
     assert "channels:read" in manifest["oauth_config"]["scopes"]["bot"]
 
 
-def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clear ambient dispatcher config and install only public test values."""
-    for name, field in DispatcherConfig.model_fields.items():
-        alias = field.validation_alias
-        monkeypatch.delenv(
-            alias if isinstance(alias, str) else name.upper(), raising=False
-        )
-    monkeypatch.setenv(
-        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
-    )
-
-
-class _TestTelemetry:
-    def shutdown(self) -> None:
-        pass
-
-
 def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch) -> None:
     """The ordering contract: the wiring gate precedes any Slack wiring.
 
@@ -2212,17 +2225,22 @@ def test_run_main_orders_api_then_slack_preflight_then_supervisor(
     def check_slack(
         *args: object,
         **kwargs: object,
-    ) -> None:
+    ) -> tuple[str, ...]:
         assert "web_client" not in kwargs
         assert "deadline" not in kwargs
         events.append("slack")
+        return ("admitted",)
 
     def build_supervisor(
         _config: DispatcherConfig,
         *,
         logger: logging.Logger,
+        identities: object,
+        declared_count: object,
     ) -> RecordingSupervisor:
         assert logger.name == "curie_dispatcher"
+        assert identities == ("admitted",), "build_supervisor must connect what preflight admitted"
+        assert declared_count == 1, "a stock install declares exactly one identity"
         events.append("supervisor")
         return RecordingSupervisor()
 
@@ -2322,7 +2340,11 @@ def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
         events.append("slack_preflight")
 
     def build_supervisor(
-        config: DispatcherConfig, *, logger: logging.Logger
+        config: DispatcherConfig,
+        *,
+        logger: logging.Logger,
+        identities: object,
+        declared_count: object,
     ) -> Supervisor:
         assert type(config) is DispatcherConfig
         assert logger.name == "curie_dispatcher"

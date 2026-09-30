@@ -40,8 +40,8 @@ clears it on the next attempt.
 */}}
 {{- include "curie.worker.validateUpgradeDrain" . }}
 {{/* The EFFECTIVE clocks, not the raw values: `timeoutSeconds` is a floor and
-     the gate is raised to cover the delivery budget, with the quiesce TTL
-     derived above that. See `curie.worker.upgradeDrain.timeout` for why this is
+     the gate is raised to cover the delivery budget, and the quiesce TTL (the
+     roll hold after a clean drain) is capped at that wait (#3127). See `curie.worker.upgradeDrain.timeout` for why this is
      derived rather than refused. */}}
 {{- $drainTimeout := include "curie.worker.upgradeDrain.timeout" . }}
 {{- $quiesceTtl := include "curie.worker.upgradeDrain.quiesceTtl" . }}
@@ -61,13 +61,14 @@ metadata:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "-10"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "curie.ai/minimum-helm-timeout-seconds": {{ include "curie.worker.minimumHelmTimeoutSeconds" . | quote }}
 spec:
   backoffLimit: 0
   # A hard ceiling above the gate's own wait, so a Job wedged on an unreachable
   # Valkey cannot hold `helm upgrade` open indefinitely. The gate returns on its
   # own timeout well before this; reaching it means the container never got as
   # far as waiting.
-  activeDeadlineSeconds: {{ add (int64 $drainTimeout) 120 }}
+  activeDeadlineSeconds: {{ include "curie.worker.upgradeDrain.jobDeadline" . }}
   template:
     metadata:
       labels:
@@ -84,6 +85,11 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- if or (not .Values.priorityClasses.platform.create) (not .Release.IsUpgrade) }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- end }}
       {{- with .Values.worker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -141,7 +147,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   # Unlike the gate, this one SHOULD retry: clearing the flag is idempotent, and
-  # a release that never lands leaves the fleet waiting out `quiesceTtlSeconds`
+  # a release that never lands leaves the fleet waiting out the roll hold
   # before it claims again. The TTL is the fail-safe behind these attempts, not
   # a substitute for them.
   backoffLimit: 3
@@ -162,6 +168,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.worker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -181,11 +190,89 @@ spec:
           env:
             {{- include "curie.env.valkey" . | nindent 12 }}
             # Present so the release Job builds the SAME WorkerConfig the gate
-            # does; the config's own validator refuses a quiesce TTL that does
-            # not outlast the drain wait, and a Job that omitted these would
-            # construct a config the gate could not.
+            # does, from the same effective clocks.
             - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
               value: {{ $drainTimeout | quote }}
+            - name: CURIE_UPGRADE_QUIESCE_TTL_S
+              value: {{ $quiesceTtl | quote }}
+            - name: CURIE_INSTALLATION_ID
+              value: {{ $installationId | quote }}
+            - name: CURIE_UPGRADE_REVISION
+              value: {{ $upgradeRevision | quote }}
+            - name: CURIE_UPGRADE_LEGACY_QUIESCE
+              value: {{ $upgradeLegacyQuiesce | quote }}
+          resources:
+            {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
+---
+{{/*
+Attest hook (#3360). This hook is the refusal carrier when the drain Job
+object is deleted: Helm treats that deletion as the drain hook finishing, so
+this later hook fails closed unless the success record exists. A finalizer
+does not close that gap: the SIGTERM handler must clear the quiesce marker and
+exit, and dropping the finalizer there lets the object disappear. Leaving the
+finalizer wedges the next before-hook-creation delete.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-upgrade-drain-attest
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: upgrade-drain-attest
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  # The clock starts at Job creation, so it has to cover scheduling and the
+  # worker image pull, not only the Valkey read. The release hook uses the
+  # same ceiling. A tighter deadline can fail attest after a clean drain and
+  # leave the roll hold set until it expires.
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "upgrade-drain-attest") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      restartPolicy: Never
+      {{- if or (not .Values.priorityClasses.platform.create) (not .Release.IsUpgrade) }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: upgrade-drain-attest
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- with .Values.worker.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "attest", "--installation-id-observed={{ $installationIdObserved }}"]
+          env:
+            {{- include "curie.env.valkey" . | nindent 12 }}
+            - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
+              value: {{ $drainTimeout | quote }}
+            - name: CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S
+              value: {{ .Values.worker.upgradeDrain.pollIntervalSeconds | quote }}
             - name: CURIE_UPGRADE_QUIESCE_TTL_S
               value: {{ $quiesceTtl | quote }}
             - name: CURIE_INSTALLATION_ID

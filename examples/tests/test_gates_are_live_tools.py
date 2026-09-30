@@ -157,19 +157,25 @@ def bundle(
     b = root / "bundle"
     (b / ".claude-plugin").mkdir(parents=True)
     (b / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({
-            "name": "fixture",
-            "version": "0.0.1",
-            "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
-            **({
-                "toolPolicy": {
-                    "enforcement": "curie/mcp-tool-policy@1",
-                    "allow": [],
-                    "approvalRequired": approval_required,
-                    "deny": [],
-                }
-            } if approval_required is not None else {}),
-        }),
+        json.dumps(
+            {
+                "name": "fixture",
+                "version": "0.0.1",
+                "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
+                **(
+                    {
+                        "toolPolicy": {
+                            "enforcement": "curie/mcp-tool-policy@1",
+                            "allow": [],
+                            "approvalRequired": approval_required,
+                            "deny": [],
+                        }
+                    }
+                    if approval_required is not None
+                    else {}
+                ),
+            }
+        ),
         encoding="utf-8",
     )
     return b

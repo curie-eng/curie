@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from runner_dockerfile_support import logical_instructions
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,26 +27,10 @@ APP_DOCKERFILES = (
 )
 
 
-def _logical_instructions(dockerfile_text: str) -> list[str]:
-    instructions: list[str] = []
-    pending: list[str] = []
-    for raw_line in dockerfile_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        continues = line.endswith("\\")
-        pending.append(line[:-1].rstrip() if continues else line)
-        if not continues:
-            instructions.append(" ".join(pending))
-            pending = []
-    assert not pending, "Dockerfile ends with an unfinished continuation"
-    return instructions
-
-
 @functools.cache
 def _builder_stage_instructions(relative: str) -> list[str]:
     text = (_REPO_ROOT / relative).read_text(encoding="utf-8")
-    instructions = _logical_instructions(text)
+    instructions = logical_instructions(text)
     from_indexes = [i for i, ins in enumerate(instructions) if ins.startswith("FROM ")]
     assert len(from_indexes) >= 2, f"{relative} does not have a runtime stage"
     return instructions[from_indexes[0] : from_indexes[1]]

@@ -19,6 +19,7 @@ from typing import Literal, Protocol
 
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
+from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
 from plugin_format import is_reserved_boot_env_name
 
 # Substrate-neutral labels: every backend tags its managed objects with these
@@ -31,6 +32,7 @@ THREAD_HASH_LABEL = "curietech.ai/thread-hash"
 # rejects curietech.ai under additionalPodMetadata; template pod labels and
 # claim metadata labels are the supported paths (#1488).
 AGENT_LABEL = "curietech.ai/agent"
+TURN_PROGRESS_ELIGIBILITY_ENV = "CURIE_TURN_PROGRESS_ENABLED"
 
 _GENERIC_POOL_SUFFIX = "-runner-pool"
 
@@ -52,15 +54,45 @@ def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
 
 
 def claim_warm_pool(
-    base_pool: str, env: Mapping[str, str] | None, agent_name: str | None
+    base_pool: str,
+    env: Mapping[str, str] | None,
+    agent_name: str | None,
+    agent_pools: frozenset[str],
+    connector_secret_pools: frozenset[str],
 ) -> str:
-    """Route connector-secret claims to the per-agent pool, otherwise the generic pool."""
+    """Pick the warm pool a claim names.
 
+    The chart states which per-agent pools it rendered: ``agent_pools`` is
+    every one (CURIE_AGENT_SANDBOX_POOLS), ``connector_secret_pools`` those
+    whose template carries connector secretKeyRefs
+    (CURIE_AGENT_CONNECTOR_SECRET_POOLS). The ``connector_secret_keys`` marker
+    comes from the agent's own bundle and does not agree with either: an agent
+    deployed with ``curie cluster deploy`` can set it while no render produced
+    its pool (#2943). A secret claim with no secret-capable pool raises
+    MissingAgentPoolError at once instead of blocking on an object nothing
+    created, and is never sent to another pool: connector secret values are
+    stripped from the claim env and reach the pod only through that template.
+    """
+
+    if not agent_name:
+        return base_pool
+    pool = agent_warm_pool_name(base_pool, agent_name)
     marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if marker and agent_name:
-        return agent_warm_pool_name(base_pool, agent_name)
+    if marker:
+        # A non-chart base pool yields no derivable per-agent name.
+        if agent_name in connector_secret_pools and pool != base_pool:
+            return pool
+        raise MissingAgentPoolError(agent_name, pool)
+    if agent_name in agent_pools:
+        return pool
     return base_pool
 
+# The worker's own credentials, which never enter a sandbox. The connector
+# caller signing key is here and the caller token it signs
+# (``CURIE_CONNECTOR_CALLER_TOKEN``) is deliberately not: the token is this
+# sandbox's own identity, short-lived and naming only its agent, and the runner
+# must keep it to present to its hosted connectors (ADR-0168 decision 7). The
+# key could mint a token naming any agent.
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     {
         "POSTGRES_PASSWORD",
@@ -74,8 +106,20 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
 )
+
+#: A second Slack identity's tokens are indexed (ADR-0168 decision 1), so they
+#: are matched by prefix rather than listed. Every name here is under ``CURIE_``,
+#: which a connector secret may never declare, so no marker readmits one.
+HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = SLACK_CREDENTIAL_ENV_PREFIXES
+
+
+def _is_host_application_credential(name: str) -> bool:
+    return name in HOST_APPLICATION_CREDENTIAL_ENV_NAMES or name.startswith(
+        HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES
+    )
 
 
 def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
@@ -91,7 +135,7 @@ def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
     return {
         name: value
         for name, value in env.items()
-        if name not in HOST_APPLICATION_CREDENTIAL_ENV_NAMES
+        if not _is_host_application_credential(name)
         or (
             name in declared_connector_secret_names
             and not is_reserved_boot_env_name(name)
@@ -138,6 +182,18 @@ class SandboxHandle:
     # when a denied/failed revision leaves the git head unchanged.
     publication_visible_outcome_revision: int = 0
     generation: int = 0
+    # CURIE_MAX_TURNS this runner booted with (#3071), None when absent. The
+    # runner reads it once at boot, so a delivery wanting a different budget
+    # must not adopt this route.
+    max_turns: str | None = None
+    # Whether this runner booted with a connector caller token (ADR-0168
+    # decision 7). False for a record written before the field existed, which
+    # is what makes the one replacement after an install gains a caller key.
+    carries_caller_token: bool = False
+    # Whether this runner booted with ADR 0130's model-visible tool and prompt.
+    # False rehydrates legacy routes conservatively and forces one replacement
+    # before an eligible turn may adopt them.
+    carries_turn_progress: bool = False
 
     @property
     def sandbox_id(self) -> str:
@@ -192,6 +248,13 @@ class SubstrateConfig:
 
     namespace: str
     warm_pool: str
+    # Agents the chart renders a per-agent pool for (agentSandbox.connectorSecrets,
+    # agentSandbox.registryEgress, #3083, #2943, or agentSandbox.runnerImages,
+    # ADR-0173), from CURIE_AGENT_SANDBOX_POOLS.
+    agent_pools: frozenset[str] = frozenset()
+    # The subset whose pool template carries connector secrets
+    # (agentSandbox.connectorSecrets), from CURIE_AGENT_CONNECTOR_SECRET_POOLS.
+    connector_secret_pools: frozenset[str] = frozenset()
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
     # is an orphan and reap_orphans() deletes it.
@@ -321,6 +384,8 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 
@@ -349,6 +414,15 @@ class SandboxClient(Protocol):
         request_timeout_seconds: float,
     ) -> bool: ...
 
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        """The scheduler's message when pod ``name`` is ``PodScheduled=False``
+        with reason ``Unschedulable``; None when it is scheduled, missing, or
+        unreadable."""
+
+        ...
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None: ...
 
 
@@ -358,6 +432,32 @@ class SandboxError(Exception):
 
 class ClaimTimeoutError(SandboxError):
     """The claim did not bind a ready sandbox within the configured timeout."""
+
+
+class UnschedulableClaimError(ClaimTimeoutError):
+    """The claim timed out while its pod was Unschedulable: no node has room.
+
+    A ClaimTimeoutError subclass, so every caller that handles a claim timeout
+    keeps doing so; only the factory work-item path treats it as capacity
+    (#3169).
+    """
+
+
+class MissingAgentPoolError(SandboxError):
+    """An agent declares connector secrets but the chart rendered no pool for it.
+
+    Retrying cannot help: the pool appears only after an operator sets
+    ``agentSandbox.connectorSecrets.<agent>`` and upgrades the release (#2943).
+    """
+
+    def __init__(self, agent_name: str, pool: str) -> None:
+        self.agent_name = agent_name
+        self.pool = pool
+        super().__init__(
+            f"agent {agent_name} declares connector secrets but SandboxWarmPool "
+            f"{pool} was not rendered; set agentSandbox.connectorSecrets.{agent_name} "
+            "in the release values and upgrade"
+        )
 
 
 class CapacityExhaustedError(SandboxError):

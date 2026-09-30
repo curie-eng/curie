@@ -33,6 +33,7 @@ import pytest
 import redis
 from curie_dispatcher import identity as identity_module
 from curie_dispatcher import run
+from curie_dispatcher.admission import build_admission
 from curie_dispatcher.app import build_app
 from curie_dispatcher.approval_actions import APPROVE_ACTION_ID, ResolveOutcome
 from curie_dispatcher.config import DispatcherConfig
@@ -719,8 +720,11 @@ def test_an_app_built_without_an_identity_client_makes_no_network_call(
     try:
         api_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
         cfg = config.model_copy(update={"api_base_url": api_url})
+        # Keep admission on its own fake API while observing identity traffic.
+        admission = build_admission(config, redis_client)
         app = build_app(
             cfg,
+            admission=admission,
             web_client=_web_client(),
             redis_client=redis_client,
             authorize=_authorize,

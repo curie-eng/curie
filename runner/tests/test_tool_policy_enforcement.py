@@ -33,7 +33,11 @@ from typing import Any
 
 import anyio
 import pytest
-from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 from curie_runner import mcp_tool_capability
 from curie_runner.approval import (
     APPROVAL_TOOL_NAME,
@@ -77,7 +81,10 @@ def _hook_call(
     matcher = hooks["PreToolUse"][0]
     callback = matcher.hooks[0]
     return anyio.run(
-        callback, {"tool_name": tool_name, "tool_input": tool_input or {}}, None, None
+        callback,
+        {"tool_name": tool_name, "tool_input": tool_input or {}},
+        "toolu_policy_test",
+        None,
     )
 
 
@@ -152,7 +159,12 @@ def _interception_reason(
     if interceptor == "hook":
         result = _hook_call(gate, tool_name, tool_input)
         return _reason(result) if _denied(result) else ""
-    outcome = anyio.run(build_can_use_tool(gate), tool_name, tool_input or {}, None)
+    outcome = anyio.run(
+        build_can_use_tool(gate),
+        tool_name,
+        tool_input or {},
+        ToolPermissionContext(tool_use_id="toolu_policy_test"),
+    )
     return outcome.message if isinstance(outcome, PermissionResultDeny) else ""
 
 
@@ -246,7 +258,10 @@ def test_nonconforming_mcp_tool_name_fails_catalog_probe_closed(
 
     callback_gate = _catalog_gate()
     callback_result = anyio.run(
-        build_can_use_tool(callback_gate), live_name, {}, None
+        build_can_use_tool(callback_gate),
+        live_name,
+        {},
+        ToolPermissionContext(tool_use_id="toolu_policy_test"),
     )
     assert isinstance(callback_result, PermissionResultDeny)
     _assert_no_approval_was_recorded(callback_gate)
@@ -307,7 +322,10 @@ def test_policy_disallowed_tools_project_only_denied_observed_runtime_names() ->
 
         callback_gate = _catalog_gate()
         callback_result = anyio.run(
-            build_can_use_tool(callback_gate), tool_name, {}, None
+            build_can_use_tool(callback_gate),
+            tool_name,
+            {},
+            ToolPermissionContext(tool_use_id="toolu_policy_test"),
         )
         assert isinstance(callback_result, PermissionResultDeny)
         assert "denied by this agent's tool policy" in callback_result.message
@@ -366,7 +384,10 @@ def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy
         reason = _reason(result)
     else:
         result = anyio.run(
-            build_can_use_tool(gate), PLATFORM_PUBLISH_TOOL_NAME, tool_input, None
+            build_can_use_tool(gate),
+            PLATFORM_PUBLISH_TOOL_NAME,
+            tool_input,
+            ToolPermissionContext(tool_use_id="toolu_policy_test"),
         )
         assert isinstance(result, PermissionResultDeny)
         reason = result.message
@@ -388,7 +409,12 @@ def test_platform_request_approval_is_outside_production_sre_tool_policy(
     if interceptor == "hook":
         assert _hook_call(gate, APPROVAL_TOOL_NAME) == {}
     else:
-        result = anyio.run(build_can_use_tool(gate), APPROVAL_TOOL_NAME, {}, None)
+        result = anyio.run(
+            build_can_use_tool(gate),
+            APPROVAL_TOOL_NAME,
+            {},
+            ToolPermissionContext(tool_use_id="toolu_policy_test"),
+        )
         assert isinstance(result, PermissionResultAllow)
 
     _assert_no_approval_was_recorded(gate)
@@ -431,7 +457,9 @@ def test_the_callback_agrees_with_the_hook(tool: str) -> None:
     -- the defect class #1852 closed for the two invocation contexts."""
     gate = _gate(_policy(deny=["k8s-write/restart_deployment"]))
     callback = build_can_use_tool(gate)
-    result = anyio.run(callback, tool, {}, None)
+    result = anyio.run(
+        callback, tool, {}, ToolPermissionContext(tool_use_id="toolu_policy_test")
+    )
     assert type(result).__name__ == "PermissionResultDeny"
 
 

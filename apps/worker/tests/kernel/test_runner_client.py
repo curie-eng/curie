@@ -1450,10 +1450,10 @@ async def _assert_real_timeout_boundary(
     for private_value in (
         epoch,
         _RUNNER_TOKEN,
-        _PRIVATE_EVENT_TEXT,
         _PRIVATE_TOOL_CALL,
         _PRIVATE_TOOL_ARGUMENT,
         _PRIVATE_POST_TIMEOUT_TEXT,
+        _PRIVATE_EVENT_TEXT,
     ):
         assert private_value not in material
     if not release_on_interrupt:

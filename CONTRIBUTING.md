@@ -8,6 +8,20 @@ Read [`AGENTS.md`](AGENTS.md) alongside this guide: it is the authoritative
 source for the build, test, and architecture conventions summarized here, and
 each area's own `CLAUDE.md` carries the rules specific to that directory.
 
+## Table of contents
+
+- [Scope of contributions](#scope-of-contributions)
+- [Labeling issues, PRs, and discussions](#labeling-issues-prs-and-discussions)
+- [Before you start](#before-you-start)
+- [Development setup](#development-setup)
+- [Running the checks](#running-the-checks)
+  - [Testing discipline](#testing-discipline)
+- [Frozen contracts: stop and escalate](#frozen-contracts-stop-and-escalate)
+- [Decisions: ADR vs GitHub issue](#decisions-adr-vs-github-issue)
+- [Release train, branch, commit, and PR conventions](#release-train-branch-commit-and-pr-conventions)
+- [Certifying your contribution](#certifying-your-contribution)
+- [Getting help while contributing](#getting-help-while-contributing)
+
 ## Scope of contributions
 
 We welcome bug reports, documentation improvements, tests, and focused feature
@@ -67,6 +81,20 @@ main checkout. Read only runs against the current tree are fine; the moment you
 need to change code, cut a worktree.
 
 ## Running the checks
+
+Once the primary checkout contains the tracked hook, run `curie dev hooks
+install` there or from any linked worktree. This sets the repository's shared
+`core.hooksPath` to the primary checkout's tracked `hooks/` directory, so new
+linked worktrees use the hook automatically. Keep the primary checkout in place.
+Keep it on a revision containing `hooks/pre-push`; switching it to an older
+revision removes the hook for every linked worktree. An existing custom
+`core.hooksPath` is preserved. Once installed, Git no longer runs hooks from
+`.git/hooks`.
+Each push checks Rust formatting when the pushed commits change
+`cli/` Rust files, and checks Python formatting and lint only for Python files
+changed by those commits. The hook prints the command to fix a failure. It
+checks the currently checked out `HEAD`; commit local source edits before
+pushing. It does not replace the full CI checks below.
 
 CI (`.github/workflows/ci.yaml`) runs the same commands below. Run the ones for
 the area you touched before opening a PR. Scope test runs to what you changed;
@@ -210,6 +238,13 @@ list. Then run every parity ladder rung on the resulting `main` commit:
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
+
+The schema window gate requires the candidate window to match the Alembic head
+and the API window in `apps/api/src/curie_api/schema_compat.json`. It also
+requires the chart version's window to match the candidate. If a migration
+lands after the chart version is registered in the architecture atlas, bump
+the chart and CLI to a new version first. While the version is unregistered,
+rerun `curie dev bump-version` after the migration to refresh its window.
 
 Tag v0.7.0 from `main` only after both commands pass. Only an administrator may
 retire `next`. Before deleting it, the administrator must merge one release

@@ -18,7 +18,7 @@ const CHANNEL: &str = "C0EXAMPLE1";
 const API_KEY: &str = "fixture-platform-key";
 const RELAY_ADAPTER: &str = "curie-cluster-message";
 const WORKER_CLAIM_SELECTION: &str = "kubectl get pods -n acme-system -l app.kubernetes.io/instance=acme-release,app.kubernetes.io/component=worker -o json";
-const WORKER_CLAIM_EXEC: &str = "kubectl exec -n acme-system worker-stable-a -- python -m curie_worker.upgrade_drain --mode status --json";
+const WORKER_CLAIM_EXEC: &str = "kubectl exec -n acme-system worker-stable-a -- python -m curie_worker.upgrade_drain --mode status --json --with-ttl";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -102,6 +102,15 @@ def redis_reply(command):
             })
             return stream_id
         return bulk(update_state(append))
+    if verb == "SADD":
+        # Thread reset after an eval sample. A successful integer is enough;
+        # the member is recorded only so a missed SADD is visible in state.
+        member = words[2] if len(words) > 2 else ""
+        def remember(state):
+            state.setdefault("sadd_members", []).append(member)
+            return 1
+        update_state(remember)
+        return b":1\r\n"
     if verb == "XACK":
         entry_ids = words[3:]
         def acknowledge(state):
@@ -313,7 +322,7 @@ if args == ["get", "pods", "-n", "acme-system", "-l", worker_selector, "-o", "js
 
 if args == [
     "exec", "-n", "acme-system", "worker-stable-a", "--",
-    "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json",
+    "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json", "--with-ttl",
 ]:
     print('{"state":"claims_enabled","since":null,"revision":null}')
     sys.exit(0)
@@ -420,6 +429,54 @@ impl Fixture {
         if continue_turn {
             command.arg("--continue");
         }
+        command
+    }
+
+    /// `cluster eval` from a directory that has the cases file and no
+    /// `evals/trajectory.json`. Same PATH and cluster env as `command`.
+    /// Does not set `CURIE_TEST_CONNECTED`.
+    fn eval_command(&self, cwd: &Path) -> Command {
+        let cases = cwd.join("cases.json");
+        fs::write(
+            &cases,
+            r#"{"name":"smoke","cases":[{"id":"alpha","input":"alpha","grader":{"kind":"contains","expected":"reply-alpha"}}]}"#,
+        )
+        .expect("write cluster eval cases");
+        let mut command = Command::new(bin());
+        command
+            .args(["cluster", "eval"])
+            .args([
+                "--cases",
+                cases.to_str().expect("cases path is utf-8"),
+                "--channel",
+                CHANNEL,
+                "--namespace",
+                "acme-system",
+                "--release",
+                "acme-release",
+                "--listen-host",
+                "127.0.0.1",
+                "--valkey-local-port",
+                "0",
+                "--api-local-port",
+                "0",
+                "--api-key",
+                API_KEY,
+                "--valkey-password",
+                "fixture-valkey-password",
+                "--stream",
+                "curie:test:cluster-eval-3351",
+                "--timeout-secs",
+                "3",
+                "--json",
+            ])
+            .current_dir(cwd)
+            .env("PATH", &self.path)
+            .env("CURIE_TEST_CLUSTER_LOG", &self.log_path)
+            .env("CURIE_TEST_CLUSTER_STATE", &self.state_path)
+            .env_remove("CURIE_API_KEY")
+            .env_remove("CURIE_VALKEY_PASSWORD")
+            .env_remove("CURIE_SLACK_BOT_TOKEN");
         command
     }
 
@@ -843,9 +900,9 @@ fn connected_dispatcher_uses_slack_placeholder_and_never_the_relay() {
     let state = fixture.state();
     assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
     let handle = &state["turns"][0]["payload"]["reply_handle"];
-    assert!(
-        handle["adapter"].is_null(),
-        "connected turn selected relay: {handle}"
+    assert_eq!(
+        handle["adapter"], "default",
+        "a connected turn speaks as the default identity, never the relay: {handle}"
     );
     assert!(
         handle["endpoint"].is_null(),
@@ -913,5 +970,108 @@ fn cluster_json_dry_run_hides_callback_endpoint_but_human_plan_names_poll_url() 
     assert!(
         plan.contains("poll replies at http://127.0.0.1:18157/cluster-message-replies/<uuid-v4>"),
         "human plan must still explain the separate loopback poll URL: {plan}"
+    );
+}
+
+#[test]
+fn cluster_eval_grades_through_the_message_relay_without_a_stub_or_rollout() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .eval_command(fixture.state_home.path())
+        .output()
+        .expect("run cluster eval");
+    assert!(
+        output.status.success(),
+        "cluster eval must grade through the relay: {}",
+        describe(&output)
+    );
+    let report = json_output(&output);
+    let case = &report["cases"][0];
+    assert_eq!(case["outcome"], "pass", "{report}");
+    let graded = case["output"].as_str().expect("case output is a string");
+    assert!(
+        graded.contains("reply-alpha"),
+        "the relay reply is the graded output: {graded}"
+    );
+
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("recorded turns");
+    assert_eq!(turns.len(), 1, "exactly one XADD: {turns:#?}");
+    let payload = &turns[0]["payload"];
+    let reply_ref = assert_relay_turn(payload, "alpha");
+    let conversation_id = payload["conversation_id"]
+        .as_str()
+        .expect("conversation_id");
+    assert!(
+        conversation_id.starts_with("eval:"),
+        "eval isolation prefix missing: {conversation_id}"
+    );
+    let resets = state["sadd_members"].as_array().expect("thread reset SADD");
+    assert!(!resets.is_empty(), "eval must SADD the scoped thread key");
+    assert!(
+        resets.iter().all(|member| {
+            member
+                .as_str()
+                .is_some_and(|value| value.starts_with("slack:C0EXAMPLE1:eval%3A"))
+        }),
+        "reset must be the scoped eval thread key, not the bare conversation id: {resets:?}"
+    );
+    assert_eq!(
+        state["xack_commands"],
+        serde_json::json!([]),
+        "the CLI must never issue XACK"
+    );
+    assert_eq!(
+        state["worker_xacks"].as_array().map(Vec::len),
+        Some(1),
+        "the worker xacks the delivered eval turn once: {state}"
+    );
+    let gets = state["http_gets"].as_array().expect("recorded relay GETs");
+    let relay_path = format!("/cluster-message-replies/{reply_ref}");
+    assert!(
+        gets.iter().any(|get| {
+            get["path"]
+                .as_str()
+                .is_some_and(|path| path.contains(&relay_path))
+        }),
+        "at least one relay GET for {reply_ref}: {gets:#?}"
+    );
+    let log = fixture.log();
+    assert_no_worker_rollout(&log, &state);
+    assert!(
+        !log.contains("slackTrustedOrigins"),
+        "cluster eval must not rewrite worker Slack trust: {log}"
+    );
+}
+
+#[test]
+fn cluster_eval_timeout_names_the_missing_relay_reply_not_stream_internals() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .eval_command(fixture.state_home.path())
+        .env("CURIE_TEST_RELAY_MODE", "timeout")
+        .output()
+        .expect("run cluster eval relay timeout");
+    // Red eval is Failure (1), not usage (2) and not a transient message timeout (3).
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let report = json_output(&output);
+    let case = &report["cases"][0];
+    assert_eq!(case["outcome"], "fail", "{report}");
+    let graded = case["output"].as_str().expect("case output is a string");
+    // Stable substrings: "cluster message relay" and "deadline".
+    // The case output must not dump stream internals under replied.
+    assert!(graded.contains("cluster message relay"), "{graded}");
+    assert!(graded.contains("deadline"), "{graded}");
+    assert!(!graded.contains("XLEN"), "{graded}");
+    assert!(!graded.contains("XPENDING"), "{graded}");
+    assert!(!graded.contains("group name="), "{graded}");
+
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("recorded turns");
+    assert_eq!(turns.len(), 1, "{turns:#?}");
+    assert_relay_turn(&turns[0]["payload"], "alpha");
+    assert_eq!(
+        turns[0]["pending"], true,
+        "a relay timeout leaves the worker's entry pending"
     );
 }

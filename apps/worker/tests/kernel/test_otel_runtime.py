@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import threading
+import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 from aci_protocol import (
+    Attachment,
     ErrorEvent,
     Event,
     Final,
     QueuedTurn,
-    ReplyHandle,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    TurnSource,
 )
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -29,31 +29,40 @@ from curie_telemetry import (
     inject_trace_context,
     operation_span,
     record_metric,
-    stamp_event_id,
 )
+from curie_telemetry.metrics import record_metric as validate_record_metric
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
 from curie_worker import runner_client as runner_client_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker import threadlock as threadlock_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.attachments import AttachmentResolutionError
+from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.sandbox import substrate as substrate_module
-from opentelemetry import context as otel_context
-from opentelemetry import trace
 from opentelemetry.trace import (
-    NonRecordingSpan,
-    SpanContext,
     SpanKind,
     StatusCode,
-    TraceFlags,
-    TraceState,
 )
+
+# importlib import mode does not add the tests directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from otel_fixtures import (  # noqa: E402
+    REMOTE_TRACE_ID,
+    Metric,
+    Probe,
+    SpanCall,
+    install,
+)
+from queue_fixtures import qevent  # noqa: E402
 
 DONE = SessionStatus.DONE
 AWAITING = SessionStatus.AWAITING_APPROVAL
-_REMOTE_TRACE_ID = int("3123456789abcdef0123456789abcdef", 16)
 _REMOTE_SPAN_ID = int("3123456789abcdef", 16)
 _TRACEPARENT = "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"
 _BOUNDED_KEYS = {
@@ -63,146 +72,30 @@ _BOUNDED_KEYS = {
     "source",
     "outcome",
     "retry_class",
+    "agent",
 }
 
 
-@dataclass(frozen=True)
-class _Metric:
-    name: str
-    value: float
-    attributes: dict[str, str]
-
-
-@dataclass
-class _SpanCall:
-    name: str
-    kind: Any
-    parent_trace_id: int
-    parent_span_id: int
-    span_id: int
-    attributes: dict[str, str]
-    events: list[tuple[str, dict[str, str]]] = field(default_factory=list)
-    status: Any = None
-
-
-class _ProbeSpan:
-    def __init__(self, call: _SpanCall) -> None:
-        self._call = call
-
-    def add_event(
-        self, name: str, attributes: Mapping[str, str] | None = None, **_kwargs: Any
-    ) -> None:
-        self._call.events.append((name, dict(attributes or {})))
-
-    def set_attribute(self, name: str, value: Any) -> None:
-        self._call.attributes[name] = str(value)
-
-    def record_exception(self, _exc: BaseException) -> None:
-        pass
-
-    def set_status(self, status: Any, _description: str | None = None) -> None:
-        self._call.status = status
-
-
-class _Probe:
-    def __init__(self) -> None:
-        self.spans: list[_SpanCall] = []
-        self.metrics: list[_Metric] = []
-        self._next_span_id = 0x4000000000000000
-        # operation_span is called from asyncio.to_thread worker threads (the
-        # sandbox claim/release hops in kernel.py), not just the event loop.
-        # Without a lock, two threads can read the same _next_span_id and mint
-        # duplicate span ids, which collapses T6's {span_id: call} root-join map.
-        self._lock = threading.Lock()
-
-    @contextmanager
-    def operation_span(
-        self,
-        name: str,
-        *,
-        kind: Any,
-        parent: Any = None,
-        attributes: Mapping[str, str] | None = None,
-    ) -> Iterator[_ProbeSpan]:
-        parent_span = trace.get_current_span(parent).get_span_context()
-        if parent is None:
-            parent_span = trace.get_current_span().get_span_context()
-        trace_id = parent_span.trace_id if parent_span.is_valid else _REMOTE_TRACE_ID + 1
-        with self._lock:
-            span_id = self._next_span_id
-            self._next_span_id += 1
-            call = _SpanCall(
-                name=name,
-                kind=kind,
-                parent_trace_id=parent_span.trace_id,
-                parent_span_id=parent_span.span_id,
-                span_id=span_id,
-                # The REAL stamping helper, not a reimplementation: this probe
-                # replaces ``operation_span`` wholesale, so anything reimplemented
-                # here would be tested instead of the production code path.
-                attributes=dict(stamp_event_id(attributes)),
-            )
-            self.spans.append(call)
-        child = SpanContext(
-            trace_id=trace_id,
-            span_id=span_id,
-            is_remote=False,
-            trace_flags=TraceFlags.SAMPLED,
-            trace_state=TraceState(),
-        )
-        token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(child)))
-        try:
-            yield _ProbeSpan(call)
-        finally:
-            otel_context.detach(token)
-
-    def record_metric(
-        self,
-        name: str,
-        value: float = 1,
-        *,
-        attributes: Mapping[str, str] | None = None,
-    ) -> None:
-        with self._lock:
-            self.metrics.append(_Metric(name, float(value), dict(attributes or {})))
-
-
-def _install(monkeypatch: pytest.MonkeyPatch) -> _Probe:
-    """Capture direct imports and module-qualified shared API calls alike."""
-
-    import curie_telemetry
-
-    probe = _Probe()
-    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
-    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
-    for module in (
+def _install(monkeypatch: pytest.MonkeyPatch) -> Probe:
+    return install(
+        monkeypatch,
         consumer_module,
         stream_consumer_module,
         kernel_module,
         threadlock_module,
         runner_client_module,
         substrate_module,
-    ):
-        if hasattr(module, "operation_span"):
-            monkeypatch.setattr(module, "operation_span", probe.operation_span)
-        if hasattr(module, "record_metric"):
-            monkeypatch.setattr(module, "record_metric", probe.record_metric)
-    return probe
+    )
 
 
-def _qevent(
-    text: str,
-    *,
-    thread: str = "thread-otel",
-    event_id: str | None = None,
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C0EXAMPLE1", placeholder="p-1"),
+def _qevent(text: str, **overrides: Any) -> QueuedTurn:
+    # received_at is evaluated per call: a module-level partial would freeze it.
+    overrides.setdefault("thread", "thread-otel")
+    return qevent(
+        text,
+        channel="C0EXAMPLE1",
         received_at=datetime.now(UTC).isoformat(),
+        **overrides,
     )
 
 
@@ -222,11 +115,11 @@ async def _deliver(consumer: Consumer, h, fields: dict[str, str]) -> str:
     return entry_id
 
 
-def _metrics(probe: _Probe, name: str) -> list[_Metric]:
-    return [point for point in probe.metrics if point.name == name]
+def _metrics(probe: Probe, name: str) -> list[Metric]:
+    return probe.points(name)
 
 
-def _spans(probe: _Probe, name: str) -> list[_SpanCall]:
+def _spans(probe: Probe, name: str) -> list[SpanCall]:
     return [span for span in probe.spans if span.name == name]
 
 
@@ -244,7 +137,12 @@ def test_missing_or_malformed_carrier_runs_and_acks_under_a_safe_root(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="safe", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             fields = {"payload": _qevent("safe root").model_dump_json()}
             if carrier is not None:
@@ -256,9 +154,7 @@ def test_missing_or_malformed_carrier_runs_and_acks_under_a_safe_root(
             await consumer._observe_queue_state()
 
             assert h.runner.opened == ["safe root"]
-            pending = await h.async_redis.xpending(
-                h.config.stream, h.config.consumer_group
-            )
+            pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
             assert pending["pending"] == 0
             process = _spans(probe, "curie.queue.process")
             assert len(process) == 1
@@ -282,12 +178,10 @@ def test_missing_or_malformed_carrier_runs_and_acks_under_a_safe_root(
             ):
                 assert _metrics(probe, name)
             assert {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.turn.accepted")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.turn.accepted")
             } == {"accepted"}
             assert {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.turn.completed")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.turn.completed")
             } == {"done"}
             for point in probe.metrics:
                 assert set(point.attributes) <= _BOUNDED_KEYS
@@ -365,6 +259,82 @@ def test_turn_process_span_exports_bounded_terminal_failures_as_error(
     asyncio.run(go())
 
 
+def test_a_resolved_agent_labels_only_the_agent_turn_counter(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2952: the fleet counter stays unlabeled; the agent series names the bot.
+
+    No binding leaves ``unbound``. A binding's agent name is the label. The
+    fleet ``curie.turn.completed`` point never gains an agent attribute.
+    """
+
+    class _Resolved:
+        def __init__(self) -> None:
+            self.agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+            self.agent_name = "acme-bot"
+            self.endpoint = None
+            self.adapter = None
+
+    class _Binding:
+        async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _Resolved:
+            return _Resolved()
+
+        def boot_env(
+            self,
+            _resolved: object,
+            thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            del kind, address
+            return {
+                "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
+                "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+            }
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    async def go() -> None:
+        probe = _install(monkeypatch)
+        async with make_harness() as unbound:
+            await unbound.kernel.process_event(_qevent("plain", thread="thread-unbound-agent"))
+            unlabeled = _metrics(probe, "curie.turn.completed")
+            assert unlabeled
+            assert "agent" not in unlabeled[-1].attributes
+            agent_points = _metrics(probe, "curie.agent.turn.completed")
+            assert agent_points[-1].attributes["agent"] == "unbound"
+            assert agent_points[-1].attributes["outcome"] == "done"
+
+        probe.metrics.clear()
+        async with make_harness(binding=_Binding()) as named:
+            await named.kernel.process_event(_qevent("named", thread="thread-named-agent"))
+            fleet = _metrics(probe, "curie.turn.completed")
+            assert fleet and "agent" not in fleet[-1].attributes
+            named_points = _metrics(probe, "curie.agent.turn.completed")
+            assert named_points[-1].attributes["agent"] == "acme-bot"
+            assert named_points[-1].attributes["service.name"] == "curie-worker"
+            # The probe stores attributes. The real recorder must accept them.
+            validate_record_metric(
+                "curie.agent.turn.completed",
+                attributes=named_points[-1].attributes,
+            )
+            validate_record_metric(
+                "curie.turn.completed",
+                attributes=fleet[-1].attributes,
+            )
+            token = kernel_module._TURN_AGENT.set("unbound")
+            try:
+                named.kernel._record_agent_turn("done")
+            finally:
+                kernel_module._TURN_AGENT.reset(token)
+            assert _metrics(probe, "curie.agent.turn.completed")[-1].attributes["agent"] == "other"
+
+    asyncio.run(go())
+
+
 def test_side_effect_failure_has_its_own_terminal_metric_and_span_class(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
@@ -384,9 +354,107 @@ def test_side_effect_failure_has_its_own_terminal_metric_and_span_class(
             assert span.attributes["outcome"] == "side_effect_halted"
             assert span.status is StatusCode.ERROR
             assert {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.turn.completed")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.turn.completed")
             } == {"side_effect_halted"}
+
+    asyncio.run(go())
+
+
+_Refusal = Callable[[Any, pytest.MonkeyPatch], tuple[QueuedTurn, str]]
+
+
+def _refuse_missing_agent_pool(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[QueuedTurn, str]:
+    error = MissingAgentPoolError("acme-bot", "curie-agent-acme-bot-runner-pool")
+
+    def refuse(thread_key: str, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(h.substrate, "claim", refuse)
+    return (
+        _qevent("hello", thread="thread-refused-pool"),
+        f"This agent cannot start: {error}. An operator has to make that change.",
+    )
+
+
+class _UnavailableAttachments:
+    """An attachment lane that refuses every download."""
+
+    def resolve(self, **_kwargs: object) -> object:
+        raise AttachmentResolutionError("fetch", "source refused the download")
+
+
+def _refuse_unavailable_attachment(
+    h: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[QueuedTurn, str]:
+    monkeypatch.setattr(h.kernel, "_attachments", _UnavailableAttachments())
+    return (
+        _qevent(
+            "read this",
+            thread="thread-refused-file",
+            attachments=[Attachment(id="F0EXAMPLE1", name="report.txt")],
+        ),
+        "I could not make that file available to the agent. "
+        "Please send the message again with the file attached.",
+    )
+
+
+def _refuse_capacity(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[QueuedTurn, str]:
+    # Only a Slack turn waits for capacity; any other source is answered at once.
+    h.fake_k8s.quota_rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1"},
+        used={"pods": "2"},
+        hard={"pods": "2"},
+    )
+    return (
+        _qevent("job output", thread="thread-refused-capacity", source=TurnSource.WEBHOOK),
+        "This agent is at capacity right now. Please try again shortly.",
+    )
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [_refuse_missing_agent_pool, _refuse_unavailable_attachment, _refuse_capacity],
+    ids=["missing-agent-pool", "unavailable-attachment", "capacity"],
+)
+def test_a_turn_the_worker_refuses_to_start_completes_as_classified_failure(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: _Refusal,
+) -> None:
+    """A refusal is a failure to alerting and the same one reply to the person.
+
+    Each path answers with the worker's own text and never opens the runner. It
+    completed exactly as a real answer does, outcome ``done``, so an alert on
+    ``classified_failure`` could not see an agent that refused every turn.
+    """
+
+    async def go() -> None:
+        probe = _install(monkeypatch)
+        async with make_harness(max_attempts=3, claim_timeout_seconds=0.05) as h:
+            event, reply = refusal(h, monkeypatch)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            texts = [text for _address, _ref, text in h.sink.updates]
+            assert texts.count(reply) == 1
+            assert texts[-1] == reply
+            assert [
+                completion.outcome
+                for completion in h.sink.completions
+                if completion.event_id == event.event_id
+            ] == ["delivered"]
+            assert {
+                point.attributes["outcome"] for point in _metrics(probe, "curie.turn.completed")
+            } == {"classified_failure"}
+            [span] = _spans(probe, "curie.turn.process")
+            assert span.attributes["outcome"] == "classified_failure"
+            assert span.status is StatusCode.ERROR
+            assert (
+                "turn.processing.completed",
+                {"outcome": "classified_failure"},
+            ) in span.events
 
     asyncio.run(go())
 
@@ -401,7 +469,12 @@ def test_worker_process_parent_flows_to_exact_runner_http_client_boundary(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="traced", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             event = _qevent("trace me", event_id="Ev0EXAMPLETRACE1")
             fields = {
@@ -413,7 +486,7 @@ def test_worker_process_parent_flows_to_exact_runner_http_client_boundary(
 
             process = _spans(probe, "curie.queue.process")
             assert len(process) == 1
-            assert process[0].parent_trace_id == _REMOTE_TRACE_ID
+            assert process[0].parent_trace_id == REMOTE_TRACE_ID
             assert process[0].parent_span_id == _REMOTE_SPAN_ID
 
             rpc = _spans(probe, "curie.runner.rpc")
@@ -422,7 +495,7 @@ def test_worker_process_parent_flows_to_exact_runner_http_client_boundary(
             header = headers["traceparent"]
             version, trace_hex, parent_hex, flags = header.split("-")
             assert version == "00" and flags == "01"
-            assert int(trace_hex, 16) == _REMOTE_TRACE_ID
+            assert int(trace_hex, 16) == REMOTE_TRACE_ID
             assert int(parent_hex, 16) == rpc[-1].span_id
             durations = _metrics(probe, "curie.runner.rpc.request.duration")
             results = _metrics(probe, "curie.runner.rpc.result")
@@ -443,10 +516,15 @@ def test_queue_success_retry_and_dead_letter_emit_bounded_outcomes_and_keep_carr
     async def go() -> None:
         probe = _install(monkeypatch)
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
-            async def fail(_turn: QueuedTurn) -> None:
+            async def fail(_turn: QueuedTurn, *, lease: Any) -> None:
                 raise RuntimeError("injected processing failure")
 
             h.kernel.process_event = fail  # type: ignore[method-assign]
@@ -469,20 +547,17 @@ def test_queue_success_retry_and_dead_letter_emit_bounded_outcomes_and_keep_carr
             assert graveyard[TRACEPARENT_STREAM_FIELD] == _TRACEPARENT
 
             settle_outcomes = {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.queue.settle")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.queue.settle")
             }
             assert settle_outcomes >= {
                 "pending",
                 "dead-letter",
             }
             assert {
-                point.attributes["retry_class"]
-                for point in _metrics(probe, "curie.queue.retry")
+                point.attributes["retry_class"] for point in _metrics(probe, "curie.queue.retry")
             } == {"redelivery"}
             assert {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.queue.dead_letter")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.queue.dead_letter")
             } == {
                 "success",
             }
@@ -545,10 +620,9 @@ def test_turn_lifecycle_covers_lock_start_steer_reply_and_retry(
                 "best-effort",
             }
             assert _metrics(probe, "curie.reply.delivery")
-            assert {
-                p.attributes["retry_class"]
-                for p in _metrics(probe, "curie.queue.retry")
-            } >= {"rate-limit"}
+            assert {p.attributes["retry_class"] for p in _metrics(probe, "curie.queue.retry")} >= {
+                "rate-limit"
+            }
             assert not _metrics(probe, "curie.reply.retry"), (
                 "a model rate-limit retry is a queue retry, not a reply-sink retry"
             )
@@ -559,9 +633,7 @@ def test_turn_lifecycle_covers_lock_start_steer_reply_and_retry(
             assert max(point.value for point in active_routes) == 2
             assert active_routes[-1].value == 1
 
-            event_names = {
-                event for span in probe.spans for event, _attributes in span.events
-            }
+            event_names = {event for span in probe.spans for event, _attributes in span.events}
             assert {
                 "thread.lock.acquired",
                 "runner.turn.started",
@@ -589,13 +661,10 @@ def test_fresh_claim_failed_steer_is_not_reported_as_a_finish_race(
             assert len(h.runner.steer_headers) == 1
             assert h.runner.opened == ["first"]
             route_outcomes = [
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.thread.route")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.thread.route")
             ]
             assert route_outcomes == ["start"]
-            lifecycle_events = [
-                name for span in probe.spans for name, _attributes in span.events
-            ]
+            lifecycle_events = [name for span in probe.spans for name, _attributes in span.events]
             assert lifecycle_events.count("runner.finish_race") == 0
             assert lifecycle_events.count("runner.turn.started") == 1
 
@@ -626,13 +695,10 @@ def test_idle_retained_route_is_not_reported_as_a_finish_race(
             assert len(h.runner.steer_headers) == steer_attempts + 1
             assert h.runner.opened == ["first", "second"]
             route_outcomes = [
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.thread.route")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.thread.route")
             ]
             assert route_outcomes == ["start"]
-            lifecycle_events = [
-                name for span in probe.spans for name, _attributes in span.events
-            ]
+            lifecycle_events = [name for span in probe.spans for name, _attributes in span.events]
             assert lifecycle_events.count("runner.finish_race") == 0
             assert lifecycle_events.count("runner.turn.started") == 1
 
@@ -654,9 +720,7 @@ def test_observed_active_turn_that_ends_before_steer_reports_one_finish_race(
             steer_attempts = len(h.runner.steer_headers)
             status_reads = 0
 
-            async def active_before_steer(
-                _base_url: str, **_kwargs: object
-            ) -> dict[str, object]:
+            async def active_before_steer(_base_url: str, **_kwargs: object) -> dict[str, object]:
                 nonlocal status_reads
                 status_reads += 1
                 return {"turn_active": True}
@@ -672,13 +736,10 @@ def test_observed_active_turn_that_ends_before_steer_reports_one_finish_race(
             assert len(h.runner.steer_headers) == steer_attempts + 1
             assert h.runner.opened == ["first", "second"]
             route_outcomes = [
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.thread.route")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.thread.route")
             ]
             assert route_outcomes == ["finish-race", "start"]
-            lifecycle_events = [
-                name for span in probe.spans for name, _attributes in span.events
-            ]
+            lifecycle_events = [name for span in probe.spans for name, _attributes in span.events]
             assert lifecycle_events.count("runner.finish_race") == 1
             assert lifecycle_events.count("runner.turn.started") == 1
 
@@ -758,8 +819,7 @@ def test_approval_suspend_and_resume_have_bounded_lifecycle_outcomes(
             )
 
             outcomes = {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.approval.lifecycle")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.approval.lifecycle")
             }
             assert outcomes >= {"suspended", "resumed"}
             assert {
@@ -889,7 +949,7 @@ def test_stream_timeout_emits_a_timeout_rpc_result_and_a_failed_span(
 # --- #2622: the channel event id on request-path spans ------------------------
 #
 # R3: the probe stores CALLER keys (``stamp_event_id`` returns caller
-# spellings, and ``_ProbeSpan.set_attribute`` writes ``name`` raw), so every
+# spellings, and ``ProbeSpan.set_attribute`` writes ``name`` raw), so every
 # assertion below names ``event_id``. The EXPORTED name
 # (``curie.channel.event_id``) is pinned exactly once, in
 # ``packages/telemetry/tests/test_event_id_scope.py``; a rename must fail there.
@@ -902,7 +962,7 @@ _REQUEST_PATH_SPANS = (
 )
 
 
-def _event_ids(probe: _Probe, name: str) -> list[str | None]:
+def _event_ids(probe: Probe, name: str) -> list[str | None]:
     return [span.attributes.get("event_id") for span in _spans(probe, name)]
 
 
@@ -916,7 +976,12 @@ def test_every_named_request_path_span_carries_the_delivered_event_id(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="stamped", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             event = _qevent("stamp me", event_id="Ev0EXAMPLEKNOWN1")
 
@@ -946,10 +1011,15 @@ def test_failed_processing_keeps_the_event_id_on_the_span_and_off_the_metrics(
     async def go() -> None:
         probe = _install(monkeypatch)
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
-            async def fail(_turn: QueuedTurn) -> None:
+            async def fail(_turn: QueuedTurn, *, lease: Any) -> None:
                 raise RuntimeError("injected processing failure")
 
             h.kernel.process_event = fail  # type: ignore[method-assign]
@@ -960,12 +1030,11 @@ def test_failed_processing_keeps_the_event_id_on_the_span_and_off_the_metrics(
             process = _spans(probe, "curie.queue.process")
             assert len(process) == 1
             assert process[0].attributes.get("event_id") == "Ev0EXAMPLEFAILED1"
-            assert any(
-                name == "queue.processing.failed" for name, _a in process[0].events
-            ), "the failure branch did not run; this test proved nothing"
+            assert any(name == "queue.processing.failed" for name, _a in process[0].events), (
+                "the failure branch did not run; this test proved nothing"
+            )
             assert {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.queue.settle")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.queue.settle")
             } == {"pending"}
             for point in probe.metrics:
                 assert set(point.attributes) <= _BOUNDED_KEYS
@@ -986,7 +1055,12 @@ def test_lease_loss_pending_path_keeps_the_event_id_on_the_span(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="pending", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             class _LostLease:
@@ -1011,12 +1085,11 @@ def test_lease_loss_pending_path_keeps_the_event_id_on_the_span(
             process = _spans(probe, "curie.queue.process")
             assert len(process) == 1
             assert process[0].attributes.get("event_id") == "Ev0EXAMPLEPENDING1"
-            assert not any(
-                name == "queue.message.acked" for name, _a in process[0].events
-            ), "the entry was acked; the lease-loss pending branch did not run"
+            assert not any(name == "queue.message.acked" for name, _a in process[0].events), (
+                "the entry was acked; the lease-loss pending branch did not run"
+            )
             assert "pending" in {
-                point.attributes["outcome"]
-                for point in _metrics(probe, "curie.queue.settle")
+                point.attributes["outcome"] for point in _metrics(probe, "curie.queue.settle")
             }
             for point in probe.metrics:
                 assert "Ev0EXAMPLEPENDING1" not in point.attributes.values()
@@ -1053,12 +1126,12 @@ class _Rendezvous:
         self.admitted += 1
 
 
-def _root_of(probe: _Probe, span: _SpanCall) -> _SpanCall | None:
+def _root_of(probe: Probe, span: SpanCall) -> SpanCall | None:
     """The ``curie.queue.process`` ancestor of ``span``, by span-id linkage."""
 
     by_id = {call.span_id: call for call in probe.spans}
     seen: set[int] = set()
-    current: _SpanCall | None = span
+    current: SpanCall | None = span
     while current is not None and current.name != "curie.queue.process":
         if current.span_id in seen:
             return None
@@ -1103,7 +1176,12 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
                 runner.tail = [Final(text="done", status=DONE)]
                 runner.hold = rendezvous
 
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             assert consumer._max_concurrency >= turns, (
                 "the consumer semaphore must admit every turn at once, or the "
@@ -1122,9 +1200,7 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
             assert len(delivered_ids) == turns
 
             for event in events:
-                await h.async_redis.xadd(
-                    h.config.stream, {"payload": event.model_dump_json()}
-                )
+                await h.async_redis.xadd(h.config.stream, {"payload": event.model_dump_json()})
             rows = await h.async_redis.xreadgroup(
                 h.config.consumer_group,
                 h.config.consumer_name,
@@ -1135,9 +1211,7 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
             assert len(entries) == turns, f"expected {turns} entries, got {len(entries)}"
             for entry_id, fields in entries:
                 await consumer._dispatch(entry_id, fields)
-            await asyncio.wait_for(
-                asyncio.gather(*list(consumer._inflight)), timeout=120
-            )
+            await asyncio.wait_for(asyncio.gather(*list(consumer._inflight)), timeout=120)
 
             # PRECONDITION, not decoration: all N were parked mid-turn, inside
             # their own scope, at the same instant.
@@ -1150,7 +1224,7 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
 
             roots = _spans(probe, "curie.queue.process")
             assert len(roots) == turns
-            by_event_id: dict[str, _SpanCall] = {}
+            by_event_id: dict[str, SpanCall] = {}
             for root in roots:
                 event_id = root.attributes.get("event_id")
                 assert event_id is not None, "a queue.process root was not stamped"
@@ -1161,15 +1235,12 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
             # 1. MEMBERSHIP (primary). Every stamped span belongs to the subtree
             #    of the root carrying the same id. This is the assertion that
             #    fails under a process-global.
-            stamped = [
-                span for span in probe.spans if span.attributes.get("event_id") is not None
-            ]
+            stamped = [span for span in probe.spans if span.attributes.get("event_id") is not None]
             assert stamped
             for span in stamped:
                 root = _root_of(probe, span)
                 assert root is not None, (
-                    f"{span.name} carries an event id but descends from no "
-                    "curie.queue.process root"
+                    f"{span.name} carries an event id but descends from no curie.queue.process root"
                 )
                 assert span.attributes["event_id"] == root.attributes.get("event_id"), (
                     f"{span.name} carries {span.attributes['event_id']!r} but "
@@ -1181,8 +1252,7 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
                 group = {
                     span.name
                     for span in stamped
-                    if span.attributes["event_id"] == event_id
-                    and _root_of(probe, span) is root
+                    if span.attributes["event_id"] == event_id and _root_of(probe, span) is root
                 }
                 assert set(_REQUEST_PATH_SPANS) <= group, (
                     f"turn {event_id} is missing {set(_REQUEST_PATH_SPANS) - group}"
@@ -1213,7 +1283,12 @@ def test_no_event_id_survives_a_turn_or_crosses_into_the_next_one(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="a", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             first = _qevent("first", thread="thread-leak-a", event_id="Ev0EXAMPLELEAKA1")
             await _deliver(consumer, h, {"payload": first.model_dump_json()})
@@ -1232,9 +1307,7 @@ def test_no_event_id_survives_a_turn_or_crosses_into_the_next_one(
             await _deliver(consumer, h, {"payload": second.model_dump_json()})
 
             observed = {
-                span.attributes["event_id"]
-                for span in probe.spans
-                if "event_id" in span.attributes
+                span.attributes["event_id"] for span in probe.spans if "event_id" in span.attributes
             }
             assert observed == {"Ev0EXAMPLELEAKB1"}, (
                 f"the second turn's spans carried {observed!r}; a stale id crossed "
@@ -1263,13 +1336,16 @@ def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
         probe = _install(monkeypatch)
         async with make_harness() as h:
             h.runner.default_script = [Final(text="drained", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             # A DIFFERENT thread than the turn's: the drain tears down thread B
             # while turn A is in flight on the same handler task.
-            await h.async_redis.sadd(
-                consumer_module.THREAD_RESET_SET, "thread-reset-victim"
-            )
+            await h.async_redis.sadd(consumer_module.THREAD_RESET_SET, "thread-reset-victim")
             try:
                 event = _qevent(
                     "turn under a drain",
@@ -1287,9 +1363,9 @@ def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
                 )
                 # (b) The drain describes ANOTHER thread; a Tempo query for this
                 #     turn must not return it.
-                assert [span.attributes.get("event_id") for span in releases] == [
-                    None
-                ] * len(releases), (
+                assert [span.attributes.get("event_id") for span in releases] == [None] * len(
+                    releases
+                ), (
                     "a thread-reset teardown span was stamped with the in-flight "
                     "turn's event id: the scope opens before the drain"
                 )

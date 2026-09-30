@@ -125,6 +125,10 @@ def _payload(
         pr_url=None,
         title="Publish cluster proof",
         body="Approved publication cluster proof.",
+        observed_title_sha256=None,
+        observed_body_sha256=None,
+        github_repository_id=None,
+        github_pr_node_id=None,
     )
 
 
@@ -430,6 +434,11 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
             assert "error: No valid patches in input" in observation.error
             assert "container exited" in observation.error
 
+            # The first pass released its lease while the Job was in flight.
+            # Reclaim before processing the terminal observation, as the drain does.
+            work = await store.claim_next()
+            assert work is not None
+            assert work.publication_id == FAILURE_ID
             await reconciler.reconcile(work)
             async with engine.connect() as connection:
                 terminal = (

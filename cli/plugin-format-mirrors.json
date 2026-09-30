@@ -57,6 +57,16 @@
       "reason": "Mirrors plugin_format.connectors.ConnectorsFile, but plugin-format.schema.json carries no Connector* $defs (schema_export.py imports only from .models), so field-by-field comparison against the schema does not apply. The seam is frozen in tests/vectors/connector-build-decl.json and tests/vectors/connector-fields.json instead, read by both packages/plugin-format/tests/test_connectors.py and cli/tests/connector_build_decl_vectors.rs."
     },
     {
+      "struct": "RunnerSpecDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.RunnerSpec (ADR 0173), which plugin-format.schema.json does not carry (no Connector* $defs). Frozen in tests/vectors/connector-build-decl.json and tests/vectors/connector-fields.json, read by both languages."
+    },
+    {
+      "struct": "RunnerLockEntryDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connector_lock.RunnerLockEntry (ADR 0173), which plugin-format.schema.json does not carry. Frozen in tests/vectors/connector-lock.json and tests/vectors/connector-fields.json, read by both languages."
+    },
+    {
       "struct": "ConnectorSpecDecl",
       "file": "cli/src/connector_build.rs",
       "reason": "Mirrors plugin_format.connectors.ConnectorSpec; same missing Connector* $defs, same vector-frozen seam (tests/vectors/connector-build-decl.json, tests/vectors/connector-fields.json)."

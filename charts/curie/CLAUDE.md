@@ -258,7 +258,9 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`). Adding a `required` or
+  nonblank contract (`api.approvalChatAttesterSecret`), plus the new
+  `e2eConnectorIdentity` block, whose prefix and label patterns keep its
+  values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
   key, would fail every install whose values file happens not to match the
   new shape -- broaden the schema only for a key you are prepared to

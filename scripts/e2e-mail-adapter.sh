@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CHART="$REPO_ROOT/charts/curie"
 RUN_ID="$(date -u +%Y%m%d%H%M%S)-${RANDOM}"
-NAMESPACE="curie-mail-e2e-${RUN_ID,,}"
+NAMESPACE="curie-mail-e2e-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]')"
 RELEASE="curie-mail-e2e"
 OWNED_LABEL="curie-mail-e2e/owned"
 TMP="$(mktemp -d /tmp/curie-mail-e2e.XXXXXX)"
@@ -59,8 +59,10 @@ namespace_is_owned() {
 
 cleanup() {
   local rc=$?
-  for pid in "${PF_PIDS[@]}"; do kill "$pid" >/dev/null 2>&1 || true; done
-  for id_file in "${INBOX_ID_FILES[@]}"; do delete_inbox "$id_file"; done
+  # Both are empty until a port-forward or an inbox exists, which bash 3.2
+  # refuses to expand under `set -u` without the `+` guard.
+  for pid in ${PF_PIDS[@]+"${PF_PIDS[@]}"}; do kill "$pid" >/dev/null 2>&1 || true; done
+  for id_file in ${INBOX_ID_FILES[@]+"${INBOX_ID_FILES[@]}"}; do delete_inbox "$id_file"; done
   if [[ "$KEEP" -eq 0 ]] && namespace_is_owned; then
     helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
     kubectl --context "$CONTEXT" delete namespace "$NAMESPACE" --wait=false >/dev/null 2>&1 || true

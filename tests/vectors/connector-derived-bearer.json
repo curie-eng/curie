@@ -53,6 +53,22 @@
         }
       },
       "expected_name": null
+    },
+    {
+      "name": "two-secretrefs",
+      "why": "two SecretRefs and no bearer_secret are valid (#3057): a SecretRef is the server's own upstream credential, never delivered to the sandbox, so no client header is derived",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": [
+              {"name": "SERVICE_A_TOKEN", "from_secret": "tool-credentials", "key": "SERVICE_A_TOKEN"},
+              {"name": "SERVICE_B_TOKEN", "from_secret": "tool-credentials", "key": "SERVICE_B_TOKEN"}
+            ]
+          }
+        }
+      },
+      "expected_name": null
     }
   ]
 }

@@ -6,6 +6,8 @@ import { useWired } from "../../state/wired";
 import { useAllDeployments } from "../../api/hooks";
 import { hiddenAgentIdsForEnv } from "../../state/env";
 import { deleteAgent } from "../../api/client";
+import { channelIdentityKey, channelIdentityLabel } from "../../lib/format";
+import { AgentMetricsLine } from "./AgentMetricsLine";
 
 export function WiredAgents() {
   const { state, dispatch } = useStore();
@@ -90,7 +92,7 @@ export function WiredAgents() {
                 {a.name}
               </button>
               <span style={{ marginLeft: "auto", fontSize: 12, color: C.muted, fontFamily: C.mono }}>
-                {a.channels.map((c) => c.address).join(", ")}
+                {a.channels.map((c) => channelIdentityLabel(c)).join(", ")}
               </span>
             </div>
             <div
@@ -106,8 +108,8 @@ export function WiredAgents() {
               <div>
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>channel</div>
                 {a.channels.map((c) => (
-                  <div key={`${c.kind}:${c.address}`} style={{ fontFamily: C.mono, fontSize: 13 }}>
-                    {c.address}
+                  <div key={channelIdentityKey(c)} style={{ fontFamily: C.mono, fontSize: 13 }}>
+                    {channelIdentityLabel(c)}
                   </div>
                 ))}
               </div>
@@ -115,6 +117,9 @@ export function WiredAgents() {
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>created</div>
                 <div style={{ fontFamily: C.mono, fontSize: 13 }}>{new Date(a.created_at).toLocaleDateString()}</div>
               </div>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <AgentMetricsLine agent={a} />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
               {/* No status chip: GET /agents carries no bundle/deploy state, so we

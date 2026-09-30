@@ -90,11 +90,20 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, eval work, transcript-capacity, and supervised-task restarts. `record_metric`
+  background-loop, schedule fires, eval work, transcript-capacity, and supervised-task restarts. `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
-  operation classes and outcomes, not event, run, session, sandbox, user, agent, or
-  deployment identifiers, so the application-defined series space remains bounded.
+  operation classes and outcomes, not event, run, session, sandbox, user, or
+  deployment identifiers. The one exception is `curie.agent.turn.completed`, whose
+  `agent` label admits at most 32 distinct slugs per process and folds the rest,
+  plus any name that is not a 1 to 63 character slug, into `other`
+  (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
+  Admission is first-come and resets when the process restarts, so the same slug
+  can be named on one worker and counted as `other` on another. A rising
+  `agent="other"` series means the ceiling or the slug rule is hiding a name.
+  `unbound` is only a turn that never resolved an agent. A real agent named
+  `other` or `unbound` shares `other`. Every other instrument refuses an
+  agent identifier. The application-defined series space remains bounded.
   Standard resource identity still contributes one anonymous `service.instance.id` per
   running process. It is independent of turn input and adds at most one resource series
   per live or restarted process, never one per event, session, user, or sandbox. The
@@ -119,6 +128,16 @@ keys:
   `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
   `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
+  (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
+  Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
+  of the tool results that opened the round
+  (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
+  `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
+  `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
+  turn received per-message usage, the turn total is stamped on the final generation
+  with scope `turn`, earlier generations carry no usage, and if no generation is active
+  at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
   value type: the four usage counts, generation TTFT, generation round, and bounded tool

@@ -1244,13 +1244,16 @@ def _plan_seed(
     *,
     approval_route_era: str,
     released_state_repaired: bool = False,
+    released_route_identity: bool = False,
 ) -> tuple[tuple[str, ...], Any]:
     """The planner's SQL and the exact metadata that describes what it wrote."""
-    statements, metadata = gate._plan_seed_statements(
-        columns,
-        approval_route_era=approval_route_era,
-        released_state_repaired=released_state_repaired,
-    )
+    kwargs: dict[str, Any] = {
+        "approval_route_era": approval_route_era,
+        "released_state_repaired": released_state_repaired,
+    }
+    if released_route_identity:
+        kwargs["released_route_identity"] = True
+    statements, metadata = gate._plan_seed_statements(columns, **kwargs)
     assert isinstance(statements, tuple)
     return statements, metadata
 
@@ -1318,6 +1321,44 @@ def test_agent_channels_branch_writes_agent_id_kind_and_address(
         assert agent.name in rendered
         assert agent.address in binding_text
         assert agent.kind in binding_text
+
+
+def test_agent_channels_branch_names_default_identity_after_0070(
+    gate: ModuleType,
+) -> None:
+    """The v0.11.0 check accepts Slack rows only with a named identity (#3494)."""
+    statements, _metadata = _plan_seed(
+        gate,
+        _agent_channels_columns(gate),
+        approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+        released_route_identity=True,
+    )
+
+    binding_statements = [
+        statement for statement in statements if "curie.agent_channels" in statement
+    ]
+    assert len(binding_statements) == len(gate.SEED_FIXTURE)
+    for statement in binding_statements:
+        assert "(id, agent_id, kind, address, adapter)" in statement
+        assert "'default'" in statement
+
+
+def test_agent_channels_branch_leaves_identity_null_before_0070(
+    gate: ModuleType,
+) -> None:
+    """Older releases retain 0024's both-or-neither endpoint/adapter shape."""
+    statements, _metadata = _plan_seed(
+        gate,
+        _agent_channels_columns(gate),
+        approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+        released_route_identity=False,
+    )
+
+    binding_text = "\n".join(
+        statement for statement in statements if "curie.agent_channels" in statement
+    )
+    assert "(id, agent_id, kind, address)" in binding_text
+    assert "(id, agent_id, kind, address, adapter)" not in binding_text
 
 
 @pytest.mark.parametrize("binding_scope", [False, True])
@@ -1500,6 +1541,76 @@ def test_released_state_candidate_capability_is_pinned_to_an_exact_0037_file(
     assert gate._candidate_supports_legacy_state(tree) is expected
 
 
+@pytest.mark.parametrize(
+    ("revisions", "expected"),
+    [
+        (("0069_binding_allowed_callers.py",), False),
+        (("0070_agent_channels_route_identity.py",), True),
+        (("0070.py",), False),
+        (("00700_not_route_identity.py",), False),
+    ],
+)
+def test_released_route_identity_is_pinned_to_the_exact_0070_file(
+    gate: ModuleType,
+    tmp_path: Path,
+    revisions: tuple[str, ...],
+    expected: bool,
+) -> None:
+    tree = _fake_released_tree(tmp_path, revisions=revisions)
+
+    assert gate._released_supports_route_identity(tree) is expected
+
+
+def test_upgrade_pair_passes_released_route_identity_to_the_seed(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    released_tree = _fake_released_tree(
+        tmp_path / "released",
+        revisions=("0070_agent_channels_route_identity.py",),
+    )
+    candidate_tree = _fake_released_tree(tmp_path / "candidate", revisions=())
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        gate,
+        "_run_alembic",
+        lambda *_args, **_kwargs: gate.CommandResult(0, "ok"),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_detect_approval_route_era",
+        lambda _tree: gate.APPROVAL_ROUTE_ERA_SPLIT,
+    )
+
+    def _fake_seed(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _metadata_with_released_state(gate)
+
+    monkeypatch.setattr(gate, "_seed_released_database", _fake_seed)
+    monkeypatch.setattr(
+        gate,
+        "_run_readback",
+        lambda *_args, **_kwargs: gate.CommandResult(0, "ok"),
+    )
+
+    result = gate._upgrade_pair(
+        released_tree,
+        candidate_tree,
+        database_url="postgresql+asyncpg://gate/test",
+        database_name="released_route_identity",
+        released_ref="v0.11.0",
+        released_commit="1" * 40,
+        candidate_ref="HEAD",
+        candidate_commit="2" * 40,
+        resources=gate._released_upgrade_resources_from_env(),
+    )
+
+    assert result == gate.PairResult(gate.READBACK_PHASE, 0, "ok")
+    assert captured["released_route_identity"] is True
+
+
 def _metadata_with_released_state(gate: ModuleType) -> Any:
     return _plan_seed(
         gate,
@@ -1627,7 +1738,7 @@ def test_seed_released_database_returns_the_exact_released_state_metadata(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era, released_state_repaired: (
+        lambda _columns, *, approval_route_era, released_state_repaired, released_route_identity: (
             ("SELECT 1",),
             metadata,
         ),
@@ -1662,7 +1773,7 @@ def test_seed_released_database_refuses_state_capable_schema_without_a_sentinel(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era, released_state_repaired: (
+        lambda _columns, *, approval_route_era, released_state_repaired, released_route_identity: (
             ("SELECT 1",),
             empty_metadata,
         ),
@@ -2286,3 +2397,119 @@ def test_released_state_readback_rejects_an_owner_that_remains_memory_false(
     rendered = "\n".join(failures).lower()
     assert "memory" in rendered
     assert "true" in rendered
+
+
+@pytest.mark.parametrize(
+    ("revisions", "expected"),
+    [
+        (("0067_execution_request_model_usage.py",), False),
+        (("0070_agent_channels_route_identity.py",), True),
+        (("0070_something_else.py",), False),
+    ],
+)
+def test_route_identity_readback_is_pinned_to_the_exact_0070_file(
+    gate: ModuleType, tmp_path: Path, revisions: tuple[str, ...], expected: bool
+) -> None:
+    tree = _fake_released_tree(tmp_path, revisions=revisions)
+
+    assert gate._candidate_supports_route_identity(tree) is expected
+
+
+def test_route_identity_readback_argument_is_enabled_only_by_0070(
+    gate: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[list[str]] = []
+
+    def _fake_run_in_tree(command: list[str], **_kwargs: Any) -> Any:
+        captured.append(command)
+        return gate.CommandResult(0, "ok")
+
+    monkeypatch.setattr(gate, "_run_in_tree", _fake_run_in_tree)
+    for name, revision in (
+        ("before", "0067_execution_request_model_usage.py"),
+        ("after", "0070_agent_channels_route_identity.py"),
+    ):
+        gate._run_readback(
+            _fake_released_tree(tmp_path / name, revisions=(revision,)),
+            database_url="postgresql+asyncpg://gate/test",
+            phase=gate.READBACK_PHASE,
+            ref="candidate",
+            commit="0" * 40,
+            seed_metadata=gate.SeedMetadata(legacy_state=None),
+        )
+
+    assert "--expect-slack-identity" not in captured[0]
+    assert _argument_value(captured[1], "--expect-slack-identity") == "default"
+
+
+def test_readback_names_every_slack_binding_that_is_not_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=(("gate-valid", "C0EXAMPLE1", None),),
+    )
+
+    assert any("C0EXAMPLE1" in f and "'default'" in f for f in failures), failures
+
+
+def test_readback_names_a_serialized_slack_binding_that_is_not_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    dumps = tuple(
+        readback.AgentDump(
+            name=agent.name,
+            addresses=(agent.address,),
+            dump={
+                "name": agent.name,
+                "channels": [{"kind": "slack", "address": agent.address, "adapter": None}],
+            },
+            error=None,
+        )
+        for agent in gate.SEED_FIXTURE
+    )
+    observed = tuple((agent.name, agent.address, "default") for agent in gate.SEED_FIXTURE)
+
+    failures = readback._collect_failures(
+        dumps,
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=observed,
+    )
+
+    assert failures
+    assert all("serialized" in failure for failure in failures), failures
+
+
+def test_readback_refuses_an_identity_expectation_that_observed_nothing(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=(),
+    )
+
+    assert any("no Slack binding" in failure for failure in failures), failures
+
+
+def test_readback_passes_when_every_slack_binding_names_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    observed = tuple((agent.name, agent.address, "default") for agent in gate.SEED_FIXTURE)
+
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=observed,
+    )
+
+    assert failures == ()

@@ -53,6 +53,9 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.ui.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

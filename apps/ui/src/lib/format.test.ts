@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatLatency } from "./format";
+import { channelIdentityKey, channelIdentityLabel, channelNamedIdentity, formatLatency } from "./format";
 
 describe("formatLatency", () => {
   it("renders sub-second latency in milliseconds", () => {
@@ -19,5 +19,46 @@ describe("formatLatency", () => {
   it("returns a neutral dash for non-finite or negative input", () => {
     expect(formatLatency(NaN)).toBe("—");
     expect(formatLatency(-5)).toBe("—");
+  });
+});
+
+describe("channelIdentityLabel", () => {
+  it("shows only the address for a default, missing or null identity", () => {
+    expect(channelIdentityLabel({ kind: "slack", address: "C0EXAMPLE1", adapter: "default" })).toBe(
+      "C0EXAMPLE1",
+    );
+    expect(channelIdentityLabel({ kind: "slack", address: "C0EXAMPLE1", adapter: null })).toBe(
+      "C0EXAMPLE1",
+    );
+    expect(channelIdentityLabel({ kind: "slack", address: "C0EXAMPLE1" })).toBe("C0EXAMPLE1");
+  });
+
+  it("appends a non-default identity beside the address", () => {
+    expect(channelIdentityLabel({ kind: "slack", address: "C0EXAMPLE1", adapter: "finance" })).toBe(
+      "C0EXAMPLE1 (finance)",
+    );
+  });
+});
+
+describe("channelNamedIdentity", () => {
+  it("suppresses \"default\" only on Slack, the one kind with a default identity", () => {
+    expect(channelNamedIdentity({ kind: "slack", address: "C0EXAMPLE1", adapter: "default" })).toBeNull();
+    expect(channelNamedIdentity({ kind: "email", address: "ops@example.com", adapter: "default" })).toBe(
+      "default",
+    );
+  });
+});
+
+describe("channelIdentityKey", () => {
+  it("keys two bindings on the same pair differently when their identity differs", () => {
+    const a = channelIdentityKey({ kind: "slack", address: "C0EXAMPLE1", adapter: "finance" });
+    const b = channelIdentityKey({ kind: "slack", address: "C0EXAMPLE1", adapter: "default" });
+    expect(a).not.toBe(b);
+  });
+
+  it("treats a missing adapter the same as an explicit null", () => {
+    expect(channelIdentityKey({ kind: "slack", address: "C0EXAMPLE1" })).toBe(
+      channelIdentityKey({ kind: "slack", address: "C0EXAMPLE1", adapter: null }),
+    );
   });
 });

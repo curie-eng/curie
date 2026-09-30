@@ -22,11 +22,14 @@ import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
+from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,9 +65,24 @@ CI_OBSERVATION_DEADLINE_SECONDS = 10.0
 # work, which is what keeps repeated timeouts from accumulating threads and
 # lock contention.
 CI_CREDENTIAL_SLOTS = 4
+# One overall bound on the CI gate's detail observation (#3097): the credential
+# mint, check runs, commit statuses and failing-run annotations together.
+CI_DETAIL_DEADLINE_SECONDS = 20.0
+# Annotations are read for at most this many failing check runs per observation.
+CI_DETAIL_ANNOTATED_RUNS = 5
+CI_DETAIL_LOGGED_JOBS = 5
+CI_JOB_LOG_TAIL_BYTES = 64 * 1024
+CI_JOB_LOG_MAX_DECODED_BYTES = 8 * 1024 * 1024
+CI_JOB_LOG_MAX_CHARS = 6_000
+CI_JOB_LOG_MAX_LINES = 80
+CI_JOB_LOG_TIMEOUT_SECONDS = 5.0
+_CI_LOG_HOST = "pipelines.actions.githubusercontent.com"
+# GitHub's job log redirect has also been observed on Azure Blob storage.
+_CI_AZURE_LOG_HOST = re.compile(r"productionresults[a-z0-9]+\.blob\.core\.windows\.net")
 _CI_CREDENTIAL_GUARD = threading.BoundedSemaphore(CI_CREDENTIAL_SLOTS)
 
 _PUBLISHING = frozenset({"approved", "launching", "running"})
+_ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
 _FAILING_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 )
@@ -79,6 +97,13 @@ CiObservation = WorkItemCiOut
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else "unknown"
+
+
+def _deadline_seconds(req: ExecutionRequest) -> str:
+    """The execution deadline this row was started with, in whole seconds (#3071)."""
+    if req.started_at is None or req.execution_deadline is None:
+        return "unknown"
+    return str(int((req.execution_deadline - req.started_at).total_seconds()))
 
 
 def _cause(
@@ -97,10 +122,14 @@ def _cause(
             "admits one"
         )
     cause = req.terminal_cause
+    if state == "queued":
+        return "revision waiting on the current run"
     if state == "cancellation_requested":
         reasons = {
             "issue_cancelled": "the issue was cancelled (label removed or issue closed)",
-            "execution_deadline": "the 1800 s execution deadline elapsed",
+            "execution_deadline": (
+                f"the {_deadline_seconds(req)} s execution deadline elapsed"
+            ),
             "owner_lost": "the runtime owner stopped heartbeating",
         }
         return (
@@ -108,25 +137,31 @@ def _cause(
             "termination is awaiting a runtime observation"
         )
     if state == "waiting":
+        deadline = req.wait_deadline
+        if deadline is None:
+            raise ValueError("a waiting request has no capacity deadline")
         text = "waiting for sandbox capacity"
         if req.capacity_deferrals:
             text += (
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"
             )
-        if now >= req.wait_deadline:
+        if now >= deadline:
             return (
-                f"{text}; the waiting deadline elapsed at {_iso(req.wait_deadline)} "
+                f"{text}; the waiting deadline elapsed at {_iso(deadline)} "
                 "and expiry is pending the reconciler"
             )
-        return f"{text}; waiting deadline {_iso(req.wait_deadline)}"
+        return f"{text}; waiting deadline {_iso(deadline)}"
     if state == "running":
         return (
             f"running since {_iso(req.started_at)}, bounded by the execution "
             f"deadline {_iso(req.execution_deadline)}"
         )
     if state == "cancelled":
-        text = "cancelled: the issue label was removed or the issue was closed"
+        if cause == "lineage_closed":
+            text = "cancelled: the pull request closed before this revision could start"
+        else:
+            text = "cancelled: the issue label was removed or the issue was closed"
         if lineage is not None and lineage.pr_number is not None:
             text += f"; pull request #{lineage.pr_number} is retained"
         return text
@@ -137,7 +172,8 @@ def _cause(
                 "waiting deadline"
             )
         return (
-            f"expired: {cause}, the execution exceeded 1800 s and termination "
+            f"expired: {cause}, the execution exceeded {_deadline_seconds(req)} s "
+            "and termination "
             "was observed"
         )
     if state == "failed":
@@ -181,6 +217,29 @@ def _cause(
     return f"execution completed; publication {publication.status}, no pull request"
 
 
+def _current_request(ordered: Sequence[ExecutionRequest]) -> ExecutionRequest | None:
+    """Prefer the live run, then the last revision that reached execution.
+
+    A revision refused because its pull request closed never ran, so its
+    cancellation must not replace the preceding completed run's outcome.
+    """
+
+    active = next(
+        (req for req in reversed(ordered) if req.status in _ACTIVE_REQUEST_STATUSES),
+        None,
+    )
+    if active is not None:
+        return active
+    return next(
+        (
+            req
+            for req in reversed(ordered)
+            if not (req.status == "cancelled" and req.terminal_cause == "lineage_closed")
+        ),
+        ordered[-1] if ordered else None,
+    )
+
+
 def derive_outcome(
     item: WorkItem,
     requests: Sequence[ExecutionRequest],
@@ -195,10 +254,12 @@ def derive_outcome(
     """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
 
     ordered = sorted(requests, key=lambda r: r.sequence)
-    req = ordered[-1] if ordered else None
+    req = _current_request(ordered)
     state: WorkItemOutcomeState
     if req is None:
         state = "cancelled" if item.cancelled_at is not None else "waiting"
+    elif req.status == "queued":
+        state = "queued"
     elif req.status == "cancellation_requested":
         state = "cancellation_requested"
     elif req.status == "waiting":
@@ -238,7 +299,14 @@ def derive_outcome(
     else:
         state = "completed_unpublished"
 
-    snapshot = next((r for r in reversed(ordered) if r.objective is not None), None)
+    snapshot = next(
+        (
+            r
+            for r in reversed(ordered)
+            if req is not None and r.sequence <= req.sequence and r.objective is not None
+        ),
+        None,
+    )
     objective = snapshot.objective if snapshot is not None else None
     truncated = objective is not None and len(objective) > OBJECTIVE_LIMIT
     pr = (
@@ -327,8 +395,7 @@ def _pick_lineage(
     item: WorkItem, lineages: Iterable[ThreadPublicationLineage]
 ) -> ThreadPublicationLineage | None:
     """The linked lineage when set; otherwise the conversation's lineage for the
-    same agent and repository, open first, then newest (D2: nothing links
-    ``publication_lineage_id`` in production yet)."""
+    same agent and repository, open first, then newest for older unlinked rows."""
 
     candidates = list(lineages)
     if item.publication_lineage_id is not None:
@@ -438,17 +505,17 @@ async def _views(
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
-        latest = max(item_requests, key=lambda r: r.sequence, default=None)
+        current_request = _current_request(sorted(item_requests, key=lambda r: r.sequence))
         pending_turn = (
-            latest is not None
-            and latest.reply_kind is not None
-            and latest.reply_address is not None
-            and latest.reply_conversation_id is not None
+            current_request is not None
+            and current_request.reply_kind is not None
+            and current_request.reply_address is not None
+            and current_request.reply_conversation_id is not None
             and (
                 item.agent_id,
-                latest.reply_kind,
-                latest.reply_address,
-                latest.reply_conversation_id,
+                current_request.reply_kind,
+                current_request.reply_address,
+                current_request.reply_conversation_id,
             )
             in pending_tuples
         )
@@ -626,22 +693,23 @@ def _mint_and_release(
             _CI_CREDENTIAL_GUARD.release()
 
 
-async def _observe_ci(
-    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
-) -> CiObservation:
-    if lineage is None or lineage.pr_number is None:
-        return CiObservation(state="not_applicable", reason="no_pull_request")
-    head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
-        return _unavailable("no_head_sha")
+async def _mint_ci_token(
+    lineage: Any, work_item: Any, settings: Settings, head_sha: str
+) -> tuple[str | None, CiObservation | None]:
+    """Mint a CI read token through the bounded credential slots.
+
+    Returns ``(token, None)`` or ``(None, unavailable)``. The token lives only
+    in the caller's local; every failure maps to a fixed reason code.
+    """
+
     resolver = credentials_for(settings)
     if not resolver.app_configured:
-        return _unavailable("app_not_configured", head_sha)
+        return None, _unavailable("app_not_configured", head_sha)
     installation_id = lineage.github_installation_id or work_item.github_installation_id
     if not _CI_CREDENTIAL_GUARD.acquire(blocking=False):
         # Every slot is held by a mint that has not finished; refuse now rather
         # than pile another thread onto the repository lock.
-        return _unavailable("observation_busy", head_sha)
+        return None, _unavailable("observation_busy", head_sha)
     permit = _CredentialPermit()
     try:
         # abandon_on_cancel: the overall deadline must release the caller even
@@ -658,12 +726,27 @@ async def _observe_ci(
             abandon_on_cancel=True,
         )
     except GitHubInstallationRefused:
-        return _unavailable("installation_refused", head_sha)
+        return None, _unavailable("installation_refused", head_sha)
     except (GitHubAppError, ValueError):
-        return _unavailable("github_error", head_sha)
+        return None, _unavailable("github_error", head_sha)
     finally:
         if permit.claim():
             _CI_CREDENTIAL_GUARD.release()
+    return token, None
+
+
+async def _observe_ci(
+    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
+) -> CiObservation:
+    if lineage is None or lineage.pr_number is None:
+        return CiObservation(state="not_applicable", reason="no_pull_request")
+    head_sha = lineage.head_sha
+    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
+        return _unavailable("no_head_sha")
+    token, refused = await _mint_ci_token(lineage, work_item, settings, head_sha)
+    if refused is not None:
+        return refused
+    assert token is not None
     try:
         url = (
             f"{settings.github_api_url.rstrip('/')}/repos/"
@@ -705,4 +788,265 @@ async def _observe_ci(
         reason=None,
         head_sha=head_sha,
         observed_at=datetime.now(UTC),
+    )
+
+
+@dataclass(frozen=True)
+class CiDetail:
+    """The CI gate's view of a published head (#3097), never persisted.
+
+    ``state`` is ``observed`` with the raw check runs, commit statuses and
+    failing-run annotations, or ``unavailable`` with a fixed ``reason`` code
+    that never carries a response body, header, URL or token.
+    """
+
+    state: str
+    reason: str | None
+    head_sha: str | None
+    check_runs: list[dict[str, Any]] = field(default_factory=list)
+    statuses: list[dict[str, Any]] = field(default_factory=list)
+    annotations: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    job_logs: dict[int, str] = field(default_factory=dict)
+    job_log_unavailable: set[int] = field(default_factory=set)
+
+
+def _detail_unavailable(reason: str, head_sha: str | None) -> CiDetail:
+    return CiDetail(state="unavailable", reason=reason, head_sha=head_sha)
+
+
+def _check_runs_reason(payload: Any) -> str | None:
+    """None when the check-runs page is complete and well formed, else a reason."""
+
+    verdict = _verdict(payload)
+    if verdict in ("passing", "failing", "pending", "none"):
+        return None
+    return verdict
+
+
+def _signed_job_log_url(location: str | None) -> httpx.URL | None:
+    """Accept only observed GitHub Actions log storage hosts."""
+
+    if not location or len(location) > 4096:
+        return None
+    try:
+        parts = urlsplit(location)
+        url = httpx.URL(location)
+    except (ValueError, httpx.InvalidURL):
+        return None
+    if (
+        parts.scheme != "https"
+        or "@" in parts.netloc
+        or parts.fragment
+        or not (
+            url.host == _CI_LOG_HOST
+            or (url.host is not None and _CI_AZURE_LOG_HOST.fullmatch(url.host))
+        )
+        or url.port not in (None, 443)
+    ):
+        return None
+    return url
+
+
+async def _fetch_job_log(
+    client: httpx.AsyncClient,
+    base: str,
+    job_id: int,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> str | None:
+    """Read one bounded log; any provider or download error is optional."""
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            response = await client.get(
+                f"{base}/actions/jobs/{job_id}/logs",
+                headers=headers,
+                timeout=timeout_seconds,
+                auth=None,
+                follow_redirects=False,
+            )
+            if response.status_code != 302:
+                return None
+            url = _signed_job_log_url(response.headers.get("Location"))
+            if url is None:
+                return None
+            # build_request inherits client defaults. Strip credentials before
+            # sending to the signed URL, and disable client level auth as well.
+            request = client.build_request("GET", url)
+            for name in ("authorization", "proxy-authorization", "cookie", "x-github-api-version"):
+                request.headers.pop(name, None)
+            download = await client.send(
+                request, stream=True, auth=None, follow_redirects=False
+            )
+            try:
+                if download.status_code != 200:
+                    return None
+                tail = bytearray()
+                consumed = 0
+                async for chunk in download.aiter_bytes(chunk_size=8192):
+                    consumed += len(chunk)
+                    if consumed > CI_JOB_LOG_MAX_DECODED_BYTES:
+                        return None
+                    tail.extend(chunk)
+                    if len(tail) > CI_JOB_LOG_TAIL_BYTES:
+                        del tail[:-CI_JOB_LOG_TAIL_BYTES]
+            finally:
+                await download.aclose()
+            redacted = redact_text(tail.decode("utf-8", errors="replace"))
+            return "\n".join(redacted.splitlines()[-CI_JOB_LOG_MAX_LINES:])[-CI_JOB_LOG_MAX_CHARS:]
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return None
+
+
+async def observe_ci_detail(
+    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
+) -> CiDetail:
+    """Observe check runs, commit statuses and failing annotations for the head.
+
+    Shares ``observe_ci``'s bounded credential mint (``_mint_ci_token``). The
+    whole observation is bounded by ``CI_DETAIL_DEADLINE_SECONDS``; on expiry
+    the caller is released with ``unavailable``/``timeout``.
+    """
+
+    raw = getattr(lineage, "head_sha", None) if lineage is not None else None
+    head_sha = raw if isinstance(raw, str) and _SHA_RE.fullmatch(raw) else None
+    log_deadline = asyncio.get_running_loop().time() + CI_DETAIL_DEADLINE_SECONDS - 0.5
+    try:
+        return await asyncio.wait_for(
+            _observe_ci_detail(lineage, work_item, settings, client, log_deadline),
+            timeout=CI_DETAIL_DEADLINE_SECONDS,
+        )
+    except TimeoutError:
+        return _detail_unavailable("timeout", head_sha)
+
+
+async def _observe_ci_detail(
+    lineage: Any,
+    work_item: Any,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    log_deadline: float,
+) -> CiDetail:
+    head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
+    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
+        return _detail_unavailable("no_head_sha", None)
+    token, refused = await _mint_ci_token(lineage, work_item, settings, head_sha)
+    if refused is not None:
+        return _detail_unavailable(refused.reason or "github_error", head_sha)
+    assert token is not None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        try:
+            base = (
+                f"{settings.github_api_url.rstrip('/')}/repos/"
+                f"{repo_url_path(lineage.repo_full_name)}"
+            )
+        except ValueError:
+            return _detail_unavailable("github_error", head_sha)
+
+        async def get(path: str, params: dict[str, Any]) -> tuple[Any, str | None]:
+            try:
+                response = await client.get(
+                    f"{base}{path}",
+                    params=params,
+                    headers=headers,
+                    timeout=settings.github_app_timeout_seconds,
+                    auth=None,
+                    follow_redirects=False,
+                )
+            except httpx.TimeoutException:
+                return None, "timeout"
+            except httpx.HTTPError:
+                return None, "github_error"
+            if response.status_code in _STATUS_REASONS:
+                return None, _STATUS_REASONS[response.status_code]
+            if response.status_code != 200:
+                return None, "github_error"
+            try:
+                return response.json(), None
+            except ValueError:
+                return None, "malformed_response"
+
+        runs_payload, reason = await get(
+            f"/commits/{head_sha}/check-runs",
+            {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
+        )
+        if reason is None:
+            reason = _check_runs_reason(runs_payload)
+        if reason is not None:
+            return _detail_unavailable(reason, head_sha)
+        status_payload, reason = await get(
+            f"/commits/{head_sha}/status", {"per_page": CHECK_RUNS_PAGE}
+        )
+        if reason is not None:
+            return _detail_unavailable(reason, head_sha)
+        # Only the statuses list counts: the combined ``state`` reads pending
+        # when no status exists at all.
+        statuses = status_payload.get("statuses") if isinstance(status_payload, dict) else None
+        if not isinstance(statuses, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("state"), str) for item in statuses
+        ):
+            return _detail_unavailable("malformed_response", head_sha)
+        check_runs: list[dict[str, Any]] = list(runs_payload["check_runs"])
+        annotations: dict[int, list[dict[str, Any]]] = {}
+        job_logs: dict[int, str] = {}
+        job_log_unavailable: set[int] = set()
+        failing_ids = [
+            run["id"]
+            for run in check_runs
+            if run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            and isinstance(run.get("id"), int)
+            and not isinstance(run.get("id"), bool)
+        ]
+        for run_id in failing_ids[:CI_DETAIL_ANNOTATED_RUNS]:
+            payload, reason = await get(
+                f"/check-runs/{run_id}/annotations", {"per_page": CHECK_RUNS_PAGE}
+            )
+            # Annotations only enrich the failure report; an unreadable page
+            # never changes the verdict.
+            if reason is None and isinstance(payload, list):
+                annotations[run_id] = [item for item in payload if isinstance(item, dict)]
+        action_ids = list(
+            dict.fromkeys(
+                run["id"]
+                for run in check_runs
+                if run.get("status") == "completed"
+                and run.get("conclusion") in _FAILING_CONCLUSIONS
+                and isinstance(run.get("id"), int)
+                and not isinstance(run.get("id"), bool)
+                and isinstance(run.get("app"), dict)
+                and run["app"].get("slug") == "github-actions"
+            )
+        )
+        job_log_unavailable.update(action_ids[CI_DETAIL_LOGGED_JOBS:])
+        for job_id in action_ids[:CI_DETAIL_LOGGED_JOBS]:
+            time_left = max(0.0, log_deadline - asyncio.get_running_loop().time())
+            log = await _fetch_job_log(
+                client,
+                base,
+                job_id,
+                headers,
+                min(CI_JOB_LOG_TIMEOUT_SECONDS, time_left),
+            )
+            if log:
+                job_logs[job_id] = log
+            else:
+                job_log_unavailable.add(job_id)
+    finally:
+        del token
+        headers.clear()
+    return CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=head_sha,
+        check_runs=check_runs,
+        statuses=list(statuses),
+        annotations=annotations,
+        job_logs=job_logs,
+        job_log_unavailable=job_log_unavailable,
     )

@@ -184,18 +184,29 @@ networks:
     )
     _write_bundle(
         cases[0].bundle,
-        [{"name": "acme-nightly", "type": "cron", "schedule": "0 2 * * *"}],
+        [
+            {
+                "name": "acme-nightly",
+                "type": "cron",
+                "schedule": "0 2 * * *",
+                "prompt": "Summarize the nightly build.",
+            }
+        ],
     )
     _write_bundle(cases[1].bundle, None)
     _write_bundle(
         cases[2].bundle,
-        [{"name": "acme-nightly", "type": "cron"}],
+        [
+            {
+                "name": "acme-nightly",
+                "type": "cron",
+                "prompt": "Summarize the nightly build.",
+            }
+        ],
     )
 
     try:
-        image = _run(
-            ["docker", "image", "inspect", runner_ref, "--format", "{{.Id}}"]
-        )
+        image = _run(["docker", "image", "inspect", runner_ref, "--format", "{{.Id}}"])
         runner_image = _require(image, f"finding runner image {runner_ref}").strip()
         rendered = json.loads(
             _require(
@@ -206,12 +217,9 @@ networks:
         for service in ("postgres", "valkey", "rustfs"):
             ports = rendered["services"][service].get("ports", [])
             if not ports or any(
-                port.get("host_ip") != "127.0.0.1" or port.get("published")
-                for port in ports
+                port.get("host_ip") != "127.0.0.1" or port.get("published") for port in ports
             ):
-                raise RuntimeError(
-                    f"{service} does not use random loopback ports: {ports}"
-                )
+                raise RuntimeError(f"{service} does not use random loopback ports: {ports}")
         if rendered["networks"]["curie_runner"]["name"] != f"{project}_runner":
             raise RuntimeError("private runner network name was not applied")
 
@@ -275,9 +283,7 @@ networks:
         for _ in range(60):
             if api.poll() is not None:
                 api_log.flush()
-                raise RuntimeError(
-                    f"source API exited during startup:\n{api_log_path.read_text()}"
-                )
+                raise RuntimeError(f"source API exited during startup:\n{api_log_path.read_text()}")
             try:
                 with urllib.request.urlopen(f"{api_url}/health", timeout=1) as response:
                     if response.status == 200:
@@ -286,9 +292,7 @@ networks:
                 time.sleep(1)
         else:
             api_log.flush()
-            raise RuntimeError(
-                f"source API never became healthy:\n{api_log_path.read_text()}"
-            )
+            raise RuntimeError(f"source API never became healthy:\n{api_log_path.read_text()}")
 
         yield Runtime(curie_binary, api_url, runner_image, env, cases)
     finally:
@@ -414,17 +418,20 @@ def test_cron_trigger_warning_across_skill_and_local_deploy(runtime: Runtime) ->
                 )
 
             result = _run(args, env=runtime.env, timeout=90)
-            warnings = [line for line in result.stderr.splitlines() if "#268" in line]
+            warnings = [line for line in result.stderr.splitlines() if "cron trigger" in line]
+            # The worker scheduler fires cron triggers on local installs, so only
+            # the skill tier, which has no scheduler, reports a declared cron.
+            expects_warning = case.expects_warning and surface == "skill"
 
-            assert len(warnings) == (1 if case.expects_warning else 0), (
+            assert len(warnings) == (1 if expects_warning else 0), (
                 case.name,
                 surface,
                 result.stdout,
                 result.stderr,
             )
-            if case.expects_warning:
+            if expects_warning:
                 assert "acme-nightly" in warnings[0]
-                assert "this platform tier does not yet fire it" in warnings[0]
+                assert "the skill tier has no scheduler" in warnings[0]
             if case.valid:
                 assert result.returncode == 0, (
                     case.name,

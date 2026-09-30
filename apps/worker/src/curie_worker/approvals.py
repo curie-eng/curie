@@ -20,10 +20,13 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import httpx
-from aci_protocol import ApprovalRequest, QueuedTurn
+from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
+from channel_protocol import MessageField, OutboundMessage
+from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
 
 from .workspace import WorkspaceSelectionRefused
@@ -43,6 +46,8 @@ _TERMINAL_WORKSPACE_CONFLICT_DETAILS = {
     "publication repository differs from the thread workspace",
     "thread workspace repository is no longer allowed",
 }
+# Frozen with the API in tests/vectors/approval-reraise-refusal.json (#2885).
+_REJECTED_IN_THREAD_CODE = "approval.rejected_in_thread"
 _REVIEW_EVENT_ID_RE = re.compile(
     r"github-feedback-"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -51,6 +56,7 @@ _REVIEW_EVENT_ID_RE = re.compile(
 # margin while still bounding this worker-side HTTP hop independently of the
 # much longer model/session client timeout.
 _REVIEW_RESERVE_HTTP_TIMEOUT_S = 3.0
+_PUBLICATION_CONTEXT_HTTP_TIMEOUT_S = 10.0
 
 
 def _publication_refusal(response: httpx.Response) -> str | None:
@@ -77,11 +83,33 @@ def _publication_refusal(response: httpx.Response) -> str | None:
         return detail
     return None
 
+def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
+    """The thread message of an API re-raise refusal (#2885), or None.
+
+    Only a 409 carrying the frozen code and a non-empty message counts, so an
+    unrelated conflict is never reflected into a conversation.
+    """
+
+    if response.status_code != 409:
+        return None
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(detail, dict) or detail.get("code") != _REJECTED_IN_THREAD_CODE:
+        return None
+    message = detail.get("message")
+    if isinstance(message, str) and message.strip():
+        return message
+    return None
+
+
 __all__ = [
     "ApprovalBackendError",
     "ApprovalClient",
     "ApprovalCreator",
     "ApprovalReader",
+    "ApprovalRefused",
     "ApprovalRequest",
     "CreatedApproval",
     "SettledApproval",
@@ -129,6 +157,10 @@ class PublicationCreateRequest:
     route: str | None = None
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = None
+    observed_title: str | None = None
+    observed_body_sha256: str | None = None
+    observed_lineage_id: uuid.UUID | None = None
+    observed_lineage_version: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         if len(self.patch) > self.max_patch_bytes:
@@ -164,6 +196,14 @@ class PublicationCreateRequest:
             payload["work_item_request_id"] = str(self.work_item_request_id)
         if self.work_item_runtime_epoch is not None:
             payload["work_item_runtime_epoch"] = self.work_item_runtime_epoch
+        if self.observed_title is not None:
+            payload["observed_title"] = self.observed_title
+        if self.observed_body_sha256 is not None:
+            payload["observed_body_sha256"] = self.observed_body_sha256
+        if self.observed_lineage_id is not None:
+            payload["observed_lineage_id"] = str(self.observed_lineage_id)
+        if self.observed_lineage_version is not None:
+            payload["observed_lineage_version"] = self.observed_lineage_version
         return payload
 
 
@@ -198,6 +238,20 @@ class ApprovalBackendError(Exception):
     than suspending a session no resolution could ever wake."""
 
 
+class ApprovalRefused(Exception):
+    """The API refused to raise this approval (#2885): a person rejected the
+    same approval in this thread and nobody has asked for it since.
+
+    Terminal, not a backend failure: the kernel posts ``public_detail`` (the
+    API-authored message naming the rejected approval, who rejected it and
+    when) to the thread and ends the turn, instead of escalating or pausing.
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.public_detail = detail
+        super().__init__(detail)
+
+
 class ReviewAuthorityUnavailable(Exception):
     """Fresh review authority was unavailable before a model turn started.
 
@@ -222,6 +276,31 @@ class SettledApproval:
     status: str
     resolved_by: str | None
     resolution_note: str | None
+    # When the decision was recorded, aware UTC; None when the record omits it.
+    resolved_at: datetime | None = None
+
+
+# The settle message's decision time (ADR-0179). ``SettledOutcome`` is decoded
+# strictly by out-of-process adapters, so the instant rides the message's
+# existing ``fields`` list instead: this label, an RFC 3339 UTC value. The kernel
+# and the publication loop write it; the Slack adapter reads it.
+DECIDED_FIELD_LABEL = "Decided"
+
+
+def decided_field(resolved_at: datetime) -> MessageField:
+    """The settle message field carrying when an approval was decided."""
+
+    instant = resolved_at.replace(tzinfo=UTC) if resolved_at.tzinfo is None else resolved_at
+    return MessageField(label=DECIDED_FIELD_LABEL, value=instant.astimezone(UTC).isoformat())
+
+
+def decided_at(message: OutboundMessage) -> datetime | None:
+    """The decision time a settle message carries, or None when it has none."""
+
+    for item in message.fields:
+        if item.label == DECIDED_FIELD_LABEL:
+            return parse_decision_time(item.value)
+    return None
 
 
 class ApprovalCreator(Protocol):
@@ -254,6 +333,16 @@ class PublicationCreator(Protocol):
         conversation_id: str,
         repo_full_name: str,
     ) -> PublicationLineage | None: ...
+
+    async def get_publication_precheck_context(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        work_item_id: uuid.UUID,
+        execution_request_id: uuid.UUID,
+        runtime_epoch: int,
+        queued_event_id: str,
+    ) -> PublicationContext | None: ...
 
     async def verify_review_feedback(
         self,
@@ -449,6 +538,9 @@ class ApprovalClient:
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"approval create failed: {exc}") from exc
+        refusal = _rejected_reraise_refusal(response)
+        if refusal is not None:
+            raise ApprovalRefused(refusal)
         # 201 is a fresh record; 200 is the idempotent dedupe_key replay.
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
@@ -488,6 +580,7 @@ class ApprovalClient:
                 status=str(body["status"]),
                 resolved_by=body.get("resolved_by"),
                 resolution_note=body.get("resolution_note"),
+                resolved_at=parse_decision_time(body.get("resolved_at")),
             )
         except (ValueError, KeyError) as exc:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
@@ -531,6 +624,61 @@ class ApprovalClient:
             )
         except (ValueError, KeyError) as exc:
             raise ApprovalBackendError("publication create returned an unusable body") from exc
+
+    async def get_publication_precheck_context(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        work_item_id: uuid.UUID,
+        execution_request_id: uuid.UUID,
+        runtime_epoch: int,
+        queued_event_id: str,
+    ) -> PublicationContext | None:
+        """Obtain one execution's scoped read capability from the trusted API."""
+
+        if not self._worker_headers:
+            raise ApprovalBackendError("publication context requires internal worker auth")
+        headers = {**self._worker_headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
+        try:
+            response = await self._client.post(
+                f"{self._publication_url}/precheck/context",
+                json={
+                    "deployment_id": str(deployment_id),
+                    "work_item_id": str(work_item_id),
+                    "execution_request_id": str(execution_request_id),
+                    "runtime_epoch": runtime_epoch,
+                    "queued_event_id": queued_event_id,
+                },
+                headers=headers,
+                follow_redirects=False,
+                timeout=_PUBLICATION_CONTEXT_HTTP_TIMEOUT_S,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError("publication context transport unavailable") from None
+        if response.status_code == 204:
+            # Only the authenticated API can establish first publication
+            # absence. Auth, provider and authority errors are never absence.
+            return None
+        if response.status_code != 200:
+            raise ApprovalBackendError("publication context unavailable")
+        try:
+            context = PublicationContext.model_validate(
+                response.json(), context=READER_CONTEXT
+            )
+        except (TypeError, ValueError):
+            # Validation errors can contain the capability. Do not propagate
+            # their body or chain into the worker's ordinary error logging.
+            raise ApprovalBackendError("publication context returned an unusable body") from None
+        if (
+            context.deployment_id != deployment_id
+            or context.work_item_id != work_item_id
+            or context.execution_request_id != execution_request_id
+            or context.runtime_epoch != runtime_epoch
+            or context.queued_event_id != queued_event_id
+        ):
+            raise ApprovalBackendError("publication context identity was refused")
+        return context
 
     async def get_publication_lineage(
         self,

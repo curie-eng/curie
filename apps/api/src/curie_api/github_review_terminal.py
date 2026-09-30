@@ -1,17 +1,17 @@
 """Read exact worker terminal evidence; absence never means completion."""
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 import redis.asyncio as redis
 
 from .config import Settings
 
 
-async def worker_event_is_terminal(
+async def worker_event_terminal_outcome(
     valkey: redis.Redis, settings: Settings, event_id: str
-) -> bool:
-    """Mirror Markers.is_terminal without becoming another terminal writer.
+) -> Literal["complete", "history_capacity"] | None:
+    """Read the worker's exact terminal outcome without writing one.
 
     The worker alone records terminal completion under its delivery fence. A
     missing queue entry or an expired lease supplies no terminal evidence.
@@ -19,10 +19,14 @@ async def worker_event_is_terminal(
     fence, and the independently retained completion-outbox flag.
     """
     async with valkey.pipeline(transaction=False) as pipe:
-        pipe.exists(f"{settings.worker_key_prefix}:done:{event_id}")
+        pipe.get(f"{settings.worker_key_prefix}:done:{event_id}")
         pipe.hget(f"{settings.worker_key_prefix}:completion:{event_id}", "done")
         marker, flag = await pipe.execute()
-    return bool(marker) or flag in ("1", b"1")
+    if marker in ("history_capacity", b"history_capacity"):
+        return "history_capacity"
+    if marker is not None or flag in ("1", b"1"):
+        return "complete"
+    return None
 
 
 async def read_review_dead_letter(

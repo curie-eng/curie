@@ -37,12 +37,14 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
-from claude_agent_sdk import HookMatcher, create_sdk_mcp_server, tool
+from aci_protocol import PublicationContext
+from claude_agent_sdk import HookMatcher, SdkMcpTool, create_sdk_mcp_server, tool
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -72,7 +74,21 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .memory_facts import (
+    FORGET_TOOL,
+    MAX_STATEMENT_CHARS,
+    MEMORY_TOOL_NAMES,
+    REMEMBER_TOOL,
+    UPDATE_TOOL,
+    FactNotFound,
+    MemoryFactsError,
+    MemoryFactsStore,
+    MemoryFull,
+    MemoryTurn,
+)
+from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
+from .turn_progress import TURN_PROGRESS_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +239,12 @@ APPROVAL_SERVER_NAME = "curie"
 _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
+# The live-status-card progress tool (#3077), mounted on the same server only
+# when the worker injected a progress URL and token.
+PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
+# Deliberate progress (ADR 0130's ``curie_progress``), mounted on the same server
+# whenever ``report_progress`` is not; see ``turn_progress.py``.
+TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -251,9 +273,28 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # Both are always exempt even though ``request_approval`` is omitted when a
 # permission gate already pages (#2657): an omitted tool is not callable, so
 # exempting its name costs nothing, and making the exemption depend on the
-# pager decision would add a second way for the two to disagree.
+# pager decision would add a second way for the two to disagree. The same
+# reasoning covers ``report_progress`` (#3077), mounted only for a factory
+# execution: it reports a phase and never acts, so it is never gated. And it
+# covers ``progress`` (ADR 0130), mounted only for eligible human turns: it
+# reports task state and never acts either.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
-    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME}
+    {
+        APPROVAL_TOOL_NAME,
+        PLATFORM_PUBLISH_TOOL_NAME,
+        PROGRESS_TOOL_NAME,
+        TURN_PROGRESS_TOOL_NAME,
+    }
+)
+
+# The memory tools (#1461, ADR-0167), on the same ``curie`` server but mounted
+# only when the worker set a channel memory ref. Rendered from the one tuple
+# ``memory_facts.build_memory_tools`` registers, so a fourth memory tool cannot
+# be published without being exempted. Unlike ``report_progress`` these are
+# exempt ONLY when mounted: they write, so a name the platform did not publish
+# this session must fall to the fail-closed default.
+MEMORY_TOOL_LIVE_NAMES: frozenset[str] = frozenset(
+    f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES
 )
 
 # Platform-owned remote-development publication gate.  This is deliberately
@@ -269,8 +310,13 @@ _PUBLISH_DESCRIPTION = (
     " identify the repository's own documented test or check command for the"
     " area you changed, run it from /workspace, and report the exact command,"
     " its exit status, and a concise result in the session thread. If you"
-    " cannot identify or run an appropriate command, report that and do not"
-    " publish. If the command fails, report the failure and do not publish. If"
+    " cannot identify an appropriate command, report that and do not publish."
+    " If the command cannot run because a required binary or service is unavailable,"
+    " report that cause and publish only through a declared required CI route that"
+    " selects the changed paths. The pull request must state that in-sandbox"
+    " verification was unavailable and CI is pending proof. If no matching route"
+    " exists, do not publish. If the command runs and fails, report the failure"
+    " and do not publish. If"
     " verification generates artifacts, do not publish unrequested artifacts:"
     " use the repository's documented cleanup procedure when one exists and"
     " remove only artifacts this verification created, never requested or"
@@ -403,6 +449,9 @@ def build_approval_server(
     *,
     managed_workspace: bool = False,
     include_request_approval: bool = True,
+    progress_tool: SdkMcpTool[Any] | None = None,
+    turn_progress_tool: SdkMcpTool[Any] | None = None,
+    memory_tools: Sequence[SdkMcpTool[Any]] = (),
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -423,13 +472,21 @@ def build_approval_server(
     ``include_request_approval=False`` omits only the generic policy gate. A
     managed workspace still carries ``publish_changes``, whose separate
     permission gate corresponds to an action the platform can actually perform.
+
+    ``progress_tool`` (#3077) is the ``report_progress`` tool, appended when the
+    runner resolved a progress URL, token and phase declaration.
+    ``turn_progress_tool`` is the deliberate progress tool (ADR 0130), appended
+    only when ``progress_tool`` is not: a factory execution keeps its own.
+
+    ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
+    when the worker set a channel memory ref.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
-    tools = [request_approval] if include_request_approval else []
+    tools: list[SdkMcpTool[Any]] = [request_approval] if include_request_approval else []
 
     @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
     async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
@@ -451,12 +508,158 @@ def build_approval_server(
         )
 
     tools.append(publish_changes)
+    if progress_tool is not None:
+        tools.append(progress_tool)
+    elif turn_progress_tool is not None:
+        tools.append(turn_progress_tool)
+    tools.extend(memory_tools)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
         version="1.0.0",
         tools=tools,
     )
+
+
+# --- The memory tools (#1461, ADR-0167) ---------------------------------------
+
+_MEMORY_PROPERTY = {
+    "type": "string",
+    "enum": ["agent", "channel"],
+    "description": "Which memory: channel (this channel only) or agent (every channel).",
+}
+_STATEMENT_PROPERTY = {"type": "string", "description": "One fact, stated plainly."}
+_ID_PROPERTY = {"type": "string", "description": "The fact's id, as shown in brackets."}
+
+_REMEMBER_SCHEMA = {
+    "type": "object",
+    "properties": {"memory": _MEMORY_PROPERTY, "statement": _STATEMENT_PROPERTY},
+    "required": ["memory", "statement"],
+}
+_UPDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "id": _ID_PROPERTY,
+        "statement": _STATEMENT_PROPERTY,
+    },
+    "required": ["memory", "id", "statement"],
+}
+_FORGET_SCHEMA = {
+    "type": "object",
+    "properties": {"memory": _MEMORY_PROPERTY, "id": _ID_PROPERTY},
+    "required": ["memory", "id"],
+}
+
+
+def build_memory_tools(
+    *,
+    agent_store: MemoryFactsStore | None,
+    channel_store: MemoryFactsStore,
+    turn: MemoryTurn,
+    session_id: str,
+) -> list[SdkMcpTool[Any]]:
+    """The ``remember``/``update``/``forget`` tools for the ``curie`` server.
+
+    The author of every write is ``turn.author``, set by the SessionRunner from
+    the turn's inbound event; no argument names an author, a channel or a URL,
+    and an ``author`` the model passes anyway is ignored. Every failure (an
+    unknown memory, an unknown id, a full memory, an unreachable store) is an
+    ``is_error`` result the model reads.
+    """
+
+    def pick(args: Mapping[str, Any]) -> tuple[MemoryFactsStore | None, str | None]:
+        memory = args.get("memory")
+        if memory == "channel":
+            return channel_store, None
+        if memory == "agent":
+            if agent_store is None:
+                return None, "Agent memory is not available in this session."
+            return agent_store, None
+        return None, f"Unknown memory {memory!r}; pass memory as agent or channel."
+
+    def statement_of(args: Mapping[str, Any]) -> str | None:
+        statement = args.get("statement")
+        if isinstance(statement, str) and statement.strip():
+            return statement.strip()
+        return None
+
+    def bad_statement(statement: str | None) -> dict[str, Any] | None:
+        if statement is None:
+            return _approval_error("statement must be a non-empty string.")
+        if len(statement) > MAX_STATEMENT_CHARS:
+            return _approval_error(
+                f"Refused: a statement may be at most {MAX_STATEMENT_CHARS} characters "
+                f"(this one is {len(statement)}). Nothing was saved."
+            )
+        return None
+
+    def failure(exc: MemoryFactsError, memory: object, fact_id: object = None) -> dict[str, Any]:
+        if isinstance(exc, MemoryFull) and exc.limit == "value":
+            return _approval_error(
+                f"Refused: that fact is too large to store as one {memory} memory entry "
+                f"({exc}). Nothing was saved; state it more briefly."
+            )
+        if isinstance(exc, MemoryFull):
+            return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
+        if isinstance(exc, FactNotFound):
+            return _approval_error(f"Not found: no fact with id {fact_id!r} in {memory} memory.")
+        logger.warning("memory tool failed error_class=%s: %s", type(exc).__name__, exc)
+        return _approval_error(f"The {memory} memory could not be reached. Nothing changed.")
+
+    def ok(payload: dict[str, Any]) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    @tool(REMEMBER_TOOL, "Save one new fact to memory. Returns its id.", _REMEMBER_SCHEMA)
+    async def remember(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        statement = statement_of(args)
+        refusal = bad_statement(statement)
+        if refusal is not None:
+            return refusal
+        assert statement is not None
+        try:
+            fact_id = await store.add(
+                statement=statement, author=turn.author, session_id=session_id
+            )
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"))
+        return ok({"id": fact_id})
+
+    @tool(UPDATE_TOOL, "Replace the statement of a remembered fact, by id.", _UPDATE_SCHEMA)
+    async def update(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        statement = statement_of(args)
+        refusal = bad_statement(statement)
+        if refusal is not None:
+            return refusal
+        assert statement is not None
+        fact_id = args.get("id")
+        try:
+            await store.update(
+                str(fact_id), statement=statement, author=turn.author, session_id=session_id
+            )
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"), fact_id)
+        return ok({"id": fact_id, "updated": True})
+
+    @tool(FORGET_TOOL, "Remove a remembered fact, by id.", _FORGET_SCHEMA)
+    async def forget(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        fact_id = args.get("id")
+        try:
+            await store.forget(str(fact_id))
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"), fact_id)
+        return ok({"id": fact_id, "forgotten": True})
+
+    return [remember, update, forget]
 
 
 def resolve_policy_route(
@@ -666,6 +869,7 @@ class ApprovalGate:
     # decision, never a tool); its provenance is stamped in translate.py.
     pending_gate_kind: str | None = None
     pending_granted_tool: str | None = None
+    pending_granted_arguments: dict[str, Any] | None = None
     # Policy-gate route reconciliation (#544, Decision B), set by the
     # request_approval tool when the model calls it: whether a request was made
     # this turn, whether it was refused (ambiguous/unknown route -> no approval
@@ -676,9 +880,17 @@ class ApprovalGate:
     policy_rejected: bool = False
     policy_route: str | None = None
     grant_tool: str | None = None
+    # The canonical arguments the approver saw (#3174), carried on the trusted
+    # resume boot input (#3255). When set, the grant admits only a call whose
+    # arguments are canonically equal; None (a policy grant, which authorizes a
+    # business decision rather than one call, or an approval recorded before
+    # arguments were carried) keeps the tool-name-only match.
+    grant_arguments: dict[str, Any] | None = None
     grantable_by_route: dict[str, str] = field(default_factory=dict)
     publication_title: str | None = None
     publication_body: str | None = None
+    publication_precheck: PublicationPrecheck | None = field(default=None, repr=False)
+    _publication_pending_id: str | None = None
     # Set by ``block()`` whenever the gate refuses a call (#1852). Since the
     # refusal now carries the SDK's turn-stopping flags, the CLI aborts the turn
     # and its terminal result arrives shaped like a failure; this marker is how
@@ -703,6 +915,10 @@ class ApprovalGate:
     # state server, so a forgotten wiring costs an over-refusal a human can see
     # rather than a silent bypass nobody can.
     state_server_mounted: bool = False
+    # Whether THIS session mounted the memory tools on the ``curie`` server
+    # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
+    # ``__main__`` sets it from the expression that decides the mount.
+    memory_tools_mounted: bool = False
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -723,11 +939,15 @@ class ApprovalGate:
         self.pending_route = None
         self.pending_gate_kind = None
         self.pending_granted_tool = None
+        self.pending_granted_arguments = None
         self.policy_requested = False
         self.policy_rejected = False
         self.policy_route = None
         self.publication_title = None
         self.publication_body = None
+        self._publication_pending_id = None
+        if self.publication_precheck is not None:
+            self.publication_precheck.clear()
         # Strictly per-turn, and cleared with the other pending state rather
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
@@ -737,15 +957,78 @@ class ApprovalGate:
         # leaks into a subsequent turn.
         if self._boot_turn_seen:
             self.grant_tool = None
+            self.grant_arguments = None
         self._boot_turn_seen = True
 
-    def consume_grant(self, tool_name: str) -> bool:
-        """Spend the one-shot grant iff it names ``tool_name`` (single use)."""
+    def bind_publication_context(self, context: PublicationContext | None) -> None:
+        if self.publication_precheck is None and context is not None:
+            self.publication_precheck = PublicationPrecheck(None, None, network_enabled=False)
+        if self.publication_precheck is not None:
+            self.publication_precheck.bind(context)
 
-        if self.grant_tool is not None and tool_name == self.grant_tool:
-            self.grant_tool = None
-            return True
-        return False
+    def clear_publication_context(self) -> None:
+        if self.publication_precheck is not None:
+            self.publication_precheck.clear()
+
+    def publication_refused(self, tool_use_id: str | None) -> bool:
+        return (
+            self.publication_precheck is not None
+            and tool_use_id in self.publication_precheck.refused_ids
+        )
+
+    async def check_publication(
+        self, tool_use_id: str | None, tool_input: dict[str, Any]
+    ) -> str | None:
+        if self.publication_precheck is None:
+            return None
+        refusal = await self.publication_precheck.decide(tool_use_id, tool_input)
+        if (
+            refusal is not None
+            and self.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+            and self._publication_pending_id == tool_use_id
+        ):
+            # A conflicting observation invalidates this call's earlier record.
+            # Other tools retain ownership of their existing approval slot.
+            self.pending_summary = None
+            self.pending_display = None
+            self.pending_route = None
+            self.pending_gate_kind = None
+            self.pending_granted_tool = None
+            self.pending_granted_arguments = None
+            self.pending_halt = False
+            self.publication_title = None
+            self.publication_body = None
+            self._publication_pending_id = None
+        return refusal
+
+    def grant_argument_mismatch(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        """Whether an unspent grant names ``tool_name`` but not these arguments (#3174)."""
+
+        return (
+            self.grant_tool is not None
+            and tool_name == self.grant_tool
+            and self.grant_arguments is not None
+            and _canonical_arguments(tool_input) != _canonical_arguments(self.grant_arguments)
+        )
+
+    def consume_grant(self, tool_name: str, tool_input: dict[str, Any] | None = None) -> bool:
+        """Spend the one-shot grant iff it names ``tool_name`` (single use).
+
+        When the grant carries the approved arguments, the call's arguments
+        must also be canonically equal to them (#3174). A mismatch leaves the
+        grant unspent so the exact approved call can still run once.
+        """
+
+        if self.grant_tool is None or tool_name != self.grant_tool:
+            return False
+        if self.grant_arguments is not None and (
+            tool_input is None
+            or _canonical_arguments(tool_input) != _canonical_arguments(self.grant_arguments)
+        ):
+            return False
+        self.grant_tool = None
+        self.grant_arguments = None
+        return True
 
     def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         # Outside the first-block guard on purpose (#1852): the FIRST blocked
@@ -793,41 +1076,32 @@ class ApprovalGate:
         # trusted grant target, never derived from the summary string.
         self.pending_gate_kind = "permission"
         self.pending_granted_tool = tool_name
+        self.pending_granted_arguments = deepcopy(tool_input)
         return True
 
-    def observe_publication(self, tool_input: dict[str, Any]) -> bool:
-        """Record a publication request the runner saw on the STREAM (#2294).
+    async def observe_publication(
+        self, tool_use_id: str | None, tool_input: dict[str, Any]
+    ) -> bool | None:
+        """Await the shared decision before recording a streamed publication.
 
-        The runner's own observer of a publication call, alongside the
-        PreToolUse hook (#1852) and ``can_use_tool`` (#245) rather than behind
-        them. Against the real SDK the stream reaches the session loop BEFORE
-        the CLI dispatches PreToolUse (observed live, #2294), so this is
-        normally the FIRST writer of the record and the hook's ``block`` then
-        finds it standing and only adds the halt marker; the fake tier inverts
-        that order, and there this call is the duplicate. It replaces neither
-        layer -- both still DECIDE the call, which this never does.
+        The real SDK may deliver the stream before either permission callback.
+        Every observer uses the exact call ID, so only one comparison runs and
+        a continuing refusal never creates pending state. An approval decision
+        records the first pending proposal without setting the halt marker;
+        only the SDK callbacks request that stop. This observer never grants
+        permission to execute the publication tool.
 
-        What it closes is the case where NEITHER layer recorded the call (a
-        hook that raised is reported and the call proceeds; a concurrently
-        dispatched bundle hook; an input shape a layer abstains on): the stream
-        still carries the ``ToolUseBlock``, and without this the turn finalizes
-        DONE with nothing for a human to approve.
-
-        It can only ever RECORD or raise -- it never returns an allow decision
-        and never mints a grant, so it cannot widen authority: ``safe_grant_tool``
-        already refuses a sandbox grant for the publish tool, and a second call
-        blocks again. It deliberately leaves ``pending_halt`` False: the runner
-        did not ask the CLI to stop this turn, and claiming otherwise would
-        relabel an unrelated failure as awaiting-approval.
-
-        Returns True when it created the pending record, False when one already
-        stands (an earlier call this turn, or a gate layer that got there first
-        on the fake tier -- exactly one record per turn either way). Raises
-        ``ValueError`` on a malformed title/body, identically to ``block``; the
-        session turns that into a fail-closed classified failure.
+        Return None for a continuing refusal, True for a new pending record,
+        and False when a previous record already owns the slot. A malformed
+        proposal raises ValueError for the existing terminal failure handling.
         """
 
-        return self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
+        if await self.check_publication(tool_use_id, tool_input) is not None:
+            return None
+        recorded = self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
+        if recorded:
+            self._publication_pending_id = tool_use_id
+        return recorded
 
 
 class _GateDecision(NamedTuple):
@@ -851,6 +1125,7 @@ class _GateDecision(NamedTuple):
     blocked: bool
     ungated: bool
     refusal: str | None = None
+    continue_turn: bool = False
 
 
 def is_mcp_tool(live_tool_name: str) -> bool:
@@ -884,7 +1159,9 @@ def canonical_tool_name(
     return None
 
 
-def platform_tool_names(*, state_server_mounted: bool) -> frozenset[str]:
+def platform_tool_names(
+    *, state_server_mounted: bool, memory_tools_mounted: bool = False
+) -> frozenset[str]:
     """The live tool names Curie's own in-process servers mounted THIS session.
 
     Always the two ``curie`` server tools; the five ``curie-state`` tools only
@@ -898,14 +1175,22 @@ def platform_tool_names(*, state_server_mounted: bool) -> frozenset[str]:
     The state names come from ``state.STATE_TOOL_NAMES``, which is rendered from
     the SAME spec list ``build_state_server`` registers, so a sixth state tool
     cannot be published without being exempted (#2286).
+
+    The three memory tools (#1461) join the set only when the runner mounted
+    them, on the same reasoning as the state tools.
     """
 
+    names = _APPROVAL_SERVER_TOOL_NAMES
     if state_server_mounted:
-        return _APPROVAL_SERVER_TOOL_NAMES | STATE_TOOL_NAMES
-    return _APPROVAL_SERVER_TOOL_NAMES
+        names = names | STATE_TOOL_NAMES
+    if memory_tools_mounted:
+        names = names | MEMORY_TOOL_LIVE_NAMES
+    return names
 
 
-def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -> bool:
+def is_platform_owned_tool(
+    live_tool_name: str, *, state_server_mounted: bool, memory_tools_mounted: bool = False
+) -> bool:
     """Whether a live SDK name is one Curie's own servers published (#2286).
 
     EXACT membership in ``platform_tool_names``, and the exactness is the whole
@@ -938,7 +1223,9 @@ def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -
     named ``curie`` (its live names carry the ``plugin_<bundle>_`` infix).
     """
 
-    return live_tool_name in platform_tool_names(state_server_mounted=state_server_mounted)
+    return live_tool_name in platform_tool_names(
+        state_server_mounted=state_server_mounted, memory_tools_mounted=memory_tools_mounted
+    )
 
 
 def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
@@ -966,7 +1253,11 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     # Outside policy scope is not permission to run. Returning None means the
     # policy has no opinion; `_decide_gate` still applies gate.required, the
     # operator gates, and the publication special case below.
-    if is_platform_owned_tool(tool_name, state_server_mounted=gate.state_server_mounted):
+    if is_platform_owned_tool(
+        tool_name,
+        state_server_mounted=gate.state_server_mounted,
+        memory_tools_mounted=gate.memory_tools_mounted,
+    ):
         return None
     canonical = canonical_tool_name(
         tool_name,
@@ -1007,10 +1298,30 @@ def policy_disallowed_tools(
     )
 
 
-def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
+def _canonical_arguments(arguments: dict[str, Any]) -> str:
+    """Canonical JSON for argument equality: sorted keys, no insignificant space."""
+
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _grant_mismatch_refusal(tool_name: str) -> str:
+    return (
+        f"The approval for {tool_name} covers only the exact arguments the approver "
+        "saw, and this call's arguments differ. It was not run. Retry with exactly "
+        "the approved arguments, or tell the user what changed so they can approve "
+        "the new call."
+    )
+
+
+async def _decide_gate(
+    gate: ApprovalGate,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    tool_use_id: str | None,
+) -> _GateDecision:
     """Apply the gate rule to one candidate call, mutating ``gate`` as needed.
 
-    Mirrors the pre-extraction ``can_use_tool`` logic verbatim: a tool outside
+    Publication awaits its shared precheck before the ordinary rule: a tool outside
     ``gate.required`` is ungated (no state change, allow); a gated tool with an
     unspent one-shot grant is granted (the grant is spent here, allow); anything
     else is blocked (``gate.block`` records it, deny). The caller still owns
@@ -1019,6 +1330,12 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     flag) -- this function decides, it does not render.
     """
 
+    if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
+        refusal = await gate.check_publication(tool_use_id, tool_input)
+        if refusal is not None:
+            return _GateDecision(
+                blocked=False, ungated=False, refusal=refusal, continue_turn=True
+            )
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
         return _GateDecision(
@@ -1033,7 +1350,14 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     # Policy gates are additive to legacy/operator gates. A policy allow never
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
-        if gate.consume_grant(tool_name):
+        if gate.grant_argument_mismatch(tool_name, tool_input):
+            return _GateDecision(
+                blocked=False,
+                ungated=False,
+                refusal=_grant_mismatch_refusal(tool_name),
+                continue_turn=True,
+            )
+        if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False)
         gate.block(tool_name, tool_input)
         return _GateDecision(blocked=True, ungated=False)
@@ -1041,9 +1365,24 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
     # injected or stale grant must never let the in-sandbox tool execute.
-    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
+    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
+        tool_name, tool_input
+    ):
+        return _GateDecision(
+            blocked=False,
+            ungated=False,
+            refusal=_grant_mismatch_refusal(tool_name),
+            continue_turn=True,
+        )
+    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
+    if (
+        tool_name == PLATFORM_PUBLISH_TOOL_NAME
+        and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+        and gate._publication_pending_id is None
+    ):
+        gate._publication_pending_id = tool_use_id
     return _GateDecision(blocked=True, ungated=False)
 
 
@@ -1079,14 +1418,16 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         # approved action completes) and re-arms the gate. ``_decide_gate``
         # applies this rule (shared with the hook below).
         try:
-            decision = _decide_gate(gate, tool_name, tool_input)
+            decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
         except ValueError as exc:
             return PermissionResultDeny(
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
                 interrupt=True,
             )
         if decision.refusal is not None:
-            return PermissionResultDeny(message=decision.refusal, interrupt=True)
+            return PermissionResultDeny(
+                message=decision.refusal, interrupt=not decision.continue_turn
+            )
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
             # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
@@ -1213,7 +1554,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # used by ``build_can_use_tool`` above); the grant, if any, is spent as
         # a side effect of this call.
         try:
-            decision = _decide_gate(gate, tool_name, tool_input)
+            decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
         except ValueError as exc:
             reason = f"Publication request was not recorded: {exc}. Correct it and retry."
             return {
@@ -1226,6 +1567,15 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "stopReason": reason,
             }
         if decision.refusal is not None:
+            if decision.continue_turn:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": decision.refusal,
+                    },
+                    "continue_": True,
+                }
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -1476,6 +1826,8 @@ def build_approval_gate(
     operator_tools: Sequence[str] | None,
     policy_routes: dict[str, str],
     grant_tool: str | None = None,
+    grant_arguments: dict[str, Any] | None = None,
+    resumed_kind: str | None = None,
     grantable_by_route: dict[str, str] | None = None,
     summary_by_tool: dict[str, str] | None = None,
     bundle_name: str | None = None,
@@ -1601,10 +1953,26 @@ def build_approval_gate(
     if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PLATFORM_PUBLISH_TOOL_NAME else grant_tool
+    # #3174: only a policy grant may be admitted by name alone, and it must be
+    # one on both counts: the resume is recorded as a policy approval AND the
+    # tool is one some grantableViaPolicy route maps to. ``resumed_kind`` only
+    # narrows here; it never creates a grant. A permission grant without the
+    # approved arguments (an old row, or a malformed carrier) cannot prove what
+    # the approver saw, so it is dropped and the call asks for a fresh approval.
+    policy_grant = resumed_kind == "policy" and safe_grant_tool in set(
+        (grantable_by_route or {}).values()
+    )
+    if safe_grant_tool is not None and grant_arguments is None and not policy_grant:
+        logger.warning(
+            "dropping resume grant for %s: no approved arguments were carried",
+            safe_grant_tool,
+        )
+        safe_grant_tool = None
     return ApprovalGate(
         required=gated_tools,
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
+        grant_arguments=grant_arguments if safe_grant_tool is not None else None,
         grantable_by_route=grantable_by_route or {},
         summary_by_tool=summary_by_tool or {},
         tool_policy=tool_policy,

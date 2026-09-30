@@ -31,14 +31,16 @@ hide exactly the difference that matters.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import sys
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
@@ -46,6 +48,14 @@ from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heart
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
 from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+from queue_fixtures import wait_until  # noqa: E402
+
+_wait_until = functools.partial(wait_until, timeout=10.0)
 
 DONE = SessionStatus.DONE
 
@@ -63,26 +73,6 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": _HEARTBEAT_S,
     "runner_total_timeout_s": 30.0,
 }
-
-
-def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 async def _read_one(h: Any, consumer_name: str) -> tuple[str, dict[str, str]]:
@@ -181,6 +171,262 @@ def test_a_second_replica_is_refused_while_the_first_holds_a_live_lease(
 
             hold.set()
             await _settle(consumer_a)
+
+    asyncio.run(go())
+
+
+def test_distinct_approval_resume_deliveries_run_once_while_first_turn_is_live(
+    make_harness,
+) -> None:
+    """#2832: a resume event id fences separate stream entries, not just one PEL row.
+
+    The API can enqueue the same deterministic resume twice. Each entry has its
+    own delivery lease, so fencing only by stream id lets the second delivery
+    steer the live approved turn. The redundant entry is acked while the winner
+    retains its own durable PEL row. A later duplicate must be consumed through
+    the existing done marker without starting or steering another turn.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            cfg_a = h.config.model_copy(update={"consumer_name": "resume-worker-a"})
+            cfg_b = h.config.model_copy(update={"consumer_name": "resume-worker-b"})
+            consumer_a = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
+            )
+            consumer_b = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
+            )
+            await consumer_a.ensure_group()
+
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="approved work finished", status=DONE)]
+            event_id = f"approval-{uuid.uuid4()}-resolved"
+            resume = _qevent(
+                "continue approved work", thread="resume-2832", event_id=event_id
+            )
+            first_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(resume)
+            )
+            second_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(resume)
+            )
+            assert first_id != second_id
+
+            read_first_id, first_fields = await _read_one(h, "resume-worker-a")
+            assert read_first_id == first_id
+            await consumer_a._dispatch(first_id, first_fields)
+            await _wait_until(lambda: h.runner.turn_active)
+            read_second_id, second_fields = await _read_one(h, "resume-worker-b")
+            assert read_second_id == second_id
+
+            try:
+                await consumer_b._dispatch(second_id, second_fields)
+                await _settle(consumer_b)
+                assert h.runner.opened == [resume.text]
+                assert h.runner.steers == [], (
+                    "the duplicate resume steered into the live approved turn"
+                )
+                assert second_id not in await _pending_rows(h), (
+                    "the redundant entry remained pending despite the live winner"
+                )
+                assert first_id in await _pending_rows(h)
+            finally:
+                hold.set()
+                await _settle(consumer_a)
+
+            assert first_id not in await _pending_rows(h)
+            assert await h.async_redis.exists(h.config.done_key(event_id))
+
+            third_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(resume)
+            )
+            read_third_id, third_fields = await _read_one(h, cfg_b.consumer_name)
+            assert read_third_id == third_id
+            await consumer_b._dispatch(third_id, third_fields)
+            await _settle(consumer_b)
+            assert third_id not in await _pending_rows(h), (
+                "the completed duplicate was not absorbed on redelivery"
+            )
+            assert h.runner.opened == [resume.text]
+            assert h.runner.steers == []
+
+    asyncio.run(go())
+
+
+def test_approval_resume_claim_renews_then_releases_after_owner_failure(
+    make_harness,
+) -> None:
+    """#2832: a live claim survives its TTL, and a failed owner permits retry.
+
+    The first handler fails before reaching the kernel's terminal marker. The
+    second entry has the same resume id but its own PEL row and delivery lease.
+    It is acked after several lease TTLs while the first handler is alive. The
+    first entry remains pending, then transfers and runs after its owner fails.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            cfg_a = h.config.model_copy(update={"consumer_name": "resume-failure-a"})
+            cfg_b = h.config.model_copy(update={"consumer_name": "resume-failure-b"})
+            consumer_a = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
+            )
+            consumer_b = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
+            )
+            await consumer_a.ensure_group()
+
+            event_id = f"approval-{uuid.uuid4()}-resolved"
+            resume = _qevent(
+                "retry approved work", thread="resume-retry", event_id=event_id
+            )
+            first_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
+            second_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
+            read_first_id, first_fields = await _read_one(h, cfg_a.consumer_name)
+            read_second_id, second_fields = await _read_one(h, cfg_b.consumer_name)
+            assert (read_first_id, read_second_id) == (first_id, second_id)
+
+            entered = asyncio.Event()
+            fail = asyncio.Event()
+            attempts: list[str] = []
+            original_process = h.kernel.process_event
+
+            async def fail_first_process(qevent: QueuedTurn, *, lease: Any = None) -> None:
+                attempts.append(qevent.event_id)
+                entered.set()
+                await fail.wait()
+                raise RuntimeError("injected handler failure before terminal settlement")
+
+            h.kernel.process_event = fail_first_process  # type: ignore[method-assign,assignment]
+            await consumer_a._dispatch(first_id, first_fields)
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=10.0)
+                await asyncio.sleep(2.5 * _TTL_S)
+                await consumer_b._dispatch(second_id, second_fields)
+                await asyncio.wait_for(_settle(consumer_b), timeout=10.0)
+                assert attempts == [event_id], (
+                    "the second delivery entered while the first owner was still live"
+                )
+                assert second_id not in await _pending_rows(h)
+                assert first_id in await _pending_rows(h)
+            finally:
+                fail.set()
+                await _settle(consumer_a)
+                h.kernel.process_event = original_process  # type: ignore[method-assign,assignment]
+
+            assert first_id in await _pending_rows(h)
+            assert not await h.async_redis.exists(h.config.done_key(event_id))
+
+            h.runner.default_script = [Final(text="recovered", status=DONE)]
+            await h.async_redis.xclaim(
+                h.config.stream,
+                h.config.consumer_group,
+                cfg_b.consumer_name,
+                0,
+                [first_id],
+            )
+            await consumer_b._dispatch(first_id, first_fields)
+            await _settle(consumer_b)
+            assert h.runner.opened == [resume.text]
+            assert h.sink.last_text == "recovered"
+            assert first_id not in await _pending_rows(h)
+            assert await h.async_redis.exists(h.config.done_key(event_id))
+
+            third_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
+            read_third_id, third_fields = await _read_one(h, cfg_a.consumer_name)
+            assert read_third_id == third_id
+            await consumer_a._dispatch(third_id, third_fields)
+            await _settle(consumer_a)
+            assert third_id not in await _pending_rows(h)
+            assert h.runner.opened == [resume.text]
+
+    asyncio.run(go())
+
+
+def test_reclaimed_sole_resume_entry_takes_over_a_stale_event_claim(
+    make_harness,
+) -> None:
+    """#2832: a crashed winner's own row is work, not a redundant duplicate.
+
+    A hard crash leaves both the PEL row and its event claim behind, but its
+    delivery lease can disappear before the event claim expires. Reclaiming the
+    sole pending row must take over that stale claim and run the approval turn.
+    Merely acknowledging a refused claim would lose the approved work.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            **{**_LEASE_KNOBS, "delivery_lease_ttl_s": 5.0}
+        ) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            replacement_name = "resume-replacement"
+            replacement_config = h.config.model_copy(
+                update={"consumer_name": replacement_name}
+            )
+            replacement = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=replacement_config,
+                leases=store,
+            )
+            await replacement.ensure_group()
+
+            event_id = f"approval-{uuid.uuid4()}-resolved"
+            resume = _qevent(
+                "resume after crash", thread="resume-crash", event_id=event_id
+            )
+            entry_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(resume)
+            )
+            read_id, fields = await _read_one(h, "crashed-owner")
+            assert read_id == entry_id
+            assert await h.async_redis.xlen(h.config.stream) == 1
+
+            stale = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer="crashed-owner",
+            )
+            assert await store.claim_resume(stale, event_id, consumer="crashed-owner")
+            claim_key = store._resume_key(
+                h.config.stream, h.config.consumer_group, event_id
+            )
+            assert await h.async_redis.exists(claim_key)
+
+            # A SIGKILL runs no release finally. Its delivery lease disappears,
+            # while the separate event claim still names that dead owner.
+            await h.async_redis.delete(
+                h.config.delivery_lease_key(
+                    h.config.stream, h.config.consumer_group, entry_id
+                )
+            )
+            assert await h.async_redis.exists(claim_key)
+            await h.async_redis.xclaim(
+                h.config.stream,
+                h.config.consumer_group,
+                replacement_name,
+                0,
+                [entry_id],
+            )
+            assert entry_id in await _pending_rows(h)
+            assert await h.async_redis.pttl(claim_key) > 1000
+
+            h.runner.default_script = [Final(text="recovered", status=DONE)]
+            await replacement._dispatch(entry_id, fields)
+            await _settle(replacement)
+
+            assert h.runner.opened == [resume.text], (
+                "the sole pending resume was mistaken for a redundant entry"
+            )
+            assert h.sink.last_text == "recovered"
+            assert entry_id not in await _pending_rows(h)
+            assert await h.async_redis.exists(h.config.done_key(event_id))
 
     asyncio.run(go())
 
@@ -648,7 +894,8 @@ def test_a_transferred_delivery_inherits_the_remaining_budget_not_a_fresh_one(
             # And the kernel receives the inherited budget, not a fresh one: the
             # replacement's delivery is what actually runs the turn.
             await store.release(
-                h.config.stream, h.config.consumer_group, entry_id, owner=lease_3.owner
+                h.config.stream, h.config.consumer_group, entry_id, owner=lease_3.owner,
+                resume_event_id=None,
             )
             await h.async_redis.xclaim(
                 h.config.stream, h.config.consumer_group, h.config.consumer_name, 0, [entry_id]
@@ -960,7 +1207,8 @@ async def _lease_expired_row(
         h.config.stream, h.config.consumer_group, entry_id, consumer=owner
     )
     await store.release(
-        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+        resume_event_id=None,
     )
     return entry_id, fields
 
@@ -1158,47 +1406,6 @@ def test_a_live_lease_is_never_reclaimed_by_the_expiry_pass(make_harness) -> Non
             await _settle(consumer)
             assert attempts == ["live-1"]
             assert (await _pending_rows(h))[entry_id] == before + 1
-
-    asyncio.run(go())
-
-
-def test_the_expiry_pass_is_inert_without_a_lease_store(make_harness) -> None:
-    """A base-only consumer keeps its pre-ADR-0131 behavior exactly.
-
-    Red on dereferencing ``self._leases`` unconditionally in the new pass, and
-    red on keying the pass on the CONFIGURED threshold alone: the config carries
-    a threshold here, and the leaseless consumer must still do nothing with it,
-    because with no lease store there is no evidence to key on.
-
-    The fenced consumer on the same row is the positive control.
-    """
-
-    async def go() -> None:
-        async with make_harness(**_EXPIRY_KNOBS) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            leaseless = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await leaseless.ensure_group()
-            attempts = _failing_process_event(h)
-
-            entry_id, _fields = await _lease_expired_row(
-                h, store, event_id="inert-1", owner="peer-one"
-            )
-            before = (await _pending_rows(h))[entry_id]
-            await _arm_pel_idle(
-                h, entry_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
-
-            assert await leaseless._reclaim_once() == 0
-            assert attempts == []
-            assert (await _pending_rows(h))[entry_id] == before
-
-            # POSITIVE CONTROL: the same row, a fenced consumer.
-            fenced = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
-            assert await fenced._reclaim_once() == 1
-            await _settle(fenced)
-            assert attempts == ["inert-1"]
 
     asyncio.run(go())
 

@@ -135,9 +135,10 @@ next click rather than the next restart:
 
 Three independent axes, and keeping them separate is the point:
 
-- **`resolution` is WHERE the one interactive card posts.** It is required and currently
-  accepts only `{ "kind": "slack", "address": "C..." }`, because Slack's authenticated
-  interaction path supplies the verified resolver identity.
+- **`resolution` is WHERE the one interactive card posts.** It is required and takes one of
+  two forms: a fixed Slack channel, `{ "kind": "slack", "address": "C..." }`, or
+  `{ "mode": "requesting_surface" }`, which shows the card in the conversation that asked,
+  on whatever channel that is (see below).
 - **`notification` is WHERE else humans are told.** It is optional. Its text includes the
   approval ID and directs humans to the configured approval channel without naming its
   kind or address. It has no interaction, buttons, action values, or other resolving
@@ -149,9 +150,30 @@ Three independent axes, and keeping them separate is the point:
 A Slack notification can use the worker's default transport. Any other notification kind
 must store both `endpoint` and `adapter`; those transport details are write-only and are
 redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
-Resolution deliberately has a channel-neutral shape but remains Slack-only. Making another
-channel interactive requires a future adapter-scoped credential that establishes a verified
-resolver identity; this split does not add one or accept resolution through a notification.
+A fixed resolution target stays Slack-only, and a notification never resolves anything.
+
+### Answering where it was asked, including by email
+
+This is
+[ADR-0177](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md). A
+route whose `resolution` is `{ "mode": "requesting_surface" }` puts its card in the
+conversation that asked, the way an approval with no route already does. It cannot carry a
+`notification`, since the card is already in the thread that asked. Who may answer follows
+the channel the card lands on:
+
+- **In Slack**, nothing changes: the channel's members, the route's user group, or its
+  listed users, exactly as for any Slack card.
+- **Anywhere else**, such as an email thread, only the person who asked may answer, by
+  replying in that conversation through the channel's adapter. People copied on the thread
+  cannot answer, and neither can an operator token, a console session or a Slack click.
+  This is the requester confirming their own request, not a second person's sign-off. A
+  route that lists `approvers` and would land on such a conversation is escalated when the
+  approval is raised, because approver lists name Slack users that nobody there can prove
+  to be yet. A bot that needs a second person's sign-off keeps a fixed Slack route.
+
+An adapter answers only approvals whose card went to one of its own bindings. Until a
+channel's adapter renders the Approve and Reject request and reads the replies, its
+approvals still only expire.
 
 A route the bundle names but the agent never bound is **escalated to a human**, not
 posted to the requesting channel. Silently widening a request to whoever happens to be
@@ -230,6 +252,14 @@ and it is stored on the record, stamped onto the card in the approver channel, a
 carried to the requester in the resume turn below. Cancelling the dialog resolves
 nothing, so a misclick is recoverable.
 
+Once an approval ends, its card is a record of the outcome
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+The buttons are gone, the header reads `Approved`, `Rejected` or `Expired`, the summary
+and the requester stay. An approved or rejected card names who decided and when, with
+the note under it. The time is a Slack date token, so each reader sees it in their own
+time zone. An expired card states that the request expired without a decision time.
+A resolve from the CLI or the Console settles the card the same way a click does.
+
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra
 click, and it is deliberate. A reason is the half of a rejection the requester actually
@@ -302,8 +332,23 @@ recognize them will treat the resume as an unrelated user message and the verdic
 silently dropped. Give the skill a section that says what to do on each, including for
 a rejection.
 
-The reply streams back into the **same message** the "awaiting approval" notice was left
-on, because the resume turn replays the original turn's reply handle.
+Where the reply lands depends on where the card went
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+When the card was posted into the requester's own thread, the message above it reads
+only "Approval requested. See the card below.", and the resumed answer is posted as a
+new message below the card, so the thread reads request, card, answer. When the card
+went somewhere else (a route bound to another channel, or the `cluster message` relay),
+the requester's thread gets the full `Awaiting approval (<id>): ...` notice, and the
+reply streams back into that same message, because the resume turn replays the
+original turn's reply handle. The CLI reads the id from the card when its stub
+receives one and from that full notice otherwise.
+
+**A rejection is final until a person asks again.** If the resumed turn requests the same
+approval again (same agent, thread, route and gated tool, however the summary is worded),
+the platform refuses it: no card goes out, the refusal is recorded on the rejected
+approval's audit trail as `reraise_refused`, and the thread gets one message naming the
+rejected approval, who rejected it and when. A person asking in the thread starts a new
+turn, and that turn may raise it again.
 
 ## Driving it from the CLI
 
@@ -345,6 +390,13 @@ so a human knows where that authenticated card lives. A null or empty `card_chan
 from an older row or a direct API write that omitted the field; for that compatibility
 case, the requesting channel is the card location.
 
+A single operator does not need a second person to settle a card. An authenticated
+member of the approver set may approve their own request, including the person who
+asked. Terminal resolution still works only for an explicit `approvers.users`
+binding, because an operator principal carries no channel. If nobody resolves a
+worker-raised request, it expires after 24 hours and the paused session wakes on
+the timeout branch instead of staying pending.
+
 ## Operational guarantees
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
@@ -354,10 +406,14 @@ case, the requesting channel is the card location.
   ([ADR-0003](adr/0003-stateless-first-rehydrate-on-resume.md)). Resume cold-creates a
   fresh one and rehydrates from history. Never design a feature that needs in-process
   state to survive a pause.
-- **Unresolved approvals expire.** A sweeper settles records nobody answered and wakes
-  the session down its timeout branch (`apps/api/src/curie_api/sweeper.py`), and a
-  reconciler re-drives resolutions whose resume turn never landed
-  (`apps/api/src/curie_api/resumereconciler.py`).
+- **Worker-raised approvals expire.** Session approvals the worker creates, and
+  publication approvals, carry a 24 hour deadline. The sweeper settles a lapsed
+  record and wakes the paused session down its timeout branch
+  (`apps/api/src/curie_api/sweeper.py`), and a reconciler re-drives resolutions
+  whose resume turn never landed (`apps/api/src/curie_api/resumereconciler.py`).
+  A direct API create that omits `expires_in_seconds` is still the wire's no-SLA
+  path and is not swept. Approvals created before this deadline existed keep a
+  null `expires_at` and are not swept; settle those by hand.
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
   attempt with the authorizer, membership evidence, `principal_kind`, and
   `authenticated` proof state, including refusals. Historical rows remain
@@ -365,8 +421,13 @@ case, the requesting channel is the card location.
 - **Roll the API before the dispatcher.** The identity contract intentionally has no
   assertion-compatible dual mode. During an upgrade, bring up the verifier first, then
   the attester; the reverse order is rejected rather than reopening asserted identity.
-- **Console resolution requires HTTPS.** Its session cookie is `Secure`, `HttpOnly`, and
-  same-site. A browser on a plain-HTTP endpoint will not retain the credential.
+- **Console resolution requires HTTPS.** Its session cookie is `__Host-curie_console_session`:
+  `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, and no `Domain`. A browser on a plain-HTTP
+  endpoint will not retain the credential. `SameSite` does not stop another origin on the same
+  site, so a cookie-authenticated resolve or recover also requires a matching `Origin` (or
+  `Referer` when `Origin` is absent). The host must match; the scheme may differ because the
+  UI proxy speaks HTTP to the API. Sessions minted under the old name `curie_console_session`
+  stop working on upgrade. The TTL is 12 hours; exchange a new login code.
 
 ## Common failures
 
@@ -375,13 +436,15 @@ case, the requesting channel is the card location.
 | `401 missing or invalid approval principal` | A platform API key alone cannot resolve. For an explicit-user route, mint an operator principal, export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and retry; otherwise use the authenticated Slack card or a live Console session. |
 | `403 operator approval principals can resolve only routes bound to an explicit user list` | Terminal credentials carry no Slack membership evidence. Add the subject to an explicit `approvers.users` binding, or resolve through the authenticated card. |
 | `403 console approval principals can resolve only routes bound to an explicit user list or verifiable user group` | The Console session carries no channel evidence. Use an explicit `approvers.users` binding, a group the API can verify, or the authenticated card. |
-| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. |
+| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. After an upgrade that renames the cookie to `__Host-curie_console_session`, an older session also returns 401 until the operator exchanges a new login code. |
+| `403 console session origin rejected` | The console cookie was the only principal on an unsafe call, and `Origin` (or `Referer` if `Origin` was absent) was missing or named a different host. Retry from the console page itself. Header principals are not checked. |
 | `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
 | `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
+| Thread says "Not requesting approval again: ... was rejected by ..." | The agent re-raised an approval a person rejected in this thread, with nobody asking since (`409 approval.rejected_in_thread`). Expected. To try again, ask for it in the thread. |
 | Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Since #2436 this case is now caught before deploy for a newly declared route; the escalation remains the backstop for a binding removed after deployment. Add the binding. |
 | `422`, or a rejected push with code `approval_routes.unbound` | The bundle declares an approval route with no entry in this agent's `approval_routes`. Bind every route the bundle declares, then redeploy. |
 | deploy or route write exits 2: "declares approval route(s) ... with no entry in this agent's approval_routes" or "this write removes approval route(s)" | The CLI's local pre-check found the same gap before sending. Run the command in the error's fix, then re-run. |
@@ -426,6 +489,77 @@ for attribution. The key is recorded in the recovery's audit row. Replaying the
 same key returns the outcome that already happened and changes nothing; a key
 already recorded for another approval, or a record settled some other way, is a
 `409`. Cancelling an owed resume is not part of this path yet (#2829).
+
+### Bounded operator procedure
+
+Use recovery for one identified approval, not as a standing alternative to the
+ordinary approver path. The positional agent below may be any existing agent:
+the report and recovery are installation-wide, and the approval id is the
+mutation's scope.
+
+1. While recovery is still disabled, record the pending row with the read-only
+   report and verify its id, route, and reply/card facts:
+
+   ```sh
+   AGENT=acme-bot
+   APPROVAL_ID=00000000-0000-4000-8000-000000000001
+   RECOVERY_KEY="rk-$(uuidgen)"
+
+   curie --json cluster approvals "$AGENT" --report-identity \
+     > approval-recovery-report.json
+   jq -e --arg id "$APPROVAL_ID" \
+     '.identity_report.approvals[] | select(.id == $id)' \
+     approval-recovery-report.json
+   ```
+
+2. Through the installation's normal values and upgrade workflow, set only
+   `api.approvalRecovery.enabled: true` and wait for the API rollout. Keep this
+   window attended: every platform-key holder has the installation-wide reject
+   grant until it is disabled again. Prepare the exact disable rollout before
+   enabling, and perform it even if principal minting or recovery fails, returns
+   a conflict, or is interrupted.
+
+3. Mint an attributed operator principal without putting its returned token in
+   shell history, then recover exactly the inspected id. The disposition is
+   always `rejected`; this command cannot approve on anyone's behalf.
+
+   ```sh
+   export CURIE_APPROVAL_PRINCIPAL_TOKEN="$(
+     curie cluster approvals "$AGENT" \
+       --mint-operator-principal operator@example.com
+   )"
+
+   curie cluster approvals "$AGENT" \
+     --recover "$APPROVAL_ID" \
+     --reason "Retire a stale approval after verified operator review" \
+     --recovery-key "$RECOVERY_KEY"
+   ```
+
+   If the client loses the response, retry the exact command with the same
+   `RECOVERY_KEY`. Never invent a new key for that retry: the original key is
+   what turns it into a read of the already-recorded outcome rather than a new
+   administrative act.
+
+4. Immediately set `api.approvalRecovery.enabled: false` through the same
+   deployment workflow, wait for the API rollout, and remove the principal from
+   the shell:
+
+   ```sh
+   unset CURIE_APPROVAL_PRINCIPAL_TOKEN
+   ```
+
+5. Read `GET /approvals/$APPROVAL_ID/audit` through the normal authenticated
+   operator API path and retain the result with the incident. Confirm one row
+   with `action=administratively_recovered`,
+   `authorizer=approval_recovery`, the operator subject, the reason, and the
+   exact recovery key.
+
+Recovery wakes the suspended session through the ordinary runs stream, whose
+worker also attempts to replace a remembered Slack card with its buttonless
+rejected form. The API row is the authority: if that best-effort Slack edit
+cannot find or update an old card, its buttons can no longer resolve the
+already-rejected approval. Manually delete or annotate the stale Slack message
+so it does not mislead people.
 
 A report entry stating `reply_identity_unreconstructable` means neither the row
 nor any binding says how that reply would be authenticated. The report does not

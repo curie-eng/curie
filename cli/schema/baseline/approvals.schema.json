@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.2.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.3.json",
   "title": "curie <tier> approvals --json",
   "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant.",
   "$defs": {
@@ -73,11 +73,36 @@
           ]
         },
         "card_channel": {
-          "description": "The channel the approval card was posted to, or null on an older row or a direct API write that omitted the field. The CLI uses the authenticated card channel in its resolve hint; resolver identity and channel are derived from the authenticated principal and are never asserted as request fields.\n\nOPTIONAL, and the only optional property in this record, which is deliberate rather than an oversight. Every sibling was required at birth, when no compatibility question existed. ADR-0101 prefers optional for a property added later: a consumer can tolerate its absence in a payload from an older CLI, which keeps this a MINOR bump. Making it required would reject those older payloads and cost a major version for no gain.",
+          "description": "The channel the approval card was posted to, or null on an older row or a direct API write that omitted the field. The CLI uses the authenticated card channel in its resolve hint; resolver identity and channel are derived from the authenticated principal and are never asserted as request fields. Optional because a consumer can tolerate its absence in a payload from an older CLI.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "current_route_approvers": {
+          "description": "Present on pending records only. The current explicit approvers block read from the agent route binding when the list was fetched, or null if there is no explicit block or no current binding. This is display context, not a creation time snapshot or a claim about who can resolve later. Resolution reads the route binding again. Optional so payloads from earlier CLI versions remain valid.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "group": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "users": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         }
       },
       "required": [

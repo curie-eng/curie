@@ -62,6 +62,18 @@ logger = logging.getLogger(__name__)
 
 _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
 
+# The CLI's built-in instructions tell the model to end commits with a
+# "Co-Authored-By: Claude" trailer and PR bodies with the "Generated with
+# [Claude Code]" footer (#3193). Both texts are governed by the CLI's
+# ``attribution`` settings object; an empty string hides each. Delivered on
+# the flag-settings layer (``ClaudeAgentOptions.settings``, the ``--settings``
+# CLI flag, highest priority among user-controlled settings), and with both
+# texts empty the CLI emits no attribution instruction at all, so no model --
+# Claude or otherwise -- ever sees one.
+_SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
+_SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
+
 
 class _SeededSessionStore:
     """SDK mirror seeded from portable messages or an optional native checkpoint."""
@@ -108,6 +120,11 @@ class _SeededSessionStore:
             entries=tuple(json.loads(json.dumps(selected))),
         )
 
+    def request_full_checkpoint(self) -> None:
+        """The prior native export was not durable; reset the delta baseline."""
+
+        self._checkpoint_required = True
+
 
 @dataclass(frozen=True)
 class StructuredResume:
@@ -119,12 +136,37 @@ class StructuredResume:
     session_key: SessionKey
 
 
+def _checkpoint_keeps_system_prompt(
+    entries: Iterable[dict[str, Any]], system_prompt: str | None
+) -> bool:
+    """Whether resuming ``entries`` leaves this boot's system prompt in force.
+
+    The CLI records the prompt it ran under as a ``prompt_snapshot`` attachment
+    entry and resends that prompt on resume instead of the one it is given
+    (claude-agent-sdk 0.2.159, CLI 2.1.281). A checkpoint recorded under any
+    other prompt would hide what this boot added to it, such as this turn's
+    attachments. With no prompt of its own, there is nothing a restored one
+    could hide.
+    """
+
+    if system_prompt is None:
+        return True
+    return all(
+        attachment.get("systemPrompt") == [system_prompt]
+        for entry in entries
+        if entry.get("type") == "attachment"
+        and isinstance(attachment := entry.get("attachment"), dict)
+        and attachment.get("type") == "prompt_snapshot"
+    )
+
+
 def build_structured_resume(
     messages: tuple[ConversationMessage, ...],
     *,
     curie_session_id: str,
     cwd: str | None,
     harness_replay: HarnessReplayState | None = None,
+    system_prompt: str | None = None,
 ) -> StructuredResume:
     """Materialize portable messages into the SDK's ephemeral resume envelope.
 
@@ -132,7 +174,8 @@ def build_structured_resume(
     an opaque native checkpoint, it is preferred to retain the SDK's exact
     cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
     deterministic adapter details reconstructed on this runner. Native entries
-    are an optional optimization, never Curie's portable persistence contract.
+    are an optional optimization, never Curie's portable persistence contract,
+    so a checkpoint that would override ``system_prompt`` is set aside.
     """
 
     session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
@@ -140,15 +183,24 @@ def build_structured_resume(
         "project_key": project_key_for_directory(cwd),
         "session_id": session_id,
     }
-    if (
-        harness_replay is not None
+    checkpoint: tuple[dict[str, Any], ...] = (
+        harness_replay.entries
+        if harness_replay is not None
         and harness_replay.harness == "claude"
         and harness_replay.kind == "checkpoint"
-        and harness_replay.entries
-    ):
+        else ()
+    )
+    if checkpoint and not _checkpoint_keeps_system_prompt(checkpoint, system_prompt):
+        logger.info(
+            "native checkpoint recorded another system prompt; replaying the portable"
+            " prefix session_id=%s",
+            session_id,
+        )
+        checkpoint = ()
+    if checkpoint:
         native_entries = cast(
             "list[SessionStoreEntry]",
-            json.loads(json.dumps(harness_replay.entries)),
+            json.loads(json.dumps(checkpoint)),
         )
         store = _SeededSessionStore(
             key,
@@ -387,6 +439,11 @@ def build_options(
             "WebSearch",
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
+    sdk_env = dict(env or {})
+    title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
+    if not title_model.strip():
+        sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"
+        logger.info("SDK session title request skipped: %s is not configured", _SDK_TITLE_MODEL_ENV)
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
@@ -414,7 +471,7 @@ def build_options(
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,
-        env=env or {},
+        env=sdk_env,
         # In-bundle PreToolUse guardrails from the manifest hooks field (#272).
         # Empty/None means no bundle hooks; the SDK default applies. The event
         # keys are the SDK's HookEvent literals (we emit only "PreToolUse").
@@ -422,6 +479,9 @@ def build_options(
         # In-process platform tools (the approval-request gate, ADR-0010).
         mcp_servers=cast("Any", mcp_servers or {}),
         include_partial_messages=True,
+        # Commit/PR attribution off for every session this runner builds
+        # (#3193); see _SDK_ATTRIBUTION_OFF_SETTINGS above.
+        settings=_SDK_ATTRIBUTION_OFF_SETTINGS,
     )
 
 
@@ -488,6 +548,14 @@ class ClaudeAgentSession:
         if isinstance(store, _SeededSessionStore):
             return await store.export_replay_state()
         return None
+
+    def request_full_checkpoint(self) -> None:
+        """Make the next native export self contained after a bounded write."""
+
+        store = self._options.session_store
+        if not isinstance(store, _SeededSessionStore):
+            raise RuntimeError("native replay store is unavailable")
+        store.request_full_checkpoint()
 
     async def ensure_mcp_server(self, name: str) -> bool:
         """Confirm the SDK session's own MCP connection to ``name`` (#2634).

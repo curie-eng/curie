@@ -64,13 +64,40 @@ def _testpaths() -> list[str]:
     return list(parsed["tool"]["pytest"]["ini_options"]["testpaths"])
 
 
-def _is_collected(test_file: Path, testpaths: list[str]) -> bool:
-    relative = test_file.relative_to(REPO)
+def _is_collected(test_file: Path, testpaths: list[str], repo: Path = REPO) -> bool:
+    relative = test_file.relative_to(repo)
     for root in testpaths:
         root_path = Path(root)
         if relative == root_path or root_path in relative.parents:
             return True
     return False
+
+
+def _uncollected_python_tests(repo: Path, testpaths: list[str]) -> list[Path]:
+    """Find Python tests missed by the root suite, including new untracked tests."""
+    local_tier = repo / "cli/tests/local"
+    return [
+        test_file.relative_to(repo)
+        for test_file in sorted(repo.rglob("test_*.py"))
+        if not any(part.startswith(".") or part in {"node_modules", "target"}
+                   for part in test_file.relative_to(repo).parts)
+        and not test_file.is_relative_to(local_tier)
+        and not _is_collected(test_file, testpaths, repo)
+    ]
+
+
+def test_all_python_tests_are_collected() -> None:
+    missing = _uncollected_python_tests(REPO, _testpaths())
+    assert not missing, f"Python tests outside pytest testpaths: {missing!r}"
+
+
+def test_collection_audit_rejects_a_planted_test(tmp_path: Path) -> None:
+    planted = tmp_path / "observability/test_planted.py"
+    planted.parent.mkdir()
+    planted.write_text("def test_planted(): pass\n", encoding="utf-8")
+    assert _uncollected_python_tests(tmp_path, ["examples/tests"]) == [
+        Path("observability/test_planted.py")
+    ]
 
 
 def test_the_discovery_finds_connectors_and_test_files() -> None:

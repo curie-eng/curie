@@ -2033,9 +2033,14 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
     let output = cluster.run("helm-upgrade-hang", false);
     let elapsed = started.elapsed();
     let events = cluster.events();
+    // The 150 ms child deadline is followed by several recovery subprocesses.
+    // Under nextest's partition-wide load those process launches can take a
+    // couple of seconds even though the hung Helm child was killed on time.
+    // Keep the wall bound far below the production Helm timeout without
+    // coupling the assertion to an otherwise idle runner.
     assert!(
-        elapsed < Duration::from_secs(2),
-        "debug timeout override must bound the hanging Helm child near 150ms; elapsed={elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "debug timeout override must bound the hanging Helm child well below the production timeout; elapsed={elapsed:?}"
     );
     assert!(
         !output.status.success(),

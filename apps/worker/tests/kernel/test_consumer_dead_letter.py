@@ -35,37 +35,35 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import curie_worker.consumer as consumer_module
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import Final, QueuedTurn, SessionStatus
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from pydantic import ValidationError
 
 from .conftest import _pending_rows, _updates_for
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+
+# The #505 shape: a reply endpoint that is durably persisted but dead.
+_qevent = functools.partial(qevent, endpoint="http://localhost:8155/api/")
+
 DONE = SessionStatus.DONE
-
-
-def _qevent(text: str, *, thread: str, event_id: str) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        # The #505 shape: a reply endpoint that is durably persisted but dead.
-        reply_handle=ReplyHandle(
-            kind="slack", channel="C1", placeholder="p-1", endpoint="http://localhost:8155/api/"
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
 
 
 def _dead_stream(config: WorkerConfig) -> str:
@@ -126,7 +124,12 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
     async def go() -> None:
         async with make_harness(max_delivery=3, reclaim_min_idle_ms=0) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             # The controllable-failure seam: process_event raises forever for the
@@ -136,11 +139,11 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
             real_process = h.kernel.process_event
             calls: dict[str, int] = {"poison": 0, "healthy": 0}
 
-            async def counting(qevent: QueuedTurn) -> None:
+            async def counting(qevent: QueuedTurn, *, lease: Any) -> None:
                 calls[qevent.event_id] += 1
                 if qevent.event_id == "poison":
                     raise RuntimeError("simulated dead reply endpoint")
-                await real_process(qevent)
+                await real_process(qevent, lease=lease)
 
             h.kernel.process_event = counting  # type: ignore[method-assign,assignment]
 
@@ -238,7 +241,12 @@ def test_transient_failure_reclaims_and_acks_without_dead_lettering(
     async def go() -> None:
         async with make_harness(max_delivery=3, reclaim_min_idle_ms=0) as h:
             h.runner.default_script = [Final(text="recovered", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             # Fails the first two deliveries (a worker crash / transient blip),
@@ -247,11 +255,11 @@ def test_transient_failure_reclaims_and_acks_without_dead_lettering(
             real_process = h.kernel.process_event
             calls = {"n": 0}
 
-            async def flaky(qevent: QueuedTurn) -> None:
+            async def flaky(qevent: QueuedTurn, *, lease: Any) -> None:
                 calls["n"] += 1
                 if calls["n"] <= 2:
                     raise RuntimeError("simulated transient failure")
-                await real_process(qevent)
+                await real_process(qevent, lease=lease)
 
             h.kernel.process_event = flaky  # type: ignore[method-assign,assignment]
 
@@ -293,7 +301,12 @@ def test_unparseable_entry_is_dead_lettered_not_silently_dropped(
 
     async def go() -> None:
         async with make_harness(reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             token = uuid.uuid4().hex[:8]
@@ -347,12 +360,17 @@ def test_cap_binds_beyond_the_first_pending_page(
 
     async def go() -> None:
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             calls: dict[str, int] = {"p0": 0, "p1": 0, "p2": 0}
 
-            async def always_fails(qevent: QueuedTurn) -> None:
+            async def always_fails(qevent: QueuedTurn, *, lease: Any) -> None:
                 calls[qevent.event_id] += 1
                 raise RuntimeError("simulated dead reply endpoint")
 
@@ -412,12 +430,17 @@ def test_a_failing_dead_letter_does_not_kill_the_rest_of_the_tick(
 
     async def go() -> None:
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             calls: dict[str, int] = {"bad": 0, "good": 0}
 
-            async def always_fails(qevent: QueuedTurn) -> None:
+            async def always_fails(qevent: QueuedTurn, *, lease: Any) -> None:
                 calls[qevent.event_id] += 1
                 raise RuntimeError("simulated dead reply endpoint")
 
@@ -515,7 +538,12 @@ def test_graveyard_is_bounded_by_dead_letter_maxlen(
 
     async def go() -> None:
         async with make_harness(dead_letter_maxlen=1, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             for i in range(flood):
@@ -566,7 +594,12 @@ def test_unparseable_entry_records_its_real_reclaimed_delivery_count(
 
     async def go() -> None:
         async with make_harness(reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             entry_id = await h.async_redis.xadd(h.config.stream, {"garbage": "x"})
@@ -618,7 +651,12 @@ def test_unparseable_entry_cannot_clobber_or_forge_its_own_dl_metadata(
 
     async def go() -> None:
         async with make_harness(reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             entry_id = await h.async_redis.xadd(
@@ -678,12 +716,17 @@ def test_over_cap_entry_whose_message_was_trimmed_is_dead_lettered_and_acked(
 
     async def go() -> None:
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             calls = {"n": 0}
 
-            async def always_fails(qevent: QueuedTurn) -> None:
+            async def always_fails(qevent: QueuedTurn, *, lease: Any) -> None:
                 calls["n"] += 1
                 raise RuntimeError("simulated dead reply endpoint")
 
@@ -749,10 +792,15 @@ def test_dead_letter_is_logged_loudly_with_the_operational_facts(
 
     async def go() -> None:
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
-            async def always_fails(qevent: QueuedTurn) -> None:
+            async def always_fails(qevent: QueuedTurn, *, lease: Any) -> None:
                 raise RuntimeError("simulated dead reply endpoint")
 
             h.kernel.process_event = always_fails  # type: ignore[method-assign,assignment]
@@ -804,10 +852,15 @@ def test_dead_letter_emits_one_retention_independent_critical_alert(
 
     async def go() -> None:
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
-            async def always_fails(qevent: QueuedTurn) -> None:
+            async def always_fails(qevent: QueuedTurn, *, lease: Any) -> None:
                 raise RuntimeError("simulated dead reply endpoint")
 
             h.kernel.process_event = always_fails  # type: ignore[method-assign,assignment]
@@ -1040,7 +1093,8 @@ def test_a_live_lease_holds_off_the_cap_and_releasing_it_dead_letters_normally(
             # count, dead-letters on the next pass.
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    resume_event_id=None,
                 )
                 is True
             )
@@ -1106,45 +1160,6 @@ _FENCE_CONFIG: dict[str, object] = {
     "delivery_lease_ttl_s": 1.0,
     "delivery_lease_heartbeat_s": 0.3,
 }
-
-
-def test_a_consumer_with_no_lease_store_dead_letters_exactly_as_before(
-    make_harness,
-) -> None:
-    """The leaseless regression guard: no lease store means no fence at all.
-
-    ``_dead_letter_refusal`` returns None immediately when ``self._leases is
-    None``, so a base-only consumer (the second-broker port, the ``_FakeBroker``
-    units, every pre-ADR-0131 deployment) dead-letters an over-cap entry exactly
-    as it did before the fence existed.
-
-    Red if the fence is ever made unconditional -- e.g. dropping the
-    ``if self._leases is None: return None`` early return from
-    ``_dead_letter_refusal``, or having a missing store read as "somebody owns
-    it". Either turns the graveyard off for every leaseless consumer, which is
-    #505's permanent stall reached from the new code.
-    """
-
-    async def go() -> None:
-        async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await consumer.ensure_group()
-            assert consumer._leases is None
-
-            try:
-                entry_id = await _park_over_cap(h, "peer-worker")
-
-                over_cap = await consumer._dead_letter_over_cap()
-
-                assert over_cap == {entry_id}
-                rows = await _dead_rows(h)
-                assert len(rows) == 1, f"a leaseless consumer stopped dead-lettering: {rows}"
-                assert rows[0][1]["dl_original_id"] == entry_id
-                assert entry_id not in await _pending_ids(h)
-            finally:
-                await h.async_redis.delete(_dead_stream(h.config))
-
-    asyncio.run(go())
 
 
 def test_the_maintenance_scan_refuses_to_dead_letter_once_another_owner_acquires(
@@ -1249,7 +1264,8 @@ def test_the_maintenance_scan_dead_letters_normally_when_nobody_owns_the_entry(
                 )
                 assert (
                     await store.release(
-                        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                        resume_event_id=None,
                     )
                     is True
                 )
@@ -1352,7 +1368,8 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
                     h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
                 )
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    resume_event_id=None,
                 )
                 assert await h.async_redis.exists(state_key) == 1
                 assert consumer._held_leases == {}
@@ -1805,7 +1822,8 @@ def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pendin
                     h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
                 )
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    resume_event_id=None,
                 )
 
                 await h.async_redis.set(dead, "not-a-stream")

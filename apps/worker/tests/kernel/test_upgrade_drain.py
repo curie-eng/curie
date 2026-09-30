@@ -42,19 +42,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import sys
 import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, cast
 
 from aci_protocol import (
     Final,
-    QueuedTurn,
-    ReplyHandle,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
-    TurnSource,
 )
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.config import WorkerConfig
@@ -63,6 +63,14 @@ from curie_worker.consumer_liveness import ConsumerLivenessStore
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import EvalStreamConsumer
 from curie_worker.upgrade_drain import UpgradeDrainGate, run_gate
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent, wait_until  # noqa: E402
+
+_qevent = functools.partial(qevent, received_at="2026-08-28T11:15:23+00:00")
+_wait_until = functools.partial(wait_until, timeout=20.0, interval=0.02)
 
 DONE = SessionStatus.DONE
 
@@ -89,27 +97,6 @@ _KNOBS: dict[str, object] = {
     "upgrade_drain_poll_interval_s": 0.05,
     "upgrade_quiesce_ttl_s": 5.0,
 }
-
-
-def _qevent(text: str, *, thread: str, event_id: str) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-08-28T11:15:23+00:00",
-        source=TurnSource.SLACK,
-    )
-
-
-async def _wait_until(predicate, *, timeout: float = 20.0) -> None:  # noqa: ANN001
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("condition not reached within timeout")
 
 
 async def _stop(task: asyncio.Task[None], consumer: Consumer | None = None) -> None:

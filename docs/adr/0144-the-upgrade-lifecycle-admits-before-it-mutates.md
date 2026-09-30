@@ -135,9 +135,10 @@ atomic Lua evaluation over every key applicable to the invocation: a marker at a
 higher revision fences the write, a same-revision retry refreshes the TTL while
 retaining the original marker byte for byte, and a clear compares every
 applicable key before deleting any of them so a delayed release cannot clear
-half of a newer mixed-version marker. A permanent flag is never written — the
-TTL is validated to be strictly greater than the drain wait, so an upgrade that
-dies between quiesce and release lapses instead of leaving a fleet that has
+half of a newer mixed-version marker. A permanent flag is never written — while
+the gate waits it holds the marker as a short lease renewed every poll, and only
+a clean drain extends it to a roll hold capped at the drain wait, so an upgrade
+that dies between quiesce and release lapses instead of leaving a fleet that has
 silently stopped answering.
 
 A paused fleet is **reported, not inferred**. `cluster status`, `doctor` and the

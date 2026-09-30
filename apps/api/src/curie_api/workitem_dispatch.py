@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
-from channel_protocol import scoped_conversation_id
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
-from . import workitems
+from . import crud, workitems
 from .config import get_settings
-from .models import Agent, AgentChannel, ExecutionRequest, WorkItem
+from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
+from .threadkeys import (
+    legacy_route_adapter_of,
+    pre_identity_key_of,
+    pre_identity_thread_key_for,
+    route_thread_key,
+    route_thread_key_matches,
+)
 from .workitems import (
     ExecutionRequestSnapshot,
     WorkItemConflict,
@@ -31,6 +40,8 @@ from .workitems import (
     _terminalize_execution,
 )
 from .workspace_policy import repository_is_allowed
+
+logger = logging.getLogger(__name__)
 
 RefusalCode = Literal[
     "not_found",
@@ -65,6 +76,7 @@ class AcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: datetime
+    repo_full_name: str
 
 
 @dataclass(frozen=True)
@@ -101,12 +113,26 @@ class ClaimedDispatch:
 
 
 @dataclass(frozen=True)
+class RuntimeOwnerRow:
+    request_id: uuid.UUID
+    runtime_owner: str
+    runtime_epoch: int
+
+
+@dataclass(frozen=True)
+class OwnerLostResult:
+    status: str
+    terminal_cause: str | None
+
+
+@dataclass(frozen=True)
 class TerminatePublish:
     request_id: uuid.UUID
     reply_kind: str
     reply_address: str
     reply_conversation_id: str
     requester: str | None
+    reply_adapter: str | None
 
 
 async def _refuse(
@@ -127,9 +153,9 @@ async def _refuse(
     return result
 
 
-def _facts_conversation(facts: Any) -> str:
-    return scoped_conversation_id(
-        facts.kind, facts.address, facts.reply_conversation_id
+def _facts_conversation(facts: Any, adapter: str | None) -> str:
+    return route_thread_key(
+        facts.kind, adapter, facts.address, facts.reply_conversation_id
     )
 
 
@@ -153,14 +179,20 @@ def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
     )
 
 
-def _work_item_matches(item: WorkItem, facts: Any) -> bool:
+def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
         and item.repo_full_name == facts.repo_full_name
         and item.github_repository_id == facts.github_repository_id
         and item.github_issue_number == facts.github_issue_number
         and item.github_installation_id == facts.github_installation_id
-        and item.conversation_id == _facts_conversation(facts)
+        and route_thread_key_matches(
+            facts.kind,
+            adapter,
+            facts.address,
+            facts.reply_conversation_id,
+            item.conversation_id,
+        )
     )
 
 
@@ -187,7 +219,7 @@ async def _write_snapshot(
 
 
 async def _replay_existing(
-    session: AsyncSession, request: ExecutionRequest, facts: Any
+    session: AsyncSession, request: ExecutionRequest, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | DispatchConflict:
     work_item = await _lock_work_item(session, request.work_item_id)
     if work_item is None:
@@ -199,7 +231,7 @@ async def _replay_existing(
         return await _refuse(
             session, "not_found", work_item_id=work_item.id, request_id=request.id
         )
-    if not _work_item_matches(work_item, facts):
+    if not _work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
             "identity_mismatch",
@@ -221,20 +253,36 @@ async def _replay_existing(
     return await _outcome(session, work_item, locked, replayed=True)
 
 
-async def admit(
+async def _admission_refusal(
     session: AsyncSession, facts: Any
-) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+) -> DispatchConflict | AgentChannel:
+    """The binding that authorizes this admission, or the refusal.
+
+    Every caller below reuses THIS binding for the rest of its own
+    transaction rather than re-resolving `crud.binding_for_route`: under
+    Postgres's default READ COMMITTED isolation, a second read in the same
+    transaction sees any rebind already committed since the first, so
+    re-resolving could key the work item by a binding other than the one
+    that just authorized it.
+    """
+
     agent = await session.get(Agent, facts.agent_id)
     if agent is None:
         return await _refuse(session, "not_found")
-    binding = await session.scalar(
-        select(AgentChannel).where(
-            AgentChannel.agent_id == facts.agent_id,
-            AgentChannel.kind == facts.kind,
-            AgentChannel.address == facts.address,
+    # `facts` (a GitHub event's admission facts) names no adapter -- there is
+    # no such field on it -- so `adapter=None` is the whole request: the
+    # default Slack identity or the agent's single route on a non-Slack pair
+    # (ADR-0168 decision 3). Scoped to the agent, since another agent's route
+    # on the pair is not this work item's; two of this agent's routes on one
+    # pair are ambiguous, which admission refuses rather than picking one.
+    try:
+        binding = await crud.binding_for_route(
+            session, facts.kind, None, facts.address, agent_id=facts.agent_id
         )
-    )
-    if binding is None:
+    except crud.AmbiguousRoute:
+        logger.warning("work item admission for agent %s is ambiguous", facts.agent_id)
+        binding = None
+    if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
     if not repository_is_allowed(
         facts.repo_full_name, get_settings().github_repo_allowlist
@@ -250,13 +298,126 @@ async def admit(
         or not requester.strip()
     ):
         return await _refuse(session, "identity_mismatch")
+    return binding
 
+
+async def admit(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
     existing = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
     )
     if existing is not None:
-        return await _replay_existing(session, existing, facts)
+        return await _replay_existing(session, existing, facts, resolved.adapter)
+    return await _admit_new(session, facts, resolved.adapter)
 
+
+async def admit_revision(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Accept a verified mention even while its WorkItem has a live run."""
+
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
+    existing = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
+    )
+    if existing is not None:
+        return await _replay_existing(session, existing, facts, resolved.adapter)
+    work_item = await session.scalar(
+        select(WorkItem).where(
+            WorkItem.github_repository_id == facts.github_repository_id,
+            WorkItem.github_issue_number == facts.github_issue_number,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if work_item is None:
+        return await _refuse(session, "not_found")
+    if not _work_item_matches(work_item, facts, resolved.adapter):
+        return await _refuse(
+            session, "identity_mismatch", work_item_id=work_item.id
+        )
+    now = await _database_now(session)
+    requested = await workitems.create_revision_request(
+        session,
+        work_item_id=work_item.id,
+        request_id=facts.request_id,
+        wait_deadline=now
+        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        expected_work_item_version=work_item.version,
+        snapshot=_snapshot_values(facts),
+    )
+    if isinstance(requested, WorkItemConflict):
+        return requested
+    assert requested.request is not None
+    if requested.request.status == "queued":
+        return requested
+    written = await _write_snapshot(session, facts.request_id, facts)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await _reload_work_item(session, work_item.id)
+    return await _outcome(session, reloaded, written, replayed=requested.replayed)
+
+
+async def readmit(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Admit a label addition. On an existing WorkItem it starts a new run.
+
+    When the WorkItem still has a running request, the outcome carries that
+    request, not ``facts.request_id``: the new run starts once it has stopped.
+    """
+
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
+    existing = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
+    )
+    if existing is not None:
+        return await _replay_existing(session, existing, facts, resolved.adapter)
+    work_item = await session.scalar(
+        select(WorkItem).where(
+            WorkItem.github_repository_id == facts.github_repository_id,
+            WorkItem.github_issue_number == facts.github_issue_number,
+        )
+    )
+    if work_item is None:
+        return await _admit_new(session, facts, resolved.adapter)
+    if not _work_item_matches(work_item, facts, resolved.adapter):
+        return await _refuse(
+            session, "identity_mismatch", work_item_id=work_item.id
+        )
+    now = await _database_now(session)
+    readmitted = await workitems.readmit(
+        session,
+        work_item_id=work_item.id,
+        request_id=facts.request_id,
+        wait_deadline=now
+        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        objective=facts.objective,
+        requester=facts.requester,
+    )
+    if isinstance(readmitted, WorkItemConflict):
+        return readmitted
+    assert readmitted.request is not None
+    if readmitted.request.id != facts.request_id:
+        return readmitted
+    written = await _write_snapshot(session, facts.request_id, facts)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await _reload_work_item(session, work_item.id)
+    return await _outcome(session, reloaded, written)
+
+
+async def _admit_new(
+    session: AsyncSession, facts: Any, adapter: str | None
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     created = await workitems.create_or_get_work_item(
         session,
         github_repository_id=facts.github_repository_id,
@@ -264,7 +425,7 @@ async def admit(
         github_installation_id=facts.github_installation_id,
         agent_id=facts.agent_id,
         repo_full_name=facts.repo_full_name,
-        conversation_id=_facts_conversation(facts),
+        conversation_id=_facts_conversation(facts, adapter),
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -287,7 +448,7 @@ async def admit(
                 )
             )
             if existing is not None:
-                return await _replay_existing(session, existing, facts)
+                return await _replay_existing(session, existing, facts, adapter)
         return requested
     assert requested.request is not None
     written = await _write_snapshot(session, requested.request.id, facts)
@@ -425,6 +586,15 @@ async def acquire(
             request_id=request.id,
             status=request.status,
         )
+    deadline = request.wait_deadline
+    if deadline is None:
+        return await _refuse(
+            session,
+            "not_dispatchable",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
     if generation != request.dispatch_generation:
         return await _refuse(
             session,
@@ -433,7 +603,7 @@ async def acquire(
             request_id=request.id,
         )
     now = await _database_now(session)
-    if now >= request.wait_deadline:
+    if now >= deadline:
         return await _refuse(
             session,
             "waiting_deadline_elapsed",
@@ -459,7 +629,8 @@ async def acquire(
             generation=generation,
             work_item_id=work_item.id,
             conversation_id=work_item.conversation_id,
-            wait_deadline=request.wait_deadline,
+            wait_deadline=deadline,
+            repo_full_name=work_item.repo_full_name,
         )
         await session.execute(
             update(ExecutionRequest)
@@ -501,7 +672,8 @@ async def acquire(
         generation=generation,
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
-        wait_deadline=request.wait_deadline,
+        wait_deadline=deadline,
+        repo_full_name=work_item.repo_full_name,
     )
     await session.commit()
     return grant
@@ -730,7 +902,7 @@ async def heartbeat(
 async def hold_for_approval(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> HeartbeatResult | DispatchConflict:
-    """Keep a suspended approval inside the 1800s execution bound.
+    """Keep a suspended approval inside the request's execution deadline.
 
     The worker stops refreshing the short runtime lease when the turn suspends.
     This sets that lease to the execution deadline. It does not finish the request.
@@ -786,6 +958,144 @@ async def hold_for_approval(
     return result
 
 
+def _not_approval_hold() -> ColumnElement[bool]:
+    # hold_for_approval parks the lease at exactly the execution deadline.
+    return ExecutionRequest.runtime_heartbeat_expires_at.is_distinct_from(
+        ExecutionRequest.execution_deadline
+    )
+
+
+def _not_awaiting_publication() -> ColumnElement[bool]:
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+    )
+
+
+async def list_runtime_owners(
+    session: AsyncSession, *, limit: int, after: uuid.UUID | None = None
+) -> list[RuntimeOwnerRow]:
+    """Running requests with a live runtime owner, approval holds excluded.
+
+    Ordered by id so a caller pages with `after` set to the last id it saw.
+    """
+
+    rows = (
+        await session.execute(
+            select(
+                ExecutionRequest.id,
+                ExecutionRequest.runtime_owner,
+                ExecutionRequest.runtime_epoch,
+            )
+            .where(
+                ExecutionRequest.status == "running",
+                ExecutionRequest.runtime_owner.is_not(None),
+                _not_approval_hold(),
+                _not_awaiting_publication(),
+                *(() if after is None else (ExecutionRequest.id > after,)),
+            )
+            .order_by(ExecutionRequest.id)
+            .limit(limit)
+        )
+    ).all()
+    await session.commit()
+    return [
+        RuntimeOwnerRow(
+            request_id=row.id,
+            runtime_owner=row.runtime_owner,
+            runtime_epoch=row.runtime_epoch,
+        )
+        for row in rows
+        if row.runtime_owner is not None
+    ]
+
+
+async def declare_owner_lost(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    runtime_epoch: int,
+) -> OwnerLostResult | DispatchConflict:
+    """A worker proved ``owner`` dead; hand the run to the terminate chain.
+
+    The runtime lease expires now so any worker can claim the termination.
+    """
+
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
+    if work_item.cancelled_at is not None:
+        return await _refuse(
+            session,
+            "work_item_cancelled",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    held = (
+        request.runtime_heartbeat_expires_at is not None
+        and request.runtime_heartbeat_expires_at == request.execution_deadline
+    )
+    awaiting_publication = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request.id,
+            Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+        )
+        .limit(1)
+    )
+    if (
+        request.status != "running"
+        or request.runtime_owner != owner
+        or request.runtime_epoch != runtime_epoch
+        or held
+        or awaiting_publication is not None
+    ):
+        return await _refuse(
+            session,
+            "stale_owner",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "running",
+            ExecutionRequest.runtime_owner == owner,
+            ExecutionRequest.runtime_epoch == runtime_epoch,
+            _not_approval_hold(),
+            _not_awaiting_publication(),
+        )
+        .values(
+            status="cancellation_requested",
+            terminal_cause="owner_lost",
+            cancellation_requested_at=func.clock_timestamp(),
+            runtime_heartbeat_expires_at=func.clock_timestamp(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(
+            session,
+            "stale_owner",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    request = await _reload_request(session, request.id)
+    result = OwnerLostResult(status=request.status, terminal_cause=request.terminal_cause)
+    await session.commit()
+    return result
+
+
 def _map_finish_conflict(
     result: WorkItemConflict, request: ExecutionRequest | None
 ) -> RefusalCode:
@@ -811,6 +1121,7 @@ async def finish(
     runtime_epoch: int,
     outcome: Literal["completed", "failed"],
     cause: str,
+    detail: str | None,
 ) -> WorkItemOutcome | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -844,6 +1155,7 @@ async def finish(
         expected_request_version=request.version,
         status=outcome,
         cause=cause,
+        detail=detail,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):
@@ -858,13 +1170,42 @@ async def finish(
     return result
 
 
+_ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
+    """A force-settled cancellation whose sandbox teardown is still owed.
+
+    Teardown is thread-scoped, so a newer relabeled request on the same work
+    item owns the sandbox while it is active. Such a row is left flagged, not
+    cleared: once the sibling reaches a terminus the wake resumes and tears
+    down whatever the old claim left behind.
+    """
+
+    sibling = aliased(ExecutionRequest)
+    return and_(
+        ExecutionRequest.status == "cancelled",
+        ExecutionRequest.teardown_unconfirmed_at.is_not(None),
+        ~exists().where(
+            sibling.work_item_id == ExecutionRequest.work_item_id,
+            sibling.id != ExecutionRequest.id,
+            sibling.status.in_(_ACTIVE_STATUSES),
+        ),
+    )
+
+
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
     request = await _lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    if request.status != "cancellation_requested":
+    settled_teardown = (
+        request.status == "cancelled" and request.teardown_unconfirmed_at is not None
+    )
+    # A settled teardown is re-checked against active siblings in the
+    # guarded update below.
+    if not settled_teardown and request.status != "cancellation_requested":
         return await _refuse(
             session,
             "not_running",
@@ -888,7 +1229,9 @@ async def claim_termination(
         update(ExecutionRequest)
         .where(
             ExecutionRequest.id == request.id,
-            ExecutionRequest.status == "cancellation_requested",
+            _unconfirmed_settle_teardown()
+            if settled_teardown
+            else ExecutionRequest.status == "cancellation_requested",
         )
         .values(
             runtime_owner=owner,
@@ -900,6 +1243,14 @@ async def claim_termination(
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
+        if settled_teardown:
+            # A newer request on the thread owns the sandbox lifecycle.
+            return await _refuse(
+                session,
+                "not_running",
+                request_id=request.id,
+                status=request.status,
+            )
         return await _refuse(session, "duplicate", request_id=request.id)
     request = await _reload_request(session, request.id)
     claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
@@ -973,6 +1324,18 @@ async def running_for_conversation(
     work_item = await session.scalar(
         select(WorkItem).where(WorkItem.conversation_id == conversation_id)
     )
+    old = pre_identity_key_of(conversation_id) if work_item is None else None
+    if old is not None:
+        # This endpoint names no agent, so the owner of the old-key row must
+        # prove the old key is its route's (ADR-0168 decision 4).
+        candidate = await session.scalar(
+            select(WorkItem).where(WorkItem.conversation_id == old)
+        )
+        if candidate is not None and (
+            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id)
+            == old
+        ):
+            work_item = candidate
     if work_item is None:
         return "absent", None
     running = cast(
@@ -1038,13 +1401,21 @@ async def claim_terminate_publishes(
     due = (
         select(ExecutionRequest.id)
         .where(
-            ExecutionRequest.status == "cancellation_requested",
             ExecutionRequest.reply_kind.is_not(None),
             or_(
-                ExecutionRequest.runtime_owner.is_(None),
-                ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
-                ExecutionRequest.runtime_heartbeat_expires_at
-                <= func.clock_timestamp(),
+                and_(
+                    ExecutionRequest.status == "cancellation_requested",
+                    or_(
+                        # An issue cancellation stops a live runtime too.
+                        ExecutionRequest.terminal_cause == "issue_cancelled",
+                        ExecutionRequest.runtime_owner.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at
+                        <= func.clock_timestamp(),
+                    ),
+                ),
+                # A forced settle still owes the sandbox a teardown.
+                _unconfirmed_settle_teardown(),
             ),
             or_(
                 ExecutionRequest.terminate_published_at.is_(None),
@@ -1066,6 +1437,7 @@ async def claim_terminate_publishes(
             )
             .returning(
                 ExecutionRequest.id,
+                ExecutionRequest.work_item_id,
                 ExecutionRequest.reply_kind,
                 ExecutionRequest.reply_address,
                 ExecutionRequest.reply_conversation_id,
@@ -1074,12 +1446,30 @@ async def claim_terminate_publishes(
         )
     ).all()
     await session.commit()
+    # This endpoint names no live channel to copy `adapter` from -- the owning
+    # binding may already be gone by the time termination fires -- so it is
+    # decoded back out of the work item's OWN stored route instead, the same
+    # key `_facts_conversation` minted at admission (ADR-0168 decision 4). A
+    # work item admitted before decision 4 has no identity to decode there,
+    # so `legacy_route_adapter_of` falls back to its agent's one binding --
+    # the same live lookup its CURRENT execute wake already resolves.
+    work_items: dict[uuid.UUID, WorkItem] = {}
+    if rows:
+        work_items = {
+            found.id: found
+            for found in await session.scalars(
+                select(WorkItem).where(
+                    WorkItem.id.in_({row.work_item_id for row in rows})
+                )
+            )
+        }
     published: list[TerminatePublish] = []
     for row in rows:
         if row.reply_kind is None or row.reply_address is None:
             continue
         if row.reply_conversation_id is None:
             continue
+        work_item = work_items.get(row.work_item_id)
         published.append(
             TerminatePublish(
                 request_id=row.id,
@@ -1087,6 +1477,13 @@ async def claim_terminate_publishes(
                 reply_address=row.reply_address,
                 reply_conversation_id=row.reply_conversation_id,
                 requester=row.requester,
+                reply_adapter=(
+                    None
+                    if work_item is None
+                    else await legacy_route_adapter_of(
+                        session, work_item.agent_id, work_item.conversation_id
+                    )
+                ),
             )
         )
     return published
@@ -1107,13 +1504,27 @@ async def load_execute_wake(
         return None
     binding = None
     if request.reply_kind is not None and request.reply_address is not None:
-        binding = await session.scalar(
-            select(AgentChannel).where(
-                AgentChannel.agent_id == work_item.agent_id,
-                AgentChannel.kind == request.reply_kind,
-                AgentChannel.address == request.reply_address,
-            )
+        # `ExecutionRequest` carries no `reply_adapter` column, so the identity
+        # is decoded from the work item's own key, the same source the
+        # terminate wake uses (ADR-0168 decisions 3 and 4), and the lookup is
+        # scoped to the work item's agent: a route belonging to a DIFFERENT
+        # agent reads as no binding, not this agent's wake target.
+        adapter = await legacy_route_adapter_of(
+            session, work_item.agent_id, work_item.conversation_id
         )
+        try:
+            binding = await crud.binding_for_route(
+                session,
+                request.reply_kind,
+                adapter,
+                request.reply_address,
+                agent_id=work_item.agent_id,
+            )
+        except crud.AmbiguousRoute:
+            logger.warning(
+                "execute wake for request %s names an ambiguous route", request.id
+            )
+            binding = None
     return request, work_item, binding
 
 

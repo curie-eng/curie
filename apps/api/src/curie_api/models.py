@@ -8,8 +8,10 @@ agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 from __future__ import annotations
 
 import enum
+import secrets
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -19,9 +21,11 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     ForeignKeyConstraint,
+    Identity,
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -33,6 +37,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
+
+# Work-item execution deadline bounds (#3071). An agent's
+# `execution_deadline_seconds` NULL means the default; a set value is bounded
+# by the minimum and maximum, and the ExecutionRequest CHECK caps every row at
+# the maximum.
+DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
+MIN_EXECUTION_DEADLINE_SECONDS = 60
+MAX_EXECUTION_DEADLINE_SECONDS = 10800
 
 GIT_FLOW_CREATED_BY = "git-flow"
 
@@ -87,6 +99,11 @@ class Agent(Base):
             "AND publication_branch_prefix NOT LIKE '%./')",
             name="agents_publication_branch_prefix_ck",
         ),
+        CheckConstraint(
+            "execution_deadline_seconds IS NULL OR execution_deadline_seconds "
+            f"BETWEEN {MIN_EXECUTION_DEADLINE_SECONDS} AND {MAX_EXECUTION_DEADLINE_SECONDS}",
+            name="agents_execution_deadline_seconds_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -128,6 +145,13 @@ class Agent(Base):
     # (`curie_runner.thinking`), not this column's -- stored as a plain string so
     # the persistence layer does not have to track the harness.
     thinking: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
+    # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
+    execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
+    # Per-agent runner cpu, memory, and ephemeral-storage (#3209). NULL means
+    # the chart agentSandbox.runner.resources block. A set value is applied on
+    # the next sandbox claim, not by resizing a sandbox that is already running.
+    runner_resources: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
@@ -210,6 +234,10 @@ class Agent(Base):
     # across every binding. Existing single-binding agents are unaffected
     # either way, since there is nothing else to share with.
     memory: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the runner mounts its remember/update/forget memory tools for this
+    # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
+    # worker hands the runner the binding-scoped channel memory URL.
+    memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -222,9 +250,8 @@ class Agent(Base):
     # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
     # `created_at` to fall back on, so without an explicit order the serialized
     # list's element order is whatever Postgres happens to return, and two
-    # identical GETs could differ. `(kind, address)` is used because it is the
-    # pair every other layer already treats as the binding's identity
-    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
+    # identical GETs could differ. `(kind, address, adapter)` is used because it
+    # is the route every other layer keys by (`agent_channels_route_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
@@ -234,7 +261,7 @@ class Agent(Base):
     channels: Mapped[list[AgentChannel]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        order_by="(AgentChannel.kind, AgentChannel.address)",
+        order_by="(AgentChannel.kind, AgentChannel.address, AgentChannel.adapter)",
         lazy="selectin",
     )
 
@@ -253,7 +280,8 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running.
+    after the cutover proves no old worker is running. Migration 0070 widens the
+    key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
@@ -262,27 +290,39 @@ class AgentChannel(Base):
     PLACE, and `POST /channels/token` bumps it on every mint, so the row id is a
     stable identity and the generation is the only thing that makes a rebind or
     remint observable to a credential minted before it.
+
+    `allowed_callers` (ADR 0175, migration 0068) is who may start a turn through
+    this binding: NULL for everyone, else the exact caller ids `admission.admit`
+    matches. It is written only by its own endpoint, which leaves `generation`
+    alone, because who may use a route is a separate question from the route.
     """
 
     __tablename__ = "agent_channels"
     __table_args__ = (
-        # One agent per ROUTE, the `(kind, address)` pair (#38, widened from
-        # migration 0021's address-only `agent_channels_address_key` by 0023).
-        # The worker resolves a pair to an agent, so a second agent bound to the
-        # same pair could never respond -- it would be silently shadowed.
-        # Enforced here so it fails at create time.
-        #
-        # The pair, not the address alone, ONLY because the resolver now sees the
-        # pair too (`binding._RESOLVE_SQL`). Widening this while any address-only
-        # consumer can still run re-opens the exact ambiguity the constraint
-        # exists to close, which is why the cutover proves no old worker pod is
-        # running before migration 0023 applies.
-        UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
+        # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
+        # decision 3, migration 0070; 0023 keyed the pair, 0021 the address).
+        # A second agent bound to the same route could never respond -- it
+        # would be silently shadowed (#38). Enforced here so it fails at create
+        # time. The pair leads so `(kind, address)` lookups keep the index
+        # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
+        # colliding on the pair.
+        UniqueConstraint(
+            "kind",
+            "address",
+            "adapter",
+            name="agent_channels_route_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
+            "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
+            name="agent_channels_route_ck",
+        ),
         # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
         # hold more than one binding now. ADR-0089's "one agent still binds one
-        # channel" is amended in part -- the (kind, address) constraint above is
-        # still what stops two agents claiming the same channel; nothing stops
-        # one agent from claiming several.
+        # channel" is amended in part -- the route key above is what stops two
+        # agents claiming the same route; nothing stops one agent from claiming
+        # several.
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
@@ -298,17 +338,27 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
-    # The server-controlled reply route (migration 0024). Both NULL for `slack`,
-    # whose route is the worker's configured Slack origin; both set together for
-    # any other kind -- `agent_channels_route_pair_ck` states that invariant at
-    # the database so a half-configured route cannot be written out of band.
+    # The reply route (migration 0024) and, for `slack`, the bot identity
+    # (ADR-0168 decision 3): a Slack row names its identity in `adapter` and has
+    # no `endpoint`; any other kind sets both or neither.
+    # `agent_channels_route_ck` states it at the database so a half-configured
+    # route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
-    # Rotation counter (ADR-0096 D5, #2379). Bumped on every binding write,
-    # including one that changes nothing, and on every `POST /channels/token`
-    # mint: re-asserting a binding or reminting its credential both invalidate
-    # outstanding tokens.
+    # Rotation counter (ADR-0096 D5, #2379). Bumped on every write to the ROUTE
+    # (a move or re-assert through `update_channel_binding`, including one that
+    # changes nothing) and on every `POST /channels/token` mint: re-asserting a
+    # binding or reminting its credential both invalidate outstanding tokens.
+    # Editing `allowed_callers` below does NOT bump it (ADR 0175 decision 4).
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
+    # Who may start a turn through this binding (ADR 0175, migration 0068).
+    # NULL means everyone; a list is never empty (the API refuses it and
+    # `agent_channels_allowed_callers_ck` states it at the database).
+    # `none_as_null` is load-bearing: without it a Python None is stored as the
+    # JSON value `null`, which is not SQL NULL and fails that CHECK.
+    allowed_callers: Mapped[list[str] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="channels")
 
@@ -473,6 +523,12 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Canonical arguments of the denied permission gated call. NULL on old
+    # approvals and policy gates; an empty object is a real argument value.
+    # Kept private to the worker's resume lookup bound to the agent.
+    granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
     # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
@@ -603,6 +659,13 @@ class WorkItem(Base):
             "publication_lineage_id",
             name="work_items_publication_lineage_key",
         ),
+        CheckConstraint(
+            "(readmit_request_id IS NULL AND readmit_requester IS NULL "
+            "AND readmit_objective IS NULL) OR "
+            "(readmit_request_id IS NOT NULL AND readmit_requester IS NOT NULL "
+            "AND readmit_objective IS NOT NULL)",
+            name="work_items_readmit_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -626,6 +689,13 @@ class WorkItem(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # A relabel that arrived while a request was still running. The
+    # reconciler admits it once that request reaches a terminus.
+    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
@@ -651,8 +721,12 @@ class ExecutionRequest(Base):
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
+            "status IN ('queued', 'cancelled') OR wait_deadline IS NOT NULL",
+            name="execution_requests_wait_deadline_ck",
+        ),
+        CheckConstraint(
             "status IS NOT NULL AND status IN "
-            "('waiting', 'running', 'cancellation_requested', 'completed', "
+            "('queued', 'waiting', 'running', 'cancellation_requested', 'completed', "
             "'failed', 'expired', 'cancelled')",
             name="execution_requests_status_ck",
         ),
@@ -668,11 +742,16 @@ class ExecutionRequest(Base):
         CheckConstraint(
             "(started_at IS NULL AND execution_deadline IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND "
-            "execution_deadline = started_at + interval '1800 seconds')",
+            "execution_deadline > started_at AND "
+            "execution_deadline <= started_at + "
+            f"interval '{MAX_EXECUTION_DEADLINE_SECONDS} seconds')",
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'waiting' AND started_at IS NULL "
+            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'running' AND started_at IS NOT NULL "
@@ -703,12 +782,16 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NOT NULL))) "
             "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause = 'issue_cancelled' AND "
+            "AND terminal_cause IN ('issue_cancelled', 'lineage_closed') AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
             "AND termination_observation IS NOT NULL)))) IS TRUE",
             name="execution_requests_state_shape_ck",
+        ),
+        CheckConstraint(
+            "teardown_unconfirmed_at IS NULL OR status = 'cancelled'",
+            name="execution_requests_teardown_unconfirmed_ck",
         ),
         CheckConstraint(
             "dispatch_generation >= 1",
@@ -771,6 +854,12 @@ class ExecutionRequest(Base):
             postgresql_where=text("status = 'waiting'"),
         ),
         Index(
+            "ix_execution_requests_queued",
+            "work_item_id",
+            "sequence",
+            postgresql_where=text("status = 'queued'"),
+        ),
+        Index(
             "ix_execution_requests_runtime_liveness",
             "runtime_heartbeat_expires_at",
             postgresql_where=text(
@@ -785,7 +874,7 @@ class ExecutionRequest(Base):
     )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
-    wait_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
@@ -836,6 +925,15 @@ class ExecutionRequest(Base):
     terminate_published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # Settle anchor: updated_at moves on heartbeats and terminate publishes.
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # A forced settle with no worker teardown receipt. Terminate wakes keep
+    # going out until a worker records the teardown and clears this.
+    teardown_unconfirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     runtime_claim_name: Mapped[str | None] = mapped_column(Text, default=None)
     runtime_sandbox_name: Mapped[str | None] = mapped_column(Text, default=None)
     objective: Mapped[str | None] = mapped_column(Text, default=None)
@@ -847,17 +945,27 @@ class ExecutionRequest(Base):
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
 
-class FactoryTerminalNotice(Base):
-    """One issue comment owed by a non-PR execution terminus.
+def new_card_token() -> str:
+    """A fresh unguessable card capability: 32 random bytes as lowercase hex."""
 
-    Inserted in the same transaction as the terminal UPDATE. The reconciler
-    posts it later. A refusal is recorded here and does not rewrite the request.
+    return secrets.token_hex(32)
+
+
+class FactoryStatusComment(Base):
+    """One bot-authored GitHub status comment per factory execution request.
+
+    Inserted at admission and edited in place by the reconciler as the request
+    progresses (#3077). The terminus fills ``terminal_cause`` and ``detail``. A
+    refusal is recorded here and does not rewrite the request. ``posted_at``
+    means the comment was created; ``finalized_at`` means it will not be edited
+    again.
     """
 
+    # Keeps its pre-#3077 table name so 0055 stays an expand revision.
     __tablename__ = "factory_terminal_notices"
     __table_args__ = (
         CheckConstraint(
-            "length(btrim(terminal_cause)) > 0",
+            "terminal_cause IS NULL OR length(btrim(terminal_cause)) > 0",
             name="factory_terminal_notices_cause_ck",
         ),
         CheckConstraint("attempts >= 0", name="factory_terminal_notices_attempts_ck"),
@@ -874,10 +982,41 @@ class FactoryTerminalNotice(Base):
             "(refusal IS NULL) = (refused_at IS NULL)",
             name="factory_terminal_notices_refusal_ck",
         ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_list IN ('issue', 'review')",
+            name="factory_terminal_notices_comment_list_ck",
+        ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_id IS NOT NULL",
+            name="factory_terminal_notices_comment_list_pair_ck",
+        ),
+        CheckConstraint(
+            "finalized_at IS NULL OR posted_at IS NOT NULL",
+            name="factory_terminal_notices_finalized_ck",
+        ),
+        CheckConstraint(
+            "subject_title IS NULL OR length(subject_title) <= 256",
+            name="factory_terminal_notices_subject_title_ck",
+        ),
+        # The four curie:* values are legacy, accepted so application N-1 can
+        # still write them, and are not the labels the reconciler applies.
+        CheckConstraint(
+            "applied_label IS NULL OR applied_label IN "
+            "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human', "
+            "'curie-factory:queued', 'curie-factory:running', 'curie-factory:pr-open', "
+            "'curie-factory:needs-human')",
+            name="factory_terminal_notices_applied_label_ck",
+        ),
+        # Application N-1's delivery scan still reads this one.
         Index(
             "ix_factory_terminal_notices_pending",
             "created_at",
             postgresql_where=text("posted_at IS NULL AND refused_at IS NULL"),
+        ),
+        Index(
+            "ix_factory_terminal_notices_unfinalized",
+            "created_at",
+            postgresql_where=text("finalized_at IS NULL AND refused_at IS NULL"),
         ),
     )
 
@@ -889,19 +1028,135 @@ class FactoryTerminalNotice(Base):
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
     )
-    terminal_cause: Mapped[str] = mapped_column(Text)
+    # The capability in the card URL camo fetches: 64 lowercase hex characters.
+    card_token: Mapped[str] = mapped_column(
+        Text,
+        unique=True,
+        default=new_card_token,
+        server_default=text(
+            "replace(gen_random_uuid()::text, '-', '') "
+            "|| replace(gen_random_uuid()::text, '-', '')"
+        ),
+    )
+    terminal_cause: Mapped[str | None] = mapped_column(Text, default=None)
+    # The provider's own failure message, redacted before it is stored (#3073).
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
     posted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     comment_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Which GitHub comment list ``comment_id`` lives in: issue or PR review.
+    comment_list: Mapped[str | None] = mapped_column(Text, default=None)
+    rendered_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    subject_title: Mapped[str | None] = mapped_column(Text, default=None)
+    # NULL: never applied. '': backfilled by 0055, never touch.
+    applied_label: Mapped[str | None] = mapped_column(Text, default=None)
+    declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    activity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     refused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     refusal: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExecutionRequestPhaseReport(Base):
+    """One ``report_progress`` call from the sandbox, on its active request (#3077)."""
+
+    __tablename__ = "execution_request_phase_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "phase ~ '^[a-z][a-z0-9_]{0,63}$'",
+            name="execution_request_phase_reports_phase_ck",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) BETWEEN 1 AND 280",
+            name="execution_request_phase_reports_note_ck",
+        ),
+        CheckConstraint(
+            "loop_round IS NULL OR loop_round BETWEEN 1 AND 5",
+            name="execution_request_phase_reports_round_ck",
+        ),
+        Index(
+            "ix_execution_request_phase_reports_request",
+            "execution_request_id",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    phase: Mapped[str] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    loop_round: Mapped[int | None] = mapped_column(default=None)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
+class ExecutionRequestModelUsage(Base):
+    """Token usage of one model in one turn of a request, with its estimate (#3223).
+
+    Cost, price source, and price time are all NULL or all set: an unpriced
+    model keeps its tokens with no estimate.
+    """
+
+    __tablename__ = "execution_request_model_usage"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('implementer', 'reviewer')",
+            name="execution_request_model_usage_role_ck",
+        ),
+        CheckConstraint(
+            "input_tokens >= 0 AND cached_input_tokens >= 0 "
+            "AND cache_write_tokens >= 0 AND output_tokens >= 0",
+            name="execution_request_model_usage_tokens_ck",
+        ),
+        CheckConstraint(
+            "(estimated_cost_usd IS NULL AND price_source IS NULL AND price_as_of IS NULL) "
+            "OR (estimated_cost_usd IS NOT NULL AND estimated_cost_usd >= 0 "
+            "AND price_source IS NOT NULL AND price_as_of IS NOT NULL)",
+            name="execution_request_model_usage_price_ck",
+        ),
+        UniqueConstraint(
+            "execution_request_id",
+            "turn_id",
+            "model",
+            "role",
+            name="execution_request_model_usage_turn_model_role_key",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger)
+    output_tokens: Mapped[int] = mapped_column(BigInteger)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6), default=None)
+    price_source: Mapped[str | None] = mapped_column(Text, default=None)
+    price_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
     )
 
 
@@ -1005,6 +1260,9 @@ class GitHubReviewFeedback(Base):
         CheckConstraint(
             "enqueue_attempts >= 0", name="github_review_feedback_attempts_ck"
         ),
+        CheckConstraint(
+            "notice_scan_page >= 1", name="github_review_feedback_notice_scan_page_ck"
+        ),
         Index("ix_github_review_feedback_pending", "status", "created_at"),
     )
 
@@ -1042,6 +1300,8 @@ class GitHubReviewFeedback(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     queued_at: Mapped[datetime | None] = mapped_column(default=None)
     terminal_scan_cursor: Mapped[str | None] = mapped_column(default=None)
+    notice_marker: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    notice_scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
 
 
 class Publication(Base):
@@ -1130,6 +1390,11 @@ class Publication(Base):
     # these bytes while preserving the audit/result metadata.
     patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
     changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    observed_title_sha256: Mapped[str | None] = mapped_column(default=None)
+    observed_body_sha256: Mapped[str | None] = mapped_column(default=None)
+    metadata_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     title: Mapped[str]
     body: Mapped[str] = mapped_column(Text)
     reply_kind: Mapped[str]
@@ -1254,7 +1519,8 @@ class ApprovalAuditEntry(Base):
     approval_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"), index=True
     )
-    # What happened: resolved / denied / race_lost / expired.
+    # What happened: resolved / denied / race_lost / expired / reraise_refused
+    # (a re-raise of this rejected approval refused, #2885).
     action: Mapped[str]
     actor: Mapped[str]
     actor_channel: Mapped[str | None] = mapped_column(default=None)
@@ -1452,6 +1718,49 @@ class WorkflowStateEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+
+class ThreadTranscript(Base):
+    """One thread's conversation transcript (ADR-0170, #3070).
+
+    Moved out of ``workflow_state_entries``: that store caps a whole (agent,
+    namespace), so every thread an agent ever ran shared one transcript budget
+    and a busy factory agent stopped for good once it filled. A transcript is
+    capped per thread here (``transcript_max_thread_bytes``) with no agent-wide
+    cap, and it is deleted when its WorkItem reaches a terminal state or, for a
+    thread with no WorkItem, once ``expires_at`` passes. The state API keeps
+    serving it under ``/state/transcript/<thread_key>``.
+    """
+
+    __tablename__ = "thread_transcripts"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            name="uq_thread_transcripts_agent_scope_thread",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_thread_transcripts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    # Same partition key as ``WorkflowStateEntry.binding_scope``; NULL is the
+    # agent-wide identity every runner transcript uses today.
+    binding_scope: Mapped[str | None] = mapped_column(default=None)
+    # The worker's scoped thread key, which is also ``WorkItem.conversation_id``.
+    thread_key: Mapped[str]
+    value: Mapped[Any] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
@@ -1486,6 +1795,20 @@ class ConsoleSession(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ScheduleControl(Base):
+    """Operator pause state for one agent and named cron hook."""
+
+    __tablename__ = "schedule_controls"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resume_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 
@@ -1498,7 +1821,8 @@ class HookRun(Base):
             name="hook_runs_agent_name_slot_key",
         ),
         CheckConstraint(
-            "outcome IS NULL OR outcome IN ('ran', 'skipped', 'blocked', 'failed')",
+            "outcome IS NULL OR outcome IN "
+            "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
     )
@@ -1519,6 +1843,8 @@ class HookRun(Base):
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # When an open claim becomes reclaimable by the hook's next fire (#2931).
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Tenant(Base):
@@ -1737,9 +2063,7 @@ class ProviderInstallation(Base):
     external_account_id: Mapped[str] = mapped_column(String)
     display_name: Mapped[str | None] = mapped_column(default=None)
     credential_ref: Mapped[str | None] = mapped_column(default=None)
-    scopes: Mapped[list[str]] = mapped_column(
-        JSONB, default=list, server_default=text("'[]'::jsonb")
-    )
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
     webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
     installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(

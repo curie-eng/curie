@@ -35,13 +35,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
+    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint, MetricSeries,
+    MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, HookFireOutput,
+    HookOutput, KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
+    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -236,6 +238,30 @@ fn work_item_list() -> curie::api::WorkItemList {
     }
 }
 
+/// Locked `GET /schedules` body, including `last_outcome` `failed`.
+fn locked_schedule_list() -> serde_json::Value {
+    serde_json::json!({
+        "schedules": [
+            {
+                "agent": "acme-bot",
+                "agent_id": "00000000-0000-0000-0000-000000000001",
+                "bundle_error": null,
+                "hooks": [
+                    {
+                        "name": "nightly-cleanup",
+                        "trigger": "cron",
+                        "schedule": "30 2 * * *",
+                        "zone": "UTC",
+                        "last_fire_at": "2026-09-25T02:30:00Z",
+                        "last_outcome": "failed",
+                        "paused": false
+                    }
+                ]
+            }
+        ]
+    })
+}
+
 fn cluster_status() -> Box<ClusterStatus> {
     Box::new(ClusterStatus {
         namespace: "curie".to_string(),
@@ -292,6 +318,9 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
                 thinking: Some("adaptive".to_string()),
+                execution_deadline_seconds: Some(90),
+                runner_resources: None,
+                memory_writes: true,
                 changed: true,
             },
         ],
@@ -311,6 +340,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "CallersOutput",
+        samples![
+            "DryRun" => CallersOutput::DryRun(plan()),
+            // A restricted surface; the open (null list) shape is pinned by
+            // cli/tests/callers_verb.rs against the same schema.
+            "Done" => CallersOutput::Done {
+                agent: "a".to_string(),
+                surface: ChannelBinding {
+                    kind: "slack".to_string(),
+                    address: "C0EXAMPLE1".to_string(),
+                    adapter: Some("default".to_string()),
+                    allowed_callers: Some(vec!["U0EXAMPLE1".to_string()]),
+                },
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
         "ChannelsOutput",
         samples![
             "DryRun" => ChannelsOutput::DryRun(plan()),
@@ -323,10 +370,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     ChannelBinding {
                         kind: "slack".to_string(),
                         address: "#legacy-alerts".to_string(),
+                        adapter: None,
+                        allowed_callers: None,
                     },
+                    // A named, non-default identity (ADR-0168 decision 3)
+                    // alongside the default-identity row above, so the schema
+                    // gate sees both the present and the omitted `adapter`.
                     ChannelBinding {
                         kind: "slack".to_string(),
                         address: "C0EXAMPLE1".to_string(),
+                        adapter: Some("ops-secondary".to_string()),
+                        allowed_callers: None,
                     },
                 ],
                 changed: true,
@@ -388,6 +442,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Pending" => ApprovalsOutput::Pending {
                 agent: "a".to_string(),
                 records: vec![approval_record()],
+                routes: Default::default(),
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
@@ -464,6 +519,40 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "HookFireOutput",
+        samples![
+            "DryRun" => HookFireOutput::DryRun(plan()),
+            "Record" => HookFireOutput::Record(
+                serde_json::from_value::<HookFireRecord>(serde_json::json!({
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "agent_id": "11111111-1111-4111-8111-111111111111",
+                    "agent": "acme-bot",
+                    "name": "nightly-cleanup",
+                    "trigger": "cron",
+                    "slot_utc": "2026-09-26T12:00:00Z",
+                    "outcome": "ran",
+                    "started_at": "2026-09-26T12:00:00Z",
+                    "ended_at": "2026-09-26T12:00:01Z"
+                }))
+                .unwrap(),
+            ),
+        ],
+    );
+    m.insert(
+        "SchedulesOutput",
+        samples![
+            "DryRun" => SchedulesOutput::DryRun(plan()),
+            "List" => SchedulesOutput::List(
+                serde_json::from_value::<ScheduleList>(locked_schedule_list()).unwrap(),
+            ),
+            "Control" => SchedulesOutput::Control(curie::api::ScheduleControl {
+                agent: "acme-bot".to_string(),
+                name: "nightly-cleanup".to_string(),
+                paused: true,
+            }),
+        ],
+    );
+    m.insert(
         "WorkItemsOutput",
         samples![
             "DryRun" => WorkItemsOutput::DryRun(plan()),
@@ -521,6 +610,19 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => CommsOutput::DryRun(plan()),
             "Done" => CommsOutput::Done { connected: true },
+        ],
+    );
+    m.insert(
+        "HookOutput",
+        samples![
+            "DryRun" => HookOutput::DryRun(plan()),
+            "Config" => HookOutput::Config {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                agent: "acme-bot".to_string(),
+                hook_partitions: Some(BTreeMap::new()),
+                source_bindings: Some(BTreeMap::new()),
+            },
+            "Secret" => HookOutput::Secret { secret: "example-secret".to_string() },
         ],
     );
     m.insert(
@@ -593,6 +695,11 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Replied" => MessageOutcomeOutput::Replied {
                 thread: "1700000000.000100".to_string(),
                 reply: "the answer is 42".to_string(),
+            },
+            "Failed" => MessageOutcomeOutput::Failed {
+                thread: "1700000000.000100".to_string(),
+                reply: "curie-turn-failure: max-turns\n\nThe run failed (max-turns).".to_string(),
+                failure_class: "max-turns".to_string(),
             },
             "NoEdit" => MessageOutcomeOutput::NoEdit { thread: "1700000000.000100".to_string() },
             "AwaitingApproval" => MessageOutcomeOutput::AwaitingApproval {

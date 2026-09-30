@@ -35,6 +35,18 @@ end
 return 0
 """
 
+# Refresh the TTL only while the route is still LIVE on the caller's claim, so
+# a suspend or handoff that lands mid-turn keeps its own TTL (#3188).
+_TOUCH_IF_LIVE_CLAIM = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok then return 0 end
+local state = record['state'] or ARGV[2]
+if record['claim_name'] ~= ARGV[1] or state ~= ARGV[2] then return 0 end
+return redis.call('EXPIRE', KEYS[1], ARGV[3])
+"""
+
 _REPLACE_IF_GENERATION = """
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
@@ -79,6 +91,7 @@ class AffinityStore:
         self._prefix = key_prefix
         self._delete_if_claim = client.register_script(_DELETE_IF_CLAIM)
         self._replace_if_generation = client.register_script(_REPLACE_IF_GENERATION)
+        self._touch_if_live_claim = client.register_script(_TOUCH_IF_LIVE_CLAIM)
 
     def _key(self, thread_key: str) -> str:
         return f"{self._prefix}:route:{thread_key}"
@@ -132,6 +145,18 @@ class AffinityStore:
         """Refresh the route TTL on activity. Returns False if no route."""
 
         return bool(self._redis.expire(self._key(thread_key), ttl_seconds))
+
+    def touch_if_live_claim(
+        self, thread_key: str, claim_name: str, ttl_seconds: int
+    ) -> bool:
+        """Refresh the TTL only of a LIVE route that still names ``claim_name``."""
+
+        return bool(
+            self._touch_if_live_claim(
+                keys=[self._key(thread_key)],
+                args=[claim_name, RouteState.LIVE.value, ttl_seconds],
+            )
+        )
 
     def delete_if_claim(self, thread_key: str, claim_name: str) -> bool:
         """Delete the route only when it still names ``claim_name``."""

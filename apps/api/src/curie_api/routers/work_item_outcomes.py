@@ -13,11 +13,11 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from .. import crud, workitem_outcomes
+from .. import crud, factory_usage, workitem_outcomes
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..schemas import WorkItemOutcomeList, WorkItemOutcomeOut
+from ..schemas import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
 
 router = APIRouter(
     prefix="/work-items",
@@ -62,3 +62,26 @@ async def get_work_item(
     async with httpx.AsyncClient() as client:
         view.ci = await workitem_outcomes.observe_ci(lineage, item, settings, client)
     return view
+
+
+@router.get("/{work_item_id}/usage", response_model=WorkItemUsageOut)
+async def get_work_item_usage(
+    work_item_id: uuid.UUID,
+    session: SessionDep,
+    response: Response,
+    agent_id: uuid.UUID | None = None,
+) -> WorkItemUsageOut:
+    """Token usage and estimated cost over every round of the work item (#3223)."""
+
+    response.headers["Cache-Control"] = "no-store"
+    loaded = await workitem_outcomes.load_outcome(
+        session, work_item_id, agent_id=agent_id, settings=get_settings()
+    )
+    if loaded is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+    _view, _item, lineage = loaded
+    usage = await factory_usage.work_item_usage(session, work_item_id)
+    if lineage is not None:
+        usage.pr_number = lineage.pr_number
+        usage.pr_url = lineage.pr_url
+    return usage
