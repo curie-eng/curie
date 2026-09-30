@@ -178,3 +178,52 @@ def test_0073_backfills_existing_rows_and_round_trips(isolated_migration_db: Non
     finally:
         # A failed assertion must not leave this private database below head.
         command.upgrade(config, "head")
+
+
+def test_identity_stack_has_one_ordered_head() -> None:
+    """@spec PI-STACK-1: identity links precede tenant scope."""
+    script = ScriptDirectory.from_config(_config())
+    assert script.get_heads() == ["0074"]
+    revision = script.get_revision("0074")
+    assert revision is not None
+    assert revision.down_revision == "0073"
+    predecessor = script.get_revision("0073")
+    assert predecessor is not None
+    assert "identity_links" in predecessor.doc
+
+
+def test_tenant_scope_preserves_identity_links_on_downgrade(isolated_migration_db: None) -> None:
+    """@spec PI-STACK-2 @spec PI-STACK-3: the earlier key and row survive."""
+    config = _config()
+    command.upgrade(config, "0073")
+    ids = _seed_pre_0073_rows()
+    installation_id = uuid.uuid4()
+    link_id = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.provider_installations "
+        "(id, tenant_id, provider, external_account_id) "
+        "VALUES (:id, :tenant, 'slack', :account)",
+        {"id": installation_id, "tenant": DEFAULT_TENANT_ID, "account": f"T-{link_id.hex}"},
+    )
+    _sql(
+        "INSERT INTO curie.identity_links "
+        "(id, tenant_id, bot_id, provider_installation_id, provider_native_id, verification_source) "
+        "VALUES (:id, :tenant, :bot, :installation, 'U0EXAMPLE', 'admin_mapped')",
+        {"id": link_id, "tenant": DEFAULT_TENANT_ID, "bot": ids["agents"],
+         "installation": installation_id},
+    )
+    command.upgrade(config, "0074")
+    assert "agent_channels_provider_installation_fkey" in _constraint_names("agent_channels")
+    command.downgrade(config, "0073")
+    assert "provider_installations_tenant_id_id_key" in _constraint_names("provider_installations")
+    assert "identity_links_installation_fkey" in _constraint_names("identity_links")
+    assert _sql("SELECT id FROM curie.identity_links WHERE id = :id", {"id": link_id}) == [
+        {"id": link_id}
+    ]
+    # The negative checks the surviving key through its real database consumer.
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    with pytest.raises(IntegrityError, match="identity_links_installation_fkey"):
+        _sql("DELETE FROM curie.provider_installations WHERE id = :id", {"id": installation_id})
+    command.upgrade(config, "head")
