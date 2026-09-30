@@ -303,7 +303,8 @@ cargo test
 ```
 The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
 tests execute in CI. Contributors need a reachable Valkey, such as the compose
-Valkey, for equivalent local coverage.
+Valkey, for equivalent local coverage. The Python pytest shards likewise set
+`CI_REQUIRE_POSTGRES_TESTS`, so `pg_connect_or_skip` fails rather than skips there.
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.

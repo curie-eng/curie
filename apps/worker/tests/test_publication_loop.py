@@ -18,6 +18,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
 from curie_worker.publication_loop import (
@@ -33,7 +34,6 @@ from curie_worker.publication_store import (
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
 from curie_worker.slack_sink import UnconfiguredSlackIdentityError
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -1649,11 +1649,7 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
     engine: AsyncEngine = create_async_engine(_DB_URL)
     schema: str | None = None
     try:
-        try:
-            async with engine.connect():
-                pass
-        except SQLAlchemyError as exc:
-            pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+        await pg_connect_or_skip(engine)
 
         schema = f"test_publication_{uuid.uuid4().hex}"
         durable = PostgresPublicationStore(
