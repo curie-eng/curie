@@ -923,11 +923,12 @@ def _build_publication_loop(
         store=store,
         credentials=PublicationCredentialClient(
             api_base_url=config.api_base_url,
+            github_html_base=config.publication_github_html_base,
             worker_token=config.internal_worker_token,
             client=http,
         ),
         cluster=cluster,
-        github=GitHubPublicationLookup(http),
+        github=GitHubPublicationLookup(http, api_base_url=config.publication_github_api_url),
         lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,

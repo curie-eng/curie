@@ -1961,6 +1961,8 @@ def publication_lineage_outcome_conflict(
     publication: Publication,
     lineage: ThreadPublicationLineage,
     data: PublicationLineageAdvance,
+    *,
+    github_html_base: str,
 ) -> PublicationLineageConflict | None:
     """Preconditions one revision outcome must meet before it may claim a lineage.
 
@@ -1984,7 +1986,7 @@ def publication_lineage_outcome_conflict(
     # GitHub's own spelling of the repository and preserves it, so a repository
     # whose GitHub casing differs from `repo_full_name` publishes fine and must
     # not then take a stable refusal here.
-    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    canonical = f"{github_html_base}/{lineage.repo_full_name}/pull/{data.pr_number}"
     if data.pr_url.casefold() != canonical.casefold():
         return PublicationLineageConflict(
             "publication.lineage_stale",
@@ -2030,6 +2032,7 @@ async def advance_publication_lineage(
     publication_id: uuid.UUID,
     data: PublicationLineageAdvance,
     *,
+    github_html_base: str,
     identity: VerifiedPublicationIdentity | None = None,
 ) -> ThreadPublicationLineage:
     """Atomically advance one approved revision and its exact lineage head."""
@@ -2065,7 +2068,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    conflict = publication_lineage_outcome_conflict(
+        publication, lineage, data, github_html_base=github_html_base
+    )
     if conflict is not None:
         raise conflict
 

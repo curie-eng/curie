@@ -19,6 +19,7 @@ import json
 import os
 import socket
 from typing import Annotated, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -46,6 +47,15 @@ from pydantic_settings.sources import (
 from . import caller_token
 from .publication_validation import normalize_protected_publication_paths
 from .receipt import TurnReceiptMode
+
+
+def github_html_base(api_url: str) -> str:
+    """Derive the forge HTML base from its configured REST API base."""
+
+    parsed = urlsplit(api_url.rstrip("/"))
+    authority = "github.com" if parsed.netloc == "api.github.com" else parsed.netloc
+    path = parsed.path.removesuffix("/api/v3")
+    return urlunsplit((parsed.scheme, authority, path, "", ""))
 
 
 def _default_consumer_name() -> str:
@@ -1115,6 +1125,11 @@ class WorkerConfig(BaseSettings):
         default="https://api.github.com",
         validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
     )
+
+    @property
+    def publication_github_html_base(self) -> str:
+        return github_html_base(self.publication_github_api_url)
+
     publication_reconcile_interval_seconds: float = Field(
         default=2.0,
         gt=0,

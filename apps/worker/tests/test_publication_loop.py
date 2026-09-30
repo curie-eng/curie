@@ -728,6 +728,42 @@ def _job_env(resources: Any) -> dict[str, str]:
     return {item["name"]: item["value"] for item in container["env"]}
 
 
+@pytest.mark.parametrize(
+    "html_base", ["https://github.com", "https://github.example.com/forge"]
+)
+async def test_publication_markers_accept_the_configured_html_origin(
+    publication: Any, html_base: str
+) -> None:
+    url = f"{html_base}/acme-corp/acme-bot/pull/123"
+    marker = publication._marker_url(f"Publishing\nCURIE_PR_URL={url}\n")
+
+    assert marker == url
+    assert publication._validated_pr_url(
+        _work(publication), marker, github_html_base=html_base
+    ) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        PR_URL,
+        "https://other.example.com/forge/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/forge/acme-corp/other-bot/pull/123",
+    ],
+)
+async def test_enterprise_publication_markers_refuse_a_foreign_html_origin(
+    publication: Any, url: str
+) -> None:
+    marker = publication._marker_url(f"CURIE_PR_URL={url}\n")
+    assert marker == url
+
+    with pytest.raises(PublicationReconcileError, match="repository"):
+        publication._validated_pr_url(
+            _work(publication), marker, github_html_base="https://github.example.com/forge"
+        )
+
+
 async def test_publication_card_outbox_posts_and_remembers_before_ack(
     publication: Any,
 ) -> None:

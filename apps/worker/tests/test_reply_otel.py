@@ -213,11 +213,18 @@ def test_publication_slack_egress_is_observed_exactly_once(
             run_module, "PostgresPublicationStore", lambda *_args, **_kwargs: object()
         )
         monkeypatch.setattr(run_module, "PublicationCredentialClient", lambda **_kwargs: object())
-        monkeypatch.setattr(run_module, "GitHubPublicationLookup", lambda _http: object())
 
         opaque_dependency: Any = object()
+        github_api_url = "https://github.example.com/forge/api/v3"
+
+        def publication_lookup(client: Any, *, api_base_url: str) -> object:
+            assert client is opaque_dependency
+            assert api_base_url == github_api_url
+            return object()
+
+        monkeypatch.setattr(run_module, "GitHubPublicationLookup", publication_lookup)
         loop = run_module._build_publication_loop(
-            WorkerConfig(),
+            WorkerConfig(publication_github_api_url=github_api_url),
             {"CURIE_SANDBOX_SUBSTRATE": "kubernetes"},
             opaque_dependency,
             router,
