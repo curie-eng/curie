@@ -252,9 +252,6 @@ class ApprovalBackendError(Exception):
         self.refusal = refusal
 
 
-_REFUSAL_MAX = 500
-
-
 def _coded_refusal(response: httpx.Response) -> str | None:
     """``"<code>: <message>"`` from an API ``{"detail": {code, message}}`` body."""
 
@@ -263,13 +260,15 @@ def _coded_refusal(response: httpx.Response) -> str | None:
     except (KeyError, TypeError, ValueError):
         return None
     if isinstance(detail, str):
-        return detail[:_REFUSAL_MAX] if detail.strip() else None
+        return detail if detail.strip() else None
     if not isinstance(detail, dict):
         return None
     code, message = detail.get("code"), detail.get("message")
     if not isinstance(code, str) or not code or not isinstance(message, str):
         return None
-    return f"{code}: {message}"[:_REFUSAL_MAX]
+    # Unclipped: the kernel redacts the whole text before it clips, so a
+    # secret's closing delimiter is never cut off ahead of redaction.
+    return f"{code}: {message}"
 
 
 class ApprovalRefused(Exception):
