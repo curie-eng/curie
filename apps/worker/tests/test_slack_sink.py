@@ -926,6 +926,70 @@ def test_best_effort_still_falls_back_to_default_when_present() -> None:
 # investigation happened, cost real money, and the answer was dropped.
 
 
+_CONVERSATION_CASES = [
+    pytest.param("hook:acme-bot:alert", None, id="hook"),
+    pytest.param("", None, id="empty"),
+    pytest.param("th-card", None, id="card-reference"),
+    pytest.param("conv-abc", None, id="adapter-conversation"),
+    pytest.param("2026-08-27T00:00:00", None, id="iso-date"),
+    pytest.param(None, None, id="absent"),
+    pytest.param("1.1", "1.1", id="short-timestamp"),
+    pytest.param("1787792627.881000", "1787792627.881000", id="slack-timestamp"),
+]
+
+
+@pytest.mark.parametrize(("conversation", "expected"), _CONVERSATION_CASES)
+def test_thread_ts_recognizes_timestamp_and_non_timestamp_input_classes(
+    conversation: str | None, expected: str | None
+) -> None:
+    assert slack_sink_module._thread_ts(conversation) == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("conversation", "expected"), _CONVERSATION_CASES)
+@pytest.mark.parametrize("event_kind", ["reply.update", "reply.post", "turn.status"])
+async def test_every_slack_delivery_path_uses_only_a_timestamp_as_the_thread(
+    conversation: str | None, expected: str | None, event_kind: str
+) -> None:
+    # Only Slack's external client is replaced. emit and the concrete posting /
+    # status consumer run, so removing one call site's guard cannot stay green.
+    sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
+    seen: dict[str, object] = {}
+    _record_post(sink, seen)
+
+    async def _fake_set_status(**kwargs: object) -> None:
+        seen.update(kwargs)
+
+    sink._client_for(None).assistant_threads_setStatus = _fake_set_status  # type: ignore[method-assign]
+    target = _target(ts=None, thread=conversation)
+    if event_kind == "reply.update":
+        event = ReplyUpdate(
+            version=REPLY_WIRE_VERSION, event="reply.update", target=target, text="reply"
+        )
+    elif event_kind == "reply.post":
+        event = ReplyPost(
+            version=REPLY_WIRE_VERSION,
+            event="reply.post",
+            target=target,
+            message=OutboundMessage(version=MESSAGE_VERSION, text="approve?"),
+            requested_by="U_AE",
+        )
+    else:
+        event = TurnStatus(
+            version=REPLY_WIRE_VERSION, event="turn.status", target=target, status="working"
+        )
+
+    ack = await sink.emit(event, route=TargetRoute(endpoint=None))
+
+    if event_kind == "turn.status":
+        assert seen == {"channel_id": "C1", "thread_ts": expected or "", "status": "working"}
+        assert ack.ref is None
+    else:
+        assert seen["channel"] == "C1"
+        assert seen["thread_ts"] == expected, seen
+        assert ack.ref == "9.9"
+
+
 def _hook_update(sink: SlackReplyAdapter, *, conversation: str | None) -> object:
     """A placeholder-less reply.update, the shape a triggered turn produces."""
     return sink.emit(
