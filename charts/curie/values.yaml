@@ -2762,16 +2762,14 @@ security:
   gvisor:
     # Tri-state, default `auto`:
     #   auto    - at install/upgrade time the chart looks up the `runtimeClassName`
-    #             RuntimeClass. If present, runner pods run under it; if absent,
-    #             pods run with NO runtimeClassName (isolation OFF) and NOTES.txt
-    #             prints a prominent warning. NOTE: Helm's `lookup` returns empty
-    #             under `helm template`/--dry-run, so a templated render always
-    #             shows the no-gvisor shape. This graceful degradation applies ONLY
-    #             to the fake-model/dev default; enabling a real model
-    #             (agentSandbox.runner.fakeModel=false or local inference.deploy)
-    #             makes `auto` render the blocking enforcement preflight, so a
-    #             runsc-less real-model install fails closed instead of silently
-    #             running on the host kernel.
+    #             RuntimeClass. A real model (agentSandbox.runner.fakeModel=false
+    #             or inference.deploy) stamps that class even when lookup is empty
+    #             (helm template, Argo CD, Flux) and renders the blocking
+    #             enforcement preflight, so a runsc-less real-model install fails
+    #             closed instead of silently running on the host kernel. Fake-model
+    #             auto still omits the class when lookup is empty (NOTES.txt warns);
+    #             when lookup finds the class, those pods use it. That path never
+    #             blocks a bare install.
     #   require - always stamp the runtimeClassName AND run the enforcement
     #             preflight as a blocking hook; a missing or downgraded runtime
     #             fails the install (the fail-hard, production posture).
