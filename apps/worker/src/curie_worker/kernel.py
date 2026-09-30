@@ -5087,6 +5087,7 @@ class Kernel:
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         scratch_root=Path(self._config.workspace_scratch_root),
                         git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
+                        protected_paths=self._config.publication_protected_paths,
                     )
                     outcome.publication_snapshot = snapshot
                 except (

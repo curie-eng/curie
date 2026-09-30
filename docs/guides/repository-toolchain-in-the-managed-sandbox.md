@@ -378,7 +378,13 @@ the coder to identify the repository's documented check command, run it from
 `/workspace`, and report the exact command and its exit status before requesting
 publication. The tool never publishes anything itself: the platform captures a
 patch, asks for human approval in the requesting thread, and publishes from a
-separate trusted job only after that approval. Human approval is the default.
+separate trusted job only after that approval. That job refuses any change
+under `.github/` (workflows, composite actions, `CODEOWNERS`, and the rest of
+that tree) and any path an operator lists in `worker.publication.protectedPaths`.
+It pushes the branch to the base repository, so a `push` or `pull_request`
+workflow there runs the changed files with the repository's Actions secrets
+before a person reviews the pull request. Keep those secrets in GitHub
+environments that require reviewers. Human approval is the default.
 An operator can opt one agent into automatic publication with
 `curie local publication-policy` or `curie cluster publication-policy` and
 `--policy auto`. That still records an approval, names the platform policy as

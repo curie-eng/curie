@@ -44,6 +44,7 @@ worker:
   CURIE_PUBLICATION_OWNER_NAME: worker.publication.ownerName
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_PRIORITY_CLASS_NAME: priorityClasses.platform.name
+  CURIE_PUBLICATION_PROTECTED_PATHS: worker.publication.protectedPaths
   CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS: worker.publication.reconcileIntervalSeconds
   CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS: worker.publication.reconcileMaxAttempts
   CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS: worker.publication.resultMaxAttempts

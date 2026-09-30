@@ -12,7 +12,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from curie_worker.config import WorkerConfig
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
+from pydantic import ValidationError
 
 
 def test_publication_git_environment_drops_ambient_credentials_and_config(
@@ -41,9 +43,13 @@ def test_publication_git_environment_drops_ambient_credentials_and_config(
 def test_publication_validation_refuses_workflow_changes() -> None:
     validation = importlib.import_module("curie_worker.publication_validation")
 
-    assert not validation._safe_changed_path(".github/workflows/publish.yml")
-    assert not validation._safe_changed_path(".GIT/config")
-    assert validation._safe_changed_path("src/main.py")
+    assert not validation._safe_changed_path(".github/workflows/publish.yml", ())
+    assert not validation._safe_changed_path(".GIT/config", ())
+    assert not validation._safe_changed_path(".github/actions/build/action.yml", ())
+    assert not validation._safe_changed_path(".github/CODEOWNERS", ())
+    assert validation._safe_changed_path("src/main.py", ())
+    assert not validation._safe_changed_path("scripts/release.sh", ("scripts/release.sh",))
+    assert validation._safe_changed_path("scripts/release.sh.bak", ("scripts/release.sh",))
 
 
 def test_derived_workflow_path_cannot_hide_behind_a_safe_declared_path(
@@ -58,9 +64,7 @@ def test_derived_workflow_path_cannot_hide_behind_a_safe_declared_path(
         cwd=repo,
         check=True,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Publisher"], cwd=repo, check=True
-    )
+    subprocess.run(["git", "config", "user.name", "Publisher"], cwd=repo, check=True)
     (repo / "README.md").write_text("base\n")
     subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
@@ -88,9 +92,7 @@ def test_derived_workflow_path_cannot_hide_behind_a_safe_declared_path(
         archive.add(repo / "README.md", arcname="README.md")
     archive_bytes = archive_buffer.getvalue()
     coordinator = SimpleNamespace(
-        preparer=SimpleNamespace(
-            limits=SimpleNamespace(max_archive_bytes=len(archive_bytes) + 1)
-        ),
+        preparer=SimpleNamespace(limits=SimpleNamespace(max_archive_bytes=len(archive_bytes) + 1)),
         current=lambda _thread: SimpleNamespace(
             repo_full_name="acme-corp/acme-bot",
             base_sha="a" * 40,
@@ -109,13 +111,14 @@ def test_derived_workflow_path_cannot_hide_behind_a_safe_declared_path(
 
     with pytest.raises(
         validation.WorkspacePreparationError,
-        match="changed_paths do not exactly match",
+        match="GitHub workflow changes cannot be published",
     ):
         validation.validate_snapshot_against_base(
             coordinator,
             thread_key="1700000000.000100",
             snapshot=snapshot,
             scratch_root=tmp_path,
+            protected_paths=(),
         )
 
 
@@ -133,7 +136,10 @@ def test_empty_snapshot_requires_matching_base_and_empty_patch() -> None:
         publication_body="Correct the body for CI.",
     )
     validation.validate_snapshot_against_base(
-        coordinator, thread_key="example-thread", snapshot=snapshot
+        coordinator,
+        thread_key="example-thread",
+        snapshot=snapshot,
+        protected_paths=(),
     )
     for changed in (
         {"patch": b"diff --git a/a b/a\n"},
@@ -143,7 +149,176 @@ def test_empty_snapshot_requires_matching_base_and_empty_patch() -> None:
             validation.validate_snapshot_against_base(
                 coordinator,
                 thread_key="example-thread",
-                snapshot=RunnerWorkspaceSnapshot(
-                    **{**snapshot.__dict__, **changed}
-                ),
+                snapshot=RunnerWorkspaceSnapshot(**{**snapshot.__dict__, **changed}),
+                protected_paths=(),
             )
+
+
+def _prepared_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "patch-source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "publisher@example.test"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Publisher"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    return repo
+
+
+def _archive_readme(repo: Path) -> bytes:
+    archive_buffer = BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        archive.add(repo / "README.md", arcname="README.md")
+    return archive_buffer.getvalue()
+
+
+def _coordinator(archive_bytes: bytes) -> SimpleNamespace:
+    return SimpleNamespace(
+        preparer=SimpleNamespace(limits=SimpleNamespace(max_archive_bytes=len(archive_bytes) + 1)),
+        current=lambda _thread: SimpleNamespace(
+            repo_full_name="acme-corp/acme-bot",
+            base_sha="a" * 40,
+        ),
+        stream_current_base=lambda _thread: [archive_bytes],
+    )
+
+
+def _snapshot(paths: tuple[str, ...], patch: bytes) -> RunnerWorkspaceSnapshot:
+    return RunnerWorkspaceSnapshot(
+        repo_full_name="acme-corp/acme-bot",
+        base_sha="a" * 40,
+        patch=patch,
+        changed_paths=paths,
+        contains_workflow_files=False,
+        publication_title="Update source",
+        publication_body="Approved platform publication.",
+    )
+
+
+def _cached_patch(repo: Path) -> bytes:
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "diff", "--cached", "--binary", "--no-renames"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def test_publication_refuses_github_actions_and_codeowners(tmp_path: Path) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    action = repo / ".github" / "actions" / "build" / "action.yml"
+    action.parent.mkdir(parents=True)
+    action.write_text("name: build\n")
+    (repo / ".github" / "CODEOWNERS").write_text("* @acme\n")
+    patch = _cached_patch(repo)
+
+    with pytest.raises(
+        validation.WorkspacePreparationError,
+        match="GitHub metadata changes cannot be published",
+    ):
+        validation.validate_snapshot_against_base(
+            _coordinator(_archive_readme(repo)),
+            thread_key="1700000000.000100",
+            snapshot=_snapshot(
+                (".github/actions/build/action.yml", ".github/CODEOWNERS"),
+                patch,
+            ),
+            scratch_root=tmp_path,
+            protected_paths=(),
+        )
+
+
+def test_publication_refuses_operator_protected_paths(tmp_path: Path) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    script = repo / "scripts" / "release.sh"
+    script.parent.mkdir()
+    script.write_text("echo release\n")
+    patch = _cached_patch(repo)
+
+    with pytest.raises(
+        validation.WorkspacePreparationError,
+        match="operator-protected path changes cannot be published",
+    ):
+        validation.validate_snapshot_against_base(
+            _coordinator(_archive_readme(repo)),
+            thread_key="1700000000.000100",
+            snapshot=_snapshot(("scripts/release.sh",), patch),
+            scratch_root=tmp_path,
+            protected_paths=("scripts",),
+        )
+
+
+def test_publication_accepts_a_readme_outside_protected_paths(tmp_path: Path) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    archive = _archive_readme(repo)
+    (repo / "README.md").write_text("changed\n")
+    neighbor = repo / "scripts" / "release.sh.bak"
+    neighbor.parent.mkdir()
+    neighbor.write_text("echo not protected\n")
+    readme_patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-renames"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+    neighbor_patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-index", "/dev/null", "scripts/release.sh.bak"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    assert neighbor_patch.returncode == 1
+    validation.validate_snapshot_against_base(
+        _coordinator(archive),
+        thread_key="1700000000.000100",
+        snapshot=_snapshot(("README.md",), readme_patch),
+        scratch_root=tmp_path,
+        protected_paths=("scripts/release.sh",),
+    )
+    validation.validate_snapshot_against_base(
+        _coordinator(archive),
+        thread_key="1700000000.000100",
+        snapshot=_snapshot(("scripts/release.sh.bak",), neighbor_patch.stdout),
+        scratch_root=tmp_path,
+        protected_paths=("scripts/release.sh",),
+    )
+
+
+def test_hidden_github_metadata_is_refused_by_name(tmp_path: Path) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    action = repo / ".GITHUB" / "actions" / "build" / "action.yml"
+    action.parent.mkdir(parents=True)
+    action.write_text("name: build\n")
+    patch = _cached_patch(repo)
+
+    with pytest.raises(
+        validation.WorkspacePreparationError,
+        match="GitHub metadata changes cannot be published",
+    ):
+        validation.validate_snapshot_against_base(
+            _coordinator(_archive_readme(repo)),
+            thread_key="1700000000.000100",
+            snapshot=_snapshot(("README.md",), patch),
+            scratch_root=tmp_path,
+            protected_paths=(),
+        )
+
+
+def test_worker_config_reads_repository_relative_protected_paths(monkeypatch: Any) -> None:
+    monkeypatch.delenv("CURIE_PUBLICATION_PROTECTED_PATHS", raising=False)
+    assert WorkerConfig().publication_protected_paths == ()
+    monkeypatch.setenv("CURIE_PUBLICATION_PROTECTED_PATHS", "scripts/release.sh, build")
+    assert WorkerConfig().publication_protected_paths == ("scripts/release.sh", "build")
+    monkeypatch.setenv("CURIE_PUBLICATION_PROTECTED_PATHS", "scripts/../secret")
+    with pytest.raises(ValidationError, match="repository-relative"):
+        WorkerConfig()
