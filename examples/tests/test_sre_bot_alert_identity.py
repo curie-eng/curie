@@ -466,3 +466,23 @@ def test_identity_eval_requires_an_answer_rather_than_its_prompt(case_id: str) -
     suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
     case = next(case for case in suite.cases if case.id == PREFIX + case_id)
     assert not _grader(case_id).grade(case.input)
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Sandbox turns have been refused for about 1h17m, as far as the alarm shows.",
+        "This is an ongoing problem that has been refusing turns since 10:02:03Z.",
+    ],
+)
+def test_one_current_sample_does_not_prove_continuous_service_impact(claim: str) -> None:
+    with pytest.raises(AssertionError):
+        assert_alert_identity_reply("exact-current-read", CURRENT + " " + claim)
+
+
+def test_reported_episode_age_keeps_continuous_impact_unverified() -> None:
+    assert_alert_identity_reply(
+        "exact-current-read",
+        CURRENT
+        + " The reported episode started 38 minutes before the read. I cannot establish whether turns were refused continuously since that start without covering history.",
+    )
