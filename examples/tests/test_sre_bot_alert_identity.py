@@ -498,7 +498,9 @@ def test_reported_episode_age_keeps_continuous_impact_unverified() -> None:
     assert_alert_identity_reply(
         "exact-current-read",
         CURRENT
-        + " The reported episode started 38 minutes before the read. I cannot establish whether turns were refused continuously since that start without covering history.",
+        + " The reported episode started 38 minutes before the read. "
+        "I cannot establish whether turns were refused continuously since that start "
+        "without covering history.",
     )
 
 
@@ -513,7 +515,9 @@ def test_current_read_replay_rejects_the_observed_prefixed_prompt_echo() -> None
     suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
     case = next(case for case in suite.cases if case.id == PREFIX + "exact-current-read")
     with pytest.raises(AssertionError):
-        assert_alert_identity_reply("exact-current-read", "The following text was supplied: " + case.input)
+        assert_alert_identity_reply(
+            "exact-current-read", "The following text was supplied: " + case.input
+        )
 
 
 @pytest.mark.parametrize("answer", [
