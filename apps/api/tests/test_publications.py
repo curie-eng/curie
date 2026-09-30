@@ -2363,6 +2363,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: model,
         ceiling=10_000,
         tracer=RunTracer(None),

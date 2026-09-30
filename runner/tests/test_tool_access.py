@@ -368,6 +368,7 @@ def _fake_runner(
         tool_access=access,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -873,6 +874,7 @@ def test_the_steer_route_refuses_a_different_access_with_409() -> None:
     access = _access()
     session = _Held(default_turn, tool_access=access)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -927,6 +929,7 @@ def _counting_runner(access: TurnToolAccess) -> tuple[SessionRunner, list[FakeMo
         return session
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=factory,
         ceiling=10_000,
         tracer=RunTracer(None),

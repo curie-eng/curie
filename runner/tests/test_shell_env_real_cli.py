@@ -151,6 +151,7 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
                 },
             )
             runner = SessionRunner(
+                held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,
                 tracer=RunTracer(None),
