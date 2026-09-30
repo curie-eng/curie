@@ -55,6 +55,10 @@ os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
 # Production enables the work-item reconciler. Suite create_app() must not:
 # a 5s pass races TRUNCATE on the shared engine. Loop tests construct it.
 os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+# The deploy notice outbox reconciler likewise: its 5s pass holds pooled
+# connections from the TestClient's loop, which a test driving the same app
+# from its own loop then receives (#1331). Its tests call reconcile_once.
+os.environ.setdefault("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED", "false")
 get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would

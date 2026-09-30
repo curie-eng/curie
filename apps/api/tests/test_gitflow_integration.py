@@ -724,6 +724,23 @@ def test_notice_marker_lasts_beyond_outbox_retention() -> None:
     assert _DEDUP_TTL_SECONDS > _OUTBOX_RETENTION.total_seconds()
 
 
+def test_notice_reconciler_is_on_by_default_and_the_suite_turns_it_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production must retry pending notices; only this suite opts out."""
+    from curie_api.config import Settings
+
+    assert os.environ["CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED"] == "false"
+    assert Settings().deploy_notice_reconciler_enabled is False
+    monkeypatch.delenv("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED")
+    assert Settings().deploy_notice_reconciler_enabled is True
+
+
+def test_suite_app_runs_no_background_notice_reconciler(client: Any) -> None:
+    assert client.app.state.deploy_notice_reconciler_task is None
+    assert client.app.state.deploy_notice_queue is not None
+
+
 def test_webhook_reports_outbox_persistence_failure_instead_of_false_success(
     client: Any,
     auth_headers: dict[str, str],
