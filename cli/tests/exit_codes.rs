@@ -5,15 +5,394 @@
 
 use curie::exit::{self, CliError, ExitClass};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+mod support;
+
+use curie_aci_protocol::PROTOCOL_VERSION;
+use support::{serve, Response};
 
 const SEAL_VALUE: &str = "placeholder-seal-value";
 const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
 const INVALID_API_URL: &str = "localhost:8000";
 const INVALID_RUNNER_URL: &str = "localhost:8787";
 const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
+
+fn streamed_reply(status: &str, include_final: bool) -> Response {
+    let mut frames = vec![
+        serde_json::json!({
+            "type": "text_delta", "version": PROTOCOL_VERSION, "text": "runner reply"
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "tool_note", "version": PROTOCOL_VERSION,
+            "text": "checking the reply", "tool": "ExampleTool"
+        })
+        .to_string(),
+    ];
+    if include_final {
+        frames.push(
+            serde_json::json!({
+                "type": "final", "version": PROTOCOL_VERSION,
+                "text": "runner reply", "status": status
+            })
+            .to_string(),
+        );
+    }
+    Response::ndjson(&frames)
+}
+
+struct DemoRunner {
+    stopped: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl DemoRunner {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", curie::commands::DEFAULT_PORT))
+            .expect("bind the demo runner port");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new("done".to_string()));
+        let stop_flag = Arc::clone(&stopped);
+        let current_status = Arc::clone(&status);
+        let thread = thread::spawn(move || {
+            for connection in listener.incoming() {
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                let stream = connection.expect("accept demo runner request");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("set demo request deadline");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read demo request");
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let mut content_length = 0;
+                loop {
+                    line.clear();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read demo request header");
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader
+                    .read_exact(&mut body)
+                    .expect("read demo request body");
+                let response = match path.as_str() {
+                    "/healthz" => Response::json(200, "{}"),
+                    "/v1/event" => streamed_reply(&current_status.lock().unwrap(), true),
+                    path => panic!("unexpected demo runner request: {path}"),
+                };
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.content_type,
+                    response.body.len()
+                )
+                .expect("write demo response headers");
+                reader
+                    .get_mut()
+                    .write_all(&response.body)
+                    .expect("write demo response");
+            }
+        });
+        Self {
+            stopped,
+            status,
+            thread: Some(thread),
+        }
+    }
+
+    fn set_status(&self, status: &str) {
+        *self.status.lock().unwrap() = status.to_string();
+    }
+}
+
+impl Drop for DemoRunner {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", curie::commands::DEFAULT_PORT));
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("stop demo runner fixture");
+        }
+    }
+}
+
+fn run_demo(mode: &str, json: bool) -> Output {
+    let scratch = tempfile::tempdir().expect("create isolated demo environment");
+    let bin = scratch.path().join("bin");
+    let demos = scratch.path().join("demos");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&demos).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1" in
+  image) exit 0 ;;
+  ps)
+    case "$*" in
+      *'name=^curie-runner-local$'*)
+        if [ -f "$CURIE_TEST_DEMO_STATE/started" ]; then
+          printf 'curie-runner-local\tfixture-runner-id\tcurie-cli\n'
+        fi ;;
+    esac
+    exit 0 ;;
+  run)
+    printf started > "$CURIE_TEST_DEMO_STATE/started"
+    printf 'fixture-runner-id\n'
+    exit 0 ;;
+  rm)
+    printf removed > "$CURIE_TEST_DEMO_STATE/teardown-attempted"
+    if [ "$CURIE_TEST_DEMO_MODE" = teardown ]; then
+      printf 'fixture teardown failed\n' >&2
+      exit 37
+    fi
+    /bin/rm "$CURIE_TEST_DEMO_STATE/started"
+    if [ "$CURIE_TEST_DEMO_MODE" = remove ]; then
+      for demo in "$TMPDIR"/curie-try-*; do
+        /bin/rm -rf "$demo"
+        printf 'fixture prevents directory removal' > "$demo"
+      done
+    fi
+    exit 0 ;;
+  *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
+esac
+"#,
+    )
+    .expect("write demo Docker fixture");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if json {
+        command.arg("--json");
+    }
+    command
+        .arg("try")
+        .current_dir(scratch.path())
+        .env("PATH", &bin)
+        .env("TMPDIR", &demos)
+        .env("CURIE_CONFIG_DIR", scratch.path().join("config"))
+        .env("CURIE_TEST_DEMO_STATE", scratch.path())
+        .env("CURIE_TEST_DEMO_MODE", mode);
+    for name in curie::commands::MODEL_CREDENTIAL_ENV_NAMES {
+        command.env_remove(name);
+    }
+    let output = command.output().expect("run the demo binary");
+    assert!(
+        scratch.path().join("teardown-attempted").is_file(),
+        "demo must reach container teardown: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let remaining: Vec<_> = fs::read_dir(&demos)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    match mode {
+        "teardown" => {
+            assert!(scratch.path().join("started").is_file());
+            assert_eq!(remaining.len(), 1);
+            assert!(remaining[0].join(".curie/runner.json").is_file());
+        }
+        "remove" => {
+            assert!(!scratch.path().join("started").exists());
+            assert_eq!(remaining.len(), 1);
+            assert!(remaining[0].is_file());
+        }
+        _ => {
+            assert!(!scratch.path().join("started").exists());
+            assert!(remaining.is_empty(), "demo cleanup must finish");
+        }
+    }
+    output
+}
+
+fn run_stream_command(hook: bool, status: &str, include_final: bool, json: bool) -> Output {
+    let status = status.to_string();
+    let server = serve(move |request| match request.path.as_str() {
+        "/v1/reset" => Response::json(200, "{}"),
+        "/v1/event" => streamed_reply(&status, include_final),
+        path => panic!("unexpected runner request: {path}"),
+    });
+    let dir = tempfile::tempdir().expect("create isolated skill environment");
+    fs::create_dir(dir.path().join(".claude-plugin")).unwrap();
+    fs::write(
+        dir.path().join(".claude-plugin/plugin.json"),
+        r#"{"triggers":[{"type":"cron","name":"fixture","prompt":"Run the check."}]}"#,
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if json {
+        command.arg("--json");
+    }
+    command.arg("skill");
+    if hook {
+        command.args(["hook", "fire", "fixture"]);
+    } else {
+        command.args(["message", "hello"]);
+    }
+    let output = command
+        .args(["--url", &server.base_url])
+        .current_dir(dir.path())
+        .env("CURIE_CONFIG_DIR", dir.path().join("config"))
+        .output()
+        .expect("run streamed skill command");
+    assert_eq!(
+        server
+            .recorded()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/reset", "/v1/event"]
+    );
+    output
+}
+
+#[test]
+fn json_stream_failures_emit_one_error_after_cleanup() {
+    let demo = DemoRunner::start();
+    let mut failures = vec![
+        ("demo teardown", run_demo("teardown", true)),
+        ("demo directory removal", run_demo("remove", true)),
+    ];
+    demo.set_status("classified-failure");
+    failures.push(("demo classified failure", run_demo("normal", true)));
+    failures.push((
+        "demo classified failure with teardown failure",
+        run_demo("teardown", true),
+    ));
+    failures.push((
+        "demo classified failure with directory removal failure",
+        run_demo("remove", true),
+    ));
+    let human_classified_teardown = run_demo("teardown", false);
+    for hook in [false, true] {
+        failures.push((
+            if hook {
+                "hook classified failure"
+            } else {
+                "message classified failure"
+            },
+            run_stream_command(hook, "classified-failure", true, true),
+        ));
+    }
+    demo.set_status("done");
+    let successful_demo = run_demo("normal", true);
+    let human_demo = run_demo("normal", false);
+    let human_teardown = run_demo("teardown", false);
+    for (label, output) in failures {
+        assert_eq!(output.status.code(), Some(1), "{label}");
+        let payload = json_error(&output, label);
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{label} must emit an error instead of a successful turn: {payload}"
+        );
+        assert!(payload.get("fix").is_some(), "{label}: {payload}");
+        assert_eq!(payload.as_object().unwrap().len(), 2, "{label}: {payload}");
+        if label.contains("teardown") {
+            assert_eq!(
+                payload["error"]
+                    .as_str()
+                    .unwrap()
+                    .matches("could not tear down the demo")
+                    .count(),
+                1,
+                "{label} must report the teardown error once: {payload}"
+            );
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not tear down the demo"),
+                "{label} must report the cleanup failure: {payload}"
+            );
+            assert!(
+                payload["fix"]
+                    .as_str()
+                    .unwrap()
+                    .contains("curie skill down"),
+                "{label} must retain the cleanup recovery instruction: {payload}"
+            );
+        } else if label.contains("directory removal") {
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not remove temporary demo"),
+                "{label} must report the cleanup failure: {payload}"
+            );
+        }
+    }
+    for (label, output) in [
+        ("human teardown", human_teardown),
+        (
+            "human classified failure with teardown failure",
+            human_classified_teardown,
+        ),
+    ] {
+        assert_eq!(output.status.code(), Some(1), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not tear down the demo")
+                && stderr.contains("recover with: cd ")
+                && stderr.contains("curie skill down"),
+            "{label} must retain the teardown recovery instruction: {stderr}"
+        );
+    }
+    assert_eq!(successful_demo.status.code(), Some(0));
+    let payload = json_error(&successful_demo, "successful demo");
+    assert_eq!(payload["reply"], "runner reply");
+    assert_eq!(payload["status"], "done");
+    assert_eq!(human_demo.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&human_demo.stdout)
+            .matches("runner reply")
+            .count(),
+        1,
+        "the human demo reply must stream once"
+    );
+}
+
+#[test]
+fn streamed_skill_success_and_incomplete_stream_preserve_the_output_contract() {
+    for hook in [false, true] {
+        for status in ["done", "awaiting-approval"] {
+            let output = run_stream_command(hook, status, true, true);
+            assert_eq!(output.status.code(), Some(0));
+            let payload = json_error(&output, "successful streamed skill command");
+            assert_eq!(payload["reply"], "runner reply");
+            assert_eq!(payload["status"], status);
+            assert_eq!(payload["finalized"], status != "awaiting-approval");
+        }
+        let human = run_stream_command(hook, "done", true, false);
+        assert_eq!(human.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&human.stdout), "runner reply\n");
+        let incomplete = run_stream_command(hook, "done", false, true);
+        assert_eq!(incomplete.status.code(), Some(1));
+        assert!(json_error(&incomplete, "incomplete stream")["error"]
+            .as_str()
+            .unwrap()
+            .contains("without a final frame"));
+    }
+}
 
 fn run_seal(connector: &str, json: bool) -> Output {
     let keypair = curie::sealing::generate_keypair();
