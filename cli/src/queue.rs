@@ -198,6 +198,9 @@ pub fn synthetic_turn(
         // for the same reason `source` is.
         attachments: Vec::new(),
         hook_run: None,
+        // `local message` and `cluster message` send unrestricted turns; no CLI
+        // flag sets a tool access yet. Stated for the same reason `source` is.
+        tool_access: None,
     }
 }
 
@@ -638,10 +641,13 @@ mod tests {
                 // message, so it is always "slack" on this lane.
                 "source",
                 "text",
+                // TOOL-ACCESS-1: optional, and null on these unrestricted turns.
+                "tool_access",
             ]
         );
         assert_eq!(object["source"], "slack");
         assert!(object["hook_run"].is_null());
+        assert!(object["tool_access"].is_null());
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -767,6 +773,7 @@ mod tests {
             source: TurnSource::Slack,
             attachments: Vec::new(),
             hook_run: None,
+            tool_access: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

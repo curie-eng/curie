@@ -34,6 +34,7 @@ from aci_protocol import Event, Final, SessionStatus, parse_ndjson
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -47,6 +48,7 @@ from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from plugin_format import TOOL_POLICY_ENFORCEMENT, ToolPolicy
 
 _METRIC = "curie.tool.result"
 # Distinctive strings a failed call carries in its arguments and its result. The
@@ -208,6 +210,7 @@ def _run(
     *scripts: list[Any],
     gate: ApprovalGate | None = None,
     stop: Literal["interrupt", "timeout"] | None = None,
+    reset_after_first: bool = False,
 ) -> list[Final]:
     """Run one turn per script through a real SessionRunner; return each final."""
 
@@ -241,6 +244,8 @@ def _run(
         await runner.start()
         try:
             for index in range(len(scripts)):
+                if index == 1 and reset_after_first:
+                    await runner.reset()
                 lines = [
                     line
                     async for line in runner.run_turn(
@@ -560,6 +565,195 @@ def test_a_held_call_is_awaiting_approval_and_another_tools_error_is_still_an_er
     assert _points(reader) == {("connector", "awaiting_approval"): 1, ("connector", "error"): 1}
     warnings = _connector_warnings(caplog)
     assert [(server, tool) for server, tool, _ in warnings] == [("acme", "read_ledger")]
+
+
+def test_a_granted_same_name_call_failing_is_not_the_sibling_call_held_for_approval(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hold belongs to its call ID, not every call with that tool name.
+
+    The first call spends a one-shot grant and reaches the connector, where it
+    fails. The second call with the same name is held. The old name comparison
+    calls both results awaiting_approval and suppresses the real warning.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    tool = "mcp__acme__delete_files"
+    gate = ApprovalGate(
+        required=frozenset({tool}),
+        grant_tool=tool,
+        connector_servers={"acme"},
+    )
+    _run(
+        [
+            _use(
+                ("toolu_granted", tool, {"account": _ARGUMENT}),
+                ("toolu_held", tool, {"account": _ARGUMENT}),
+            ),
+            _answer(
+                ("toolu_granted", _RESULT_TEXT, True),
+                ("toolu_held", "PreToolUse:mcp__acme__delete_files hook error", True),
+            ),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="fake-session",
+                result="",
+                terminal_reason="hook_stopped",
+            ),
+        ],
+        gate=gate,
+    )
+
+    assert _points(reader) == {("connector", "error"): 1, ("connector", "awaiting_approval"): 1}
+    assert [(server, name) for server, name, _ in _connector_warnings(caplog)] == [
+        ("acme", "delete_files")
+    ]
+
+
+def test_a_policy_refusal_is_not_a_connector_error(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A policy DENY never reaches the named MCP server, so cannot page it."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    gate = ApprovalGate(
+        required=frozenset(),
+        tool_policy=ToolPolicy(enforcement=TOOL_POLICY_ENFORCEMENT, deny=["acme/read_ledger"]),
+        mcp_servers=set(),
+        connector_servers={"acme"},
+    )
+    _run(
+        [
+            _use(("toolu_policy_denied", "mcp__acme__read_ledger", {"account": _ARGUMENT})),
+            _answer(("toolu_policy_denied", "denied by tool policy", True)),
+            *_done(),
+        ],
+        gate=gate,
+    )
+
+    assert _points(reader) == {("connector", "refused"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_grant_argument_mismatch_is_refused_without_spending_the_exact_grant(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rejected retry never reaches the connector; the approved call still can."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    tool = "mcp__acme__read_ledger"
+    gate = ApprovalGate(
+        required=frozenset({tool}),
+        grant_tool=tool,
+        grant_arguments={"account": "approved"},
+        connector_servers={"acme"},
+    )
+    _run(
+        [
+            _use(
+                ("toolu_mismatch", tool, {"account": _ARGUMENT}),
+                ("toolu_approved", tool, {"account": "approved"}),
+            ),
+            _answer(
+                ("toolu_mismatch", "grant arguments differ", True),
+                ("toolu_approved", "ok", None),
+            ),
+            *_done(),
+        ],
+        gate=gate,
+    )
+
+    assert _points(reader) == {("connector", "refused"): 1, ("connector", "success"): 1}
+    assert _connector_warnings(caplog) == []
+
+
+def test_a_second_different_held_call_does_not_page_its_connector(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first-block-wins summary must not lose the second hold's provenance."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    gate = ApprovalGate(
+        required=frozenset({"mcp__acme__delete_files", "mcp__acme__write_ledger"}),
+        connector_servers={"acme"},
+    )
+    _run(
+        [
+            _use(
+                ("toolu_first", "mcp__acme__delete_files", {}),
+                ("toolu_second", "mcp__acme__write_ledger", {}),
+            ),
+            _answer(
+                ("toolu_first", "approval required", True),
+                ("toolu_second", "approval required", True),
+            ),
+            *_done(),
+        ],
+        gate=gate,
+    )
+
+    assert _points(reader) == {("connector", "awaiting_approval"): 2}
+    assert _connector_warnings(caplog) == []
+
+
+def test_unknown_looking_payload_without_a_catalog_is_still_a_connector_error(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No init catalog means text alone cannot prove the CLI owned the error."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    name = "mcp__acme__read_ledger"
+    _run(
+        [
+            _use(("toolu_spoof", name, {})),
+            _answer(
+                (
+                    "toolu_spoof",
+                    f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>",
+                    True,
+                )
+            ),
+            *_done(),
+        ]
+    )
+
+    assert _points(reader) == {("connector", "error"): 1}
+    assert [(server, tool) for server, tool, _ in _connector_warnings(caplog)] == [
+        ("acme", "read_ledger")
+    ]
+
+
+def test_reset_discards_old_init_catalog_before_a_new_session_answers(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A replacement session without init cannot borrow the prior catalog."""
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    name = "mcp__acme__read_ledger"
+    _run(
+        [SystemMessage(subtype="init", data={"tools": []}), *_done()],
+        [
+            _use(("toolu_after_reset", name, {})),
+            _answer(
+                (
+                    "toolu_after_reset",
+                    f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>",
+                    True,
+                )
+            ),
+            *_done(),
+        ],
+        reset_after_first=True,
+    )
+
+    assert _points(reader) == {("connector", "error"): 1}
+    assert [(server, tool) for server, tool, _ in _connector_warnings(caplog)] == [
+        ("acme", "read_ledger")
+    ]
 
 
 def _cut_off_turn() -> list[Any]:

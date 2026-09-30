@@ -32,7 +32,7 @@ separately.
 
 from typing import Annotated, Any
 
-from aci_protocol import READER_CONTEXT, ApprovalRequest, EvalReport
+from aci_protocol import READER_CONTEXT, ApprovalRequest, EvalReport, QueuedTurn
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, BeforeValidator
 
@@ -94,5 +94,31 @@ def _reader_decode[M: BaseModel](model: type[M]) -> Any:
 
 ApprovalRequestBody = Annotated[ApprovalRequest, _reader_decode(ApprovalRequest)]
 EvalReportBody = Annotated[EvalReport, _reader_decode(EvalReport)]
+# A worker echoes a queued turn back to the API (the GitHub feedback checks); a
+# newer worker's turn can carry an optional field this API predates
+# (TOOL-ACCESS-7).
+QueuedTurnBody = Annotated[QueuedTurn, _reader_decode(QueuedTurn)]
 
-__all__ = ["ApprovalRequestBody", "EvalReportBody", "read_bounded_body"]
+
+def stored_turn_matches(turn: QueuedTurn, stored: Any) -> bool:
+    """Whether ``turn`` is the turn ``stored`` holds, compared as decoded models.
+
+    @spec TOOL-ACCESS-7: a row written before an optional turn field existed
+    lacks its key, and a turn decoded after carries it as its default, so raw
+    JSON equality would refuse the same turn across an upgrade. Both sides are
+    read tolerantly; an unreadable stored value matches nothing.
+    """
+
+    try:
+        return QueuedTurn.model_validate(stored, context=READER_CONTEXT) == turn
+    except ValueError:
+        return False
+
+
+__all__ = [
+    "ApprovalRequestBody",
+    "EvalReportBody",
+    "QueuedTurnBody",
+    "read_bounded_body",
+    "stored_turn_matches",
+]
