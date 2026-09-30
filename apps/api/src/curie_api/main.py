@@ -40,6 +40,7 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .provider_installations import start_static_slack_bootstrap
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
@@ -64,6 +65,7 @@ from .routers import (
     hooks,
     memory,
     observability,
+    provider_installations,
     publication_precheck,
     publications,
     runs,
@@ -161,6 +163,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # deployment, and a route that declares an approvers group then fails
     # closed at resolve time rather than silently widening.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
+    # Today's static Slack app as one provider installation (#2909), behind the
+    # same token gate: a Slack-free install gets no row. Never fails boot; if
+    # this image started below this migration it keeps retrying in the
+    # background. identities.py still reads CURIE_SLACK_IDENTITIES directly
+    # (ADR-0168) until it is wired to this table.
+    app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
+        app.state.sessionmaker, settings
+    )
     app.state.github_reporter = GitHubStatusReporter(
         http_client,
         api_url=settings.github_api_url,
@@ -273,6 +283,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             notice_task.cancel()
             try:
                 await notice_task
+            except asyncio.CancelledError:
+                pass
+        # Holds a session while it retries, so it stops before engine.dispose().
+        bootstrap_task = getattr(app.state, "static_slack_bootstrap_task", None)
+        if bootstrap_task is not None:
+            bootstrap_task.cancel()
+            try:
+                await bootstrap_task
             except asyncio.CancelledError:
                 pass
         review_task = getattr(app.state, "github_review_reconciler_task", None)
@@ -460,6 +478,7 @@ def create_app() -> FastAPI:
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
+    app.include_router(provider_installations.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")
