@@ -70,6 +70,54 @@ Enforcement is only-when-configured: with the var unset the app is pass-through
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
 
+## Per-turn tool access
+
+The runner is the reference enforcement of TOOL-ACCESS in
+[the ACI producer seam](../docs/interfaces/aci-producer/INTERFACE.md). For a
+turn whose `Event.tool_access` is `read-only`:
+
+- **RUNNER-TOOL-ACCESS-1:** The tools classified read-only are the ones the
+  side-effect classifier already treats as read-only: the harness's declared
+  read-only built-ins (for the Claude harness `Read`, `Glob`, `Grep`, `LS`,
+  `NotebookRead`, `WebFetch`, `WebSearch`, `ToolSearch`, `TodoRead`) and each
+  live MCP tool whose server declared `readOnlyHint: true` on the boot probe,
+  less every tool an operator gate, a bundle approval gate or a `toolPolicy`
+  `approvalRequired` pattern names. The same set built at boot feeds both the
+  classifier and this check. Curie's platform tools are not read-only,
+  including `mcp__curie__request_approval` and `mcp__curie__report_progress`,
+  which the classifier treats as idempotent.
+- **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
+  The runner registers a PreToolUse callback for every tool and wraps every
+  other PreToolUse callback and the permission callback, so the read-only
+  decision is made first for each call: the approval gate records no pending
+  approval and spends no grant, a bundle PreToolUse command does not run, and
+  the call never reaches its tool or connector. A call whose tool name cannot
+  be read is denied. The denial does not end the turn: the model receives the
+  refusal as that call's error result and can still answer.
+- **RUNNER-TOOL-ACCESS-3:** The turn never ends `awaiting-approval` and its
+  `final` carries no approval field. A `request_approval` or `publish_changes`
+  call in it is denied like any other write and is not captured as a request.
+- **RUNNER-TOOL-ACCESS-4:** The access in force is the one sent with the most
+  recent prompt. It is set immediately before the prompt is sent and stays
+  until the next turn sends its own, so model activity left over from an
+  abandoned read-only turn remains read-only. A `POST /v1/steer` whose
+  `tool_access` differs from the live turn's is refused with `409`.
+- **RUNNER-TOOL-ACCESS-5:** `GET /status` and `GET /v1/status` carry
+  `"tool_access": ["read-only"]` when the session was built with enforcement,
+  and `"tool_access": []` otherwise. A session without enforcement answers a
+  read-only event with a classified-failure `final`, before any connector or
+  model work.
+- **RUNNER-TOOL-ACCESS-6:** A denied call counts as `refused` on
+  `curie.tool.result` and never as a connector `error`, so it logs no
+  connector warning.
+- **RUNNER-TOOL-ACCESS-7:** With `tool_access` null the run is today's: the
+  fronting callbacks abstain and delegate unchanged, and the permission mode
+  is unchanged (`bypassPermissions` when the session has no approval gate).
+- **RUNNER-TOOL-ACCESS-8:** The offline fake model session applies the same
+  decision before it emulates any tool, and answers a denied call with an
+  error result in place of the scripted one, so the fake tier observes what
+  the real CLI does.
+
 ## Environment
 
 - **ACI-frozen** (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,
