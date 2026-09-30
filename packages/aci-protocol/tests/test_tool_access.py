@@ -22,7 +22,6 @@ from aci_protocol import (
     parse_queued_turn,
     to_inbound_json,
 )
-from aci_protocol.events import READER_CONTEXT
 from aci_protocol.schema_export import build_schema
 from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER
 from pydantic import ValidationError
@@ -97,12 +96,12 @@ def test_a_payload_written_before_the_field_existed_decodes_unrestricted() -> No
     pre_upgrade = json.loads(_GOLDEN.read_text())
     pre_upgrade.pop("tool_access", None)
 
-    turn = QueuedTurn.model_validate(pre_upgrade, context=READER_CONTEXT)
+    turn = parse_queued_turn(json.dumps(pre_upgrade))
 
     assert turn.tool_access is None
 
 
-def test_the_committed_golden_fixture_carries_no_tool_access() -> None:
+def test_the_committed_golden_fixture_carries_a_null_tool_access() -> None:
     # @spec TOOL-ACCESS-1: the cross-language golden is an ordinary turn, and the
     # Rust CLI re-serializes it byte-identically, so the key is present as null.
     golden = json.loads(_GOLDEN.read_text())
@@ -143,9 +142,20 @@ def test_an_event_without_tool_access_is_unrestricted() -> None:
 
 
 def test_an_unknown_event_tool_access_is_refused_never_degraded() -> None:
-    # @spec TOOL-ACCESS-2
+    # @spec TOOL-ACCESS-2: by the consumer decode and by a strict producer alike.
     with pytest.raises(ValidationError):
         parse_inbound(json.dumps(_event(tool_access="read-mostly")))
+    with pytest.raises(ValidationError):
+        Event.model_validate(_event(tool_access="read-mostly"))
+
+
+@pytest.mark.parametrize("spelling", ["Read-Only", "READ-ONLY", "read_only", " read-only"])
+def test_the_spelling_of_read_only_is_exact(spelling: str) -> None:
+    # @spec TOOL-ACCESS-2: a near miss is an unknown value, not read-only.
+    with pytest.raises(ValidationError):
+        parse_inbound(json.dumps(_event(tool_access=spelling)))
+    with pytest.raises(ValidationError):
+        parse_queued_turn(json.dumps(_relay_turn(tool_access=spelling)))
 
 
 def test_the_runner_status_advertisement_key_is_tool_access() -> None:

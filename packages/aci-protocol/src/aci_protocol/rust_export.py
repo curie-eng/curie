@@ -359,6 +359,9 @@ mod tests {
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
+        // TOOL-ACCESS-2: an unknown value is refused, never read as None.
+        let unknown = encoded.replace(r#""read-only""#, r#""read-mostly""#);
+        assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
     }
