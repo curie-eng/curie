@@ -7451,7 +7451,10 @@ class Kernel:
                 exc.public_detail,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return _ApprovalPause(created=False)
+            return _ApprovalPause(
+                created=False,
+                failure_detail=redact_text(exc.public_detail)[:_ESCALATION_DETAIL_MAX] or None,
+            )
         except ApprovalRefused as exc:
             # #2885: a person rejected this approval in this thread and nobody
             # has asked since. The API refused it and audited the refusal; the
@@ -7463,7 +7466,10 @@ class Kernel:
                 qevent.event_id,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return _ApprovalPause(created=False)
+            return _ApprovalPause(
+                created=False,
+                failure_detail=redact_text(exc.public_detail)[:_ESCALATION_DETAIL_MAX] or None,
+            )
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty

@@ -277,6 +277,11 @@ def result_section(
         text = f"Could not complete: {cause_text(cause)}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
+        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+            # The API refusal can quote caller-supplied paths (#3617): one line,
+            # so it cannot add a ``Cause:`` line, and no HTML comment opener.
+            inert = " ".join(detail.split()).replace("<!--", "<\u200b!--")
+            text += f"Details: {inert}\n"
         elif cause != "history_capacity" and detail is not None and detail.strip():
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"

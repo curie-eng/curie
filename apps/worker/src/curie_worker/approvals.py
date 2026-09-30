@@ -241,8 +241,9 @@ class ApprovalBackendError(Exception):
     than suspending a session no resolution could ever wake.
 
     ``refusal`` is ``"<code>: <message>"`` when the API refused the request
-    with a coded detail (#3617), redacted and clipped, so the factory run can
-    name the cause; ``None`` for any other failure.
+    with a coded detail (#3617), or the plain message when the detail is a
+    non-empty string, redacted and clipped, so the factory run can name the
+    cause; ``None`` for any other failure.
     """
 
     refusal: str | None = None
@@ -262,6 +263,8 @@ def _coded_refusal(response: httpx.Response) -> str | None:
         detail = response.json()["detail"]
     except (KeyError, TypeError, ValueError):
         return None
+    if isinstance(detail, str):
+        return redact_text(detail)[:_REFUSAL_MAX] if detail.strip() else None
     if not isinstance(detail, dict):
         return None
     code, message = detail.get("code"), detail.get("message")
