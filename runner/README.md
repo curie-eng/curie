@@ -98,10 +98,14 @@ turn whose `Event.tool_access` is `read-only`:
   into an allow. A call whose tool name cannot be read is denied, and so is
   every call when the decision itself fails. The denial does not end the turn:
   the model receives the refusal as that call's error result and can still
-  answer. The CLI also runs the bundle's hook commands from the plugin on
-  their own lifecycle events (PreToolUse, UserPromptSubmit, Stop and the
-  like). Those are the bundle's code, not tools the model calls, and they run
-  on a read-only turn as on any other.
+  answer. The CLI also loads the bundle as a plugin and runs the bundle's own
+  hook commands on their lifecycle events (PreToolUse, UserPromptSubmit, Stop,
+  SessionStart and the like), beside and concurrently with the runner's
+  callbacks, including for a call the front refuses; a bundle that ships its
+  hooks only in `hooks/hooks.json` has no runner registration at all. Those
+  commands are the bundle's code, not tools the model calls: they run on a
+  read-only turn as on any other, can change state the bundle keeps for later
+  turns, and cannot turn the deny into an allow.
 - **RUNNER-TOOL-ACCESS-3:** The turn never ends `awaiting-approval` and its
   `final` carries no approval field. A `request_approval` or `publish_changes`
   call in it is denied like any other write and is not captured as a request.
@@ -110,18 +114,23 @@ turn whose `Event.tool_access` is `read-only`:
   until the next turn sends its own, so model activity left over from an
   abandoned read-only turn remains read-only. A read-only turn accepts no
   steer, and a `POST /v1/steer` whose `tool_access` differs from the live
-  turn's is refused with `409`. A session that has accepted any steer refuses
-  a later read-only event: a steer that lands as a turn ends can be answered
-  by the CLI as a turn of its own, after the runner has moved on, and that
-  leftover prompt would otherwise run under another turn's access.
+  turn's is refused with `409`. A read-only event runs only on a session that
+  has sent no unrestricted prompt, neither an ordinary turn nor any steer,
+  since it started or was reset. An unrestricted prompt can leave work the
+  CLI answers as turns of its own after the runner has moved on (a steer, a
+  background task's notification), and such a turn would shift a read-only
+  prompt out of its turn and past the next turn's change of access. A
+  read-only turn cannot leave such work, because it may start neither.
 - **RUNNER-TOOL-ACCESS-5:** `GET /status` and `GET /v1/status` carry
-  `"tool_access": ["read-only"]` when the session was built with enforcement,
-  and `"tool_access": []` otherwise. A session without enforcement answers a
-  read-only event with a classified-failure `final`, before any connector or
-  model work.
-- **RUNNER-TOOL-ACCESS-6:** A denied call counts as `refused` on
-  `curie.tool.result` and never as a connector `error`, so it logs no
-  connector warning.
+  `"tool_access": ["read-only"]` while the session can enforce it: it was
+  built with enforcement and has sent no unrestricted prompt
+  (RUNNER-TOOL-ACCESS-4). Otherwise they carry `"tool_access": []`, so a
+  worker refuses the turn before sending it. A read-only event that arrives
+  anyway is answered with a classified-failure `final` whose error is
+  classified `tool-access-unenforced`, before any connector or model work.
+- **RUNNER-TOOL-ACCESS-6:** A denied call, including one denied because its
+  decision failed, counts as `refused` on `curie.tool.result` and never as a
+  connector `error`, so it logs no connector warning.
 - **RUNNER-TOOL-ACCESS-7:** With `tool_access` null the run is today's: the
   fronting callbacks abstain and delegate unchanged, and the permission mode
   is unchanged (`bypassPermissions` when the session has no approval gate).
@@ -130,9 +139,10 @@ turn whose `Event.tool_access` is `read-only`:
   error result in place of the scripted one, so the fake tier observes what
   the real CLI does.
 - **RUNNER-TOOL-ACCESS-9:** A read-only event whose text, less leading
-  whitespace, begins with `/` is refused with a classified-failure `final`
-  before the model is asked: the CLI expands a slash command before any tool
-  call, and a bundle command can run shell with no PreToolUse event.
+  whitespace, begins with `/` is refused with a classified-failure `final`,
+  its error classified `tool-access-refused`, before the model is asked: the
+  CLI expands a slash command before any tool call, and a bundle command can
+  run shell with no PreToolUse event.
 - **RUNNER-TOOL-ACCESS-10:** A read-only turn does not use up an approved
   action's one-shot boot grant. The grant stays for the next unrestricted
   turn, the only kind that may spend it.
