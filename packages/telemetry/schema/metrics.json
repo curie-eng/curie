@@ -1210,6 +1210,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/identity/resolve",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -1286,7 +1287,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4640
+      "cardinality_bound": 4680
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1360,6 +1361,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/identity/resolve",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -1436,7 +1438,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4640
+      "cardinality_bound": 4680
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1510,6 +1512,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/identity/resolve",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -1579,7 +1582,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 928
+      "cardinality_bound": 936
     },
     "curie.background.loop": {
       "type": "counter",

@@ -61,6 +61,7 @@ from .routers import (
     github_reviews,
     hook_fire,
     hooks,
+    identity,
     memory,
     observability,
     provider_installations,
@@ -444,6 +445,7 @@ def create_app() -> FastAPI:
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
+    app.include_router(identity.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

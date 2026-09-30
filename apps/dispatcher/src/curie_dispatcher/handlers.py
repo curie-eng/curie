@@ -88,6 +88,7 @@ from .approval_actions import (
 )
 from .config import DispatcherConfig, release_identity
 from .identities import delivery_key, minted_adapter
+from .identity import IdentityResolver, build_identity_client, principal_observer_middleware
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
@@ -650,6 +651,7 @@ def register_handlers(
     slack_identity: str = DEFAULT_IDENTITY,
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
+    identity_client: IdentityResolver | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
@@ -662,6 +664,13 @@ def register_handlers(
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
     admission_gate = admission if admission is not None else build_admission(config, redis_client)
+    # Log-only principal lookup for every inbound payload (#2910). It is
+    # submitted to a background executor, so it never delays a listener's ack.
+    app.use(
+        principal_observer_middleware(
+            identity_client if identity_client is not None else build_identity_client(config)
+        )
+    )
     # Resolved once here rather than per listener: the lane filter below drops
     # outside `process_event`, so it needs a logger of its own, and the injected
     # one is the single logger every drop must land on.

@@ -1,4 +1,4 @@
-"""Migration 0073 tenant-scopes agents, bindings, versions and deployments (#2911)."""
+"""Migration 0074 tenant-scopes agents, bindings, versions and deployments (#2911)."""
 
 from __future__ import annotations
 
@@ -90,13 +90,13 @@ def _constraint_names(table: str) -> set[str]:
     return {row["conname"] for row in rows}
 
 
-def _seed_pre_0073_rows() -> dict[str, uuid.UUID]:
-    """One agent with a binding, version and deployment, written the 0072 way."""
+def _seed_pre_0074_rows() -> dict[str, uuid.UUID]:
+    """One agent with a binding, version and deployment, written the 0073 way."""
     ids = {name: uuid.uuid4() for name in SCOPED_TABLES}
     token = ids["agents"].hex[:8]
     _sql(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
-        {"id": ids["agents"], "name": f"mig-0073-{token}"},
+        {"id": ids["agents"], "name": f"mig-0074-{token}"},
     )
     _sql(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
@@ -120,21 +120,21 @@ def _seed_pre_0073_rows() -> dict[str, uuid.UUID]:
     return ids
 
 
-def test_0073_revises_0072() -> None:
+def test_0074_revises_0073() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0073")
+    revision = script.get_revision("0074")
     assert revision is not None
-    assert revision.down_revision == "0072"
+    assert revision.down_revision == "0073"
 
 
-def test_0073_backfills_existing_rows_and_round_trips(isolated_migration_db: None) -> None:
+def test_0074_backfills_existing_rows_and_round_trips(isolated_migration_db: None) -> None:
     config = _config()
     command.upgrade(config, "head")
     try:
-        command.downgrade(config, "0072")
-        ids = _seed_pre_0073_rows()
+        command.downgrade(config, "0073")
+        ids = _seed_pre_0074_rows()
 
-        command.upgrade(config, "0073")
+        command.upgrade(config, "0074")
 
         for table in SCOPED_TABLES:
             (row,) = _sql(f"SELECT tenant_id FROM curie.{table} WHERE id = :id", {"id": ids[table]})
@@ -157,22 +157,22 @@ def test_0073_backfills_existing_rows_and_round_trips(isolated_migration_db: Non
         for table, names in NAMED_CONSTRAINTS.items():
             assert names <= _constraint_names(table), table
 
-        # N-1 writers (API/worker pods still on 0072 code) insert without any
+        # N-1 writers (API/worker pods still on 0073 code) insert without any
         # tenant column; the server default must keep those inserts working.
-        n1 = _seed_pre_0073_rows()
+        n1 = _seed_pre_0074_rows()
         for table in SCOPED_TABLES:
             (row,) = _sql(f"SELECT tenant_id FROM curie.{table} WHERE id = :id", {"id": n1[table]})
             assert row["tenant_id"] == DEFAULT_TENANT_UUID, table
         (n1_agent,) = _sql("SELECT status FROM curie.agents WHERE id = :id", {"id": n1["agents"]})
         assert n1_agent["status"] == "active"
 
-        command.downgrade(config, "0072")
+        command.downgrade(config, "0073")
         for table in SCOPED_TABLES:
             assert not NEW_COLUMNS[table] & set(_columns(table)), table
-        assert "provider_installations_tenant_id_id_key" not in _constraint_names(
+        assert "provider_installations_tenant_id_id_key" in _constraint_names(
             "provider_installations"
         )
-        # 0051-0072's tables are FK targets and must outlive the downgrade.
+        # 0051-0073's tables are FK targets and must outlive the downgrade.
         for table in ("tenants", "teams", "provider_installations"):
             assert _regclass(table) is not None, table
     finally:
@@ -189,14 +189,14 @@ def test_identity_stack_has_one_ordered_head() -> None:
     assert revision.down_revision == "0073"
     predecessor = script.get_revision("0073")
     assert predecessor is not None
-    assert "identity_links" in predecessor.doc
+    assert Path(predecessor.path).name == "0073_identity_links.py"
 
 
 def test_tenant_scope_preserves_identity_links_on_downgrade(isolated_migration_db: None) -> None:
     """@spec PI-STACK-2 @spec PI-STACK-3: the earlier key and row survive."""
     config = _config()
     command.upgrade(config, "0073")
-    ids = _seed_pre_0073_rows()
+    ids = _seed_pre_0074_rows()
     installation_id = uuid.uuid4()
     link_id = uuid.uuid4()
     _sql(

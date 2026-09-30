@@ -15,11 +15,10 @@ arrives with the work-item subsystem.
 
 The owning team and the provider installation are referenced through
 tenant-carrying composite keys (0052's discipline), so neither can point into
-another tenant. ``provider_installations`` gains the ``(tenant_id, id)`` key
-that needs.
+another tenant. The channel foreign key reuses the installation key owned by revision 0073.
 
-Revision ID: 0073
-Revises: 0072
+Revision ID: 0074
+Revises: 0073
 Create Date: 2026-09-23
 """
 
@@ -29,8 +28,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0073"
-down_revision: str | None = "0072"
+revision: str = "0074"
+down_revision: str | None = "0073"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -54,7 +53,7 @@ LOCK_TIMEOUT_MS = 15000
 TENANT_TABLES = ("agent_channels", "agents", "agent_versions", "deployments")
 LOCKED_TABLES = (*TENANT_TABLES, "teams", "provider_installations")
 
-# Frozen copy of curie_api.models.AgentStatus at 0073.
+# Frozen copy of curie_api.models.AgentStatus at 0074.
 AGENT_STATUSES = ("active", "paused", "draining", "retired")
 
 
@@ -96,6 +95,7 @@ def _lock_tables() -> None:
 
 
 def upgrade() -> None:
+    """@spec PI-STACK-2: reuse the predecessor's installation key."""
     _lock_tables()
 
     for table in TENANT_TABLES:
@@ -128,12 +128,6 @@ def upgrade() -> None:
     for column in ("topic_policy_ref", "data_classification_ref", "retention_policy_ref"):
         op.add_column("agents", sa.Column(column, sa.String(), nullable=True), schema=SCHEMA)
 
-    op.create_unique_constraint(
-        "provider_installations_tenant_id_id_key",
-        "provider_installations",
-        ["tenant_id", "id"],
-        schema=SCHEMA,
-    )
     op.add_column(
         "agent_channels",
         sa.Column("provider_installation_id", postgresql.UUID(as_uuid=True), nullable=True),
@@ -162,6 +156,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """@spec PI-STACK-3: retain the predecessor's links and installation key."""
     _lock_tables()
     op.drop_column("agent_channels", "topic_id", schema=SCHEMA)
     op.drop_index(
@@ -176,12 +171,6 @@ def downgrade() -> None:
         schema=SCHEMA,
     )
     op.drop_column("agent_channels", "provider_installation_id", schema=SCHEMA)
-    op.drop_constraint(
-        "provider_installations_tenant_id_id_key",
-        "provider_installations",
-        type_="unique",
-        schema=SCHEMA,
-    )
     for column in ("retention_policy_ref", "data_classification_ref", "topic_policy_ref"):
         op.drop_column("agents", column, schema=SCHEMA)
     op.drop_index("ix_agents_owning_team_id", table_name="agents", schema=SCHEMA)

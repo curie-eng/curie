@@ -445,7 +445,7 @@ mod tests {
         let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
         assert_eq!(retained.schema_min, "0070");
-        assert_eq!(retained.schema_head, "0073");
+        assert_eq!(retained.schema_head, "0074");
         assert!(live_in_window("0070", &retained));
         assert!(live_in_window("0071", &retained));
         assert!(live_in_window("0072", &retained));

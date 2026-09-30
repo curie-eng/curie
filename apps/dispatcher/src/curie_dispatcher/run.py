@@ -30,6 +30,7 @@ from .identities import (
     default_identity_credentials,
     resolve_identity_credentials,
 )
+from .identity import shutdown_identity_lookups
 from .preflight import (
     ApiUnreachableError,
     PreflightedIdentity,
@@ -250,6 +251,8 @@ def main() -> None:
             supervisor.run()
         finally:
             hb_stop.set()
+            # Queued lookups and their sockets must not outlive the dispatcher.
+            shutdown_identity_lookups()
         logger.info("dispatcher stopped")
     finally:
         telemetry.shutdown()

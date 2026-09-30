@@ -515,8 +515,8 @@ def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only).
 
-    Scoped to one tenant (ADR 0155 step 6). Every read matches only agents
-    whose ``tenant_id`` is the resolver's, and resolution also requires the
+    Scoped to one tenant (ADR 0155 step 6). The route, repository, secret,
+    name and model-setting reads match the resolver's tenant. Resolution also requires the
     binding row to carry it, so a binding out of step with its agent fails
     closed. Another tenant's agent answers exactly as an unknown one does.
     ``deployments`` and ``agent_versions`` are row scoped by the column only and

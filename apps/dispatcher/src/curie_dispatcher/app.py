@@ -81,6 +81,7 @@ def build_app(
     resolver: Any | None = None,
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
+    identity_client: Any | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
@@ -126,6 +127,9 @@ def build_app(
         register_kwargs["identity_bots"] = identity_bots
     if admission is not None:
         register_kwargs["admission"] = admission
+    if identity_client is not None:
+        # The principal lookup client (#2910); None builds it from config.
+        register_kwargs["identity_client"] = identity_client
     register_handlers(app, **register_kwargs)
     return app
 
