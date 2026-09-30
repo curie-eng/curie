@@ -251,13 +251,9 @@ spec:
       {{- end }}
       {{- $gvisorClass := include "curie.gvisor.runtimeClassName" . }}
       {{- if $gvisorClass }}
-      # Kernel-isolation RuntimeClass from security.gvisor.mode. In `auto` this is
-      # present only when the class was found by lookup at install time; under
-      # `helm template`/--dry-run lookup is empty, so it renders the no-gvisor shape.
-      # In `auto` with a real (non-fake) model the install is guarded by the blocking
-      # gVisor preflight, so a runsc-less real-model install fails closed rather than
-      # silently rendering this no-gvisor shape; under `helm template`/--dry-run this
-      # still renders without runtimeClassName, but no real install proceeds unprotected.
+      # Kernel-isolation RuntimeClass from security.gvisor.mode. auto with a real
+      # model stamps the class even when lookup is empty (helm template, Argo CD,
+      # Flux). Fake-model auto still omits the class when lookup is empty.
       runtimeClassName: {{ $gvisorClass }}
       {{- end }}
       {{- if $runner.dnsPolicy }}

@@ -533,8 +533,10 @@ case "$selector_kind" in
   python)
     if ! (
       cd "$scratch"
-      uv run --python 3.13 python - "$reversed_junit" "$selector_file" "${selector#*::}" <<'PY'
+      uv run --python 3.13 python - "$reversed_junit" "$selector_file" "${selector#*::}" \
+        "$reversed_stdout" "$reversed_stderr" <<'PY'
 import pathlib
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -547,10 +549,75 @@ expected_classname = selector_file.removesuffix(".py").replace("/", ".")
 if selector_parts:
     expected_classname += "." + ".".join(selector_parts)
 
+# #3577: a fix that adds a symbol or module the selected test (or a conftest
+# on its path) imports cannot fail an assertion under revert; the selected
+# module fails to import instead. That import error is the pinned test failing,
+# but only when the innermost `<module>` frame before the `E   ImportError`
+# line is the selected module or that conftest. An import error raised inside
+# any other module, or inside a function the selected module calls, stays
+# unattributed, and so does any other exception whose message quotes an
+# ImportError line: the first `E` line must itself name the import error.
+TRACEBACK_FRAME = re.compile(r"^(?P<path>\S.*?):(?P<line>\d+): in (?P<func>\S+)$")
+EXCEPTION_LINE = re.compile(r"^E\s")
+IMPORT_ERROR = re.compile(r"^E\s+(ImportError|ModuleNotFoundError):")
+CONFTEST_HEADER = re.compile(r"^ImportError while loading conftest '(?P<path>[^']+)'\.$")
+repo_root = pathlib.Path.cwd().resolve()
+selector_path = (repo_root / selector_file).resolve()
+
+
+def importer(lines):
+    frame = None
+    for line in lines:
+        if EXCEPTION_LINE.match(line):
+            if frame is None or frame.group("func") != "<module>" or not IMPORT_ERROR.match(line):
+                return None
+            return (repo_root / frame.group("path")).resolve()
+        frame = TRACEBACK_FRAME.match(line) or frame
+    return None
+
+
+def selector_import_error(root):
+    testcases = root.findall(".//testcase")
+    if len(testcases) != 1 or root.findall(".//failure"):
+        return False
+    (testcase,) = testcases
+    errors = testcase.findall("error")
+    return (
+        testcase.get("classname") == ""
+        and testcase.get("name") == selector_file.removesuffix(".py").replace("/", ".")
+        and len(root.findall(".//error")) == 1
+        and len(errors) == 1
+        and errors[0].get("message") == "collection failure"
+        and importer((errors[0].text or "").splitlines()) == selector_path
+    )
+
+
+def conftest_import_error():
+    lines = []
+    for output in sys.argv[4:6]:
+        try:
+            lines += pathlib.Path(output).read_text(errors="replace").splitlines()
+        except OSError:
+            return False
+    headers = [index for index, line in enumerate(lines) if CONFTEST_HEADER.match(line)]
+    if len(headers) != 1:
+        return False
+    conftest = (repo_root / CONFTEST_HEADER.match(lines[headers[0]]).group("path")).resolve()
+    allowed = {
+        directory / "conftest.py"
+        for directory in selector_path.parents
+        if directory == repo_root or repo_root in directory.parents
+    }
+    return conftest in allowed and importer(lines[headers[0] + 1 :]) == conftest
+
+
 try:
     root = ET.parse(report).getroot()
 except (ET.ParseError, OSError):
-    raise SystemExit(1)
+    raise SystemExit(0 if conftest_import_error() else 1)
+
+if selector_import_error(root):
+    raise SystemExit(0)
 
 testcases = root.findall(".//testcase")
 

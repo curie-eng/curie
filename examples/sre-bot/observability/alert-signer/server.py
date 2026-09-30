@@ -2,8 +2,13 @@
 
 Alertmanager cannot HMAC the body. This adapter is the one supported source
 binding: it injects a partition-safe ``curie_partition`` derived from groupKey,
-assigns a stable delivery id, signs the forwarded bytes with the derived hook
-secret, and POSTs to ``POST /hooks/{agent}/{hook}``.
+assigns a stable delivery id, stamps the current unix time, signs
+``f"{timestamp}.{delivery}.".encode() + body`` with the derived hook secret, and
+POSTs to ``POST /hooks/{agent}/{hook}`` with ``X-Curie-Timestamp`` and
+``X-Curie-Delivery-Id`` alongside the signature. Curie refuses a timestamp more
+than five minutes from its clock, so the forwarder must be roughly in sync.
+The delivery id must not contain "." (the signed-material delimiter); the hex ids
+this adapter assigns never do.
 
 Environment:
   CURIE_HOOK_URL       Full ingest URL, including agent id and hook name
@@ -17,6 +22,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,11 +38,14 @@ def delivery_id(group_key: str, status: str, fingerprints: list[str], starts_at:
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-def sign(secret: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+def sign(secret: str, timestamp: str, delivery: str, body: bytes) -> str:
+    material = f"{timestamp}.{delivery}.".encode() + body
+    return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
 
 
-def prepare(payload: dict[str, Any]) -> tuple[bytes, str, str]:
+def prepare(payload: dict[str, Any]) -> tuple[bytes, str, str, str]:
+    """Return ``(body, signature, delivery, timestamp)`` for one forward."""
+
     group_key = str(payload.get("groupKey") or "")
     status = str(payload.get("status") or "")
     alerts = [alert for alert in payload.get("alerts") or [] if isinstance(alert, dict)]
@@ -45,14 +54,13 @@ def prepare(payload: dict[str, Any]) -> tuple[bytes, str, str]:
     forwarded = dict(payload)
     forwarded["curie_partition"] = partition_value(group_key)
     body = json.dumps(forwarded, separators=(",", ":")).encode()
-    return (
-        body,
-        sign(os.environ["CURIE_HOOK_SECRET"], body),
-        delivery_id(group_key, status, fingerprints, starts_at),
-    )
+    delivery = delivery_id(group_key, status, fingerprints, starts_at)
+    timestamp = str(int(time.time()))
+    signature = sign(os.environ["CURIE_HOOK_SECRET"], timestamp, delivery, body)
+    return body, signature, delivery, timestamp
 
 
-def forward(body: bytes, signature: str, delivery: str) -> int:
+def forward(body: bytes, signature: str, delivery: str, timestamp: str) -> int:
     request = urllib.request.Request(
         os.environ["CURIE_HOOK_URL"],
         data=body,
@@ -61,6 +69,7 @@ def forward(body: bytes, signature: str, delivery: str) -> int:
             "Content-Type": "application/json",
             "X-Curie-Signature-256": signature,
             "X-Curie-Delivery-Id": delivery,
+            "X-Curie-Timestamp": timestamp,
         },
     )
     try:
@@ -88,12 +97,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("payload is not an object")
-            body, signature, delivery = prepare(payload)
+            body, signature, delivery, timestamp = prepare(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError):
             self.send_response(400)
             self.end_headers()
             return
-        status = forward(body, signature, delivery)
+        status = forward(body, signature, delivery, timestamp)
         self.send_response(200 if 200 <= status < 300 else 502)
         self.end_headers()
 

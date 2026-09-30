@@ -467,6 +467,149 @@ if [[ "$got" != "Basic explicit-otel-sentinel-1569" ]]; then
 fi
 echo "  ok: explicit OTel auth override honored"
 
+echo "=== Assertion 4f: explicit blank API keys are refused in every secret mode (#3556) ==="
+python3 - "$TMP" "${KEYS[@]}" internalWorkerToken <<'PYEOF'
+import base64
+from pathlib import Path
+import sys
+
+import yaml
+
+directory = Path(sys.argv[1])
+for label, value in (("empty", ""), ("spaces", "   "), ("tabs", "\t\r\n")):
+    (directory / f"api-key-{label}-values.yaml").write_text(
+        yaml.safe_dump({"api": {"apiKey": value}})
+    )
+    data = {key: "" for key in sys.argv[2:]}
+    data["apiKey"] = base64.b64encode(value.encode()).decode()
+    (directory / f"api-key-retained-{label}-values.yaml").write_text(
+        yaml.safe_dump({"renderAssertionExistingSecret": {"data": data}})
+    )
+for label, value in (("nil", None), ("padded", "  configured-render-key  ")):
+    (directory / f"api-key-{label}-values.yaml").write_text(
+        yaml.safe_dump({"api": {"apiKey": value}})
+    )
+(directory / "api-key-default-values.yaml").write_text("{}\n")
+for label, value in (("missing", None), ("nonblank", "  retained-render-key  ")):
+    data = {key: "" for key in sys.argv[2:] if key != "apiKey"}
+    if value is not None:
+        data["apiKey"] = base64.b64encode(value.encode()).decode()
+    (directory / f"api-key-retained-{label}-values.yaml").write_text(
+        yaml.safe_dump({"renderAssertionExistingSecret": {"data": data}})
+    )
+PYEOF
+
+# Valid unrelated bootstrap inputs let either credential checking mode reach
+# the API guard. Captured manifests stay private and never enter diagnostics.
+API_KEY_HELM_ARGS=(
+  --set langfuse.init.projectSecretKey=render-project-secret
+  --set langfuse.init.userPassword=render-user-password
+  --show-only templates/secrets.yaml
+)
+for allow_dev_defaults in false true; do
+  for check_default_credentials in false true; do
+    for api_key_case in empty spaces tabs; do
+      API_KEY_ERROR="$TMP/api-key-error.log"
+      if helm template curie "$CHART" "${API_KEY_HELM_ARGS[@]}" \
+          --set "security.allowDevDefaults=$allow_dev_defaults" \
+          --set "security.checkDefaultCredentials=$check_default_credentials" \
+          -f "$TMP/api-key-$api_key_case-values.yaml" \
+          > "$TMP/api-key-invalid-render.yaml" 2> "$API_KEY_ERROR"; then
+        fail "explicit $api_key_case api.apiKey rendered with allowDevDefaults=$allow_dev_defaults and checkDefaultCredentials=$check_default_credentials."
+      fi
+      grep -q 'api\.apiKey' "$API_KEY_ERROR" \
+        || fail "explicit $api_key_case API key failed without naming api.apiKey."
+    done
+    API_KEY_PADDED="$TMP/api-key-padded-$allow_dev_defaults-$check_default_credentials.yaml"
+    helm template curie "$CHART" "${API_KEY_HELM_ARGS[@]}" \
+      --set "security.allowDevDefaults=$allow_dev_defaults" \
+      --set "security.checkDefaultCredentials=$check_default_credentials" \
+      -f "$TMP/api-key-padded-values.yaml" > "$API_KEY_PADDED"
+    if [[ "$(read_key "$API_KEY_PADDED" apiKey)" != "  configured-render-key  " ]]; then
+      fail "a valid explicit api.apiKey must preserve its surrounding spaces."
+    fi
+  done
+done
+
+API_KEY_NIL="$TMP/api-key-nil.yaml"
+helm template curie "$CHART" "${API_KEY_HELM_ARGS[@]}" \
+  -f "$TMP/api-key-nil-values.yaml" > "$API_KEY_NIL"
+if [[ ! "$(read_key "$API_KEY_NIL" apiKey)" =~ ^[[:alnum:]]{32}$ ]]; then
+  fail "a nil api.apiKey must retain sealed default generation."
+fi
+echo "  ok: explicit blank API keys are refused, valid bytes are preserved, and nil still generates"
+
+echo "=== Assertion 4g: retained blank API keys refuse sealed defaults and permit explicit recovery (#3556) ==="
+# Offline Helm cannot query a retained Secret. Replace only the unchanged
+# lookup boundary in a disposable chart; the real Secret template and guard
+# execute against that fixture, including installation identity memoization.
+API_KEY_RETAINED_CHART="$TMP/api-key-retained-chart"
+cp -a "$CHART" "$API_KEY_RETAINED_CHART"
+python3 - "$API_KEY_RETAINED_CHART/templates/_helpers.tpl" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+boundary = 'lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict'
+if source.count(boundary) != 1:
+    sys.exit("retained API key fixture requires exactly one managed Secret lookup boundary")
+path.write_text(source.replace(boundary, '.Values.renderAssertionExistingSecret | default dict'))
+PYEOF
+
+for api_key_case in empty spaces tabs; do
+  API_KEY_RETAINED_VALUES="$TMP/api-key-retained-$api_key_case-values.yaml"
+  for selection in default nil; do
+    API_KEY_ERROR="$TMP/api-key-retained-error.log"
+    if helm template curie "$API_KEY_RETAINED_CHART" "${API_KEY_HELM_ARGS[@]}" \
+        -f "$API_KEY_RETAINED_VALUES" -f "$TMP/api-key-$selection-values.yaml" \
+        > "$TMP/api-key-retained-invalid.yaml" 2> "$API_KEY_ERROR"; then
+      fail "a retained $api_key_case apiKey must refuse sealed $selection selection."
+    fi
+    grep -q 'api\.apiKey' "$API_KEY_ERROR" \
+      || fail "retained blank API key refusal must name api.apiKey."
+    grep -Eq 'retained|existing' "$API_KEY_ERROR" \
+      || fail "retained blank API key refusal must identify the retained Secret."
+  done
+
+  API_KEY_RECOVERED="$TMP/api-key-recovered-$api_key_case.yaml"
+  helm template curie "$API_KEY_RETAINED_CHART" "${API_KEY_HELM_ARGS[@]}" \
+    -f "$API_KEY_RETAINED_VALUES" -f "$TMP/api-key-padded-values.yaml" > "$API_KEY_RECOVERED"
+  if [[ "$(read_key "$API_KEY_RECOVERED" apiKey)" != "  configured-render-key  " ]]; then
+    fail "valid explicit api.apiKey must replace a retained blank value without changing its bytes."
+  fi
+  for key in "${KEYS[@]}" internalWorkerToken; do
+    if [[ "$key" == apiKey ]]; then
+      continue
+    fi
+    healed_key="$(read_key "$API_KEY_RECOVERED" "$key")"
+    if [[ -z "${healed_key//[[:space:]]/}" ]]; then
+      fail "retained blank '$key' must keep its existing healing behavior."
+    fi
+  done
+
+  API_KEY_RETAINED_DEV="$TMP/api-key-retained-dev-$api_key_case.yaml"
+  helm template curie "$API_KEY_RETAINED_CHART" "${API_KEY_HELM_ARGS[@]}" \
+    -f "$API_KEY_RETAINED_VALUES" --set security.allowDevDefaults=true > "$API_KEY_RETAINED_DEV"
+  if [[ "$(read_key "$API_KEY_RETAINED_DEV" apiKey)" != "curie-dev-key" ]]; then
+    fail "dev defaults must ignore an unused retained blank apiKey."
+  fi
+done
+
+API_KEY_RETAINED_VALID="$TMP/api-key-retained-valid.yaml"
+helm template curie "$API_KEY_RETAINED_CHART" "${API_KEY_HELM_ARGS[@]}" \
+  -f "$TMP/api-key-retained-nonblank-values.yaml" > "$API_KEY_RETAINED_VALID"
+if [[ "$(read_key "$API_KEY_RETAINED_VALID" apiKey)" != "  retained-render-key  " ]]; then
+  fail "a nonblank retained apiKey must stay unchanged."
+fi
+API_KEY_RETAINED_MISSING="$TMP/api-key-retained-missing.yaml"
+helm template curie "$API_KEY_RETAINED_CHART" "${API_KEY_HELM_ARGS[@]}" \
+  -f "$TMP/api-key-retained-missing-values.yaml" > "$API_KEY_RETAINED_MISSING"
+if [[ ! "$(read_key "$API_KEY_RETAINED_MISSING" apiKey)" =~ ^[[:alnum:]]{32}$ ]]; then
+  fail "a missing retained apiKey must still generate."
+fi
+echo "  ok: retained blank API keys refuse sealed defaults, valid recovery wins, and sibling healing remains"
+
 echo "=== Assertion 5: quoted \"false\" does NOT disable generation (fail closed) ==="
 # Go templates treat any non-empty string as truthy, so a quoted
 # `security.allowDevDefaults="false"` (easily produced by --set or values-file

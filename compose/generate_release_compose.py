@@ -22,6 +22,10 @@ via three ordered text transforms:
       to the same literal pin, since the release asset has no shell to resolve
       that override in.
 
+After the transforms, a final check (V1) requires every published port of every
+service to carry a host IP (`"127.0.0.1:H:C"` or long-syntax `host_ip:`), so a
+bare `"H:C"` mapping, which listens on every interface, cannot ship (#3557).
+
 Each transform locates its anchor explicitly and raises ValueError if it is
 missing: this runs unattended at publish time, so a silent no-op would ship a
 broken release asset. Fail loud instead.
@@ -122,7 +126,70 @@ def generate(dev_text: str, otel_text: str, version: str) -> str:
     # T3b: pin every curie-* image tag to the release version (worker-local too).
     text = CURIE_LATEST_RE.sub(rf"\1:{version}", text)
 
+    # V1: every published port must bind a host IP.
+    _check_ports_have_host_ip(text)
+
     return text
+
+
+def _check_ports_have_host_ip(text: str) -> None:
+    """Raise ValueError for any service port published without a host IP.
+
+    Line-based (stdlib only; PyYAML is not guaranteed at publish time). Tracks the
+    current service and its `ports:` list; handles short syntax (`"H:C"`,
+    `"IP:H:C"`) and long syntax (`host_ip:` in a mapping item).
+    """
+    service = None
+    in_services = False
+    ports_active = False
+    item = None  # (service, lines) for a long-syntax mapping under ports
+
+    def flush_item() -> None:
+        nonlocal item
+        if item is not None:
+            svc, lines = item
+            if not any(re.match(r"host_ip:\s*\S", ln) for ln in lines):
+                raise ValueError(f"V1: service {svc!r} publishes a port without a host IP")
+            item = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            flush_item()
+            ports_active = False
+            in_services = stripped == "services:"
+            service = None
+            continue
+        if not in_services:
+            continue
+        if indent == 2 and stripped.endswith(":") and not stripped.startswith("-"):
+            flush_item()
+            service = stripped[:-1]
+            ports_active = False
+            continue
+        if indent == 4:
+            flush_item()
+            ports_active = stripped == "ports:"
+            continue
+        if not ports_active:
+            continue
+        if stripped.startswith("- "):
+            flush_item()
+            value = stripped[2:].strip()
+            if re.match(r"^[A-Za-z_]+:(\s|$)", value):
+                item = (service, [value])
+            else:
+                port = value.strip("\"'")
+                if len(port.split("/")[0].split(":")) < 3:
+                    raise ValueError(
+                        f"V1: service {service!r} publishes port {port!r} without a host IP"
+                    )
+        elif item is not None:
+            item[1].append(stripped)
+    flush_item()
 
 
 def main() -> None:

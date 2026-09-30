@@ -600,15 +600,7 @@ def test_verifier_exit_zero_requires_an_exact_pinned_marker(
     assert call_log.exists(), "a valid declaration must reach curie"
 
 
-def test_changed_selected_python_test_is_pinned_by_real_pytest_junit_failure(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    test_path = repository / "apps" / "api" / "tests" / "test_pin.py"
-    source_path = repository / "apps" / "api" / "pin_fixture.py"
-    test_path.parent.mkdir(parents=True)
-    (repository / "pyproject.toml").write_text(
-        """[project]
+_PYTHON_PIN_PYPROJECT = """[project]
 name = "pin-fixture"
 version = "0.1.0"
 requires-python = ">=3.13"
@@ -622,65 +614,44 @@ package = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-""",
-        encoding="utf-8",
-    )
-    for package in (
-        repository / "apps" / "__init__.py",
-        repository / "apps" / "api" / "__init__.py",
-        repository / "apps" / "api" / "tests" / "__init__.py",
-    ):
-        package.write_text("", encoding="utf-8")
-    source_path.write_text("def value():\n    return 1\n", encoding="utf-8")
-    test_path.write_text(
-        """from apps.api.pin_fixture import value
+"""
+_PYTHON_PIN_SELECTOR = "apps/api/tests/test_pin.py::test_selected"
+_GIT = ["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
 
 
-def test_selected():
-    assert value() == 1
-""",
-        encoding="utf-8",
-    )
+def _commit_files(repository: Path, files: dict[str, str], message: str) -> None:
+    for relative, content in files.items():
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    for arguments in (["add", "."], ["commit", "-q", "-m", message]):
+        subprocess.run([*_GIT, *arguments], cwd=repository, check=True)
 
-    git_command = [
-        "git",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-    ]
+
+def _verify_python_fix_pin(
+    tmp_path: Path, baseline: dict[str, str], fix: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Commit ``baseline`` then ``fix`` in a scratch repo and run the verifier."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
     for arguments in (
         ["init", "-q"],
         ["config", "user.name", "Curie Test"],
         ["config", "user.email", "curie@example.com"],
-        ["add", "."],
-        ["commit", "-q", "-m", "Add Python fixture"],
     ):
-        subprocess.run(
-            [*git_command, *arguments],
-            cwd=repository,
-            check=True,
-        )
-
-    source_path.write_text("def value():\n    return 2\n", encoding="utf-8")
-    test_path.write_text(
-        """from apps.api.pin_fixture import value
-
-
-def test_selected():
-    assert value() == 2
-""",
-        encoding="utf-8",
+        subprocess.run([*_GIT, *arguments], cwd=repository, check=True)
+    _commit_files(
+        repository,
+        {
+            "pyproject.toml": _PYTHON_PIN_PYPROJECT,
+            "apps/__init__.py": "",
+            "apps/api/__init__.py": "",
+            "apps/api/tests/__init__.py": "",
+            **baseline,
+        },
+        "Add Python fixture",
     )
-    for arguments in (
-        ["add", "."],
-        ["commit", "-q", "-m", "Fix Python behavior"],
-    ):
-        subprocess.run(
-            [*git_command, *arguments],
-            cwd=repository,
-            check=True,
-        )
+    _commit_files(repository, fix, "Fix Python behavior")
     fix_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repository,
@@ -690,23 +661,289 @@ def test_selected():
     ).stdout.strip()
 
     completed = subprocess.run(
-        [
-            "bash",
-            str(VERIFY_FIX_PIN),
-            fix_commit,
-            "apps/api/tests/test_pin.py::test_selected",
-        ],
+        ["bash", str(VERIFY_FIX_PIN), fix_commit, _PYTHON_PIN_SELECTOR],
         cwd=repository,
         capture_output=True,
         check=False,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         text=True,
     )
-    shown = f"{completed.stdout}\n{completed.stderr}"
+    return completed, f"{completed.stdout}\n{completed.stderr}"
+
+
+def test_changed_selected_python_test_is_pinned_by_real_pytest_junit_failure(
+    tmp_path: Path,
+) -> None:
+    completed, shown = _verify_python_fix_pin(
+        tmp_path,
+        {
+            "apps/api/pin_fixture.py": "def value():\n    return 1\n",
+            "apps/api/tests/test_pin.py": """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 1
+""",
+        },
+        {
+            "apps/api/pin_fixture.py": "def value():\n    return 2\n",
+            "apps/api/tests/test_pin.py": """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 2
+""",
+        },
+    )
 
     assert completed.returncode == 0, shown
     assert "PINNED" in completed.stdout.splitlines(), shown
     assert "1 failed" in shown, shown
+
+
+_PIN_FIXTURE_BASELINE = "def value():\n    return 1\n"
+_PIN_FIXTURE_WITH_ADDED = "def value():\n    return 1\n\n\nAdded = 2\n"
+_TEST_PIN_BASELINE = """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 1
+"""
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/test_pin.py": """from apps.api.pin_fixture import Added
+
+
+def test_selected():
+    assert Added == 2
+""",
+            },
+            id="test-module-imports-added-symbol",
+        ),
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/conftest.py": """import pytest
+
+from apps.api.pin_fixture import Added
+
+
+@pytest.fixture
+def added():
+    return Added
+""",
+                "apps/api/tests/test_pin.py": """def test_selected(added):
+    assert added == 2
+""",
+            },
+            id="adjacent-conftest-imports-added-symbol",
+        ),
+        pytest.param(
+            {
+                "apps/api/added_module.py": "Added = 2\n",
+                "apps/api/tests/test_pin.py": """from apps.api.added_module import Added
+
+
+def test_selected():
+    assert Added == 2
+""",
+            },
+            id="test-module-imports-added-module",
+        ),
+    ],
+)
+def test_import_error_from_selected_module_or_its_conftest_counts_as_pinned(
+    tmp_path: Path, fix: dict[str, str]
+) -> None:
+    """#3577: a symbol the fix added is missing under revert, so the selected
+    test module (or its conftest) fails to import. That is the pinned test
+    failing, not an unattributed collection error."""
+    completed, shown = _verify_python_fix_pin(
+        tmp_path,
+        {
+            "apps/api/pin_fixture.py": _PIN_FIXTURE_BASELINE,
+            "apps/api/tests/test_pin.py": _TEST_PIN_BASELINE,
+        },
+        fix,
+    )
+
+    assert completed.returncode == 0, shown
+    assert "PINNED" in completed.stdout.splitlines(), shown
+    assert "ImportError" in shown or "ModuleNotFoundError" in shown, shown
+
+
+# ``other.py`` imports ``Added`` at both commits, so the fix only restores the
+# symbol it needs. Under revert the import error is raised inside other.py,
+# a module the selected test merely depends on.
+_OTHER_IMPORTS_ADDED = "from apps.api.pin_fixture import Added\n\nOTHER = Added\n"
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/test_pin.py": """from apps.api import other
+from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 1
+    assert other.OTHER == 2
+""",
+            },
+            id="test-module-imports-failing-unrelated-module",
+        ),
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/conftest.py": """import pytest
+
+from apps.api import other
+
+
+@pytest.fixture
+def other_value():
+    return other.OTHER
+""",
+                "apps/api/tests/test_pin.py": """from apps.api.pin_fixture import value
+
+
+def test_selected(other_value):
+    assert value() == 1
+    assert other_value == 2
+""",
+            },
+            id="conftest-imports-failing-unrelated-module",
+        ),
+    ],
+)
+def test_import_error_raised_in_an_unrelated_module_is_not_attributed(
+    tmp_path: Path, fix: dict[str, str]
+) -> None:
+    completed, shown = _verify_python_fix_pin(
+        tmp_path,
+        {
+            "apps/api/pin_fixture.py": _PIN_FIXTURE_BASELINE,
+            "apps/api/other.py": _OTHER_IMPORTS_ADDED,
+            "apps/api/tests/test_pin.py": _TEST_PIN_BASELINE,
+        },
+        fix,
+    )
+
+    assert completed.returncode != 0, shown
+    assert "reversed failure was not attributed" in shown, shown
+    assert "PINNED" not in completed.stdout.splitlines(), shown
+    assert "ImportError" in shown, shown
+
+
+# ``load`` imports ``Added`` only when called, so other.py itself always
+# imports. Under revert the ImportError is raised in ``load``'s frame, which
+# the selected module (or its conftest) merely called at import time.
+_OTHER_LOADS_ADDED = """def load():
+    from apps.api.pin_fixture import Added
+
+    return Added
+"""
+# A non-import exception whose message quotes an ImportError line. pytest
+# renders every message line as its own ``E`` line.
+_FORGED_IMPORT_ERROR = """from apps.api import pin_fixture
+
+if not hasattr(pin_fixture, "Added"):
+    raise RuntimeError("service unavailable\\nImportError: quoted diagnostic")
+"""
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/test_pin.py": """from apps.api import other
+
+LOADED = other.load()
+
+
+def test_selected():
+    assert LOADED == 2
+""",
+            },
+            id="test-module-calls-function-that-raises-import-error",
+        ),
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/conftest.py": """import pytest
+
+from apps.api import other
+
+LOADED = other.load()
+
+
+@pytest.fixture
+def loaded():
+    return LOADED
+""",
+                "apps/api/tests/test_pin.py": """def test_selected(loaded):
+    assert loaded == 2
+""",
+            },
+            id="conftest-calls-function-that-raises-import-error",
+        ),
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/test_pin.py": _FORGED_IMPORT_ERROR
+                + """
+
+def test_selected():
+    assert pin_fixture.Added == 2
+""",
+            },
+            id="test-module-raises-runtime-error-quoting-import-error",
+        ),
+        pytest.param(
+            {
+                "apps/api/pin_fixture.py": _PIN_FIXTURE_WITH_ADDED,
+                "apps/api/tests/conftest.py": _FORGED_IMPORT_ERROR,
+                "apps/api/tests/test_pin.py": """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 2 - 1
+""",
+            },
+            id="conftest-raises-runtime-error-quoting-import-error",
+        ),
+    ],
+)
+def test_non_import_failure_in_selected_module_or_conftest_is_not_attributed(
+    tmp_path: Path, fix: dict[str, str]
+) -> None:
+    """Only an ImportError raised by the selected module's (or conftest's) own
+    ``<module>`` frame is attributable: not one raised in a function it calls,
+    and not a different exception whose message quotes an ImportError line."""
+    completed, shown = _verify_python_fix_pin(
+        tmp_path,
+        {
+            "apps/api/pin_fixture.py": _PIN_FIXTURE_BASELINE,
+            "apps/api/other.py": _OTHER_LOADS_ADDED,
+            "apps/api/tests/test_pin.py": _TEST_PIN_BASELINE,
+        },
+        fix,
+    )
+
+    assert completed.returncode != 0, shown
+    assert "reversed failure was not attributed" in shown, shown
+    assert "PINNED" not in completed.stdout.splitlines(), shown
 
 
 def test_committed_pull_request_template_skips_without_calling_curie(tmp_path: Path) -> None:
@@ -878,7 +1115,12 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     ]
     if extra[: len(distribution)] == distribution:
         extra = extra[len(distribution) :]
-    assert all(argument.startswith("--durations") or argument == "-rR" for argument in extra), (
+    report_chars = set("fEsxXpPaAR")
+    assert all(
+        argument.startswith("--durations")
+        or (argument.startswith("-r") and len(argument) > 2 and set(argument[2:]) <= report_chars)
+        for argument in extra
+    ), (
         "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
         f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
     )

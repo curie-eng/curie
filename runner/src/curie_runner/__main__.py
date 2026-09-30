@@ -45,8 +45,10 @@ from .approval import (
 from .config import RunnerConfig
 from .connectors import (
     build_mcp_servers,
+    declared_secret_names,
     derive_mcp_servers,
     drop_connector_secret_names,
+    materialize_connector_caller_headers,
     materialize_hosted_bearer_headers,
 )
 from .fake import FakeModelSession
@@ -88,7 +90,7 @@ from .progress import (
     resolve_progress,
 )
 from .publication_precheck import PublicationPrecheck
-from .redact import install_stdout_redaction
+from .redact import collect_held_secrets, install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
@@ -651,9 +653,23 @@ def build_runner(
     # cannot read the PAT from the process env (#2559). The on-disk catalog
     # keeps the placeholder; derive_mcp_servers never sees a value.
     spawn_env = sdk_env if sdk_env is not None else os.environ
+    held_secrets = collect_held_secrets(
+        config,
+        environments=(os.environ, sdk_env or {}),
+        credential_names=harness.auth.credential_env_keys,
+        connector_names=declared_secret_names(config.session.plugin_dir),
+        server_groups=(bundle_mcp_servers(config.session.plugin_dir), derived_mcp_servers),
+    )
     dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
     if spawn_env is not os.environ:
         drop_connector_secret_names(os.environ, dropped)
+    # The caller token is a platform credential. Expand it into the hosted
+    # header, then drop the name from both the spawn mapping and the process
+    # env. Bash and hooks must not inherit it (#3550).
+    if spawn_env is os.environ:
+        materialize_connector_caller_headers(derived_mcp_servers, os.environ)
+    else:
+        materialize_connector_caller_headers(derived_mcp_servers, spawn_env, os.environ)
 
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
@@ -891,6 +907,7 @@ def build_runner(
                 readonly_tools=_readonly_tools(harness, observed_readonly_tools, approval_gate)
             ),
             trace_name=f"curie-run:{config.session.session_id}",
+            held_secrets=held_secrets,
             session_id=config.session.session_id,
             model=config.model,
             memory_store=memory_store,

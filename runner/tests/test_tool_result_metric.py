@@ -227,6 +227,7 @@ def _run(
     else:
         fake = FakeModelSession(next_script)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),

@@ -74,6 +74,7 @@ class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
     prefixes: dict[str, tuple[str, ...]]
+    ignored_exact: tuple[str, ...]
     ignored_prefixes: tuple[str, ...]
 
 
@@ -114,7 +115,7 @@ def _matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
 
-# Fail-closed pytest set. ignored_prefixes may skip compose+pytest, but never
+# Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
 # for these Python or runtime paths even when a more-specific ignore exists
 # (packages/test-support, apps/dispatcher, apps/ui).
 MUST_RUN_PYTEST_EXACT = frozenset(
@@ -150,7 +151,7 @@ def _needs_pytest(registry: Registry, paths: list[str]) -> bool:
     for path in paths:
         if _is_must_run_pytest(path):
             return True
-        if not any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
+        if not _is_ignored(registry, path):
             return True
     return False
 
@@ -193,10 +194,23 @@ def _load_registry(path: Path) -> Registry:
         raise RegistryError("fallback must contain every base tier in canonical order")
 
     rules = _mapping(root.get("rules"), "rules")
-    if set(rules) != {"exact", "prefixes", "ignored_prefixes"}:
-        raise RegistryError("rules must define exact, prefixes, and ignored_prefixes")
+    if set(rules) != {"exact", "prefixes", "ignored_exact", "ignored_prefixes"}:
+        raise RegistryError(
+            "rules must define exact, prefixes, ignored_exact, and ignored_prefixes"
+        )
     exact = _tier_rules(rules["exact"], "rules.exact")
     prefixes = _tier_rules(rules["prefixes"], "rules.prefixes")
+    ignored_exact_rules = _mapping(rules["ignored_exact"], "rules.ignored_exact")
+    ignored_exact: list[str] = []
+    for ignored, value in ignored_exact_rules.items():
+        if not ignored or ignored.startswith("/") or ignored.endswith("/"):
+            raise RegistryError("rules.ignored_exact contains an invalid path")
+        if value != []:
+            raise RegistryError("ignored exact values must be empty lists")
+        if ignored in exact or ignored in prefixes:
+            raise RegistryError(f"ignored exact path overlaps a selected rule: {ignored}")
+        ignored_exact.append(ignored)
+
     ignored_rules = _mapping(rules["ignored_prefixes"], "rules.ignored_prefixes")
 
     ignored_prefixes: list[str] = []
@@ -215,11 +229,17 @@ def _load_registry(path: Path) -> Registry:
         if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
-    return Registry(fallback, exact, prefixes, tuple(ignored_prefixes))
+    return Registry(fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes))
+
+
+def _is_ignored(registry: Registry, path: str) -> bool:
+    return path in registry.ignored_exact or any(
+        _matches_prefix(path, prefix) for prefix in registry.ignored_prefixes
+    )
 
 
 def _select_path(registry: Registry, path: str) -> set[str]:
-    if any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
+    if _is_ignored(registry, path):
         return set()
 
     selected: set[str] = set()

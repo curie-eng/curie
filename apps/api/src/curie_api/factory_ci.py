@@ -31,6 +31,12 @@ from typing import Any, Literal
 
 import httpx
 import redis.asyncio as redis
+from channel_protocol.work_item_events import (
+    CI_FIRST_FIX_ROUND,
+    CI_MAX_ROUNDS,
+    ci_event_id,
+    ci_round_key,
+)
 from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -42,7 +48,6 @@ from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
 CI_POLL_SECONDS = 20
-CI_MAX_ROUNDS = 3
 CI_OBSERVATIONS_PER_PASS = 4
 CI_CLAIM_SECONDS = 60
 # Causes the reconciler writes for a request whose pull request already opened;
@@ -67,7 +72,8 @@ PERMANENT_UNREADABLE = frozenset(
 # Reason codes that count as pending until the CI deadline.
 TRANSIENT = frozenset({"timeout", "observation_busy", "github_rate_limited", "github_error"})
 
-MARKER = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
+_MARKER_ROUNDS = "|".join(str(r) for r in range(CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS + 1))
+MARKER = re.compile(rf"^Curie wait_ci round ({_MARKER_ROUNDS}) of {CI_MAX_ROUNDS}: ")
 
 _FAILING_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
@@ -113,13 +119,13 @@ class Verdict:
 def continuation_event_id(request_id: uuid.UUID, round_: int) -> str:
     """The runs-stream event id of a CI fix turn (worker contract)."""
 
-    return f"work-item-{request_id}-ci-{round_}"
+    return ci_event_id(request_id, round_)
 
 
 def ci_key(request_id: uuid.UUID, round_: int) -> str:
     """The Valkey key that keeps a round to at most one continuation."""
 
-    return f"curie:work-item:ci:{request_id}:{round_}"
+    return ci_round_key(request_id, round_)
 
 
 # --- verdict (pure) -----------------------------------------------------------------
