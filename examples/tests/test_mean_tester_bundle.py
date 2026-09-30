@@ -12,14 +12,9 @@ import json
 import re
 from pathlib import Path
 
-import pytest
 import yaml
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
-    PluginManifest,
-    ToolPolicyDecision,
-    classify_tool,
-    load_tool_policy,
     validate_bundle,
 )
 
@@ -55,14 +50,6 @@ DENIED = [
 
 def _manifest() -> dict:
     return json.loads((BUNDLE / ".claude-plugin" / "plugin.json").read_text())
-
-
-def _policy():
-    policy = load_tool_policy(
-        PluginManifest.model_validate(_manifest()), enforces=TOOL_POLICY_ENFORCEMENT
-    )
-    assert policy is not None
-    return policy
 
 
 def _skill() -> str:
@@ -132,14 +119,13 @@ def test_the_manifest_declares_the_three_secrets_and_no_approval_route():
     assert manifest["toolPolicy"]["approvalRequired"] == []
 
 
-@pytest.mark.parametrize("tool", ALLOWED)
-def test_the_named_tools_are_allowed(tool: str):
-    assert classify_tool(_policy(), tool) == ToolPolicyDecision.ALLOW
-
-
-@pytest.mark.parametrize("tool", DENIED)
-def test_everything_else_is_denied(tool: str):
-    assert classify_tool(_policy(), tool) == ToolPolicyDecision.DENY
+def test_the_tool_policy_entries_are_exact():
+    # Unlisted tools are denied by the classifier (plugin-format
+    # test_tool_policy.py); this pins the entries so a widened glob such as
+    # github/* fails here.
+    policy = _manifest()["toolPolicy"]
+    assert policy["allow"] == ALLOWED
+    assert policy["deny"] == []
 
 
 def test_the_skill_names_every_allowed_tool_and_files_nothing():
@@ -253,14 +239,19 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
         assert text in joined, f"{text!r} no longer appears in the platform; update SKILL.md"
 
 
-def test_production_is_off_limits_unless_listed_as_a_test_installation():
+def test_every_installation_is_read_or_ask_only():
+    # @spec #3043
     skill = _skill()
-    where = re.search(r"^## Where you work\n(.*?)(?=^## )", skill, re.M | re.S)
-    assert where and re.search(r"^- Test installations: ", where.group(1), re.M)
-    rule = re.search(r"^## Production is off limits\n(.*?)(?=^## )", skill, re.M | re.S)
-    assert rule, "SKILL.md must keep a '## Production is off limits' section"
-    for phrase in ("approval card", "attach", "Next (test installation):"):
-        assert phrase in rule.group(1), phrase
+    rule = re.search(r"^## Every probe only reads or asks\n(.*?)(?=^## )", skill, re.M | re.S)
+    assert rule, "SKILL.md must keep an '## Every probe only reads or asks' section"
+    text = " ".join(rule.group(1).split())
+    for phrase in (
+        "same for production and test installations",
+        "Send only probes that read or ask",
+        "even on a test installation",
+        "Never attach a file, create an approval card, or resolve one",
+    ):
+        assert phrase in text, phrase
 
 
 def test_a_round_waits_by_the_clock_and_posts_only_probes():

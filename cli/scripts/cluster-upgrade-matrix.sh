@@ -99,7 +99,7 @@ EXCLUSIVE_KIND_TAG=""
 # shards start from setup_nonempty_n (published 0.8.8 + sentinel, forward-only
 # upgrade to 0.10.0). --list-shards, --shard and the self-test coverage gate all
 # read SHARDS, so CI cannot run a manifest the gate did not check.
-SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
+SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version rollback-published-088 migration-crash
 s02 setup fail-every-phase:plan+validate+drain_preflight
 s03 setup fail-every-phase:checkpoint+migrate+apply
 s04 setup fail-every-phase:converge
@@ -108,9 +108,7 @@ s06 setup fail-every-phase:commit
 s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
 s09 setup n-to-n1 guarded-rollback
-s10 setup rollback-published-088
 s11 nosetup rollback-published-089
-s12 nosetup migration-crash
 s13 setup converge-negative
 s14 setup previous-serves"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
@@ -474,7 +472,7 @@ run_self_test() {
     for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
-            "duplicated scenario") mutated="${SHARDS_CANONICAL/s12 nosetup migration-crash/s12 nosetup migration-crash fresh-n}" ;;
+            "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
             "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
             "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
         esac

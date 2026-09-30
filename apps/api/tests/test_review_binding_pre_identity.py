@@ -180,11 +180,10 @@ def test_require_review_binding_refuses_a_bare_slack_lineage_after_a_named_rebin
             session,
             kind="slack",
             address=SLACK_ADDRESS,
-            # A custom-transport rebind (endpoint + adapter, decision 3):
-            # storable today, and its adapter is now a declared identity,
-            # not the default the lineage's bare key was captured under.
+            # A rebind onto a named identity (decision 3): not the default
+            # the lineage's bare key was captured under.
             binding_adapter="second-bot",
-            binding_endpoint="http://acme-custom-transport:8080/",
+            binding_endpoint=None,
             lineage_conversation_id=bare_key,
             reply_conversation_id=SLACK_TS,
         )
@@ -251,7 +250,7 @@ def test_review_context_refuses_a_bare_slack_lineage_after_a_named_rebind(
             kind="slack",
             address=SLACK_ADDRESS,
             binding_adapter="second-bot",
-            binding_endpoint="http://acme-custom-transport:8080/",
+            binding_endpoint=None,
             lineage_conversation_id=bare_key,
             reply_conversation_id=SLACK_TS,
             github=True,

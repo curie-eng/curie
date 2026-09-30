@@ -1011,7 +1011,7 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
         "SELECT c.address, c.endpoint, c.adapter, l.binding_generation = c.generation AS current "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id"
-    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": None, "current": True}]
+    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": "default", "current": True}]
     response = post_review(client, truth)
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "feedback_queued"
@@ -3671,18 +3671,20 @@ def test_review_before_lineage_identity_is_held_then_admitted_when_identity_land
     publish_through_worker(client, pr_number=17)
 
     assert valkey.zrange(HELD_INDEX, 0, -1) == []
-    assert review_rows(
-        "SELECT event_id, status FROM curie.github_review_feedback"
-    ) == [{"event_id": truth.feedback.event_id, "status": "queued"}]
+    # The saved receipt proves enqueue without depending on live stream retention.
+    queued = review_rows(
+        "SELECT event_id, status, stream_id, turn FROM curie.github_review_feedback"
+    )
+    assert len(queued) == 1
+    assert queued[0]["event_id"] == truth.feedback.event_id
+    assert queued[0]["status"] == "queued"
+    assert queued[0]["turn"]["event_id"] == truth.feedback.event_id
+    assert all(part.isdigit() for part in queued[0]["stream_id"].split("-"))
     assert review_rows(
         "SELECT status, reason, event_id FROM curie.github_review_deliveries "
         "ORDER BY delivery_id"
     ) == [{"status": "accepted", "reason": None, "event_id": truth.feedback.event_id}] * 2
     assert valkey.exists(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == 0
-    turns = [json.loads(fields["payload"]) for _, fields in valkey.xrange(stream)]
-    assert [t["event_id"] for t in turns if t["event_id"] == truth.feedback.event_id] == [
-        truth.feedback.event_id
-    ]
 
 
 def test_review_for_an_unknown_pr_is_still_rejected_not_held(review_stack) -> None:

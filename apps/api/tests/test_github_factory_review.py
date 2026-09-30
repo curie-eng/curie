@@ -34,11 +34,14 @@ from typing import Any
 
 import httpx
 import pytest
+import redis.asyncio as redis
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -369,7 +372,8 @@ def _complete(request_id: uuid.UUID) -> None:
 
 def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
-        "SELECT r.id, r.sequence, r.status, r.objective, r.requester, r.reply_kind, "
+        "SELECT r.id, r.sequence, r.status, r.terminal_cause, "
+        "r.objective, r.requester, r.reply_kind, "
         "r.reply_address, r.reply_conversation_id, w.id AS work_item_id, "
         "w.conversation_id AS work_item_conversation "
         "FROM curie.execution_requests r "
@@ -543,8 +547,33 @@ def test_open_pull_request_without_an_owning_work_item_is_unbound(
     _refused(client, number, "issue_comment", payload, "lineage_unbound")
 
 
-def test_running_request_blocks_another_revision(
-    factory: tuple[TestClient, ReviewGitHubAPI],
+def _reconcile_queued_revisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = redis.Redis(
+            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
+        )
+        reconciler = WorkItemReconciler(maker, valkey, get_settings())
+
+        async def skip_github_io() -> None:
+            # GitHub reads and status delivery are covered by separate fixtures.
+            return None
+
+        monkeypatch.setattr(reconciler, "_reconcile_missed_labels", skip_github_io)
+        monkeypatch.setattr(reconciler, "_sync_status_comments", skip_github_io)
+        try:
+            await reconciler.run_once()
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("event", EVENTS)
+def test_review_mention_during_live_run_waits_then_becomes_next_request(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch, event: str
 ) -> None:
     client, api = factory
     number, first = _admit_issue(client, api)
@@ -552,9 +581,219 @@ def test_running_request_blocks_another_revision(
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
     _mark_running(first["id"])
+    payload, fid = _feedback_event(api, event, pr, _mention())
+    delivery = str(uuid.uuid4())
+
+    admitted = _post(client, event, payload, delivery=delivery)
+    same_delivery = _post(client, event, payload, delivery=delivery)
+    fresh_delivery = _post(client, event, payload, delivery=str(uuid.uuid4()))
+
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_queued", admitted.text
+    assert same_delivery.json()["status"] == "factory_duplicate", same_delivery.text
+    assert fresh_delivery.json()["status"] == "factory_duplicate", fresh_delivery.text
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[0]["status"] == "running"
+    revision = rows[1]
+    assert revision["status"] == "queued"
+    assert revision["work_item_id"] == first["work_item_id"]
+    assert revision["objective"].splitlines()[0] == (
+        f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+    )
+    assert len(
+        _rows(
+            "SELECT execution_request_id FROM curie.factory_terminal_notices "
+            "WHERE execution_request_id = :id",
+            {"id": revision["id"]},
+        )
+    ) == 1
+
+    _reconcile_queued_revisions(monkeypatch)
+    assert _requests(number)[1]["status"] == "queued"
+
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+        "version = version + 1 WHERE id = :id AND status = 'running'",
+        {"id": first["id"]},
+    )
+    _reconcile_queued_revisions(monkeypatch)
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert [row["status"] for row in rows] == ["completed", "waiting"]
+    assert rows[1]["id"] == revision["id"]
+
+
+def test_distinct_review_mentions_wait_in_order_until_each_live_run_ends(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = factory
+    number, first = _admit_issue(client, api)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    _own_pull_request(first["work_item_id"], pr)
+    _mark_running(first["id"])
+    first_payload, first_fid = _feedback_event(
+        api, "issue_comment", pr, f"@{MENTION} please change the first helper"
+    )
+    second_payload, second_fid = _feedback_event(
+        api, "issue_comment", pr, f"@{MENTION} please change the second helper"
+    )
+
+    first_reply = _post(client, "issue_comment", first_payload)
+    second_reply = _post(client, "issue_comment", second_payload)
+
+    assert first_reply.json()["status"] == "factory_queued", first_reply.text
+    assert second_reply.json()["status"] == "factory_queued", second_reply.text
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2, 3]
+    assert [row["status"] for row in rows] == ["running", "queued", "queued"]
+    assert [row["work_item_id"] for row in rows] == [first["work_item_id"]] * 3
+    assert rows[1]["objective"].splitlines()[0].endswith(f"#issuecomment-{first_fid}")
+    assert rows[2]["objective"].splitlines()[0].endswith(f"#issuecomment-{second_fid}")
+    first_revision_id, second_revision_id = rows[1]["id"], rows[2]["id"]
+
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+        "version = version + 1 WHERE id = :id AND status = 'running'",
+        {"id": first["id"]},
+    )
+    _reconcile_queued_revisions(monkeypatch)
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["completed", "waiting", "queued"]
+    assert [row["id"] for row in rows[1:]] == [first_revision_id, second_revision_id]
+
+    _mark_running(first_revision_id)
+    _reconcile_queued_revisions(monkeypatch)
+    assert [row["status"] for row in _requests(number)] == [
+        "completed", "running", "queued"
+    ]
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+        "version = version + 1 WHERE id = :id AND status = 'running'",
+        {"id": first_revision_id},
+    )
+    _reconcile_queued_revisions(monkeypatch)
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["completed", "completed", "waiting"]
+    assert rows[2]["id"] == second_revision_id
+
+
+def test_review_admission_survives_work_item_version_change_during_verification(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api import github_factory_review
+
+    client, api = factory
+    number, first = _admit_issue(client, api)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    _own_pull_request(first["work_item_id"], pr)
+    _mark_running(first["id"])
+    payload, fid = _feedback_event(api, "issue_comment", pr, _mention())
+    verify = github_factory_review.verify_feedback_truth
+    bumped = False
+
+    async def verify_with_version_change(*args: Any, **kwargs: Any) -> None:
+        nonlocal bumped
+        await verify(*args, **kwargs)
+        if bumped:
+            return
+        bumped = True
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.work_items SET version = version + 1 "
+                        "WHERE id = :id"
+                    ),
+                    {"id": first["work_item_id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    monkeypatch.setattr(
+        github_factory_review, "verify_feedback_truth", verify_with_version_change
+    )
+
+    response = _post(client, "issue_comment", payload)
+    replay = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
+
+    assert bumped
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_queued", response.text
+    assert replay.json()["status"] == "factory_duplicate", replay.text
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["running", "queued"]
+    assert rows[1]["objective"].splitlines()[0].endswith(f"#issuecomment-{fid}")
+    assert rows[1]["work_item_id"] == first["work_item_id"]
+
+
+def test_unlabel_cancels_queued_review_revision_before_it_can_run(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = factory
+    number, first = _admit_issue(client, api)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    _own_pull_request(first["work_item_id"], pr)
+    _mark_running(first["id"])
+    payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
+    queued = _post(client, "issue_comment", payload)
+    assert queued.json()["status"] == "factory_queued", queued.text
+    revision_id = _requests(number)[1]["id"]
+
+    api.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+
+    assert removed.json()["status"] == "factory_cancellation_requested", removed.text
+    _reconcile_queued_revisions(monkeypatch)
+    rows = _requests(number)
+    assert rows[0]["status"] == "cancellation_requested"
+    assert rows[1]["id"] == revision_id
+    assert rows[1]["status"] == "cancelled"
+    assert rows[1]["terminal_cause"] == "issue_cancelled"
+    _reconcile_queued_revisions(monkeypatch)
+    assert _requests(number)[1]["status"] == "cancelled"
+
+
+def test_closed_lineage_cancels_queued_review_revision_after_live_run_ends(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = factory
+    number, first = _admit_issue(client, api)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    lineage_id = _own_pull_request(first["work_item_id"], pr)
+    _mark_running(first["id"])
     payload, _ = _feedback_event(api, "pull_request_review_comment", pr, _mention())
-    _refused(client, number, "pull_request_review_comment", payload, "active_request")
-    assert _requests(number)[0]["status"] == "running"
+    queued = _post(client, "pull_request_review_comment", payload)
+    assert queued.json()["status"] == "factory_queued", queued.text
+    revision_id = _requests(number)[1]["id"]
+
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'closed', "
+        "version = version + 1 WHERE id = :id",
+        {"id": lineage_id},
+    )
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+        "version = version + 1 WHERE id = :id AND status = 'running'",
+        {"id": first["id"]},
+    )
+    _reconcile_queued_revisions(monkeypatch)
+    rows = _requests(number)
+    assert rows[0]["status"] == "completed"
+    assert rows[1]["id"] == revision_id
+    assert rows[1]["status"] == "cancelled"
+    assert rows[1]["terminal_cause"] == "lineage_closed"
+    _reconcile_queued_revisions(monkeypatch)
+    assert _requests(number)[1]["status"] == "cancelled"
 
 
 @pytest.fixture

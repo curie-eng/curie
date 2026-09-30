@@ -320,6 +320,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 thinking: Some("adaptive".to_string()),
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
+                memory_writes: true,
                 changed: true,
             },
         ],
@@ -694,6 +695,11 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Replied" => MessageOutcomeOutput::Replied {
                 thread: "1700000000.000100".to_string(),
                 reply: "the answer is 42".to_string(),
+            },
+            "Failed" => MessageOutcomeOutput::Failed {
+                thread: "1700000000.000100".to_string(),
+                reply: "curie-turn-failure: max-turns\n\nThe run failed (max-turns).".to_string(),
+                failure_class: "max-turns".to_string(),
             },
             "NoEdit" => MessageOutcomeOutput::NoEdit { thread: "1700000000.000100".to_string() },
             "AwaitingApproval" => MessageOutcomeOutput::AwaitingApproval {

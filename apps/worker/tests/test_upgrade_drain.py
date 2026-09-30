@@ -22,7 +22,7 @@ The API this file pins:
       .await_drained(*, timeout_s=None, poll_interval_s=None) -> DrainOutcome
 
     DrainOutcome: .drained .remaining .waited_s
-    run_gate(config, *, mode="drain"|"release") -> int   (the hook's exit code)
+    run_gate(config, *, mode="drain"|"release"|"attest") -> int   (the hook's exit code)
 """
 
 from __future__ import annotations
@@ -785,7 +785,7 @@ def test_status_reports_unknown_when_the_marker_cannot_be_read(
         assert _VALKEY_PW not in stderr
 
 
-@pytest.mark.parametrize("mode", ["drain", "release"])
+@pytest.mark.parametrize("mode", ["drain", "release", "attest"])
 def test_unobserved_installation_refuses_mutating_modes_before_connecting(
     names,
     mode: str,
@@ -1113,6 +1113,178 @@ def test_a_refused_upgrade_leaves_the_fleet_claiming_again(names) -> None:  # no
     asyncio.run(go())
 
 
+def _recorded_revision(config: WorkerConfig) -> int:
+    """The integer the success record stores. An unset hook revision is 0."""
+    return 0 if config.upgrade_revision is None else config.upgrade_revision
+
+
+def _success_configs(names: dict[str, str]) -> tuple[WorkerConfig, ...]:
+    """Blank installation id keeps the unscoped key; a nonblank id appends it."""
+    return (
+        _config(names),
+        _config(names, installation_id="acme-install", upgrade_revision=4),
+    )
+
+
+def _hook_redis() -> AsyncRedis:
+    return AsyncRedis(
+        host=_VALKEY_HOST,
+        port=_VALKEY_PORT,
+        password=_VALKEY_PW or None,
+        decode_responses=True,
+    )
+
+
+async def _delete_marker_keys(client: AsyncRedis, config: WorkerConfig) -> None:
+    await client.delete(config.upgrade_quiesce_key())
+    # Cleanup must not hide a missing success-key method; the assertions call it.
+    deleter = getattr(config, "upgrade_drain_success_key", None)
+    if deleter is not None:
+        await client.delete(deleter())
+
+
+def test_clean_drain_records_success_and_release_deletes_both(
+    names: dict[str, str],
+) -> None:
+    """A clean drain leaves the quiesce marker and this revision's success record.
+    Release deletes both."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            try:
+                assert await run_gate(config, mode="drain") == 0
+                assert await client.exists(config.upgrade_quiesce_key())
+                recorded = json.loads(await client.get(config.upgrade_drain_success_key()))
+                assert recorded == {"revision": _recorded_revision(config)}
+                assert await run_gate(config, mode="release") == 0
+                assert not await client.exists(config.upgrade_quiesce_key())
+                assert not await client.exists(config.upgrade_drain_success_key())
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_refused_drain_leaves_no_success_key_and_no_quiesce_key(
+    names: dict[str, str],
+) -> None:
+    """A live lease refuses the drain. That path must not record success and must
+    clear the quiesce marker, same as the pending-plus-lease refusal above."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            try:
+                entry_id = await _pending(client, config, "replica-a")
+                store = DeliveryLeaseStore(client, config)
+                await store.acquire(
+                    config.stream, config.consumer_group, entry_id, consumer="replica-a"
+                )
+                assert await run_gate(config, mode="drain") == 1
+                assert not await client.exists(config.upgrade_quiesce_key())
+                assert not await client.exists(config.upgrade_drain_success_key())
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_attest_without_success_key_refuses_and_creates_nothing(
+    names: dict[str, str],
+) -> None:
+    """Attest only reads the success record. Missing means refuse, and neither
+    the quiesce marker nor the success key may be created."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            try:
+                assert await client.get(config.upgrade_drain_success_key()) is None
+                assert await run_gate(config, mode="attest") == 1
+                assert not await client.exists(config.upgrade_quiesce_key())
+                assert await client.get(config.upgrade_drain_success_key()) is None
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_attest_accepts_a_planted_success_key_without_draining(
+    names: dict[str, str],
+) -> None:
+    """A success record for this revision is enough. Attest must not require a
+    drain call and must not write the quiesce marker."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            try:
+                revision = _recorded_revision(config)
+                await client.set(
+                    config.upgrade_drain_success_key(),
+                    json.dumps({"revision": revision}),
+                )
+                assert await run_gate(config, mode="attest") == 0
+                assert not await client.exists(config.upgrade_quiesce_key())
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_attest_refuses_a_success_key_for_another_revision(
+    names: dict[str, str],
+) -> None:
+    """The key embeds the revision, so another revision lives under another key.
+    Attest for this hook must still refuse, and must not create this key."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            other = _config(
+                names,
+                installation_id=config.installation_id,
+                upgrade_revision=_recorded_revision(config) + 1,
+            )
+            try:
+                await client.set(
+                    other.upgrade_drain_success_key(),
+                    json.dumps({"revision": _recorded_revision(other)}),
+                )
+                assert other.upgrade_drain_success_key() != config.upgrade_drain_success_key()
+                assert await run_gate(config, mode="attest") == 1
+                assert await client.get(config.upgrade_drain_success_key()) is None
+                assert not await client.exists(config.upgrade_quiesce_key())
+            finally:
+                await _delete_marker_keys(client, config)
+                await _delete_marker_keys(client, other)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_attest_refuses_a_non_json_success_value(names: dict[str, str]) -> None:
+    """Garbage stored under this revision's key is not a successful drain."""
+
+    async def go() -> None:
+        for config in _success_configs(names):
+            client = _hook_redis()
+            try:
+                await client.set(config.upgrade_drain_success_key(), "not-json")
+                assert await run_gate(config, mode="attest") == 1
+                assert not await client.exists(config.upgrade_quiesce_key())
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.aclose()
+
+    asyncio.run(go())
+
+
 # --- the chart's cross-artifact coupling --------------------------------------
 
 _CHART_HOOK = (
@@ -1146,14 +1318,44 @@ def test_the_chart_hooks_invoke_a_module_and_modes_this_package_actually_has() -
         interpreter, dash_m, module, mode_flag, mode, *_hook_args = command
         assert (interpreter, dash_m, mode_flag) == ("python", "-m", "--mode"), command
         importlib.import_module(module)
-        # The mode reaches argparse, whose `choices` is the real contract; an
-        # unknown one exits 2 before the gate does anything.
-        assert mode in ("drain", "release"), f"the chart asks for --mode {mode}"
+        assert mode in ("drain", "release", "attest"), f"the chart asks for --mode {mode}"
     modes = {command[4] for command in commands}
-    assert modes == {"drain", "release"}, (
-        f"the chart wires {sorted(modes)}; both hooks are required -- without the "
-        "release the fleet waits out the whole quiesce TTL after every upgrade"
+    assert modes == {"drain", "release", "attest"}, (
+        f"the chart wires {sorted(modes)}; drain, release, and attest are required. "
+        "Without the release the fleet waits out the whole quiesce TTL after every "
+        "upgrade, and without attest a deleted drain Job still lets the roll proceed."
     )
+    annotations = _template_hook_annotations(_CHART_HOOK.read_text())
+    attest = annotations.get("upgrade-drain-attest")
+    assert attest is not None, "the chart has no upgrade-drain-attest hook annotations"
+    assert attest.get("helm.sh/hook") == "pre-upgrade", attest
+    assert attest.get("helm.sh/hook-weight") == "-9", attest
+    assert annotations["upgrade-drain"]["helm.sh/hook-weight"] == "-10", annotations
+
+
+def _template_hook_annotations(text: str) -> dict[str, dict[str, str]]:
+    """Read hook annotations from the chart template text, next to each component."""
+    lines = text.splitlines()
+    found: dict[str, dict[str, str]] = {}
+    prefix = "app.kubernetes.io/component: "
+    known = {"upgrade-drain", "upgrade-drain-release", "upgrade-drain-attest"}
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        component = stripped[len(prefix):].strip()
+        if component not in known:
+            continue
+        if index + 1 >= len(lines) or lines[index + 1].strip() != "annotations:":
+            continue
+        parsed: dict[str, str] = {}
+        for follower in lines[index + 2:]:
+            if not follower.startswith('    "'):
+                break
+            key, value = follower.strip().split(": ", 1)
+            parsed[key.strip('"')] = value.strip().strip('"')
+        found[component] = parsed
+    return found
 
 
 def test_an_unknown_mode_is_refused_rather_than_silently_draining() -> None:
@@ -1349,15 +1551,26 @@ def test_an_abandoned_gate_marker_expires_within_one_lease(
             await _hold_live_delivery(client, config)
             key = config.upgrade_quiesce_key()
             waiter = asyncio.create_task(gate.await_drained(poll_interval_s=0.05))
-            await asyncio.sleep(0.2)
-            assert await client.exists(key)
+            published = time.monotonic() + 2
+            while time.monotonic() < published:
+                if await client.exists(key):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("the abandoned drain never published its lease marker")
             waiter.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await waiter
-            await asyncio.sleep(_TINY_LEASE_S + 0.3)
-            assert not await client.exists(key), (
-                "an abandoned drain left the fleet paused past one lease"
-            )
+            # The last renewal can land as the wait is cancelled. Poll past
+            # one full lease from that join instead of sleeping a fixed margin
+            # that loses to the in-flight SET.
+            absent = time.monotonic() + _TINY_LEASE_S + 2
+            while time.monotonic() < absent:
+                if not await client.exists(key):
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("an abandoned drain left the fleet paused past one lease")
 
     asyncio.run(go())
 
@@ -1401,8 +1614,12 @@ def test_sigterm_mid_wait_clears_the_marker_and_refuses(
                 f"SIGTERM did not stop the gate; it ran {elapsed:.1f}s to its timeout"
             )
             assert not await client.exists(key), "SIGTERM left the marker set"
+            assert not await client.exists(config.upgrade_drain_success_key()), (
+                "SIGTERM wrote a successful drain record"
+            )
         finally:
             await client.delete(key)
+            await _delete_marker_keys(client, config)
             await client.aclose()
 
     try:

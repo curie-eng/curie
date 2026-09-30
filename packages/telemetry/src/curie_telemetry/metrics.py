@@ -270,6 +270,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hook-secret",
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
+    "/agents/{agent_id}/memory/guidance",
     "/agents/{agent_id}/memory/{index}",
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",
@@ -359,6 +360,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
+    "/v1/work-item-progress/{request_id}/verification",
+    # Deliberate progress from a running turn (ADR 0130).
+    "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
     "/schedules",
     "/schedules/{agent}/{name}/pause",

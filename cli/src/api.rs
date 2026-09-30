@@ -72,6 +72,23 @@ pub(crate) struct ClusterMessageReplyEvent {
     pub(crate) status: Option<String>,
     #[serde(default)]
     pub(crate) outcome: Option<String>,
+    /// Reply wire 1.1's progress payload (ADR-0130), a card or a milestone.
+    /// Present, the event is never the turn's reply.
+    #[serde(default)]
+    pub(crate) progress: Option<ClusterMessageProgress>,
+}
+
+/// The fields of a relayed progress card or milestone the CLI shows as a
+/// status line. Tolerant like the event: a field it does not read is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageProgress {
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) milestone: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: String,
 }
 
 /// The channel used when an agent is first created if `--slack-channel` is
@@ -297,6 +314,11 @@ pub struct Agent {
     /// is the separate, explicit toggle for whether those surfaces share
     /// cross-turn state.
     pub memory: bool,
+    /// Whether the runner mounts its remember/update/forget memory tools for
+    /// this agent (#1461). Defaulted so a platform older than the field reads
+    /// as off, which is what it does.
+    #[serde(default)]
+    pub memory_writes: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -414,13 +436,16 @@ pub struct ApprovalNotificationTargetResponse {
 /// Who may resolve a route's approvals, mirroring the committed
 /// `ApprovalApprovers`. The API settles the precedence (`users` wins over
 /// `group`); the CLI never reorders or merges them, it forwards what was asked
-/// for and lets the one authoritative validator answer.
+/// for and lets the one authoritative validator answer. `emails` is read only
+/// for a card shown in an email thread (ADR 0183), never for a Slack card.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalApprovers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emails: Option<Vec<String>>,
 }
 
 // --- The input side of the same contract (#1072) -------------------------------
@@ -541,6 +566,8 @@ pub struct ApproversInput {
     pub group: Option<String>,
     #[serde(default)]
     pub users: Option<Vec<String>>,
+    #[serde(default)]
+    pub emails: Option<Vec<String>>,
 }
 
 impl From<ApproversInput> for ApprovalApprovers {
@@ -548,6 +575,7 @@ impl From<ApproversInput> for ApprovalApprovers {
         ApprovalApprovers {
             group: input.group,
             users: input.users,
+            emails: input.emails,
         }
     }
 }
@@ -725,6 +753,15 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
+/// text the runner shows beside its memory tools, and whether it is the
+/// platform `default` or `operator`-set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryGuidance {
+    pub text: String,
+    pub source: String,
 }
 
 /// One row returned by `GET /langfuse/traces`.
@@ -1120,7 +1157,7 @@ pub struct WorkItemRequest {
     pub sequence: u64,
     pub status: String,
     pub created_at: String,
-    pub wait_deadline: String,
+    pub wait_deadline: Option<String>,
     pub started_at: Option<String>,
     pub execution_deadline: Option<String>,
     pub terminal_at: Option<String>,
@@ -1678,8 +1715,7 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
 /// A binding write the platform refused over the identity it names.
 ///
 /// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
-/// identity, or a database that cannot yet store one), so it is carried
-/// verbatim rather than restated.
+/// identity, for instance), so it is carried verbatim rather than restated.
 fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
     let detail = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1727,13 +1763,11 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
 /// it speaks through. Pure so the shape is testable without a live API. The
 /// kind is never inferred -- a channel-neutral binding carries it explicitly.
 ///
-/// `adapter` alone (no `endpoint`) names a Slack identity (ADR-0168 decision
-/// 3): Slack is an in-process ingress, so it has no transport to configure.
-/// `endpoint` and `adapter` together are the pre-ADR custom-transport form,
-/// still both-or-neither for a non-Slack ingress -- `ChannelChange::resolve`
-/// refuses a non-Slack `adapter` with no `endpoint` before this function ever
-/// sees the arguments, and clap's `--endpoint` `requires` `--adapter` covers
-/// the other direction.
+/// `adapter` alone names a Slack identity (ADR-0168 decision 3); a non-Slack
+/// route sends `endpoint` and `adapter` together. `ChannelChange::resolve`
+/// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
+/// before this function ever sees the arguments, and clap's `--endpoint`
+/// `requires` `--adapter` covers the other direction.
 fn add_channel_body(
     kind: &str,
     address: &str,
@@ -3242,6 +3276,65 @@ impl ApiClient {
             .context("decoding created memory entry")
     }
 
+    /// The agent's effective memory guidance: `GET /agents/{id}/memory/guidance`.
+    pub async fn get_memory_guidance(&self, agent_id: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding memory guidance")
+    }
+
+    /// Store operator memory guidance: `PUT /agents/{id}/memory/guidance`.
+    /// Returns the effective guidance as the API stored it.
+    pub async fn put_memory_guidance(&self, agent_id: &str, text: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "text": text })),
+                "PUT /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "storing memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding stored memory guidance")
+    }
+
+    /// Remove operator memory guidance: `DELETE /agents/{id}/memory/guidance`.
+    pub async fn delete_memory_guidance(&self, agent_id: &str) -> Result<()> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "removing memory guidance").await?;
+        Ok(())
+    }
+
     /// The server's max page for `GET /work-items` (`limit` maximum 200 in
     /// `apps/api/openapi.json`), requested explicitly so a truncated answer is
     /// the API's `truncated` flag, never a silent default page.
@@ -3748,7 +3841,7 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
         mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY, MAX_OBSERVABILITY_METRIC_POINTS,
+        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3888,10 +3981,6 @@ mod tests {
         let error = prevalidate_series_span("hour", Some("1970-01-01T00:00:00Z"), None)
             .expect_err("a start of 1970 with no end exceeds the cap against now");
         assert!(error.to_string().contains("now"));
-        assert_eq!(
-            MAX_OBSERVABILITY_METRIC_POINTS, 1000,
-            "the pre-dispatch guard and the post-dispatch bound share one cap"
-        );
     }
 
     #[test]
@@ -3995,9 +4084,8 @@ mod tests {
     }
 
     #[test]
-    fn add_channel_body_keeps_the_custom_transport_form() {
-        // The pre-ADR non-Slack form is unchanged: endpoint and adapter still
-        // travel together.
+    fn add_channel_body_sends_a_non_slack_route_whole() {
+        // A non-Slack route's endpoint and adapter travel together.
         assert_eq!(
             add_channel_body(
                 "discord",

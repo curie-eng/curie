@@ -11,17 +11,14 @@ against the session's freshly-created, migrated disposable DB (conftest's
 
 import asyncio
 import uuid
-from pathlib import Path
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 
 def _column(sql: str) -> list[str]:
@@ -122,16 +119,15 @@ def test_public_schema_is_empty_after_migration(migrated: None) -> None:
 
 
 def test_reply_placeholder_becomes_nullable_without_rewriting_existing_strings(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The post once migration preserves old edit targets while allowing new ones."""
 
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    cfg = alembic_config()
 
     # Target the revision immediately before this migration. A relative revision
     # would silently stop testing this migration once a later one lands.
-    command.upgrade(cfg, "0024")
+    isolated_migration_db.at("0024")
     existing_id = uuid.uuid4()
     _insert_approval(existing_id, "p-existing")
 
@@ -151,11 +147,10 @@ def test_reply_placeholder_becomes_nullable_without_rewriting_existing_strings(
 
 
 def test_reply_placeholder_downgrade_refuses_null_rows(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    command.upgrade(cfg, "0025")
+    cfg = alembic_config()
+    isolated_migration_db.at("0025")
 
     approval_id = uuid.uuid4()
     _insert_approval(approval_id, None)

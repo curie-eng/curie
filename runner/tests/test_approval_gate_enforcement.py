@@ -808,6 +808,10 @@ def _options_from_boot(
     *,
     workspace_path: Path | None = None,
 ) -> Any:
+    # This suite verifies approval composition, not eligibility. Make its
+    # formerly implicit human-Slack boot explicit; default-off is pinned in
+    # test_harness_boot_wiring.py.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, workspace_path=workspace_path)
     session = runner._factory()
@@ -907,10 +911,11 @@ def test_boot_omits_request_approval_for_an_observed_read_only_bundle(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
 
+    # ``progress`` (ADR 0130) rides every non-factory session, gated or not.
     assert anyio.run(
         _mcp_tool_names,
         options.mcp_servers[APPROVAL_SERVER_NAME],
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
     assert "operations" not in options.mcp_servers  # plugin-loaded, not platform-mounted
     assert any(
         "request_approval omitted" in message
@@ -935,7 +940,7 @@ def test_boot_omits_request_approval_for_a_complete_empty_mcp_surface(
     assert anyio.run(
         _mcp_tool_names,
         options.mcp_servers[APPROVAL_SERVER_NAME],
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
 
 
 def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
@@ -969,7 +974,7 @@ def test_boot_omits_request_approval_when_permission_gates_already_exist(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
     names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
-    assert names == {"publish_changes"}
+    assert names == {"publish_changes", "progress"}
 
 
 def test_boot_omits_request_approval_for_tool_policy_approval_required(
@@ -990,7 +995,7 @@ def test_boot_omits_request_approval_for_tool_policy_approval_required(
 
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
     names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
-    assert names == {"publish_changes"}
+    assert names == {"publish_changes", "progress"}
 
 
 def test_boot_keeps_request_approval_when_gate_is_grantable_via_policy(
@@ -1128,7 +1133,7 @@ def test_publish_only_gate_does_not_recreate_the_generic_pager(
 
     assert anyio.run(
         _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
-    ) == {"publish_changes"}
+    ) == {"publish_changes", "progress"}
 
 
 # --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------

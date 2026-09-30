@@ -1858,6 +1858,7 @@ fn sre_approvals_route_map(
             approvers: Some(crate::api::ApprovalApprovers {
                 group: None,
                 users: Some(approvers.to_vec()),
+                emails: None,
             }),
         },
     );

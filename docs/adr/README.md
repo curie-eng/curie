@@ -203,4 +203,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
 | 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
 | 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
+| 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
+| 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
+| 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
+| 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
+| 0183 | [An email approval is answered only by a listed address](0183-an-email-approval-is-answered-only-by-a-listed-address.md) | Draft |
 <!-- END GENERATED: adr-index -->

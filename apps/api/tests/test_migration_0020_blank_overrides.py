@@ -23,17 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config
 from alembic import command
-from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
-
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Blanks the migration is responsible for. ASCII whitespace an operator or a
 # pre-#1355 client could realistically have stored: an empty value, spaces, and
@@ -139,14 +136,8 @@ def _read_overrides(agent_id: uuid.UUID) -> tuple[str | None, str | None]:
     return asyncio.run(_go())
 
 
-def _alembic_config() -> Config:
-    cfg = Config()
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    return cfg
-
-
 def test_the_backfill_clears_blank_overrides_and_leaves_real_values_alone(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The whole substance of 0020, on rows seeded before it runs.
 
@@ -155,8 +146,8 @@ def test_the_backfill_clears_blank_overrides_and_leaves_real_values_alone(
     re-run on the seeded rows -- the failure mode that makes a green migration
     test meaningless.
     """
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, "0019")
 
     blank_ids: dict[str, uuid.UUID] = {}
@@ -181,7 +172,7 @@ def test_the_backfill_clears_blank_overrides_and_leaves_real_values_alone(
 
 
 def test_the_backfill_is_idempotent_and_the_revision_round_trips(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """Re-running must be a no-op, and the downgrade must not undo the repair.
 
@@ -190,8 +181,8 @@ def test_the_backfill_is_idempotent_and_the_revision_round_trips(
     correctly-NULL row would be strictly worse than leaving the repair standing.
     This pins that as intended rather than as an omission.
     """
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, "0019")
 
     blanked = _seed_agent("round-trip", "CMIGRTRP0", "  ", "")
@@ -209,7 +200,7 @@ def test_the_backfill_is_idempotent_and_the_revision_round_trips(
 
 
 def test_a_unicode_blank_survives_and_that_boundary_is_deliberate(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """Pin the measured edge of the predicate instead of leaving it unknown.
 
@@ -223,8 +214,8 @@ def test_a_unicode_blank_survives_and_that_boundary_is_deliberate(
     down, and it fails loudly the moment someone widens the predicate without
     deciding to.
     """
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, "0019")
 
     exotic = _seed_agent("nbsp", "CMIGNBSP0", SURVIVES_BY_DESIGN, SURVIVES_BY_DESIGN)
@@ -239,14 +230,14 @@ def test_a_unicode_blank_survives_and_that_boundary_is_deliberate(
 
 @pytest.mark.parametrize("column", ["model", "thinking"])
 def test_each_column_is_repaired_independently(
-    isolated_migration_db: None, column: str
+    isolated_migration_db: IsolatedMigrationDb, column: str
 ) -> None:
     """Both columns, asserted separately, so one statement covering the other is
     not mistaken for both working. 0020 loops over a NAMED list; a third override
     added to the schema and not to that list would slip through, and this is the
     shape that notices."""
-    cfg = _alembic_config()
-    command.upgrade(cfg, "head")
+    cfg = alembic_config()
+    isolated_migration_db.at("head")
     command.downgrade(cfg, "0019")
 
     values: dict[str, Any] = {"model": None, "thinking": None}

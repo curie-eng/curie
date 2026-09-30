@@ -31,9 +31,9 @@ quietly sharing one runner.
 from __future__ import annotations
 
 import asyncio
-import time
+import sys
 import uuid
-from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from aci_protocol import (
@@ -45,6 +45,11 @@ from aci_protocol import (
     TurnSource,
 )
 from curie_worker.kernel import ThreadBusyError
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 DONE = SessionStatus.DONE
 
@@ -95,15 +100,6 @@ def _hook_event(
         received_at="2026-08-29T00:00:00+00:00",
         source=TurnSource.WEBHOOK,
     )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 def _park_every_runner(h, hold: asyncio.Event) -> None:

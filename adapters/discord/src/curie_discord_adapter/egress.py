@@ -2,7 +2,15 @@
 
 from typing import Protocol
 
-from channel_protocol import ReplyAck, ReplyEvent, ReplyPost, ReplyUpdate, TurnCompleted, TurnStatus
+from channel_protocol import (
+    ReplyAck,
+    ReplyEvent,
+    ReplyPost,
+    ReplyUpdate,
+    TurnCompleted,
+    TurnStatus,
+    progress_text,
+)
 
 from .state import DiscordState
 
@@ -43,10 +51,34 @@ class DiscordReplyService:
             return ReplyAck(ref=None)
         channel_id = event.target.conversation_id or event.target.address
         if isinstance(event, ReplyPost):
-            ref = await self._discord.post_message(channel_id, event.message.text)
+            # A 1.1 post is keyed by its delivery_id (ADR-0130 d4): a redelivery
+            # answers with the message the first attempt created.
+            if event.delivery_id is not None:
+                known = self._state.posted_message(event.delivery_id)
+                if known is not None:
+                    return ReplyAck(ref=known)
+            text = (
+                progress_text(event.progress)
+                if event.progress is not None
+                else event.message.text
+            )
+            ref = await self._discord.post_message(channel_id, text)
+            if event.delivery_id is not None:
+                self._state.remember_post(event.delivery_id, ref)
             return ReplyAck(ref=ref)
         if not isinstance(event, ReplyUpdate):
             raise TypeError(f"unsupported reply event {type(event).__name__}")
+        if event.progress is not None:
+            # A card edit (ADR-0130 d5) carries no answer text. It edits the card
+            # and nothing else, so it never reaches the continuation logic below.
+            if event.target.reply_ref is None:
+                raise ValueError(
+                    "reply.update carrying progress needs the progress card's reply_ref"
+                )
+            await self._discord.edit_message(
+                channel_id, event.target.reply_ref, progress_text(event.progress)
+            )
+            return ReplyAck(ref=event.target.reply_ref)
         text = (
             event.text
             if event.text is not None
@@ -60,8 +92,14 @@ class DiscordReplyService:
                 text = f"{text}\n\n{event.settled.decision.title()} by {resolver}."
         chunks = split_discord_text(text)
         reply_ref = event.target.reply_ref
+        if reply_ref is None and event.delivery_id is not None:
+            # A placeholderless answer redelivered under its delivery_id edits
+            # the message its first attempt posted instead of posting another.
+            reply_ref = self._state.posted_message(event.delivery_id)
         if reply_ref is None:
             ref = await self._discord.post_message(channel_id, chunks[0])
+            if event.delivery_id is not None:
+                self._state.remember_post(event.delivery_id, ref)
             reply_ref = ref
         else:
             await self._discord.edit_message(channel_id, reply_ref, chunks[0])

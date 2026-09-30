@@ -700,7 +700,103 @@ fn resolve_preserved_values(
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
     all.extend(resolve_preserved_sealing_values(existing, operator_sets));
+    all.extend(resolve_credential_values(
+        existing,
+        operator_sets,
+        crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS,
+    ));
     all
+}
+
+/// What `cluster up` does with the connector caller key pair (ADR-0168
+/// decision 7), decided as the sealing key's is: an operator `--set` or a
+/// named Secret wins, a recorded pair comes back unchanged, and only a release
+/// with none gains one. `--dev` mints none, as it mints no sealing key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallerKeyDisposition {
+    OperatorSet,
+    External,
+    Preserved,
+    Deferred,
+    Generated,
+}
+
+fn connector_caller_key_disposition(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> CallerKeyDisposition {
+    use crate::connector_caller::{
+        CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY,
+    };
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) || set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return CallerKeyDisposition::OperatorSet;
+    }
+    let named = operator_set_entries(operator_sets)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key.trim() == CONNECTOR_CALLER_EXISTING_SECRET)
+        .map(|(_, value)| !value.is_empty())
+        .unwrap_or_else(|| preserved_value(existing, CONNECTOR_CALLER_EXISTING_SECRET).is_some());
+    if named {
+        return CallerKeyDisposition::External;
+    }
+    if preserved_value(existing, CONNECTOR_CALLER_SIGNING_KEY).is_some() {
+        return CallerKeyDisposition::Preserved;
+    }
+    if dry_run {
+        CallerKeyDisposition::Deferred
+    } else {
+        CallerKeyDisposition::Generated
+    }
+}
+
+/// Refuse a `--set` of only one half of the connector caller key pair. The
+/// recorded other half would come back beside it, so the worker would sign
+/// with one key while every caller proxy verifies with the other, and every
+/// hosted connector would refuse every caller.
+fn refuse_half_a_caller_key_pair(operator_sets: &[String]) -> Result<()> {
+    use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) == set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to set only one half of the connector caller key pair: set both \
+         {CONNECTOR_CALLER_SIGNING_KEY} and {CONNECTOR_CALLER_VERIFY_KEY}, or neither"
+    ))
+    .with_fix(format!(
+        "pass {CONNECTOR_CALLER_VERIFY_KEY} as the public key of the \
+         {CONNECTOR_CALLER_SIGNING_KEY} you set, in the same run"
+    ))
+    .into())
+}
+
+/// The connector caller key pair to add to the values file: a new pair only
+/// when the release records none, names no Secret, and the operator set none.
+/// A recorded pair already rides [`resolve_preserved_values`].
+fn generate_connector_caller_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> Result<Vec<(String, String)>> {
+    if connector_caller_key_disposition(existing, operator_sets, dry_run)
+        != CallerKeyDisposition::Generated
+    {
+        return Ok(Vec::new());
+    }
+    let pair = crate::connector_caller::generate_keypair()?;
+    Ok(vec![
+        (
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY.to_string(),
+            pair.signing_key,
+        ),
+        (
+            crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY.to_string(),
+            pair.verify_key,
+        ),
+    ])
 }
 
 /// Resolve managed values for an actual or previewed `cluster up`.
@@ -892,6 +988,124 @@ mod sealing_preservation_tests {
         let sets = vec![format!("{}=mine", crate::sealing::SEALING_PRIVATE_KEY)];
         let resolved = resolve_sealing_values(None, &sets);
         assert!(get(&resolved, crate::sealing::SEALING_PRIVATE_KEY).is_none());
+    }
+}
+
+#[cfg(test)]
+mod connector_caller_preservation_tests {
+    use super::*;
+    use crate::connector_caller::{
+        verify_key_of, CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_MANAGED_KEYS,
+        CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY, CONNECTOR_CALLER_SIGNING_KEY,
+        CONNECTOR_CALLER_VERIFY_KEY,
+    };
+
+    // The first frozen seed and its public key
+    // (tests/vectors/connector-caller-token.json).
+    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const PUBLIC: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+
+    fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn recorded() -> serde_json::Value {
+        serde_json::json!({"connectorCaller": {"signingKey": SEED, "verifyKey": PUBLIC}})
+    }
+
+    /// A plain `cluster up` drops anything it does not re-pass, and a new pair
+    /// makes every live sandbox's token unverifiable.
+    #[test]
+    fn an_upgrade_re_supplies_the_recorded_pair_unchanged() {
+        let all = resolve_preserved_values(Some(&recorded()), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_SIGNING_KEY), Some(SEED));
+        assert_eq!(get(&all, CONNECTOR_CALLER_VERIFY_KEY), Some(PUBLIC));
+        assert!(
+            generate_connector_caller_values(Some(&recorded()), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_generates_a_real_pair() {
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        let seed = get(&generated, CONNECTOR_CALLER_SIGNING_KEY).expect("generated");
+        let public = get(&generated, CONNECTOR_CALLER_VERIFY_KEY).expect("generated");
+        assert_eq!(verify_key_of(seed).unwrap(), public);
+    }
+
+    /// How an install that predates the caller proxy starts enforcing.
+    #[test]
+    fn an_existing_release_without_a_pair_gains_one() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let generated = generate_connector_caller_values(Some(&existing), &[], false).unwrap();
+        assert_eq!(generated.len(), 2);
+    }
+
+    #[test]
+    fn a_named_secret_is_never_shadowed_by_a_generated_pair() {
+        let existing = serde_json::json!({"connectorCaller": {"existingSecret": "acme-caller"}});
+        assert!(
+            generate_connector_caller_values(Some(&existing), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+        let sets = vec![format!("{CONNECTOR_CALLER_EXISTING_SECRET}=acme-caller")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&all, CONNECTOR_CALLER_EXISTING_SECRET),
+            Some("acme-caller")
+        );
+    }
+
+    #[test]
+    fn an_operator_set_wins() {
+        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={SEED}")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            get(
+                &resolve_preserved_values(Some(&recorded()), &sets),
+                CONNECTOR_CALLER_SIGNING_KEY
+            ),
+            None
+        );
+    }
+
+    /// An offline preview has no evidence the release lacks a pair.
+    #[test]
+    fn a_dry_run_generates_nothing() {
+        assert!(generate_connector_caller_values(None, &[], true)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Preserved while a rotation overlaps, and never invented.
+    #[test]
+    fn a_previous_key_is_preserved_and_never_generated() {
+        let existing = serde_json::json!({"connectorCaller": {
+            "signingKey": SEED, "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
+        }});
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY), Some("OLD"));
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        assert!(get(&generated, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY).is_none());
+    }
+
+    /// `curie diff` must not report a reset of a key `up` hands straight back.
+    #[test]
+    fn diff_agrees_with_every_caller_key_up_re_supplies() {
+        for key in CONNECTOR_CALLER_MANAGED_KEYS {
+            assert!(is_preserved_by_up(key), "{key}");
+        }
     }
 }
 
@@ -1372,6 +1586,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS.contains(&key)
         || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
@@ -2001,6 +2216,7 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    refuse_half_a_caller_key_pair(&operator_sets)?;
     let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
     if preserved_value(existing, &sealing_source).is_some()
         && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
@@ -2041,6 +2257,11 @@ fn complete_up_opts_without_runner_egress(
             &operator_sets,
             opts.common.dry_run,
         ));
+        opts.secrets.extend(generate_connector_caller_values(
+            existing,
+            &operator_sets,
+            opts.common.dry_run,
+        )?);
     } else {
         // `--dev` keeps the chart's published credential defaults (#195) and
         // must not mint a sealing key, but it is still a FULL helm upgrade:
@@ -2116,6 +2337,7 @@ fn overlay_overridden_keys(
         .iter()
         .chain(GITHUB_APP_MANAGED_KEYS)
         .chain(crate::sealing::SEALING_MANAGED_KEYS)
+        .chain(crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS)
         .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
         .chain(GITHUB_TOKEN_REFERENCE_KEYS)
     {
@@ -2181,6 +2403,9 @@ fn overlay_family_is_managed(key: &str) -> bool {
             .iter()
             .any(|(managed, _)| key_is_or_descends_from(key, managed))
         || crate::sealing::SEALING_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS
             .iter()
             .any(|managed| key_is_or_descends_from(key, managed))
         || key_is_or_descends_from(key, GITHUB_TOKEN_KEY)
@@ -3567,6 +3792,250 @@ struct RunningGvisorEventWatch {
     existing_event_uids: BTreeSet<String>,
 }
 
+fn admission_text<'a>(value: &'a serde_json::Value, pointer: &str) -> &'a str {
+    value
+        .pointer(pointer)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+fn admission_event_count(event: &serde_json::Value) -> u64 {
+    ["/count", "/series/count"]
+        .into_iter()
+        .filter_map(|pointer| event.pointer(pointer).and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0)
+}
+
+fn admission_event_time(event: &serde_json::Value) -> Option<time::OffsetDateTime> {
+    [
+        "/series/lastObservedTime",
+        "/lastTimestamp",
+        "/eventTime",
+        "/metadata/creationTimestamp",
+    ]
+    .into_iter()
+    .filter_map(|pointer| {
+        time::OffsetDateTime::parse(
+            admission_text(event, pointer),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()
+    })
+    .max()
+}
+
+fn fresh_admission_event(event: &serde_json::Value, baseline: &[serde_json::Value]) -> bool {
+    let uid = admission_text(event, "/metadata/uid");
+    if uid.is_empty() {
+        return false;
+    }
+    // The complete snapshot is the freshness boundary. Comparing the cluster's
+    // timestamps to this host's clock would discard events under clock skew.
+    match baseline
+        .iter()
+        .find(|old| admission_text(old, "/metadata/uid") == uid)
+    {
+        Some(old) => {
+            admission_event_count(event) > admission_event_count(old)
+                || admission_event_time(event) > admission_event_time(old)
+        }
+        None => true,
+    }
+}
+
+fn admission_controller_owned(
+    controller: &serde_json::Value,
+    common: &CommonOpts,
+    namespace: &str,
+) -> bool {
+    if admission_text(controller, "/metadata/namespace") != namespace {
+        return false;
+    }
+    if namespace != common.namespace
+        && (namespace != CONTROLLER_DEPLOYMENT_NAMESPACE
+            || admission_text(controller, "/kind") != "Deployment"
+            || admission_text(controller, "/metadata/name") != CONTROLLER_DEPLOYMENT_NAME)
+    {
+        return false;
+    }
+    if admission_text(
+        controller,
+        "/metadata/annotations/meta.helm.sh~1release-name",
+    ) == common.release
+        && admission_text(
+            controller,
+            "/metadata/annotations/meta.helm.sh~1release-namespace",
+        ) == common.namespace
+    {
+        return true;
+    }
+    // Helm creates hook manifests directly, without the ownership annotations
+    // it adds to ordinary resources. The chart supplies their release labels.
+    admission_text(controller, "/kind") == "Job"
+        && admission_text(controller, "/metadata/labels/app.kubernetes.io~1instance")
+            == common.release
+        && admission_text(controller, "/metadata/labels/app.kubernetes.io~1managed-by") == "Helm"
+        && admission_text(controller, "/metadata/annotations/helm.sh~1hook")
+            .split(',')
+            .any(|hook| {
+                matches!(
+                    hook.trim(),
+                    "pre-install" | "post-install" | "pre-upgrade" | "post-upgrade"
+                )
+            })
+}
+
+fn admission_event_owned(
+    event: &serde_json::Value,
+    controllers: &[serde_json::Value],
+    common: &CommonOpts,
+    namespace: &str,
+) -> bool {
+    let uid = admission_text(event, "/involvedObject/uid");
+    let kind = admission_text(event, "/involvedObject/kind");
+    let name = admission_text(event, "/involvedObject/name");
+    if uid.is_empty()
+        || name.is_empty()
+        || admission_text(event, "/involvedObject/namespace") != namespace
+        || !matches!(
+            kind,
+            "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job"
+        )
+    {
+        return false;
+    }
+    let Some(controller) = controllers.iter().find(|controller| {
+        admission_text(controller, "/metadata/uid") == uid
+            && admission_text(controller, "/metadata/name") == name
+            && admission_text(controller, "/metadata/namespace") == namespace
+            && admission_text(controller, "/kind") == kind
+    }) else {
+        return false;
+    };
+    if kind != "ReplicaSet" {
+        return admission_controller_owned(controller, common, namespace);
+    }
+    controller
+        .pointer("/metadata/ownerReferences")
+        .and_then(|owners| owners.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|owner| {
+            owner.get("controller").and_then(|v| v.as_bool()) == Some(true)
+                && admission_text(owner, "/kind") == "Deployment"
+                && !admission_text(owner, "/uid").is_empty()
+        })
+        .any(|owner| {
+            controllers.iter().any(|parent| {
+                admission_text(parent, "/kind") == "Deployment"
+                    && admission_text(parent, "/metadata/uid") == admission_text(owner, "/uid")
+                    && admission_text(parent, "/metadata/name") == admission_text(owner, "/name")
+                    && admission_controller_owned(parent, common, namespace)
+            })
+        })
+}
+
+async fn admission_objects(namespace: &str, resources: &str) -> Option<Vec<serde_json::Value>> {
+    let mut args = vec![
+        plain("get"),
+        plain(resources),
+        plain("-n"),
+        plain(namespace),
+    ];
+    if resources == "events" {
+        args.extend([plain("--field-selector"), plain("reason=FailedCreate")]);
+    }
+    args.extend([plain("-o"), plain("json")]);
+    let cmd = OpsCommand::new("kubectl", args);
+    let (ok, out, _) = tokio::time::timeout(Duration::from_secs(3), run_capture(&cmd))
+        .await
+        .ok()?
+        .ok()?;
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()?
+        .get("items")?
+        .as_array()
+        .cloned()
+}
+
+fn admission_rejection_excerpt(message: &str) -> String {
+    let printable: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let single_line = printable.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = crate::connectors::redact_last_log(&single_line, &BTreeMap::new());
+    let mut excerpt: String = redacted.chars().take(1024).collect();
+    if redacted.chars().count() > 1024 {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
+async fn observe_admission_rejection(
+    common: &CommonOpts,
+    namespace: &str,
+    baseline: Option<Vec<serde_json::Value>>,
+    gvisor_job: Option<&str>,
+) -> String {
+    let Some(baseline) = baseline else {
+        crate::ui::ui().plumbing(&format!(
+            "admission event snapshot unavailable in namespace {namespace}; retaining Helm wait for that namespace"
+        ));
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(events) = admission_objects(namespace, "events").await {
+            let candidates: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    let message = admission_text(event, "/message");
+                    admission_text(event, "/reason") == "FailedCreate"
+                        && message.to_ascii_lowercase().contains("is forbidden:")
+                        && fresh_admission_event(event, &baseline)
+                        // The existing gVisor observer owns its inference and retry.
+                        && !(namespace == common.namespace && gvisor_job.is_some_and(|job| {
+                            admission_text(event, "/involvedObject/kind") == "Job"
+                                && admission_text(event, "/involvedObject/name") == job
+                        }) && message.contains("RuntimeClass \"gvisor\" not found"))
+                })
+                .collect();
+            if !candidates.is_empty() {
+                if let Some(controllers) = admission_objects(
+                    namespace,
+                    "deployments,statefulsets,daemonsets,replicasets,jobs",
+                )
+                .await
+                {
+                    for event in candidates {
+                        if admission_event_owned(event, &controllers, common, namespace) {
+                            return format!(
+                                "FailedCreate on {}/{} in namespace {namespace}: \"{}\"",
+                                admission_text(event, "/involvedObject/kind"),
+                                admission_text(event, "/involvedObject/name"),
+                                admission_rejection_excerpt(admission_text(event, "/message")),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 fn gvisor_event_selector(namespace: &str, job: &str) -> String {
     format!(
         "involvedObject.kind=Job,involvedObject.namespace={namespace},involvedObject.name={job},reason=FailedCreate"
@@ -3758,32 +4227,61 @@ async fn terminate_helm_process(child: &mut Child) -> std::io::Result<std::proce
     terminate_process(child).await
 }
 
-enum GvisorInstallRace {
+enum InstallRace {
     Helm(std::io::Result<std::process::ExitStatus>),
     RuntimeClassRejected(String),
+    AdmissionRejected(String),
 }
 
-enum GvisorInstallOutcome {
+enum InstallOutcome {
     Installed,
     RuntimeClassRejected {
         rejection: String,
         step: crate::ui::Step,
     },
+    AdmissionRejected(String),
 }
 
-async fn run_install_with_gvisor_observer(
+fn admission_install_error(rejection: String, invocation: UpInvocation) -> anyhow::Error {
+    crate::exit::CliError::failure(format!(
+        "Helm installation stopped after Kubernetes rejected pod creation: {rejection}"
+    ))
+    .with_fix(match invocation {
+        UpInvocation::ClusterUp => "correct the reported admission rejection and rerun `curie cluster up`",
+        UpInvocation::Apply => "correct the reported admission rejection in `curie.yaml` or the cluster and rerun `curie apply`",
+    })
+    .into()
+}
+
+async fn run_install_with_observers(
     cl: &crate::ui::Checklist,
     label: &str,
     ok_detail: &str,
     cmd: &OpsCommand,
-    namespace: &str,
-    job: &str,
-    namespace_existed_before_install: bool,
-) -> Result<GvisorInstallOutcome> {
+    common: &CommonOpts,
+    job: Option<&str>,
+    namespace_states: &[(String, bool)],
+) -> Result<InstallOutcome> {
     let ui = crate::ui::ui();
+    let namespace = &common.namespace;
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
-    let mut watch_start = if namespace_existed_before_install {
+    let namespace_existed_before_install = namespace_states
+        .iter()
+        .find_map(|(name, existed)| (name == namespace).then_some(*existed))
+        .expect("install observers include the release namespace");
+    let admission_baselines = futures_util::future::join_all(namespace_states.iter().map(
+        |(namespace, existed)| async move {
+            let baseline = if *existed {
+                admission_objects(namespace, "events").await
+            } else {
+                Some(Vec::new())
+            };
+            (namespace.clone(), baseline)
+        },
+    ))
+    .await;
+    let mut watch_start = if let Some(job) = job.filter(|_| namespace_existed_before_install) {
         Some(match gvisor_existing_event_uids(namespace, job).await {
             Some(existing_event_uids) => {
                 start_gvisor_event_watch(namespace, job, existing_event_uids)
@@ -3805,7 +4303,7 @@ async fn run_install_with_gvisor_observer(
     };
 
     let mut early_helm_status = None;
-    if !namespace_existed_before_install {
+    if let Some(job) = job.filter(|_| !namespace_existed_before_install) {
         // Helm owns `--create-namespace`. Wait for that one object, then use a
         // single list and watch request that cannot lose an Event between calls.
         let mut retry_delay = Duration::from_millis(50);
@@ -3842,52 +4340,58 @@ async fn run_install_with_gvisor_observer(
         }
     }
 
-    let watch_start = watch_start.unwrap_or(GvisorEventWatchStart::Unavailable);
-    let mut watch = None;
+    let mut watch = match watch_start {
+        Some(GvisorEventWatchStart::Watching(watch)) => Some(*watch),
+        _ => None,
+    };
     let race = if let Some(status) = early_helm_status {
-        GvisorInstallRace::Helm(status)
+        InstallRace::Helm(status)
     } else {
-        match watch_start {
-            GvisorEventWatchStart::Watching(running_watch) => {
-                watch = Some(*running_watch);
-                let running_watch = watch.as_mut().expect("watch was just installed");
-                let existing_event_uids = running_watch.existing_event_uids.clone();
-                loop {
-                    let outcome = tokio::select! {
-                        status = install.child.wait() => Some(GvisorInstallRace::Helm(status)),
-                        line = running_watch.stdout.next_line() => {
-                            match line {
-                                Ok(Some(line)) => match gvisor_event_watch_line(
+        let admission = futures_util::future::select_all(admission_baselines.into_iter().map(
+            |(namespace, baseline)| {
+                Box::pin(async move {
+                    observe_admission_rejection(common, &namespace, baseline, job).await
+                })
+            },
+        ));
+        tokio::pin!(admission);
+        loop {
+            tokio::select! {
+                line = async {
+                    match watch.as_mut() {
+                        Some(watch) => watch.stdout.next_line().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match line {
+                        Ok(Some(line)) => {
+                            let running_watch = watch.as_ref().expect("watch yielded a line");
+                            if let GvisorEventWatchLine::RuntimeClassRejected(rejection) =
+                                gvisor_event_watch_line(
                                     &line,
                                     namespace,
-                                    job,
-                                    &existing_event_uids,
-                                ) {
-                                    GvisorEventWatchLine::RuntimeClassRejected(rejection) => {
-                                        Some(GvisorInstallRace::RuntimeClassRejected(rejection))
-                                    }
-                                    GvisorEventWatchLine::Ignore => None,
-                                },
-                                Ok(None) | Err(_) => {
-                                    stop_gvisor_event_watch(running_watch).await;
-                                    Some(GvisorInstallRace::Helm(install.child.wait().await))
-                                }
+                                    job.expect("gVisor watch requires a rendered Job"),
+                                    &running_watch.existing_event_uids,
+                                )
+                            {
+                                break InstallRace::RuntimeClassRejected(rejection);
                             }
                         }
-                    };
-                    if let Some(outcome) = outcome {
-                        break outcome;
+                        Ok(None) | Err(_) => {
+                            if let Some(mut stopped) = watch.take() {
+                                stop_gvisor_event_watch(&mut stopped).await;
+                            }
+                        }
                     }
                 }
-            }
-            GvisorEventWatchStart::Unavailable => {
-                GvisorInstallRace::Helm(install.child.wait().await)
+                rejection = &mut admission => break InstallRace::AdmissionRejected(rejection.0),
+                status = install.child.wait() => break InstallRace::Helm(status),
             }
         }
     };
 
     match race {
-        GvisorInstallRace::Helm(status) => {
+        InstallRace::Helm(status) => {
             if let Some(watch) = watch.as_mut() {
                 stop_gvisor_event_watch(watch).await;
             }
@@ -3895,7 +4399,7 @@ async fn run_install_with_gvisor_observer(
             match captured {
                 Ok((ok, out, err)) => {
                     finish_captured_step(step, ok_detail, cmd, ok, out, err)?;
-                    Ok(GvisorInstallOutcome::Installed)
+                    Ok(InstallOutcome::Installed)
                 }
                 Err(error) => {
                     step.fail("failed");
@@ -3903,12 +4407,20 @@ async fn run_install_with_gvisor_observer(
                 }
             }
         }
-        GvisorInstallRace::RuntimeClassRejected(rejection) => {
+        InstallRace::RuntimeClassRejected(rejection) => {
             if let Some(watch) = watch.as_mut() {
                 stop_gvisor_event_watch(watch).await;
             }
             install.terminate().await;
-            Ok(GvisorInstallOutcome::RuntimeClassRejected { rejection, step })
+            Ok(InstallOutcome::RuntimeClassRejected { rejection, step })
+        }
+        InstallRace::AdmissionRejected(rejection) => {
+            if let Some(watch) = watch.as_mut() {
+                stop_gvisor_event_watch(watch).await;
+            }
+            install.terminate().await;
+            step.fail("admission rejected");
+            Ok(InstallOutcome::AdmissionRejected(rejection))
         }
     }
 }
@@ -4228,6 +4740,11 @@ async fn run_prepared_up(
             | SealingPrivateKeyDisposition::Preserved
             | SealingPrivateKeyDisposition::External => {}
         }
+        if connector_caller_key_disposition(existing.as_ref(), &operator_sets, opts.common.dry_run)
+            == CallerKeyDisposition::Generated
+        {
+            ui.note("generated a connector caller key pair for this release; later cluster up runs preserve it");
+        }
         if existing.is_none() && !opts.common.dry_run {
             let generated_required_secrets = opts
                 .secrets
@@ -4455,10 +4972,6 @@ async fn run_prepared_up(
         );
         return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
-    let release_namespace_existed_before_install = ownership_candidates
-        .iter()
-        .find_map(|(namespace, existed)| (namespace == &opts.common.namespace).then_some(*existed))
-        .unwrap_or(false);
     require_on_path("helm")?;
     if detect_facts {
         for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
@@ -4470,6 +4983,19 @@ async fn run_prepared_up(
     } else {
         preflight_priority_class_ownership(&opts, &value_plan).await?;
     }
+    let observe_controller = value_plan
+        .effective_values()
+        .get(CONTROLLER_DEPLOY_KEY)
+        .map(String::as_str)
+        != Some("false");
+    let admission_namespaces: Vec<_> = ownership_candidates
+        .iter()
+        .filter(|(namespace, _)| {
+            namespace == &opts.common.namespace
+                || (observe_controller && namespace == CONTROLLER_DEPLOYMENT_NAMESPACE)
+        })
+        .cloned()
+        .collect();
     cmds = up_commands_with_plan(&opts, &value_plan);
     let gvisor_preflight_job =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
@@ -4485,65 +5011,92 @@ async fn run_prepared_up(
         return Err(convergence::installation_failure(&opts.common, error, invocation).await);
     }
     for cmd in &cmds {
-        if let Some(job) = gvisor_preflight_job.as_deref() {
-            let outcome = match run_install_with_gvisor_observer(
-                &cl,
-                &label,
-                "installed",
-                cmd,
-                &opts.common.namespace,
-                job,
-                release_namespace_existed_before_install,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return Err(
-                        convergence::installation_failure(&opts.common, error, invocation).await,
-                    )
-                }
-            };
-            match outcome {
-                GvisorInstallOutcome::Installed => {}
-                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
-                    if let Some(mode @ ("auto" | "require")) =
-                        final_operator_value(&opts, GVISOR_MODE_KEY)
-                    {
-                        step.fail("failed");
-                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
-                        let fix = format!(
+        let outcome = match run_install_with_observers(
+            &cl,
+            &label,
+            "installed",
+            cmd,
+            &opts.common,
+            gvisor_preflight_job.as_deref(),
+            &admission_namespaces,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(
+                    convergence::installation_failure(&opts.common, error, invocation).await,
+                )
+            }
+        };
+        match outcome {
+            InstallOutcome::Installed => {}
+            InstallOutcome::AdmissionRejected(rejection) => {
+                return Err(admission_install_error(rejection, invocation));
+            }
+            InstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
+                if let Some(mode @ ("auto" | "require")) =
+                    final_operator_value(&opts, GVISOR_MODE_KEY)
+                {
+                    step.fail("failed");
+                    let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                    let fix = format!(
                             "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
                         );
-                        return Err(crate::exit::CliError::usage(format!(
+                    return Err(crate::exit::CliError::usage(format!(
                             "explicit `{assignment}` contradicts the detected admission result `{rejection}`; {fix}"
                         ))
                         .with_fix(fix)
                         .into());
+                }
+                step.warn("retrying");
+                value_plan.set(GVISOR_MODE_KEY, "off");
+                ClusterUpInference::GvisorOff.render(ui);
+                if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
+                    &cl,
+                    &opts.common,
+                    false,
+                    invocation,
+                )
+                .await
+                {
+                    return Err(
+                        convergence::installation_failure(&opts.common, error, invocation).await,
+                    );
+                }
+                let retry = up_commands_with_plan(&opts, &value_plan)
+                    .into_iter()
+                    .next()
+                    .expect("cluster up always has one Helm command");
+                let retry_namespace_states =
+                    futures_util::future::try_join_all(admission_namespaces.iter().map(
+                        |(namespace, _)| async move {
+                            Ok::<_, anyhow::Error>((
+                                namespace.clone(),
+                                namespace_exists(namespace).await?,
+                            ))
+                        },
+                    ))
+                    .await?;
+                match run_install_with_observers(
+                    &cl,
+                    &label,
+                    "installed",
+                    &retry,
+                    &opts.common,
+                    None,
+                    &retry_namespace_states,
+                )
+                .await
+                {
+                    Ok(InstallOutcome::Installed) => {}
+                    Ok(InstallOutcome::AdmissionRejected(rejection)) => {
+                        return Err(admission_install_error(rejection, invocation));
                     }
-                    step.warn("retrying");
-                    value_plan.set(GVISOR_MODE_KEY, "off");
-                    ClusterUpInference::GvisorOff.render(ui);
-                    if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
-                        &cl,
-                        &opts.common,
-                        false,
-                        invocation,
-                    )
-                    .await
-                    {
-                        return Err(convergence::installation_failure(
-                            &opts.common,
-                            error,
-                            invocation,
-                        )
-                        .await);
+                    Ok(InstallOutcome::RuntimeClassRejected { .. }) => {
+                        unreachable!("gVisor observer is disabled after retry inference");
                     }
-                    let retry = up_commands_with_plan(&opts, &value_plan)
-                        .into_iter()
-                        .next()
-                        .expect("cluster up always has one Helm command");
-                    if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
+                    Err(error) => {
                         return Err(convergence::installation_failure(
                             &opts.common,
                             error,
@@ -4552,25 +5105,22 @@ async fn run_prepared_up(
                         .await);
                     }
                 }
-                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
-                    step.fail("failed");
-                    let fix = invocation.gvisor_fix();
-                    let instruction = match invocation {
-                        UpInvocation::ClusterUp => format!("run `{fix}`"),
-                        UpInvocation::Apply => fix.to_string(),
-                    };
-                    return Err(crate::exit::CliError::failure(format!(
+            }
+            InstallOutcome::RuntimeClassRejected { rejection, step } => {
+                step.fail("failed");
+                let job = gvisor_preflight_job
+                    .as_deref()
+                    .expect("gVisor watch requires a rendered Job");
+                let fix = invocation.gvisor_fix();
+                let instruction = match invocation {
+                    UpInvocation::ClusterUp => format!("run `{fix}`"),
+                    UpInvocation::Apply => fix.to_string(),
+                };
+                return Err(crate::exit::CliError::failure(format!(
                         "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, {instruction}."
                     ))
                     .with_fix(fix)
                     .into());
-                }
-            }
-        } else {
-            if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
-                return Err(
-                    convergence::installation_failure(&opts.common, error, invocation).await,
-                );
             }
         }
     }
@@ -4616,26 +5166,34 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    fn opts() -> UpOpts {
+        UpOpts {
+            retained_mail_values: None,
+            common: common(),
+            chart: "charts/curie".into(),
+            no_expose: true,
+            set: vec![],
+            set_string: vec![],
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+            secrets: vec![],
+            github_token: GithubTokenPlan::Untouched,
+            dev: false,
+            adopt: false,
+        }
+    }
+
     fn mail_upgrade_opts(existing: &serde_json::Value, set: Vec<String>) -> UpOpts {
         complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                chart: "charts/curie".into(),
-                no_expose: true,
                 set,
-                set_string: vec![],
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
-                secrets: vec![],
-                github_token: GithubTokenPlan::Untouched,
                 dev: true,
-                adopt: false,
+                ..opts()
             },
             Some(existing),
             None,
@@ -4816,23 +5374,8 @@ mod tests {
     #[test]
     fn up_defaults_expose_ui_and_langfuse() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         assert_eq!(cmds.len(), 1);
         let line = cmds[0].display();
@@ -4861,23 +5404,8 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
                 no_expose: false,
-                set: vec![],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                ..opts()
             },
             Some(&existing),
             None,
@@ -4917,26 +5445,11 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
                 set_string: vec![
                     "worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL".into(),
                     "worker.extraEnv[0].value=https://operator.example.com/v1".into(),
                 ],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                ..opts()
             },
             Some(&existing),
             None,
@@ -4972,32 +5485,9 @@ mod tests {
                 }]
             }
         });
-        let opts = complete_up_opts_without_runner_egress(
-            UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
-            },
-            Some(&existing),
-            None,
-            false,
-            true,
-        )
-        .unwrap();
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
+                .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -5036,32 +5526,9 @@ mod tests {
                 }
             }
         });
-        let opts = complete_up_opts_without_runner_egress(
-            UpOpts {
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                retained_mail_values: None,
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
-            },
-            Some(&existing),
-            None,
-            false,
-            true,
-        )
-        .unwrap();
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
+                .unwrap();
 
         let effective = up_value_plan(&opts).effective_values();
         assert_eq!(
@@ -5199,32 +5666,9 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
         });
-        let opts = complete_up_opts_without_runner_egress(
-            UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
-            },
-            Some(&existing),
-            None,
-            false,
-            true,
-        )
-        .unwrap();
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
+                .unwrap();
 
         let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
         let argv = materialized.argv().join(" ");
@@ -5248,23 +5692,8 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
                 set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                ..opts()
             },
             Some(&existing),
             None,
@@ -5295,23 +5724,8 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
                 set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                ..opts()
             },
             Some(&existing),
             None,
@@ -5341,32 +5755,9 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": recorded }
         });
-        let opts = complete_up_opts_without_runner_egress(
-            UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
-                set: vec![],
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
-            },
-            Some(&existing),
-            None,
-            false,
-            true,
-        )
-        .unwrap();
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
+                .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -5400,25 +5791,7 @@ mod tests {
             None,
         ] {
             let opts = complete_up_opts_without_runner_egress(
-                UpOpts {
-                    retained_mail_values: None,
-                    common: common(),
-                    github_token: GithubTokenPlan::Untouched,
-                    allow_egress_host: vec![],
-                    resolved_egress_cidrs: vec![],
-                    chart: "charts/curie".into(),
-                    secrets: vec![],
-                    dev: false,
-                    adopt: false,
-                    no_expose: true,
-                    set: vec![],
-                    set_string: vec![],
-                    allow_web_egress: vec![],
-                    fake_model: false,
-                    credentials: None,
-                    local_model: None,
-                    model: None,
-                },
+                opts(),
                 existing.as_ref(),
                 None,
                 false,
@@ -5534,23 +5907,9 @@ mod tests {
     ) -> UpOpts {
         complete_up_opts_without_runner_egress(
             UpOpts {
-                retained_mail_values: None,
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                dev: false,
-                adopt: false,
-                no_expose: true,
                 set,
                 set_string,
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                ..opts()
             },
             existing,
             None,
@@ -5704,25 +6063,7 @@ mod tests {
 
     #[test]
     fn up_no_expose_drops_the_nodeport_sets() {
-        let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
-        });
+        let cmds = up_commands(&opts());
         let line = cmds[0].display();
         assert!(!line.contains("NodePort"), "{line}");
         assert!(line.ends_with("--create-namespace"), "{line}");
@@ -5731,23 +6072,8 @@ mod tests {
     #[test]
     fn up_passthrough_set_is_appended_verbatim() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -5761,23 +6087,8 @@ mod tests {
         // No credential and not --fake-model: a plain install with no real-model
         // or egress sets (the fake model stays on, egress stays fail-closed).
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(!line.contains("agentSandbox.runner.fakeModel"), "{line}");
@@ -5790,23 +6101,9 @@ mod tests {
         // --fake-model resolves to no credential, so the argv is the sealed
         // install even when the caller had a credential in the environment.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
             fake_model: true,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(!line.contains("agentSandbox.runner"), "{line}");
@@ -5816,23 +6113,11 @@ mod tests {
     #[test]
     fn up_with_credentials_enables_real_model_and_masks() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
+            no_expose: false,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: false,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -5925,23 +6210,8 @@ mod tests {
     #[test]
     fn up_local_model_adds_inference_sets() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
             local_model: Some("qwen3:4b".into()),
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(line.contains("--set inference.deploy=true"), "{line}");
@@ -5950,25 +6220,7 @@ mod tests {
 
     #[test]
     fn up_without_local_model_omits_inference_sets() {
-        let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
-        });
+        let cmds = up_commands(&opts());
         let line = cmds[0].display();
         assert!(!line.contains("inference.deploy"), "{line}");
         assert!(!line.contains("inference.model"), "{line}");
@@ -5978,23 +6230,8 @@ mod tests {
     fn up_defaults_runner_model_from_env() {
         // CURIE_MODEL set, no explicit --set: inject the runner model (#361).
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
             model: Some("z-ai/glm-5.2".into()),
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -6006,25 +6243,7 @@ mod tests {
     #[test]
     fn up_without_env_model_omits_runner_model_set() {
         // No CURIE_MODEL: inject nothing, the chart default stands (#361).
-        let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
-        });
+        let cmds = up_commands(&opts());
         let line = cmds[0].display();
         assert!(!line.contains("agentSandbox.runner.model="), "{line}");
     }
@@ -6034,23 +6253,9 @@ mod tests {
         // CURIE_MODEL set AND an explicit matching --set: the operator's set
         // already carries it, so no duplicate injection (#361).
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
             model: Some("z-ai/glm-5.2".into()),
+            ..opts()
         });
         let line = cmds[0].display();
         assert_eq!(
@@ -6067,23 +6272,9 @@ mod tests {
         // `--set` must be detected so `up` does not inject a redundant
         // `--set agentSandbox.runner.model=<model>` on top of it (#361).
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
             set: vec!["worker.replicas=2,agentSandbox.runner.model=glm".into()],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
             model: Some("glm".into()),
+            ..opts()
         });
         let line = cmds[0].display();
         assert_eq!(
@@ -6096,23 +6287,12 @@ mod tests {
     #[test]
     fn up_opens_web_egress_after_model() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
+            no_expose: false,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: false,
-            set: vec![],
-            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -6136,23 +6316,10 @@ mod tests {
     #[test]
     fn up_web_egress_without_model_uses_index_zero() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
             allow_web_egress: vec!["0.0.0.0/0".into()],
             fake_model: true,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(!line.contains("160.79.104.0/23"), "{line}");
@@ -6173,23 +6340,12 @@ mod tests {
     #[test]
     fn up_web_egress_multiple_cidrs_contiguous() {
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
+            no_expose: false,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: false,
-            set: vec![],
-            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -6209,45 +6365,16 @@ mod tests {
     #[test]
     fn up_no_web_egress_stays_sealed() {
         let sealed_cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let sealed_line = sealed_cmds[0].display();
         assert!(!sealed_line.contains("allowedEgress"), "{sealed_line}");
 
         let model_cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
             no_expose: false,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let model_line = model_cmds[0].display();
         assert!(!model_line.contains("allowedEgress[1]"), "{model_line}");
@@ -6456,26 +6583,11 @@ mod tests {
         // live credential, so it must land in the private -f file like any other
         // secret and never appear in argv or the printed line.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
             secrets: vec![(
                 "dispatcher.slack.botToken".into(),
                 "xoxb-preserved-secret".into(),
             )],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(!line.contains("xoxb-preserved-secret"), "leaked: {line}");
@@ -6641,23 +6753,9 @@ mod tests {
     fn completed_dev_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
         complete_up_opts_without_runner_egress(
             UpOpts {
-                common: common(),
-                github_token: GithubTokenPlan::Untouched,
-                allow_egress_host: vec![],
-                resolved_egress_cidrs: vec![],
-                chart: "charts/curie".into(),
-                secrets: vec![],
-                retained_mail_values: None,
-                dev: true,
-                adopt: false,
-                no_expose: true,
                 set,
-                set_string: vec![],
-                allow_web_egress: vec![],
-                fake_model: false,
-                credentials: None,
-                local_model: None,
-                model: None,
+                dev: true,
+                ..opts()
             },
             existing,
             None,
@@ -6762,6 +6860,124 @@ mod tests {
         );
     }
 
+    fn completed_sealed_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
+        let mut opts = completed_dev_up(None, vec![]);
+        opts.dev = false;
+        opts.secrets = vec![];
+        opts.set = set;
+        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+    }
+
+    /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
+    /// `up` on a release with no caller pair hands the chart a real one, and
+    /// the next `up` hands back exactly that pair.
+    #[test]
+    fn a_sealed_up_gains_a_caller_pair_and_the_next_up_keeps_it() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let first = completed_sealed_up(Some(&existing), vec![]);
+        let seed = secret_for(
+            &first,
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY,
+        )
+        .expect("generated")
+        .to_string();
+        let public = secret_for(&first, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY)
+            .expect("generated")
+            .to_string();
+        assert_eq!(
+            crate::connector_caller::verify_key_of(&seed).unwrap(),
+            public
+        );
+        let recorded =
+            serde_json::json!({"connectorCaller": {"signingKey": seed, "verifyKey": public}});
+        let next = completed_sealed_up(Some(&recorded), vec![]);
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some(seed.as_str())
+        );
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some(public.as_str())
+        );
+    }
+
+    /// `--dev` mints no pair (the no-invented-secrets rule above), but it is a
+    /// full upgrade, so a recorded pair must still come back.
+    #[test]
+    fn a_dev_upgrade_re_supplies_a_recorded_caller_pair() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some("SEED-RECORDED")
+        );
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some("PUBLIC-RECORDED")
+        );
+    }
+
+    /// Half a pair would leave the worker signing with one key while every
+    /// caller proxy verifies with the other, so every hosted connector would
+    /// refuse every caller. Refused before anything is resolved, on a sealed
+    /// and a `--dev` up alike, whichever half is given.
+    #[test]
+    fn a_set_of_one_caller_key_half_is_a_usage_error_naming_both() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        let recorded = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        for half in [CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY] {
+            for dev in [false, true] {
+                let mut opts = completed_dev_up(None, vec![]);
+                opts.dev = dev;
+                opts.secrets = vec![];
+                opts.set = vec![format!("{half}=NEW-HALF")];
+                let Err(err) = complete_up_opts_without_runner_egress(
+                    opts,
+                    Some(&recorded),
+                    None,
+                    false,
+                    true,
+                ) else {
+                    panic!("half a caller key pair must be refused: {half} dev={dev}");
+                };
+                assert_eq!(
+                    crate::exit::classify(&err).0,
+                    crate::exit::ExitClass::Usage,
+                    "{half} dev={dev}"
+                );
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(CONNECTOR_CALLER_SIGNING_KEY)
+                        && message.contains(CONNECTOR_CALLER_VERIFY_KEY),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// Both halves together, or both cleared together, stay the operator's.
+    #[test]
+    fn a_set_of_both_caller_key_halves_is_accepted() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        for (seed, public) in [("NEW-SEED", "NEW-PUBLIC"), ("", "")] {
+            let opts = completed_sealed_up(
+                None,
+                vec![
+                    format!("{CONNECTOR_CALLER_SIGNING_KEY}={seed}"),
+                    format!("{CONNECTOR_CALLER_VERIFY_KEY}={public}"),
+                ],
+            );
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_SIGNING_KEY), None);
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_VERIFY_KEY), None);
+        }
+    }
+
     #[test]
     fn a_dev_upgrade_stays_disconnected_after_comms_disconnect() {
         let existing = serde_json::json!({
@@ -6803,12 +7019,6 @@ mod tests {
         // Success criterion: a missing secret's generated value lands in the
         // private -f values file, never in the executed argv / process table.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
             secrets: vec![
                 ("api.apiKey".into(), "generated-api-key".into()),
                 (
@@ -6816,16 +7026,7 @@ mod tests {
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0".into(),
                 ),
             ],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         // Printed form masks the values and shows the -f secret values file.
         let line = cmds[0].display();
@@ -6861,23 +7062,8 @@ mod tests {
         // The pure builder with no supplied secrets (the --dev path, and every
         // pre-#196 argv test) emits no secret values file.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
             dev: true,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         assert!(!cmds[0].display().contains("secret values file"));
     }
@@ -6889,23 +7075,8 @@ mod tests {
         // to helm (issue #195). Without it the sealed chart generates strong
         // random values and the dev/e2e stack would not match compose.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
             dev: true,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -6918,25 +7089,7 @@ mod tests {
     fn up_without_dev_omits_allow_dev_defaults_flag() {
         // The default (non-dev) path must NOT opt into the published defaults;
         // the sealed chart generates strong per-release credentials there.
-        let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
-        });
+        let cmds = up_commands(&opts());
         let line = cmds[0].display();
         assert!(
             !line.contains("security.allowDevDefaults"),
@@ -6971,23 +7124,11 @@ mod tests {
         // Resolved provider CIDRs take the first slots (in order), then declared
         // web destinations continue contiguously -- one array, no gaps.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            model: None,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["10.0.0.1/32".into(), "2001:db8::1/128".into()],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         // Provider CIDRs occupy [0] and [1], each with the shared TCP/443 shape.
@@ -7023,23 +7164,8 @@ mod tests {
         // unconditional Anthropic carve-out is removed entirely (#362). The
         // sandbox stays sealed and the model is unreachable by design.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            model: None,
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
-            local_model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         // Real model still enabled and the credential still delivered by file.
@@ -7058,23 +7184,9 @@ mod tests {
         // Existing behavior preserved: with no credential and no provider host,
         // a declared web destination still occupies index [0].
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            model: None,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: true,
-            credentials: None,
-            local_model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(
@@ -7348,23 +7460,9 @@ mod tests {
         // Between them these two pin the read DECISION and the argv it feeds; the
         // live evidence is the E2E's `--dev` arm.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
             dev: true,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            set_string: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            ..opts()
         });
         let line = cmds[0].display();
         assert!(line.contains("security.allowDevDefaults=true"), "{line}");
@@ -7601,23 +7699,10 @@ mod tests {
         // `operator_sets` chains `--set` THEN `--set-string`, and a key the
         // operator supplied only through the latter must exempt the run too.
         let opts = UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Untouched,
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
-            secrets: vec![],
-            dev: true,
-            adopt: false,
             no_expose: false,
-            set: vec![],
             set_string: vec!["security.allowDevDefaults=false".into()],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            dev: true,
+            ..opts()
         };
         guard_dev_defaults_flip(true, Some(&sealed), &opts.operator_sets()).expect(
             "an explicit `--set-string security.allowDevDefaults=false` must exempt the run \
@@ -7738,13 +7823,6 @@ mod tests {
         // credential, so both keys must survive to their own file and neither
         // may reach argv.
         let cmds = up_commands(&UpOpts {
-            retained_mail_values: None,
-            common: common(),
-            github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
-            set_string: vec![],
-            allow_egress_host: vec![],
-            resolved_egress_cidrs: vec![],
-            chart: "charts/curie".into(),
             secrets: vec![
                 ("api.apiKey".into(), "generated-api-key".into()),
                 (
@@ -7752,15 +7830,8 @@ mod tests {
                     "generated-webhook-secret".into(),
                 ),
             ],
-            dev: false,
-            adopt: false,
-            no_expose: true,
-            set: vec![],
-            allow_web_egress: vec![],
-            fake_model: false,
-            credentials: None,
-            local_model: None,
-            model: None,
+            github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
+            ..opts()
         });
 
         // Both credentials are masked in the printed form, neither is raw.

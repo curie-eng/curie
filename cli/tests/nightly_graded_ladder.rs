@@ -27,6 +27,9 @@
 //! existing `ci.yaml` and only breaks if someone arms `ci.yaml`'s fake seal
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -754,15 +757,6 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
     assert!(text.contains("\nassert_collector_metrics_network_policy\n"));
 }
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write harness executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read harness metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("mark harness executable");
-}
-
 /// The cluster ladder may run an otherwise standard `curie` release in an
 /// owned namespace. Its direct worker probe must follow the same
 /// `CURIE_NAMESPACE` setting as the CLI calls around it, or it reads an
@@ -773,7 +767,7 @@ fn cluster_worker_probe_uses_the_configured_namespace() {
 
     let harness = tempfile::tempdir().expect("create cluster probe harness");
     let invocation_log = harness.path().join("kubectl-invocation.log");
-    write_executable(
+    test_executable::install(
         &harness.path().join("kubectl"),
         r#"#!/bin/sh
 set -eu
@@ -1138,6 +1132,21 @@ fn local_rung_honors_isolated_compose_project_and_ordered_files() {
     assert!(
         source.contains("compose.dev.yaml") && local_rung.contains("--build"),
         "isolation must still pin this checkout's compose.dev.yaml with --build"
+    );
+}
+
+#[test]
+fn local_release_teardown_uses_the_same_project_and_override_as_startup() {
+    let rung = ladder_function("rung_local_release");
+    let teardown = rung
+        .split("=== curie local down -f compose.release.yaml ===")
+        .nth(1)
+        .expect("local release teardown must be present");
+    assert!(
+        teardown.contains("local down --project \"$COMPOSE_PROJECT\" -f \"$release_compose\"")
+            && teardown.contains("down_args+=(-f \"${COMPOSE_FILES[$extra_i]}\")")
+            && teardown.contains("\"$BIN\" \"${down_args[@]}\""),
+        "local release teardown must pass the selected project, generated release compose, and every private override to the CLI"
     );
 }
 
@@ -2143,7 +2152,7 @@ fn write_ladder_stubs(dir: &Path) {
     )
     .expect("write deploy provider fixture");
 
-    write_executable(
+    test_executable::install(
         &dir.join("curie"),
         r#"#!/bin/sh
 set -u
@@ -2595,7 +2604,7 @@ esac
     // unrecognized invocation returning nothing is the honest default; the
     // reads that carry a real answer (compose-worker selection, env inspect,
     // and the snapshotted SKILL.md) get explicit arms.
-    write_executable(
+    test_executable::install(
         &dir.join("docker"),
         r#"#!/bin/sh
 set -u
@@ -2671,7 +2680,7 @@ esac
 "#,
     );
 
-    write_executable(
+    test_executable::install(
         &dir.join("kubectl"),
         r#"#!/bin/sh
 set -u
@@ -3014,7 +3023,7 @@ fn run_approval_seed_route_harness(
 ) -> Output {
     let helper = ladder_function("configure_deterministic_approval_seed_route");
     let curie = harness.join("approval-seed-curie");
-    write_executable(
+    test_executable::install(
         &curie,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -5059,7 +5068,7 @@ fn run_cluster_receipt_consumers_from(
     // macOS ships BSD stat, which refuses GNU's `-c` exactly like this. Every
     // run sees it, so a consumer that reads the receipt's mode through one
     // stat dialect fails on a Linux host too, not only on a Mac.
-    write_executable(
+    test_executable::install(
         &harness.path().join("stat"),
         r#"#!/bin/sh
 case "$1" in
@@ -5151,7 +5160,7 @@ exit 97
         .expect("write trace fixture");
     }
 
-    write_executable(
+    test_executable::install(
         &harness.path().join("curie"),
         r#"#!/bin/sh
 set -eu

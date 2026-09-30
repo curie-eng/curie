@@ -47,6 +47,7 @@ from aci_protocol import (
     TurnSource,
     parse_queued_turn,
 )
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -77,6 +78,7 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
+from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
@@ -231,7 +233,8 @@ def _mint_turn(
     event_id: str,
     body: bytes,
     *,
-    partition: str | None,
+    conversation_id: str,
+    placeholder: str | None,
     outcome: MappingOutcome | None = None,
 ) -> QueuedTurn:
     """Build the ``QueuedTurn`` a verified hook delivery becomes.
@@ -240,19 +243,17 @@ def _mint_turn(
     request: an upstream that could name its own endpoint would be pointing the
     platform's authenticated egress wherever it liked.
 
-    ``placeholder`` is None because nothing was preposted -- this is precisely the
-    placeholder-less turn ADR-0079's kernel path exists for, so the first reply
-    delivery creates its own message.
+    The caller may supply an existing conversation and a placeholder it already
+    posted there. Otherwise the route supplies ADR-0079's synthetic hook
+    conversation and no placeholder, so the first reply creates its own message.
 
     Args:
         agent: The agent, with its channel binding loaded.
         hook: The validated hook name.
         event_id: This delivery's deterministic event id.
         body: The raw request body.
-        partition: The derived partition value, or None when this hook is
-            unpartitioned. It reaches the conversation id and nothing else: the
-            author stays the hook, since the partition names the thing the
-            delivery is about rather than who sent it.
+        conversation_id: The exact conversation this turn joins.
+        placeholder: The exact preposted reply the worker edits, if any.
 
     Returns:
         The queued turn.
@@ -260,7 +261,7 @@ def _mint_turn(
 
     return QueuedTurn(
         event_id=event_id,
-        conversation_id=hook_conversation_id(agent.id, hook, partition),
+        conversation_id=conversation_id,
         # The author is the platform, not a person: no human sent this, and
         # putting an upstream-supplied identity here would let a hook impersonate
         # one to anything downstream that reads the field.
@@ -270,7 +271,7 @@ def _mint_turn(
         reply_handle=ReplyHandle(
             kind=binding.kind,
             channel=binding.address,
-            placeholder=None,
+            placeholder=placeholder,
             endpoint=binding.endpoint,
             adapter=binding.adapter,
         ),
@@ -287,6 +288,9 @@ async def ingest_hook(
     hook: str,
     kind: str | None = None,
     address: str | None = None,
+    adapter: str | None = None,
+    conversation_id: str | None = None,
+    placeholder: str | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
@@ -304,9 +308,11 @@ async def ingest_hook(
     4. the SIGNATURE over the raw body;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
-    6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
+    6. the optional explicit reply TARGET, after authentication so malformed
+       coordinates reveal nothing to an unsigned caller;
+    7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
        after both of those and before anything is claimed;
-    7. routability, then the claim, quota and enqueue.
+    8. routability, then the claim, quota and enqueue.
     """
 
     if not HOOK_NAME.fullmatch(hook):
@@ -340,6 +346,13 @@ async def ingest_hook(
             "agent twice",
         )
 
+    target_supplied = conversation_id is not None or placeholder is not None
+    if target_supplied and (not conversation_id or not placeholder):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "an explicit hook reply target requires both conversation_id and placeholder",
+        )
+
     # Derived here and nowhere else in the order. After the signature and the
     # delivery id, so an unsigned caller is never told which field of its payload
     # the operator reads -- nor that this hook is partitioned at all. Before the
@@ -367,6 +380,11 @@ async def ingest_hook(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "hook reply surface requires both kind and address",
         )
+    if adapter is not None and kind is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface adapter names a route within kind and address; pass all three",
+        )
     # Both or neither, checked just above; naming both here lets the type
     # checker see that the `else` branch holds a full pair.
     if kind is None or address is None:
@@ -378,21 +396,45 @@ async def ingest_hook(
             )
         binding = agent.channels[0]
     else:
-        # The hook route names no adapter -- there is no such query parameter
-        # -- so `adapter=None` is the whole request: the default Slack
-        # identity, or (today) the single row a non-Slack pair holds.
+        # The route is the triple (ADR-0168 decision 3): `adapter` names the
+        # identity for Slack and the adapter slug for any other kind, and an
+        # omitted one means what it means to every reader -- the default Slack
+        # identity, or the agent's single route on a non-Slack pair.
         # `crud.matching_bindings` is the one matching rule every reader of a
-        # route shares; `agent.channels` is already
-        # loaded, so this calls it directly rather than issuing a fresh query.
-        matches = crud.matching_bindings(agent.channels, kind, address, None)
+        # route shares; `agent.channels` is already loaded, so this calls it
+        # directly rather than issuing a fresh query.
+        if adapter is not None:
+            try:
+                refuse_undeclared(kind, route_identity(kind, adapter))
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        matches = crud.matching_bindings(agent.channels, kind, address, adapter)
         if not matches:
+            unbound = "this agent has no binding for the selected kind and address"
+            if adapter is not None:
+                unbound += f" as {route_identity(kind, adapter)!r}"
+            elif kind == SLACK_KIND:
+                identities = sorted(
+                    route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
+                    for binding in agent.channels
+                    if binding.kind == kind and binding.address == address
+                )
+                if identities:
+                    unbound += (
+                        f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
+                        f"{', '.join(map(repr, identities))}, so pass adapter to name one"
+                    )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
+        if len(matches) > 1:
+            # Two of this agent's routes on one pair and no adapter to name
+            # one: replying through either would be a guess.
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "this agent has no binding for the selected kind and address",
+                status.HTTP_409_CONFLICT,
+                f"{len(matches)} routes are bound to {kind}:{address}; pass adapter to name one",
             )
         binding = matches[0]
 
-    thread_id = hook_conversation_id(agent.id, hook, partition)
+    thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
     if mapping.selects_workspace and mapping.repository is not None:
         existing = await crud.get_thread_workspace(
             session, agent_id=agent.id, conversation_id=thread_id
@@ -468,7 +510,8 @@ async def ingest_hook(
                 hook,
                 event_id,
                 raw,
-                partition=partition,
+                conversation_id=thread_id,
+                placeholder=placeholder,
                 outcome=mapping,
             )
             carrier: dict[str, str] = {}

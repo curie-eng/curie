@@ -35,7 +35,7 @@ from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
-from ..binding import MAX_TURNS_ENV, RUNNER_TOKEN_ENV
+from ..binding import CONNECTOR_CALLER_TOKEN_ENV, MAX_TURNS_ENV, RUNNER_TOKEN_ENV
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
@@ -44,6 +44,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    TURN_PROGRESS_ELIGIBILITY_ENV,
     CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
@@ -1155,6 +1156,8 @@ class SandboxSubstrate:
             publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=generation,
             max_turns=(env or {}).get(MAX_TURNS_ENV),
+            carries_caller_token=CONNECTOR_CALLER_TOKEN_ENV in (env or {}),
+            carries_turn_progress=TURN_PROGRESS_ELIGIBILITY_ENV in (env or {}),
         )
         if not publish:
             return handle

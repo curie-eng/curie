@@ -1,7 +1,7 @@
 ---
 seam: Memory
 kind: CLEAN
-impls: 1 loader (StateApiMemoryStore)
+impls: 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore)
 grade: not separately graded
 epics:
   - "#28"
@@ -13,7 +13,7 @@ order: 15
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 loader (StateApiMemoryStore) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -54,7 +54,10 @@ frozen ACI field is unchanged; the state-API bearer is a runner-local knob
 
 ## Implementations today
 
-One: **`StateApiMemoryStore`**, backing memory as a scoped `memory` namespace
+Two stores over the same backing. The `MemoryStore` port has one loader; the
+facts store (`MemoryFactsStore`, below) sits beside the port, not behind it.
+
+**`StateApiMemoryStore`** is the port's loader, backing memory as a scoped `memory` namespace
 over the durable KV/document store landed for #23/#248
 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres JSONB).
 `load` GETs the single log-shaped key; `append` POSTs to that key's `/append`
@@ -66,6 +69,36 @@ key, except on a default local/cluster eval turn whose `conversation_id`
 starts with `eval:` (#1909): that path omits the ref so the runner boots
 `NullMemoryStore` and a deployed memory log cannot change a static suite.
 `NullMemoryStore` is also the no-ref sink.
+
+### Facts, channel memory and the memory tools (#1461, ADR-0167)
+
+Beside the legacy `log`, memory also holds **facts**, read and written by
+`runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
+the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
+`{statement, author, stated_at, session_id}`. Facts live in two namespaces
+reached with the same memory token:
+
+- **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
+  holds two reserved keys that are never facts: `log` (above) and `guidance`
+  (`{"text": ...}`, an operator's replacement for the default guidance).
+- **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
+  (`BootEnv.channel_memory_ref`), the binding-scoped namespace
+  `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
+  only when the agent's `memory_writes` setting is on and the turn has a
+  binding, and never on an eval-isolated turn.
+
+At boot the runner lists whichever of the two it was given and renders a
+"Remembered facts" block (agent facts, then channel facts, newest first, at
+most 200 per memory, each statement flattened to one line and framed as data,
+not instructions) after the legacy log preamble. With memory writes off no
+channel ref is minted, so only agent facts are loaded. When
+`CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
+`forget` on the platform `curie` server and injects the guidance block
+(`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The
+tools take `memory: agent|channel`; the author is the turn's sender, never a
+tool argument. A write the state API refuses at its cap is reported to the model
+as refused. The tools are exempt from bundle toolPolicy by published name, and
+the worker leaves them out of change receipts.
 
 ## Known leakage
 
@@ -110,8 +143,8 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
   the sandbox path it is platform-key-only (`require_api_key`), so the scoped
-  memory token cannot reach it. This is coherent today (one loader, one backing
-  store, and the router says so in its own docstring), but it is the precise leak
+  memory token cannot reach it. This is coherent today (one loader plus the facts
+  store, one backing store, and the router says so in its own docstring), but it is the precise leak
   a real second loader would trip over: an `s3://` store would satisfy the port
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that

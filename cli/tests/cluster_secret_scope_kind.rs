@@ -1,5 +1,5 @@
-//! Real two-cluster proof for #1913. Skips unless CURIE_E2E_TWO_CLUSTER=1
-//! and KUBECONFIG_A / KUBECONFIG_B point at disposable kubeconfigs.
+//! Real two-cluster proof for #1913. Requires CURIE_E2E_TWO_CLUSTER=1
+//! and KUBECONFIG_A / KUBECONFIG_B pointing at disposable kubeconfigs.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -7,13 +7,6 @@ use std::process::Command;
 use curie::connectors::{self, prepare, sync};
 use curie::secrets::{self, SecretScope};
 use curie::ui::CliOutput;
-
-fn required_env(name: &str) -> Option<String> {
-    match std::env::var(name) {
-        Ok(value) if !value.is_empty() => Some(value),
-        _ => None,
-    }
-}
 
 fn kubectl(kubeconfig: &str, args: &[&str]) -> (bool, String, String) {
     let output = Command::new("kubectl")
@@ -42,16 +35,14 @@ async fn identity_for(kubeconfig: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires CURIE_E2E_TWO_CLUSTER=1 and disposable KUBECONFIG_A and KUBECONFIG_B"]
 async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
-    let Some(kube_a) = required_env("KUBECONFIG_A") else {
-        eprintln!("skipping: set CURIE_E2E_TWO_CLUSTER=1 KUBECONFIG_A KUBECONFIG_B");
-        return;
-    };
-    if required_env("CURIE_E2E_TWO_CLUSTER").as_deref() != Some("1") {
-        eprintln!("skipping: CURIE_E2E_TWO_CLUSTER is not 1");
-        return;
-    }
-    let kube_b = required_env("KUBECONFIG_B").expect("KUBECONFIG_B");
+    assert_eq!(
+        std::env::var("CURIE_E2E_TWO_CLUSTER").expect("CURIE_E2E_TWO_CLUSTER"),
+        "1"
+    );
+    let kube_a = std::env::var("KUBECONFIG_A").expect("KUBECONFIG_A");
+    let kube_b = std::env::var("KUBECONFIG_B").expect("KUBECONFIG_B");
 
     let config = tempfile::tempdir().expect("config");
     std::env::set_var("CURIE_CONFIG_DIR", config.path());

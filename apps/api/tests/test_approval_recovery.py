@@ -37,6 +37,7 @@ from curie_api import approval_principal, crud
 from curie_api.config import get_settings
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
+from curie_api.routers.console import SESSION_COOKIE
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
 from fastapi.testclient import TestClient
@@ -317,6 +318,68 @@ def test_recovery_requires_an_operator_principal_for_attribution(
     )
     assert refused.status_code == 401, refused.text
     assert _approval_row(created["id"])["status"] == "pending"
+
+
+def _console_cookie_headers(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    origin: str | None = None,
+    referer: str | None = None,
+) -> dict[str, str]:
+    """Platform key plus the console cookie as the only principal credential."""
+
+    minted = client.post(
+        "/console/login-codes", json={"subject": _OPERATOR}, headers=auth_headers
+    )
+    assert minted.status_code == 201, minted.text
+    exchanged = client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    token = client.cookies.get(SESSION_COOKIE)
+    assert token
+    client.cookies.clear()
+    headers = {**auth_headers, "Cookie": f"{SESSION_COOKIE}={token}"}
+    if origin is not None:
+        headers["Origin"] = origin
+    if referer is not None:
+        headers["Referer"] = referer
+    return headers
+
+
+def test_console_cookie_recover_rejects_a_missing_origin(
+    recovery_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    created = _channel_membership_approval(recovery_client, auth_headers)
+    refused = recovery_client.post(
+        f"/approvals/{created['id']}/recover",
+        json=_recover_body(),
+        headers=_console_cookie_headers(recovery_client, auth_headers),
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == "console session origin rejected"
+    assert _approval_row(created["id"])["status"] == "pending"
+
+
+def test_console_cookie_recover_accepts_a_matching_referer_without_origin(
+    recovery_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    created = _channel_membership_approval(recovery_client, auth_headers)
+    recovered = recovery_client.post(
+        f"/approvals/{created['id']}/recover",
+        json=_recover_body(),
+        headers=_console_cookie_headers(
+            recovery_client, auth_headers, referer="http://testserver/recover"
+        ),
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert _approval_row(created["id"])["status"] == "rejected"
+    assert len(valkey.xrange(runs_stream)) == 1
 
 
 def test_recovery_succeeds_where_operator_resolution_is_refused_403(

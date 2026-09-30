@@ -1059,6 +1059,11 @@
             "title": "Memory",
             "type": "boolean"
           },
+          "memory_writes": {
+            "default": false,
+            "title": "Memory Writes",
+            "type": "boolean"
+          },
           "model": {
             "anyOf": [
               {
@@ -1295,6 +1300,17 @@
             ],
             "title": "Memory"
           },
+          "memory_writes": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Writes"
+          },
           "model": {
             "anyOf": [
               {
@@ -1428,8 +1444,22 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default in Slack: the resolution-card channel's members\nare the approvers. Notification recipients never enter this policy.\n\n``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR 0183).\nEach surface reads only its own: a Slack card never reads ``emails``, and an\nemail card never reads ``users`` or ``group``.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -1462,6 +1492,20 @@
       "ApprovalApproversOut": {
         "description": "Repair-oriented read projection of the stored approver declaration.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -1741,7 +1785,7 @@
       },
       "ApprovalNotificationTarget": {
         "additionalProperties": false,
-        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch. Inheriting `ChannelBindingWrite` also inherits its Slack branch\n(ADR-0168 decision 3): a Slack notification target still needs\nno endpoint or adapter (the identity form), and may still carry the old\nendpoint-plus-adapter custom-transport pair instead -- either is valid\nhere, exactly as on any other Slack binding.",
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nA Slack target names no transport, and may name its identity in\n`adapter`. Every other kind needs the full endpoint/adapter pair at write\ntime, so a declared notification cannot persist as a permanently\nundeliverable best-effort branch.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2328,7 +2372,7 @@
       },
       "ApprovalRequestingSurfaceTarget": {
         "additionalProperties": false,
-        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nthe requester alone (``approvers.RequesterOnly``).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
+        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nonly an address on the route's approver ``emails`` (``approvers.EmailApprovers``,\nADR 0183).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
         "properties": {
           "mode": {
             "const": "requesting_surface",
@@ -2815,7 +2859,7 @@
       },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThe rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_ck` states the first two\nat the database for out-of-band writers:\n\n- **A Slack route names its identity**, `default` when omitted, and has no\n  endpoint (ADR-0168 decision 3): its replies go through the worker's\n  configured Slack origin, so an endpoint is refused by field name.\n- **Any other kind is both or neither.** A half-configured route is an\n  operator error that would otherwise surface as a fail-closed escalation\n  mid-turn, in the worker, far from the request that caused it.\n- **Both absent is legal** for a non-Slack kind: the cutover binds the\n  agent first and PATCHes the route in later. The gate for an unroutable\n  binding is `POST /channels/token`, which refuses (409) to mint for a\n  non-`slack` binding with no route.\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -4303,6 +4347,43 @@
         "title": "MemoryEntryOut",
         "type": "object"
       },
+      "MemoryGuidanceIn": {
+        "description": "Operator memory guidance for one agent (#1461).\n\nStored verbatim at ``memory/guidance`` as ``{\"text\": ...}``; the runner shows\nit to the model beside its memory tools in place of the platform default.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "MemoryGuidanceIn",
+        "type": "object"
+      },
+      "MemoryGuidanceOut": {
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent, else\n``default`` and ``text`` is the platform default.",
+        "properties": {
+          "source": {
+            "enum": [
+              "default",
+              "operator"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "source"
+        ],
+        "title": "MemoryGuidanceOut",
+        "type": "object"
+      },
       "MemoryProvenanceOut": {
         "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).\n\n``source`` distinguishes an operator-seeded record (``operator``) from a\nsession-learned one. Absent or null means learned/unspecified, matching\nrecords written before the operator seed path existed.",
         "properties": {
@@ -4489,6 +4570,16 @@
         ],
         "title": "MetricsSummary",
         "type": "object"
+      },
+      "MilestoneClass": {
+        "description": "Why a durable interruption is warranted (ADR-0130 section 3).\n\nA class is a reason, not a step: a chain may skip one or repeat one while\nits milestone budget lasts.",
+        "enum": [
+          "evidence",
+          "scope",
+          "verification"
+        ],
+        "title": "MilestoneClass",
+        "type": "string"
       },
       "ModelUsageEntry": {
         "additionalProperties": false,
@@ -4842,6 +4933,22 @@
         ],
         "title": "ProgressReport",
         "type": "object"
+      },
+      "ProgressState": {
+        "description": "The initial state set, in ADR-0130 section 1's order.",
+        "enum": [
+          "queued",
+          "investigating",
+          "awaiting-approval",
+          "preparing-workspace",
+          "testing",
+          "publishing",
+          "complete",
+          "failed",
+          "cancelled"
+        ],
+        "title": "ProgressState",
+        "type": "string"
       },
       "PublicationContext": {
         "description": "API issued authority and observation for one execution's publication read.\n\nThe capability authorizes only the publication precheck endpoint. It must\nstay outside model text, transcripts, workspace files and logs. The queued\nevent identifier is a correlation value, not proof of an active turn.\nObservation metadata records the API read at dispatch; consumers must make\na fresh comparison before handling an empty publication proposal.",
@@ -7008,6 +7115,66 @@
         "title": "TurnAccepted",
         "type": "object"
       },
+      "TurnProgressBody": {
+        "additionalProperties": false,
+        "description": "A ``ProgressCommand`` and the worker/runner position for it.\n\nClosed like the command: an unknown field is refused. ``generation`` is\nallocated durably by the worker and ``seq`` orders commands within it.",
+        "properties": {
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "milestone": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MilestoneClass"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requests a durable milestone reply of this class. The milestone budget is the platform's to apply, not the command's to state."
+          },
+          "seq": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Seq",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProgressState"
+          },
+          "summary": {
+            "maxLength": 200,
+            "minLength": 1,
+            "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+            "title": "Summary",
+            "type": "string"
+          },
+          "update_id": {
+            "description": "Identifies this update within its record, for idempotency.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+            "title": "Update Id",
+            "type": "string"
+          },
+          "version": {
+            "const": "1.0",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "update_id",
+          "state",
+          "summary",
+          "generation",
+          "seq"
+        ],
+        "title": "TurnProgressBody",
+        "type": "object"
+      },
       "TurnSource": {
         "description": "What started this turn: a person speaking, or the system doing a job.\n\nADR-0079's new event kind. The values are the three the ADR names, and the\ndistinction the kernel actually acts on is binary: ``SLACK`` is a person's\nmessage and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a\njob is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept\nhere rather than re-derived at each call site so a fourth value cannot be\nadded without deciding which side of the line it falls on.\n\n**This is a different axis from ``ReplyHandle.kind`` and the two do not\ncollapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``\nanswers *what caused the turn*. A nightly digest posted into a Slack channel\nis ``kind=\"slack\"`` with ``source=CRON``: same transport as a mention, and it\nmust not steer whatever conversation is live in that thread. Reading either\nfield off the other is the silent misroute both exist to close.\n\n``SLACK`` is the ADR's spelling for \"a person's chat message\", which was the\nonly such ingress when ADR-0079 was accepted. A channel port turn from a\nhuman on another transport (an email that a person actually sent) is that\nsame category on a different ``kind``, and giving it its own value is a NEW\nENUM VALUE -- breaking under this package's rules, so it is a deliberate,\nseparately-decided bump rather than something this change assumes.",
         "enum": [
@@ -7093,6 +7260,65 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VerificationObservation": {
+        "additionalProperties": false,
+        "description": "Exact sandbox command result recorded before the model starts.",
+        "properties": {
+          "blocked_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Blocked Services",
+            "type": "array"
+          },
+          "command": {
+            "maxLength": 180,
+            "minLength": 1,
+            "title": "Command",
+            "type": "string"
+          },
+          "exit_status": {
+            "anyOf": [
+              {
+                "maximum": 255.0,
+                "minimum": -255.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Status"
+          },
+          "missing_binaries": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Missing Binaries",
+            "type": "array"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "unavailable",
+              "failed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "outcome",
+          "exit_status",
+          "missing_binaries",
+          "blocked_services"
+        ],
+        "title": "VerificationObservation",
         "type": "object"
       },
       "VersionCreate": {
@@ -7509,6 +7735,7 @@
           },
           "state": {
             "enum": [
+              "queued",
               "waiting",
               "running",
               "cancellation_requested",
@@ -7702,9 +7929,16 @@
             "title": "Termination Observation"
           },
           "wait_deadline": {
-            "format": "date-time",
-            "title": "Wait Deadline",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wait Deadline"
           }
         },
         "required": [
@@ -9903,6 +10137,185 @@
           }
         },
         "summary": "Create Memory",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/guidance": {
+      "delete": {
+        "description": "Remove operator guidance, so the platform default applies again (#1461).\n\nRemoving guidance that is not stored is a no-op, still 204.",
+        "operationId": "delete_memory_guidance_agents__agent_id__memory_guidance_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "get": {
+        "description": "The agent's effective memory guidance and its source (#1461).",
+        "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "put": {
+        "description": "Store operator guidance, replacing any earlier one (#1461).\n\nThe runner reads it at the next session boot; a live thread keeps the\nguidance it booted with.",
+        "operationId": "put_memory_guidance_agents__agent_id__memory_guidance_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryGuidanceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Memory Guidance",
         "tags": [
           "memory"
         ]
@@ -12450,7 +12863,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12461,7 +12874,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12568,7 +12981,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12579,7 +12992,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -12964,7 +13377,7 @@
         "parameters": [
           {
             "in": "cookie",
-            "name": "curie_console_session",
+            "name": "__Host-curie_console_session",
             "required": false,
             "schema": {
               "anyOf": [
@@ -12975,7 +13388,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Curie Console Session"
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -13761,7 +14174,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n7. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -13813,6 +14226,54 @@
                 }
               ],
               "title": "Address"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
+            }
+          },
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "placeholder",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Placeholder"
             }
           },
           {
@@ -16698,6 +17159,76 @@
         ]
       }
     },
+    "/v1/turn-progress/{progress_id}": {
+      "post": {
+        "description": "Append one command to the chain's inbox for the worker's pump.\n\n202 means the command is queued for the chain, not that it was applied:\nthe worker's store may still refuse it as a duplicate, out of order, past\nthe chain's update cap, or for a state only the platform sets.",
+        "operationId": "accept_turn_progress_v1_turn_progress__progress_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "progress_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Progress Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnProgressBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Accept Turn Progress V1 Turn Progress  Progress Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Turn Progress",
+        "tags": [
+          "turn-progress"
+        ]
+      }
+    },
     "/v1/work-item-progress/{request_id}": {
       "post": {
         "operationId": "report_work_item_progress_v1_work_item_progress__request_id__post",
@@ -16832,6 +17363,75 @@
           }
         },
         "summary": "Report Work Item Usage",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}/verification": {
+      "post": {
+        "operationId": "report_work_item_verification_v1_work_item_progress__request_id__verification_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Verification V1 Work Item Progress  Request Id  Verification Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Verification",
         "tags": [
           "factory-status"
         ]

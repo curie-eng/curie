@@ -1029,7 +1029,7 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
 
     if row.caller_list is not None:
         address, callers = row.caller_list
-        admission_api.lists[(address, None)] = set(callers)
+        admission_api.lists[(address, "default")] = set(callers)
     admission_api.down = row.api_down
 
     before = len(_stream_entries(redis_client, config))

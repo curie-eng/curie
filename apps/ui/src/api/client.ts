@@ -449,6 +449,7 @@ export async function getAgents(): Promise<AgentOut[]> {
 // ---- Work items (#2577): factory outcomes for a GitHub-issue-driven agent ----
 
 export type WorkItemState =
+  | "queued"
   | "waiting"
   | "running"
   | "cancellation_requested"
@@ -490,7 +491,7 @@ export interface WorkItemRequest {
   sequence: number;
   status: string;
   created_at: string;
-  wait_deadline: string;
+  wait_deadline: string | null;
   started_at: string | null;
   execution_deadline: string | null;
   terminal_at: string | null;

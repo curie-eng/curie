@@ -71,10 +71,12 @@ from .memory import (
     consolidate_memory,
     utcnow_iso,
 )
+from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 from .translate import TurnState, translate_message
+from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
 logger = logging.getLogger(__name__)
@@ -225,13 +227,20 @@ _HISTORY_CAPACITY_FINAL = Final(
 )
 
 
-def _history_capacity_lines() -> tuple[str, str]:
-    """The one non-retryable capacity refusal, shared by append and boot (#2820)."""
+def _history_capacity_lines(detail: str | None = None) -> tuple[str, str]:
+    """The one non-retryable capacity refusal, shared by append and boot (#2820).
 
+    ``detail`` carries the cap and the turn's size when a turn could not be
+    bounded (#3301).
+    """
+
+    message = "conversation history capacity exceeded"
+    if detail:
+        message = f"{message}: {detail}"
     return (
         to_ndjson_line(
             ErrorEvent(
-                message="conversation history capacity exceeded",
+                message=message,
                 classification="history-persistence-error",
             )
         ),
@@ -266,15 +275,24 @@ class SessionRunner:
         progress_activity: ProgressActivity | None = None,
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
+        turn_progress: TurnProgress | None = None,
+        memory_turn: MemoryTurn | None = None,
     ) -> None:
         self._factory = session_factory
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
         self._primary_model = primary_model
+        # Who the memory tools attribute a fact to (#1461); None when the
+        # tools are not mounted. Set at each turn start from the inbound event.
+        self._memory_turn = memory_turn
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
+        # The deliberate progress tool's holder (ADR 0130), shared with the
+        # tool: opened with each turn's capability, closed when the turn ends.
+        # None when the tool is not mounted (a factory execution).
+        self._turn_progress = turn_progress
         self._ceiling = ceiling
         self._tracer = tracer
         self._classifier = classifier
@@ -381,6 +399,8 @@ class SessionRunner:
         # missing prefix, so the loss remains sticky for this runner's lifetime.
         self._history_durable = True
         self._history_loss_observed = False
+        # The cap and turn size of the last unboundable turn (#3301).
+        self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
         self._turn_ready = False
 
@@ -583,7 +603,8 @@ class SessionRunner:
             try:
                 with anyio.fail_after(_HISTORY_PERSISTENCE_BUDGET_SECONDS):
                     await self._record_turn(event, state)
-            except HistoryCapacityError:
+            except HistoryCapacityError as exc:
+                self._capacity_detail = exc.detail
                 state.final_text = None
                 state.approval_summary = None
                 state.approval_route = None
@@ -675,16 +696,22 @@ class SessionRunner:
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
-    async def steer(self, text: str) -> bool:
+    async def steer(self, text: str, *, event: Event | None = None) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
         Returns False when no turn is active (the finish-race boundary F1 owns:
         the caller falls back to opening a fresh turn). The steered output appears
         on the already-open turn's NDJSON stream.
+
+        ``event`` is the steered frame. When given, the memory tools' author is
+        rebound to its sender before the model sees the text (#1461), exactly as
+        turn start does, so a fact saved in reply is attributed to whoever said it.
         """
 
         if self._session is None or not self._turn_open or not self._turn_ready:
             return False
+        if event is not None and self._memory_turn is not None:
+            self._memory_turn.begin(event)
         await self._session.query(text)
         if self._active_state is not None:
             self._active_state.history_messages.append(
@@ -774,12 +801,16 @@ class SessionRunner:
         parent: Context | None = None,
         turn_epoch: str | None = None,
         admission_required: bool = False,
+        progress: ProgressCapability | None = None,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
         Returns an async *generator* (not just an iterator): the server wraps it
         in ``contextlib.aclosing`` so a client disconnect finalizes it on the
         driving task, and ``aclosing`` requires the ``aclose`` a generator has.
+
+        ``progress`` is this turn's deliberate progress capability (ADR 0130),
+        held only while the turn is open.
         """
 
         if self._session is None:
@@ -800,6 +831,8 @@ class SessionRunner:
             self._persistence_owned = False
             self._turn_open = True
             self._history_durable = False
+            if self._turn_progress is not None:
+                self._turn_progress.open(progress)
             # Not ready until turn-start connector recovery completes (#2634):
             # the turn is accepted and owns its epoch, but no query has been
             # sent, so steer is refused and a stop is recorded without an SDK
@@ -807,6 +840,8 @@ class SessionRunner:
             self._turn_ready = False
             state = TurnState()
             self._active_state = state
+            if self._memory_turn is not None:
+                self._memory_turn.begin(event)
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
@@ -892,7 +927,7 @@ class SessionRunner:
                                 interrupt_requested=False,
                                 classified_failure=True,
                             )
-                            for line in _history_capacity_lines():
+                            for line in _history_capacity_lines(self._capacity_detail):
                                 if isinstance(parse_ndjson_line(line), Final):
                                     terminal_for_log = True
                                 yield line
@@ -1110,6 +1145,8 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._turn_progress is not None:
+                    self._turn_progress.close()
                 if self._approval_gate is not None:
                     self._approval_gate.clear_publication_context()
                 try:
@@ -1386,7 +1423,7 @@ class SessionRunner:
                         is SessionStatus.AWAITING_APPROVAL,
                     )
                     if capacity_failure:
-                        for line in _history_capacity_lines():
+                        for line in _history_capacity_lines(self._capacity_detail):
                             yield line
                     else:
                         yield to_ndjson_line(self._with_connector_notice(final))
@@ -1452,7 +1489,7 @@ class SessionRunner:
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
         if capacity_failure:
-            for line in _history_capacity_lines():
+            for line in _history_capacity_lines(self._capacity_detail):
                 yield line
         else:
             yield to_ndjson_line(self._with_connector_notice(final))

@@ -695,6 +695,69 @@ def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
     asyncio.run(exercise())
 
 
+def _max_turns_script() -> list:
+    return [
+        ErrorEvent(message="reached max turns", classification="max-turns"),
+        Final(text="f", status=SessionStatus.CLASSIFIED_FAILURE),
+    ]
+
+
+def test_work_item_max_turns_escalation_names_the_work_item_budget(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3403: a work item that exhausts its budget names the work-item setting
+    and the value it actually ran under."""
+
+    caplog.set_level("WARNING", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = _max_turns_script()
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            # A work item has no chat sink; the escalation is the kernel's
+            # escalation record.
+            text = " ".join(
+                r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()
+            )
+            assert "max-turns" in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS, currently 5" in text, text
+            assert "through runner.extraEnv" not in text, text
+
+    asyncio.run(exercise())
+
+
+def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None:
+    """#3403: a chat delivery runs under the runner's CURIE_MAX_TURNS, so its
+    escalation must name that setting, not the work-item budget it never had."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
+            h.runner.default_script = _max_turns_script()
+
+            await h.kernel.process_event(
+                _turn(f"slack-{uuid.uuid4()}", f"Please look at {ISSUE_URL}")
+            )
+
+            text = h.sink.last_text
+            assert text is not None and "max-turns" in text, text
+            assert "raise CURIE_MAX_TURNS through runner.extraEnv" in text, text
+            assert "runner default 20 when unset" in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
+            assert "currently 5" not in text, text
+
+    asyncio.run(exercise())
+
+
 def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
     make_harness,
 ) -> None:
@@ -972,5 +1035,75 @@ def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
             assert h.kernel._held_work_items
             assert h.kernel.owns_work_item(held) is True
             assert h.kernel.owns_work_item(uuid.uuid4()) is False
+
+    asyncio.run(exercise())
+
+
+# --- ADR-0168 decision 7: a runner booted without a caller token -----------
+
+
+class _CallerKeyBinding(_Binding):
+    """Boots carry a caller token once the install holds a caller key."""
+
+    def __init__(self, *, keyed: bool) -> None:
+        self.keyed = keyed
+
+    def boot_env(self, resolved: object, thread_key: str, **kwargs: object) -> dict[str, str]:
+        env = super().boot_env(resolved, thread_key, **kwargs)
+        if self.keyed:
+            env["CURIE_CONNECTOR_CALLER_TOKEN"] = "cct.payload.signature"
+        return env
+
+
+# @spec ADR-0168 d7
+def test_a_runner_booted_before_the_caller_key_is_replaced_on_its_next_turn(
+    make_harness,
+) -> None:
+    """Every hosted connector's proxy refuses a runner with no caller token,
+    and the route TTL slides on every turn, so waiting it out is no bound."""
+
+    async def exercise() -> None:
+        binding = _CallerKeyBinding(keyed=False)
+        async with make_harness(
+            binding=binding,
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+            binding.keyed = True
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "and again"))
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 2
+            assert "CURIE_CONNECTOR_CALLER_TOKEN" not in (envs[0] or {})
+            assert (envs[1] or {}).get("CURIE_CONNECTOR_CALLER_TOKEN") == "cct.payload.signature"
+
+    asyncio.run(exercise())
+
+
+# @spec ADR-0168 d7
+@pytest.mark.parametrize(("first", "then"), [(True, True), (True, False), (False, False)])
+def test_a_runner_whose_caller_token_still_fits_is_adopted(
+    make_harness, first: bool, then: bool
+) -> None:
+    """Only a missing token forces a fresh runner. A runner that carries one
+    keeps working after the key is removed, because no proxy is rendered then."""
+
+    async def exercise() -> None:
+        binding = _CallerKeyBinding(keyed=first)
+        async with make_harness(
+            binding=binding,
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+            binding.keyed = then
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "and again"))
+
+            assert len(h.fake_k8s.claim_envs) == 1
 
     asyncio.run(exercise())

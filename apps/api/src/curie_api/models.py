@@ -234,6 +234,10 @@ class Agent(Base):
     # across every binding. Existing single-binding agents are unaffected
     # either way, since there is nothing else to share with.
     memory: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the runner mounts its remember/update/forget memory tools for this
+    # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
+    # worker hands the runner the binding-scoped channel memory URL.
+    memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -246,9 +250,8 @@ class Agent(Base):
     # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
     # `created_at` to fall back on, so without an explicit order the serialized
     # list's element order is whatever Postgres happens to return, and two
-    # identical GETs could differ. `(kind, address)` is used because it is the
-    # pair every other layer already treats as the binding's identity
-    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
+    # identical GETs could differ. `(kind, address, adapter)` is used because it
+    # is the route every other layer keys by (`agent_channels_route_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
@@ -258,7 +261,7 @@ class Agent(Base):
     channels: Mapped[list[AgentChannel]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        order_by="(AgentChannel.kind, AgentChannel.address)",
+        order_by="(AgentChannel.kind, AgentChannel.address, AgentChannel.adapter)",
         lazy="selectin",
     )
 
@@ -277,7 +280,8 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running.
+    after the cutover proves no old worker is running. Migration 0070 widens the
+    key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
@@ -295,23 +299,30 @@ class AgentChannel(Base):
 
     __tablename__ = "agent_channels"
     __table_args__ = (
-        # One agent per ROUTE, the `(kind, address)` pair (#38, widened from
-        # migration 0021's address-only `agent_channels_address_key` by 0023).
-        # The worker resolves a pair to an agent, so a second agent bound to the
-        # same pair could never respond -- it would be silently shadowed.
-        # Enforced here so it fails at create time.
-        #
-        # The pair, not the address alone, ONLY because the resolver now sees the
-        # pair too (`binding._RESOLVE_SQL`). Widening this while any address-only
-        # consumer can still run re-opens the exact ambiguity the constraint
-        # exists to close, which is why the cutover proves no old worker pod is
-        # running before migration 0023 applies.
-        UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
+        # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
+        # decision 3, migration 0070; 0023 keyed the pair, 0021 the address).
+        # A second agent bound to the same route could never respond -- it
+        # would be silently shadowed (#38). Enforced here so it fails at create
+        # time. The pair leads so `(kind, address)` lookups keep the index
+        # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
+        # colliding on the pair.
+        UniqueConstraint(
+            "kind",
+            "address",
+            "adapter",
+            name="agent_channels_route_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
+            "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
+            name="agent_channels_route_ck",
+        ),
         # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
         # hold more than one binding now. ADR-0089's "one agent still binds one
-        # channel" is amended in part -- the (kind, address) constraint above is
-        # still what stops two agents claiming the same channel; nothing stops
-        # one agent from claiming several.
+        # channel" is amended in part -- the route key above is what stops two
+        # agents claiming the same route; nothing stops one agent from claiming
+        # several.
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
@@ -327,10 +338,11 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
-    # The server-controlled reply route (migration 0024). Both NULL for `slack`,
-    # whose route is the worker's configured Slack origin; both set together for
-    # any other kind -- `agent_channels_route_pair_ck` states that invariant at
-    # the database so a half-configured route cannot be written out of band.
+    # The reply route (migration 0024) and, for `slack`, the bot identity
+    # (ADR-0168 decision 3): a Slack row names its identity in `adapter` and has
+    # no `endpoint`; any other kind sets both or neither.
+    # `agent_channels_route_ck` states it at the database so a half-configured
+    # route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
     # Rotation counter (ADR-0096 D5, #2379). Bumped on every write to the ROUTE
@@ -709,8 +721,12 @@ class ExecutionRequest(Base):
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
+            "status IN ('queued', 'cancelled') OR wait_deadline IS NOT NULL",
+            name="execution_requests_wait_deadline_ck",
+        ),
+        CheckConstraint(
             "status IS NOT NULL AND status IN "
-            "('waiting', 'running', 'cancellation_requested', 'completed', "
+            "('queued', 'waiting', 'running', 'cancellation_requested', 'completed', "
             "'failed', 'expired', 'cancelled')",
             name="execution_requests_status_ck",
         ),
@@ -732,7 +748,10 @@ class ExecutionRequest(Base):
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'waiting' AND started_at IS NULL "
+            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'running' AND started_at IS NOT NULL "
@@ -763,7 +782,7 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NOT NULL))) "
             "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause = 'issue_cancelled' AND "
+            "AND terminal_cause IN ('issue_cancelled', 'lineage_closed') AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
@@ -835,6 +854,12 @@ class ExecutionRequest(Base):
             postgresql_where=text("status = 'waiting'"),
         ),
         Index(
+            "ix_execution_requests_queued",
+            "work_item_id",
+            "sequence",
+            postgresql_where=text("status = 'queued'"),
+        ),
+        Index(
             "ix_execution_requests_runtime_liveness",
             "runtime_heartbeat_expires_at",
             postgresql_where=text(
@@ -849,7 +874,7 @@ class ExecutionRequest(Base):
     )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
-    wait_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

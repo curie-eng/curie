@@ -3,7 +3,7 @@
 Every layer of the per-binding caller list, driven against the real Postgres
 and the real Valkey the compose stack provides; nothing of ours is mocked:
 
-- migration 0068 and the model: the nullable column, its CHECK, and a Python
+- migration 0069 and the model: the nullable column, its CHECK, and a Python
   None stored as SQL NULL;
 - the entry checks (`schemas.validate_allowed_callers`) per binding kind;
 - the one admission function (`admission.admit`);
@@ -210,7 +210,7 @@ def _row(kind: str, allowed_callers: list[str] | None) -> AgentChannel:
     return AgentChannel(kind=kind, address="x", allowed_callers=allowed_callers)
 
 
-# --- migration 0068 and the model -------------------------------------------------
+# --- migration 0069 and the model -------------------------------------------------
 
 
 def _config() -> Config:
@@ -227,14 +227,14 @@ def _has_column() -> bool:
     return int(rows[0]["n"]) == 1
 
 
-def test_0068_round_trip_adds_and_drops_the_nullable_column(
+def test_0069_round_trip_adds_and_drops_the_nullable_column(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
     command.upgrade(config, "head")
     assert _has_column()
     try:
-        command.downgrade(config, "0067")
+        command.downgrade(config, "0068")
         assert not _has_column()
     finally:
         command.upgrade(config, "head")

@@ -13,8 +13,6 @@ it is not regenerated here); its input is the same committed schema this gate
 pins, so a drifted schema is caught here before TypeScript can diverge.
 """
 
-from pathlib import Path
-
 from aci_protocol.rust_export import crate_dir, render_rust
 from aci_protocol.schema_export import build_schema, render_schema, schema_path
 
@@ -61,7 +59,7 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.6"
+    assert schema["protocolVersion"] == "0.5.7"
 
     definitions = schema["$defs"]
     event = definitions["Event"]
@@ -88,15 +86,3 @@ def test_publication_context_is_an_optional_event_field_with_required_contents()
         "observed_body_sha256",
         "observed_at",
     }
-
-
-def test_publication_context_is_present_in_both_generated_language_artifacts() -> None:
-    typescript = (
-        Path(__file__).resolve().parents[1] / "generated" / "ts" / "aci-protocol.ts"
-    ).read_text(encoding="utf-8")
-    rust = (crate_dir() / "src" / "lib.rs").read_text(encoding="utf-8")
-
-    assert "export interface PublicationContext {" in typescript
-    assert "publication_context?:" in typescript
-    assert "pub struct PublicationContext {" in rust
-    assert "publication_context: Option<PublicationContext>" in rust

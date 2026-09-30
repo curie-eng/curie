@@ -26,10 +26,10 @@ use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::api::{Agent, ApiClient, ClusterMessageReplyEvent};
+use crate::api::{Agent, ApiClient, ClusterMessageProgress, ClusterMessageReplyEvent};
 use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
-    parse_approval_id, resolve_targets, Outcome, SlackStub,
+    failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
@@ -620,6 +620,49 @@ fn is_publication_result_text(text: &str) -> bool {
         || text.starts_with("Publication failed safely after approval: ")
 }
 
+/// A delivered reply is a successful task reply only when it is not a failed turn.
+///
+/// `escalated` is the worker's `turn.completed` outcome. A reply whose first line
+/// is the failure marker carries its class even when that completion is missing.
+/// An escalation with no marker is still a failure, class `unclassified`.
+fn reply_or_failed(latest: Option<String>, escalated: bool) -> Outcome {
+    match latest {
+        Some(text) => {
+            if let Some(class) = failure_class_from_reply(&text) {
+                Outcome::Failed {
+                    class: class.to_string(),
+                    reply: text,
+                }
+            } else if escalated {
+                Outcome::Failed {
+                    class: "unclassified".to_string(),
+                    reply: text,
+                }
+            } else {
+                Outcome::Replied(text)
+            }
+        }
+        None if escalated => Outcome::Failed {
+            class: "unclassified".to_string(),
+            reply: String::new(),
+        },
+        None => Outcome::CompletedNoEdit,
+    }
+}
+
+/// The status line a relayed progress card or milestone shows while the CLI
+/// waits (ADR-0130). The wire's own words, since the CLI keeps no copy of the
+/// worker's labels.
+fn progress_status_line(progress: &ClusterMessageProgress) -> String {
+    if progress.kind == "milestone" {
+        let milestone = progress.milestone.as_deref().unwrap_or("progress");
+        format!("Milestone ({milestone}): {}", progress.summary)
+    } else {
+        let state = progress.state.as_deref().unwrap_or("unknown");
+        format!("Progress ({state}): {}", progress.summary)
+    }
+}
+
 /// Classify one relay page into a resume wait outcome. Pure so the #2757 hang
 /// (publication result delivered, waiter still looping) is unit-testable
 /// without a cluster.
@@ -637,6 +680,14 @@ fn cluster_relay_page_outcome(
     let mut completed = false;
     let mut publication_result = false;
     for event in events {
+        if let Some(progress) = event.progress.as_ref() {
+            // A progress post or card edit (ADR-0130): a status line at most,
+            // never the reply and never a completion, even when it closes.
+            if matches!(event.kind.as_str(), "reply.update" | "reply.post") {
+                observer(&progress_status_line(progress));
+                continue;
+            }
+        }
         match event.kind.as_str() {
             "turn.status" => {
                 if let Some(status) = event.status.as_deref() {
@@ -670,18 +721,13 @@ fn cluster_relay_page_outcome(
         }
     }
     if publication_result {
-        return Ok(Some(
-            latest
-                .clone()
-                .map_or(Outcome::CompletedNoEdit, Outcome::Replied),
-        ));
+        return Ok(Some(reply_or_failed(latest.clone(), false)));
     }
     if completed || terminal_page {
-        return Ok(Some(
-            latest
-                .clone()
-                .map_or(Outcome::CompletedNoEdit, Outcome::Replied),
-        ));
+        let escalated = events.iter().any(|event| {
+            event.kind == "turn.completed" && event.outcome.as_deref() == Some("escalated")
+        });
+        return Ok(Some(reply_or_failed(latest.clone(), escalated)));
     }
     if awaiting_approval {
         let approval_id = latest.as_deref().and_then(parse_approval_id);
@@ -1119,6 +1165,21 @@ pub fn message_reply_json(thread: &str, reply: Option<&str>) -> serde_json::Valu
     })
 }
 
+/// The machine-readable object for a failed runner turn (#3401).
+///
+/// `finalized` is false so a consumer that treats a finalized reply as task
+/// success cannot score this turn as successful. `failure_class` is the
+/// platform token, and `reply` is the delivered text.
+pub fn message_failed_json(thread: &str, reply: &str, failure_class: &str) -> serde_json::Value {
+    serde_json::json!({
+        "reply": reply,
+        "thread": thread,
+        "finalized": false,
+        "failed": true,
+        "failure_class": failure_class,
+    })
+}
+
 /// The machine-readable object for a `local`/`cluster message --json` **timeout**
 /// (issue #354): no reply was captured before the deadline, so `reply` is null,
 /// `finalized` is false, and `timed_out` marks the terminal state distinctly from
@@ -1237,6 +1298,12 @@ impl crate::ui::CliOutput for MessageDryRunOutput {
 pub enum MessageOutcomeOutput {
     /// The worker finalized the turn with reply text.
     Replied { thread: String, reply: String },
+    /// The worker delivered a failed runner turn. Exit code is 1.
+    Failed {
+        thread: String,
+        reply: String,
+        failure_class: String,
+    },
     /// The worker finished the turn but never edited the placeholder.
     NoEdit { thread: String },
     /// The turn parked awaiting human approval. `tier`/`agent`/`channel` shape the
@@ -1275,6 +1342,11 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
             MessageOutcomeOutput::Replied { thread, reply } => {
                 message_reply_json(thread, Some(reply))
             }
+            MessageOutcomeOutput::Failed {
+                thread,
+                reply,
+                failure_class,
+            } => message_failed_json(thread, reply, failure_class),
             MessageOutcomeOutput::NoEdit { thread } => message_reply_json(thread, None),
             MessageOutcomeOutput::AwaitingApproval { thread, reply, .. } => {
                 message_awaiting_approval_json(thread, reply.as_deref())
@@ -1289,6 +1361,10 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             MessageOutcomeOutput::Replied { reply, .. } => {
+                ui.answer(reply);
+                ui.print_tokens("\n");
+            }
+            MessageOutcomeOutput::Failed { reply, .. } => {
                 ui.answer(reply);
                 ui.print_tokens("\n");
             }
@@ -2158,6 +2234,16 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
             Ok(())
         }
+        Outcome::Failed { reply, class } => {
+            step.fail(&format!("failed ({class})"));
+            ui.emit(&MessageOutcomeOutput::Failed {
+                thread: thread_ts.clone(),
+                reply,
+                failure_class: class,
+            });
+            persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, stub);
+        }
         Outcome::CompletedNoEdit => {
             step.done("no edit");
             ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -2200,6 +2286,9 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                     .await
                     {
                         ResumeExit::Done => Ok(()),
+                        ResumeExit::Failed => {
+                            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, stub);
+                        }
                         // Still parked: the durable approval stays pending and is
                         // resolvable later, so this is retryable. Local mode holds
                         // no port-forward children, but it DOES still hold the
@@ -2346,6 +2435,7 @@ async fn hint_channel(
     turn_channel: &str,
     id: &str,
     deadline: Instant,
+    budget: Duration,
 ) -> String {
     let lookup = async {
         // The port-forward guard is bound HERE, in the enclosing async block,
@@ -2400,7 +2490,7 @@ async fn hint_channel(
     // it is decorating (#1531; `cli/src/chat.rs:497-499`). Reuses the same
     // `capped` helper the resume scan uses rather than a second copy of the
     // bound.
-    match tokio::time::timeout(capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline), lookup).await {
+    match tokio::time::timeout(capped(budget, deadline), lookup).await {
         // A present, non-empty card channel is the only real answer. The
         // emptiness guard is load-bearing, not defensive: the server reads
         // `approval.card_channel or approval.reply_channel`, and in Python
@@ -2490,6 +2580,8 @@ fn note_approval_pending(ui: &crate::ui::Ui, tier: &str, agent: Option<&str>, ch
 enum ResumeExit {
     /// Fully handled; the caller returns `Ok(())` and its guards drop normally.
     Done,
+    /// The resumed turn failed. The caller drops its guards and exits 1.
+    Failed,
     /// The turn is still parked (the wait elapsed, or the resumed turn hit a NEW
     /// gate). The durable `Approval` stays pending and resolvable later, so this
     /// is retryable: the caller drops its port-forward guards and exits with the
@@ -2575,7 +2667,15 @@ async fn resume_after_approval(
         last_hint_channel = if ui.json() {
             channel.to_string()
         } else {
-            hint_channel(opts, verb, channel, &current_id, deadline).await
+            hint_channel(
+                opts,
+                verb,
+                channel,
+                &current_id,
+                deadline,
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await
         };
         // Recompute AFTER the lookup, because the lookup itself consumes turn
         // time. The pre-lookup value is stale by up to the whole lookup budget,
@@ -2635,6 +2735,15 @@ async fn resume_after_approval(
                 });
                 persist_and_hint(opts, verb, channel, thread_ts);
                 return ResumeExit::Done;
+            }
+            Outcome::Failed { reply, class } => {
+                ui.emit(&MessageOutcomeOutput::Failed {
+                    thread: thread_ts.to_string(),
+                    reply,
+                    failure_class: class,
+                });
+                persist_and_hint(opts, verb, channel, thread_ts);
+                return ResumeExit::Failed;
             }
             Outcome::CompletedNoEdit => {
                 ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -2765,7 +2874,15 @@ async fn resume_cluster_after_approval(
         last_hint_channel = if ui.json() {
             channel.to_string()
         } else {
-            hint_channel(opts, TurnVerb::Cluster, channel, &current_id, deadline).await
+            hint_channel(
+                opts,
+                TurnVerb::Cluster,
+                channel,
+                &current_id,
+                deadline,
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2804,6 +2921,15 @@ async fn resume_cluster_after_approval(
                 });
                 persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
                 return Ok(ResumeExit::Done);
+            }
+            Outcome::Failed { reply, class } => {
+                ui.emit(&MessageOutcomeOutput::Failed {
+                    thread: thread_ts.to_string(),
+                    reply,
+                    failure_class: class,
+                });
+                persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+                return Ok(ResumeExit::Failed);
             }
             Outcome::CompletedNoEdit => {
                 ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -3433,6 +3559,16 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             Ok(())
         }
+        Outcome::Failed { reply, class } => {
+            step.fail(&format!("failed ({class})"));
+            ui.emit(&MessageOutcomeOutput::Failed {
+                thread: thread_ts.clone(),
+                reply,
+                failure_class: class,
+            });
+            persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, (_api_pf, _valkey_pf));
+        }
         Outcome::CompletedNoEdit => {
             step.done("no edit");
             ui.emit(&MessageOutcomeOutput::NoEdit {
@@ -3469,6 +3605,10 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     .await?
                     {
                         ResumeExit::Done => Ok(()),
+                        ResumeExit::Failed => crate::exit::exit_after_drop(
+                            crate::exit::ExitClass::Failure,
+                            (_api_pf, _valkey_pf),
+                        ),
                         ResumeExit::Transient => crate::exit::exit_after_drop(
                             crate::exit::ExitClass::Transient,
                             (_api_pf, _valkey_pf),
@@ -3646,10 +3786,15 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
             // tool-call trajectory, so a tool_called grader has nothing to read
             // here and fails closed. The trajectory-aware grade lives on the
             // `skill eval` path (`turn_passes`) and the server-side eval matrix.
-            Outcome::Replied(reply) => case.grader.grade(reply, &[]),
-            Outcome::CompletedNoEdit | Outcome::AwaitingApproval { .. } | Outcome::TimedOut => {
-                false
+            // A failed runner turn never passes, even when its text contains the
+            // grader's expected answer (#3401).
+            Outcome::Replied(reply) => {
+                failure_class_from_reply(reply).is_none() && case.grader.grade(reply, &[])
             }
+            Outcome::Failed { .. }
+            | Outcome::CompletedNoEdit
+            | Outcome::AwaitingApproval { .. }
+            | Outcome::TimedOut => false,
         },
         // Gate-blocked assertion: the turn must have parked awaiting approval, and
         // the latest placeholder text (the model's narration before the gate flip)
@@ -3659,7 +3804,10 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
             Outcome::AwaitingApproval { reply, .. } => {
                 case.grader.grade(reply.as_deref().unwrap_or_default(), &[])
             }
-            Outcome::Replied(_) | Outcome::CompletedNoEdit | Outcome::TimedOut => false,
+            Outcome::Replied(_)
+            | Outcome::Failed { .. }
+            | Outcome::CompletedNoEdit
+            | Outcome::TimedOut => false,
         },
     }
 }
@@ -3917,7 +4065,7 @@ async fn run_eval_turns(
                 queue_thread_reset(conn, &thread_key).await?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
-                    Outcome::Replied(reply) => reply.clone(),
+                    Outcome::Replied(reply) | Outcome::Failed { reply, .. } => reply.clone(),
                     Outcome::AwaitingApproval { reply, .. } => reply.clone().unwrap_or_default(),
                     Outcome::CompletedNoEdit => String::new(),
                     Outcome::TimedOut => match relay_ref {
@@ -3931,6 +4079,7 @@ async fn run_eval_turns(
                 let completed = matches!(
                     outcome,
                     Outcome::Replied(_)
+                        | Outcome::Failed { .. }
                         | Outcome::AwaitingApproval { .. }
                         | Outcome::CompletedNoEdit
                 );
@@ -5098,79 +5247,89 @@ mod tests {
         }
     }
 
+    /// Each persist-hint driver mode, the text its stderr must carry, and the
+    /// text it must not. Every mode must also exit successfully.
     #[test]
-    fn cluster_continue_hint_carries_a_nondefault_target() {
-        let output = capture_persist_hint("cluster-short");
-        let text = captured_stderr(&output);
-        assert!(output.status.success(), "{text}");
-        assert!(text.contains("curie cluster message"), "{text}");
-        assert!(
-            text.contains("--namespace") && text.contains("acme-platform"),
-            "{text}"
-        );
-        assert!(
-            text.contains("--release") && text.contains("acme-prod"),
-            "{text}"
-        );
-        assert!(text.contains("--continue"), "{text}");
-    }
-
-    #[test]
-    fn cluster_fallback_hint_carries_a_nondefault_target() {
-        let output = capture_persist_hint("cluster-fallback");
-        let text = captured_stderr(&output);
-        assert!(output.status.success(), "{text}");
-        assert!(text.contains("could not save turn context"), "{text}");
-        assert!(text.contains("curie cluster message"), "{text}");
-        assert!(
-            text.contains("--namespace") && text.contains("acme-platform"),
-            "{text}"
-        );
-        assert!(
-            text.contains("--release") && text.contains("acme-prod"),
-            "{text}"
-        );
-        assert!(
-            text.contains("--channel") && text.contains("C0EXAMPLE1"),
-            "{text}"
-        );
-        assert!(
-            text.contains("--thread") && text.contains("1700000000.000100"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn default_cluster_hint_carries_both_target_flags() {
-        let output = capture_persist_hint("cluster-default");
-        let text = captured_stderr(&output);
-        assert!(output.status.success(), "{text}");
-        assert!(text.contains("--namespace curie"), "{text}");
-        assert!(text.contains("--release curie"), "{text}");
-        assert!(text.contains("--continue"), "{text}");
-    }
-
-    #[test]
-    fn default_cluster_fallback_hint_cannot_redirect_to_the_file_target() {
-        let output = capture_persist_hint("cluster-default-fallback");
-        let text = captured_stderr(&output);
-        assert!(output.status.success(), "{text}");
-        assert!(text.contains("could not save turn context"), "{text}");
-        assert!(text.contains("--namespace curie"), "{text}");
-        assert!(text.contains("--release curie"), "{text}");
-        assert!(!text.contains("acme-platform"), "{text}");
-        assert!(!text.contains("acme-prod"), "{text}");
-        assert!(!text.contains("--continue"), "{text}");
-    }
-
-    #[test]
-    fn local_hint_does_not_carry_cluster_target_flags() {
-        let output = capture_persist_hint("local");
-        let text = captured_stderr(&output);
-        assert!(output.status.success(), "{text}");
-        assert!(!text.contains("--namespace"), "{text}");
-        assert!(!text.contains("--release"), "{text}");
-        assert!(!text.contains("must-not-appear"), "{text}");
+    fn persist_hint_carries_the_right_target_flags_per_mode() {
+        struct Case {
+            name: &'static str,
+            mode: &'static str,
+            contains: &'static [&'static str],
+            absent: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                name: "cluster_continue_nondefault_target",
+                mode: "cluster-short",
+                contains: &[
+                    "curie cluster message",
+                    "--namespace",
+                    "acme-platform",
+                    "--release",
+                    "acme-prod",
+                    "--continue",
+                ],
+                absent: &[],
+            },
+            Case {
+                name: "cluster_fallback_nondefault_target",
+                mode: "cluster-fallback",
+                contains: &[
+                    "could not save turn context",
+                    "curie cluster message",
+                    "--namespace",
+                    "acme-platform",
+                    "--release",
+                    "acme-prod",
+                    "--channel",
+                    "C0EXAMPLE1",
+                    "--thread",
+                    "1700000000.000100",
+                ],
+                absent: &[],
+            },
+            Case {
+                name: "default_cluster_both_target_flags",
+                mode: "cluster-default",
+                contains: &["--namespace curie", "--release curie", "--continue"],
+                absent: &[],
+            },
+            Case {
+                name: "default_cluster_fallback_cannot_redirect_to_file_target",
+                mode: "cluster-default-fallback",
+                contains: &[
+                    "could not save turn context",
+                    "--namespace curie",
+                    "--release curie",
+                ],
+                absent: &["acme-platform", "acme-prod", "--continue"],
+            },
+            Case {
+                name: "local_no_cluster_target_flags",
+                mode: "local",
+                contains: &[],
+                absent: &["--namespace", "--release", "must-not-appear"],
+            },
+        ];
+        for case in cases {
+            let output = capture_persist_hint(case.mode);
+            let text = captured_stderr(&output);
+            assert!(output.status.success(), "[{}] {text}", case.name);
+            for needle in case.contains {
+                assert!(
+                    text.contains(needle),
+                    "[{}] missing {needle:?}: {text}",
+                    case.name
+                );
+            }
+            for needle in case.absent {
+                assert!(
+                    !text.contains(needle),
+                    "[{}] unexpected {needle:?}: {text}",
+                    case.name
+                );
+            }
+        }
     }
 
     const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
@@ -5629,6 +5788,7 @@ mod tests {
     //         turn_channel: &str,
     //         id: &str,
     //         deadline: Instant,
+    //         budget: Duration,
     //     ) -> String
     //
     // The `deadline` parameter is the turn's overall deadline, NOT this
@@ -5636,6 +5796,8 @@ mod tests {
     // `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)` (`cli/src/chat.rs:86`), so
     // a short `--timeout-secs` shortens the lookup rather than being overrun by
     // it. See `the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline`.
+    // `budget` is a parameter so the stalling-peer tests can exercise the bound
+    // with a fraction of a second instead of waiting out the production ten.
     //
     // and, as part of the same contract, the bound it is capped against:
     //
@@ -5769,45 +5931,6 @@ mod tests {
         }
     }
 
-    /// The defect itself (#1531 finding 3): a route binding put the card in a
-    /// different channel, and the hint must name THAT channel.
-    ///
-    /// The hint is a command a human copy-pastes. With the turn channel on it,
-    /// the default approver set -- `SlackChannelMembers(card_channel or
-    /// reply_channel)` in `apps/api/.../slack_approvers.py` -- refuses the
-    /// resolve 403 with "resolve this from the approval's channel", and the
-    /// operator has no way to derive the right value from what was printed.
-    ///
-    /// Mutation it catches: keeping `channel` at the call site, i.e. never
-    /// performing the lookup at all -- which is the pre-change behavior and is
-    /// exactly what every degraded path below must still produce.
-    #[tokio::test]
-    async fn the_hint_names_the_approvals_card_channel_when_a_route_bound_one() {
-        let base = hint_stub_api(200, HINT_ROUTE_BOUND_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_CARD_CHANNEL,
-            "the hint must name the channel the card was posted to, which is \
-             where an authenticated chat principal can act on the card"
-        );
-        assert_ne!(
-            resolved, HINT_TURN_CHANNEL,
-            "the fixture keeps the card and turn channels distinct on purpose; \
-             if they matched, this test could not tell a real lookup from the \
-             unchanged fallback"
-        );
-    }
-
     /// A-T4a. The API is unreachable, so the hint degrades to the turn channel
     /// and does it promptly.
     ///
@@ -5839,6 +5962,7 @@ mod tests {
             HINT_TURN_CHANNEL,
             HINT_APPROVAL_ID,
             hint_far_deadline(),
+            HINT_CHANNEL_LOOKUP_BUDGET,
         )
         .await;
         let elapsed = started.elapsed();
@@ -5883,6 +6007,10 @@ mod tests {
     async fn a_stalled_api_is_cut_off_at_the_budget_rather_than_hanging_the_turn() {
         let (base, stall) = hint_stalling_peer().await;
         let opts = hint_opts(&base);
+        // A short budget stands in for the production one: the bound is the
+        // same code path either way, and waiting out ten real seconds proves
+        // nothing a half second does not.
+        let budget = Duration::from_millis(500);
 
         let started = Instant::now();
         // The outer bound is the test harness's own safety net, deliberately
@@ -5890,18 +6018,19 @@ mod tests {
         // forgot the inner timeout would hang this test forever and block CI
         // instead of failing it. Its expiry IS the failure signal.
         let resolved = tokio::time::timeout(
-            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            budget * 20,
             hint_channel(
                 &opts,
                 TurnVerb::Local,
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 hint_far_deadline(),
+                budget,
             ),
         )
         .await
         .expect(
-            "the lookup never returned within three budgets against a stalled peer, so nothing \
+            "the lookup never returned within twenty budgets against a stalled peer, so nothing \
              is bounding it: a real turn would sit here forever",
         );
         let elapsed = started.elapsed();
@@ -5917,12 +6046,12 @@ mod tests {
         // error path that happened to answer quickly and would leave the real
         // stall unbounded. Upper bound: proves the budget actually fired.
         assert!(
-            elapsed >= HINT_CHANNEL_LOOKUP_BUDGET,
+            elapsed >= budget,
             "returning before the budget means the stall was not reached and \
              this test proved nothing about the bound; took {elapsed:?}"
         );
         assert!(
-            elapsed < HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            elapsed < budget * 4,
             "the lookup must be cut off at its own budget, not left to some \
              wider deadline; took {elapsed:?}"
         );
@@ -5954,20 +6083,24 @@ mod tests {
     async fn the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline() {
         let (base, stall) = hint_stalling_peer().await;
         let opts = hint_opts(&base);
-        // A turn with one second left, against a peer that never answers.
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // A turn with a fifth of a second left, against a peer that never
+        // answers, and a budget twenty times that so only the deadline can end
+        // the lookup early.
+        let budget = Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_millis(200);
 
         let started = Instant::now();
         // Same harness safety net as above: an implementation that ignored the
         // deadline would otherwise hang CI instead of failing it.
         let resolved = tokio::time::timeout(
-            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            budget * 3,
             hint_channel(
                 &opts,
                 TurnVerb::Local,
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 deadline,
+                budget,
             ),
         )
         .await
@@ -5983,173 +6116,148 @@ mod tests {
             "a deadline that expires mid-lookup is 'no answer' like any other, \
              so the hint still degrades to the turn channel"
         );
-        // Half a budget, not the one second itself: the deadline is what must
+        // Half the budget, not the deadline itself: the deadline is what must
         // end this, and anything at or near the full budget means the turn's
         // remaining time was ignored. The slack is deliberately wide so a loaded
         // machine cannot flake it, while still being far below the value a
         // deadline-blind implementation would produce.
         assert!(
-            elapsed < HINT_CHANNEL_LOOKUP_BUDGET / 2,
-            "with one second left on the turn, the lookup must end in about one \
-             second, not run its full budget: a `--timeout-secs 1` turn would \
+            elapsed < budget / 2,
+            "with a fifth of a second left on the turn, the lookup must end in \
+             about that, not run its full budget: a `--timeout-secs 1` turn would \
              otherwise take about eleven seconds and break the hard bound \
              `cli/src/chat.rs:497-499` promises. Took {elapsed:?}"
         );
     }
 
-    /// A-T4b. The lookup succeeds but the record carries no card channel, so
-    /// there is nothing to override with.
-    ///
-    /// A null `card_channel` is an older row or a direct API write, which means
-    /// the REQUESTING channel applies (#1431) -- and the requesting channel is
-    /// the turn channel. Substituting an empty string or the literal "null"
-    /// here would print an unrunnable command.
-    ///
-    /// Mutation it catches: `unwrap_or_default()` on the option, which yields
-    /// an empty, unusable channel hint.
-    #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_record_binds_no_route() {
-        let base = hint_stub_api(200, HINT_UNROUTED_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "a null card_channel means the requesting channel applies, not that \
-             the hint should print an empty or literal-null channel"
-        );
+    /// One stub response for [`hint_channel_resolves_from_the_stubbed_approval_record`].
+    struct HintStubCase {
+        name: &'static str,
+        status: u16,
+        body: &'static str,
+        expected: &'static str,
+        expected_msg: &'static str,
+        /// A channel the result must NOT be, with the reason.
+        not_expected: Option<(&'static str, &'static str)>,
+        /// Also assert the result is non-empty.
+        require_nonempty: bool,
     }
 
-    /// P2. An EMPTY `card_channel` is not a channel, and must degrade exactly
-    /// like a null one.
+    /// Every `hint_channel` case whose only input is the stub API's response.
     ///
-    /// The wire model admits `"card_channel": ""`, and the SERVER already reads
-    /// it as absent: the authorizer resolves the approver set as
-    /// `approval.card_channel or approval.reply_channel`
-    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and an empty string is
-    /// falsy in Python, so the members of the REPLY channel are the approver
-    /// set. A CLI that echoed the empty value would print an unusable hint --
-    /// the exact failure #1531 exists to remove, reintroduced by the fix for it
-    /// and on a record shape nothing else in the suite covers.
-    ///
-    /// The turn channel is the right answer rather than merely a safe one: it
-    /// IS the reply channel, which is what the server falls back to.
-    ///
-    /// Mutation it catches: `Ok(Some(card_channel)) => card_channel` with no
-    /// emptiness check, which is what the current implementation does.
+    /// - `route_bound` (#1531 finding 3): a route binding put the card in a
+    ///   different channel and the hint must name THAT channel; the turn
+    ///   channel would draw a 403 from `SlackChannelMembers(card_channel or
+    ///   reply_channel)`. Catches never performing the lookup.
+    /// - `unrouted` (A-T4b): a null `card_channel` means the requesting (turn)
+    ///   channel applies (#1431). Catches `unwrap_or_default()`.
+    /// - `empty_card_channel` (P2): `""` is falsy in Python, so the server falls
+    ///   back to the reply channel (`slack_approvers.py:174`). Catches a missing
+    ///   emptiness check.
+    /// - `whitespace_card_channel`: `" "` is TRUTHY in Python, so the server
+    ///   authorizes against it verbatim. This row and `empty_card_channel` are
+    ///   deliberately a PAIR differing by one space; do not "simplify" with a
+    ///   `trim()`. Catches `!card_channel.trim().is_empty()`.
+    /// - `approval_gone`: a 404 (another operator resolved or expired it) is
+    ///   absorbed by the advisory wrapper, not surfaced. Catches bubbling the
+    ///   client error out and failing the turn.
     #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_card_channel_is_empty() {
-        let base = hint_stub_api(200, HINT_EMPTY_CARD_APPROVAL).await;
-        let opts = hint_opts(&base);
+    async fn hint_channel_resolves_from_the_stubbed_approval_record() {
+        let cases = [
+            HintStubCase {
+                name: "route_bound",
+                status: 200,
+                body: HINT_ROUTE_BOUND_APPROVAL,
+                expected: HINT_CARD_CHANNEL,
+                expected_msg: "the hint must name the channel the card was posted to, which is \
+                               where an authenticated chat principal can act on the card",
+                not_expected: Some((
+                    HINT_TURN_CHANNEL,
+                    "the fixture keeps the card and turn channels distinct on purpose; \
+                     if they matched, this test could not tell a real lookup from the \
+                     unchanged fallback",
+                )),
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "unrouted",
+                status: 200,
+                body: HINT_UNROUTED_APPROVAL,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "a null card_channel means the requesting channel applies, not that \
+                               the hint should print an empty or literal-null channel",
+                not_expected: None,
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "empty_card_channel",
+                status: 200,
+                body: HINT_EMPTY_CARD_APPROVAL,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "an empty card_channel is what the server itself treats as absent, \
+                               so the hint must name the reply channel the server falls back to, \
+                               which is the turn channel",
+                not_expected: None,
+                require_nonempty: true,
+            },
+            HintStubCase {
+                name: "whitespace_card_channel",
+                status: 200,
+                body: HINT_BLANK_CARD_APPROVAL,
+                expected: HINT_BLANK_CARD_CHANNEL,
+                expected_msg: "a whitespace-only card_channel is TRUTHY in Python, so the server \
+                               authorizes against that exact value; the hint must reproduce it \
+                               byte for byte rather than trimming it away",
+                not_expected: Some((
+                    HINT_TURN_CHANNEL,
+                    "degrading here prints a channel the server will not accept, which \
+                     is the 403 this whole change exists to remove",
+                )),
+                require_nonempty: false,
+            },
+            HintStubCase {
+                name: "approval_gone",
+                status: 404,
+                body: r#"{"detail":"approval not found"}"#,
+                expected: HINT_TURN_CHANNEL,
+                expected_msg: "an approval resolved out from under the wait is 'no answer'; the \
+                               hint degrades rather than the turn failing",
+                not_expected: None,
+                require_nonempty: false,
+            },
+        ];
 
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
+        for case in cases {
+            let base = hint_stub_api(case.status, case.body).await;
+            let opts = hint_opts(&base);
 
-        assert!(
-            !resolved.is_empty(),
-            "the hint must never report an empty card location; fall back to \
-             the requesting channel when no route-bound location exists"
-        );
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "an empty card_channel is what the server itself treats as absent, \
-             so the hint must name the reply channel the server falls back to, \
-             which is the turn channel"
-        );
-    }
+            let resolved = hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+                HINT_CHANNEL_LOOKUP_BUDGET,
+            )
+            .await;
 
-    /// The other side of that boundary: a WHITESPACE-ONLY `card_channel` is a
-    /// real channel to the server, so the hint must print it VERBATIM.
-    ///
-    /// This test and
-    /// `the_hint_names_the_turn_channel_when_the_card_channel_is_empty` are
-    /// deliberately a PAIR, and the pair is the point. The server picks the
-    /// approver set with `approval.card_channel or approval.reply_channel`
-    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python ONLY the
-    /// empty string is falsy. `" "` is truthy, so the authorizer takes that
-    /// exact whitespace value as the card channel. A CLI that trimmed before
-    /// testing for emptiness would degrade to the turn channel and hand the
-    /// operator the wrong card location -- which is the very failure #1531
-    /// exists to remove, so a guard meant to prevent it would be causing it.
-    ///
-    /// The CLI's job here is to mirror Python falsiness exactly, not to improve
-    /// on it: only `""` is absent, and everything else is printed as-is. A later
-    /// reader must not "simplify" these two tests into one with a `trim()`; the
-    /// two fixtures differ by a single space precisely so that collapse fails.
-    ///
-    /// Mutation it catches: `!card_channel.trim().is_empty()` in place of
-    /// `!card_channel.is_empty()`, which is what the current implementation
-    /// does.
-    #[tokio::test]
-    async fn a_whitespace_only_card_channel_is_a_channel_and_prints_verbatim() {
-        let base = hint_stub_api(200, HINT_BLANK_CARD_APPROVAL).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_BLANK_CARD_CHANNEL,
-            "a whitespace-only card_channel is TRUTHY in Python, so the server \
-             authorizes against that exact value; the hint must reproduce it \
-             byte for byte rather than trimming it away"
-        );
-        assert_ne!(
-            resolved, HINT_TURN_CHANNEL,
-            "degrading here prints a channel the server will not accept, which \
-             is the 403 this whole change exists to remove"
-        );
-    }
-
-    /// A 404 is absorbed by the advisory wrapper, not surfaced.
-    ///
-    /// Real rather than theoretical: another operator can resolve or expire the
-    /// approval between the pending notice and the hint. The client method
-    /// propagates the 404 (see `cli/tests/approval_hint_channel.rs`), and this
-    /// is the layer that turns it into today's behavior. The operator then
-    /// discovers the resolution through the wait itself.
-    ///
-    /// Mutation it catches: bubbling the client error out of the wrapper, which
-    /// would make a race between two operators fail the turn.
-    #[tokio::test]
-    async fn the_hint_names_the_turn_channel_when_the_approval_is_already_gone() {
-        let base = hint_stub_api(404, r#"{"detail":"approval not found"}"#).await;
-        let opts = hint_opts(&base);
-
-        let resolved = hint_channel(
-            &opts,
-            TurnVerb::Local,
-            HINT_TURN_CHANNEL,
-            HINT_APPROVAL_ID,
-            hint_far_deadline(),
-        )
-        .await;
-
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "an approval resolved out from under the wait is 'no answer'; the \
-             hint degrades rather than the turn failing"
-        );
+            if case.require_nonempty {
+                assert!(
+                    !resolved.is_empty(),
+                    "[{}] the hint must never report an empty card location; fall back to \
+                     the requesting channel when no route-bound location exists",
+                    case.name
+                );
+            }
+            assert_eq!(
+                resolved, case.expected,
+                "[{}] {}",
+                case.name, case.expected_msg
+            );
+            if let Some((forbidden, why)) = case.not_expected {
+                assert_ne!(resolved, forbidden, "[{}] {}", case.name, why);
+            }
+        }
     }
 
     // ─── #1531 finding 3, cluster arm: degradation without a leaked child ────
@@ -6303,6 +6411,7 @@ mod tests {
                 HINT_TURN_CHANNEL,
                 HINT_APPROVAL_ID,
                 hint_far_deadline(),
+                HINT_CHANNEL_LOOKUP_BUDGET,
             ),
         )
         .await
@@ -6444,6 +6553,7 @@ mod tests {
             execution_deadline_seconds: None,
             runner_resources: None,
             memory: false,
+            memory_writes: false,
             publication_policy: "approve".to_string(),
             publication_policy_version: 1,
             publication_draft: false,
@@ -7072,7 +7182,6 @@ mod tests {
         // The stub port is coupled to the compose worker's SLACK_API_BASE_URL
         // (http://localhost:8155/api/); pin it so a change to one flags the other.
         assert_eq!(DEFAULT_LOCAL_STUB_PORT, 8155);
-        assert_eq!(DEFAULT_LOCAL_STUB_PORT, DEFAULT_LISTEN_PORT);
     }
 
     /// Native Linux Docker: `network_mode: host` shares the host loopback, so the
@@ -7322,18 +7431,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("create temporary directory");
         let pidfile = temp.path().join("pid");
         let script = temp.path().join("wedged-docker");
-        std::fs::write(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n")
-            .expect("write wedged docker shim");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("shim metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("make shim executable");
+        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
 
         let cmd = OpsCommand::new(
             script.to_str().expect("shim path is UTF 8"),
@@ -7933,6 +8034,7 @@ mod tests {
                 execution_deadline_seconds: None,
                 runner_resources: None,
                 memory: false,
+                memory_writes: false,
                 publication_policy: "approve".to_string(),
                 publication_policy_version: 1,
                 publication_draft: false,
@@ -7957,6 +8059,7 @@ mod tests {
                 execution_deadline_seconds: None,
                 runner_resources: None,
                 memory: false,
+                memory_writes: false,
                 publication_policy: "approve".to_string(),
                 publication_policy_version: 1,
                 publication_draft: false,
@@ -8410,43 +8513,145 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reject_agent_named_message_sees_json_before_the_verb() {
-        let err = reject_agent_named_message(&argv(&[
-            "--json",
-            "local",
-            "message",
-            "acme-bot",
-            "Who are you?",
-        ]))
-        .expect("global --json must not hide the two-positional trap");
-        assert!(format!("{err:#}").contains("local message"), "{err:#}");
-    }
-
-    #[test]
-    fn reject_agent_named_message_sees_json_between_target_and_verb() {
-        let err = reject_agent_named_message(&argv(&[
-            "cluster",
-            "--json",
-            "message",
-            "acme-bot",
-            "Who are you?",
-        ]))
-        .expect("global --json between target and verb must not hide the trap");
-        assert!(format!("{err:#}").contains("cluster message"), "{err:#}");
-    }
-
+    /// Decoded the way a relay page is, so a field the DTO grows does not need
+    /// every caller to learn it.
     fn relay_event(
         kind: &str,
         text: Option<&str>,
         outcome: Option<&str>,
     ) -> ClusterMessageReplyEvent {
-        ClusterMessageReplyEvent {
-            kind: kind.to_string(),
-            text: text.map(str::to_string),
-            status: None,
-            outcome: outcome.map(str::to_string),
+        serde_json::from_value(serde_json::json!({
+            "event": kind,
+            "text": text,
+            "outcome": outcome,
+        }))
+        .expect("a relay event")
+    }
+
+    /// A reply wire 1.1 progress body as the worker's relay adapter stores it:
+    /// a card edit carries no answer fields, a post carries its text fallback.
+    fn relay_progress(kind: &str, progress: serde_json::Value) -> ClusterMessageReplyEvent {
+        let mut body = serde_json::json!({
+            "version": "1.1",
+            "event": kind,
+            "target": {
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "conversation_id": "thread-example",
+                "reply_ref": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            },
+            "delivery_id": "00000000-0000-4000-8000-000000000002",
+            "progress": progress,
+        });
+        if kind == "reply.post" {
+            body["message"] = serde_json::json!({"version": "1.0", "text": "fallback text"});
+            body["requested_by"] = serde_json::json!("U0EXAMPLE1");
+        } else {
+            for field in ["text", "message", "settled", "nav"] {
+                body[field] = serde_json::Value::Null;
+            }
         }
+        serde_json::from_value(body).expect("a relay progress event")
+    }
+
+    fn relay_card(state: &str, summary: &str, terminal: bool) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "card",
+            "state": state,
+            "summary": summary,
+            "revision": 2,
+            "terminal": terminal,
+        })
+    }
+
+    /// ADR-0130 decision 5: a card edit is a status line, never the reply, and
+    /// the answer that follows it is still the reply.
+    #[test]
+    fn a_progress_update_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.update",
+                    relay_card("testing", "Running the integration suite", false),
+                ),
+                relay_event("reply.update", Some("the answer"), None),
+                relay_progress("reply.update", relay_card("complete", "Fix verified", true)),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        match outcome {
+            Outcome::Replied(reply) => assert_eq!(reply, "the answer"),
+            other => panic!("expected Replied, got {other:?}"),
+        }
+        assert_eq!(observed.len(), 3, "{observed:?}");
+        assert!(
+            observed[0].starts_with("Progress")
+                && observed[0].contains("Running the integration suite")
+        );
+        assert_eq!(observed[1], "the answer");
+        assert!(observed[2].starts_with("Progress") && observed[2].contains("Fix verified"));
+    }
+
+    /// A closed card is not the turn's completion: with no `turn.completed` the
+    /// wait keeps polling for the answer.
+    #[test]
+    fn a_terminal_card_without_a_completion_keeps_waiting() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_progress(
+                "reply.update",
+                relay_card("complete", "Fix verified", true),
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification");
+
+        assert!(outcome.is_none());
+        assert_eq!(latest, None);
+    }
+
+    /// A progress post (a card's first revision or a milestone) is a status
+    /// line; its text fallback is not a reply the wait could report.
+    #[test]
+    fn a_progress_post_is_a_status_line_and_never_the_reply() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_progress(
+                    "reply.post",
+                    serde_json::json!({
+                        "kind": "milestone",
+                        "milestone": "evidence",
+                        "summary": "Found the failing migration",
+                        "ordinal": 1,
+                    }),
+                ),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("classification")
+        .expect("a delivered completion is terminal");
+
+        assert!(matches!(outcome, Outcome::CompletedNoEdit), "{outcome:?}");
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert!(
+            observed[0].starts_with("Milestone")
+                && observed[0].contains("Found the failing migration")
+        );
     }
 
     #[test]
@@ -8532,5 +8737,100 @@ mod tests {
             Outcome::AwaitingApproval { .. } => {}
             other => panic!("expected AwaitingApproval, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn escalated_completion_is_not_a_successful_reply_even_when_the_text_looks_done() {
+        let success = "Task complete. All checks passed.";
+        let mut latest = Some(success.to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some(success), None),
+                relay_event("turn.completed", None, Some("escalated")),
+            ],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("escalation is terminal");
+        match &outcome {
+            Outcome::Failed { class, reply } => {
+                assert_eq!(class, "unclassified");
+                assert_eq!(reply, success);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let case = eval_case(GraderKind::Contains, "Task complete");
+        assert!(!reply_passes(&case, &outcome));
+    }
+
+    #[test]
+    fn a_failure_marked_reply_exposes_its_class_and_does_not_pass() {
+        let reply = "curie-turn-failure: max-turns\n\nThe run failed (max-turns).";
+        let mut latest = Some(reply.to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some(reply), None),
+                relay_event("turn.completed", None, Some("escalated")),
+            ],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("marked failure is terminal");
+        match &outcome {
+            Outcome::Failed { class, .. } => assert_eq!(class, "max-turns"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let case = eval_case(GraderKind::Contains, "max-turns");
+        assert!(!reply_passes(&case, &outcome));
+        let delivered = cluster_relay_page_outcome(
+            &[
+                relay_event("reply.update", Some("the answer is PONG"), None),
+                relay_event("turn.completed", None, Some("delivered")),
+            ],
+            false,
+            &mut Some("the answer is PONG".to_string()),
+            &mut |_| {},
+        )
+        .expect("classification")
+        .expect("success is terminal");
+        assert!(matches!(delivered, Outcome::Replied(_)));
+        assert!(reply_passes(
+            &eval_case(GraderKind::Contains, "PONG"),
+            &delivered
+        ));
+    }
+
+    #[test]
+    fn turn_failure_reply_prefix_matches_the_frozen_vector() {
+        let raw = include_str!("../../tests/vectors/turn-failure-reply.json");
+        let vector: serde_json::Value = serde_json::from_str(raw).expect("vector json");
+        let allowed = [
+            "comment",
+            "reply_prefix",
+            "factory_class_line_prefix",
+            "examples",
+        ];
+        let object = vector.as_object().expect("vector object");
+        let unknown: Vec<_> = object
+            .keys()
+            .filter(|key| !allowed.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        assert!(unknown.is_empty(), "unknown vector keys: {unknown:?}");
+        let prefix = vector["reply_prefix"].as_str().expect("reply_prefix");
+        assert_eq!(prefix, crate::chat::TURN_FAILURE_REPLY_PREFIX);
+        for example in vector["examples"].as_array().expect("examples") {
+            let line = example["reply_first_line"].as_str().expect("line");
+            let class = example["classification"].as_str().expect("class");
+            assert_eq!(failure_class_from_reply(line), Some(class));
+        }
+        assert_eq!(
+            failure_class_from_reply("Task complete.\ncurie-turn-failure: max-turns"),
+            None
+        );
     }
 }

@@ -25,13 +25,14 @@ The ordering EB-B6(c) settles on, at every ``mark_done`` call site:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import sys
 import time
-import uuid
-from collections.abc import Callable
+from pathlib import Path
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import Final, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
@@ -40,34 +41,26 @@ from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until
+
 DONE = SessionStatus.DONE
 
 ADAPTER = "agentmail-sandbox"
 EMAIL_ADDRESS = "agent@example.test"
 ENDPOINT = "https://adapter.example/hook"
 
-
-def _qevent(
-    text: str = "hi",
-    *,
-    thread: str = "th-1",
-    event_id: str | None = None,
-    placeholder: str = "msg_upstream",
-) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(
-            kind="email",
-            channel=EMAIL_ADDRESS,
-            placeholder=placeholder,
-            endpoint=ENDPOINT,
-            adapter=ADAPTER,
-        ),
-        received_at="2026-07-05T00:00:00+00:00",
-    )
+_qevent = functools.partial(
+    qevent,
+    kind="email",
+    channel=EMAIL_ADDRESS,
+    placeholder="msg_upstream",
+    endpoint=ENDPOINT,
+    adapter=ADAPTER,
+)
 
 
 def _record(
@@ -104,15 +97,6 @@ def _record(
         created_at=time.time() - age_s,
         done=done,
     )
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within timeout")
 
 
 # --- T-B8: completion happens at the durable markers, and nowhere else --------

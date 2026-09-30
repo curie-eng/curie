@@ -10,6 +10,11 @@
 //! tests pin the two properties that close it -- discovery from the directory,
 //! and a run that reports every failure rather than the first -- plus the
 //! divergence gate that keeps the verb and helm-ci describing the same set.
+//!
+//! Nothing here runs the committed scripts themselves. helm-ci's Chart job runs
+//! every one of them, its pull request filter covers every tree they read, and
+//! the divergence gate below keeps that set equal to the directory. Running
+//! them again from the Rust job duplicated about nine minutes of CI.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -367,53 +372,5 @@ fn helm_ci_and_the_chart_ci_directory_cannot_diverge() {
         unique, on_disk,
         "helm-ci and {CHART_CI_DIR} disagree. Every script in the directory needs a \
          helm-ci step, and every helm-ci step needs a script that exists."
-    );
-}
-
-/// AC4: the verb passes on the unmodified chart.
-///
-/// This runs the real assertion suite, so it needs BOTH `helm` and `uv` on PATH
-/// and takes single-digit seconds. `uv` joined `helm` with #1559: the object
-/// store assertions no longer only read the rendered manifest, they drive the
-/// real Python API and worker `BundleStore` clients through `uv run` to prove
-/// which botocore credential provider actually resolves, which reading YAML
-/// cannot show.
-///
-/// It skips rather than fails where either tool is absent, the same posture as
-/// the Valkey-backed tests: a missing local tool is not a regression in the
-/// chart. helm-ci itself is the environment where the suite is guaranteed to
-/// run, and `.github/workflows/helm-ci.yaml` installs uv and runs `uv sync`
-/// before that step, so the executing assertion runs for real on every chart
-/// change and on every push to main and next. Skipping here narrows where the
-/// suite runs locally, never where it gates.
-#[tokio::test]
-async fn chart_check_passes_on_the_unmodified_chart() {
-    if Command::new("helm").arg("version").output().is_err() {
-        eprintln!("skipping: helm is not on PATH");
-        return;
-    }
-    if Command::new("uv").arg("--version").output().is_err() {
-        eprintln!("skipping: uv is not on PATH");
-        return;
-    }
-
-    let root = repo_root();
-    let scripts = discover_chart_check_scripts(&root.join(CHART_CI_DIR)).expect("discover");
-    assert!(
-        !scripts.is_empty(),
-        "the chart assertion directory must not be empty"
-    );
-
-    let outcomes = run_chart_check_scripts(&root, &scripts)
-        .await
-        .expect("run the committed chart assertion scripts");
-    let failed: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| !o.passed)
-        .map(|o| o.name.as_str())
-        .collect();
-    assert!(
-        failed.is_empty(),
-        "chart-check must pass on the unmodified chart; failed: {failed:?}"
     );
 }

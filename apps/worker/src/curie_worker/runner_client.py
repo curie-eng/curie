@@ -21,7 +21,7 @@ import binascii
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -415,8 +415,14 @@ class RunnerClient:
         *,
         remaining_s: float | None = None,
         capacity_admission: bool = False,
+        progress: Mapping[str, str] | None = None,
     ) -> TurnStream:
-        """Open a turn. Capacity turns need a separate post-lock grant."""
+        """Open a turn. Capacity turns need a separate post-lock grant.
+
+        ``progress`` is the turn's deliberate progress capability (ADR 0130),
+        sent as runner control headers beside the capacity admission one;
+        ``curie_worker.turn_progress`` names and mints them.
+        """
         request_timeout = self._request_timeout(remaining_s)
         stream_timeout_s = (
             self._total_timeout_s
@@ -436,6 +442,8 @@ class RunnerClient:
             request_headers = dict(headers or {})
             if capacity_admission:
                 request_headers[_CAPACITY_ADMISSION_HEADER] = "wait"
+            if progress:
+                request_headers.update(progress)
             resp = await self._session.post(
                 f"{base_url}/v1/event",
                 json=event.model_dump(mode="json"),

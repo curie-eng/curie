@@ -1944,7 +1944,7 @@
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -1992,6 +1992,38 @@
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -2492,6 +2524,18 @@
               "possible_values": [
                 "true",
                 "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
               ],
               "required": false
             },
@@ -5128,6 +5172,18 @@
               "required": false
             },
             {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -6393,7 +6449,7 @@
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -6460,6 +6516,38 @@
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -7220,11 +7308,6 @@
           "about": "Run the cold-start parity ladder across the skill, local, and cluster tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`)",
           "hidden": false,
           "name": "e2e-ladder"
-        },
-        {
-          "about": "Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes MCP server and a live provider (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with `curie cluster message`. Approvals resolve through `curie cluster approvals` and an operator principal. Missing the live provider skips with the reason in the run summary",
-          "hidden": false,
-          "name": "sre-demo-e2e"
         },
         {
           "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",

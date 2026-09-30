@@ -139,27 +139,27 @@ def test_remote_and_hosted_together_mount_only_what_this_tier_can_reach(tmp_path
     assert set(tierless) == {"internal"}
 
 
-def test_unreadable_connectors_file_mounts_nothing_rather_than_crashing(tmp_path: Path) -> None:
-    # Deploy already validated this, so reaching here means the bundle changed
-    # underneath us. Losing the connector's tools is visible; losing the whole
-    # session to a boot crash is worse.
-    servers = derive_mcp_servers(
-        _bundle(tmp_path, "connectors:\n  g:\n   image: [unclosed\n"), **SCOPE
-    )
-    assert servers == {}
+@pytest.mark.parametrize(
+    "connectors_yaml",
+    [
+        # Deploy already validated this, so reaching here means the bundle changed
+        # underneath us. Losing the connector's tools is visible; losing the whole
+        # session to a boot crash is worse.
+        pytest.param("connectors:\n  g:\n   image: [unclosed\n", id="unreadable-yaml"),
+        pytest.param("connectors: !!map foo\n", id="mapping-tag-on-scalar"),
+        pytest.param("connectors:\n  Bad_Name:\n    image: x:1\n", id="invalid-connector-name"),
+    ],
+)
+def test_bad_connectors_file_mounts_nothing_rather_than_crashing(
+    tmp_path: Path, connectors_yaml: str
+) -> None:
+    assert derive_mcp_servers(_bundle(tmp_path, connectors_yaml), **SCOPE) == {}
 
 
 def test_non_utf8_connectors_file_mounts_nothing_rather_than_crashing(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
     (root / "connectors.yaml").write_bytes(b"\x80")
     assert derive_mcp_servers(root, **SCOPE) == {}
-
-
-def test_explicit_mapping_tag_on_a_scalar_mounts_nothing(tmp_path: Path) -> None:
-    servers = derive_mcp_servers(
-        _bundle(tmp_path, "connectors: !!map foo\n"), **SCOPE
-    )
-    assert servers == {}
 
 
 def test_duplicate_connector_name_mounts_nothing(tmp_path: Path) -> None:
@@ -175,13 +175,6 @@ def test_duplicate_connector_name_mounts_nothing(tmp_path: Path) -> None:
         **SCOPE,
     )
     assert servers == {}, "duplicate grafana must mount nothing"
-
-
-def test_invalid_connectors_file_mounts_nothing(tmp_path: Path) -> None:
-    servers = derive_mcp_servers(
-        _bundle(tmp_path, "connectors:\n  Bad_Name:\n    image: x:1\n"), **SCOPE
-    )
-    assert servers == {}
 
 
 def test_no_plugin_dir_is_not_an_error(tmp_path: Path) -> None:
@@ -363,6 +356,8 @@ def _config_for(
     )
     if approval_grant_tool is not None:
         env[BootEnv.env_key("approval_grant_tool")] = approval_grant_tool
+        # A permission grant carries the approved arguments (#3174).
+        env[BootEnv.env_key("approval_grant_arguments")] = "{}"
     return RunnerConfig.from_env(env)
 
 
@@ -408,9 +403,7 @@ def test_boot_threads_only_policy_hidden_observations_without_spending_gate_stat
     write_approval = f"{prefix}write_approval"
     write_denied = f"{prefix}write_denied"
     write_unmatched = f"{prefix}write_unmatched"
-    observed = frozenset(
-        {read_allowed, write_approval, write_denied, write_unmatched}
-    )
+    observed = frozenset({read_allowed, write_approval, write_denied, write_unmatched})
 
     real_projection = boot.policy_disallowed_tools
     projection_states: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
@@ -547,10 +540,7 @@ def test_the_1093_log_fires_for_a_scope_less_hosted_connector(
     # must not silently swallow.
     with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
         derive_mcp_servers(_bundle(tmp_path, HOSTED), release=None, agent=None, namespace=None)
-    assert any(
-        "declared but not exercisable in this tier" in r.message
-        for r in caplog.records
-    )
+    assert any("declared but not exercisable in this tier" in r.message for r in caplog.records)
 
 
 def test_the_1093_log_fires_for_a_scope_less_build_form_connector(
@@ -558,10 +548,7 @@ def test_the_1093_log_fires_for_a_scope_less_build_form_connector(
 ) -> None:
     with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
         derive_mcp_servers(_bundle(tmp_path, BUILT), release=None, agent=None, namespace=None)
-    assert any(
-        "declared but not exercisable in this tier" in r.message
-        for r in caplog.records
-    )
+    assert any("declared but not exercisable in this tier" in r.message for r in caplog.records)
 
 
 def test_the_1093_log_does_not_fire_once_a_scope_reaches_the_connector(
@@ -572,10 +559,7 @@ def test_the_1093_log_does_not_fire_once_a_scope_reaches_the_connector(
     # exercisable here is not "declared but not exercisable" here.
     with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
         derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE)
-    assert not any(
-        "declared but not exercisable in this tier" in r.message
-        for r in caplog.records
-    )
+    assert not any("declared but not exercisable in this tier" in r.message for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- #
@@ -585,6 +569,9 @@ BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
 
 def _boot_env(monkeypatch, tmp_path: Path, suffix: str) -> dict[str, str]:
+    # These exact-live-tool tests model an eligible human Slack sandbox. The
+    # default-off negative is pinned independently in harness boot wiring.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setenv("CURIE_STATE_URL", "http://state.invalid/agents/a/state")
     monkeypatch.setenv("CURIE_STATE_TOKEN", "t")
     return {
@@ -804,9 +791,7 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
     assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
 
 
-def test_the_boot_mounts_exactly_the_reserved_platform_servers(
-    tmp_path, monkeypatch
-) -> None:
+def test_the_boot_mounts_exactly_the_reserved_platform_servers(tmp_path, monkeypatch) -> None:
     # #2286. Pinned against the boot MOUNT, not against another constant: the
     # sibling above already pins RESERVED_CONNECTOR_NAMES against the two runner
     # constants, and two constants can agree with each other and both be wrong
@@ -880,9 +865,9 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     # (#3077); its name is exempt regardless, like an omitted request_approval.
     from curie_runner.approval import PROGRESS_TOOL_NAME
 
-    assert _published_live_tool_names(mounted) == platform_tool_names(
-        state_server_mounted=True
-    ) - {PROGRESS_TOOL_NAME}
+    assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
+        PROGRESS_TOOL_NAME
+    }
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -946,9 +931,7 @@ def test_a_forging_agent_name_mounts_nothing_rather_than_crashing_the_boot(
     root = _bundle(tmp_path, HOSTED)
 
     with caplog.at_level(logging.WARNING, logger="curie_runner.connectors"):
-        servers = derive_mcp_servers(
-            root, release="curie", agent=FORGING_AGENT, namespace="curie"
-        )
+        servers = derive_mcp_servers(root, release="curie", agent=FORGING_AGENT, namespace="curie")
 
     assert servers == {}, f"a forging agent name must mount nothing, got {servers}"
     # Silence would be worse than the crash it replaces: the agent boots, its
@@ -956,9 +939,7 @@ def test_a_forging_agent_name_mounts_nothing_rather_than_crashing_the_boot(
     # "no such tool" with nothing anywhere naming the cause. The warning must
     # carry the AGENT NAME, because that is the single thing an operator has to
     # change and it is assigned at deploy time, not written in the bundle.
-    assert any(
-        FORGING_AGENT in record.getMessage() for record in caplog.records
-    ), caplog.text
+    assert any(FORGING_AGENT in record.getMessage() for record in caplog.records), caplog.text
 
     # The control, in the same test on purpose: if `_bundle`, `HOSTED`, or
     # `derive_mcp_servers` broke for any reason unrelated to #1446, the
@@ -1025,9 +1006,7 @@ def test_the_mounted_hosted_server_carries_the_declared_credential(tmp_path: Pat
 def test_a_pod_only_credential_is_not_mounted_in_the_sandbox_catalog(tmp_path: Path) -> None:
     servers = derive_mcp_servers(_bundle(tmp_path, GITHUB_POD_CREDENTIAL), **SCOPE)
     github = servers["github"]
-    assert github["url"] == (
-        "http://curie-acme-dev-mcp-github.curie.svc.cluster.local:8000/mcp"
-    )
+    assert github["url"] == ("http://curie-acme-dev-mcp-github.curie.svc.cluster.local:8000/mcp")
     assert "headers" not in github
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in json.dumps(github)
 

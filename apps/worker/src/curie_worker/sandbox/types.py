@@ -32,6 +32,7 @@ THREAD_HASH_LABEL = "curietech.ai/thread-hash"
 # rejects curietech.ai under additionalPodMetadata; template pod labels and
 # claim metadata labels are the supported paths (#1488).
 AGENT_LABEL = "curietech.ai/agent"
+TURN_PROGRESS_ELIGIBILITY_ENV = "CURIE_TURN_PROGRESS_ENABLED"
 
 _GENERIC_POOL_SUFFIX = "-runner-pool"
 
@@ -185,6 +186,14 @@ class SandboxHandle:
     # runner reads it once at boot, so a delivery wanting a different budget
     # must not adopt this route.
     max_turns: str | None = None
+    # Whether this runner booted with a connector caller token (ADR-0168
+    # decision 7). False for a record written before the field existed, which
+    # is what makes the one replacement after an install gains a caller key.
+    carries_caller_token: bool = False
+    # Whether this runner booted with ADR 0130's model-visible tool and prompt.
+    # False rehydrates legacy routes conservatively and forces one replacement
+    # before an eligible turn may adopt them.
+    carries_turn_progress: bool = False
 
     @property
     def sandbox_id(self) -> str:

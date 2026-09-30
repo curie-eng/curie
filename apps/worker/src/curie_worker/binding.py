@@ -31,10 +31,11 @@ per-adapter token.
 ``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
 (``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
 (``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
-match. There is no address-only overload and no default kind -- either would be
-the silent address-fallback the pair exists to remove. One address can now
-legitimately be bound twice under two different kinds, and each turn reaches its
-own agent.
+match; migration 0070 widens it again to the route triple, so several
+identities may share a pair. There is no address-only overload and no default
+kind -- either would be the silent address-fallback the pair exists to remove.
+One address can now legitimately be bound twice under two different kinds, and
+each turn reaches its own agent.
 
 The binding row also carries the server-controlled reply route: ``endpoint`` (the
 channel API base URL this kind's replies go back through) and ``adapter`` (the
@@ -42,11 +43,12 @@ egress adapter identity whose credential authenticates them). Both are read here
 so the worker gets the route from the same query that resolves the agent, never
 from an ingress request body. ``slack`` never carries an ``endpoint``, because
 its route is the worker's configured Slack origin, but it DOES name its bot
-identity in ``adapter`` (ADR-0168 decision 3) -- a NULL there means the
-installation's one pre-ADR identity, read through ``route_identity``, never "no
-route" the way a non-Slack NULL pair does. Resolution matches on that identity,
-not the raw column (``matching_routes``, ``aci_protocol.turn``), so a route bound
-under one Slack identity does not answer a turn addressed to another.
+identity in ``adapter`` (ADR-0168 decision 3). A turn queued without one means
+``default``, read through ``route_identity``, never "no route" the way a
+non-Slack NULL pair does. The worker resolves by all three fields: the SQL
+selects the pair and ``matching_routes`` (``aci_protocol.turn``) narrows by
+identity, so a route bound under one Slack identity does not answer a turn
+addressed to another.
 
 A pair that is not bound, or bound but not to this turn's identity, resolves
 to None -- a polite drop naming both halves, never a fallback to the address
@@ -67,7 +69,7 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
-from aci_protocol.turn import matching_routes
+from aci_protocol.turn import SLACK_KIND, matching_routes
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -96,6 +98,7 @@ BUNDLE_VERSION_ENV = BootEnv.env_key("bundle_version")
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
 MAX_TURNS_ENV = BootEnv.env_key("max_turns")
+CONNECTOR_CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -368,11 +371,9 @@ class ResolvedDeployment(BaseModel):
     # `endpoint` is the channel API base URL this kind's replies go back
     # through. `adapter` is the egress adapter identity whose credential
     # authenticates them for a non-Slack kind, and, for `slack`, the bot
-    # IDENTITY this route names (ADR-0168 decision 3) -- `route_identity`
-    # reads a NULL there as the installation's one pre-ADR identity,
-    # `DEFAULT_IDENTITY`, never as "no route". `slack` still carries no
+    # IDENTITY this route names (ADR-0168 decision 3). `slack` carries no
     # `endpoint`, because its route is the worker's configured Slack origin;
-    # any other kind sets both together (`agent_channels_route_pair_ck`).
+    # any other kind sets both or neither (`agent_channels_route_ck`).
     endpoint: str | None = None
     adapter: str | None = None
     # Whether this agent's bindings share one general-state namespace, or each
@@ -380,6 +381,46 @@ class ResolvedDeployment(BaseModel):
     # takes effect on the very next turn -- there is no cached copy anywhere
     # to go stale.
     memory: bool = False
+    # Whether the operator turned memory writes on for this agent (#1461,
+    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
+    # mounts the remember/update/forget tools; off (the default), neither.
+    # Not selected by the resolver statements: the column arrives in migration
+    # 0068 and resolution runs against older schemas, so the kernel reads it
+    # with ``memory_writes_for`` and copies it on, as with runner_resources.
+    memory_writes: bool = False
+
+
+class AmbiguousRoute(RuntimeError):
+    """A turn names no adapter on a non-Slack pair that several agents bind.
+
+    An omitted non-Slack adapter selects every route on the pair
+    (``matching_routes``), and migration 0070's triple key lets two agents hold
+    one pair under different adapters, so no deployment is this turn's. The
+    worker's twin of the API's ``crud.AmbiguousRoute``: never resolved by
+    picking one, because the pick runs one agent's turn under another's
+    deployment, secrets and reply route (ADR-0168 decision 3, #38).
+    """
+
+    def __init__(self, kind: str, address: str, agent_ids: Sequence[uuid.UUID]) -> None:
+        self.kind = kind
+        self.address = address
+        self.agent_ids = sorted(str(agent_id) for agent_id in agent_ids)
+        super().__init__(
+            f"{len(self.agent_ids)} agents are bound to {kind}:{address} and the turn "
+            f"names no adapter to choose one ({', '.join(self.agent_ids)})"
+        )
+
+
+def refuse_several_agents(kind: str, address: str, rows: Sequence[Any]) -> None:
+    """Raise ``AmbiguousRoute`` when ``rows`` belong to more than one agent.
+
+    Counts distinct agents, not rows: one agent's several rows are one
+    deployment whichever row answers.
+    """
+
+    agents = {row["agent_id"] for row in rows}
+    if len(agents) > 1:
+        raise AmbiguousRoute(kind, address, list(agents))
 
 
 class BoundAgent(BaseModel):
@@ -400,12 +441,16 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     kinds).
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
-    The API enforces one agent per bound pair (``agent_channels_kind_address_key``,
-    migration 0023, superseding 0021's address-only ``agent_channels_address_key``
-    and 0017's ``agents_slack_channel_key``), so this state is no longer
-    reachable through the write paths. It stays as defense in depth for
-    rows predating the constraint or written out of band, and because silently
-    shadowing an agent is the failure mode #38 existed to kill.
+    The API holds one agent per route (``agent_channels_route_key``, migration
+    0070, superseding 0023's pair key, 0021's address-only
+    ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
+    a Slack turn, or a turn that names its adapter, cannot reach this state
+    through the write paths. A non-Slack turn that omits its adapter selects
+    every route on the pair, and ``resolve`` refuses it with ``AmbiguousRoute``
+    before this runs when those routes belong to several agents. So this is
+    reachable only through rows written out of band, and stays as defense in
+    depth there, because silently shadowing an agent is the failure mode #38
+    existed to kill.
 
     One agent with both a dev and a prod deployment active is two rows but one
     agent, so count distinct agents, not rows.
@@ -481,19 +526,28 @@ class BindingResolver:
         """Resolve a turn's route TRIPLE ``(kind, adapter, address)`` to its
         active deployment.
 
-        ``kind`` and ``address`` still select the SQL rows -- migration 0023's
-        ``agent_channels_kind_address_key`` still caps that pair at one bound
-        row -- but every row is narrowed in Python by ``matching_routes``
-        (ADR-0168 decision 3) against the turn's ``adapter``, so a row bound
-        under one identity does not answer a turn addressed to another once
-        that decision's contract migration (#3100) lets several identities
-        share a pair. All three are required and none has a default: an omitted
+        It resolves by all three fields (ADR-0168 decision 3): ``kind`` and
+        ``address`` select the SQL rows, and ``matching_routes`` narrows them in
+        Python by the turn's ``adapter``, so a row bound under one identity
+        does not answer a turn addressed to another on a pair several
+        identities share. All three are required and none has a default: an omitted
         identity or an address-only overload would silently answer with
         whichever row happened to be bound, which is #38's misroute wearing a
         new hat.
+
+        An omitted non-Slack adapter selects every route on the pair, so when
+        those routes belong to several agents this raises ``AmbiguousRoute``
+        rather than answer. That is judged over every BINDING on the pair, not
+        only the deployed ones this query returns: an undeployed agent's
+        route-less binding would otherwise leave the other agent's row as the
+        only match, and the turn would run as that agent.
         """
+        params = {"kind": kind, "address": address}
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"kind": kind, "address": address})
+            if adapter is None and kind != SLACK_KIND:
+                bound = (await conn.execute(self._undeployed_binding_sql, params)).all()
+                refuse_several_agents(kind, address, [dict(row._mapping) for row in bound])
+            result = await conn.execute(self._sql, params)
             rows = result.all()
         matches = matching_routes(rows, kind, address, adapter)
         if not matches:
@@ -534,7 +588,11 @@ class BindingResolver:
         matches = matching_routes(rows, kind, address, adapter)
         if not matches:
             return None
-        return BoundAgent.model_validate(dict(matches[0]._mapping))
+        mapped = [dict(row._mapping) for row in matches]
+        # The same refusal as ``resolve``: the diagnostic reply goes out
+        # through the bound agent's route, so naming either agent is a guess.
+        refuse_several_agents(kind, address, mapped)
+        return BoundAgent.model_validate(mapped[0])
 
     async def identity_for_address(self, kind: str, address: str) -> str | None:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
@@ -795,6 +853,20 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def memory_writes_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned memory writes on for the agent (#1461).
+
+        A separate read from deployment resolution, like
+        ``runner_resources_for``: resolution runs in migration tests against
+        schemas that predate the column (migration 0068). A missing agent row or
+        a null value reads as off.
+        """
+        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
     async def model_settings_for(
         self, agent_id: uuid.UUID
     ) -> tuple[str | None, str | None, dict[str, Any] | None]:
@@ -902,12 +974,31 @@ class BindingResolver:
         # WHICH agent, and a partition key within that agent's own,
         # already-fully-accessible store has no privilege to carry, so the API
         # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). memory and history stay agent-wide either way.
+        # an opaque claim). Agent memory and history stay agent-wide either
+        # way; channel memory (below) is binding-scoped by design (ADR-0167,
+        # #1461) and is decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
                 f"{base}/agents/{resolved.agent_id}/state/bindings/"
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
+            )
+        # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
+        # to this turn's binding, on the same store and read/written with the
+        # same broad memory token. Its presence is the runner's signal to mount
+        # the memory tools, so it is set only when the operator turned memory
+        # writes on and the turn names a binding. An eval-isolated turn carries
+        # no memory at all, so it gets none either.
+        channel_memory_ref: str | None = None
+        if (
+            resolved.memory_writes
+            and kind is not None
+            and address is not None
+            and not (isolate_memory or is_eval_isolate_thread(thread_key))
+        ):
+            channel_memory_ref = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
             )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
@@ -995,6 +1086,7 @@ class BindingResolver:
             model_env_key=self._config.model_env_key or None,
             history_token=state_token,
             memory_token=state_token,
+            channel_memory_ref=channel_memory_ref,
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted

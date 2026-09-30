@@ -89,10 +89,41 @@ def test_claude_runner_materializes_history_without_system_prompt_preamble(tmp_p
     runner = build_runner(config, conversation_replay=replay)
     options = runner._factory()._options
 
+    # An ineligible boot preserves the pre-progress model surface exactly.
     assert options.system_prompt is None
     assert options.resume is not None
     assert options.session_store is not None
     assert runner._history_resumed is True
+
+
+def test_only_an_eligible_boot_mounts_the_progress_tool_and_prompt(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+    import mcp.types as mcp_types
+    from curie_runner.turn_progress import (
+        PROGRESS_PREAMBLE,
+        TURN_PROGRESS_ELIGIBILITY_ENV,
+        TURN_PROGRESS_TOOL,
+    )
+
+    async def tool_names(runner: object) -> set[str]:
+        options = runner._factory()._options  # type: ignore[attr-defined]
+        server = options.mcp_servers["curie"]
+        entry = server["instance"].get_request_handler("tools/list")
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    monkeypatch.delenv(TURN_PROGRESS_ELIGIBILITY_ENV, raising=False)
+    ineligible = build_runner(_config(tmp_path / "off"))
+    assert TURN_PROGRESS_TOOL not in anyio.run(tool_names, ineligible)
+    assert ineligible._factory()._options.system_prompt is None
+
+    monkeypatch.setenv(TURN_PROGRESS_ELIGIBILITY_ENV, "1")
+    eligible = build_runner(_config(tmp_path / "on"))
+    assert TURN_PROGRESS_TOOL in anyio.run(tool_names, eligible)
+    assert eligible._factory()._options.system_prompt == PROGRESS_PREAMBLE
 
 
 def test_claude_runner_offers_provider_web_search_by_default(tmp_path) -> None:

@@ -323,6 +323,17 @@ class BootEnv(_AciModel):
     memory_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MEMORY_TOKEN", "worker")
     )
+    # This turn's channel memory (#3389, for #1461): the agent's memory
+    # namespace scoped to the turn's channel binding on the same state API
+    # (``.../agents/<id>/state/bindings/<kind>/<address>/memory``), minted from
+    # the runner-facing API base like ``memory_ref`` and read and written with
+    # ``memory_token``. The worker sets it only when an operator has turned
+    # memory writes on for the agent and the turn has a binding, and never for
+    # an eval-isolated turn, which carries no memory at all. Its presence is
+    # also the runner's signal to mount the memory tools.
+    channel_memory_ref: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CHANNEL_MEMORY_REF", "worker")
+    )
     # The durable state store exposed to bundle code (#249, epic #23). state_url
     # is the agent's state namespace base on the API state router
     # (``.../agents/<id>/state``); the auto-mounted ``curie-state`` MCP server
@@ -566,6 +577,7 @@ class BootEnv(_AciModel):
         model_env_key: str | None = None,
         history_token: str | None = None,
         memory_token: str | None = None,
+        channel_memory_ref: str | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
@@ -631,6 +643,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("history_token")] = history_token
         if memory_token:
             env[cls.env_key("memory_token")] = memory_token
+        if channel_memory_ref:
+            env[cls.env_key("channel_memory_ref")] = channel_memory_ref
         if state_url:
             env[cls.env_key("state_url")] = state_url
         if state_token:
@@ -675,6 +689,8 @@ class BootEnv(_AciModel):
             env[self.env_key("history_token")] = self.history_token
         if self.memory_token is not None:
             env[self.env_key("memory_token")] = self.memory_token
+        if self.channel_memory_ref is not None:
+            env[self.env_key("channel_memory_ref")] = self.channel_memory_ref
         if self.connector_release is not None:
             env[self.env_key("connector_release")] = self.connector_release
         if self.connector_agent is not None:
@@ -757,6 +773,7 @@ class BootEnv(_AciModel):
             history_ref=_str_or_none(env.get("CURIE_HISTORY_REF")),
             history_token=_str_or_none(env.get("CURIE_HISTORY_TOKEN")),
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
+            channel_memory_ref=_str_or_none(env.get("CURIE_CHANNEL_MEMORY_REF")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
             progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),

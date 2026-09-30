@@ -20,6 +20,10 @@ the enforceable-rule summary.
   is only the event's `target.reply_ref`. Never derive a target or accumulated
   text from conversation-global state: two turns in one thread must not clear,
   inherit, or redirect one another's reply.
+- **A progress body is acknowledged and ignored.** `EgressHandler.dispatch`
+  returns 200 for a `reply.update` or `reply.post` carrying `progress` before
+  it reaches `record_text`, so deliberate progress never replaces, clears or
+  appends to the buffered reply. Do not render it into the email.
 - **Nothing is recorded as replied until the provider has accepted the send.**
   A TCP connection refusal during the AgentMail witness or send returns 424
   with the fixed body `{"detail":"provider egress refused"}`. The worker stores

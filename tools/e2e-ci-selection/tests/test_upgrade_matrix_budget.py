@@ -2,16 +2,16 @@
 
 The helper is the consumer path the `e2e-required` job will run: it reads a
 GitHub Actions jobs payload, writes a job summary, and exits nonzero when the
-longest shard job (which includes the image bake) exceeds 20 minutes.
+shared image build job plus the longest matrix run exceeds 20 minutes.
 
 The jobs JSON shape is the documented
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` response
 (https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run):
 `total_count`, `jobs[].name`, `jobs[].started_at`, `jobs[].completed_at`, and
 `jobs[].steps[].name` / `started_at` / `completed_at`. Observed on public run
-35356180678 (next, 2026-09-18): shard jobs are named
-`E2E cluster upgrade matrix (sNN)`, the bake step is
-`Build the candidate images locally in parallel`, and the listing job
+36420097006 (main, 2026-09-28): shard jobs are named
+`E2E cluster upgrade matrix (sNN)`, and the image build runs in the separate
+`Build CI images (no push)` job. The listing job
 `E2E cluster upgrade matrix shards` must not count as a shard.
 """
 
@@ -34,9 +34,9 @@ HELPER = REPO_ROOT / "tools" / "e2e-ci-selection" / "assert_upgrade_matrix_budge
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 
 BUDGET_SECONDS = 20 * 60
-BAKE_STEP = "Build the candidate images locally in parallel"
+IMAGES_JOB = "Build CI images (no push)"
 RUN_STEP = "Run the cluster upgrade matrix"
-# Observed GitHub jobs API timestamps use a trailing Z (run 35356180678).
+# Observed GitHub jobs API timestamps use a trailing Z (run 36420097006).
 ORIGIN = datetime(2026, 9, 18, 14, 0, 0, tzinfo=UTC)
 
 
@@ -60,13 +60,11 @@ def _job(
     name: str,
     *,
     job_seconds: int,
-    bake_seconds: int = 90,
     run_seconds: int = 600,
     start: datetime | None = None,
 ) -> dict[str, Any]:
     started = start or ORIGIN
-    bake_start = started + timedelta(seconds=30)
-    run_start = bake_start + timedelta(seconds=bake_seconds + 20)
+    run_start = started + timedelta(seconds=50)
     return {
         "id": abs(hash(name)) % 10_000_000,
         "run_id": 35356180678,
@@ -76,10 +74,15 @@ def _job(
         "started_at": _iso(started),
         "completed_at": _iso(started + timedelta(seconds=job_seconds)),
         "steps": [
-            _step(BAKE_STEP, bake_start, bake_seconds),
             _step(RUN_STEP, run_start, run_seconds),
         ],
     }
+
+
+def _images_job(seconds: int = 90) -> dict[str, Any]:
+    job = _job(IMAGES_JOB, job_seconds=seconds, run_seconds=1)
+    job["steps"] = [_step("Build the CI images in parallel", ORIGIN, seconds)]
+    return job
 
 
 def _payload(*jobs: dict[str, Any]) -> dict[str, Any]:
@@ -123,31 +126,29 @@ def _summary(tmp_path: Path) -> str:
     return (tmp_path / "summary.md").read_text(encoding="utf-8")
 
 
-def test_under_budget_shard_plus_bake_passes_and_writes_the_seconds(tmp_path: Path) -> None:
-    # Observed longest shard on run 35356180678 was 1073s, bake 86s.
+def test_under_budget_shared_build_plus_matrix_run_passes_and_writes_seconds(
+    tmp_path: Path,
+) -> None:
     payload = _payload(
+        _images_job(86),
         _job(
             "E2E cluster upgrade matrix shards",
             job_seconds=6,
-            bake_seconds=0,
             run_seconds=1,
         ),
         _job(
             "E2E cluster upgrade matrix (s07)",
             job_seconds=1073,
-            bake_seconds=86,
             run_seconds=838,
         ),
         _job(
             "E2E cluster upgrade matrix (s12)",
             job_seconds=569,
-            bake_seconds=99,
             run_seconds=340,
         ),
         _job(
             "Python (ruff + mypy + pytest)",
             job_seconds=2400,
-            bake_seconds=0,
             run_seconds=1,
         ),
     )
@@ -166,18 +167,17 @@ def test_under_budget_shard_plus_bake_passes_and_writes_the_seconds(tmp_path: Pa
     assert "::notice" in completed.stdout
 
 
-def test_over_budget_shard_plus_bake_fails_and_still_writes_the_seconds(tmp_path: Path) -> None:
+def test_over_budget_shared_build_plus_matrix_run_fails_and_writes_seconds(tmp_path: Path) -> None:
     payload = _payload(
+        _images_job(180),
         _job(
             "E2E cluster upgrade matrix (s01)",
             job_seconds=900,
-            bake_seconds=80,
             run_seconds=700,
         ),
         _job(
             "E2E cluster upgrade matrix (s07)",
             job_seconds=1920,
-            bake_seconds=180,
             run_seconds=1500,
         ),
     )
@@ -198,10 +198,9 @@ def test_unexpanded_skipped_matrix_job_is_not_a_shard(tmp_path: Path) -> None:
         _job(
             "E2E cluster upgrade matrix (${{ matrix.shard }})",
             job_seconds=1,
-            bake_seconds=0,
             run_seconds=0,
         ),
-        _job("E2E cluster upgrade matrix shards", job_seconds=6, bake_seconds=0, run_seconds=1),
+        _job("E2E cluster upgrade matrix shards", job_seconds=6, run_seconds=1),
     )
     completed = _run(tmp_path, payload)
     assert completed.returncode != 0
@@ -210,7 +209,7 @@ def test_unexpanded_skipped_matrix_job_is_not_a_shard(tmp_path: Path) -> None:
 
 def test_listing_job_alone_is_not_a_shard(tmp_path: Path) -> None:
     payload = _payload(
-        _job("E2E cluster upgrade matrix shards", job_seconds=6, bake_seconds=0, run_seconds=1),
+        _job("E2E cluster upgrade matrix shards", job_seconds=6, run_seconds=1),
     )
     completed = _run(tmp_path, payload)
     assert completed.returncode != 0
@@ -220,7 +219,15 @@ def test_listing_job_alone_is_not_a_shard(tmp_path: Path) -> None:
 def test_missing_timestamps_fail_closed(tmp_path: Path) -> None:
     job = _job("E2E cluster upgrade matrix (s01)", job_seconds=900)
     job["completed_at"] = None
-    completed = _run(tmp_path, _payload(job))
+    completed = _run(tmp_path, _payload(_images_job(), job))
+    assert completed.returncode != 0
+    assert "timestamp" in (completed.stdout + completed.stderr).lower()
+
+    images = _images_job()
+    images["completed_at"] = None
+    completed = _run(
+        tmp_path, _payload(images, _job("E2E cluster upgrade matrix (s01)", job_seconds=900))
+    )
     assert completed.returncode != 0
     assert "timestamp" in (completed.stdout + completed.stderr).lower()
 
@@ -235,10 +242,10 @@ def test_truncated_jobs_page_fails_closed(tmp_path: Path) -> None:
 
 def test_exactly_budget_is_within_budget(tmp_path: Path) -> None:
     payload = _payload(
+        _images_job(200),
         _job(
             "E2E cluster upgrade matrix (s01)",
             job_seconds=1300,
-            bake_seconds=200,
             run_seconds=1000,
         ),
     )
@@ -250,10 +257,10 @@ def test_exactly_budget_is_within_budget(tmp_path: Path) -> None:
 
 def test_one_second_over_budget_fails(tmp_path: Path) -> None:
     payload = _payload(
+        _images_job(200),
         _job(
             "E2E cluster upgrade matrix (s01)",
             job_seconds=1300,
-            bake_seconds=200,
             run_seconds=1001,
         ),
     )
@@ -262,17 +269,15 @@ def test_one_second_over_budget_fails(tmp_path: Path) -> None:
     assert "over budget" in _summary(tmp_path).lower()
 
 
-def test_full_job_over_budget_still_passes_when_bake_plus_run_is_inside(
+def test_full_shard_job_over_budget_still_passes_when_build_plus_run_is_inside(
     tmp_path: Path,
 ) -> None:
-    # Observed on PR 2845 after rebase (run 35525521589): s07 job 1259s,
-    # bake 299s, matrix-run 827s. Kind/setup jitter must not fail the 20
-    # minute bake-plus-run budget.
+    # Shard setup jitter remains outside the build plus matrix run budget.
     payload = _payload(
+        _images_job(299),
         _job(
             "E2E cluster upgrade matrix (s07)",
             job_seconds=1259,
-            bake_seconds=299,
             run_seconds=827,
         ),
     )
@@ -284,19 +289,36 @@ def test_full_job_over_budget_still_passes_when_bake_plus_run_is_inside(
     assert "within budget" in summary.lower()
 
 
-def test_missing_bake_or_run_step_fails_closed(tmp_path: Path) -> None:
+def test_missing_shared_build_or_run_step_fails_closed(tmp_path: Path) -> None:
     job = _job("E2E cluster upgrade matrix (s01)", job_seconds=900)
-    job["steps"] = [step for step in job["steps"] if step["name"] != BAKE_STEP]
     completed = _run(tmp_path, _payload(job))
     assert completed.returncode != 0
-    assert "missing bake or matrix-run" in (completed.stdout + completed.stderr).lower()
+    assert "shared image build" in (completed.stdout + completed.stderr).lower()
+
+    job["steps"] = []
+    completed = _run(tmp_path, _payload(_images_job(), job))
+    assert completed.returncode != 0
+    assert "matrix-run" in (completed.stdout + completed.stderr).lower()
+
+
+def test_failed_or_duplicate_shared_build_fails_closed(tmp_path: Path) -> None:
+    images = _images_job()
+    images["conclusion"] = "failure"
+    shard = _job("E2E cluster upgrade matrix (s01)", job_seconds=900)
+    completed = _run(tmp_path, _payload(images, shard))
+    assert completed.returncode != 0
+    assert "shared image build" in (completed.stdout + completed.stderr).lower()
+
+    completed = _run(tmp_path, _payload(_images_job(), _images_job(), shard))
+    assert completed.returncode != 0
+    assert "shared image build" in (completed.stdout + completed.stderr).lower()
 
 
 def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> None:
-    page1 = _payload(_job("E2E cluster upgrade matrix (s01)", job_seconds=800))
-    page1["total_count"] = 2
-    page2 = _payload(_job("E2E cluster upgrade matrix (s02)", job_seconds=1100, bake_seconds=95))
-    page2["total_count"] = 2
+    page1 = _payload(_images_job(95), _job("E2E cluster upgrade matrix (s01)", job_seconds=800))
+    page1["total_count"] = 3
+    page2 = _payload(_job("E2E cluster upgrade matrix (s02)", job_seconds=1100))
+    page2["total_count"] = 3
     seen: list[dict[str, str]] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -368,6 +390,10 @@ def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> Non
 
 def test_e2e_required_runs_the_wall_clock_helper() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
+    images = workflow["jobs"]["ci-images"]
+    matrix = workflow["jobs"]["e2e-cluster-upgrade-matrix"]
+    assert images["name"] == IMAGES_JOB
+    assert any(step.get("name") == RUN_STEP for step in matrix["steps"])
     job = workflow["jobs"]["e2e-required"]
     permissions = job.get("permissions")
     assert isinstance(permissions, dict)
@@ -381,8 +407,7 @@ def test_e2e_required_runs_the_wall_clock_helper() -> None:
     checkout = next(
         step
         for step in job["steps"]
-        if isinstance(step, dict)
-        and str(step.get("uses", "")).startswith("actions/checkout@")
+        if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/checkout@")
     )
     assert checkout["with"]["persist-credentials"] is False
     # Outcome failure must not hide the seconds: a 32 minute shard that also

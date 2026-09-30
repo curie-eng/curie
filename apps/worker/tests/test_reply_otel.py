@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,24 +28,12 @@ from curie_worker.reply_sink import (
     TargetRoute,
 )
 
+# importlib import mode does not add this test directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from otel_fixtures import Probe, install  # noqa: E402
+
 _BOUNDED_KEYS = {"service.name", "operation", "role", "source", "outcome"}
-
-
-@dataclass(frozen=True)
-class _Metric:
-    name: str
-    value: float
-    attributes: dict[str, str]
-
-
-class _ProbeSpan:
-    def add_event(
-        self, _name: str, _attributes: Mapping[str, str] | None = None
-    ) -> None:
-        pass
-
-    def set_status(self, _status: Any) -> None:
-        pass
 
 
 class _SlackReplies:
@@ -65,45 +52,8 @@ class _SlackReplies:
         return ReplyAck(ref="1700000000.000050")
 
 
-class _Probe:
-    def __init__(self) -> None:
-        self.spans: list[str] = []
-        self.metrics: list[_Metric] = []
-
-    @contextmanager
-    def operation_span(
-        self,
-        name: str,
-        *,
-        kind: Any,
-        parent: Any = None,
-        attributes: Mapping[str, str] | None = None,
-    ) -> Iterator[_ProbeSpan]:
-        del kind, parent, attributes
-        self.spans.append(name)
-        yield _ProbeSpan()
-
-    def record_metric(
-        self,
-        name: str,
-        value: float = 1,
-        *,
-        attributes: Mapping[str, str] | None = None,
-    ) -> None:
-        self.metrics.append(_Metric(name, float(value), dict(attributes or {})))
-
-
-def _install(monkeypatch: pytest.MonkeyPatch) -> _Probe:
-    import curie_telemetry
-
-    probe = _Probe()
-    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
-    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
-    if hasattr(reply_sink_module, "operation_span"):
-        monkeypatch.setattr(reply_sink_module, "operation_span", probe.operation_span)
-    if hasattr(reply_sink_module, "record_metric"):
-        monkeypatch.setattr(reply_sink_module, "record_metric", probe.record_metric)
-    return probe
+def _install(monkeypatch: pytest.MonkeyPatch) -> Probe:
+    return install(monkeypatch, reply_sink_module)
 
 
 def _target() -> ReplyTarget:
@@ -178,12 +128,9 @@ def test_reply_update_post_and_failure_record_duration_and_bounded_result(
             if point.name == "curie.reply.delivery"
         }
         assert outcomes >= {"success", "failure"}
-        assert {"curie.reply.update", "curie.reply.post"} <= set(probe.spans)
+        assert {"curie.reply.update", "curie.reply.post"} <= set(probe.span_names())
         assert all(set(point.attributes) <= _BOUNDED_KEYS for point in probe.metrics)
-        assert all(
-            "thread-example" not in point.attributes.values()
-            for point in probe.metrics
-        )
+        assert all("thread-example" not in point.attributes.values() for point in probe.metrics)
 
     asyncio.run(go())
 
@@ -261,18 +208,12 @@ def test_publication_slack_egress_is_observed_exactly_once(
         slack = _SlackReplies()
         router = ReplySinkRouter(adapters={"slack": slack}, default=slack)
 
-        monkeypatch.setattr(
-            run_module, "KubernetesPublicationCluster", lambda _namespace: object()
-        )
+        monkeypatch.setattr(run_module, "KubernetesPublicationCluster", lambda _namespace: object())
         monkeypatch.setattr(
             run_module, "PostgresPublicationStore", lambda *_args, **_kwargs: object()
         )
-        monkeypatch.setattr(
-            run_module, "PublicationCredentialClient", lambda **_kwargs: object()
-        )
-        monkeypatch.setattr(
-            run_module, "GitHubPublicationLookup", lambda _http: object()
-        )
+        monkeypatch.setattr(run_module, "PublicationCredentialClient", lambda **_kwargs: object())
+        monkeypatch.setattr(run_module, "GitHubPublicationLookup", lambda _http: object())
 
         opaque_dependency: Any = object()
         loop = run_module._build_publication_loop(
@@ -305,10 +246,8 @@ def test_publication_slack_egress_is_observed_exactly_once(
 
         assert ack.ref == "1700000000.000050"
         assert slack.events == [post]
-        assert probe.spans.count("curie.reply.post") == 1
-        deliveries = [
-            point for point in probe.metrics if point.name == "curie.reply.delivery"
-        ]
+        assert probe.span_names().count("curie.reply.post") == 1
+        deliveries = [point for point in probe.metrics if point.name == "curie.reply.delivery"]
         assert len(deliveries) == 1
         assert deliveries[0].attributes["outcome"] == "success"
 

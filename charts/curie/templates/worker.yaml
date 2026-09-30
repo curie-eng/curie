@@ -327,15 +327,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" .Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | nindent 18 }}
-            {{- if .Values.connectorCaller.existingSecret }}
             # The connector caller signing key (ADR-0168 decision 7). Only the
-            # worker signs, so only the worker holds it.
+            # worker signs, so only the worker holds it. Empty mints no token.
             - name: CURIE_CONNECTOR_CALLER_SIGNING_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.connectorCaller.existingSecret | quote }}
-                  key: {{ .Values.connectorCaller.signingKeyKey | quote }}
-            {{- end }}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.signingKeyKey "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -453,6 +450,13 @@ spec:
               value: {{ .Values.worker.shimmer | quote }}
             - name: CURIE_STATUS_TEXT
               value: {{ .Values.worker.statusText | quote }}
+            # What the receipt beneath a turn's reply shows (ADR-0180). The
+            # schema admits all, failures and off; `required` catches the one
+            # shape it cannot see, an explicit null Helm drops before
+            # validation, which would otherwise render an empty value the
+            # worker refuses at startup.
+            - name: CURIE_TURN_RECEIPT
+              value: {{ required "worker.turnReceipt must be one of all, failures or off" .Values.worker.turnReceipt | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the

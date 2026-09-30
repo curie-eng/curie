@@ -8,10 +8,12 @@
 //! implementation still compiles this file and makes the observable assertions
 //! red.
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -35,15 +37,6 @@ const PRIVATE_SENTINEL: &str = "private-status-output-must-not-escape";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write tool shim");
-    let mut permissions = fs::metadata(path)
-        .expect("read shim metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make tool shim executable");
 }
 
 fn shim_path(tools: &Path) -> OsString {
@@ -417,7 +410,7 @@ impl Fixture {
             fs::create_dir_all(path).expect("create fixture directory");
         }
         for tool in ["docker", "kubectl", "helm"] {
-            write_executable(&tools.join(tool), TOOL_SHIM);
+            test_executable::install(&tools.join(tool), TOOL_SHIM);
         }
         fs::write(root.join("calls.log"), "").expect("create calls log");
         fs::write(root.join("claim-count"), "0").expect("create claim counter");

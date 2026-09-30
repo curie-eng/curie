@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol.turn import DEFAULT_IDENTITY
-from channel_protocol import ConfirmIntent, OutboundMessage
+from channel_protocol import ConfirmIntent, OutboundMessage, ProgressCard, ProgressMilestone
 from channel_protocol.reply import (
     NavAffordance,
     ReplyAck,
@@ -50,8 +50,16 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
+from .approvals import decided_at
 from .behaviorpacks import NavPack
-from .blocks import approval_card, expired_approval_card, render, resolved_approval_card
+from .blocks import (
+    approval_card,
+    expired_approval_card,
+    progress_card,
+    progress_milestone,
+    render,
+    resolved_approval_card,
+)
 from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
@@ -262,6 +270,29 @@ def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     return NavPack(enabled=True, hub_label=nav.label, hub_command=nav.command)
 
 
+def _adopt_posted_ts(response: Mapping[str, Any] | AsyncSlackResponse | None) -> str | None:
+    """The ts of the message a ``chat.postMessage`` answered with, or None.
+
+    Every create reads its answer here. On 2026-09-29, exact candidate
+    ``0b26aa3e3bd5d0663267e4393030200d88ece156`` ran
+    ``test_live_slack_client_msg_id_dedupes_an_ambiguous_retry`` against real
+    Slack: the second ``chat.postMessage`` carrying the accepted
+    ``client_msg_id`` answered ``ok: true`` with the first message's ``ts``.
+    The thread contained one card and one fresh-key milestone. The redacted
+    durable record is above that test. An error still never reaches here,
+    because the SDK raises ``SlackApiError`` out of
+    ``_post_with_block_fallback`` and the delivery is retried under the same
+    key.
+
+    ``None`` is the best-effort swallow (#708): nothing was delivered, so there
+    is no ts to adopt.
+    """
+    if response is None:
+        return None
+    ts = response.get("ts")
+    return str(ts) if ts else None
+
+
 async def _post_with_block_fallback(
     client: AsyncWebClient,
     *,
@@ -377,6 +408,12 @@ class SlackReplyAdapter:
         nothing: on Slack the edited message IS the delivery, so a completion
         signal would be a second, contentless message in the thread. The event
         exists for channels (email) whose reply is only sent at the end.
+
+        A body carrying ``progress`` (reply wire 1.1) is ADR-0130's Slack
+        adapter path, checked first on both events so it never reaches the
+        answer or the approval card; the worker README's "How the Slack adapter
+        renders progress" is its contract. A create carrying a ``delivery_id``
+        passes it as ``client_msg_id``.
         """
         endpoint = route.endpoint
         identity = token_identity(route.adapter, endpoint)
@@ -391,6 +428,24 @@ class SlackReplyAdapter:
             )
             return ReplyAck(ref=None)
         if isinstance(event, ReplyUpdate):
+            if event.progress is not None:
+                # A card edit (ADR-0130). Checked before everything else: it
+                # carries no text or message, so the answer path would blank the
+                # card, and it is never an approval card being settled.
+                if target.reply_ref is None:
+                    raise ValueError(
+                        "reply.update carrying progress needs the progress card's "
+                        "reply_ref to edit; got none"
+                    )
+                await self._update_progress(
+                    channel=target.address,
+                    ts=target.reply_ref,
+                    card=event.progress,
+                    endpoint=endpoint,
+                    best_effort_unreachable=best_effort_unreachable,
+                    identity=identity,
+                )
+                return ReplyAck(ref=target.reply_ref)
             if event.message is not None:
                 # Settling an ALREADY-POSTED platform message (an approval card).
                 # Its ref is the card's own ts, minted by the earlier reply.post,
@@ -431,6 +486,7 @@ class SlackReplyAdapter:
                     endpoint=endpoint,
                     best_effort_unreachable=best_effort_unreachable,
                     identity=identity,
+                    client_msg_id=event.delivery_id,
                 )
                 return ReplyAck(ref=ref)
             await self._update(
@@ -444,6 +500,19 @@ class SlackReplyAdapter:
             )
             return ReplyAck(ref=target.reply_ref)
         if isinstance(event, ReplyPost):
+            if event.progress is not None:
+                # A card's first revision or a milestone (ADR-0130): its own
+                # Block Kit, never the approval card, keyed by its delivery_id.
+                ref = await self._post_progress(
+                    channel=target.address,
+                    progress=event.progress,
+                    thread_ts=_thread_ts(target.conversation_id),
+                    client_msg_id=event.delivery_id,
+                    endpoint=endpoint,
+                    best_effort_unreachable=best_effort_unreachable,
+                    identity=identity,
+                )
+                return ReplyAck(ref=ref)
             ref = await self._post(
                 channel=target.address,
                 message=event.message,
@@ -451,6 +520,7 @@ class SlackReplyAdapter:
                 thread_ts=_thread_ts(target.conversation_id),
                 endpoint=endpoint,
                 identity=identity,
+                delivery_id=event.delivery_id,
             )
             return ReplyAck(ref=ref)
         if isinstance(event, TurnCompleted):
@@ -664,6 +734,7 @@ class SlackReplyAdapter:
         endpoint: str | None = None,
         best_effort_unreachable: bool = False,
         identity: str = DEFAULT_IDENTITY,
+        client_msg_id: str | None = None,
     ) -> str | None:
         """Post this turn's reply as a NEW message and return its ts.
 
@@ -686,6 +757,8 @@ class SlackReplyAdapter:
             endpoint: Per-turn Slack API base URL override, or None for the default.
             best_effort_unreachable: Swallow an unreachable transport instead of raising.
             identity: The Slack identity whose token the call carries.
+            client_msg_id: The body's reply wire 1.1 ``delivery_id`` (ADR-0130),
+                or None for a 1.0 body, which keeps posting with no key.
 
         Returns:
             The ts of the posted message, or None when nothing was delivered.
@@ -700,6 +773,7 @@ class SlackReplyAdapter:
                 text=rendered_text,
                 blocks=blocks,
                 thread_ts=thread_ts,
+                client_msg_id=client_msg_id,
             ),
             describe="chat_postMessage",
             operation="post",
@@ -711,10 +785,7 @@ class SlackReplyAdapter:
         # is no ts to adopt then, which is correct: nothing was delivered, so the
         # next event in this turn should post rather than edit a message that does
         # not exist.
-        if response is None:
-            return None
-        ts = response.get("ts")
-        return str(ts) if ts else None
+        return _adopt_posted_ts(response)
 
     async def _post(
         self,
@@ -725,18 +796,21 @@ class SlackReplyAdapter:
         thread_ts: str | None = None,
         endpoint: str | None = None,
         identity: str = DEFAULT_IDENTITY,
+        delivery_id: str | None = None,
     ) -> str | None:
         # Render the channel-neutral message into Block Kit HERE, below the seam
         # (ADR-0020): the kernel emits a Confirm intent, the Slack adapter turns it
         # into the approval card's Approve/Reject buttons. A message with no
         # interaction degrades to a plain text post (the mandatory text fallback).
         intent = message.interaction
-        client_msg_id: str | None = None
+        # A reply wire 1.1 delivery_id keys any other create (ADR-0130 d4).
+        client_msg_id: str | None = delivery_id
         if isinstance(intent, ConfirmIntent):
-            # Platform approvals carry UUID ids. Reusing that durable identity
-            # lets Slack adopt an ambiguous crash-after-post retry instead of
-            # rendering a second externally visible approval card.
-            client_msg_id = intent.id
+            # A 1.0 approval has no delivery_id, so it keeps its historical
+            # approval UUID key. On 1.1, ADR-0130 d4 makes delivery_id the
+            # externally visible operation's key; the approval UUID remains in
+            # the structured action value where the CLI stub reads it.
+            client_msg_id = delivery_id or intent.id
             text, blocks = approval_card(
                 approval_id=intent.id,
                 summary=message.text,
@@ -766,8 +840,83 @@ class SlackReplyAdapter:
             operation="post",
             identity=identity,
         )
-        ts = response.get("ts")
-        return str(ts) if ts else None
+        return _adopt_posted_ts(response)
+
+    async def _post_progress(
+        self,
+        *,
+        channel: str,
+        progress: ProgressCard | ProgressMilestone,
+        thread_ts: str | None,
+        client_msg_id: str | None,
+        endpoint: str | None = None,
+        best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
+    ) -> str | None:
+        """Post a card's first revision or a milestone and return its ts.
+
+        @spec ADR-0130 d4. ``client_msg_id`` is the body's ``delivery_id``, which
+        the coordinator never re-mints for a retry, so Slack sees one key for
+        every attempt at this post, the text-only fallback included.
+        """
+        if isinstance(progress, ProgressCard):
+            text, blocks = progress_card(progress)
+        else:
+            text, blocks = progress_milestone(progress)
+        response = await self._with_transport_fallback(
+            endpoint,
+            lambda client: _post_with_block_fallback(
+                client,
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+                client_msg_id=client_msg_id,
+            ),
+            describe="chat_postMessage(progress)",
+            operation="post",
+            best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
+        )
+        return _adopt_posted_ts(response)
+
+    async def _update_progress(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        card: ProgressCard,
+        endpoint: str | None = None,
+        best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
+    ) -> None:
+        """Rewrite the progress card at ``ts`` to this revision.
+
+        @spec ADR-0130 d2, d5. The text-only fallback sends ``blocks=[]``:
+        ``chat.update`` keeps a message's previous blocks when the call omits
+        them, so omitting them would leave the stale card on screen.
+        """
+        text, blocks = progress_card(card)
+
+        async def op(client: AsyncWebClient) -> None:
+            try:
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+            except SlackApiError as exc:
+                _record_reply_retry("update", _slack_retry_class(exc))
+                logger.warning(
+                    "progress card chat_update with blocks rejected for %s; retrying text-only",
+                    ts,
+                )
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=[])
+
+        await self._with_transport_fallback(
+            endpoint,
+            op,
+            describe="chat_update(progress)",
+            operation="update",
+            best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
+        )
 
     async def _update_message(
         self,
@@ -784,9 +933,13 @@ class SlackReplyAdapter:
         # the adapter picks the Slack form. No decision means nobody made one,
         # which is the expiry form (#419); a decision means the resolved form
         # (#1084), rendered by the SAME function the dispatcher's click path is
-        # pinned against, so an API resolve and a click settle a card alike.
+        # pinned against, so an API resolve and a click settle a card alike. The
+        # decision time rides the message's ``Decided`` field (ADR-0179).
         if settled is None or settled.decision is None:
-            text, blocks = expired_approval_card(summary=message.text)
+            text, blocks = expired_approval_card(
+                summary=message.text,
+                requested_by=settled.requested_by if settled is not None else "",
+            )
         else:
             text, blocks = resolved_approval_card(
                 summary=message.text,
@@ -794,6 +947,7 @@ class SlackReplyAdapter:
                 decision=settled.decision,
                 resolver=settled.resolver or "",
                 note=settled.note,
+                resolved_at=decided_at(message),
             )
 
         # A rejected Block Kit payload falls back to text-only, mirroring

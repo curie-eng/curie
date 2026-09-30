@@ -99,6 +99,7 @@ equal_ttl_path, short_ttl_path = sys.argv[6:8]
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
+ATTEST = "upgrade-drain-attest"
 
 
 def load(path):
@@ -114,7 +115,7 @@ def jobs_by_component(docs):
         component = (doc.get("metadata") or {}).get("labels", {}).get(
             "app.kubernetes.io/component"
         )
-        if component in (DRAIN, RELEASE):
+        if component in (DRAIN, RELEASE, ATTEST):
             out.setdefault(component, []).append(doc)
     return out
 
@@ -134,7 +135,7 @@ for path, label in ((disabled_path, "upgradeDrain.enabled=false"), (no_worker_pa
 
 # --- the default render ------------------------------------------------------
 jobs = jobs_by_component(load(default_path))
-for component in (DRAIN, RELEASE):
+for component in (DRAIN, RELEASE, ATTEST):
     check(
         len(jobs.get(component, [])) == 1,
         f"expected exactly one {component} Job, found {len(jobs.get(component, []))}",
@@ -143,9 +144,11 @@ for component in (DRAIN, RELEASE):
 if not failures:
     drain = jobs[DRAIN][0]
     release = jobs[RELEASE][0]
+    attest = jobs[ATTEST][0]
 
     drain_ann = (drain.get("metadata") or {}).get("annotations", {})
     release_ann = (release.get("metadata") or {}).get("annotations", {})
+    attest_ann = (attest.get("metadata") or {}).get("annotations") or {}
 
     # The hook phases. `pre-upgrade` ONLY: a fresh install has nothing in flight
     # and no Valkey to ask, so `pre-install` would fail every first install.
@@ -166,6 +169,42 @@ if not failures:
     check(
         "before-hook-creation" in drain_ann.get("helm.sh/hook-delete-policy", ""),
         "the drain Job is not cleared before the next attempt",
+    )
+    # Attest is the second pre-upgrade refusal. It runs only after a recorded
+    # drain, so Helm must not treat deleting the drain Job as success.
+    check(
+        attest_ann.get("helm.sh/hook") == "pre-upgrade",
+        f"attest hook is {attest_ann.get('helm.sh/hook')!r}, expected exactly 'pre-upgrade'",
+    )
+    check(
+        attest_ann.get("helm.sh/hook-weight") == "-9",
+        f"attest hook weight is {attest_ann.get('helm.sh/hook-weight')!r}, expected '-9'",
+    )
+    attest_delete = attest_ann.get("helm.sh/hook-delete-policy", "")
+    check(
+        "before-hook-creation" in attest_delete,
+        "the attest Job is not cleared before the next attempt",
+    )
+    check(
+        "hook-failed" not in attest_delete,
+        "the attest Job is auto-deleted on failure, destroying the refusal's evidence",
+    )
+    check(
+        "curie.ai/minimum-helm-timeout-seconds" not in attest_ann,
+        "the attest Job carries curie.ai/minimum-helm-timeout-seconds; "
+        "that annotation belongs to the drain Job only",
+    )
+    attest_spec = attest.get("spec") or {}
+    check(
+        attest_spec.get("backoffLimit") == 0,
+        f"attest backoffLimit is {attest_spec.get('backoffLimit')!r}, expected 0",
+    )
+    # The deadline starts at Job creation, so it has to cover the worker image
+    # pull. 60s timed out after a clean drain and left the roll hold set.
+    check(
+        attest_spec.get("activeDeadlineSeconds") == 300,
+        f"attest activeDeadlineSeconds is {attest_spec.get('activeDeadlineSeconds')!r}, "
+        "expected 300 so a slow image pull cannot fail attest after a clean drain",
     )
 
     drain_spec = drain.get("spec") or {}
@@ -189,7 +228,11 @@ if not failures:
         "expected greater than the 900s default drain wait",
     )
 
-    for component, doc, mode in ((DRAIN, drain, "drain"), (RELEASE, release, "release")):
+    for component, doc, mode in (
+        (DRAIN, drain, "drain"),
+        (RELEASE, release, "release"),
+        (ATTEST, attest, "attest"),
+    ):
         pod = (doc.get("spec") or {}).get("template", {}).get("spec", {})
         check(
             pod.get("restartPolicy") == "Never",
@@ -406,6 +449,7 @@ default_path, fresh_second_path, client_upgrade_path, byo_path = map(
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
+ATTEST = "upgrade-drain-attest"
 
 
 def load(path):
@@ -482,7 +526,7 @@ def assert_identity_render(docs, *, observed, legacy):
     revisions = []
     identities = []
     legacy_values = []
-    for component, mode in ((DRAIN, "drain"), (RELEASE, "release")):
+    for component, mode in ((DRAIN, "drain"), (RELEASE, "release"), (ATTEST, "attest")):
         hook = one(docs, kind="Job", component=component)
         container, env = container_env(hook)
         assert container.get("command") == [
@@ -514,12 +558,14 @@ def assert_identity_render(docs, *, observed, legacy):
         revisions.append(revision["value"])
         legacy_values.append(legacy_entry["value"])
 
-    assert identities == [installation_id, installation_id], (
+    assert identities == [installation_id, installation_id, installation_id], (
         "managed Secret and hook installation identities do not match within one render"
     )
-    assert len(set(revisions)) == 1, "drain and release hooks carry different revisions"
-    assert legacy_values == [legacy, legacy], (
-        "drain and release hooks disagree on legacy compatibility"
+    assert len(set(revisions)) == 1, (
+        "drain, release, and attest hooks carry different revisions"
+    )
+    assert legacy_values == [legacy, legacy, legacy], (
+        "drain, release, and attest hooks disagree on legacy compatibility"
     )
     return installation_id, managed_name, worker_env
 
@@ -568,7 +614,7 @@ assert installation_ref.get("name") == managed_name, (
 
 print(
     "OK: one memoized installation identity reaches the managed Secret, worker and "
-    "both hooks; fresh installs rotate it; client-only upgrades are marked unobserved; "
-    "BYO credential Secrets cannot replace it"
+    "the drain, release, and attest hooks; fresh installs rotate it; client-only "
+    "upgrades are marked unobserved; BYO credential Secrets cannot replace it"
 )
 PY

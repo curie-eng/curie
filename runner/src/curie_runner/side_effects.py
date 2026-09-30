@@ -35,9 +35,16 @@ from collections.abc import Iterable
 # independent of which harness's read-only declaration is in force -- flagging it
 # would block the no-retry rule for the very turns approvals pause, and a harness
 # declaration that happened to omit it must not be able to reintroduce that bug.
+# The factory's ``report_progress`` (#3077) is idempotent for the same reason: it
+# reports a phase to the status card and acts on nothing (#3464). So is the
+# deliberate ``progress`` tool (ADR 0130): it reports task state to the
+# platform and acts on nothing, so it is never a side effect and never on the
+# turn's receipt.
 PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
     {
         "mcp__curie__request_approval",
+        "mcp__curie__report_progress",
+        "mcp__curie__progress",
     }
 )
 

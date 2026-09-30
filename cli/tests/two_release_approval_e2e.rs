@@ -181,7 +181,7 @@ fn main_rs_declares_two_release_approval_e2e_dev_action() {
     );
     assert!(
         text.contains("[\"curie\", \"dev\", \"two-release-approval-e2e\"]"),
-        "parse test beside sre-demo-e2e must cover two-release-approval-e2e"
+        "parse test must cover two-release-approval-e2e"
     );
 }
 

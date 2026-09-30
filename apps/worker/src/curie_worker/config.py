@@ -44,6 +44,7 @@ from pydantic_settings.sources import (
 )
 
 from . import caller_token
+from .receipt import TurnReceiptMode
 
 
 def _default_consumer_name() -> str:
@@ -346,6 +347,21 @@ class WorkerConfig(BaseSettings):
         validation_alias="CURIE_BOOTING_TEXT",
     )
 
+    # What the receipt beneath a turn's reply shows (ADR-0180): every action
+    # (``all``, the ADR-0117 receipt as built), only the failed ones, or none.
+    # Any other value refuses boot rather than falling back to a mode nobody
+    # chose. It changes only what the person is shown, never what the action
+    # ledger records or what the no-retry rule reads.
+    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+
+    # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
+    # exists until the rendering change lands, and the chart does not set it.
+    # Off, the kernel's progress pump records each command's state and
+    # milestone reservation and removes the deliveries it enqueued, so nothing
+    # is shown and nothing is left owed. This worker has no progress deliverer,
+    # so ``_progress_render_needs_a_deliverer`` refuses it on.
+    progress_render: Bool = Field(default=False, validation_alias="CURIE_PROGRESS_RENDER")
+
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
     # the redelivery is waited out (#2433).
@@ -420,6 +436,22 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
+        """Refuse to start with progress rendering on (ADR 0130).
+
+        Nothing in this worker delivers progress to an adapter. Accepting the
+        switch would claim a rendering that does not happen, and leaving each
+        owed delivery in the outbox for a later deliverer would replay a
+        backlog of stale cards into old threads the day one exists.
+        """
+        if self.progress_render:
+            raise ValueError(
+                "CURIE_PROGRESS_RENDER=true needs progress rendering, which this worker "
+                "does not include; leave it unset"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_self_targeting_graveyard(self) -> WorkerConfig:
@@ -853,9 +885,7 @@ class WorkerConfig(BaseSettings):
     # value is deliberate standalone and Compose compatibility: those surfaces
     # have no Helm installation boundary and keep using the legacy key. Cluster
     # workers receive a nonblank value from the chart managed Secret.
-    installation_id: str = Field(
-        default="", validation_alias="CURIE_INSTALLATION_ID"
-    )
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
     # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
     # worker processes only read marker state, so this hook-only value may be
     # absent there. An explicitly supplied revision must be positive.
@@ -892,9 +922,7 @@ class WorkerConfig(BaseSettings):
         default=600.0,
         gt=0.0,
         le=MAX_DELIVERY_BUDGET_S,
-        validation_alias=AliasChoices(
-            "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
-        ),
+        validation_alias=AliasChoices("CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"),
     )
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
@@ -956,9 +984,7 @@ class WorkerConfig(BaseSettings):
     workspace_bucket: str = Field(
         default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
     )
-    workspace_enabled: bool = Field(
-        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
-    )
+    workspace_enabled: bool = Field(default=True, validation_alias="CURIE_WORKSPACE_ENABLED")
     workspace_object_prefix: str = Field(
         default="private/workspaces",
         validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
@@ -1022,9 +1048,7 @@ class WorkerConfig(BaseSettings):
     # today: text only, files ignored, no error. Mirrored by
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
-    attachment_enabled: bool = Field(
-        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
-    )
+    attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1038,9 +1062,7 @@ class WorkerConfig(BaseSettings):
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
-    publication_enabled: bool = Field(
-        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
-    )
+    publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
     publication_namespace: str = Field(
         default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
     )
@@ -1313,6 +1335,35 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
+    def progress_key(self, progress_id: str) -> str:
+        # One logical turn chain's progress record (ADR 0130); see the worker
+        # README's "Deliberate progress" section for its fields and expiry.
+        return f"{self.key_prefix}:progress:{progress_id}"
+
+    def progress_delivery_key(self, delivery_id: str) -> str:
+        # One pending progress delivery, keyed by its derived reply-wire id.
+        return f"{self.key_prefix}:progress:delivery:{delivery_id}"
+
+    def progress_pending_key(self) -> str:
+        # The progress sweep index: a SET, for the reason completions_pending_key
+        # gives.
+        return f"{self.key_prefix}:progress:pending"
+
+    def progress_chain_key(self, event_id: str) -> str:
+        # The pointer an approval resume event follows back to its chain's record.
+        return f"{self.key_prefix}:progress:chain:{event_id}"
+
+    def progress_inbox_key(self, progress_id: str) -> str:
+        # The chain's inbox stream. The API appends to it under the same
+        # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
+        # tests/vectors/turn-progress-capability.json.
+        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+
+    def progress_inbox_pending_key(self) -> str:
+        # Durable discovery for commands accepted after a live pump stops or
+        # while every worker is restarting.
+        return f"{self.key_prefix}:progress:inbox:pending"
+
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation
         # (#2374), shared by every replica in that installation. Standalone and
@@ -1322,6 +1373,19 @@ class WorkerConfig(BaseSettings):
         if not self.installation_id:
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
+
+    def upgrade_drain_success_key(self) -> str:
+        """The record that this revision's drain finished cleanly (#3360).
+
+        Written only after a clean drain, read by the attest hook, and deleted
+        by the post-upgrade release. An unset hook revision is zero, matching
+        the marker revision the gate already uses.
+        """
+        revision = 0 if self.upgrade_revision is None else self.upgrade_revision
+        key = f"{self.key_prefix}:upgrade:drain-succeeded:{revision}"
+        if self.installation_id:
+            return f"{key}:{self.installation_id}"
+        return key
 
     def upgrade_legacy_quiesce_key(self) -> str:
         """The pre-#2374 global key used only by standalone or the bridge."""
@@ -1341,6 +1405,11 @@ class WorkerConfig(BaseSettings):
         # row was persisted without one (#2721). A distinct segment from the card
         # key so the card store's legacy migration scan never sees these entries.
         return f"{self.key_prefix}:approval-notice-ref:{approval_id}"
+
+    def approval_reply_below_card_key(self, approval_id: str) -> str:
+        # Present when this approval's resume answers below its card (ADR-0179).
+        # Its own segment for the same reason as the notice ref's.
+        return f"{self.key_prefix}:approval-reply-below-card:{approval_id}"
 
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.

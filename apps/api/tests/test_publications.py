@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -31,7 +32,7 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import approval_principal, crud
+from curie_api import approval_principal, crud, sandbox_token
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
@@ -47,6 +48,23 @@ from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_factory_terminus import (  # noqa: F401
+    _label as _factory_label,
+)
+from test_factory_terminus import (
+    _request as _factory_request,
+)
+from test_factory_terminus import (
+    _rows as _factory_rows,
+)
+from test_factory_terminus import (
+    _start_running as _start_factory_request,
+)
+from test_factory_terminus import admitted, comments  # noqa: F401
+from test_github_factory_ingress import REPO as FACTORY_REPO
+
 REPO = "acme-corp/acme-bot"
 WORKER_TOKEN = "remote-dev-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
@@ -60,6 +78,7 @@ PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 _PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
 _REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
+FACTORY_WORKER_HEADERS = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 
 
 @pytest.fixture
@@ -236,19 +255,17 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     assert ordinary.reply_adapter == "agentmail-sandbox"
 
 
-def test_publication_schema_accepts_a_slack_identity_with_no_endpoint() -> None:
-    """No endpoint: this reply route names its IDENTITY (ADR-0168 decision 3),
-    checked against the identities this installation declares. Omitted and the
-    explicit `"default"` spelling both normalize to the pre-ADR-0168 stored
-    form (None), which is unchanged until the contract migration for that
-    decision (#3100)."""
+def test_publication_schema_stores_the_default_slack_identity_by_name() -> None:
+    """A Slack reply route names its identity (ADR-0168 decision 3), checked
+    against the identities this installation declares; the omitted and the
+    explicit spelling both store `default`."""
 
     omitted = _publication_payload(str(uuid.uuid4()))
-    assert PublicationCreate.model_validate(omitted).reply_adapter is None
+    assert PublicationCreate.model_validate(omitted).reply_adapter == "default"
 
     explicit = _publication_payload(str(uuid.uuid4()))
     explicit["reply_adapter"] = "default"
-    assert PublicationCreate.model_validate(explicit).reply_adapter is None
+    assert PublicationCreate.model_validate(explicit).reply_adapter == "default"
 
 
 def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoint() -> None:
@@ -259,20 +276,21 @@ def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoin
         PublicationCreate.model_validate(payload)
 
 
-def test_publication_schema_accepts_a_slack_endpoint_with_a_credential_adapter() -> None:
-    """The old custom-transport form is kept: a Slack reply route WITH an
-    endpoint carries a CREDENTIAL in `reply_adapter`, not an identity -- the
-    hook-approval-proof rig's shape (`charts/curie/ci/hook-approval-proof.py`),
-    which must not 422. The contract migration for ADR-0168 decision 3 (#3100)
-    is what refuses a Slack endpoint outright."""
+def test_a_slack_reply_endpoint_is_a_per_turn_origin_and_the_adapter_an_identity() -> None:
+    """A CLI stub turn carries its Slack Web API base in `reply_endpoint` (issue
+    #19); `reply_adapter` is still the identity, checked like any other, so
+    the retired custom-transport form's credential slug beside an endpoint is
+    refused as an undeclared identity."""
 
-    payload = _publication_payload(str(uuid.uuid4()))
-    payload["reply_endpoint"] = "http://127.0.0.1:1"
-    payload["reply_adapter"] = "proof-offline"
+    stub = _publication_payload(str(uuid.uuid4()))
+    stub["reply_endpoint"] = "http://cli-stub.test/api/"
+    assert PublicationCreate.model_validate(stub).reply_adapter == "default"
 
-    publication = PublicationCreate.model_validate(payload)
-    assert publication.reply_endpoint == "http://127.0.0.1:1"
-    assert publication.reply_adapter == "proof-offline"
+    retired = _publication_payload(str(uuid.uuid4()))
+    retired["reply_endpoint"] = "http://127.0.0.1:1"
+    retired["reply_adapter"] = "proof-offline"
+    with pytest.raises(ValidationError, match="'proof-offline'"):
+        PublicationCreate.model_validate(retired)
 
 
 def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
@@ -1620,6 +1638,11 @@ def test_publication_card_and_result_claims_survive_process_replacement(
             assert abandoned_result is not None
             assert abandoned_result.resolved_by == "U0REQUEST1"
             assert abandoned_result.resolution_note == "Approved for the release fixture"
+            # ADR-0179 decision 1: the publication card's rebuild reads the same
+            # decision time the resolve response returned, as an aware UTC instant.
+            assert abandoned_result.resolved_at == datetime.fromisoformat(
+                approved.json()["resolved_at"]
+            ).replace(tzinfo=UTC)
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
@@ -5714,7 +5737,12 @@ def test_cluster_message_review_revision_consumes_its_reservation(
 def test_cluster_message_review_revision_cannot_take_a_configured_route(
     review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
 ) -> None:
-    """#2789 negative: the relay binding still refuses an operator-configured route."""
+    """#2789 negative: the relay binding still refuses an operator-configured route.
+
+    A Slack route names an identity and never a transport (ADR-0168 decision
+    3), so the configured route here is the default identity with an origin
+    endpoint, which the relay's route-less binding does not have.
+    """
     client, truth, _ = review_lineage_app
     deployment, _, lineage = _verified_lineage(client, truth, auth_headers, route=_relay_route())
     assert _reserve_review(client, lineage, "review:relay-routed").status_code == 201
@@ -5724,7 +5752,7 @@ def test_cluster_message_review_revision_cannot_take_a_configured_route(
     payload.update(
         review_origin_key="review:relay-routed",
         reply_endpoint="https://adapter.example.com/reply",
-        reply_adapter="agentmail-sandbox",
+        reply_adapter="default",
     )
     refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
     assert refused.status_code == 409, refused.text
@@ -6326,9 +6354,9 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """ADR-0168 decision 3: a contract migration backfills the default Slack
-    identity to 'default', while this release's writers still send no adapter
-    for it. A replay compares the identities, so the two spellings match."""
+    """ADR-0168 decision 3: migration 0070 backfills the default Slack identity
+    to 'default', and a caller that names none means the same identity. A
+    replay compares the identities, so the two spellings match."""
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
     payload = _publication_payload(deployment["id"])
@@ -6346,3 +6374,247 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
 
     assert replay.status_code in {200, 201}, replay.text
     assert replay.json()["id"] == first["id"]
+
+
+def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A publication raised from a handle queued before migration 0070 can
+    still store NULL for the default Slack identity, while its replay now
+    arrives as 'default'. Same identity, same replay."""
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    _, first = _create_publication(client, payload)
+    _execute(
+        "UPDATE curie.approvals SET reply_adapter = NULL WHERE dedupe_key = :k",
+        {"k": payload["dedupe_key"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET reply_adapter = NULL WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+
+    assert replay.status_code in {200, 201}, replay.text
+    assert replay.json()["id"] == first["id"]
+
+
+@pytest.fixture
+def _factory_publication_case(
+    clean_db: None, admitted: Any  # noqa: F811
+) -> Iterator[tuple[TestClient, uuid.UUID, dict[str, Any]]]:
+    """Build a live factory request and its deployment for publication API tests."""
+
+    client, github, _comments = admitted
+    issue_number = 20_000 + int(uuid.uuid4().hex[:6], 16)
+    _factory_label(client, github, issue_number)
+    request = _factory_request(issue_number)
+    request_id = request["id"]
+    runtime_epoch = _start_factory_request(request_id)
+    work_item = _factory_rows(
+        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w "
+        "WHERE w.id = :id",
+        {"id": request["work_item_id"]},
+    )[0]
+
+    auth_headers = {"X-API-Key": get_settings().api_key}
+    agent_id = str(work_item["agent_id"])
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "operator"},
+        headers=auth_headers,
+    )
+    assert version.status_code == 201, version.text
+    deployment = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version.json()["id"],
+            "environment": "dev",
+            "workspace_enabled": True,
+        },
+        headers=auth_headers,
+    )
+    assert deployment.status_code == 201, deployment.text
+
+    payload = {
+        "deployment_id": deployment.json()["id"],
+        "conversation_id": work_item["conversation_id"],
+        "reply_conversation_id": f"issue-{issue_number}",
+        "repo_full_name": FACTORY_REPO,
+        "author": "github:77:maintainer",
+        "summary": "Publish the factory changes",
+        "reply_kind": "github",
+        "reply_channel": FACTORY_REPO,
+        "reply_placeholder": f"issue-comment-{issue_number}",
+        "dedupe_key": f"factory-publication-{uuid.uuid4().hex}",
+        "base_sha": BASE_SHA,
+        "work_item_request_id": str(request_id),
+        "work_item_runtime_epoch": runtime_epoch,
+        "patch_b64": base64.b64encode(b"diff --git a/example.py b/example.py\n").decode(),
+        "changed_paths": ["apps/api/src/example.py"],
+        "expires_in_seconds": 600,
+        "title": "Verify the factory publication route",
+        "body": "The change updates the factory verification route.",
+    }
+    yield client, request_id, payload
+
+
+def _record_factory_verification(
+    client: TestClient,
+    request_id: uuid.UUID,
+    *,
+    outcome: str = "unavailable",
+) -> Any:
+    observation: dict[str, Any] = {
+        "command": "uv run pytest runner/tests -q",
+        "outcome": outcome,
+        "exit_status": None if outcome == "unavailable" else 1,
+        "missing_binaries": ["uv"] if outcome == "unavailable" else [],
+        "blocked_services": [],
+    }
+    token = sandbox_token.mint(
+        get_settings().api_key,
+        agent=str(request_id),
+        scope="work_item.progress",
+        exp=int(time.time()) + 3600,
+    )
+    return client.post(
+        f"/v1/work-item-progress/{request_id}/verification",
+        headers={"X-API-Key": token},
+        json=observation,
+    )
+
+
+def _post_factory_publication(
+    client: TestClient, payload: dict[str, Any]
+) -> Any:
+    selected = client.post(
+        f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": payload["repo_full_name"],
+        },
+        headers=FACTORY_WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+    return client.post(
+        "/v1/internal/publications",
+        json=payload,
+        headers=FACTORY_WORKER_HEADERS,
+    )
+
+
+def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_body(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    publication_id = created.json()["id"]
+    body = _factory_rows(
+        "SELECT body FROM curie.publications WHERE id = :id",
+        {"id": publication_id},
+    )[0]["body"]
+    assert payload["body"] in body
+    assert "In-sandbox verification was unavailable." in body
+    assert "Python (ruff + mypy + pytest) is pending proof." in body
+    assert "verification passed" not in body.casefold()
+
+
+def test_factory_python_publication_refuses_a_missing_preflight_observation(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_missing"
+    assert "preflight" in refused.json()["detail"]["message"].casefold()
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_a_failed_preflight_observation(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="failed")
+    assert recorded.status_code == 201, recorded.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+    assert "rerun" in refused.json()["detail"]["message"].casefold()
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
+    assert "examples/coder/factory_fixture.py" in refused.json()["detail"]["message"]
+
+
+def test_factory_non_python_publication_keeps_its_existing_body_without_python_claims(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["README.md"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["body"] == payload["body"]
+
+
+def test_later_non_python_publication_keeps_prior_python_proof_pending(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+    first = _post_factory_publication(client, payload)
+    assert first.status_code == 201, first.text
+    _execute(
+        "UPDATE curie.publications SET status = 'succeeded', "
+        "outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(first.json()["id"])},
+    )
+
+    later = payload.copy()
+    later["dedupe_key"] = f"factory-publication-{uuid.uuid4().hex}"
+    later["changed_paths"] = ["README.md"]
+    later["patch_b64"] = base64.b64encode(b"diff --git a/README.md b/README.md\n").decode()
+    later["body"] = "Update the documentation after the Python change."
+    created = _post_factory_publication(client, later)
+
+    assert created.status_code == 201, created.text
+    assert "In-sandbox verification was unavailable." in created.json()["body"]
+    assert "Python (ruff + mypy + pytest) is pending proof." in created.json()["body"]

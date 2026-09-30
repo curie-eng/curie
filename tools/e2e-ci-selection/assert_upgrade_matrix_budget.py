@@ -2,10 +2,9 @@
 """Assert the cluster upgrade matrix stays inside the 20 minute budget (#2823).
 
 Reads a GitHub Actions jobs payload (the documented
-``GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`` response) and treats
-each ``E2E cluster upgrade matrix (sNN)`` job's wall clock as shard-plus-bake:
-the image bake is a step inside that job, so job ``started_at``/``completed_at``
-is the critical path #2778 claimed would stay under 20 minutes.
+``GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`` response) and adds the
+shared image build job's wall clock to each matrix shard's run step. The images
+now build once in a separate job before the shards start.
 
 Always writes the seconds to the job summary. Exits 1 when the longest shard
 job exceeds the budget, when the jobs list is truncated, or when timestamps
@@ -28,7 +27,7 @@ from typing import Any
 
 BUDGET_SECONDS = 20 * 60
 SHARD_PREFIX = "E2E cluster upgrade matrix ("
-BAKE_STEP = "Build the candidate images locally in parallel"
+IMAGES_JOB = "Build CI images (no push)"
 RUN_STEP = "Run the cluster upgrade matrix"
 DEFAULT_API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
@@ -44,16 +43,14 @@ class ShardTiming:
     name: str
     shard: str
     job_seconds: int
-    bake_seconds: int | None
+    images_seconds: int
     run_seconds: int | None
 
     @property
-    def shard_plus_bake_seconds(self) -> int:
-        if self.bake_seconds is None or self.run_seconds is None:
-            raise BudgetError(
-                f"missing bake or matrix-run step timestamps on {self.shard}"
-            )
-        return self.bake_seconds + self.run_seconds
+    def shard_plus_images_seconds(self) -> int:
+        if self.run_seconds is None:
+            raise BudgetError(f"missing matrix-run step timestamps on {self.shard}")
+        return self.images_seconds + self.run_seconds
 
 
 def parse_iso8601(value: object, label: str) -> datetime:
@@ -129,25 +126,33 @@ def load_jobs(payload: object) -> list[dict[str, Any]]:
 
 
 def timings_from_jobs(jobs: list[dict[str, Any]]) -> list[ShardTiming]:
+    shard_jobs = [job for job in jobs if is_shard_job(job.get("name"))]
+    if not shard_jobs:
+        raise BudgetError("no upgrade matrix shard jobs")
+    images_jobs = [job for job in jobs if job.get("name") == IMAGES_JOB]
+    if (
+        len(images_jobs) != 1
+        or images_jobs[0].get("status") != "completed"
+        or images_jobs[0].get("conclusion") != "success"
+    ):
+        raise BudgetError("expected one successful shared image build job")
+    images_job = images_jobs[0]
+    images_seconds = duration_seconds(
+        images_job.get("started_at"), images_job.get("completed_at"), IMAGES_JOB
+    )
     rows: list[ShardTiming] = []
-    for job in jobs:
+    for job in shard_jobs:
         name = job.get("name")
-        if not is_shard_job(name):
-            continue
         assert isinstance(name, str)
         rows.append(
             ShardTiming(
                 name=name,
                 shard=shard_id(name),
-                job_seconds=duration_seconds(
-                    job.get("started_at"), job.get("completed_at"), name
-                ),
-                bake_seconds=step_seconds(job, BAKE_STEP),
+                job_seconds=duration_seconds(job.get("started_at"), job.get("completed_at"), name),
+                images_seconds=images_seconds,
                 run_seconds=step_seconds(job, RUN_STEP),
             )
         )
-    if not rows:
-        raise BudgetError("no upgrade matrix shard jobs")
     return rows
 
 
@@ -168,26 +173,26 @@ def render_summary(rows: list[ShardTiming], longest: ShardTiming, over: bool) ->
         "## Upgrade matrix wall clock",
         "",
         f"Budget: {BUDGET_SECONDS} seconds (20 minutes). "
-        "The asserted number is bake plus matrix-run on the slowest shard "
-        "(#2823, #2778).",
+        "The asserted number is the shared image build job plus the matrix run "
+        "on the slowest shard (#2823, #2778).",
         "",
-        "| Shard | Job seconds | Bake seconds | Matrix-run seconds | Bake plus run |",
+        "| Shard | Job seconds | Image build seconds | Matrix run seconds | Build plus run |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
-    for row in sorted(rows, key=lambda item: (-item.shard_plus_bake_seconds, item.shard)):
+    for row in sorted(rows, key=lambda item: (-item.shard_plus_images_seconds, item.shard)):
         lines.append(
-            f"| {row.shard} | {row.job_seconds} | {optional_seconds(row.bake_seconds)} | "
-            f"{optional_seconds(row.run_seconds)} | {row.shard_plus_bake_seconds} |"
+            f"| {row.shard} | {row.job_seconds} | {row.images_seconds} | "
+            f"{optional_seconds(row.run_seconds)} | {row.shard_plus_images_seconds} |"
         )
     result = "over budget" if over else "within budget"
-    asserted = longest.shard_plus_bake_seconds
+    asserted = longest.shard_plus_images_seconds
     lines.extend(
         [
             "",
-            f"Longest shard plus bake: {asserted} seconds "
+            f"Longest image build plus matrix run: {asserted} seconds "
             f"({format_clock(asserted)}) on {longest.shard} "
-            f"(job {longest.job_seconds}s, bake {optional_seconds(longest.bake_seconds)}s, "
-            f"matrix-run {optional_seconds(longest.run_seconds)}s).",
+            f"(shard job {longest.job_seconds}s, image build {longest.images_seconds}s, "
+            f"matrix run {optional_seconds(longest.run_seconds)}s).",
             f"Result: {result}",
             "",
         ]
@@ -327,8 +332,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        longest = max(rows, key=lambda row: (row.shard_plus_bake_seconds, row.shard))
-        asserted = longest.shard_plus_bake_seconds
+        longest = max(rows, key=lambda row: (row.shard_plus_images_seconds, row.shard))
+        asserted = longest.shard_plus_images_seconds
     except BudgetError as exc:
         write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
         emit(str(exc), error=True)
@@ -338,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     if over:
         emit(
             (
-                f"longest shard plus bake {asserted}s on {longest.shard} "
+                f"longest image build plus matrix run {asserted}s on {longest.shard} "
                 f"exceeds {BUDGET_SECONDS}s budget"
             ),
             error=True,
@@ -346,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     emit(
         (
-            f"longest shard plus bake {asserted}s on {longest.shard} "
+            f"longest image build plus matrix run {asserted}s on {longest.shard} "
             f"(budget {BUDGET_SECONDS}s)"
         ),
         error=False,

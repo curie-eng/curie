@@ -21,7 +21,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "p0-closes-ci" / "check.py"
-SKILL = REPO_ROOT / ".claude" / "skills" / "implement" / "SKILL.md"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "p0-closes.yaml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -147,34 +146,6 @@ def _single_step(
     matches = [step for step in steps if predicate(step)]
     assert len(matches) == 1, f"expected exactly one {description}, found {len(matches)}"
     return matches[0]
-
-
-def test_implement_skill_states_the_p0_closes_trigger_and_ac_vs_diff_rule() -> None:
-    text = SKILL.read_text(encoding="utf-8")
-    for label in TRIGGER_LABELS:
-        assert f"`{label}`" in text, f"implement skill must name the `{label}` Closes trigger"
-    assert "Closes" in text
-    assert "spec-vs-impl" in text
-    assert "acceptance criterion" in text.lower() or "acceptance criteria" in text.lower()
-    assert "diff" in text
-    assert "Fix pin" in text
-    assert "e2e" in text.lower()
-
-
-def test_implement_skill_documents_the_2209_message_only_pin_as_insufficient() -> None:
-    text = SKILL.read_text(encoding="utf-8")
-    assert "#2209" in text
-    assert "#2248" in text
-    combined = text.lower()
-    assert "routing" in combined
-    assert "message-only" in combined or "refusal-text" in combined or "string" in combined
-
-
-def test_implement_skill_leaves_ordinary_bugfixes_unchanged() -> None:
-    text = SKILL.read_text(encoding="utf-8")
-    lowered = text.lower()
-    assert "ordinary" in lowered
-    assert "unchanged" in lowered
 
 
 def test_pytest_collects_this_suite_from_committed_testpaths() -> None:

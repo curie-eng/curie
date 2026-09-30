@@ -104,6 +104,10 @@ test("exchanges a login code before showing the immutable console principal", as
 test("resolves with the same-origin console cookie and exactly decision/note, never the platform key", async ({ page }, testInfo) => {
   await stubApprovals(page, [approval()]);
 
+  // Chromium rejects a __Host- cookie on this stackless HTTP preview
+  // (addCookies accepts it only for an https URL). The API tests own that
+  // name. Here the browser only has to attach the console cookie and omit
+  // the platform key; the stubbed API never reads the cookie.
   await page.context().addCookies([
     {
       name: "curie_console_session",
