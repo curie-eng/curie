@@ -124,10 +124,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class CreatedApproval:
-    """What the kernel needs back: the record's identity and its status."""
+    """Record identity plus display metadata; never an authorization principal."""
 
     id: str
     status: str
+    requested_by: str | None = None
+    requester_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -547,7 +549,12 @@ class ApprovalClient:
                 f"approval create failed: HTTP {response.status_code}: {response.text}"
             )
         body = response.json()
-        return CreatedApproval(id=str(body["id"]), status=str(body["status"]))
+        return CreatedApproval(
+            id=str(body["id"]),
+            status=str(body["status"]),
+            requested_by=body.get("requested_by"),
+            requester_known="requested_by" in body,
+        )
 
     async def get(self, approval_id: str) -> SettledApproval | None:
         """The record's settled outcome, or None when it cannot be read (#1084).

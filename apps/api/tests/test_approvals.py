@@ -752,9 +752,13 @@ def test_create_get_list_round_trip(
     assert body["status"] == "pending"
     assert body["summary"] == payload["summary"]
     assert body["resolved_by"] is None
+    # Display derivation belongs to creation only; durable record views retain
+    # their author semantics and exact field shape.
+    assert body.pop("requested_by") == payload["author"]
 
     got = approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers)
     assert got.status_code == 200
+    assert "requested_by" not in got.json()
     assert got.json() == body
 
     listed = approvals_client.get(
@@ -764,6 +768,8 @@ def test_create_get_list_round_trip(
     )
     assert [a["id"] for a in listed.json()] == [body["id"]]
     assert listed.json()[0]["reply_placeholder"] == payload["reply_placeholder"]
+    assert "requested_by" not in listed.json()[0]
+    assert listed.json()[0] == body
 
 
 def test_create_tolerates_unknown_field_from_a_newer_worker(

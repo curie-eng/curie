@@ -1616,6 +1616,203 @@
         "title": "ApprovalAuditOut",
         "type": "object"
       },
+      "ApprovalCreateOut": {
+        "description": "Display attribution for creation, separate from the durable turn author.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "gate_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Kind"
+          },
+          "granted_tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Tool"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "resolution_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Note"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          },
+          "resolved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved By"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "conversation_id",
+          "author",
+          "summary",
+          "reply_channel",
+          "reply_placeholder",
+          "reply_endpoint",
+          "dedupe_key",
+          "route",
+          "card_channel",
+          "gate_kind",
+          "granted_tool",
+          "status",
+          "expires_at",
+          "resolved_by",
+          "resolution_note",
+          "created_at",
+          "resolved_at"
+        ],
+        "title": "ApprovalCreateOut",
+        "type": "object"
+      },
       "ApprovalIdentityFactsOut": {
         "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
         "properties": {
@@ -12087,7 +12284,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApprovalOut"
+                  "$ref": "#/components/schemas/ApprovalCreateOut"
                 }
               }
             },

@@ -7525,6 +7525,15 @@ class Kernel:
             )
             return True
 
+        # Display attribution is distinct from the resume actor and the durable
+        # approval author. An older API cannot prove a continuation's origin.
+        if created.requester_known:
+            requested_by = created.requested_by or ""
+        elif self._is_approval_resume(qevent.event_id):
+            requested_by = ""
+        else:
+            requested_by = qevent.author
+
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
@@ -7599,7 +7608,7 @@ class Kernel:
                         reply_ref=card_reply_ref,
                     ),
                     message=card_message,
-                    requested_by=qevent.author,
+                    requested_by=requested_by,
                 ),
                 route=TargetRoute(endpoint=card_endpoint, adapter=card_adapter),
             )
@@ -7629,7 +7638,7 @@ class Kernel:
                         # The settled rebuild shows the same "Requested by" line
                         # the live card did, and once the sandbox is gone this
                         # is the worker's only copy of it (#1084).
-                        requested_by=qevent.author,
+                        requested_by=requested_by,
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
@@ -7671,7 +7680,7 @@ class Kernel:
                             ),
                             interaction=None,
                         ),
-                        requested_by=qevent.author,
+                        requested_by=requested_by,
                     ),
                     route=notification_route,
                 )
