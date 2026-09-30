@@ -805,6 +805,7 @@ def test_an_unmatched_rejection_never_posts_in_a_prod_bound_channel(
     assert _suppressed_counts(notice_metrics) == {}
 
 
+@pytest.mark.parametrize("remove_bindings", [False, True])
 def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
     client: Any,
     auth_headers: dict[str, str],
@@ -812,8 +813,11 @@ def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
     trusted_clone_base: Path,
     notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
     caplog: pytest.LogCaptureFixture,
+    remove_bindings: bool,
 ) -> None:
-    """One agent serves dev and prod from one channel: that channel is prod.
+    """@spec docs/operations.md#automatically-with-git-flow.
+
+    One agent serves dev and prod from one channel: that channel is prod.
 
     The rejection must post nothing there, and it must still be findable: one
     WARNING naming the repository and code, and one counted suppression.
@@ -828,6 +832,17 @@ def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
         "status"
     ] == "promoted"
     _delete_bare_repo(trusted_clone_base)
+    if remove_bindings:
+        # No Slack recipient is still an observable suppression for this repo.
+        async def remove_channels() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with engine.begin() as session:
+                    await session.execute(text("DELETE FROM curie.agent_channels"))
+            finally:
+                await engine.dispose()
+
+        asyncio.run(remove_channels())
     cursor = _notice_cursor()
 
     with caplog.at_level("WARNING", logger="curie_api.deploy_notice"):
