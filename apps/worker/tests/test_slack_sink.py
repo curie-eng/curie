@@ -1158,3 +1158,33 @@ def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
 def test_an_edit_within_the_limit_is_sent_unchanged() -> None:
     text = "x" * _EDIT_LIMIT_BYTES
     assert _captured_update(text) == text
+
+
+def test_unavailable_requester_omits_live_context_without_removing_controls() -> None:
+    # WORKER-REQUESTER-5: unavailable display identity is not a resolver identity
+    # and must not produce a bogus <@> mention or disable the existing gate.
+    sink = SlackReplyAdapter("xoxb-test")
+    captured: dict[str, object] = {}
+
+    async def post(**kwargs: object):
+        captured.update(kwargs)
+        return {"ok": True, "ts": "9.9"}
+
+    sink._client_for(None).chat_postMessage = post  # type: ignore[method-assign]
+    ack = asyncio.run(
+        _post(
+            sink,
+            channel="C0EXAMPLE1",
+            message=_approval_message("appr-1", "Next bounded action"),
+            requested_by="",
+        )
+    )
+    assert ack.ref == "9.9"
+    blocks = captured["blocks"]
+    assert isinstance(blocks, list)
+    assert not any(block["type"] == "context" for block in blocks)
+    assert "<@>" not in json.dumps(blocks)
+    actions = blocks[-1]
+    assert actions["type"] == "actions"
+    assert [button["value"] for button in actions["elements"]] == ["appr-1", "appr-1"]
+    assert "Next bounded action" in captured["text"]
