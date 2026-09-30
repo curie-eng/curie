@@ -449,3 +449,20 @@ def test_each_named_alert_needs_its_own_fresh_read_before_current_state_claim() 
         and re.search(r"read again|re-read|reread", item, re.IGNORECASE)
         for item in _policy_items()
     ), "A prior secondary rule's state stays historical until that rule is read again."
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "preserved-tuple",
+        "different-live-rule",
+        "missing-alarm-name",
+        "quoted-auth",
+        "exact-current-read",
+        "hook-root",
+    ],
+)
+def test_identity_eval_requires_an_answer_rather_than_its_prompt(case_id: str) -> None:
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    case = next(case for case in suite.cases if case.id == PREFIX + case_id)
+    assert not _grader(case_id).grade(case.input)
