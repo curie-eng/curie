@@ -2,7 +2,9 @@
 
 Date: 2026-09-29
 
-Status: Proposed
+Status: Accepted
+
+Accepted with explicit maintainer approval on 2026-09-29.
 
 ## Purpose
 
@@ -181,4 +183,3 @@ This is a shared bug in released generic hook behavior, so the PR targets
 #3529 and #3530. Merging the PR is not production completion: a release must be
 built, installed by the downstream owner, and verified with a real alert root
 and a human follow-up before the incident is closed operationally.
-
