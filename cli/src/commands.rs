@@ -14802,7 +14802,7 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
+    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir, None)?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(

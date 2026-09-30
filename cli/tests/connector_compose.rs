@@ -49,6 +49,7 @@
 //!     identity: &ConnectorScope,
 //!     project: &str,
 //!     plugin_dir: &Path,
+//!     caller_public_key: Option<&str>,
 //! ) -> anyhow::Result<serde_json::Value>;
 //! /// Resolved secret values handed to the compose child's environment only,
 //! /// where the overlay's `${NAME}` references expand from; the file on disk
@@ -936,7 +937,15 @@ fn overlay_fixture(agent: &str, plugin_dir: &Path) -> Value {
         );
     }
 
-    compose_overlay(&lock, &decl, &scope(agent), "curie", plugin_dir).expect("generate the overlay")
+    compose_overlay(
+        &lock,
+        &decl,
+        &scope(agent),
+        "curie",
+        plugin_dir,
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
+    )
+    .expect("generate the overlay")
 }
 
 /// One service per hosted connector, pinned to the locked digest, joined to the

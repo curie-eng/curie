@@ -162,6 +162,25 @@ fn a_build_connector_with_no_lock_entry_names_curie_build() {
 
 // ─── Both emitters route through it ──────────────────────────────────────────
 
+#[test]
+fn the_local_overlay_refuses_a_hosted_connector_without_a_caller_key() {
+    let dir = TempDir::new().expect("tempdir");
+    let error = compose_overlay(
+        &lock_for("tempo"),
+        &declaring("tempo", image_spec()),
+        &scope(),
+        PROJECT,
+        dir.path(),
+        None,
+    )
+    .expect_err("an empty caller key");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("hosted_connector_requires_caller_key"),
+        "{text}"
+    );
+}
+
 /// The local tier. The overlay IS the local tier's image decision: whatever it
 /// writes into `image:` is what compose starts.
 #[test]
@@ -173,6 +192,7 @@ fn the_local_overlay_starts_the_declared_image_despite_a_stale_lock_entry() {
         &scope(),
         PROJECT,
         dir.path(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");
     let service = &overlay["services"][object_name(RELEASE, AGENT, "tempo")];
@@ -190,6 +210,7 @@ fn the_local_overlay_starts_the_locked_image_for_a_build_connector() {
         &scope(),
         PROJECT,
         dir.path(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");
     let service = &overlay["services"][object_name(RELEASE, AGENT, "tempo")];
@@ -286,6 +307,7 @@ fn both_emitters_label_a_connector_with_its_agent_and_object_name() {
         &scope(),
         PROJECT,
         dir.path(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");
     let service_labels = &overlay["services"][&object]["labels"];

@@ -562,7 +562,14 @@ def render_deployment(
             "replicas": 1,
             "selector": {"matchLabels": _labels(release, agent, connector)},
             "template": {
-                "metadata": {"labels": _labels(release, agent, connector)},
+                "metadata": {
+                    "labels": {
+                        **_labels(release, agent, connector),
+                        # Not part of the Service selector. The data-tier Valkey
+                        # allow uses it so this pod can spend a grant.
+                        "app.kubernetes.io/component": "mcp-connector",
+                    }
+                },
                 "spec": {
                     # Hardened by construction. The author never writes this, so
                     # the author cannot omit it.

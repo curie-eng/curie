@@ -1852,9 +1852,16 @@ pub fn compose_overlay(
     identity: &ConnectorScope,
     project: &str,
     plugin_dir: &Path,
+    caller_public_key: Option<&str>,
 ) -> Result<serde_json::Value> {
     let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
+    let hosts_one = decl.connectors.values().any(is_hosted);
+    if hosts_one && caller_public_key.map(str::trim).unwrap_or("").is_empty() {
+        anyhow::bail!(
+            "hosted_connector_requires_caller_key: a hosted connector needs a caller public key"
+        );
+    }
     for (connector, spec) in &decl.connectors {
         if !is_hosted(spec) {
             continue;

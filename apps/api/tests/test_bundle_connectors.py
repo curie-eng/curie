@@ -24,6 +24,22 @@ from plugin_format.connector_render import CALLER_PROXY_PORT, ConnectorProxy
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
+def test_a_wildcard_approval_pattern_stays_on_the_matching_connector() -> None:
+    # `*/merge_pull_request` is how a bundle gates that tool on every server.
+    # Dropping it because it does not start with `github/` would leave the
+    # proxy forwarding the call with no grant.
+    patterns = ("*/merge_pull_request", "grafana/*", "mcp__github__merge_pull_request")
+    assert bundles.gated_tools_for_connector("github", patterns) == (
+        "*/merge_pull_request",
+        "mcp__github__merge_pull_request",
+    )
+    assert bundles.gated_tools_for_connector("grafana", patterns) == (
+        "*/merge_pull_request",
+        "grafana/*",
+    )
+    assert bundles.gated_tools_for_connector("other", ("grafana/*",)) == ()
+
+
 def _bundle(root: Path, connectors_yaml: str | None = None) -> Path:
     inner = root / "b"
     (inner / ".claude-plugin").mkdir(parents=True, exist_ok=True)

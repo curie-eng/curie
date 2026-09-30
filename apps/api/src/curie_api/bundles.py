@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import zipfile
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -379,6 +380,12 @@ def gated_tools_for_connector(
             attributed = bool(
                 separator and tool and (server == connector or server.endswith(f"_{connector}"))
             )
+        elif "/" in pattern:
+            # `*/merge_pull_request` is a real approvalRequired pattern. The
+            # server segment is a glob, matched the same way the runner matches
+            # a canonical name, so a wildcard is not dropped as "another server".
+            server, separator, tool = pattern.partition("/")
+            attributed = bool(separator and tool and fnmatchcase(connector, server))
         else:
             attributed = False
         if attributed and pattern not in kept:
