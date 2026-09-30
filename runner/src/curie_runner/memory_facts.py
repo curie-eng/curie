@@ -262,20 +262,17 @@ class MemoryFactsStore:
         Refused with ``MemoryFull`` (``limit == "facts"``), writing nothing, when
         the memory already holds ``MAX_FACTS_PER_MEMORY`` facts: boot shows the
         agent only that many, so one more would silently push the oldest out of
-        the prompt (#3624). Only ``fact-*`` keys count; ``log`` and ``guidance``
-        do not.
+        the prompt (#3624). Only facts boot would show count, which is what
+        ``list()`` returns: ``log``, ``guidance`` and malformed ``fact-*``
+        entries do not.
 
-        Two concurrent saves can both pass this check at one below the limit
-        and land one over it. That is accepted rather than locked against: boot
-        still caps at the limit and says how many facts it left out.
+        This check takes no lock. Any number of saves that run concurrently can
+        each pass it below the limit and all land, so a memory can go over the
+        limit. Boot then shows the newest ``MAX_FACTS_PER_MEMORY`` facts and says
+        how many it left out. That is a known, accepted limit.
         """
 
-        held = sum(
-            1
-            for entry in await self._entries()
-            if isinstance(entry, Mapping)
-            and str(entry.get("key") or "").startswith(FACT_KEY_PREFIX)
-        )
+        held = len(await self.list())
         if held >= MAX_FACTS_PER_MEMORY:
             raise MemoryFull(
                 f"it holds {held} facts, the most the agent can be shown "
