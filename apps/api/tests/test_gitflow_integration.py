@@ -251,14 +251,15 @@ def _notice_cursor() -> str:
     """Remember the private Valkey stream tail without erasing another test's rows."""
 
     settings = get_settings()
+    stream = settings.deploy_notice_stream_name()
     with redis.Redis(
         host=settings.valkey_host,
         port=settings.valkey_port,
         password=settings.valkey_password,
     ) as valkey:
         info = (
-            valkey.xinfo_stream("curie:deploy-notices")
-            if valkey.exists("curie:deploy-notices")
+            valkey.xinfo_stream(stream)
+            if valkey.exists(stream)
             else None
         )
         return str(info["last-generated-id"], "ascii") if info is not None else "0-0"
@@ -266,12 +267,13 @@ def _notice_cursor() -> str:
 
 def _notices_after(cursor: str) -> list[dict[str, Any]]:
     settings = get_settings()
+    stream = settings.deploy_notice_stream_name()
     with redis.Redis(
         host=settings.valkey_host,
         port=settings.valkey_port,
         password=settings.valkey_password,
     ) as valkey:
-        entries = valkey.xrange("curie:deploy-notices", min=f"({cursor}")
+        entries = valkey.xrange(stream, min=f"({cursor}")
     return [json.loads(fields[b"payload"]) for _, fields in entries]
 
 
@@ -512,21 +514,62 @@ def test_success_notice_reloads_opt_in_and_binding_after_push_started(
                 )
                 await writer.commit()
 
+                result = WebhookResult(status="deployed", agent_id=agent.id, commit_sha=sha)
+                payload = _push_payload("refs/heads/dev", sha, "file:///unused")
                 count = await DeployNoticeQueue(valkey, stream).publish(
                     stale,
-                    WebhookResult(status="deployed", agent_id=agent.id, commit_sha=sha),
-                    _push_payload("refs/heads/dev", sha, "file:///unused"),
+                    result,
+                    payload,
                     settings,
                 )
                 assert count == 1
                 notices = await valkey.xrange(stream)
                 assert len(notices) == 1
                 assert json.loads(notices[0][1]["payload"])["address"] == "C0EXAMPLE2"
+                # Two installations may use the same repository and binding
+                # with one shared Valkey; dedupe must not suppress either lane.
+                other_stream = f"{stream}:other-installation"
+                other_count = await DeployNoticeQueue(valkey, other_stream).publish(
+                    stale, result, payload, settings
+                )
+                assert other_count == 1
+                assert len(await valkey.xrange(other_stream)) == 1
         finally:
             await valkey.aclose()
             await engine.dispose()
 
     asyncio.run(exercise())
+
+
+def test_notice_stream_and_group_follow_the_api_worker_installation_contract() -> None:
+    from curie_api.config import Settings
+    from curie_worker.config import WorkerConfig
+
+    first_api = Settings.model_construct(
+        runs_stream="tenant-one:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+    first_worker = WorkerConfig.model_construct(
+        stream="tenant-one:runs",
+        consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+    second_api = Settings.model_construct(
+        runs_stream="tenant-one:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-two",
+    )
+    other_stream_api = Settings.model_construct(
+        runs_stream="tenant-two:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+
+    assert first_api.deploy_notice_stream_name() == first_worker.deploy_notice_stream_name()
+    assert first_api.deploy_notice_group_name() == first_worker.deploy_notice_group_name()
+    assert first_api.deploy_notice_stream_name() != second_api.deploy_notice_stream_name()
+    assert first_api.deploy_notice_stream_name() != other_stream_api.deploy_notice_stream_name()
 
 
 def test_archive_rejection_notifies_without_success_opt_in(
@@ -1665,7 +1708,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             store=client.app.state.bundle_store,
             settings=settings,
             eval_queue=NoopEvalQueue(),
-            notice_queue=DeployNoticeQueue(notice_redis),
+            notice_queue=DeployNoticeQueue(notice_redis, settings.deploy_notice_stream_name()),
             tips=Tips(),
             interval_seconds=60,
         )

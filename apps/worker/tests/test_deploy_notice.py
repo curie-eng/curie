@@ -27,7 +27,16 @@ from capture_fixtures import Capture  # noqa: E402
     "status,codes,expected",
     [
         ("rejected", ["git.archive_failed"], "rejected: git.archive_failed"),
+        ("rejected", [f"git.reason_{n}" for n in range(17)], "rejected: git.reason_0"),
         ("deployed", [], "deployed aaaaaaaa (dev)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "agent_name,address",
+    [
+        ("acme-dev", "C0EXAMPLE1"),
+        ("", "C0EXAMPLE1"),
+        ("n" * 300, "C" + "A" * 300),
     ],
 )
 def test_notice_posts_as_the_bound_identity_and_acks(
@@ -36,6 +45,8 @@ def test_notice_posts_as_the_bound_identity_and_acks(
     status: Literal["rejected", "deployed"],
     codes: list[str],
     expected: str,
+    agent_name: str,
+    address: str,
 ) -> None:
     async def go() -> None:
         capture = Capture()
@@ -68,9 +79,9 @@ def test_notice_posts_as_the_bound_identity_and_acks(
         task = asyncio.create_task(consumer.run())
         try:
             notice: dict[str, Any] = {
-                "address": "C0EXAMPLE1",
+                "address": address,
                 "identity": "ops",
-                "agent_name": "acme-dev",
+                "agent_name": agent_name,
                 "status": status,
                 "sha": "a" * 40,
                 "environment": "dev",
@@ -85,7 +96,7 @@ def test_notice_posts_as_the_bound_identity_and_acks(
             posted = capture.requests[0]
             assert posted["headers"]["Authorization"] == "Bearer xoxb-ops-test"
             body = json.loads(posted["body"])
-            assert body["channel"] == "C0EXAMPLE1"
+            assert body["channel"] == address
             assert expected in body["text"]
             assert "thread_ts" not in body
             assert body["client_msg_id"] == str(
@@ -106,6 +117,48 @@ def test_notice_posts_as_the_bound_identity_and_acks(
             await sink.aclose()
             await valkey.aclose()
             await server.close()
+
+    asyncio.run(go())
+
+
+def test_malformed_notice_is_dead_lettered_and_acked(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def go() -> None:
+        config = WorkerConfig(read_block_ms=100, key_prefix=names["prefix"])
+        sink = build_reply_sink(config, slack_tokens={})
+        valkey = AsyncRedis(
+            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
+        )
+        consumer = DeployNoticeConsumer(
+            redis=valkey,
+            sink=sink,
+            config=config,
+            stream=names["stream"],
+            group=names["group"],
+            consumer="notice-malformed",
+            leases=DeliveryLeaseStore(valkey, config),
+        )
+        task = asyncio.create_task(consumer.run())
+        try:
+            entry = await valkey.xadd(names["stream"], {"payload": "not-json"})
+            dead: list[Any] = []
+            for _ in range(100):
+                dead = await valkey.xrange(f"{names['stream']}:dead")
+                if dead:
+                    break
+                await asyncio.sleep(0.05)
+            assert len(dead) == 1
+            assert dead[0][1]["dl_reason"] == "unparseable"
+            assert await valkey.xpending_range(
+                names["stream"], names["group"], min=entry, max=entry, count=1
+            ) == []
+        finally:
+            consumer.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+            await valkey.delete(f"{names['stream']}:dead")
+            await sink.aclose()
+            await valkey.aclose()
 
     asyncio.run(go())
 

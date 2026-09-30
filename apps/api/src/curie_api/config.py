@@ -299,6 +299,14 @@ class Settings(BaseSettings):
     def dead_letter_stream_name(self) -> str:
         return derive_dead_letter_stream_name(self.runs_stream, self.dead_letter_stream)
 
+    def deploy_notice_stream_name(self) -> str:
+        """Keep notices in this run stream's installation, not a global lane."""
+        base = f"{self.runs_stream}:deploy-notices"
+        return f"{base}:{self.installation_id}" if self.installation_id else base
+
+    def deploy_notice_group_name(self) -> str:
+        return f"{self.runs_consumer_group}-deploy-notices"
+
     # How often the expiry sweeper scans for lapsed pending approvals (#412) and
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).

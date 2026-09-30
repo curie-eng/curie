@@ -23,7 +23,6 @@ from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
 
-DEPLOY_NOTICE_STREAM = "curie:deploy-notices"
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DEDUP_TTL_SECONDS = 86400
 _PUBLISH_ONCE = """
@@ -37,7 +36,7 @@ return false
 class DeployNoticeQueue:
     """One atomic dedupe-and-enqueue per Slack binding and push outcome."""
 
-    def __init__(self, redis: Redis, stream: str = DEPLOY_NOTICE_STREAM) -> None:
+    def __init__(self, redis: Redis, stream: str) -> None:
         self._redis = redis
         self._stream = stream
 
@@ -100,7 +99,7 @@ class DeployNoticeQueue:
                     "codes": codes,
                 }
                 encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
-                identity = f"{full_name}\0{ref}\0{sha}\0{agent.id}\0{encoded}"
+                identity = f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}\0{encoded}"
                 digest = hashlib.sha256(identity.encode()).hexdigest()
                 key = f"curie:deploy-notice:dedupe:{digest}"
                 stream_id = await self._redis.eval(

@@ -21,8 +21,6 @@ from .upgrade_drain import UpgradeDrainGate
 
 logger = logging.getLogger(__name__)
 
-DEPLOY_NOTICE_STREAM = "curie:deploy-notices"
-DEPLOY_NOTICE_GROUP = "curie-deploy-notices"
 _CAP_SCAN_PAGE = 1000
 
 
@@ -31,13 +29,13 @@ class DeployNotice(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    address: str = Field(min_length=1, max_length=255)
+    address: str = Field(min_length=1)
     identity: str = Field(min_length=1, max_length=64)
-    agent_name: str = Field(min_length=1, max_length=255)
+    agent_name: str
     status: Literal["deployed", "promoted", "rejected"]
     sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     environment: Literal["dev", "prod"] | None
-    codes: list[str] = Field(max_length=16)
+    codes: list[str]
 
 
 def render_notice(notice: DeployNotice) -> str:
@@ -64,8 +62,8 @@ class DeployNoticeConsumer(StreamConsumer):
         redis: Redis,
         sink: ReplySinkRouter,
         config: WorkerConfig,
-        stream: str = DEPLOY_NOTICE_STREAM,
-        group: str = DEPLOY_NOTICE_GROUP,
+        stream: str | None = None,
+        group: str | None = None,
         consumer: str | None = None,
         leases: DeliveryLeaseStore | None = None,
         drain: UpgradeDrainGate | None = None,
@@ -78,15 +76,15 @@ class DeployNoticeConsumer(StreamConsumer):
         )
         self._config = config
         self._sink = sink
-        self._stream = stream
-        self._group = group
+        self._stream = stream or config.deploy_notice_stream_name()
+        self._group = group or config.deploy_notice_group_name()
         self._consumer = consumer or f"{config.consumer_name}-deploy-notices"
         self._inflight: set[asyncio.Task[None]] = set()
         self._delivery = DeliverySpec(
-            stream=stream,
-            group=group,
+            stream=self._stream,
+            group=self._group,
             consumer=self._consumer,
-            dead_letter_target=f"{stream}:dead",
+            dead_letter_target=f"{self._stream}:dead",
             over_cap_reason="max-delivery-exceeded",
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
@@ -96,7 +94,7 @@ class DeployNoticeConsumer(StreamConsumer):
             capability_ttl_ms=config.consumer_capability_ttl_ms,
             read_count=config.read_count,
             cap_scan_page=_CAP_SCAN_PAGE,
-            telemetry_source="deploy-notice",
+            telemetry_source="worker",
             handler=self._dispatch,
             logger=logger,
             dead_letter_log="dead-lettered deploy notice %s after %d deliveries (%s) -> %s",
