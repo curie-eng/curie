@@ -502,7 +502,29 @@ class ClaudeAgentSession:
         self._client = ClaudeSDKClient(options)
 
     async def connect(self) -> None:
-        await self._client.connect()
+        # The SDK copies os.environ into the CLI at spawn. Install the parent
+        # env (model key kept, platform tokens removed) for that copy, then
+        # restore the process env so in-process clients keep what they captured.
+        # BASH_ENV points at an unset prelude so the Bash tool drops the model
+        # key before the command runs. The CLI parent still has the key.
+        from .subprocess_env import (
+            CLI_PARENT_MODEL_KEYS,
+            cli_parent_env,
+            platform_credential_names,
+        )
+
+        snapshot = dict(os.environ)
+        denied = platform_credential_names({**snapshot, **self._options.env})
+        for key in list(self._options.env):
+            if key in denied and key not in CLI_PARENT_MODEL_KEYS:
+                self._options.env.pop(key, None)
+        try:
+            os.environ.clear()
+            os.environ.update(cli_parent_env(snapshot))
+            await self._client.connect()
+        finally:
+            os.environ.clear()
+            os.environ.update(snapshot)
 
     async def query(self, text: str) -> None:
         await self._client.query(text)

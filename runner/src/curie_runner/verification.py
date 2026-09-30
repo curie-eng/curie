@@ -30,6 +30,7 @@ from typing import Any
 import anyio
 
 from .progress import ProgressClient
+from .subprocess_env import shell_and_hook_env
 
 logger = logging.getLogger(__name__)
 
@@ -513,13 +514,15 @@ async def _verify(
     installed = False
     if check.install is not None and lockfile_installs:
         # Registry egress for the install is the bundle's business; inherit env.
-        install = await _run(check.install, workspace, dict(os.environ), names, "install")
+        install = await _run(
+            check.install, workspace, shell_and_hook_env(os.environ), names, "install"
+        )
         if install.outcome == "failed" and install.failure_reason is None:
             install.failure_reason = f"install exited {install.exit_status}"
         if install.outcome != "passed":
             return install, installed
         installed = True
-    env = dict(os.environ)
+    env = shell_and_hook_env(os.environ)
     env.update(_OFFLINE_ENV)
     return await _run(check.command, workspace, env, names, "command"), installed
 

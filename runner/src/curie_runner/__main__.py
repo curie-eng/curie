@@ -47,6 +47,7 @@ from .connectors import (
     build_mcp_servers,
     derive_mcp_servers,
     drop_connector_secret_names,
+    materialize_connector_caller_headers,
     materialize_hosted_bearer_headers,
 )
 from .fake import FakeModelSession
@@ -654,6 +655,13 @@ def build_runner(
     dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
     if spawn_env is not os.environ:
         drop_connector_secret_names(os.environ, dropped)
+    # The caller token is a platform credential. Expand it into the hosted
+    # header, then drop the name from both the spawn mapping and the process
+    # env. Bash and hooks must not inherit it (#3550).
+    if spawn_env is os.environ:
+        materialize_connector_caller_headers(derived_mcp_servers, os.environ)
+    else:
+        materialize_connector_caller_headers(derived_mcp_servers, spawn_env, os.environ)
 
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
