@@ -20,6 +20,7 @@ from aci_protocol import (
 )
 from claude_agent_sdk import (
     AssistantMessage,
+    ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
     TextBlock,
@@ -190,6 +191,9 @@ def _adapter_session_factory(script: list[object]) -> Callable[[], ClaudeAgentSe
     def factory() -> ClaudeAgentSession:
         session = ClaudeAgentSession.__new__(ClaudeAgentSession)
         session._client = _ScriptedSDKClient(script)  # type: ignore[attr-defined]
+        # connect() installs the CLI parent env from the real options object.
+        # This scripted session never spawns a CLI, so the env map stays empty.
+        session._options = ClaudeAgentOptions(env={})  # type: ignore[attr-defined]
         return session
 
     return factory
