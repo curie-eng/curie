@@ -768,8 +768,8 @@ repository, so it goes only to the Slack channels of the repository's non-prod
 bindings. It never reaches a channel bound to a prod deployment: a Slack channel
 counts as prod when any agent bound to it, through any bot identity, has an
 active prod deployment, and an agent with an active prod deployment has no
-non-prod bindings. When no non-prod channel remains, the rejection posts
-nothing; the API logs it at WARNING with the repository, commit and codes, and
+non-prod bindings. When no non-prod channel remains, including when a bound
+repository has no Slack bindings at all, the rejection posts nothing; the API logs it at WARNING with the repository, commit and codes, and
 counts it in `curie.deploy_notice.suppressed` with
 `reason="no_nonprod_recipient"`. The notice includes the commit prefix and
 stable error codes; for `git.archive_failed`, check the API's clone credential
