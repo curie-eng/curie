@@ -70,8 +70,11 @@ curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
   --workspace-repo acme-corp/acme-bot
 ```
 
-These commands use the current Kubernetes context and the default `curie`
-release and namespace. Observability defaults to the `observability` namespace.
+These commands use the default `curie` release and namespace. Every `curie
+example sre-bot` verb pins one Kubernetes context for all of its `helm` and
+`kubectl` calls: the kubeconfig current-context, or the context named with
+`--context <NAME>`. Pass `--context` on a workstation whose kubeconfig holds
+more than one cluster. Observability defaults to the `observability` namespace.
 Persistent volumes use the cluster's default storage class, including the
 default supplied by a stock kind cluster. See the complete executable sequence
 in [DEMO.md](DEMO.md#fresh-install).

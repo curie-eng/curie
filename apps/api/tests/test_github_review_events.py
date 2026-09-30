@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -108,7 +109,12 @@ def feedback_payload(event: str = "issue_comment") -> dict:
     "event", ["issue_comment", "pull_request_review_comment", "pull_request_review"]
 )
 def test_each_human_review_family_retains_canonical_identity_and_provenance(event: str) -> None:
-    result = parse_feedback(event, feedback_payload(event), DELIVERY)
+    result = parse_feedback(
+        event,
+        feedback_payload(event),
+        DELIVERY,
+        github_html_base="https://github.com",
+    )
     assert result.repo_full_name == REPO
     assert result.pr_number == 17
     assert result.sender_id == 41 and result.sender_login == "example-reviewer"
@@ -117,7 +123,12 @@ def test_each_human_review_family_retains_canonical_identity_and_provenance(even
     assert result.url.startswith(f"https://github.com/{REPO}/pull/17#")
     assert (
         result.event_id
-        == parse_feedback(event, feedback_payload(event), str(uuid.UUID(int=2))).event_id
+        == parse_feedback(
+            event,
+            feedback_payload(event),
+            str(uuid.UUID(int=2)),
+            github_html_base="https://github.com",
+        ).event_id
     )
     if event == "pull_request_review_comment":
         assert result.path == "src/example.py" and result.line == 12 and result.review_id == 81
@@ -138,7 +149,12 @@ def test_pull_request_issue_comment_url_shapes_normalize_to_one_identity(
     # https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
     payload = feedback_payload()
     payload["comment"]["html_url"] = claimed_url
-    feedback = parse_feedback("issue_comment", payload, DELIVERY)
+    feedback = parse_feedback(
+        "issue_comment",
+        payload,
+        DELIVERY,
+        github_html_base="https://github.com",
+    )
 
     assert feedback.url == f"https://github.com/{REPO}/pull/17#issuecomment-71"
 
@@ -160,7 +176,7 @@ def test_issue_comment_url_aliases_require_exact_repository_pr_and_comment(
     payload["comment"]["html_url"] = claimed_url
 
     with pytest.raises(FeedbackIgnored, match="invalid_feedback_url"):
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
 
 
 @pytest.mark.parametrize("action", ["edited", "deleted", "dismissed"])
@@ -168,7 +184,7 @@ def test_non_creation_actions_are_observably_ignored(action: str) -> None:
     payload = feedback_payload()
     payload["action"] = action
     with pytest.raises(FeedbackIgnored, match="unsupported_action"):
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
 
 
 @pytest.mark.parametrize(
@@ -196,20 +212,35 @@ def test_invalid_or_non_human_feedback_cannot_be_normalized(mutation, reason: st
     payload = feedback_payload()
     mutation(payload)
     with pytest.raises(FeedbackIgnored, match=reason) as caught:
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
     assert "private-sentinel" not in str(caught.value)
 
 
 def test_delivery_header_must_be_a_real_uuid() -> None:
     with pytest.raises(FeedbackIgnored, match="invalid_delivery"):
-        parse_feedback("issue_comment", feedback_payload(), "not-a-delivery-private-sentinel")
+        parse_feedback(
+            "issue_comment",
+            feedback_payload(),
+            "not-a-delivery-private-sentinel",
+            github_html_base="https://github.com",
+        )
 
 
 def test_app_reinstallation_does_not_change_feedback_execution_identity() -> None:
     payload = feedback_payload()
-    original = parse_feedback("issue_comment", payload, DELIVERY)
+    original = parse_feedback(
+        "issue_comment",
+        payload,
+        DELIVERY,
+        github_html_base="https://github.com",
+    )
     payload["installation"]["id"] = 12
-    replacement = parse_feedback("issue_comment", payload, str(uuid.UUID(int=3)))
+    replacement = parse_feedback(
+        "issue_comment",
+        payload,
+        str(uuid.UUID(int=3)),
+        github_html_base="https://github.com",
+    )
     assert replacement.event_id == original.event_id
     assert replacement.installation_id != original.installation_id
 
@@ -221,14 +252,16 @@ def test_drive_by_or_malformed_sender_association_cannot_authorize_feedback(asso
     payload = feedback_payload()
     payload["comment"]["author_association"] = association
     with pytest.raises(FeedbackIgnored, match="unauthorized_association"):
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
 
 
 @pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
 def test_signed_member_associations_are_retained_and_verified(association: str) -> None:
     payload = feedback_payload()
     payload["comment"]["author_association"] = association
-    assert parse_feedback("issue_comment", payload, DELIVERY).author_association == association
+    assert parse_feedback(
+        "issue_comment", payload, DELIVERY, github_html_base="https://github.com"
+    ).author_association == association
 
 
 def test_review_ingress_is_disabled_by_default_and_refuses_incomplete_enablement() -> None:
@@ -244,7 +277,12 @@ def test_non_actionable_or_malformed_review_state_has_a_redacted_refusal(state) 
     payload = feedback_payload("pull_request_review")
     payload["review"]["state"] = state
     with pytest.raises(FeedbackIgnored, match="non_actionable_review"):
-        parse_feedback("pull_request_review", payload, DELIVERY)
+        parse_feedback(
+            "pull_request_review",
+            payload,
+            DELIVERY,
+            github_html_base="https://github.com",
+        )
 
 
 class GitHubTruth:
@@ -258,7 +296,12 @@ class GitHubTruth:
 
     def __init__(self, event: str, key: str):
         self.payload = feedback_payload(event)
-        self.feedback = parse_feedback(event, self.payload, DELIVERY)
+        self.feedback = parse_feedback(
+            event,
+            self.payload,
+            DELIVERY,
+            github_html_base="https://github.com",
+        )
         self.settings = Settings(
             github_app_id="51",
             github_app_private_key=key,
@@ -291,6 +334,9 @@ class GitHubTruth:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request.url.path)
+        path = request.url.path.removeprefix(
+            urlsplit(self.settings.github_api_url.rstrip("/")).path
+        )
         assert "fixture-pat" not in request.headers.get("Authorization", "")
         if request.url.path.endswith("/installation"):
             return httpx.Response(self.installation_status, json=self.installation)
@@ -303,11 +349,11 @@ class GitHubTruth:
                 },
             )
         assert request.headers["Authorization"] == "Bearer fixture-app-token-private-sentinel"
-        if request.url.path == f"/repos/{REPO}":
+        if path == f"/repos/{REPO}":
             return httpx.Response(200, json=self.repo)
-        if request.url.path == f"/repos/{REPO}/pulls/17":
+        if path == f"/repos/{REPO}/pulls/17":
             return httpx.Response(200, json=self.pr)
-        if request.url.path == f"/repos/{REPO}/issues/17/comments":
+        if path == f"/repos/{REPO}/issues/17/comments":
             if request.method == "GET":
                 assert request.url.params.get("per_page") == "100"
                 page = int(request.url.params.get("page", "1"))
@@ -329,7 +375,7 @@ class GitHubTruth:
             if self.comment_post_failure == "after":
                 return httpx.Response(503, json={"message": "Service unavailable"})
             return httpx.Response(201, json=created)
-        if request.url.path == (
+        if path == (
             f"/repos/{REPO}/collaborators/example-reviewer/permission"
         ):
             return httpx.Response(200, json=self.permission)
@@ -392,17 +438,60 @@ def test_review_truth_must_match_immutable_persisted_authority(
 @pytest.mark.parametrize(
     "event", ["issue_comment", "pull_request_review_comment", "pull_request_review"]
 )
+@pytest.mark.parametrize(
+    ("html_base", "api_url"),
+    [
+        ("https://github.com", "https://api.github.com"),
+        ("https://github.example.com/forge", "https://github.example.com/forge/api/v3"),
+    ],
+)
 def test_current_app_repo_pr_and_human_feedback_must_independently_agree(
     event: str,
     review_app_key: str,
     monkeypatch: pytest.MonkeyPatch,
+    html_base: str,
+    api_url: str,
 ) -> None:
     truth = GitHubTruth(event, review_app_key)
+    truth.settings = truth.settings.model_copy(update={"github_api_url": api_url})
+    feedback = truth.payload["review" if event == "pull_request_review" else "comment"]
+    feedback["html_url"] = feedback["html_url"].replace("https://github.com", html_base)
+    if event == "issue_comment":
+        truth.payload["issue"]["pull_request"].update(
+            html_url=f"{html_base}/{REPO}/pull/17",
+            url=f"{api_url}/repos/{REPO}/pulls/17",
+        )
+    else:
+        truth.payload["pull_request"]["html_url"] = f"{html_base}/{REPO}/pull/17"
+    truth.feedback = parse_feedback(
+        event, truth.payload, DELIVERY, github_html_base=html_base
+    )
+    truth.pr["html_url"] = f"{html_base}/{REPO}/pull/17"
+    truth.comment.update(
+        html_url=feedback["html_url"],
+        issue_url=f"{api_url}/repos/{REPO}/issues/17",
+        pull_request_url=f"{api_url}/repos/{REPO}/pulls/17",
+    )
+
     assert asyncio.run(verify_truth(truth, monkeypatch)) == HEAD
-    assert truth.calls[0] == f"/repos/{REPO}/installation"
-    assert f"/repos/{REPO}" in truth.calls
-    assert f"/repos/{REPO}/pulls/17" in truth.calls
-    assert f"/repos/{REPO}/collaborators/example-reviewer/permission" in truth.calls
+    prefix = urlsplit(api_url).path
+    assert truth.calls[0] == f"{prefix}/repos/{REPO}/installation"
+    assert f"{prefix}/repos/{REPO}" in truth.calls
+    assert f"{prefix}/repos/{REPO}/pulls/17" in truth.calls
+    assert f"{prefix}/repos/{REPO}/collaborators/example-reviewer/permission" in truth.calls
+
+
+@pytest.mark.parametrize(
+    "event", ["issue_comment", "pull_request_review_comment", "pull_request_review"]
+)
+def test_enterprise_review_feedback_refuses_a_public_github_url(event: str) -> None:
+    with pytest.raises(FeedbackIgnored, match="invalid_feedback_url"):
+        parse_feedback(
+            event,
+            feedback_payload(event),
+            DELIVERY,
+            github_html_base="https://github.example.com/forge",
+        )
 
 
 @pytest.mark.parametrize(
@@ -458,10 +547,20 @@ def test_inline_review_comment_submitted_from_a_pending_review_is_admitted(
 ) -> None:
     payload = feedback_payload("pull_request_review_comment")
     payload["comment"].update(PENDING_REVIEW_SUBMIT)
-    parse_feedback("pull_request_review_comment", payload, DELIVERY)
+    parse_feedback(
+        "pull_request_review_comment",
+        payload,
+        DELIVERY,
+        github_html_base="https://github.com",
+    )
     truth = GitHubTruth("pull_request_review_comment", review_app_key)
     truth.payload["comment"].update(PENDING_REVIEW_SUBMIT)
-    truth.feedback = parse_feedback("pull_request_review_comment", truth.payload, DELIVERY)
+    truth.feedback = parse_feedback(
+        "pull_request_review_comment",
+        truth.payload,
+        DELIVERY,
+        github_html_base="https://github.com",
+    )
     truth.comment.update(PENDING_REVIEW_SUBMIT)
     assert asyncio.run(verify_truth(truth, monkeypatch)) == HEAD
 
@@ -481,7 +580,7 @@ def test_edited_issue_comment_is_still_refused(
     payload = feedback_payload("issue_comment")
     payload["comment"].update(PENDING_REVIEW_SUBMIT)
     with pytest.raises(FeedbackIgnored, match="edited_feedback"):
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
     truth = GitHubTruth("issue_comment", review_app_key)
     truth.comment.update(PENDING_REVIEW_SUBMIT)
     with pytest.raises(FeedbackIgnored, match="edited_feedback"):
@@ -2713,7 +2812,7 @@ def test_repository_id_cannot_overflow_a_durable_receipt() -> None:
     payload = feedback_payload()
     payload["repository"]["id"] = 2**63
     with pytest.raises(FeedbackIgnored):
-        parse_feedback("issue_comment", payload, DELIVERY)
+        parse_feedback("issue_comment", payload, DELIVERY, github_html_base="https://github.com")
 
 
 def test_concurrent_conflicting_delivery_replays_preserve_canonical_receipt(review_stack) -> None:

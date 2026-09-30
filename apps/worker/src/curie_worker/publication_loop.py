@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from channel_protocol import MESSAGE_VERSION, Action, ConfirmIntent, OutboundMessage
 from channel_protocol.reply import (
@@ -35,7 +36,7 @@ from .publication_k8s import (
 )
 from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
 
-_PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$", re.MULTILINE)
+_PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://[^\s]+/pull/[1-9][0-9]*)$", re.MULTILINE)
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)
 _PR_STATE_MARKER = re.compile(r"^CURIE_PR_STATE=(closed|merged)$", re.MULTILINE)
@@ -345,16 +346,24 @@ def _marker_updated_at(logs: str) -> datetime | None:
     return value if value.tzinfo is not None else None
 
 
-def _validated_pr_url(work: PublicationWork, url: str | None) -> str | None:
+def _validated_pr_url(
+    work: PublicationWork, url: str | None, *, github_html_base: str
+) -> str | None:
     """Accept only a pull request URL for the publication's exact repository."""
 
     if url is None:
         return None
     expected = re.compile(
-        rf"https://github\.com/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*",
+        rf"{re.escape(github_html_base)}/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*",
         re.IGNORECASE,
     )
-    if expected.fullmatch(url) is None:
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or expected.fullmatch(url) is None
+    ):
         raise PublicationReconcileError(
             "publication result URL does not belong to the requested repository"
         )
@@ -933,7 +942,9 @@ class PublicationReconciler:
             raise PublicationReconcileError(
                 "pull request head branch no longer matches the stored lineage branch"
             )
-        validated_url = _validated_pr_url(work, pull.url)
+        validated_url = _validated_pr_url(
+            work, pull.url, github_html_base=self._job_settings.github_html_base
+        )
         if (
             validated_url is None
             or work.pr_url is None
@@ -951,7 +962,9 @@ class PublicationReconciler:
         names: PublicationResourceNames,
     ) -> bool:
         pr_url = _validated_pr_url(
-            work, observation.pr_url or _marker_url(observation.logs)
+            work,
+            observation.pr_url or _marker_url(observation.logs),
+            github_html_base=self._job_settings.github_html_base,
         )
         pr_number = observation.pr_number or _marker_number(observation.logs)
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
@@ -1077,7 +1090,9 @@ class PublicationReconciler:
                 probe_resources = build_publication_resources(
                     self._payload(
                         work,
-                        clean_clone_url=f"https://github.com/{work.repo_full_name}.git",
+                        clean_clone_url=(
+                            f"{self._job_settings.github_html_base}/{work.repo_full_name}.git"
+                        ),
                     ),
                     credential="validation-placeholder",
                     settings=self._job_settings,
@@ -1196,7 +1211,11 @@ class PublicationReconciler:
                         raise PublicationReconcileError(
                             "verified publication branch has no recoverable pull request"
                         )
-                    validated_url = _validated_pr_url(work, recovered.url)
+                    validated_url = _validated_pr_url(
+                        work,
+                        recovered.url,
+                        github_html_base=self._job_settings.github_html_base,
+                    )
                     if (
                         validated_url is None
                         or recovered.number != int(validated_url.rsplit("/", 1)[1])

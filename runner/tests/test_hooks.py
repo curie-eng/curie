@@ -253,6 +253,41 @@ def test_first_denying_command_short_circuits(tmp_path: Path) -> None:
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+def test_command_hook_env_omits_platform_credentials(monkeypatch, tmp_path) -> None:
+    """A bundle hook subprocess must not see platform credentials.
+
+    The runner process still holds them (the parent env is unchanged). The
+    hook's own environment does not, and it still receives ordinary config
+    plus CLAUDE_PLUGIN_ROOT.
+    """
+
+    monkeypatch.setenv("CURIE_RUNNER_TOKEN", "runner-sentinel")
+    monkeypatch.setenv("CURIE_STATE_TOKEN", "sbx.example-state")
+    monkeypatch.setenv("CURIE_MEMORY_TOKEN", "sbx.example-memory")
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_TOKEN", "cct.example-caller")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-PLACEHOLDER")
+    monkeypatch.setenv("CURIE_MODEL", "claude-sonnet-5")
+    captured = tmp_path / "hook-env.txt"
+
+    async def go() -> dict:
+        return await hooks._run_command_hook(
+            f"env > {captured}",
+            {"tool_name": "Bash", "tool_input": {}},
+            tmp_path,
+        )
+
+    anyio.run(go)
+    rendered = captured.read_text(encoding="utf-8")
+    assert "runner-sentinel" not in rendered
+    assert "sbx.example-state" not in rendered
+    assert "sbx.example-memory" not in rendered
+    assert "cct.example-caller" not in rendered
+    assert "sk-ant-PLACEHOLDER" not in rendered
+    assert "CURIE_MODEL=claude-sonnet-5" in rendered
+    assert f"CLAUDE_PLUGIN_ROOT={tmp_path}" in rendered
+    assert os.environ["CURIE_RUNNER_TOKEN"] == "runner-sentinel"
+
+
 def test_command_hook_kills_child_on_timeout(monkeypatch, tmp_path) -> None:
     """A hook command that outlives the timeout must not orphan its children.
 

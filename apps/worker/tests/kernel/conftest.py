@@ -97,7 +97,7 @@ class HookRunSeed:
     def recorder(self) -> object:
         from curie_worker.hook_runs import HookRunRecorder
 
-        return HookRunRecorder(self.engine)
+        return HookRunRecorder(self.engine, "curie")
 
     async def state(self) -> tuple[str | None, datetime | None] | None:
         async with self.engine.connect() as conn:

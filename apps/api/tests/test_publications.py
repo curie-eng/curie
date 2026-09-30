@@ -75,6 +75,9 @@ SECOND_REVISION_SHA = "2123456789abcdef0123456789abcdef01234567"
 EXTERNAL_REVISION_SHA = "3123456789abcdef0123456789abcdef01234567"
 PR_NUMBER = 123
 PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
+ENTERPRISE_HTML_BASE = "https://github.example.com/forge"
+ENTERPRISE_API_URL = f"{ENTERPRISE_HTML_BASE}/api/v3"
+ENTERPRISE_PR_URL = f"{ENTERPRISE_HTML_BASE}/{REPO}/pull/{PR_NUMBER}"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 _PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
 _REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
@@ -83,8 +86,12 @@ FACTORY_WORKER_HEADERS = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 
 @pytest.fixture
 def publication_stack(
-    _disposable_db: Any, monkeypatch: pytest.MonkeyPatch
+    _disposable_db: Any, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Iterator[tuple[TestClient, str]]:
+    forge = getattr(request, "param", None)
+    if forge is not None:
+        monkeypatch.setenv("GITHUB_API_URL", forge["api_url"])
+        monkeypatch.setenv("GITHUB_CLONE_BASE", forge["html_base"])
     runs_stream = f"test:curie:publication-runs:{uuid.uuid4().hex}"
     monkeypatch.setenv("RUNS_STREAM", runs_stream)
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
@@ -190,6 +197,19 @@ def test_publication_schema_refuses_github_workflow_changes() -> None:
 
     with pytest.raises(ValidationError, match="workflow changes cannot be published"):
         PublicationCreate.model_validate(payload)
+
+
+def test_publication_schema_refuses_github_metadata_changes() -> None:
+    for path in (
+        ".github/actions/build/action.yml",
+        ".github/CODEOWNERS",
+        ".GITHUB/CODEOWNERS",
+    ):
+        payload = _publication_payload(str(uuid.uuid4()))
+        payload["changed_paths"] = [path]
+
+        with pytest.raises(ValidationError, match="GitHub metadata changes cannot be published"):
+            PublicationCreate.model_validate(payload)
 
 
 def test_publication_schema_accepts_the_builtin_reply_adapter_without_an_endpoint() -> None:
@@ -487,6 +507,7 @@ def _open_lineage(
     auth_headers: dict[str, str],
     *,
     conversation_id: str,
+    pr_url: str = PR_URL,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
@@ -505,6 +526,7 @@ def _open_lineage(
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=pr_url,
     )
     assert advanced.status_code == 200, advanced.text
     _mark_outcome_history_ready(publication["id"])
@@ -2350,6 +2372,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: model,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -5279,12 +5302,18 @@ def review_lineage_app(
         "status": 200,
         "state": "open",
         "merged": False,
+        "pr_url": PR_URL,
+        "title": "Existing publication title",
+        "body": "Existing publication body.\n",
+        "requests": [],
         "calls": [],
+        "authorization": "Bearer fixture-publication-app-token",
     }
     real_client = httpx.Client
 
     def handle(request: httpx.Request) -> httpx.Response:
         truth["calls"].append((request.method, request.url.path))
+        truth["requests"].append(request)
         if request.url.path.endswith("/installation"):
             return httpx.Response(200, json={"id": truth["installation_id"]})
         if request.url.path.endswith("/access_tokens"):
@@ -5295,20 +5324,22 @@ def review_lineage_app(
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["authorization"] == "Bearer fixture-publication-app-token"
+        assert request.headers["authorization"] == truth["authorization"]
         if truth["status"] != 200:
             return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
         repo = {"id": truth["repository_id"], "full_name": REPO}
-        if request.url.path == f"/repos/{REPO}":
+        if request.url.path.endswith(f"/repos/{REPO}"):
             return httpx.Response(200, json=repo)
         return httpx.Response(
             200,
             json={
                 "number": PR_NUMBER,
-                "html_url": PR_URL,
+                "html_url": truth["pr_url"],
                 "node_id": truth["node_id"],
                 "state": truth["state"],
                 "merged": truth["merged"],
+                "title": truth["title"],
+                "body": truth["body"],
                 "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
                 "base": {"repo": repo, "ref": "main"},
             },
@@ -5382,6 +5413,7 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=truth["pr_url"],
     )
     assert advanced.status_code == 200, advanced.text
     assert _rows(
@@ -5421,10 +5453,153 @@ def _verified_lineage(
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=truth["pr_url"],
     )
     assert advanced.status_code == 200, advanced.text
     _mark_outcome_history_ready(publication["id"])
     return deployment, publication, advanced.json()
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    # Enterprise REST retains the documented repository and pull request fields:
+    # https://docs.github.com/en/enterprise-server@3.17/rest/pulls/pulls#get-a-pull-request
+    client, truth, _ = review_lineage_app
+    truth["pr_url"] = ENTERPRISE_PR_URL
+    conversation = "enterprise-publication-lineage"
+    deployment, first, lineage = _verified_lineage(
+        client, truth, auth_headers, conversation=conversation
+    )
+    assert lineage["pr_url"] == ENTERPRISE_PR_URL
+    assert _lineage_identity(first["lineage_id"]) == {
+        "status": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": ENTERPRISE_PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "version": 2,
+        "github_repository_id": 9001,
+        "github_installation_id": 41,
+        "github_pr_node_id": "PR_example_123",
+        "base_ref": "main",
+    }
+
+    truth["authorization"] = "Basic " + base64.b64encode(
+        b"x-access-token:fixture-publication-app-token"
+    ).decode()
+
+    refreshed = _get_lineage(
+        client, deployment_id=deployment["id"], conversation_id=conversation
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["pr_url"] == ENTERPRISE_PR_URL
+    assert refreshed.json()["version"] == 2
+    assert truth["requests"]
+    assert all(
+        request.url.host == "github.example.com"
+        and request.url.path.startswith("/forge/api/v3/")
+        for request in truth["requests"]
+    )
+    assert any(
+        request.url.path == f"/forge/api/v3/repos/{REPO}/pulls/{PR_NUMBER}"
+        for request in truth["requests"]
+    )
+    assert all(request.method in {"GET", "POST"} for request in truth["requests"])
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+@pytest.mark.parametrize("wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"])
+def test_enterprise_publication_refuses_wrong_host_outcomes_before_provider_access(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    wrong_url: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="enterprise-refused-outcome",
+        dedupe_key="enterprise-refused-outcome",
+    )
+    truth["branch"] = publication["branch"]
+    truth["pr_url"] = ENTERPRISE_PR_URL
+    before = _lineage_identity(publication["lineage_id"])
+
+    refused = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        pr_url=wrong_url,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.lineage_stale"
+    assert _lineage_identity(publication["lineage_id"]) == before
+    assert truth["calls"] == []
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+@pytest.mark.parametrize("stage", ["advance", "refresh"])
+def test_enterprise_publication_refuses_public_github_provider_truth(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    stage: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    if stage == "refresh":
+        truth["pr_url"] = ENTERPRISE_PR_URL
+        deployment, publication, _ = _verified_lineage(
+            client, truth, auth_headers, conversation="enterprise-refused-refresh"
+        )
+        truth["pr_url"] = PR_URL
+        truth["authorization"] = "Basic " + base64.b64encode(
+            b"x-access-token:fixture-publication-app-token"
+        ).decode()
+        before = _lineage_identity(publication["lineage_id"])
+        refused = _get_lineage(
+            client,
+            deployment_id=deployment["id"],
+            conversation_id="enterprise-refused-refresh",
+        )
+        assert refused.status_code == 502, refused.text
+        assert refused.json()["detail"]["code"] == "publication.github_invalid_response"
+    else:
+        _, publication = _approved_revision(
+            client,
+            auth_headers,
+            conversation_id="enterprise-refused-provider",
+            dedupe_key="enterprise-refused-provider",
+        )
+        truth["branch"] = publication["branch"]
+        before = _lineage_identity(publication["lineage_id"])
+        refused = _advance_lineage(
+            client,
+            publication["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+            pr_url=ENTERPRISE_PR_URL,
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "publication.lineage_stale"
+
+    assert _lineage_identity(publication["lineage_id"]) == before
 
 
 def test_review_reservation_captures_verified_identity_and_exact_replay(

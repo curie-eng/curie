@@ -106,6 +106,7 @@ def test_live_policy_refusal_does_not_call_or_page_the_connector(
         },
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
         tracer=RunTracer(None),
@@ -605,6 +606,7 @@ def test_live_runner_answers_trivial_message() -> None:
         max_turns=2, max_budget_usd=1.0, resume=None,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
         tracer=RunTracer(None),
@@ -767,6 +769,7 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
         can_use_tool=build_can_use_tool(gate),
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
         tracer=RunTracer(None),
@@ -1343,6 +1346,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         return final
     blocked_gate = ApprovalGate(required=frozenset({"Bash"}))
     blocked = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options_for(blocked_gate, ())),
         ceiling=0,
         tracer=RunTracer(None),
@@ -1378,6 +1382,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     # observation-only wrapper for any SDK path that reaches it.
     resumed_options.can_use_tool = observe_permission
     resumed = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(resumed_options),
         ceiling=0,
         tracer=RunTracer(None),
@@ -1487,6 +1492,7 @@ def _publish_runner(trace_name: str, *, gated: bool) -> tuple[SessionRunner, App
         can_use_tool=build_can_use_tool(gate) if gated else None,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
         tracer=RunTracer(None),

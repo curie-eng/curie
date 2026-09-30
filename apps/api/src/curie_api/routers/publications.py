@@ -101,6 +101,7 @@ async def mint_publication_context(
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
             authority = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=data.deployment_id,
                 work_item_id=data.work_item_id,
                 execution_request_id=data.execution_request_id,
@@ -115,6 +116,7 @@ async def mint_publication_context(
             )
             current = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=data.deployment_id,
                 work_item_id=data.work_item_id,
                 execution_request_id=data.execution_request_id,
@@ -194,6 +196,7 @@ async def _publication_lineage_out(
 def _validated_github_pr_truth(
     payload: Any,
     *,
+    github_html_base: str,
     repo_full_name: str,
     pr_number: int,
     pr_url: str,
@@ -208,7 +211,7 @@ def _validated_github_pr_truth(
     remote_state = payload.get("state")
     merged = payload.get("merged")
     head = payload.get("head")
-    expected_url = f"https://github.com/{repo_full_name}/pull/{pr_number}"
+    expected_url = f"{github_html_base}/{repo_full_name}/pull/{pr_number}"
     if (
         not isinstance(number, int)
         or isinstance(number, bool)
@@ -295,6 +298,7 @@ async def _refresh_publication_lineage_from_github(
     try:
         remote_state, actual_head_sha = _validated_github_pr_truth(
             response.json(),
+            github_html_base=settings.github_html_base,
             repo_full_name=lineage.repo_full_name,
             pr_number=lineage.pr_number,
             pr_url=lineage.pr_url,
@@ -376,7 +380,8 @@ async def create_publication(
         patch = data.decoded_patch()
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    patch_limit_bytes = get_settings().publication_patch_max_bytes
+    settings = get_settings()
+    patch_limit_bytes = settings.publication_patch_max_bytes
     if len(patch) > patch_limit_bytes:
         raise HTTPException(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -477,6 +482,7 @@ async def create_publication(
             raise PublicationPrecheckRefused
         authority = await read_publication_authority(
             session,
+            github_html_base=settings.github_html_base,
             deployment_id=data.deployment_id,
             work_item_id=execution.work_item_id,
             execution_request_id=data.work_item_request_id,
@@ -493,10 +499,11 @@ async def create_publication(
         ):
             raise PublicationPrecheckRefused
         metadata = await read_publication_metadata(
-            authority, settings=get_settings(), client=request.app.state.http_client
+            authority, settings=settings, client=request.app.state.http_client
         )
         current = await read_publication_authority(
             session,
+            github_html_base=settings.github_html_base,
             deployment_id=data.deployment_id,
             work_item_id=execution.work_item_id,
             execution_request_id=data.work_item_request_id,
@@ -598,25 +605,30 @@ async def advance_publication_lineage(
     session: SessionDep,
     request: Request,
 ) -> PublicationLineageOut:
+    settings = get_settings()
     try:
         publication = await crud.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
         conflict = crud.publication_lineage_outcome_conflict(
-            publication, publication.lineage, data
+            publication,
+            publication.lineage,
+            data,
+            github_html_base=settings.github_html_base,
         )
         if conflict is not None:
             raise conflict
         identity = await verify_publication_identity(
             publication.lineage,
             data,
-            get_settings(),
+            settings,
             request.app.state.http_client,
         )
         lineage = await crud.advance_publication_lineage(
             session,
             publication_id,
             data,
+            github_html_base=settings.github_html_base,
             identity=identity,
         )
     except PublicationRemoteTerminal as exc:

@@ -66,6 +66,7 @@ class GitHubAPI:
         self.issue_state = "open"
         self.labels = [LABEL]
         self.permission = "write"
+        self.permission_requests: list[httpx.Request] = []
         self.permission_user_id = SENDER_ID
         self.comment_body: str | None = None
         self.comment_app: dict[str, Any] | None = None
@@ -101,6 +102,7 @@ class GitHubAPI:
                 },
             )
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
+            self.permission_requests.append(request)
             return httpx.Response(
                 200,
                 json={
@@ -390,8 +392,39 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
     assert len(_requests(number)) == 1
 
 
+@pytest.mark.parametrize("permission", ["read", "none"])
+def test_issue_mention_with_revoked_write_permission_creates_no_revision(
+    factory_app: tuple[TestClient, GitHubAPI], permission: str
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    admitted = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted"
+    before = _rows("SELECT * FROM curie.execution_requests ORDER BY id")
+    assert len(before) == 1
+    assert len(api.permission_requests) == 1
+
+    api.permission = permission
+    api.comment_body = f"Please revise @{MENTION}"
+    payload = _comment_event(number, api.comment_body, 7005)
+    payload["comment"]["author_association"] = "NONE"
+    mention = _post(client, "issue_comment", payload)
+
+    assert mention.status_code == 200, mention.text
+    assert mention.json()["status"] == "factory_ignored", mention.text
+    assert _code(mention) == "sender_permission_refused"
+    assert [request.headers["Authorization"] for request in api.permission_requests] == [
+        "Bearer fixture-installation-token",
+        "Bearer fixture-installation-token",
+    ]
+    assert _rows("SELECT * FROM curie.execution_requests ORDER BY id") == before
+
+
+@pytest.mark.parametrize("permission", ["write", "admin"])
 def test_authorized_issue_mention_is_queued_while_a_request_is_active(
-    factory_app: tuple[TestClient, GitHubAPI],
+    factory_app: tuple[TestClient, GitHubAPI], permission: str
 ) -> None:
     client, api = factory_app
     number = next(_ISSUES)
@@ -402,8 +435,10 @@ def test_authorized_issue_mention_is_queued_while_a_request_is_active(
         ]
         == "factory_admitted"
     )
+    api.permission = permission
     api.comment_body = f"Please revise @{MENTION}"
     payload = _comment_event(number, api.comment_body, 7002)
+    payload["comment"]["author_association"] = "NONE"
     delivery = str(uuid.uuid4())
     mention = _post(
         client,

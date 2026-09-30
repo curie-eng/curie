@@ -53,6 +53,7 @@ class _EpochControlledSession:
 def _runner() -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession()
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),
@@ -123,6 +124,7 @@ def test_event_header_uses_explicit_parent_and_missing_or_malformed_is_safe_root
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -231,6 +233,7 @@ def test_reset_endpoint_starts_a_fresh_session() -> None:
         return fake
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=factory,
         ceiling=0,
         tracer=RunTracer(None),
@@ -466,6 +469,7 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
     async def go() -> None:
         session = _EpochControlledSession()
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(None),
@@ -571,6 +575,7 @@ def test_capacity_admission_uses_the_turn_that_owns_the_lock() -> None:
     async def go() -> None:
         session = _EpochControlledSession()
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(None),
@@ -662,6 +667,7 @@ def test_capacity_admission_without_grant_times_out_before_query(
     async def go() -> None:
         session = _EpochControlledSession()
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
             tracer=RunTracer(None),

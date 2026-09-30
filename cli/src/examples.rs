@@ -7,14 +7,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use crate::commands::{self, DeployOpts, DeployTier};
 use crate::ui::{CliOutput, DryRunPlan, Ui};
@@ -388,6 +386,14 @@ struct InstallCommand {
 }
 
 impl InstallCommand {
+    /// The live command, with workspace and chart paths resolved, as spawned.
+    fn ops_command(&self, workspace: &EmbeddedWorkspace, chart: &Path) -> crate::ops::OpsCommand {
+        ops_command(
+            self.program,
+            self.args.iter().map(|arg| arg.live(workspace, chart)),
+        )
+    }
+
     fn display(&self, chart: &Path) -> String {
         std::iter::once(self.program.to_string())
             .chain(self.args.iter().map(|arg| arg.display(chart)))
@@ -400,6 +406,15 @@ impl InstallCommand {
 struct HelmTarget {
     release: String,
     namespace: String,
+}
+
+/// A `kubectl` or `helm` invocation with plain arguments, spawned through the
+/// ops runners so every child is built in one place (#3568).
+fn ops_command<S: Into<String>>(
+    program: &str,
+    args: impl IntoIterator<Item = S>,
+) -> crate::ops::OpsCommand {
+    crate::ops::OpsCommand::new(program, args.into_iter().map(crate::ops::plain).collect())
 }
 
 fn plain(value: impl Into<String>) -> CommandArg {
@@ -955,17 +970,15 @@ pub async fn provision_observability(
 
 async fn require_existing_release(release: &str, namespace: &str) -> Result<()> {
     crate::ops::require_on_path("helm")?;
-    let output = tokio::process::Command::new("helm")
-        .args(["status", release, "--namespace", namespace])
-        .output()
-        .await
-        .with_context(|| {
-            format!("failed to run `helm status {release} --namespace {namespace}`")
-        })?;
-    if output.status.success() {
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "helm",
+        ["status", release, "--namespace", namespace],
+    ))
+    .await
+    .with_context(|| format!("failed to run `helm status {release} --namespace {namespace}`"))?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if crate::ops::failure_reason(&stderr) == "Error: release: not found" {
         return Err(crate::exit::usage(format!(
             "release {release} in namespace {namespace} does not exist; run `curie cluster up` before provisioning observability"
@@ -1007,8 +1020,9 @@ async fn provision_chart(chart: Option<&str>) -> Result<PathBuf> {
 }
 
 async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
-    let output = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "secret",
             GRAFANA_CONNECTOR_SECRET,
@@ -1016,14 +1030,14 @@ async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
             namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("reading the Grafana connector Secret")?;
-    let present = output.status.success()
-        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        ],
+    ))
+    .await
+    .context("reading the Grafana connector Secret")?;
+    let present = ok
+        && serde_json::from_str::<serde_json::Value>(&stdout)
             .is_ok_and(|secret| grafana_connector_token_present(&secret));
-    drop(output);
+    drop(stdout);
     if present {
         return Ok(());
     }
@@ -1448,8 +1462,9 @@ fn validate_sha256_digest(digest: &str) -> Result<()> {
 
 async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()> {
     ensure_observability_namespace(observability_namespace).await?;
-    let inspect = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "secret",
             GRAFANA_ADMIN_SECRET,
@@ -1457,14 +1472,13 @@ async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()
             observability_namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("inspecting the Grafana admin Secret")?;
-    if inspect.status.success() {
+        ],
+    ))
+    .await
+    .context("inspecting the Grafana admin Secret")?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&inspect.stderr);
     let lower = stderr.to_ascii_lowercase();
     if !lower.contains("notfound") && !lower.contains("not found") {
         bail!(
@@ -1495,22 +1509,22 @@ async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()
 }
 
 async fn grafana_release_exists(observability_namespace: &str) -> Result<bool> {
-    let output = tokio::process::Command::new("helm")
-        .args([
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "helm",
+        [
             "status",
             GRAFANA_RELEASE,
             "--namespace",
             observability_namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("inspecting the existing Grafana release")?;
-    if output.status.success() {
+        ],
+    ))
+    .await
+    .context("inspecting the existing Grafana release")?;
+    if ok {
         return Ok(true);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.trim() == "Error: release: not found" {
         return Ok(false);
     }
@@ -1526,8 +1540,9 @@ struct SecretKeyReference {
 }
 
 async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<()> {
-    let output = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "deployment,statefulset",
             "--namespace",
@@ -1536,14 +1551,14 @@ async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<(
             "app.kubernetes.io/instance=grafana",
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("discovering the existing Grafana admin credential")?;
-    if !output.status.success() {
+        ],
+    ))
+    .await
+    .context("discovering the existing Grafana admin credential")?;
+    if !ok {
         bail!("could not read the existing Grafana admin credential");
     }
-    let workloads: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let workloads: serde_json::Value = serde_json::from_str(&stdout)
         .context("the existing Grafana workload response was malformed")?;
     let user = find_grafana_secret_reference(&workloads, "GF_SECURITY_ADMIN_USER")?;
     let password = find_grafana_secret_reference(&workloads, "GF_SECURITY_ADMIN_PASSWORD")?;
@@ -1553,23 +1568,24 @@ async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<(
         if source_secrets.contains_key(source_name) {
             continue;
         }
-        let source = tokio::process::Command::new("kubectl")
-            .args([
+        let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+            "kubectl",
+            [
                 "get",
                 "secret",
-                source_name,
+                source_name.as_str(),
                 "--namespace",
                 observability_namespace,
                 "-o",
                 "json",
-            ])
-            .output()
-            .await
-            .context("reading the existing Grafana admin credential")?;
-        if !source.status.success() {
+            ],
+        ))
+        .await
+        .context("reading the existing Grafana admin credential")?;
+        if !ok {
             bail!("could not read the existing Grafana admin credential");
         }
-        let secret: serde_json::Value = serde_json::from_slice(&source.stdout)
+        let secret: serde_json::Value = serde_json::from_str(&stdout)
             .context("the existing Grafana admin Secret response was malformed")?;
         source_secrets.insert(source_name.clone(), secret);
     }
@@ -1668,15 +1684,15 @@ fn secret_data_value(
 }
 
 async fn ensure_observability_namespace(observability_namespace: &str) -> Result<()> {
-    let inspect = tokio::process::Command::new("kubectl")
-        .args(["get", "namespace", observability_namespace, "-o", "json"])
-        .output()
-        .await
-        .context("inspecting the observability namespace")?;
-    if inspect.status.success() {
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        ["get", "namespace", observability_namespace, "-o", "json"],
+    ))
+    .await
+    .context("inspecting the observability namespace")?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&inspect.stderr);
     let lower = stderr.to_ascii_lowercase();
     if !lower.contains("notfound") && !lower.contains("not found") {
         bail!(
@@ -1684,12 +1700,13 @@ async fn ensure_observability_namespace(observability_namespace: &str) -> Result
             stderr.trim()
         );
     }
-    let output = tokio::process::Command::new("kubectl")
-        .args(["create", "namespace", observability_namespace])
-        .output()
-        .await
-        .context("creating the observability namespace")?;
-    if !output.status.success() {
+    let (ok, _stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        ["create", "namespace", observability_namespace],
+    ))
+    .await
+    .context("creating the observability namespace")?;
+    if !ok {
         bail!(
             "could not create namespace {observability_namespace}; run `kubectl create namespace {observability_namespace}` and retry"
         );
@@ -1702,27 +1719,11 @@ async fn apply_private_manifest(
     description: &str,
     observability_namespace: &str,
 ) -> Result<()> {
-    let mut child = tokio::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting kubectl for {description}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("kubectl stdin was unavailable for {description}"))?;
-    stdin
-        .write_all(manifest)
-        .await
-        .with_context(|| format!("writing {description} to kubectl stdin"))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("waiting for kubectl to apply {description}"))?;
-    if !output.status.success() {
+    let (ok, _stdout, _stderr) =
+        crate::ops::run_capture_with_stdin(&ops_command("kubectl", ["apply", "-f", "-"]), manifest)
+            .await
+            .with_context(|| format!("running kubectl to apply {description}"))?;
+    if !ok {
         bail!(
             "could not apply {description} {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace}; inspect access with `kubectl auth can-i create secret -n {observability_namespace}`"
         );
@@ -1742,22 +1743,15 @@ async fn run_install_command(
     workspace: &EmbeddedWorkspace,
     chart: &Path,
 ) -> Result<()> {
-    let args = command
-        .args
-        .iter()
-        .map(|arg| arg.live(workspace, chart))
-        .collect::<Vec<_>>();
-    crate::ui::ui().plumbing(&format!("+ {} {}", command.program, args.join(" ")));
-    let output = tokio::process::Command::new(command.program)
-        .args(&args)
-        .output()
-        .await
-        .map_err(|error| crate::ops::command_io_error(command.program, error))?;
-    if output.status.success() {
+    let cmd = command.ops_command(workspace, chart);
+    crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&cmd).await?;
+    if ok {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = stderr.trim().to_string();
+    let args = cmd.argv();
     if let Some(target) = &command.helm_target {
         if is_helm_timeout(&stderr) {
             let diagnostic = pending_pvc_diagnostic(&target.namespace).await;
@@ -1834,27 +1828,26 @@ fn helm_pending_upgrade_recovery(target: &HelmTarget) -> String {
 }
 
 async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<String> {
-    let status = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::process::Command::new("helm")
-            .args([
-                "status",
-                &target.release,
-                "-n",
-                &target.namespace,
-                "-o",
-                "json",
-            ])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !status.status.success() {
+    let status = ops_command(
+        "helm",
+        [
+            "status",
+            target.release.as_str(),
+            "-n",
+            target.namespace.as_str(),
+            "-o",
+            "json",
+        ],
+    );
+    let (ok, stdout, _stderr) =
+        tokio::time::timeout(Duration::from_secs(3), crate::ops::run_capture(&status))
+            .await
+            .ok()?
+            .ok()?;
+    if !ok {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_slice(&status.stdout).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&stdout).ok()?;
     (value.get("name").and_then(serde_json::Value::as_str) == Some(target.release.as_str())
         && value.get("namespace").and_then(serde_json::Value::as_str)
             == Some(target.namespace.as_str())
@@ -1870,9 +1863,9 @@ async fn diagnostic_kubectl_json(
     resource: &str,
     deadline: tokio::time::Instant,
 ) -> Result<serde_json::Value> {
-    let mut command = tokio::process::Command::new("kubectl");
+    let mut command =
+        ops_command("kubectl", ["get", resource, "-n", namespace, "-o", "json"]).tokio_command();
     command
-        .args(["get", resource, "-n", namespace, "-o", "json"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2059,13 +2052,10 @@ async fn connector_kubeconfig(
         &format!("--timeout={READER_TOKEN_TIMEOUT}"),
     ];
     crate::ui::ui().plumbing(&format!("+ kubectl {}", wait_args.join(" ")));
-    let wait = tokio::process::Command::new("kubectl")
-        .args(wait_args)
-        .output()
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command("kubectl", wait_args))
         .await
         .context("waiting for the SRE bot ServiceAccount token")?;
-    if !wait.status.success() {
-        let stderr = String::from_utf8_lossy(&wait.stderr);
+    if !ok {
         bail!(
             "the connector token {token_secret} was not populated within {READER_TOKEN_TIMEOUT}: {}. Inspect it with `kubectl get secret {token_secret} -n {namespace}` and retry",
             if stderr.trim().is_empty() {
@@ -2085,17 +2075,15 @@ async fn connector_kubeconfig(
         "-o",
         "json",
     ];
-    let output = tokio::process::Command::new("kubectl")
-        .args(get_args)
-        .output()
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command("kubectl", get_args))
         .await
         .context("reading the SRE bot ServiceAccount token")?;
-    if !output.status.success() {
+    if !ok {
         bail!(
             "could not read Secret {token_secret} in namespace {namespace}; inspect it with `kubectl get secret {token_secret} -n {namespace}` and retry"
         );
     }
-    let secret: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let secret: serde_json::Value = serde_json::from_str(&stdout)
         .context("the SRE bot token Secret returned malformed JSON")?;
     let data = secret
         .get("data")
@@ -3387,13 +3375,12 @@ async fn read_kubernetes_json<T: for<'de> Deserialize<'de>>(
     display: &str,
     purpose: &str,
 ) -> Result<T> {
-    let output = tokio::process::Command::new("kubectl")
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to invoke `{display}`"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let (ok, stdout, stderr) =
+        crate::ops::run_capture(&ops_command("kubectl", args.iter().copied()))
+            .await
+            .with_context(|| format!("failed to invoke `{display}`"))?;
+    if !ok {
+        let stderr = stderr.trim().to_string();
         bail!(
             "could not read {purpose} with `{display}`: {}",
             if stderr.is_empty() {
@@ -3403,7 +3390,7 @@ async fn read_kubernetes_json<T: for<'de> Deserialize<'de>>(
             }
         );
     }
-    serde_json::from_slice(&output.stdout)
+    serde_json::from_str(&stdout)
         .with_context(|| format!("malformed JSON from `{display}` while reading {purpose}"))
 }
 

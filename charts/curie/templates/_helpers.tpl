@@ -1602,14 +1602,21 @@ livenessProbe:
      used by the enforcement preflight, the optional RuntimeClass object, and the
      probe's admission test.
 
+     curie.gvisor.requiredRuntimeClassName: the class a real install must stamp,
+     with no lookup. Empty for mode=off and for fake-model auto. The configured
+     runtimeClassName (default gvisor) for mode=require, and for mode=auto when a
+     real model is in effect (not fakeModel, OR inference.deploy). Real-model
+     auto therefore stamps the class even when lookup is empty (helm template,
+     Argo CD, Flux). Fake-model auto stays empty here even if lookup would hit.
+
      curie.gvisor.runtimeClassName: the EFFECTIVE runtimeClassName to stamp on a
-     runner pod. off -> empty; require -> className; auto -> className when the
-     chart itself creates the RuntimeClass (installRuntimeClass=true), otherwise
-     only if the class is found by `lookup`. The installRuntimeClass shortcut
-     exists because `lookup` cannot see the RuntimeClass the same install is about
-     to create (nor anything under `helm template`/--dry-run), which would leave
-     first-install runner pods with no runtimeClassName despite the chart
-     guaranteeing the object. */}}
+     runner pod. A non-empty requiredRuntimeClassName is returned immediately
+     (that covers require, and real-model auto). Otherwise today's order:
+     off -> empty; installRuntimeClass -> className; auto -> className only if
+     lookup finds the class. The installRuntimeClass shortcut exists because
+     lookup cannot see the RuntimeClass the same install is about to create (nor
+     anything under helm template/--dry-run). Fake-model auto still omits the
+     class when that lookup is empty. */}}
 {{- define "curie.gvisor.className" -}}
 {{- $g := .Values.security.gvisor -}}
 {{- if eq ($g.mode | default "auto") "off" -}}
@@ -1618,18 +1625,31 @@ livenessProbe:
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.gvisor.requiredRuntimeClassName" -}}
+{{- $g := .Values.security.gvisor -}}
+{{- $mode := $g.mode | default "auto" -}}
+{{- $realModel := or (not .Values.agentSandbox.runner.fakeModel) .Values.inference.deploy -}}
+{{- if eq $mode "off" -}}
+{{- else if or (eq $mode "require") (and (eq $mode "auto") $realModel) -}}
+{{- $g.runtimeClassName | default "gvisor" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.gvisor.runtimeClassName" -}}
+{{- $required := include "curie.gvisor.requiredRuntimeClassName" . | trim -}}
+{{- if $required -}}
+{{- $required -}}
+{{- else -}}
 {{- $g := .Values.security.gvisor -}}
 {{- $mode := $g.mode | default "auto" -}}
 {{- $name := $g.runtimeClassName | default "gvisor" -}}
 {{- if eq $mode "off" -}}
-{{- else if eq $mode "require" -}}
-{{- $name -}}
 {{- else if $g.installRuntimeClass -}}
 {{- $name -}}
 {{- else -}}
 {{- if lookup "node.k8s.io/v1" "RuntimeClass" "" $name -}}
 {{- $name -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

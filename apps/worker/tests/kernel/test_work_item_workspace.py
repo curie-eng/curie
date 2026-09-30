@@ -647,6 +647,10 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, p
             assert "record_termination" in work_items.calls
             assert h.fake_k8s.claims == {}
             assert h.substrate._affinity.get(thread_key) is None
+            # Termination ends the held run too, so the sweeper may reclaim it
+            # (#3564).
+            assert h.kernel._held_work_items == {}
+            assert h.kernel.owns_work_item(request_id) is False
 
     asyncio.run(exercise())
 
@@ -1035,6 +1039,140 @@ def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
             assert h.kernel._held_work_items
             assert h.kernel.owns_work_item(held) is True
             assert h.kernel.owns_work_item(uuid.uuid4()) is False
+
+    asyncio.run(exercise())
+
+
+# --- #3564: a held run never outlives its deadline or its end -------------
+
+
+_APPROVAL_FINAL = Final(
+    text="Requesting approval.",
+    status=SessionStatus.AWAITING_APPROVAL,
+    approval_summary="Run the requested publication",
+    approval_gate_kind="permission",
+    approval_granted_tool="Bash",
+)
+
+
+async def _park_for_approval(h: object) -> tuple[uuid.UUID, str]:
+    """Run one execute wake that parks for approval; return its request and thread."""
+
+    h.kernel._work_items = _WorkItems()  # type: ignore[attr-defined]
+    h.runner.default_script = [_APPROVAL_FINAL]  # type: ignore[attr-defined]
+    request_id = uuid.uuid4()
+    await h.kernel.process_event(  # type: ignore[attr-defined]
+        _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+    )
+    [thread_key] = list(h.kernel._held_work_items)  # type: ignore[attr-defined]
+    assert h.kernel.owns_work_item(request_id) is True  # type: ignore[attr-defined]
+    return request_id, thread_key
+
+
+class _OwnerRows:
+    """Orphan-sweeper client double listing one runtime-owner row."""
+
+    def __init__(self, request_id: uuid.UUID, owner: str) -> None:
+        self.rows = [SimpleNamespace(request_id=request_id, runtime_owner=owner, runtime_epoch=1)]
+        self.declared: list[tuple[uuid.UUID, str, int]] = []
+
+    async def runtime_owners(self, after: uuid.UUID | None = None) -> list[SimpleNamespace]:
+        return [] if after is not None else self.rows
+
+    async def declare_owner_lost(
+        self, request_id: uuid.UUID, *, owner: str, runtime_epoch: int
+    ) -> None:
+        self.declared.append((request_id, owner, runtime_epoch))
+
+
+@pytest.mark.parametrize("expired", [True, False])
+def test_orphan_sweeper_reclaims_a_held_run_only_past_its_deadline(
+    make_harness, expired: bool
+) -> None:
+    """A continuation that never arrives must not pin the request forever: past
+    the execution deadline the held run is evicted and the sweeper declares it
+    lost. Before the deadline it stays ours (#3564)."""
+
+    from curie_worker.workitem_orphans import WorkItemOrphanSweeper
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, thread_key = await _park_for_approval(h)
+            held = h.kernel._held_work_items[thread_key]
+            offset = timedelta(seconds=-1) if expired else timedelta(hours=1)
+            held.execution_deadline = datetime.now(UTC) + offset
+            self_name = h.kernel._config.consumer_name
+            client = _OwnerRows(request_id, self_name)
+
+            async def alive(_owner: str) -> bool:
+                return True
+
+            sweeper = WorkItemOrphanSweeper(
+                client,
+                alive,
+                self_name=self_name,
+                locally_owned=h.kernel.owns_work_item,
+                absence_proof_s=60.0,
+                interval_s=60.0,
+            )
+
+            declared = await sweeper.sweep()
+
+            if expired:
+                assert declared == 1
+                assert client.declared == [(request_id, self_name, 1)]
+                assert h.kernel._held_work_items == {}
+            else:
+                assert declared == 0
+                assert client.declared == []
+                assert h.kernel.owns_work_item(request_id) is True
+
+    asyncio.run(exercise())
+
+
+def test_kill_drops_the_held_run_of_that_agent_only(make_harness) -> None:
+    """A kill ends a run parked for approval as well as live turns (#3564)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, _thread_key = await _park_for_approval(h)
+
+            await h.kernel.interrupt_agent(uuid.uuid4())
+            assert h.kernel.owns_work_item(request_id) is True
+
+            await h.kernel.interrupt_agent(AGENT_ID)
+            assert h.kernel.owns_work_item(request_id) is False
+
+    asyncio.run(exercise())
+
+
+def test_operator_release_drops_the_held_run_on_that_thread(make_harness) -> None:
+    """An operator release of the thread ends its parked run (#3564)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, thread_key = await _park_for_approval(h)
+
+            await h.kernel.release_thread("some-other-thread")
+            assert h.kernel.owns_work_item(request_id) is True
+
+            await h.kernel.release_thread(thread_key)
+            assert h.kernel.owns_work_item(request_id) is False
 
     asyncio.run(exercise())
 

@@ -37,6 +37,7 @@ from curie_telemetry import (
     operation_span,
     record_metric,
 )
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_test_support.valkey import (
     VALKEY_HOST as _VH,
 )
@@ -83,7 +84,6 @@ from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 # importlib import mode does not add the test root to sys.path.
@@ -943,11 +943,7 @@ def test_provisioned_runner_end_to_end(
         engine = create_async_engine(_DB_URL)
         agent_id: uuid.UUID | None = None
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             agent_id = uuid.uuid4()

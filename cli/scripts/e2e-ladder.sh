@@ -218,7 +218,45 @@ ladder_compose() {
   for f in "${COMPOSE_FILES[@]}"; do
     args+=(-f "$f")
   done
+  # `curie local up` stores this project's random API key and Postgres password
+  # (#3557) and hands them to compose; a raw recreate here would otherwise fall
+  # back to compose.dev.yaml's curie-dev-key / postgres and split the stack from
+  # its own database and callers. Prefix them on this one child only, never
+  # exported, so they cannot reach the cluster rung. No store file means a
+  # pre-store stack, where the compose fallbacks are correct.
+  local store
+  store="$(local_store_path)"
+  if [[ -f "$store" ]]; then
+    local vals
+    vals="$(read_local_store_fields api_key postgres_password)" || {
+      echo "local: could not read the stored credentials for compose project ${COMPOSE_PROJECT}." >&2
+      echo "fix: repair or remove ${store}, then re-run." >&2
+      return 1
+    }
+    local key pw
+    key="$(sed -n 1p <<<"$vals")"
+    pw="$(sed -n 2p <<<"$vals")"
+    # Subshell export, not `env VAR=...`: argv is visible in the process list.
+    (
+      if [[ -n "$key" ]]; then export CURIE_LOCAL_API_KEY="$key"; fi
+      if [[ -n "$pw" ]]; then export CURIE_LOCAL_POSTGRES_PASSWORD="$pw"; fi
+      "${args[@]}" "$@"
+    )
+    return
+  fi
   "${args[@]}" "$@"
+}
+# Path of the credential store `curie local up` writes for this compose project.
+local_store_path() {
+  echo "${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT}.json"
+}
+# Print the named store fields, one per line (empty line when absent), read by
+# python so values never reach a log. Fails when the store is unreadable.
+read_local_store_fields() {
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2:]:
+    print(d.get(k) or "")' "$(local_store_path)" "$@" 2>/dev/null
 }
 PROMPT="What is the weather in Denver right now?"
 # The live approval-gate case's turn (#2094). Deliberately explicit and
@@ -300,6 +338,47 @@ fi
 # brought a stack up owns tearing it down, so a stack that was already running
 # when the ladder started is reused and left alone.
 LOCAL_STACK_OWNED=0
+
+# `curie local up` gives every install its own API key (#3557), and an exported
+# CURIE_API_KEY becomes that key. The local rungs also curl the API directly
+# with ${CURIE_API_KEY:-curie-dev-key}, so before a `local up` this run owns,
+# one generated key is exported and the stack and the direct curls share it.
+# Set to 1 only when the ladder set the key (generated, or adopted from a reused
+# stack's store), so rung_cluster can drop it again: a local key must never reach the cluster rung, which reads a set
+# CURIE_API_KEY as the release's key.
+LADDER_OWNS_API_KEY=0
+
+ensure_local_api_key() {
+    if [[ -n "${CURIE_API_KEY:-}" ]]; then
+        return 0
+    fi
+    CURIE_API_KEY="$(python3 -c 'import os; print(os.urandom(32).hex())')" || return 1
+    export CURIE_API_KEY
+    LADDER_OWNS_API_KEY=1
+}
+
+# A reused stack runs on whatever key its own `local up` stored for this
+# project. With CURIE_API_KEY unset, export that stored key so the direct curls
+# authenticate; never rotate it and never claim the stack. The key is read by
+# python and never echoed. rung_cluster drops it like a generated one.
+adopt_stored_local_api_key() {
+    if [[ -n "${CURIE_API_KEY:-}" ]]; then
+        return 0
+    fi
+    local store
+    store="$(local_store_path)"
+    [[ -f "$store" ]] || return 0
+    local stored
+    stored="$(read_local_store_fields api_key)" || {
+        echo "local: could not read the stored API key for compose project ${COMPOSE_PROJECT}." >&2
+        echo "fix: export CURIE_API_KEY with the reused stack's key, then re-run." >&2
+        return 1
+    }
+    [[ -n "$stored" ]] || return 0
+    CURIE_API_KEY="$stored"
+    export CURIE_API_KEY
+    LADDER_OWNS_API_KEY=1
+}
 
 # The local observability proof owns one uniquely named Collector sink. It is
 # deliberately separate from the product Collector: querying the product's own
@@ -4572,6 +4651,7 @@ rung_local() {
         # assert_model_mode below, off the reused stack's own running worker, and
         # a contradiction is a hard failure with a fix line.
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
+        adopt_stored_local_api_key || return 1
     else
         echo
         # local up is deliberately pinned to this checkout and builds the
@@ -4609,6 +4689,7 @@ rung_local() {
         # failure leaves the trap disowning a stack this run created, stranding
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
+        ensure_local_api_key || return 1
         LOCAL_STACK_OWNED=1
         DOCKER_HOST="$daemon_endpoint" BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
         pin_local_source_images
@@ -4926,6 +5007,7 @@ rung_local_release() {
         # stack's mode is verified by assert_model_mode below rather than
         # disclaimed in a warning.
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
+        adopt_stored_local_api_key || return 1
     else
         echo
         echo "=== clear any stale volumes from a prior non-wiped teardown ==="
@@ -4952,6 +5034,7 @@ rung_local_release() {
             up_args+=(--minimal)
         fi
         echo "=== curie ${up_args[*]} ==="
+        ensure_local_api_key || return 1
         LOCAL_STACK_OWNED=1
         "$BIN" "${up_args[@]}"
     fi
@@ -5455,6 +5538,11 @@ PYCLAIM
 }
 
 rung_cluster() {
+    # A key ensure_local_api_key generated belongs to the local stack only.
+    if (( LADDER_OWNS_API_KEY )); then
+        unset CURIE_API_KEY
+        LADDER_OWNS_API_KEY=0
+    fi
     if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
         CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
         CURIE_RELEASE="${CURIE_RELEASE-curie}"

@@ -902,6 +902,57 @@ def test_approval_hold_is_not_an_orphan(
     with_session(body)
 
 
+def test_expired_approval_hold_is_an_orphan(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        held = await _running(session, agent_id)
+        await workitem_dispatch.hold_for_approval(
+            session, held.request_id, runtime_epoch=1
+        )
+        # Move the whole window into the past; the hold parks the lease at the
+        # deadline, so both columns stay equal.
+        past = (await _now(session)) - timedelta(minutes=5)
+        # A trigger makes the deadline write once; lift it for this fixture only.
+        await session.execute(
+            text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER")
+        )
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET started_at = :started, "
+                "execution_deadline = :past, runtime_heartbeat_expires_at = :past "
+                "WHERE id = :id"
+            ),
+            {
+                "started": past - timedelta(minutes=5),
+                "past": past,
+                "id": held.request_id,
+            },
+        )
+        await session.execute(
+            text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER")
+        )
+        await session.commit()
+        before = await _request_row(session, held.request_id)
+        assert before.runtime_heartbeat_expires_at == before.execution_deadline
+
+        owners = await workitem_dispatch.list_runtime_owners(session, limit=50)
+        assert [o.request_id for o in owners] == [held.request_id]
+
+        lost = await workitem_dispatch.declare_owner_lost(
+            session, held.request_id, owner=OWNER, runtime_epoch=1
+        )
+        assert not hasattr(lost, "code"), lost
+        assert lost.status == "cancellation_requested"
+        assert lost.terminal_cause == "owner_lost"
+        after = await _request_row(session, held.request_id)
+        assert after.status == "cancellation_requested"
+        assert after.terminal_cause == "owner_lost"
+
+    with_session(body)
+
+
 def test_http_runtime_owners_and_owner_lost(
     dispatch_client: TestClient, auth_headers: dict[str, str]
 ) -> None:

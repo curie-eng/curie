@@ -234,7 +234,7 @@ impl std::fmt::Debug for GithubTokenPlan {
 /// chars). Hex keeps the value shell-, env- and URL-safe and satisfies every
 /// backing store's charset/min-length rule, and a hex `langfuse.encryptionKey`
 /// is the exact `openssl rand -hex 32` shape the chart documents.
-fn random_hex(n_bytes: usize) -> Result<String> {
+pub(crate) fn random_hex(n_bytes: usize) -> Result<String> {
     use std::fmt::Write;
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf)
