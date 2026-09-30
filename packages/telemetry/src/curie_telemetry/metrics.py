@@ -136,6 +136,10 @@ _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES = {
     "outcome": ["capacity"],
     "limit": ["value", "namespace"],
 }
+_DEPLOY_NOTICE_SUPPRESSED_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "reason": ["no_nonprod_recipient", "rate_limited"],
+}
 _QUEUE_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-dispatcher", "curie-worker"],
     "source": ["api", "dispatcher", "worker", "local", "eval"],
@@ -460,6 +464,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Transcript persistence failures caused by state capacity limits.",
         True,
         _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES,
+    ),
+    "curie.deploy_notice.suppressed": _definition(
+        "counter",
+        "{outcome}",
+        "Git-flow push outcomes whose Slack deploy notices were withheld.",
+        True,
+        _DEPLOY_NOTICE_SUPPRESSED_ATTRIBUTES,
     ),
     "curie.queue.enqueue": _definition(
         "counter", "{message}", "Messages enqueued.", True, _QUEUE_ATTRIBUTES

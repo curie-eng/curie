@@ -26,6 +26,7 @@ def upgrade() -> None:
         "deploy_notice_outbox",
         sa.Column("key", sa.String(length=64), primary_key=True),
         sa.Column("stream", sa.Text(), nullable=False),
+        sa.Column("repo", sa.Text(), nullable=False),
         sa.Column("payload", sa.Text(), nullable=False),
         sa.Column("attempts", sa.Integer(), server_default="0", nullable=False),
         sa.Column(
@@ -47,9 +48,18 @@ def upgrade() -> None:
         ["enqueued_at"],
         schema="curie",
     )
+    op.create_index(
+        "ix_deploy_notice_outbox_repo_window",
+        "deploy_notice_outbox",
+        ["stream", "repo", "created_at"],
+        schema="curie",
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(
+        "ix_deploy_notice_outbox_repo_window", table_name="deploy_notice_outbox", schema="curie"
+    )
     op.drop_index(
         "ix_deploy_notice_outbox_enqueued_at", table_name="deploy_notice_outbox", schema="curie"
     )

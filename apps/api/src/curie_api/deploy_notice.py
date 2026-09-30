@@ -15,15 +15,16 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from curie_telemetry import record_metric
 from redis.asyncio import Redis
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
 from .config import Settings
 from .gitflow import environment_for_ref
-from .models import Deployment, DeployNoticeOutbox
+from .models import Agent, AgentChannel, Deployment, DeployNoticeOutbox, Environment
 from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,10 @@ _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DEDUP_TTL_SECONDS = 31 * 86400
 _OUTBOX_BATCH = 100
 _OUTBOX_RETENTION = timedelta(days=30)
+# The per-repository notice bound (docs/operations.md): at most this many
+# notices, one per post to one channel, per repository in any rolling window.
+_REPO_NOTICE_LIMIT = 20
+_REPO_NOTICE_WINDOW_MINUTES = 60
 _PUBLISH_ONCE = """
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return false
@@ -65,6 +70,35 @@ async def _changes_the_active_version(session: AsyncSession, result: WebhookResu
         .limit(1)
     )
     return previous != result.version_id
+
+
+def _count_suppressed(reason: str) -> None:
+    record_metric(
+        "curie.deploy_notice.suppressed",
+        attributes={"service.name": "curie-api", "reason": reason},
+    )
+
+
+async def _prod_bound_routes(
+    session: AsyncSession, routes: set[tuple[str, str]]
+) -> set[tuple[str, str]]:
+    """The ``(kind, address)`` channels any agent with a live prod deployment binds.
+
+    Keyed without the adapter: one channel reached through another bot
+    identity is still the prod audience.
+    """
+
+    rows = await session.execute(
+        select(AgentChannel.kind, AgentChannel.address)
+        .join(Deployment, Deployment.agent_id == AgentChannel.agent_id)
+        .where(
+            Deployment.environment == Environment.prod,
+            Deployment.status == "active",
+            tuple_(AgentChannel.kind, AgentChannel.address).in_(sorted(routes)),
+        )
+        .distinct()
+    )
+    return {(kind, address) for kind, address in rows.all()}
 
 
 class DeployNoticeQueue:
@@ -126,7 +160,7 @@ class DeployNoticeQueue:
         codes = sorted(
             {error.get("code", "") for error in (result.errors or []) if error.get("code")}
         )
-        rows: list[dict[str, str]] = []
+        recipients: list[tuple[Agent, AgentChannel]] = []
         for agent in agents:
             # A clone may finish after an operator changed opt-in or channels.
             # The webhook shares process_push's expire_on_commit=False session,
@@ -134,40 +168,113 @@ class DeployNoticeQueue:
             await session.refresh(agent, attribute_names=["deploy_notifications", "channels"])
             if result.status != "rejected" and not agent.deploy_notifications:
                 continue
-            for binding in agent.channels:
-                if binding.kind != "slack" or binding.adapter is None:
-                    continue
-                notice: dict[str, Any] = {
-                    "address": binding.address,
-                    "identity": binding.adapter,
-                    "agent_name": agent.name,
-                    "status": result.status,
-                    "sha": sha,
-                    "environment": environment.value if environment is not None else None,
-                    "codes": codes,
-                }
-                encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
-                # A success notice is keyed by its deployment, so a rollback to
-                # an announced sha is announced again; retries of the same
-                # deployment keep one key. A rejection has no deployment row.
-                deployment = result.deployment_id or ""
-                identity = (
-                    f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}"
-                    f"\0{deployment}\0{encoded}"
+            recipients.extend(
+                (agent, binding)
+                for binding in agent.channels
+                if binding.kind == "slack" and binding.adapter is not None
+            )
+        if result.status == "rejected" and result.agent_id is None and recipients:
+            # Unmatched: it may belong to any agent the repository builds, so a
+            # prod channel never hears it (docs/operations.md).
+            prod = await _prod_bound_routes(
+                session, {(binding.kind, binding.address) for _, binding in recipients}
+            )
+            recipients = [
+                (agent, binding)
+                for agent, binding in recipients
+                if (binding.kind, binding.address) not in prod
+            ]
+            if not recipients:
+                logger.warning(
+                    "deploy notice withheld: no non-prod channel for an unmatched rejection "
+                    "repo=%s sha=%s codes=%s",
+                    full_name,
+                    sha[:12],
+                    ",".join(codes),
                 )
-                digest = hashlib.sha256(identity.encode()).hexdigest()
-                notice["notice_key"] = digest
-                encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
-                rows.append({"key": digest, "stream": self._stream, "payload": encoded})
+                _count_suppressed("no_nonprod_recipient")
+                return 0
+        rows: list[dict[str, str]] = []
+        repo_key = full_name.casefold()
+        for agent, binding in recipients:
+            notice: dict[str, Any] = {
+                "address": binding.address,
+                "identity": binding.adapter,
+                "agent_name": agent.name,
+                "status": result.status,
+                "sha": sha,
+                "environment": environment.value if environment is not None else None,
+                "codes": codes,
+            }
+            encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
+            # A success notice is keyed by its deployment, so a rollback to
+            # an announced sha is announced again; retries of the same
+            # deployment keep one key. A rejection has no deployment row.
+            deployment = result.deployment_id or ""
+            identity = (
+                f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}"
+                f"\0{deployment}\0{encoded}"
+            )
+            digest = hashlib.sha256(identity.encode()).hexdigest()
+            notice["notice_key"] = digest
+            encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
+            rows.append(
+                {"key": digest, "stream": self._stream, "repo": repo_key, "payload": encoded}
+            )
         if not rows:
             return 0
-        # Persist the recipient decision before touching Valkey. A process or
-        # Valkey outage leaves the row for the independent API reconciler.
+        # One writer per repository at a time, so two concurrent pushes cannot
+        # both pass the bound. The lock is transaction scoped.
         await session.execute(
-            insert(DeployNoticeOutbox).values(rows).on_conflict_do_nothing(
-                index_elements=[DeployNoticeOutbox.key]
+            select(
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"curie:deploy-notice\0{self._stream}\0{repo_key}", 0)
+                )
             )
         )
+        recorded = set(
+            (
+                await session.scalars(
+                    select(DeployNoticeOutbox.key).where(
+                        DeployNoticeOutbox.key.in_([row["key"] for row in rows])
+                    )
+                )
+            ).all()
+        )
+        new_rows = [row for row in rows if row["key"] not in recorded]
+        if new_rows:
+            recent = await session.scalar(
+                select(func.count())
+                .select_from(DeployNoticeOutbox)
+                .where(
+                    DeployNoticeOutbox.stream == self._stream,
+                    DeployNoticeOutbox.repo == repo_key,
+                    DeployNoticeOutbox.created_at
+                    > datetime.now(UTC) - timedelta(minutes=_REPO_NOTICE_WINDOW_MINUTES),
+                )
+            )
+            if (recent or 0) + len(new_rows) > _REPO_NOTICE_LIMIT:
+                await session.commit()
+                logger.warning(
+                    "deploy notice withheld: repository notice bound reached "
+                    "repo=%s sha=%s status=%s bound=%d per %d minutes",
+                    full_name,
+                    sha[:12],
+                    result.status,
+                    _REPO_NOTICE_LIMIT,
+                    _REPO_NOTICE_WINDOW_MINUTES,
+                )
+                _count_suppressed("rate_limited")
+                if not recorded:
+                    return 0
+                return await self.reconcile_once(session, keys=sorted(recorded))
+            # Persist the recipient decision before touching Valkey. A process
+            # or Valkey outage leaves the row for the independent reconciler.
+            await session.execute(
+                insert(DeployNoticeOutbox).values(new_rows).on_conflict_do_nothing(
+                    index_elements=[DeployNoticeOutbox.key]
+                )
+            )
         await session.commit()
         return await self.reconcile_once(session, keys=[row["key"] for row in rows])
 

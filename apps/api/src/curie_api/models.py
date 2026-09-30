@@ -61,11 +61,15 @@ class DeployNoticeOutbox(Base):
             postgresql_where=text("enqueued_at IS NULL"),
         ),
         Index("ix_deploy_notice_outbox_enqueued_at", "enqueued_at"),
+        Index("ix_deploy_notice_outbox_repo_window", "stream", "repo", "created_at"),
         {"schema": SCHEMA},
     )
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     stream: Mapped[str] = mapped_column(Text)
+    # Case-folded repository full name, which the per-repository notice bound
+    # counts by (docs/operations.md).
+    repo: Mapped[str] = mapped_column(Text)
     payload: Mapped[str] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(server_default="0", default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
