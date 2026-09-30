@@ -114,6 +114,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["hooks", "show", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "console",
+            args: &["console", "login", "--subject", "operator", "--dry-run"],
+        },
+        ClusterCase {
             name: "callers",
             args: &[
                 "callers",
@@ -273,7 +277,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 30);
+    assert_eq!(covered_names.len(), 31);
 }
 
 #[test]
@@ -381,6 +385,72 @@ fn target_precedence_is_per_field() {
             "curie.yaml"
         )]
     );
+}
+
+#[test]
+fn console_login_resolves_nested_target_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
+    let output = run(
+        dir.path(),
+        &[
+            "cluster",
+            "console",
+            "login",
+            "--subject",
+            "operator",
+            "--namespace",
+            "flag-namespace",
+            "--dry-run",
+            "--json",
+        ],
+        &[("CURIE_NAMESPACE", "env-namespace")],
+    );
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "console login plan must succeed\n{text}"
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON plan");
+    assert!(plan.is_object(), "{plan}");
+    assert_eq!(
+        target_diagnostics(&output),
+        vec![target_note(
+            "flag-namespace",
+            "flag",
+            FILE_RELEASE,
+            "curie.yaml"
+        )],
+        "nested login must preserve explicitly supplied target sources\n{text}"
+    );
+}
+
+#[test]
+fn console_login_refuses_malformed_target_before_external_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("curie.yaml"),
+        "version: 1\ninstall:\n  namespace: [\n",
+    )
+    .expect("write malformed curie.yaml");
+    let output = run(
+        dir.path(),
+        &[
+            "cluster",
+            "console",
+            "login",
+            "--subject",
+            "operator",
+            "--dry-run",
+            "--json",
+        ],
+        &[],
+    );
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON error");
+    assert!(error.to_string().contains("curie.yaml"), "{error}");
+    assert!(!text.contains("panicked"), "{text}");
 }
 
 #[test]
