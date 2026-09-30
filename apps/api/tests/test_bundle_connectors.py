@@ -241,6 +241,7 @@ def test_each_of_the_four_names_lands_where_it_belongs(tmp_path: Path) -> None:
     assert dep["metadata"]["labels"] == {
         "app.kubernetes.io/name": name,
         "app.kubernetes.io/part-of": RELEASE,
+        "app.kubernetes.io/component": "mcp-connector",
     }
 
     # namespace: the only place it shows up is the Service DNS Curie derives.

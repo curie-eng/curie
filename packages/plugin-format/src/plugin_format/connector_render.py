@@ -562,14 +562,7 @@ def render_deployment(
             "replicas": 1,
             "selector": {"matchLabels": _labels(release, agent, connector)},
             "template": {
-                "metadata": {
-                    "labels": {
-                        **_labels(release, agent, connector),
-                        # Not part of the Service selector. The data-tier Valkey
-                        # allow uses it so this pod can spend a grant.
-                        "app.kubernetes.io/component": "mcp-connector",
-                    }
-                },
+                "metadata": {"labels": _labels(release, agent, connector)},
                 "spec": {
                     # Hardened by construction. The author never writes this, so
                     # the author cannot omit it.
@@ -967,4 +960,7 @@ def _labels(release: str, agent: str, connector: str) -> dict[str, str]:
     return {
         "app.kubernetes.io/name": object_name(release, agent, connector),
         "app.kubernetes.io/part-of": release,
+        # Valkey's data-tier allow selects this. It is on the pod and the
+        # selector together so a policy that names the connector still matches.
+        "app.kubernetes.io/component": "mcp-connector",
     }

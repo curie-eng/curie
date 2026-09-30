@@ -14802,7 +14802,15 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir, None)?;
+    let caller_key = crate::connector_caller::generate_keypair()?;
+    let overlay = cb::compose_overlay(
+        lock,
+        decl,
+        identity,
+        project,
+        plugin_dir,
+        Some(&caller_key.verify_key),
+    )?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
@@ -14985,6 +14993,7 @@ async fn start_skill_connectors(
                 cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
             }
         }
+        let caller_key = crate::connector_caller::generate_keypair()?;
         let start = docker::ConnectorStartSpec::from_declaration(
             connector,
             spec,
@@ -14994,7 +15003,7 @@ async fn start_skill_connectors(
             project,
             plugin_dir,
             &secret_values,
-            None,
+            Some(&caller_key.verify_key),
         )?;
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await
