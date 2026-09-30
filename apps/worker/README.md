@@ -462,6 +462,15 @@ ledger, retry latch, receipt mode, or Bash grouping. A meaningful connector
 explanation, a failed-action warning, and an undoable-action verdict take
 precedence over this fallback.
 
+For successful native instruction or shell requests with no meaningful summary,
+no undo capability and only generic runner detail, use plain request-completion
+wording. State that changes were not summarized and undo information is
+incomplete; do not infer that no prior snapshot exists from undo capability
+alone. Preserve counts and every stored action. Do not suppress instruction
+requests or promote them to read-only: loading one can execute dynamic context.
+Custom descriptions, summaries, failed warnings and undoable verdicts retain
+their existing meaning.
+
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
 sandboxes resolve to a local in-process fake runner, and a recording Slack sink.
