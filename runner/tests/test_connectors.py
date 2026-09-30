@@ -1116,8 +1116,9 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
 # The caller token header (ADR-0168 decision 7)
 #
 # The worker signs this sandbox's agent into CURIE_CONNECTOR_CALLER_TOKEN, and
-# each hosted connector's entry names it in X-Curie-Caller. The value stays a
-# placeholder that the MCP client expands from the sandbox env, and it goes
+# each hosted connector's entry names it in X-Curie-Caller. derive_mcp_servers
+# still writes the placeholder. The runner expands that placeholder in memory
+# and drops the env name before Bash or a hook can read it. The header goes
 # only to a Service Curie created: a remote or fallback URL is somebody else's
 # server.
 # --------------------------------------------------------------------------- #
@@ -1163,12 +1164,12 @@ def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     assert servers["grafana"] == {"type": "http", "url": "http://host.docker.internal:8765/mcp"}
 
 
-def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
+def test_a_minted_token_is_expanded_into_the_header_and_dropped_from_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The whole chain: worker render, RunnerConfig, the session's MCP servers.
-    # Unlike a hosted Bearer, the token is not dropped from the spawn env: the
-    # MCP client expands the header from it, and it names only this agent.
+    # The runner expands X-Curie-Caller in memory and removes the token from
+    # the spawn env so a Bash tool or hook cannot read it.
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     config = _config_for(
         _bundle(tmp_path, GITHUB_POD_CREDENTIAL),
@@ -1178,7 +1179,10 @@ def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
         caller_token="cct.payload.signature",
     )
     assert config.connector_caller_token == "cct.payload.signature"
-    spawn = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    spawn = {
+        "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+        "CURIE_MODEL": "claude-sonnet-5",
+    }
 
     async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
         return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
@@ -1188,9 +1192,11 @@ def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
     session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
     assert isinstance(session, _CapturedSession)
     assert session.options.mcp_servers["github"]["headers"] == {
-        _CALLER_HEADER: _CALLER_PLACEHOLDER
+        _CALLER_HEADER: "cct.payload.signature"
     }
-    assert spawn == {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn
+    assert spawn["CURIE_MODEL"] == "claude-sonnet-5"
+    assert "cct.payload.signature" not in spawn.values()
 
 
 def test_a_boot_without_a_token_hands_the_runner_none(tmp_path: Path) -> None:
