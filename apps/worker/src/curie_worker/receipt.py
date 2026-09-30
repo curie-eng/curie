@@ -87,6 +87,11 @@ def _verdict(action: dict[str, Any]) -> str:
     # Runner bookkeeping is not a connector explanation of irreversibility.
     if isinstance(detail, str) and detail.strip() and detail not in _GENERIC_DETAILS:
         return _clamp(detail)
+    result = action.get("result")
+    if action.get("prior_state") is not None or (
+        isinstance(result, dict) and result.get("prior") is not None
+    ):
+        return "cannot be undone: undo information is incomplete"
     return _UNDECLARED
 
 
