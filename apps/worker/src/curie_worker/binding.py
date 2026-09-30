@@ -69,6 +69,7 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
+from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
 from aci_protocol.turn import (
     CLUSTER_MESSAGE_ADAPTER,
     DEFAULT_IDENTITY,
@@ -180,10 +181,19 @@ SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
 # not in the loop: it already forwards conversation_id as thread_key.
 EVAL_ISOLATE_THREAD_PREFIX = "eval:"
 
-# @spec WORKER-CANARY-2: the worker reads the same lowercase slug shape as
-# persisted Slack route adapters. Empty and malformed selectors cannot resolve
-# through ``route_identity``'s legacy default behavior.
-_SLACK_IDENTITY = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+# @spec WORKER-CANARY-2: a declared Slack identity has a narrower shape than
+# the general binding adapter slug. Share its frozen name rule.
+_SLACK_IDENTITY = re.compile(IDENTITY_NAME_PATTERN)
+
+
+def _valid_slack_identity(identity: str) -> bool:
+    """@spec WORKER-CANARY-2: declared identity shape, excluding the relay name."""
+
+    return (
+        identity != CLUSTER_MESSAGE_ADAPTER
+        and len(identity) <= IDENTITY_NAME_MAX_LENGTH
+        and _SLACK_IDENTITY.fullmatch(identity) is not None
+    )
 
 
 def binding_adapter_for_handle(handle: ReplyHandle) -> str | None:
@@ -194,8 +204,8 @@ def binding_adapter_for_handle(handle: ReplyHandle) -> str | None:
     identity = handle.identity
     if identity is None:
         return DEFAULT_IDENTITY
-    if not _SLACK_IDENTITY.fullmatch(identity):
-        raise ValueError("cluster-message identity must be a lowercase slug")
+    if not _valid_slack_identity(identity):
+        raise ValueError("cluster-message identity must name a declared Slack identity")
     return identity
 
 
@@ -206,7 +216,7 @@ def _valid_slack_selector(kind: str, adapter: str | None) -> bool:
         kind != SLACK_KIND
         or adapter is None
         or adapter == CLUSTER_MESSAGE_ADAPTER
-        or bool(_SLACK_IDENTITY.fullmatch(adapter))
+        or _valid_slack_identity(adapter)
     )
 
 
