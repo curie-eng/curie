@@ -452,6 +452,25 @@ beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180),
 plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
 substrate. Run with `python -m curie_worker`.
 
+<!-- @spec WORKER-RECEIPT-1 -->
+A receipt must explain an irreversible action without exposing generic runner
+bookkeeping such as `non-idempotent tool completed`, `non-idempotent tool executed`
+or `tool result too large to record`. When a successful action has no prior state
+and only that generic detail, show that nothing reported a prior state. Keep the
+call visible; this does not classify the tool as read-only or change the action
+ledger, retry latch, receipt mode, or Bash grouping. A meaningful connector
+explanation, a failed-action warning, and an undoable-action verdict take
+precedence over this fallback.
+
+For successful native instruction or shell requests with no meaningful summary,
+no undo capability and only generic runner detail, use plain request-completion
+wording. State that changes were not summarized and undo information is
+incomplete; do not infer that no prior snapshot exists from undo capability
+alone. Preserve counts and every stored action. Do not suppress instruction
+requests or promote them to read-only: loading one can execute dynamic context.
+Custom descriptions, summaries, failed warnings and undoable verdicts retain
+their existing meaning.
+
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
 sandboxes resolve to a local in-process fake runner, and a recording Slack sink.
