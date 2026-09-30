@@ -601,9 +601,11 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         preflight_capacity(&opts.observability_namespace).await?;
         let log_runtime = preflight_log_runtime().await?;
-        ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+        // Render before the first mutation, so a values mismatch refuses
+        // with the cluster untouched.
         let workspace =
             EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
+        ensure_grafana_admin_secret(&opts.observability_namespace).await?;
         for command in &stack_commands {
             run_install_command(command, &workspace, Path::new("charts/curie")).await?;
         }
@@ -926,9 +928,11 @@ pub async fn provision_observability(
     let chart = provision_chart(opts.chart.as_deref()).await?;
     preflight_capacity(&opts.observability_namespace).await?;
     let log_runtime = preflight_log_runtime().await?;
-    ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+    // Render before the first mutation, so a values mismatch refuses with the
+    // cluster untouched.
     let workspace =
         EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
+    ensure_grafana_admin_secret(&opts.observability_namespace).await?;
     let identity = InstallIdentity {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
@@ -1910,7 +1914,7 @@ async fn diagnostic_kubectl_json(
 
 async fn pending_pvc_diagnostic(namespace: &str) -> String {
     let hint = format!(
-        "Inspect storage with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
+        "If a PVC is Pending, inspect it with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let read = async {
@@ -3130,9 +3134,14 @@ fn alloy_can_schedule_on(node: &Node) -> bool {
     // The checked-in Alloy values have no custom tolerations or hostNetwork.
     // Kubernetes automatically adds only these DaemonSet tolerations.
     // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+    // Condition taints are lifted by their controllers once the node is
+    // healthy or initialized, and the DaemonSet then places Alloy there, so a
+    // node behind one still decides the parser.
+    // https://kubernetes.io/docs/reference/labels-annotations-taints/
     node.spec
         .taints
         .iter()
+        .filter(|taint| !is_transient_condition_taint(&taint.key))
         .all(|taint| match taint.effect.as_str() {
             "NoExecute" => matches!(
                 taint.key.as_str(),
@@ -3147,6 +3156,16 @@ fn alloy_can_schedule_on(node: &Node) -> bool {
             ),
             _ => true,
         })
+}
+
+fn is_transient_condition_taint(key: &str) -> bool {
+    matches!(
+        key,
+        "node.kubernetes.io/not-ready"
+            | "node.kubernetes.io/unreachable"
+            | "node.kubernetes.io/network-unavailable"
+            | "node.cloudprovider.kubernetes.io/uninitialized"
+    )
 }
 
 fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {

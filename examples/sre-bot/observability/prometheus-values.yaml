@@ -282,6 +282,54 @@ serverFiles:
               description: >-
                 Alloy read log lines in 15 minutes but sent none to Loki.
                 Check loki.write, network egress, and the receiver.
+          - alert: CurieAlloyScrapeMissing
+            # Both rules above need up == 1, so an Alloy pod Prometheus cannot
+            # scrape (up 0, a blocked metrics port) or never sees (no scrape
+            # annotation) leaves them silent while it ships nothing.
+            # kube-state-metrics reports how many Alloy pods the DaemonSet
+            # wants; fewer scrapeable pods than that pages. The zero term
+            # stands in for the count when no Alloy pod is up at all. A
+            # kube-state-metrics outage removes the left side and is
+            # CurieKubeStateMetricsDown's page, not this one.
+            expr: |
+              max by (namespace) (
+                kube_daemonset_status_desired_number_scheduled{
+                  namespace="observability",
+                  curie_source="curie-sre-bot",
+                  daemonset="alloy"
+                }
+              )
+              >
+              (
+                count by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    namespace="observability",
+                    pod=~"alloy-.*"
+                  } == 1
+                )
+                or on (namespace)
+                (
+                  0 * max by (namespace) (
+                    kube_daemonset_status_desired_number_scheduled{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      daemonset="alloy"
+                    }
+                  )
+                )
+              )
+            for: 10m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
           - alert: CurieApplicationMetricsAbsent
             expr: |
               absent(curie_queue_depth{service_name="curie-worker"})

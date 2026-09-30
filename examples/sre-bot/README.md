@@ -76,13 +76,13 @@ Persistent volumes use the cluster's default storage class, including the
 default supplied by a stock kind cluster. See the complete executable sequence
 in [DEMO.md](DEMO.md#fresh-install).
 
-The live installer reads the runtime of every cluster node before creating
-the Grafana Secret or installing charts. A uniform containerd or CRI-O cluster
-uses the checked-in Alloy CRI parser; a uniform Docker cluster uses a rendered
-Docker log mount and parser. Mixed or unknown runtimes are refused because
-Alloy runs as a DaemonSet, including on cordoned or temporarily NotReady nodes.
-`--dry-run` stays offline and reports that this selection occurs on the live
-run.
+The live installer reads the runtime of every node the Alloy DaemonSet can
+run on before creating the Grafana Secret or installing charts. A uniform
+containerd or CRI-O cluster uses the checked-in Alloy CRI parser; a uniform
+Docker cluster uses a rendered Docker log mount and parser. Mixed or unknown
+runtimes are refused because Alloy runs as a DaemonSet, including on cordoned
+or temporarily NotReady nodes. `--dry-run` does not read node runtimes or
+mutate the cluster, and reports that this selection occurs on the live run.
 
 For a manual values-file install, the checked-in
 [`observability/alloy-values.yaml`](observability/alloy-values.yaml) targets
