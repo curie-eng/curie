@@ -2565,6 +2565,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 "status": "idle-awaiting-input",
                 "turn_epoch": None,
                 "capacity_admission": True,
+                # RUNNER-TOOL-ACCESS-5: this test's runner session is built
+                # without tool access enforcement, so it advertises none.
+                "tool_access": [],
             }
         ]
         if late_handoff
