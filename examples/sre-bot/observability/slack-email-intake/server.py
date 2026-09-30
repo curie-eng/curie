@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -28,6 +29,22 @@ PLACEHOLDER = "Investigating this alert..."
 MAX_FILE_BYTES = 1_048_576
 MAX_EMAIL_TEXT = 100_000
 SLACK_API = "https://slack.com/api"
+
+
+class RateLimited(RuntimeError):
+    """An interrupted scan must wait without claiming a health success."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("Slack rate limited the scan")
+        self.retry_after = retry_after
+
+
+def _retry_after(headers: Any, fallback: float) -> float:
+    try:
+        value = float(headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return fallback
+    return value if math.isfinite(value) and value > 0 else fallback
 
 
 def _is_slack_url(url: str) -> bool:
@@ -250,14 +267,22 @@ class SlackClient:
             },
             method="POST",
         )
-        with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
-            payload = json.loads(response.read())
+        try:
+            with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
+                payload = json.loads(response.read())
+                retry_after = _retry_after(response.headers, self.config.poll_seconds)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise RateLimited(_retry_after(exc.headers, self.config.poll_seconds)) from exc
+            raise
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             error = (
                 payload.get("error", "invalid_response")
                 if isinstance(payload, dict)
                 else "invalid_response"
             )
+            if error == "ratelimited":
+                raise RateLimited(retry_after)
             raise RuntimeError(f"Slack {method} failed: {error}")
         return payload
 
@@ -271,7 +296,7 @@ class SlackClient:
         messages: list[dict[str, Any]] = []
         cursor = ""
         while True:
-            fields = {"channel": channel, "oldest": oldest, "limit": "200"}
+            fields = {"channel": channel, "oldest": oldest, "limit": "200", "inclusive": "true"}
             if cursor:
                 fields["cursor"] = cursor
             payload = self._api("conversations.history", fields)
@@ -282,6 +307,27 @@ class SlackClient:
             cursor = str((payload.get("response_metadata") or {}).get("next_cursor") or "")
             if not cursor:
                 return messages
+
+    def root(self, channel: str, thread_ts: str) -> dict[str, Any] | None:
+        """Look up the canary without anchoring discovery to its timestamp."""
+
+        payload = self._api(
+            "conversations.history",
+            {
+                "channel": channel,
+                "oldest": thread_ts,
+                "latest": thread_ts,
+                "inclusive": "true",
+                "limit": "1",
+            },
+        )
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list):
+            raise RuntimeError("Slack conversations.history returned invalid messages")
+        return next(
+            (item for item in messages if isinstance(item, dict) and item.get("ts") == thread_ts),
+            None,
+        )
 
     def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -314,8 +360,13 @@ class SlackClient:
         request = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {self.config.slack_token}"}
         )
-        with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
-            raw = bytes(response.read(MAX_FILE_BYTES + 1))
+        try:
+            with self.opener.open(request, timeout=self.config.http_timeout_seconds) as response:
+                raw = bytes(response.read(MAX_FILE_BYTES + 1))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise RateLimited(_retry_after(exc.headers, self.config.poll_seconds)) from exc
+            raise
         if len(raw) > MAX_FILE_BYTES:
             raise RuntimeError("Slack Email HTML file exceeds the intake byte limit")
         return raw
@@ -404,7 +455,7 @@ def process_message(
     bot_user_id: str,
     now: float,
     force_probe: bool = False,
-) -> None:
+) -> bool:
     """Acknowledge or dispatch one selected root."""
 
     root_ts = str(message["ts"])
@@ -415,7 +466,7 @@ def process_message(
     )
     if completed is not None:
         if not force_probe:
-            return
+            return True
         placeholder = str(completed["ts"])
         pending = None
     else:
@@ -451,32 +502,69 @@ def process_message(
         placeholder=placeholder,
         delivery_id=f"slack-email:{config.channel_id}:{root_ts}",
     )
+    return completed is not None
 
 
-def scan_once(config: Config, slack: Any, hook: Any, *, now: float) -> None:
+class ScanState:
+    """Disposable discovery progress; Slack replies remain the durable state."""
+
+    def __init__(self) -> None:
+        self.last_start: float | None = None
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.acknowledged: set[str] = set()
+
+    def oldest(self, config: Config) -> str:
+        if self.last_start is None:
+            return config.scan_not_before
+        overlap = config.placeholder_stale_seconds + 2 * config.poll_seconds
+        return f"{max(float(config.scan_not_before), self.last_start - overlap):.6f}"
+
+
+def scan_once(
+    config: Config, slack: Any, hook: Any, *, now: float, state: ScanState | None = None
+) -> None:
     """Process every selected root oldest first; any broken item fails the scan."""
 
+    state = state if state is not None else ScanState()
     bot_user_id = slack.bot_user_id()
-    history = slack.history(config.channel_id, config.scan_not_before)
-    canary = next(
-        (message for message in history if str(message.get("ts") or "") == config.canary_thread_ts),
-        None,
-    )
+    history = slack.history(config.channel_id, state.oldest(config))
+    canary = slack.root(config.channel_id, config.canary_thread_ts)
     if canary is None:
         raise RuntimeError("configured Slack Email canary is missing from channel history")
     if not is_candidate(canary, config):
         raise RuntimeError("configured Slack Email canary no longer matches intake criteria")
-    candidates = [message for message in history if is_candidate(message, config)]
-    for message in sorted(candidates, key=lambda item: float(item["ts"])):
-        process_message(
+    candidates = dict(state.pending)
+    candidates.update(
+        {
+            str(message["ts"]): message
+            for message in history
+            if is_candidate(message, config)
+            and float(message["ts"]) >= float(config.scan_not_before)
+        }
+    )
+    candidates[config.canary_thread_ts] = canary
+    for root_ts, message in sorted(candidates.items(), key=lambda item: float(item[0])):
+        force_probe = root_ts == config.canary_thread_ts
+        if root_ts in state.acknowledged and not force_probe:
+            continue
+        completed = process_message(
             config,
             slack,
             hook,
             message,
             bot_user_id=bot_user_id,
             now=now,
-            force_probe=str(message["ts"]) == config.canary_thread_ts,
+            force_probe=force_probe,
         )
+        if completed:
+            state.acknowledged.add(root_ts)
+            state.pending.pop(root_ts, None)
+        else:
+            state.pending[root_ts] = message
+    # Advance only after every pending item and the independent probe succeeded.
+    state.last_start = now
+    oldest = float(state.oldest(config))
+    state.acknowledged = {ts for ts in state.acknowledged if float(ts) >= oldest}
 
 
 class Health:
@@ -547,7 +635,7 @@ def handler(health: Health, config: Config) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> None:
-    """Run until one scan fails; Kubernetes then restarts and pages it."""
+    """Keep throttled scans alive; other failures restart and page."""
 
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     config = Config.from_env()
@@ -556,9 +644,15 @@ def main() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     slack = SlackClient(config)
     hook = CurieHookClient(config)
+    state = ScanState()
     while True:
         started = time.time()
-        scan_once(config, slack, hook, now=started)
+        try:
+            scan_once(config, slack, hook, now=started, state=state)
+        except RateLimited as exc:
+            LOG.warning("Slack Email scan throttled; waiting %.3f seconds", exc.retry_after)
+            time.sleep(exc.retry_after)
+            continue
         health.mark_success(time.time())
         LOG.info("Slack Email alert scan completed")
         time.sleep(max(0.0, config.poll_seconds - (time.time() - started)))
