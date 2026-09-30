@@ -77,13 +77,46 @@ placement:
     affinity: {}
 
 # ---------------------------------------------------------------------------
-# PriorityClass (ADR-0059 decision 5): ranks the control plane -- worker, api,
-# dispatcher, and the data tier (postgres, valkey, clickhouse, rustfs) -- above
-# sandbox pods for node-pressure eviction, so the components that supervise,
-# drain, and reclaim a sandbox are never themselves preferred for eviction over
-# the sandboxes they manage. Priority is a ranking and preemption lever, not
-# immunity: a node fully out of a resource (e.g. disk) can still take anything
-# down regardless of priority.
+# End to end connector identity (ADR 0176 decision 4, issue #3243)
+#
+# Install this ONLY on the release that owns a separate TEST cluster (ADR 0129
+# owner release), never on the cluster that runs the factory. Enable it with
+# `curie cluster up --e2e-connector-identity`.
+#
+# It renders a service account that may create and delete only namespaces whose
+# name starts with `namespacePrefix` and that carry `ownerLabel`, may read and
+# write only inside such namespaces, and holds no cluster scoped write. A
+# ValidatingAdmissionPolicy enforces the prefix and label at the API server,
+# so it needs admissionregistration.k8s.io/v1 (Kubernetes 1.30 or newer). The
+# template header in templates/e2e-connector-identity.yaml explains the grant.
+# ---------------------------------------------------------------------------
+e2eConnectorIdentity:
+  enabled: false
+  # Defaults to <fullname>-e2e-connector.
+  serviceAccountName: ""
+  # Lowercase DNS label ending in "-". Every namespace the identity creates
+  # must start with it.
+  namespacePrefix: "curie-e2e-"
+  ownerLabel:
+    key: "curietech.ai/e2e-owner"
+    # Defaults to the release name.
+    value: ""
+
+# ---------------------------------------------------------------------------
+# PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
+# dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
+# observability and UI tier (langfuse web/worker, the OTel collector, the UI,
+# inference, the mail adapter) -- above sandbox pods for node-pressure
+# eviction, so the components that supervise, drain, and reclaim a sandbox --
+# and the components that carry its traces and metrics -- are never themselves
+# preferred for eviction over the sandboxes they manage. The observability and
+# UI tier joined the platform set in #3182: at priority 0 those pods were
+# preempted by the very sandboxes whose telemetry they collect, and the
+# collector's OTLP endpoint went `Connection refused` mid-run. The
+# runner-prewarm DaemonSet deliberately stays UNCLASSED (priority 0, below
+# `sandbox`): the image-cache pod is the designated sacrifice. Priority is a
+# ranking and preemption lever, not immunity: a node fully out of a resource
+# (e.g. disk) can still take anything down regardless of priority.
 #
 # Both names are cluster-scoped (PriorityClass has no namespace), so installing
 # a second curie release into the SAME cluster must override one release's
@@ -97,8 +130,14 @@ placement:
 priorityClasses:
   platform:
     # Renders the PriorityClass and sets priorityClassName on every
-    # control-plane pod. Set false (and repoint `name` at an existing class) if
+    # long-running platform workload (control plane, data tier, observability
+    # and UI; the full inventory is pinned by ci/render-assertions.sh
+    # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
+    # Preinstall and preupgrade hooks omit this class when create is true,
+    # because the class can be absent until normal resources are applied.
+    # Postinstall and postupgrade hooks use it. When create is false, create
+    # the named class before installing so hooks can use it.
     create: true
     name: curie-platform
     value: 1000000
@@ -116,6 +155,16 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
+  # Langfuse writes every ingested event to <rustfs.bucket>/events/ and never
+  # deletes it after ingest; ClickHouse keeps the trace. Each trace costs about
+  # three inodes on the RustFS volume, and on a long-lived install those
+  # objects filled the node's inode table while kubelet still reported
+  # DiskPressure=False (#2870). The in-chart RustFS init Job installs an S3
+  # lifecycle rule that expires events/ after this many days. 0 disables the
+  # rule. A BYO store (rustfs.deploy false) is not touched: put the same
+  # expiration rule on its bucket yourself.
+  eventUpload:
+    retentionDays: 2
   # Bare external hostname required only when deploy is false. Consumers build
   # the URL as <langfuse.scheme>://<host>:<langfuse.web.service.port>, with the
   # scheme coming from `langfuse.scheme` below; do not include a scheme or port
@@ -452,6 +501,12 @@ valkey:
   persistence:
     enabled: true
     size: 1Gi
+  # Internal memory ceiling (#3350), passed as `--maxmemory`. Empty derives 75%
+  # of resources.limits.memory so a full broker refuses writes with an OOM error
+  # instead of being OOMKilled, leaving headroom for the BGSAVE fork. Set a
+  # Valkey size ("200mb", bytes) to override; with no memory limit and no value,
+  # no ceiling is set. The policy is always noeviction (Langfuse BullMQ needs it).
+  maxmemory: ""
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 250m, memory: 256Mi }
@@ -644,6 +699,33 @@ sealing:
   # Same BYO escape and upgrade preservation as privateKeyExistingSecret above.
   previousPrivateKeyExistingSecret: ""
   previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
+
+# The connector caller key pair (ADR-0168 decision 7). The worker signs each
+# sandbox's caller token with the private half. The API renders the public half
+# into the caller proxy in front of every hosted connector, which refuses a
+# caller whose token is missing, invalid or expired, or names an agent the
+# connector's `admits` list does not.
+#
+# `curie cluster up` generates the pair on a release that records none and
+# re-supplies it on every upgrade, as it does the sealing keypair; `--dev`
+# generates none. Do not set these by hand unless you are restoring a backup
+# or rotating. Empty mints no token and renders no proxy, and each connector's
+# NetworkPolicy is then its only access check.
+#
+# To rotate, set previousVerifyKey to the current verifyKey, set the new pair,
+# and restart the api and worker Deployments. Clear previousVerifyKey a day
+# later, when every token signed with the old key has expired.
+#
+# existingSecret (BYO) wins over signingKey and verifyKey: name a Secret holding
+# both halves as standard base64, the 32-byte seed under signingKeyKey and its
+# public key under verifyKeyKey.
+connectorCaller:
+  signingKey: ""
+  verifyKey: ""
+  previousVerifyKey: ""
+  existingSecret: ""
+  signingKeyKey: signingKey
+  verifyKeyKey: verifyKey
 
 rustfs:
   deploy: true
@@ -882,6 +964,11 @@ otelCollector:
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
+  # SDK metrics use delta aggregation so each export carries the measurements
+  # made since the prior collection. Override to cumulative or lowmemory when
+  # the receiving backend requires that preference. A workload extraEnv entry
+  # with the same OTEL variable takes precedence.
+  metricsTemporalityPreference: delta
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
   # exclusive; a literal is only for non-sensitive values such as a tenant id.
@@ -922,6 +1009,18 @@ otelCollector:
   extraLogPipelineExporters: []
   extraMetricPipelineExporters: []
   debugExporter:
+    enabled: false
+  # Kubernetes Events for this release's namespace (#2954). Kubernetes keeps
+  # events for about an hour, so without a durable copy the Warning events that
+  # explain an OOMKill, eviction, failed schedule or probe failure are gone by
+  # the time an incident review asks. When enabled, a k8sobjects receiver
+  # watches events.k8s.io Events in the release namespace and feeds them into
+  # the logs pipeline, and the chart creates a collector ServiceAccount with a
+  # namespaced Role limited to get/list/watch on events. The logs pipeline
+  # exports only to nop until an operator adds extraLogPipelineExporters, so
+  # the render is refused unless one is set (or debugExporter is enabled):
+  # watching events into nop would look enabled while recording nothing.
+  kubernetesEvents:
     enabled: false
   # The built-in Langfuse hop retains at most 1000 queued export requests and
   # retries each request for at most 5 minutes. Queue overflow or retry expiry is
@@ -1126,6 +1225,13 @@ api:
   githubFactoryIngressEnabled: false
   githubFactoryLabel: ""
   githubFactoryMention: ""
+  # Public https origin GitHub's image proxy fetches the live factory status card
+  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
+  # the card and the comment shows the checklist instead.
+  githubFactoryCardBaseUrl: ""
+  # Seconds a published factory run waits on its pull request's CI, from the
+  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
+  githubFactoryCiWaitSeconds: 1200
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1208,6 +1314,9 @@ api:
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
+  # Each sweep also records curie_approval_pending, so 0 stops that gauge too;
+  # the SRE bot example's CurieApplicationMetricsAbsent reads it, and an install
+  # that disables the sweeper drops that term.
   approvalSweepIntervalSeconds: 30
   # Break-glass approval recovery (#2753). OFF by default. Turn it on only for
   # the duration of a recovery, then turn it off again.
@@ -1236,6 +1345,13 @@ api:
   # limit becomes a false denial of a legitimate approver, so 0 suits low-volume
   # or strict-revocation deployments.
   slackUsergroupCacheTtlSeconds: 60
+  # Per-thread conversation transcript cap in bytes (#3301). The runner bounds
+  # each turn to this cap less an 8 KiB append reserve and compacts older turns
+  # when a thread fills; a single turn that still cannot fit fails the run with
+  # a history-persistence-error naming the turn size and this cap. The default
+  # (16 MiB) holds a dark-factory turn with several plan-review rounds. Raise it
+  # for longer factory runs; lower it only to bound Postgres row size.
+  transcriptMaxThreadBytes: 16777216
   # Level for the API's own loggers (#1270). INFO surfaces the operator-facing
   # records -- connector drift corrected, polled deploys, webhook outcomes --
   # which were silently dropped before. WARNING to quieten it.
@@ -1342,6 +1458,14 @@ api:
 
 dispatcher:
   deploy: true
+  # The dispatcher is not a rolling workload. It deploys with strategy Recreate
+  # so a rollout never runs two Socket Mode clients on one app token: Slack
+  # delivers each event to only one connected client, and an event handed to a
+  # pod that is terminating is lost (issue #2944). The cost is a brief gap on
+  # every rollout, from the old pod exiting until the new pod reconnects, in
+  # which Slack retries events it could not deliver instead of splitting them.
+  # For the same reason keep replicas at 1: each extra replica is another
+  # client on the same tokens.
   replicas: 1
   # Platform API the dispatcher resolves Slack approval clicks against. Empty
   # (the default) derives the in-chart API Service,
@@ -1402,6 +1526,35 @@ dispatcher:
     signingSecret: ""
     signingSecretExistingSecret: ""
     signingSecretExistingSecretKey: slackSigningSecret
+    # More Slack identities (ADR-0168 decision 1). The block above is the
+    # identity named `default`; each entry here is one more Slack app, and a
+    # binding names it in `adapter`. Empty (the default) renders nothing new.
+    # Each secret arrives by existingSecret reference only (#1759): a plain
+    # appToken/botToken/signingSecret key in an entry fails the render, and so
+    # does a plain appToken/botToken/signingSecret in the block above once this
+    # list is non-empty. With the list empty, the block keeps taking plain
+    # values.
+    #   identities:
+    #     - name: sales                     # [a-z0-9]+(-[a-z0-9]+)*, at most 40
+    #       appTokenExistingSecret: slack-sales
+    #       appTokenExistingSecretKey: slackAppToken          # the default
+    #       botTokenExistingSecret: slack-sales
+    #       botTokenExistingSecretKey: slackBotToken          # the default
+    #       signingSecretExistingSecret: slack-sales          # optional
+    #       signingSecretExistingSecretKey: slackSigningSecret  # the default
+    # `default` is configured in exactly one place: the block above, or an
+    # entry named `default` with the block's token fields left empty. A list
+    # that ends up with no `default` fails the render, because a Slack route
+    # that names no identity means `default`. A list entry's tokens render as
+    # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
+    # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
+    # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
+    # three which name reads which variable. That declaration is what the API
+    # validates a Slack binding's identity against. A plain `curie cluster up`
+    # carries a recorded non-empty list forward instead of resetting it to this
+    # default; a recorded empty list makes `up` refuse until it is removed from
+    # the release's values.
+    identities: []
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
@@ -1648,15 +1801,16 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
-  # Must be >= deliveryBudgetSeconds + deliveryShutdownReserveSeconds
-  # (ADR-0131): 1800 + 60 = 1860 covers the ADR's maximum configurable budget.
-  # The prior 1800 (#1570, "Give worker turns time to drain") was sized
-  # against max_attempts * runner_total_timeout_s with zero headroom for
-  # settlement -- a worker draining a maximum-budget turn was SIGKILLed at
-  # exactly the moment it would have settled. Voluntary termination may now
-  # take up to the configured budget plus reserve, so a rollout can take up
-  # to ~31 minutes per pod at the maximum budget; operators choose that cost
-  # when they choose a long execution budget.
+  # Floor for the worker's voluntary termination grace. The chart renders the
+  # effective grace as max(this, deliveryBudgetSeconds +
+  # deliveryShutdownReserveSeconds) (ADR-0131, #3071), so a raised budget
+  # raises the grace with it and the render never fails on this pair. 1860
+  # covers the default-era 1800 s budget plus the 60 s reserve. The prior 1800
+  # (#1570) left zero headroom for settlement -- a worker draining a
+  # maximum-budget turn was SIGKILLed at exactly the moment it would have
+  # settled. Voluntary termination may take up to the budget plus reserve, so
+  # at the 10800 s maximum a rollout can take about three hours per pod;
+  # operators choose that cost when they choose a long execution budget.
   terminationGracePeriodSeconds: 1860
   image:
     repository: ghcr.io/curie-eng/curie-worker
@@ -1876,13 +2030,12 @@ worker:
   # scientific notation for larger values, which the worker then cannot parse.
   #
   # The OVERALL deadline for one delivery: claim, every runner request, every
-  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
-  # (the ADR's stated maximum); values.schema.json enforces this at
-  # install/template time and the worker's own validator enforces it again at
-  # boot.
+  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 10800
+  # (three hours, #3071); values.schema.json enforces this at install/template
+  # time and the worker's own validator enforces it again at boot.
   deliveryBudgetSeconds: 600
   # Positive per-request ceiling for runner work within the overall delivery
-  # budget. Must be at most 1800 seconds and no greater than
+  # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
   # enforces the scalar bounds and the worker template enforces the relationship
   # at render time.
@@ -1897,9 +2050,15 @@ worker:
   # count.
   deliveryLeaseHeartbeatSeconds: 10
   # Budget reserved for terminal settlement (fenced ACK/dead-letter/outbox
-  # clear) after the runner work is done. `terminationGracePeriodSeconds`
-  # above must be at least deliveryBudgetSeconds + this value.
+  # clear) after the runner work is done. The rendered termination grace is
+  # at least deliveryBudgetSeconds + this value.
   deliveryShutdownReserveSeconds: 60
+  # Turn budget for a work-item (factory) delivery (#3071), rendered as
+  # CURIE_WORK_ITEM_MAX_TURNS. The worker writes it into that delivery's
+  # sandbox as CURIE_MAX_TURNS; chat and other deliveries keep the runner's
+  # short default (CURIE_MAX_TURNS via runner.extraEnv). A run that exhausts
+  # either cap fails as `max-turns`, and the escalation names the one it hit.
+  workItemMaxTurns: 1000
   # Pre-upgrade drain gate (issue #2010). ADR-0131 made one worker's own
   # shutdown safe; it says nothing about the roll happening around it. A
   # `helm upgrade` applies the worker AND its backing services in one pass, so
@@ -1919,6 +2078,10 @@ worker:
   # Disable it for a release where an interrupted turn is acceptable (a dev
   # cluster, a fake-model install). The chart's behavior without it is exactly
   # what it was before the gate existed.
+  #
+  # A second pre-upgrade hook refuses the upgrade unless the drain recorded
+  # success for this revision, so deleting the drain Job mid-wait does not
+  # roll workers.
   upgradeDrain:
     enabled: true
     # How long to wait for the in-flight deliveries before refusing. A FLOOR,
@@ -1928,20 +2091,23 @@ worker:
     # promised it would postpone upgrades during ordinary traffic. Raising the
     # delivery budget therefore raises this automatically rather than breaking
     # the render for a value you never touched.
+    # Helm needs a timeout of at least the effective drain wait plus the 120
+    # second drain Job allowance, the effective worker termination grace, and
+    # 60 seconds for scheduling and Helm operations. The pre upgrade drain Job
+    # publishes this minimum in curie.ai/minimum-helm-timeout-seconds. With the
+    # default values it is 900 + 120 + 1860 + 60 = 2940 seconds.
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
-    # How long the quiesce flag lives. Also a floor: it is derived above the
-    # EFFECTIVE wait above, because the worker refuses a TTL that does not
-    # outlast the drain at boot, and a render the app rejects is a green
-    # `helm upgrade` followed by a CrashLoopBackOff. Finite by construction, so
-    # an upgrade killed between the two hooks cannot leave the fleet
-    # permanently unable to claim. Size it to span the expected rollout: the
-    # flag is what keeps replacement Pods from reclaiming mid-roll.
-    #
-    # Setting it at or below timeoutSeconds IS refused at render time -- that
-    # pair is written together, so contradicting yourself there is a stated
-    # intent worth surfacing rather than silently raising.
+    # The roll hold: how long the quiesce flag lives after a CLEAN drain, while
+    # the roll runs and until the post-upgrade release clears it. Capped at the
+    # EFFECTIVE wait above (#3127), so a gate whose roll never follows cannot
+    # strand a paused fleet for longer than the upgrade could have waited.
+    # While the gate is still waiting, the flag is a short lease renewed every
+    # poll (max(30s, 3 x pollIntervalSeconds)), so a gate Job that is deleted,
+    # times out or is killed releases the fleet at once or within one lease.
+    # Size it to span the expected rollout: the flag is what keeps replacement
+    # Pods from reclaiming mid-roll.
     quiesceTtlSeconds: 1800
     resources:
       requests:
@@ -1968,6 +2134,17 @@ worker:
   # standalone sentence. Empty disables the generic caption while leaving any
   # per-agent behavior-pack load line intact.
   statusText: "is working on your request..."
+  # What the receipt beneath a turn's reply shows (ADR-0180), rendered as
+  # CURIE_TURN_RECEIPT. A turn that ran a tool outside the read-only allowlist
+  # ends its reply with a "What I changed:" list of those actions (ADR-0117).
+  #   all       every action, each saying whether it can be undone (default)
+  #   failures  only actions that reported failure, the ones a person must
+  #             check before asking again; no receipt when nothing failed
+  #   off       no receipt at all, even when an action failed
+  # Only the reply changes: every action is still recorded, and a turn that
+  # touched anything is still never retried automatically. The schema admits
+  # these three values only, because the worker refuses any other at startup.
+  turnReceipt: all
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
   # worker Deployment so its Slack sink uses that global base URL instead of real
   # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
@@ -2162,7 +2339,9 @@ agentSandbox:
   # (<fullname>-agent-<name>-connector-secrets), kept off the shared chart
   # Secret and off the value-only SandboxClaim CR. The runner sandbox reads a
   # value via a per-agent SandboxTemplate `secretKeyRef`. Worker claims route
-  # to that agent's pool (#1488). Empty by default; supply per agent,
+  # to that agent's pool (#1488). An agent whose bundle declares connector
+  # secrets but has no entry here gets no pool, and its turns are refused
+  # with a reply naming this value (#2943). Empty by default; supply per agent,
   # e.g.:
   #   connectorSecrets:
   #     github-issues:
@@ -2184,6 +2363,35 @@ agentSandbox:
   #         ports:
   #           - { protocol: TCP, port: 443 }
   connectorEgress: {}
+  # Per-agent package registry egress (#3083): agent name -> the CIDR entries
+  # of the package registries (npm, PyPI and similar) that agent's runner pods
+  # may reach, so an agent can run `npm ci` or the target repository's checks
+  # in its sandbox. Closed by default: nothing opens unless an agent is listed
+  # here. Each agent renders its own NetworkPolicy
+  # (<release>-agent-<name>-allow-registry-egress) selecting
+  # curietech.ai/agent=<name>, and each entry passes the same floor as
+  # connectorEgress. NetworkPolicy cannot target a DNS name, so list the
+  # registry CDN's published ranges or a registry mirror/proxy address, e.g.
+  # registry.npmjs.org and pypi.org's files are CDN fronted:
+  #   registryEgress:
+  #     factory:
+  #       - cidr: 104.16.0.0/12        # Cloudflare (registry.npmjs.org)
+  #         ports:
+  #           - { protocol: TCP, port: 443 }
+  #       - cidr: 151.101.0.0/16       # Fastly (pypi.org, files.pythonhosted.org)
+  #         ports:
+  #           - { protocol: TCP, port: 443 }
+  registryEgress: {}
+  # Per-agent layered runner image (ADR-0173): agent name -> the runner image
+  # that agent's bundle layers on the platform runner, as the digest reference
+  # `<repository>@sha256:<64 hex>` that `curie build` records in the bundle's
+  # connectors.lock.yaml. A tag is refused at render time. Each listed agent
+  # gets its own SandboxTemplate and warm pool rendering that digest, every
+  # other template keeps runner.image, and the runner prewarm DaemonSet also
+  # pulls each distinct digest so a cold boot never pulls an image.
+  #   runnerImages:
+  #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
+  runnerImages: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
@@ -2656,6 +2864,43 @@ resourceQuota:
   # (`priorityClasses.sandbox.create: false`) whose name differs from
   # `priorityClasses.sandbox.name`. Setting it overrides the derivation.
   sandboxPriorityClassName: ""
+  # THE QUOTA IS AN ADMISSION CEILING, NOT A SCHEDULING GUARANTEE (#2949).
+  # Kubernetes checks these numbers against the requests of sandbox pods, never
+  # against what the nodes can hold. A quota above node capacity admits sandboxes
+  # that then sit Pending until the claim times out.
+  #
+  #   quota ceiling = min(sandboxPodCount,
+  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
+  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
+  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
+  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #   (a term whose per-sandbox value is unset or 0 is skipped). With the
+  #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
+  #   = 8, so limitsCpu is the binding term.
+  #   what fits     = sum over schedulable nodes of
+  #                   floor((allocatable - non-sandbox pod requests) / per-sandbox request),
+  #                   taking the smaller of the cpu and memory counts per node
+  #
+  # Worked example: 3 nodes with 3.23 cpu free between them (roughly 1.08 each),
+  # 1 cpu per sandbox -> 1 fits per node, 3 in total. A quota of
+  # requestsCpu: "8" advertised 8; sandboxes 4 through 8 were admitted and
+  # never scheduled. `helm install`/`upgrade` NOTES print both numbers and a
+  # warning when the ceiling exceeds what fits.
+  #
+  # Telling the refusals apart:
+  #   quota refusal: the pod create is rejected with "exceeded quota" --
+  #     kubectl describe resourcequota <fullname>-sandbox-quota -n <ns>
+  #   unschedulable: the pod exists, is Pending, and has FailedScheduling events --
+  #     kubectl get events --field-selector reason=FailedScheduling -n <ns>
+  # Remedy for the second: lower hard.* to what fits, or add node capacity.
+  #
+  # capacityReport: the NOTES comparison above. To compute "what fits" it
+  # lists every Node and every Pod cluster-wide (Helm `lookup`) during
+  # install/upgrade. If the identity running helm is forbidden to list Nodes or
+  # Pods across all namespaces, that lookup errors and Helm FAILS THE RELEASE.
+  # Set false in that case; the quota itself is unaffected, only the report is
+  # skipped and no lookup runs.
+  capacityReport: true
   hard:
     requestsCpu: "4"
     requestsMemory: 8Gi

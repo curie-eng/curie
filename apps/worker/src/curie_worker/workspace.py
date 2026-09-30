@@ -132,13 +132,14 @@ WORKSPACES_DISABLED_REFUSAL = (
     "agentSandbox.runner.workspace.enabled in the chart values "
     "(CURIE_WORKSPACE_ENABLED on the worker)."
 )
+# The worker maps the API's machine-readable 409 `detail.code` values from
+# `apps/api/src/curie_api/routers/workspaces.py` to its own user-facing prose;
+# it never echoes the API's mutable message text. A code the API does not emit
+# is unreachable here (#2684), and an emitted code missing from this mapping is
+# treated as an invalid refusal response, so the two sets must stay equal.
+# Pinned by `test_selection_refusal_codes_match_the_apis_emissions` in
+# `apps/worker/tests/test_workspace.py`.
 _SELECTION_REFUSAL_MESSAGES = {
-    "workspace.deployment_disabled": (
-        "This deployment does not enable repository workspaces."
-    ),
-    "workspace.repository_required": (
-        "Start the thread by naming one allowed root GitHub repository URL."
-    ),
     "workspace.selection_conflict": (
         "This thread is already bound to a different repository."
     ),
@@ -174,6 +175,26 @@ class WorkspaceSelectionRefused(WorkspacePreparationError):
     def __init__(self, detail: str) -> None:
         self.public_detail = detail
         super().__init__("repository-selection", detail)
+
+
+class WorkspaceRepositoryNotAllowed(WorkspaceSelectionRefused):
+    """The API refused the named repository against the installation allowlist."""
+
+
+class RepoFact(str):
+    """A repository full name plus where it came from (#2947).
+
+    ``bare`` is True when the name was inferred from an ``owner/repo`` token
+    rather than parsed from a github.com URL. A bare token is a guess, so the
+    allowlist decides whether it named a repository at all.
+    """
+
+    bare: bool
+
+    def __new__(cls, full_name: str, *, bare: bool) -> RepoFact:
+        fact = super().__new__(cls, full_name)
+        fact.bare = bare
+        return fact
 
 
 class _OwnershipWriteUncertain(WorkspacePreparationError):
@@ -247,10 +268,11 @@ class WorkspaceCredential:
             raise ValueError("workspace authorization header contains control characters")
 
 
-def parse_github_repo_fact(message: str) -> str | None:
+def parse_github_repo_fact(message: str) -> RepoFact | None:
     """Extract one canonical GitHub repository from trusted turn text."""
 
     repositories: dict[str, str] = {}
+    bare_repositories: dict[str, str] = {}
     for matched in _GITHUB_URL.finditer(message):
         raw = matched.group(0).rstrip(_TRAILING_PUNCTUATION)
         parsed = urlsplit(raw)
@@ -301,16 +323,38 @@ def parse_github_repo_fact(message: str) -> str | None:
         if candidate.casefold() in _ENGLISH_SLASH_PAIRS:
             continue
         if _REPO_FULL_NAME.fullmatch(candidate):
-            repositories.setdefault(candidate.casefold(), candidate)
+            bare_repositories.setdefault(candidate.casefold(), candidate)
     if len(repositories) > 1:
         raise WorkspaceSelectionRefused(
             "This message names more than one GitHub repository, so no repository "
             "was attached and no work started. A thread works in only one repository."
         )
-    return next(iter(repositories.values()), None)
+    if repositories:
+        # A URL wins outright. A bare token beside one is noise next to a plain
+        # statement, so it neither competes with it nor refuses.
+        return RepoFact(next(iter(repositories.values())), bare=False)
+    # AMBIGUOUS MEANS ABSENT, NEVER REFUSED (#2767). A bare owner/repo is a
+    # guess: `P/L`, `24/7`, `him/her` and `headlines/taglines` all match, and so
+    # does every media type, `application/pdf` and `image/png` included. One
+    # guess reaches the allowlist and is refused there. TWO guesses never got
+    # that far -- the count above raised first -- so `the P/L statement and our
+    # 24/7 support desk` and `the file is application/pdf and the deck is
+    # image/png` ended the turn, and the refusal text was delivered to the
+    # sender as the whole answer to their question. The second is any message
+    # naming two attachments.
+    #
+    # `_ENGLISH_SLASH_PAIRS` cannot grow to cover it, and that is the difference
+    # between it and `_BARE_REPO_SOURCE_EXTENSIONS` above: file extensions are a
+    # finite set and slashed English is not. So two bare tokens are read as what
+    # they much more often are, ordinary prose, and this message names no
+    # repository. Two URLs still refuse -- a sender who writes two github.com
+    # URLs has plainly named two repositories.
+    if len(bare_repositories) != 1:
+        return None
+    return RepoFact(next(iter(bare_repositories.values())), bare=True)
 
 
-def trusted_repository_fact(message: str, *, ignore_message: bool) -> str | None:
+def trusted_repository_fact(message: str, *, ignore_message: bool) -> RepoFact | None:
     """Repository facts for workspace selection.
 
     Job payloads (webhook/cron), verified-review bodies, and approval resume
@@ -424,7 +468,7 @@ class WorkspaceCredentialClient:
                 "repository-selection", "worker could not reach the internal workspace API"
             ) from exc
         if response.status == 403:
-            raise WorkspaceSelectionRefused(
+            raise WorkspaceRepositoryNotAllowed(
                 "That repository is not in api.githubRepoAllowlist for this installation; "
                 "allow `owner/repo` or `owner/*` in the chart values."
             )
@@ -1446,6 +1490,7 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         repo_full_name: str | None = None,
         replace_handle: Any | None = None,
         revalidate_before_handoff: Callable[[], None] | None = None,
@@ -1535,6 +1580,7 @@ class WorkspaceClaimCoordinator:
                         publication_visible_outcome_revision
                     ),
                     agent_name=agent_name,
+                    runner_resources=runner_resources,
                     **candidate_guard,
                 )
             else:
@@ -1543,6 +1589,7 @@ class WorkspaceClaimCoordinator:
                         thread_key,
                         env=claim_env,
                         agent_name=agent_name,
+                        runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
                         publication_visible_outcome_revision=(
@@ -1559,6 +1606,7 @@ class WorkspaceClaimCoordinator:
                         thread_key,
                         env=claim_env,
                         agent_name=agent_name,
+                        runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
                         publication_visible_outcome_revision=(

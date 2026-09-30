@@ -78,6 +78,8 @@ build/
 # Personal, in-progress agent bundles (sibling of examples/) -- `list-agents`
 # and `deploy-local <folder>` read from here; never part of the repo proper.
 agents/
+# ...except a shipped example's Claude Code subagent definitions.
+!/examples/*/agents/
 
 # Big-plan server sidecars (belong with the .projects working copies, not the repo)
 *.snapshot

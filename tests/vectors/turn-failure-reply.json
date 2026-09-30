@@ -1,0 +1,25 @@
+{
+  "comment": "The machine-readable marker on a delivered reply when a runner turn fails (#3401). The worker prefixes the channel reply. The factory status comment carries the same class on its own line. The CLI refuses to grade a reply that starts with the marker as a successful task reply. Python and Rust cannot share the literal, so it is frozen here. An unknown top-level key is rejected.",
+  "reply_prefix": "curie-turn-failure:",
+  "factory_class_line_prefix": "Failure class:",
+  "examples": [
+    {
+      "classification": "unclassified",
+      "reply_first_line": "curie-turn-failure: unclassified",
+      "factory_cause": "unclassified",
+      "factory_class_line": "Failure class: unclassified"
+    },
+    {
+      "classification": "max-turns",
+      "reply_first_line": "curie-turn-failure: max-turns",
+      "factory_cause": "max_turns",
+      "factory_class_line": "Failure class: max-turns"
+    },
+    {
+      "classification": "history-persistence-error",
+      "reply_first_line": "curie-turn-failure: history-persistence-error",
+      "factory_cause": "history_capacity",
+      "factory_class_line": "Failure class: history-persistence-error"
+    }
+  ]
+}

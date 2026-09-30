@@ -86,6 +86,7 @@ _API_BASE = "https://api.example.test"
 _SESSION_ID = f"agent-{_AGENT_ID}-thread-{_THREAD_KEY}"
 _MEMORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/memory"
 _HISTORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/transcript/{_THREAD_SEGMENT}"
+_CHANNEL_MEMORY_REF = f"http://api:8000/agents/{_AGENT_ID}/state/bindings/slack/C0ABC/memory"
 
 # binding.budget_for builds a Budget with no task_budget_hint, rendered with
 # Budget.model_dump_json().
@@ -170,23 +171,30 @@ def _full_boot_env() -> BootEnv:
         model="claude-opus-4-6",
         fake_model=True,
         history_ref=_HISTORY_REF,
+        channel_memory_ref=_CHANNEL_MEMORY_REF,
         history_token="st-history-token",
         memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-state-token",
+        progress_url="http://api:8000/v1/work-item-progress/wi-full",
+        progress_token="sbx-progress-token",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
+        approval_grant_arguments={"command": "printf ok"},
         approval_resumed_kind="policy",
         approval_decision="approved",
         connector_secret_keys=["GITHUB_TOKEN", "LINEAR_API_KEY"],
         connector_release="curie",
         connector_agent="acme-dev",
         connector_namespace="curie-prod",
+        connector_caller_token="cct.full-payload.full-signature",
         port=9090,
         base_url="http://litellm:4000",
         api_backend="messages",
         thinking="disabled",
+        deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
+        metrics_temporality_preference="delta",
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
@@ -540,13 +548,16 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         credentials_ref="k8s://secret/demo",
         api_backend="messages",
         thinking="disabled",
+        deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-scoped-token",
         connector_release="curie",
         connector_agent="acme-dev",
         connector_namespace="curie",
+        connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
+        channel_memory_ref=_CHANNEL_MEMORY_REF,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -556,18 +567,22 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
 # --- Golden 3: the kernel resume overlay. ------------------------------------
 
 
-def test_the_kernel_owns_exactly_the_three_approval_resume_keys() -> None:
+def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     """kernel.py layers these onto binding.boot_env's dict after the fact.
 
     They are a distinct producer: same process, different code path, rendered
     independently. The kernel sets them via the exported constants, so the
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
-    ``CURIE_APPROVAL_DECISION`` alongside the original two.
+    ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
+    request-bound progress URL/token the resume overlay mints per work item.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
+        "CURIE_PROGRESS_URL",
+        "CURIE_PROGRESS_TOKEN",
     }
 
 
@@ -621,6 +636,7 @@ def test_from_env_on_the_worker_subset_alone_raises() -> None:
 def test_from_env_parses_the_resume_overlay() -> None:
     overlay = {
         "CURIE_APPROVAL_GRANT_TOOL": "Bash",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS": '{"command":"printf ok","options":{"flags":["a"]}}',
         "CURIE_APPROVAL_RESUMED_KIND": "policy",
     }
     boot = BootEnv.from_env(
@@ -630,6 +646,7 @@ def test_from_env_parses_the_resume_overlay() -> None:
     )
     assert boot.approval_required_tools == ["Bash", "mcp__github__create_pr"]
     assert boot.approval_grant_tool == "Bash"
+    assert boot.approval_grant_arguments == {"command": "printf ok", "options": {"flags": ["a"]}}
     assert boot.approval_resumed_kind == "policy"
 
 
@@ -772,23 +789,30 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MODEL",
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
+        "CURIE_CHANNEL_MEMORY_REF",
         "CURIE_HISTORY_TOKEN",
         "CURIE_MEMORY_TOKEN",
         "CURIE_STATE_URL",
         "CURIE_STATE_TOKEN",
+        "CURIE_PROGRESS_URL",
+        "CURIE_PROGRESS_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_CONNECTOR_SECRET_KEYS",
         "CURIE_CONNECTOR_RELEASE",
         "CURIE_CONNECTOR_AGENT",
         "CURIE_CONNECTOR_NAMESPACE",
+        "CURIE_CONNECTOR_CALLER_TOKEN",
         "CURIE_RUNNER_PORT",
         "ANTHROPIC_BASE_URL",
         "CURIE_MODEL_API_BACKEND",
         "CURIE_THINKING",
+        "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_MODEL_ENV_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
@@ -871,6 +895,7 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_RUNNER_PORT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",  # agent-sandbox.yaml:433
         "OTEL_EXPORTER_OTLP_PROTOCOL",  # agent-sandbox.yaml:435
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         # Worker-authoritative with a substrate fallback: the chart bakes a
         # warm-pool default into the runner container so an unclaimed pod boots
         # resolvable, and the worker's per-claim value legitimately wins under
@@ -969,3 +994,79 @@ def test_connector_scope_is_absent_by_default() -> None:
     # Absent is meaningful, not degraded: the skill tier hosts nothing, so there
     # is no Service to derive a URL from.
     assert not [k for k in _worker_env() if k.startswith("CURIE_CONNECTOR_")]
+
+
+# --- The connector caller token (ADR-0168 decision 7). ----------------------
+
+_SCOPE = {
+    "connector_release": "curie",
+    "connector_agent": "acme-dev",
+    "connector_namespace": "curie-prod",
+}
+
+
+def test_the_caller_token_rides_with_the_connector_scope() -> None:
+    # Only a scoped boot mounts hosted connectors, and the token is addressed
+    # to them alone. Without the scope there is nothing to present it to.
+    scoped = _worker_env(**_SCOPE, connector_caller_token="cct.payload.signature")
+    assert scoped["CURIE_CONNECTOR_CALLER_TOKEN"] == "cct.payload.signature"
+
+    unscoped = _worker_env(connector_caller_token="cct.payload.signature")
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in unscoped
+
+
+@pytest.mark.parametrize("token", [None, ""])
+def test_no_caller_token_is_rendered_when_none_was_minted(token: str | None) -> None:
+    # An install with no signing key mints nothing, and its boot env is the
+    # one it had before the key existed.
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in _worker_env(
+        **_SCOPE, connector_caller_token=token
+    )
+
+
+def test_the_caller_token_survives_the_worker_render_and_the_consumer_parse() -> None:
+    boot = BootEnv.from_env(
+        _worker_env(**_SCOPE, connector_caller_token="cct.payload.signature") | _SUBSTRATE_ENV
+    )
+    assert boot.connector_caller_token == "cct.payload.signature"
+
+
+def test_the_caller_token_has_one_producer_the_worker() -> None:
+    assert _producers_of("CURIE_CONNECTOR_CALLER_TOKEN") == {"worker"}
+
+
+# --- Channel memory ref (#3389) ----------------------------------------------
+
+
+def test_render_worker_emits_the_channel_memory_ref_when_given() -> None:
+    env = _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF)
+    assert env["CURIE_CHANNEL_MEMORY_REF"] == _CHANNEL_MEMORY_REF
+
+
+def test_render_worker_omits_the_channel_memory_ref_when_not_given() -> None:
+    assert "CURIE_CHANNEL_MEMORY_REF" not in _worker_env()
+    assert "CURIE_CHANNEL_MEMORY_REF" not in _worker_env(channel_memory_ref=None)
+
+
+def test_channel_memory_ref_survives_the_worker_render_and_the_consumer_parse() -> None:
+    boot = BootEnv.from_env(_worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF) | _SUBSTRATE_ENV)
+    assert boot.channel_memory_ref == _CHANNEL_MEMORY_REF
+    assert boot.to_env()["CURIE_CHANNEL_MEMORY_REF"] == _CHANNEL_MEMORY_REF
+    assert BootEnv.from_env(boot.to_env()) == boot
+
+
+def test_to_env_omits_the_channel_memory_ref_when_unset() -> None:
+    boot = BootEnv(session=_boot_session())
+    assert boot.channel_memory_ref is None
+    assert "CURIE_CHANNEL_MEMORY_REF" not in boot.to_env()
+
+
+def test_from_env_reads_an_empty_channel_memory_ref_as_unset() -> None:
+    env = BootEnv(session=_boot_session()).to_env()
+    env["CURIE_CHANNEL_MEMORY_REF"] = ""
+    assert BootEnv.from_env(env).channel_memory_ref is None
+
+
+def test_channel_memory_ref_is_a_worker_only_env_key() -> None:
+    assert BootEnv.env_key("channel_memory_ref") == "CURIE_CHANNEL_MEMORY_REF"
+    assert _producers_of("CURIE_CHANNEL_MEMORY_REF") == {"worker"}

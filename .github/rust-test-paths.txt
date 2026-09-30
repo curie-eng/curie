@@ -1,0 +1,33 @@
+# Extended regexes (grep -E), one per line, matched against paths changed by a
+# pull request. The CLI test partitions run when any changed path matches.
+#
+# Derived by tracing every file a full `cargo test` in cli/ opened, at compile
+# time (include_str!, build.rs) and at run time (fixtures, helm renders, and the
+# `uv run` Python it shells out to, which imports the api, worker, dispatcher and
+# packages sources), plus paths the sources name by relative literal. When a test
+# starts reading a new file outside these paths, add it here. Pushes to main and
+# next run the tests unconditionally, so a miss is caught before a release.
+^cli/
+^charts/
+^packages/
+^examples/
+^apps/(api|worker|dispatcher|mail-adapter)/
+^apps/ui/src/generated/commandManifest\.ts$
+^adapters/
+^runner/
+^tests/vectors/
+^compose/
+^compose\.dev\.yaml$
+^docs/(approvals|operations)\.md$
+^\.github/workflows/
+^\.github/e2e-selection\.yaml$
+^\.github/rust-test-paths\.txt$
+^tools/
+^scripts/
+^hooks/
+^pyproject\.toml$
+^uv\.lock$
+^uv\.toml$
+^CLAUDE\.md$
+^\.gitignore$
+^rust-toolchain(\.toml)?$

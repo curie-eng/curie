@@ -6,6 +6,8 @@ Status: Accepted
 
 Partially amended by [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md), which realizes dispatch, runtime admission and termination.
 
+Partially superseded by [ADR 0171](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md): the execution deadline is the owning agent's value from 60 to 10800 seconds, default 1800, not exactly 1800 seconds.
+
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md)
 and

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.8";
+pub const PROTOCOL_VERSION: &str = "0.5.7";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -165,13 +165,21 @@ pub struct BootEnv {
     #[serde(default)]
     pub memory_token: Option<String>,
     #[serde(default)]
+    pub channel_memory_ref: Option<String>,
+    #[serde(default)]
     pub state_url: Option<String>,
     #[serde(default)]
     pub state_token: Option<String>,
     #[serde(default)]
+    pub progress_url: Option<String>,
+    #[serde(default)]
+    pub progress_token: Option<String>,
+    #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default)]
     pub approval_grant_tool: Option<String>,
+    #[serde(default)]
+    pub approval_grant_arguments: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub approval_resumed_kind: Option<String>,
     #[serde(default)]
@@ -185,6 +193,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub connector_namespace: Option<String>,
     #[serde(default)]
+    pub connector_caller_token: Option<String>,
+    #[serde(default)]
     pub port: Option<i64>,
     #[serde(default)]
     pub base_url: Option<String>,
@@ -193,7 +203,11 @@ pub struct BootEnv {
     #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
+    pub deployment_environment: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
+    #[serde(default)]
+    pub metrics_temporality_preference: Option<String>,
     #[serde(default)]
     pub max_turns: Option<i64>,
     #[serde(default)]
@@ -208,17 +222,21 @@ pub struct BootEnv {
 pub mod env_keys {
     pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
     pub const CURIE_APPROVAL_DECISION: &str = "CURIE_APPROVAL_DECISION";
+    pub const CURIE_APPROVAL_GRANT_ARGUMENTS: &str = "CURIE_APPROVAL_GRANT_ARGUMENTS";
     pub const CURIE_APPROVAL_GRANT_TOOL: &str = "CURIE_APPROVAL_GRANT_TOOL";
     pub const CURIE_APPROVAL_REQUIRED_TOOLS: &str = "CURIE_APPROVAL_REQUIRED_TOOLS";
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
     pub const CURIE_BUDGET: &str = "CURIE_BUDGET";
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
+    pub const CURIE_CHANNEL_MEMORY_REF: &str = "CURIE_CHANNEL_MEMORY_REF";
     pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
+    pub const CURIE_CONNECTOR_CALLER_TOKEN: &str = "CURIE_CONNECTOR_CALLER_TOKEN";
     pub const CURIE_CONNECTOR_NAMESPACE: &str = "CURIE_CONNECTOR_NAMESPACE";
     pub const CURIE_CONNECTOR_RELEASE: &str = "CURIE_CONNECTOR_RELEASE";
     pub const CURIE_CONNECTOR_SECRET_KEYS: &str = "CURIE_CONNECTOR_SECRET_KEYS";
     pub const CURIE_CREDENTIALS: &str = "CURIE_CREDENTIALS";
+    pub const CURIE_DEPLOYMENT_ENVIRONMENT: &str = "CURIE_DEPLOYMENT_ENVIRONMENT";
     pub const CURIE_FAKE_MODEL: &str = "CURIE_FAKE_MODEL";
     pub const CURIE_HISTORY_MAX_BYTES: &str = "CURIE_HISTORY_MAX_BYTES";
     pub const CURIE_HISTORY_MAX_TURNS: &str = "CURIE_HISTORY_MAX_TURNS";
@@ -231,6 +249,8 @@ pub mod env_keys {
     pub const CURIE_MODEL_API_BACKEND: &str = "CURIE_MODEL_API_BACKEND";
     pub const CURIE_MODEL_ENV_KEY: &str = "CURIE_MODEL_ENV_KEY";
     pub const CURIE_PLUGIN_DIR: &str = "CURIE_PLUGIN_DIR";
+    pub const CURIE_PROGRESS_TOKEN: &str = "CURIE_PROGRESS_TOKEN";
+    pub const CURIE_PROGRESS_URL: &str = "CURIE_PROGRESS_URL";
     pub const CURIE_RUNNER_PORT: &str = "CURIE_RUNNER_PORT";
     pub const CURIE_RUNNER_TOKEN: &str = "CURIE_RUNNER_TOKEN";
     pub const CURIE_SANDBOX_ID: &str = "CURIE_SANDBOX_ID";
@@ -240,6 +260,7 @@ pub mod env_keys {
     pub const CURIE_THINKING: &str = "CURIE_THINKING";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+    pub const OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: &str = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE";
     pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 }
 
@@ -278,7 +299,8 @@ pub struct QueuedTurn {
     pub conversation_id: String,
     pub author: String,
     pub text: String,
-    pub reply_handle: ReplyHandle,
+    #[serde(default)]
+    pub reply_handle: Option<ReplyHandle>,
     pub received_at: String,
     #[serde(default)]
     pub source: TurnSource,
@@ -338,7 +360,28 @@ pub struct ApprovalRequest {
     #[serde(default)]
     pub granted_tool: Option<String>,
     #[serde(default)]
+    pub granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
     pub expires_in_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PublicationContext {
+    pub agent_id: String,
+    pub deployment_id: String,
+    pub work_item_id: String,
+    pub execution_request_id: String,
+    pub runtime_epoch: i64,
+    pub conversation_id: String,
+    pub lineage_id: String,
+    pub lineage_version: i64,
+    pub expected_head: String,
+    pub queued_event_id: String,
+    pub precheck_url: String,
+    pub capability: String,
+    pub observed_title: String,
+    pub observed_body_sha256: String,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +397,8 @@ pub enum InboundMessage {
         session_id: Option<String>,
         #[serde(default)]
         history_ref: Option<String>,
+        #[serde(default)]
+        publication_context: Option<PublicationContext>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -393,6 +438,8 @@ pub enum OutboundEvent {
         approval_gate_kind: Option<String>,
         #[serde(default)]
         approval_granted_tool: Option<String>,
+        #[serde(default)]
+        approval_granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default)]
         approval_display: Option<String>,
         #[serde(default)]
@@ -441,6 +488,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -460,6 +508,7 @@ mod tests {
             approval_route: Some("managers".to_string()),
             approval_gate_kind: Some("policy".to_string()),
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -478,6 +527,7 @@ mod tests {
             ts: "1.0".to_string(),
             session_id: None,
             history_ref: None,
+            publication_context: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
@@ -510,19 +560,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_near_version() {
-        let raw = r#"{"type":"final","version":"0.5.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.6.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.9","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.8","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.8","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.7","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

@@ -107,8 +107,8 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
-        text.contains("compatible rollback reloads exclusive 0.10.0 images"),
-        "self-test must pin compatible rollback reloading 0.10.0 images\n{text}"
+        text.contains("guarded rollback reloads exclusive 0.10.0 images"),
+        "self-test must pin guarded rollback reloading 0.10.0 images\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
@@ -212,7 +212,7 @@ fn candidate_image_setup_derives_every_n1_tag_from_local_n_before_exclusive_load
 }
 
 #[test]
-fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
+fn published_v089_rollback_scenario_is_strict_and_keeps_guarded_rollback() {
     let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
     let catalog: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repo_root().join("cli/src/application_schema_windows.json"))
@@ -238,7 +238,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "released 0.9.2 must stop at its schema compatibility head"
     );
     assert_eq!(
-        catalog["windows"]["0.10.0"]["schema_head"], "0054",
+        catalog["windows"]["0.10.0"]["schema_head"], "0058",
         "the candidate 0.10.0 rollback head must match this tree"
     );
     assert!(
@@ -312,11 +312,11 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         scenario.contains("status != 0")
             && scenario.contains("0.8.9")
             && scenario.contains("PUBLISHED_HEAD")
-            && scenario.contains("SUPPORTED_ROLLBACK_HEAD")
+            && scenario.contains("TARGET_HEAD")
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
-        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0054 while rejecting identity failures"
+        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and the live candidate head while rejecting identity failures"
     );
     assert!(
         scenario.contains("helm_version") && scenario.contains("0.10.0"),
@@ -330,18 +330,19 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "refusal must retain the sentinel, candidate Alembic head, and a ready API"
     );
     assert!(
-        scenario.contains("run_compatible_rollback"),
-        "the same scenario must prove one compatible rollback succeeds"
+        scenario.contains("run_guarded_rollback"),
+        "the same scenario must prove one guarded rollback refusal"
     );
 
-    let compatible = source
-        .split_once("run_compatible_rollback() {")
+    let guarded = source
+        .split_once("run_guarded_rollback() {")
         .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
-        .expect("run_compatible_rollback function");
+        .expect("run_guarded_rollback function");
     assert!(
-        compatible.contains("assert_sentinel")
-            && compatible.contains("assert_alembic \"$SUPPORTED_ROLLBACK_HEAD\""),
-        "supported 0.10.1 to 0.10.0 rollback must retain the sentinel and catalogued Alembic head"
+        guarded.contains("assert_sentinel")
+            && guarded.contains("assert_alembic \"$TARGET_HEAD\"")
+            && guarded.contains("outside its declared schema range"),
+        "guarded rollback must refuse the older release and retain the sentinel and live Alembic head"
     );
 }
 
@@ -383,10 +384,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         .collect();
     assert_eq!(
         ids,
-        [
-            "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12",
-            "s13", "s14"
-        ],
+        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14"],
         "canonical shard ids\n{manifest}"
     );
 
@@ -397,7 +395,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         let setup = shard["setup"].as_bool().expect("shard setup flag");
         assert_eq!(
             setup,
-            !matches!(id, "s01" | "s11" | "s12"),
+            !matches!(id, "s01" | "s11"),
             "setup flag wrong for {id}"
         );
         for item in shard["scenarios"].as_array().expect("scenarios array") {
@@ -489,7 +487,8 @@ fn self_test_checks_shard_coverage_and_timing() {
     );
 }
 
-const GOOD_SHARDS: &str = "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
+const GOOD_SHARDS: &str =
+    "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version rollback-published-088 migration-crash
 s02 setup fail-every-phase:plan+validate+drain_preflight
 s03 setup fail-every-phase:checkpoint+migrate+apply
 s04 setup fail-every-phase:converge
@@ -497,10 +496,8 @@ s05 setup fail-every-phase:canary
 s06 setup fail-every-phase:commit
 s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
-s09 setup n-to-n1 compatible-rollback
-s10 setup rollback-published-088
+s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
-s12 nosetup migration-crash
 s13 setup converge-negative
 s14 setup previous-serves";
 
@@ -547,8 +544,8 @@ fn self_test_fails_when_override_drops_a_scenario() {
 fn self_test_fails_when_override_duplicates_a_scenario() {
     assert_override_refused(
         &GOOD_SHARDS.replace(
-            "s12 nosetup migration-crash",
-            "s12 nosetup migration-crash fresh-n",
+            "s11 nosetup rollback-published-089",
+            "s11 nosetup rollback-published-089 fresh-n",
         ),
         "duplicated scenario",
     );

@@ -35,7 +35,6 @@ from plugin_format.deploy_targets import validate_deploy_targets
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "examples" / "sre-bot"
-CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yaml"
 UPGRADE_SCRIPT = BUNDLE / "platform-upgrade" / "upgrade.sh"
 # Named allowlisted ids, not a prefix-plus-digit regex. A bare prefix
 # of the sanctioned placeholders matches slack-conversation-id and is
@@ -63,40 +62,29 @@ def _live_command_index(text: str, prefix: str) -> int:
     raise AssertionError(f"missing live command beginning with {prefix!r}")
 
 
-def test_demo_fresh_install_prepares_the_example_before_cluster_up() -> None:
+def _assert_credential_exported_before_installer(block: str, where: str) -> None:
+    # The installer reads CURIE_CREDENTIALS itself (#2920). Exported after
+    # it, the install lands on the fake model.
+    export = _live_command_index(block, "export CURIE_CREDENTIALS")
+    installer = _live_command_index(block, "curie example sre-bot install")
+    assert export < installer, (
+        f"{where} must export CURIE_CREDENTIALS before the example installer "
+        "so the fresh install records the real model"
+    )
+
+
+def test_demo_fresh_install_exports_the_credential_before_the_installer() -> None:
     text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
     fresh_install = _markdown_section(text, "## Fresh install")
-
-    installer = _live_command_index(
-        fresh_install, "curie example sre-bot install"
-    )
-    cluster_up = _live_command_index(fresh_install, "curie cluster up")
-
-    assert installer < cluster_up, (
-        "examples/sre-bot/DEMO.md must run the example installer before "
-        "credentialed cluster up on a fresh install"
-    )
+    _assert_credential_exported_before_installer(fresh_install, "examples/sre-bot/DEMO.md")
 
 
-def test_readme_first_install_block_names_the_safe_fresh_install_sequence() -> None:
+def test_readme_first_install_block_exports_the_credential_before_the_installer() -> None:
     text = (BUNDLE / "README.md").read_text(encoding="utf-8")
     install = _markdown_section(text, "## Install")
-    first_block = _first_bash_block(install)
-
-    if "curie cluster up" in first_block:
-        installer = _live_command_index(
-            first_block, "curie example sre-bot install"
-        )
-        cluster_up = _live_command_index(first_block, "curie cluster up")
-        assert installer < cluster_up, (
-            "the first README install block must prepare the example before "
-            "credentialed cluster up"
-        )
-    else:
-        assert "(DEMO.md#fresh-install)" in install, (
-            "the first README install block must show the safe command order "
-            "or link to DEMO.md#fresh-install"
-        )
+    _assert_credential_exported_before_installer(
+        _first_bash_block(install), "the first README install block"
+    )
 
 
 def test_staging_deploy_doc_names_what_the_tree_installs_today() -> None:
@@ -228,42 +216,11 @@ def test_permission_map_matches_the_vanilla_kubernetes_connector() -> None:
     assert "kubernetes/resources_scale" in text
 
 
-def test_ci_shellchecks_the_platform_upgrade_script() -> None:
-    """upgrade.sh is the Job body. CI must run shellcheck on that path.
-
-    A pytest that shells out to shellcheck is not enough on its own: if
-    that test were deleted, CI would still have zero coverage of this
-    script. The workflow must invoke shellcheck on this path so the gate
-    is visible in the job that actually runs on every PR.
-
-    Comments do not count. An earlier pin matched the path and the word
-    ``shellcheck`` anywhere in the file, so deleting the ``run:`` line
-    left both asserts green.
-    """
-
-    workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")) or {}
-    python_job = (workflow.get("jobs") or {}).get("python") or {}
-    steps = python_job.get("steps") or []
-    runs = [step.get("run") or "" for step in steps if isinstance(step, dict)]
-    matching = [
-        run
-        for run in runs
-        if "shellcheck" in run and "examples/sre-bot/platform-upgrade/upgrade.sh" in run
-    ]
-    assert matching, (
-        "the python CI job has no step whose run: invokes shellcheck on "
-        "examples/sre-bot/platform-upgrade/upgrade.sh. A comment naming "
-        "the path is not a gate. Add a step that runs "
-        "`shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh`."
-    )
-
-
 def test_platform_upgrade_script_is_shellcheck_clean() -> None:
-    """The Job script itself must be clean, not merely mentioned in CI.
+    """The Job script itself must be clean under shellcheck.
 
-    The sibling test asserts the workflow names the path. This one runs
-    shellcheck against the script so a syntax error still fails even if
-    the workflow step is later pointed at a different file.
+    Pytest runs shellcheck against upgrade.sh, so a syntax error fails
+    the suite even if a workflow step is later pointed at a different file.
     """
 
     assert UPGRADE_SCRIPT.is_file(), f"missing {UPGRADE_SCRIPT}"

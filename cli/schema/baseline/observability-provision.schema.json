@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability-provision/v1.json",
+  "title": "curie example sre-bot provision-observability --json",
+  "description": "The agent-facing receipt that the Grafana connector token exists. The token value and the Grafana admin password are never included.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "secret": {
+      "type": "string",
+      "const": "curie-grafana-connector",
+      "description": "The Secret the Grafana and Tempo connectors mount."
+    },
+    "key": {
+      "type": "string",
+      "const": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+      "description": "The key that must be non-empty. The value is not returned."
+    },
+    "namespace": {
+      "type": "string",
+      "description": "The Curie release namespace that holds the Secret."
+    },
+    "release": {
+      "type": "string",
+      "description": "The Helm release that was upgraded with the observability values."
+    },
+    "observability_namespace": {
+      "type": "string",
+      "description": "The namespace of the Grafana, Loki, Alloy, Prometheus, and Tempo stack."
+    },
+    "ready": {
+      "type": "boolean",
+      "const": true,
+      "description": "True only when the token key decoded to a non-empty value."
+    }
+  },
+  "required": ["secret", "key", "namespace", "release", "observability_namespace", "ready"]
+}

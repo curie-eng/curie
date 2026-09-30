@@ -31,21 +31,29 @@ per-adapter token.
 ``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
 (``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
 (``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
-match. There is no address-only overload and no default kind -- either would be
-the silent address-fallback the pair exists to remove. One address can now
-legitimately be bound twice under two different kinds, and each turn reaches its
-own agent.
+match; migration 0070 widens it again to the route triple, so several
+identities may share a pair. There is no address-only overload and no default
+kind -- either would be the silent address-fallback the pair exists to remove.
+One address can now legitimately be bound twice under two different kinds, and
+each turn reaches its own agent.
 
 The binding row also carries the server-controlled reply route: ``endpoint`` (the
 channel API base URL this kind's replies go back through) and ``adapter`` (the
 egress adapter identity whose credential authenticates them). Both are read here
 so the worker gets the route from the same query that resolves the agent, never
-from an ingress request body. ``slack`` legitimately carries neither: its route
-is the worker's configured Slack origin.
+from an ingress request body. ``slack`` never carries an ``endpoint``, because
+its route is the worker's configured Slack origin, but it DOES name its bot
+identity in ``adapter`` (ADR-0168 decision 3). A turn queued without one means
+``default``, read through ``route_identity``, never "no route" the way a
+non-Slack NULL pair does. The worker resolves by all three fields: the SQL
+selects the pair and ``matching_routes`` (``aci_protocol.turn``) narrows by
+identity, so a route bound under one Slack identity does not answer a turn
+addressed to another.
 
-A pair that is not bound resolves to None -- a polite drop naming both halves,
-never a fallback to the address alone, because that fallback is exactly the
-silent misroute (#38) this predicate closes.
+A pair that is not bound, or bound but not to this turn's identity, resolves
+to None -- a polite drop naming both halves, never a fallback to the address
+alone, because that fallback is exactly the silent misroute (#38) this
+predicate closes.
 """
 
 from __future__ import annotations
@@ -61,12 +69,13 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
+from aci_protocol.turn import SLACK_KIND, matching_routes
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from . import sandbox_token
+from . import caller_token, sandbox_token
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -88,6 +97,8 @@ BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_VERSION_ENV = BootEnv.env_key("bundle_version")
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
+MAX_TURNS_ENV = BootEnv.env_key("max_turns")
+CONNECTOR_CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -129,11 +140,17 @@ CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
 # #430 one-shot post-approval allowance (ADR-0035): a runner-local knob carrying
 # the single approved tool name the runner gate lets through once on a resume boot.
 GRANT_TOOL_ENV = BootEnv.env_key("approval_grant_tool")
+# The paired argument object comes only from the approved permission row.
+GRANT_ARGUMENTS_ENV = BootEnv.env_key("approval_grant_arguments")
 # #544 Decision A2 turn-end reconciliation marker: an authority-free FACT that
 # THIS resume boot is resuming a policy-gate approval. Unlike GRANT_TOOL_ENV it
 # confers nothing -- the runner reads it only to decide whether to emit an
 # observe-only warning when the approved business action never ran.
 RESUMED_KIND_ENV = BootEnv.env_key("approval_resumed_kind")
+# #3077 live factory status card: the request-bound report_progress URL and
+# scoped token, minted by the kernel's resume overlay per work-item execution.
+PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
+PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
 # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
 # ('approved'/'rejected'/'expired') of the approval this resume boot is
 # resuming from, so the runner can stamp it on the turn's OTel span and close
@@ -221,10 +238,13 @@ SELECT a.id AS agent_id,
        a.secrets AS secrets,
        d.id AS deployment_id,
        d.workspace_enabled AS workspace_enabled,
+       d.environment AS deployment_environment,
        a.memory AS memory,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
+       c.kind AS kind,
+       c.address AS address,
        c.endpoint AS endpoint,
        c.adapter AS adapter
 FROM {schema}.agents a
@@ -235,6 +255,38 @@ WHERE c.kind = :kind AND c.address = :address
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
+# A targetless cron turn (#2963) is routed by the hook run's agent, not by a
+# binding, so this selects the same active deployment as _RESOLVE_SQL (the
+# ORDER BY key is duplicated verbatim for the same tiebreak reason) with no
+# agent_channels join. endpoint/adapter are NULL: there is no reply route.
+_RESOLVE_AGENT_SQL = """
+SELECT a.id AS agent_id,
+       a.name AS agent_name,
+       a.max_usd_per_day AS max_usd_per_day,
+       a.max_output_tokens_per_run AS max_output_tokens_per_run,
+       a.behavior_packs AS behavior_packs,
+       a.model AS model,
+       a.thinking AS thinking,
+       a.approval_required_tools AS approval_required_tools,
+       a.approval_routes AS approval_routes,
+       a.secrets AS secrets,
+       d.id AS deployment_id,
+       d.workspace_enabled AS workspace_enabled,
+       d.environment AS deployment_environment,
+       a.memory AS memory,
+       v.id AS version_id,
+       v.version_label AS version_label,
+       v.bundle_ref AS bundle_ref,
+       NULL AS endpoint,
+       NULL AS adapter
+FROM {schema}.agents a
+JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
+JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
+WHERE a.id = :agent_id
+ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
+LIMIT 1
+"""
+
 # ``resolve`` deliberately requires an active deployment: it is the only
 # deployment a worker may boot. When that lookup misses, the kernel needs this
 # narrower second query to distinguish an unbound route from an existing agent
@@ -242,11 +294,25 @@ ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 _UNDEPLOYED_BINDING_SQL = """
 SELECT a.id AS agent_id,
        a.name AS agent_name,
+       c.kind AS kind,
+       c.address AS address,
        c.endpoint AS endpoint,
        c.adapter AS adapter
 FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+"""
+
+# ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
+# identity is one adapter deployment on one address and writes as that
+# address. Case-insensitive because the mail adapter lowercases a sender
+# (`curie_mail_adapter.adapter._bare_address`).
+_ADDRESS_IDENTITY_SQL = """
+SELECT c.adapter AS adapter
+FROM {schema}.agent_channels c
+WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT NULL
+ORDER BY c.adapter
+LIMIT 1
 """
 
 
@@ -281,6 +347,13 @@ class ResolvedDeployment(BaseModel):
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
     thinking: str | None = None
+    # Per-agent runner resources (#3209). None means the chart block. A set
+    # value is applied to the next claim, not to a sandbox that is already running.
+    runner_resources: dict[str, Any] | None = None
+    # The active deployment's environment (#3166), forwarded as
+    # CURIE_DEPLOYMENT_ENVIRONMENT so runner traces carry it. Optional so old
+    # worker doubles stay source-compatible.
+    deployment_environment: str | None = None
     # The agent's permission gates (#245): tool names requiring human approval,
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
@@ -294,11 +367,13 @@ class ResolvedDeployment(BaseModel):
     # connector secrets. (Local tier stores values on the agent row; the cluster
     # tier delivers them via a per-agent K8s Secret instead.)
     secrets: dict[str, str] | None = None
-    # The binding row's server-controlled reply route (ADR-0096 phase 2). The
-    # channel API base URL this kind's replies go back through, and the egress
-    # adapter identity whose credential authenticates them. Both NULL for
-    # `slack`, whose route is the worker's configured Slack origin; both set
-    # together for any other kind (`agent_channels_route_pair_ck`).
+    # The binding row's server-controlled reply route (ADR-0096 phase 2).
+    # `endpoint` is the channel API base URL this kind's replies go back
+    # through. `adapter` is the egress adapter identity whose credential
+    # authenticates them for a non-Slack kind, and, for `slack`, the bot
+    # IDENTITY this route names (ADR-0168 decision 3). `slack` carries no
+    # `endpoint`, because its route is the worker's configured Slack origin;
+    # any other kind sets both or neither (`agent_channels_route_ck`).
     endpoint: str | None = None
     adapter: str | None = None
     # Whether this agent's bindings share one general-state namespace, or each
@@ -306,6 +381,46 @@ class ResolvedDeployment(BaseModel):
     # takes effect on the very next turn -- there is no cached copy anywhere
     # to go stale.
     memory: bool = False
+    # Whether the operator turned memory writes on for this agent (#1461,
+    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
+    # mounts the remember/update/forget tools; off (the default), neither.
+    # Not selected by the resolver statements: the column arrives in migration
+    # 0068 and resolution runs against older schemas, so the kernel reads it
+    # with ``memory_writes_for`` and copies it on, as with runner_resources.
+    memory_writes: bool = False
+
+
+class AmbiguousRoute(RuntimeError):
+    """A turn names no adapter on a non-Slack pair that several agents bind.
+
+    An omitted non-Slack adapter selects every route on the pair
+    (``matching_routes``), and migration 0070's triple key lets two agents hold
+    one pair under different adapters, so no deployment is this turn's. The
+    worker's twin of the API's ``crud.AmbiguousRoute``: never resolved by
+    picking one, because the pick runs one agent's turn under another's
+    deployment, secrets and reply route (ADR-0168 decision 3, #38).
+    """
+
+    def __init__(self, kind: str, address: str, agent_ids: Sequence[uuid.UUID]) -> None:
+        self.kind = kind
+        self.address = address
+        self.agent_ids = sorted(str(agent_id) for agent_id in agent_ids)
+        super().__init__(
+            f"{len(self.agent_ids)} agents are bound to {kind}:{address} and the turn "
+            f"names no adapter to choose one ({', '.join(self.agent_ids)})"
+        )
+
+
+def refuse_several_agents(kind: str, address: str, rows: Sequence[Any]) -> None:
+    """Raise ``AmbiguousRoute`` when ``rows`` belong to more than one agent.
+
+    Counts distinct agents, not rows: one agent's several rows are one
+    deployment whichever row answers.
+    """
+
+    agents = {row["agent_id"] for row in rows}
+    if len(agents) > 1:
+        raise AmbiguousRoute(kind, address, list(agents))
 
 
 class BoundAgent(BaseModel):
@@ -326,12 +441,16 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     kinds).
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
-    The API enforces one agent per bound pair (``agent_channels_kind_address_key``,
-    migration 0023, superseding 0021's address-only ``agent_channels_address_key``
-    and 0017's ``agents_slack_channel_key``), so this state is no longer
-    reachable through the write paths. It stays as defense in depth for
-    rows predating the constraint or written out of band, and because silently
-    shadowing an agent is the failure mode #38 existed to kill.
+    The API holds one agent per route (``agent_channels_route_key``, migration
+    0070, superseding 0023's pair key, 0021's address-only
+    ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
+    a Slack turn, or a turn that names its adapter, cannot reach this state
+    through the write paths. A non-Slack turn that omits its adapter selects
+    every route on the pair, and ``resolve`` refuses it with ``AmbiguousRoute``
+    before this runs when those routes belong to several agents. So this is
+    reachable only through rows written out of band, and stays as defense in
+    depth there, because silently shadowing an agent is the failure mode #38
+    existed to kill.
 
     One agent with both a dev and a prod deployment active is two rows but one
     agent, so count distinct agents, not rows.
@@ -363,6 +482,28 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     )
 
 
+def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
+    # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
+    # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
+    # model expects. A dict/list (or None) passes through untouched.
+    packs = data.get("behavior_packs")
+    if isinstance(packs, str):
+        data["behavior_packs"] = json.loads(packs)
+    gates = data.get("approval_required_tools")
+    if isinstance(gates, str):
+        data["approval_required_tools"] = json.loads(gates)
+    routes = data.get("approval_routes")
+    if isinstance(routes, str):
+        data["approval_routes"] = json.loads(routes)
+    conn_secrets = data.get("secrets")
+    if isinstance(conn_secrets, str):
+        data["secrets"] = json.loads(conn_secrets)
+    runner_resources = data.get("runner_resources")
+    if isinstance(runner_resources, str):
+        data["runner_resources"] = json.loads(runner_resources)
+    return ResolvedDeployment.model_validate(data)
+
+
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only)."""
 
@@ -374,40 +515,66 @@ class BindingResolver:
         self._undeployed_binding_sql = text(
             _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
         )
+        self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
+        self._address_identity_sql = text(
+            _ADDRESS_IDENTITY_SQL.format(schema=config.db_schema)
+        )
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
-        """Resolve the ``(kind, address)`` routing pair to its active deployment.
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
+        """Resolve a turn's route TRIPLE ``(kind, adapter, address)`` to its
+        active deployment.
 
-        Both halves are required and neither has a default: an address-only
-        overload would silently answer an unbound kind with somebody else's
-        agent, which is #38's misroute wearing the neutral-binding hat.
+        It resolves by all three fields (ADR-0168 decision 3): ``kind`` and
+        ``address`` select the SQL rows, and ``matching_routes`` narrows them in
+        Python by the turn's ``adapter``, so a row bound under one identity
+        does not answer a turn addressed to another on a pair several
+        identities share. All three are required and none has a default: an omitted
+        identity or an address-only overload would silently answer with
+        whichever row happened to be bound, which is #38's misroute wearing a
+        new hat.
+
+        An omitted non-Slack adapter selects every route on the pair, so when
+        those routes belong to several agents this raises ``AmbiguousRoute``
+        rather than answer. That is judged over every BINDING on the pair, not
+        only the deployed ones this query returns: an undeployed agent's
+        route-less binding would otherwise leave the other agent's row as the
+        only match, and the turn would run as that agent.
+        """
+        params = {"kind": kind, "address": address}
+        async with self._engine.connect() as conn:
+            if adapter is None and kind != SLACK_KIND:
+                bound = (await conn.execute(self._undeployed_binding_sql, params)).all()
+                refuse_several_agents(kind, address, [dict(row._mapping) for row in bound])
+            result = await conn.execute(self._sql, params)
+            rows = result.all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
+            return None
+        mapped = [dict(row._mapping) for row in matches]
+        warn_if_multiple_agents_bound(kind, address, mapped)
+        return _deployment_from_row(mapped[0])
+
+    async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
+        """Resolve an explicit agent to its active deployment, with no binding.
+
+        Only for a targetless cron turn (#2963), whose agent is the hook run
+        row's validated id. Never a fallback for a binding miss.
         """
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"kind": kind, "address": address})
-            rows = result.mappings().all()
-        if not rows:
-            return None
-        warn_if_multiple_agents_bound(kind, address, rows)
-        data = dict(rows[0])
-        # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
-        # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
-        # model expects. A dict/list (or None) passes through untouched.
-        packs = data.get("behavior_packs")
-        if isinstance(packs, str):
-            data["behavior_packs"] = json.loads(packs)
-        gates = data.get("approval_required_tools")
-        if isinstance(gates, str):
-            data["approval_required_tools"] = json.loads(gates)
-        routes = data.get("approval_routes")
-        if isinstance(routes, str):
-            data["approval_routes"] = json.loads(routes)
-        conn_secrets = data.get("secrets")
-        if isinstance(conn_secrets, str):
-            data["secrets"] = json.loads(conn_secrets)
-        return ResolvedDeployment.model_validate(data)
+            result = await conn.execute(self._resolve_agent_sql, {"agent_id": agent_id})
+            row = result.mappings().first()
+        return None if row is None else _deployment_from_row(dict(row))
 
-    async def undeployed_binding(self, kind: str, address: str) -> BoundAgent | None:
+    async def undeployed_binding(
+        self, kind: str, adapter: str | None, address: str
+    ) -> BoundAgent | None:
         """Return a bound agent after ``resolve`` found no active deployment.
+
+        Narrows by the same route triple ``resolve`` does (``matching_routes``,
+        ADR-0168 decision 3): a bound-but-undeployed diagnostic for a
+        DIFFERENT identity on this pair must not read as this turn's agent.
 
         The caller must use this only as a diagnostic after an active-resolution
         miss. Returning this record never grants a runner boot: a route remains
@@ -417,8 +584,24 @@ class BindingResolver:
             result = await conn.execute(
                 self._undeployed_binding_sql, {"kind": kind, "address": address}
             )
-            row = result.mappings().first()
-        return None if row is None else BoundAgent.model_validate(dict(row))
+            rows = result.all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
+            return None
+        mapped = [dict(row._mapping) for row in matches]
+        # The same refusal as ``resolve``: the diagnostic reply goes out
+        # through the bound agent's route, so naming either agent is a guess.
+        refuse_several_agents(kind, address, mapped)
+        return BoundAgent.model_validate(mapped[0])
+
+    async def identity_for_address(self, kind: str, address: str) -> str | None:
+        """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                self._address_identity_sql, {"kind": kind, "address": address}
+            )
+            value = result.scalar()
+        return value if isinstance(value, str) and value else None
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
@@ -511,6 +694,38 @@ class BindingResolver:
             return None
         tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX) :].split(" ", 1)[0]
         return tool or None
+
+    async def approval_grant_arguments(
+        self, event_id: str, agent_id: uuid.UUID
+    ) -> dict[str, Any] | None:
+        """Return the denied call's stored arguments for its approved resume.
+
+        The new carrier has no summary fallback. Only an approved permission
+        gate with a stored tool and a resume for the same agent may carry arguments;
+        policy approvals, old rows and malformed values return None. An empty
+        object remains a valid argument value.
+        """
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        sql = text(
+            f"SELECT status, agent_id, gate_kind, granted_tool, granted_arguments "
+            f"FROM {self._config.db_schema}.approvals WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": approval_id})
+            row = result.mappings().first()
+        if row is None:
+            return None
+        if row["status"] != "approved":
+            return None
+        row_agent_id = row["agent_id"]
+        if row_agent_id is None or row_agent_id != agent_id:
+            return None
+        if row["gate_kind"] != "permission" or not row["granted_tool"]:
+            return None
+        arguments: Any = row["granted_arguments"]
+        return arguments if isinstance(arguments, dict) else None
 
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
@@ -618,21 +833,61 @@ class BindingResolver:
         value: str | None = row[0]
         return value
 
-    async def model_settings_for(
-        self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
-        """The agent's model and thinking settings for eval sandbox boots."""
+    async def runner_resources_for(self, agent_id: uuid.UUID) -> dict[str, Any] | None:
+        """The agent's runner resource override, or None for the chart block.
+
+        This is a separate read from deployment resolution. Resolution runs in
+        migration tests against schemas that predate the column.
+        """
         sql = text(
-            f"SELECT model, thinking FROM {self._config.db_schema}.agents WHERE id = :id"
+            "SELECT runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None
+            return None
+        value = row[0]
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
+
+    async def memory_writes_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned memory writes on for the agent (#1461).
+
+        A separate read from deployment resolution, like
+        ``runner_resources_for``: resolution runs in migration tests against
+        schemas that predate the column (migration 0068). A missing agent row or
+        a null value reads as off.
+        """
+        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
+    async def model_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
+        """The agent's model, thinking, and runner_resources for eval boots."""
+        sql = text(
+            "SELECT model, thinking, runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None, None, None
         model: str | None = row[0]
         thinking: str | None = row[1]
-        return model, thinking
+        runner_resources = row[2]
+        if isinstance(runner_resources, str):
+            runner_resources = json.loads(runner_resources)
+        if runner_resources is not None and not isinstance(runner_resources, dict):
+            runner_resources = None
+        return model, thinking, runner_resources
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
@@ -719,12 +974,31 @@ class BindingResolver:
         # WHICH agent, and a partition key within that agent's own,
         # already-fully-accessible store has no privilege to carry, so the API
         # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). memory and history stay agent-wide either way.
+        # an opaque claim). Agent memory and history stay agent-wide either
+        # way; channel memory (below) is binding-scoped by design (ADR-0167,
+        # #1461) and is decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
                 f"{base}/agents/{resolved.agent_id}/state/bindings/"
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
+            )
+        # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
+        # to this turn's binding, on the same store and read/written with the
+        # same broad memory token. Its presence is the runner's signal to mount
+        # the memory tools, so it is set only when the operator turned memory
+        # writes on and the turn names a binding. An eval-isolated turn carries
+        # no memory at all, so it gets none either.
+        channel_memory_ref: str | None = None
+        if (
+            resolved.memory_writes
+            and kind is not None
+            and address is not None
+            and not (isolate_memory or is_eval_isolate_thread(thread_key))
+        ):
+            channel_memory_ref = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
             )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
@@ -741,8 +1015,8 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
+        exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
         if self._config.api_key:
-            exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             state_token = sandbox_token.mint(
                 self._config.api_key,
                 agent=str(resolved.agent_id),
@@ -753,6 +1027,17 @@ class BindingResolver:
                 self._config.api_key,
                 agent=str(resolved.agent_id),
                 scope="state.app",
+                exp=exp,
+            )
+        # The caller token (ADR-0168 decision 7): this sandbox's agent, signed
+        # for its hosted connectors, with the state tokens' expiry. No key mints
+        # none, which is the stock install. render_worker emits it only with
+        # the connector scope.
+        connector_caller_token: str | None = None
+        if self._config.connector_caller_signing_key.strip():
+            connector_caller_token = caller_token.mint(
+                self._config.connector_caller_signing_key,
+                agent=resolved.agent_name,
                 exp=exp,
             )
         env = BootEnv.render_worker(
@@ -779,6 +1064,7 @@ class BindingResolver:
             connector_release=self._config.connector_release or None,
             connector_agent=resolved.agent_name,
             connector_namespace=self._config.connector_namespace or None,
+            connector_caller_token=connector_caller_token,
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,
@@ -787,6 +1073,7 @@ class BindingResolver:
             # all" is what makes an unconfigured install behave as it always has.
             thinking=(resolved.thinking if resolved.thinking is not None else self._config.thinking)
             or None,
+            deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
@@ -799,6 +1086,7 @@ class BindingResolver:
             model_env_key=self._config.model_env_key or None,
             history_token=state_token,
             memory_token=state_token,
+            channel_memory_ref=channel_memory_ref,
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted

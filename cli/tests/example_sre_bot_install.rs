@@ -7,9 +7,11 @@
 
 mod support;
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::fs;
 use std::io::{Cursor, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -42,7 +44,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn write_exec(dir: &Path, name: &str, body: &str) {
+fn install_example_stub(dir: &Path, name: &str, body: &str) {
     let reads = include_str!("data/converged-installation-read.sh");
     let body = if name == "helm" {
         // Preserve this installer's existing Grafana status/migration replies.
@@ -56,14 +58,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
     } else {
         body.to_string()
     };
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
-    let mut permissions = fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("read {name} metadata: {error}"))
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
-        .unwrap_or_else(|error| panic!("make {name} executable: {error}"));
+    test_executable::install_in(dir, name, &body);
 }
 
 struct Fixture {
@@ -115,7 +110,7 @@ impl Fixture {
         fs::create_dir(&applied_dir).expect("create applied-file capture directory");
         fs::create_dir(&helm_values_dir).expect("create helm-values capture directory");
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
@@ -277,7 +272,7 @@ exit 64
 "#,
         );
 
-        write_exec(
+        install_example_stub(
             &bin_dir,
             "helm",
             r#"#!/bin/sh
@@ -628,6 +623,12 @@ exit 64
             .env("CURIE_TEST_CONNECTOR_STDIN", &self.connector_stdin)
             .env("CURIE_TEST_APPLIED_DIR", &self.applied_dir)
             .env("CURIE_TEST_HELM_VALUES_DIR", &self.helm_values_dir)
+            // The installer reads CURIE_CREDENTIALS from the secret store too
+            // (#2920); never let the host's store decide the model.
+            .env(
+                "CURIE_CONFIG_DIR",
+                self.helm_values_dir.join("curie-config"),
+            )
             .env("CURIE_TEST_NODES_JSON", &self.nodes)
             .env("CURIE_TEST_PODS_JSON", &self.pods)
             .env("CURIE_TEST_NODES_MODE", self.nodes_mode)
@@ -1576,7 +1577,7 @@ fn publication_gate_survives_both_embedded_installer_modes_with_operator_approve
         assert_eq!(
             gates
                 .iter()
-                .any(|gate| gate["gate"] == "mcp__self-upgrade__upgrade_self"),
+                .any(|gate| gate["gate"] == "mcp__self-upgrade__upgrade_platform"),
             platform_upgrade,
             "the two iterations must exercise different self upgrade modes: {gates:?}"
         );
@@ -1701,7 +1702,7 @@ fn released_binary_path_uses_cached_chart_and_embedded_assets_outside_checkout()
 }
 
 #[test]
-fn recorded_model_credential_refusal_explains_the_fresh_install_order() {
+fn recorded_model_credential_refusal_names_the_credential_to_export() {
     const MODEL_CREDENTIAL: &str = "fixture_model_credential_value";
 
     let fixture = Fixture::with_modes(
@@ -1735,17 +1736,14 @@ fn recorded_model_credential_refusal_explains_the_fresh_install_order() {
     }
 
     let guidance = text.to_ascii_lowercase();
-    let fresh_install = guidance
-        .find("fresh install")
-        .unwrap_or_else(|| panic!("refusal must explain fresh install ordering: {text}"));
-    let fresh_install_guidance = &guidance[fresh_install..];
-    let before = fresh_install_guidance.find("before");
-    let model_credential = fresh_install_guidance.find("model credential");
+    // #2920: the installer declares CURIE_CREDENTIALS when it is exported, so
+    // the way through is to export it and re-run, not a second command after.
+    let export = guidance
+        .find("export curie_credentials")
+        .unwrap_or_else(|| panic!("refusal must name the credential to export: {text}"));
     assert!(
-        before
-            .zip(model_credential)
-            .is_some_and(|(before, model_credential)| before < model_credential),
-        "fresh install guidance must place this installer before model credential configuration: {text}"
+        guidance[export..].contains("re-running"),
+        "refusal must say exporting it and re-running keeps the credential: {text}"
     );
     for stale_advice in ["preserve it first", "helm get values", "helm upgrade"] {
         assert!(

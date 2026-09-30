@@ -1,14 +1,18 @@
-"""Live proof that a real Slack PDF reaches the model through the worker.
+"""Live proofs against real Slack.
 
 The default tier proves that the production Slack transport refuses redirects.
-The live tier requires ``CURIE_LIVE_PDF_PROOF=1`` and the platform, Slack,
-and Valkey environment named in ``_REQUIRED_ENV``. Run both with
-``uv run pytest apps/worker/tests/test_live.py -q``. The external driver owns
-the isolated stack, Valkey database, worker, runner, and their teardown.
+The PDF proof requires ``CURIE_LIVE_PDF_PROOF=1`` and the platform, Slack, and
+Valkey environment named in ``_REQUIRED_ENV``; the external driver owns the
+isolated stack, Valkey database, worker, runner, and their teardown. The
+progress proof (ADR-0130) requires ``CURIE_LIVE_PROGRESS_PROOF=1`` and only the
+Slack environment named in ``_PROGRESS_REQUIRED_ENV``. Run them with
+``uv run pytest apps/worker/tests/test_live.py -q -s``; ``-s`` shows what the
+progress proof records.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +20,7 @@ import secrets
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,10 +36,28 @@ from aci_protocol import (
     ReplyHandle,
     TurnSource,
 )
+from channel_protocol import (
+    MESSAGE_VERSION,
+    PROGRESS_REPLY_WIRE_VERSION,
+    MilestoneClass,
+    OutboundMessage,
+    ProgressCard,
+    ProgressMilestone,
+    ProgressState,
+    ReplyPost,
+    ReplyTarget,
+)
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.attachments import SlackFileClient, SlackFileError
+from curie_worker.blocks import (
+    PROGRESS_CARD_BLOCK_ID_PREFIX,
+    PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
+)
+from curie_worker.reply_sink import TargetRoute
+from curie_worker.slack_sink import SlackReplyAdapter
 from redis import Redis
 from redis.exceptions import RedisError
+from slack_sdk.errors import SlackApiError
 
 _SLACK_API = "https://slack.com/api"
 _FILE_NAME = "proof.pdf"
@@ -538,3 +561,273 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
     problems = ([failure] if failure is not None else []) + cleanup_failures
     if problems:
         pytest.fail("; ".join(problems), pytrace=False)
+
+
+# --- ADR-0130: does Slack deduplicate an ambiguous progress post? ------------
+#
+# RECORDED 2026-09-29 at 0b26aa3e3bd5d0663267e4393030200d88ece156:
+# CURIE_LIVE_PROGRESS_PROOF=1 SLACK_BOT_TOKEN=<redacted>
+# SLACK_TEST_CHANNEL=<redacted> uv run pytest
+# apps/worker/tests/test_live.py::test_live_slack_client_msg_id_dedupes_an_ambiguous_retry
+# -q -s
+# The first post and its same-client_msg_id retry both answered ``ok: true``
+# with the same ``ts``; the fresh milestone answered with a different ``ts``.
+# Adapter results were first_ref_is_ts=true, second_ref_equals_first=true,
+# second_error=null and milestone_ref_is_new=true. The thread showed
+# messages_below_root=2, progress_cards=1 and milestones=1. The test deliberately
+# leaves the proof thread available for inspection; the authorized external
+# driver then deleted the root and its two replies and verified
+# roots=1, deleted=3, failed=0, remaining_roots=0. No credential or real Slack
+# identifier is retained in this record.
+
+_PROGRESS_REQUIRED_ENV = ("SLACK_BOT_TOKEN", "SLACK_TEST_CHANNEL")
+_PROGRESS_PROOF_DEADLINE_S = 60.0
+_PROGRESS_ROOT = "Curie progress idempotency proof (ADR-0130). Safe to ignore."
+
+
+@dataclass(frozen=True)
+class _ProgressProofConfig:
+    slack_token: str = field(repr=False)
+    slack_channel: str
+
+
+def _progress_proof_config() -> _ProgressProofConfig:
+    if os.environ.get("CURIE_LIVE_PROGRESS_PROOF") != "1":
+        pytest.skip(
+            "set CURIE_LIVE_PROGRESS_PROOF=1, SLACK_BOT_TOKEN and SLACK_TEST_CHANNEL "
+            "to run the live Slack client_msg_id proof"
+        )
+    missing = [name for name in _PROGRESS_REQUIRED_ENV if not os.environ.get(name)]
+    if missing:
+        pytest.fail(
+            "live progress proof prerequisites are incomplete: " + ", ".join(missing),
+            pytrace=False,
+        )
+    return _ProgressProofConfig(
+        slack_token=os.environ["SLACK_BOT_TOKEN"],
+        slack_channel=os.environ["SLACK_TEST_CHANNEL"],
+    )
+
+
+def _slack_answer(data: object) -> dict[str, Any]:
+    """The parts of a chat.postMessage answer the record needs, and no identifier.
+
+    ``channel`` and the echoed ``message`` carry the channel, bot and team ids,
+    so only the answer's own verdict fields and the message's ts and
+    client_msg_id are kept.
+    """
+
+    if not isinstance(data, dict):
+        return {"shape": type(data).__name__}
+    kept: dict[str, Any] = {
+        key: data[key] for key in ("ok", "ts", "error", "warning") if key in data
+    }
+    metadata = data.get("response_metadata")
+    if isinstance(metadata, dict):
+        kept["response_metadata"] = {
+            key: metadata[key] for key in ("messages", "warnings") if key in metadata
+        }
+    message = data.get("message")
+    if isinstance(message, dict):
+        kept["message"] = {
+            key: message[key] for key in ("ts", "client_msg_id") if key in message
+        }
+    kept["keys"] = sorted(data)
+    return kept
+
+
+def _progress_blocks_of(message: dict[str, Any]) -> set[str]:
+    kinds: set[str] = set()
+    for block in message.get("blocks") or []:
+        block_id = block.get("block_id") if isinstance(block, dict) else None
+        if not isinstance(block_id, str):
+            continue
+        if block_id.startswith(PROGRESS_CARD_BLOCK_ID_PREFIX):
+            kinds.add("card")
+        elif block_id.startswith(PROGRESS_MILESTONE_BLOCK_ID_PREFIX):
+            kinds.add("milestone")
+    return kinds
+
+
+def test_live_slack_client_msg_id_dedupes_an_ambiguous_retry() -> None:
+    """@spec ADR-0130 d4: an ambiguous progress post retried under its key is one message.
+
+    Drives the production ``SlackReplyAdapter`` against real Slack: a root
+    message, a progress card posted twice under one ``delivery_id`` (the retry
+    an outbox makes when the first answer was lost), and a milestone once under
+    a fresh one. It then reads the thread back with ``conversations.replies``.
+    The bot token needs ``chat:write`` and history and info read access to
+    ``SLACK_TEST_CHANNEL`` (``channels:*`` for a public channel, ``groups:*``
+    for a private one), and the bot must be a member. The test leaves its root
+    and replies available for inspection; the authorized external driver owns
+    deleting all three messages after it captures the printed evidence.
+
+    It prints what Slack answered each post, which is the record the comment
+    above this test is filled in from, and it fails unless the retry converged
+    on the first card and the thread shows exactly one card and one milestone.
+    """
+
+    config = _progress_proof_config()
+    deadline = time.monotonic() + _PROGRESS_PROOF_DEADLINE_S
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _ProofError("live progress proof exceeded its bounded deadline")
+        return min(15.0, left)
+
+    web = httpx.Client(follow_redirects=False)
+    answers: list[dict[str, Any]] = []
+    try:
+        identity = _slack_call(web, config.slack_token, "auth.test", timeout=remaining())
+        bot_user_id = identity.get("user_id")
+        if not isinstance(bot_user_id, str) or not bot_user_id:
+            raise _ProofError("Slack identity prerequisite returned no bot identity")
+        channel = _slack_call(
+            web,
+            config.slack_token,
+            "conversations.info",
+            timeout=remaining(),
+            data={"channel": config.slack_channel},
+        ).get("channel")
+        if not isinstance(channel, dict) or channel.get("is_member") is not True:
+            raise _ProofError("Slack channel prerequisite did not confirm bot membership")
+        root_ts = _slack_call(
+            web,
+            config.slack_token,
+            "chat.postMessage",
+            timeout=remaining(),
+            json_body={"channel": config.slack_channel, "text": _PROGRESS_ROOT},
+        ).get("ts")
+        if not isinstance(root_ts, str) or not root_ts:
+            raise _ProofError("Slack root post returned no timestamp")
+
+        sink = SlackReplyAdapter(config.slack_token)
+        client = sink._client_for(None)
+        original = client.chat_postMessage
+
+        async def recording_post(**kwargs: Any) -> Any:
+            attempt: dict[str, Any] = {
+                "client_msg_id": kwargs.get("client_msg_id"),
+                "with_blocks": kwargs.get("blocks") is not None,
+            }
+            try:
+                response = await original(**kwargs)
+            except SlackApiError as exc:
+                attempt["raised"] = _slack_answer(getattr(exc.response, "data", None))
+                answers.append(attempt)
+                raise
+            attempt["answered"] = _slack_answer(response.data)
+            answers.append(attempt)
+            return response
+
+        client.chat_postMessage = recording_post  # type: ignore[method-assign]
+
+        target = ReplyTarget(
+            kind="slack",
+            address=config.slack_channel,
+            conversation_id=root_ts,
+            reply_ref=root_ts,
+        )
+        card = ProgressCard(
+            kind="card",
+            state=ProgressState.INVESTIGATING,
+            summary="Proof card posted twice under one client_msg_id",
+            revision=1,
+            terminal=False,
+        )
+        card_delivery = str(uuid.uuid4())
+        card_post = ReplyPost(
+            version=PROGRESS_REPLY_WIRE_VERSION,
+            event="reply.post",
+            target=target,
+            message=OutboundMessage(version=MESSAGE_VERSION, text=card.summary),
+            requested_by=bot_user_id,
+            delivery_id=card_delivery,
+            progress=card,
+        )
+        first = asyncio.run(sink.emit(card_post, route=TargetRoute()))
+        second_ref: str | None = None
+        second_error: str | None = None
+        try:
+            second_ref = asyncio.run(sink.emit(card_post, route=TargetRoute())).ref
+        except SlackApiError as exc:
+            second_error = f"SlackApiError: {_slack_answer(getattr(exc.response, 'data', None))}"
+        milestone = ProgressMilestone(
+            kind="milestone",
+            milestone=MilestoneClass.EVIDENCE,
+            summary="Proof milestone posted once under a fresh client_msg_id",
+            ordinal=1,
+        )
+        milestone_ack = asyncio.run(
+            sink.emit(
+                ReplyPost(
+                    version=PROGRESS_REPLY_WIRE_VERSION,
+                    event="reply.post",
+                    target=target,
+                    message=OutboundMessage(version=MESSAGE_VERSION, text=milestone.summary),
+                    requested_by=bot_user_id,
+                    delivery_id=str(uuid.uuid4()),
+                    progress=milestone,
+                ),
+                route=TargetRoute(),
+            )
+        )
+
+        replies = _slack_call(
+            web,
+            config.slack_token,
+            "conversations.replies",
+            timeout=remaining(),
+            data={"channel": config.slack_channel, "ts": root_ts, "limit": "20"},
+        ).get("messages")
+        if not isinstance(replies, list):
+            raise _ProofError("Slack conversations.replies returned no message list")
+        below_root = [
+            message
+            for message in replies
+            if isinstance(message, dict) and message.get("ts") != root_ts
+        ]
+        cards = [m for m in below_root if "card" in _progress_blocks_of(m)]
+        milestones = [m for m in below_root if "milestone" in _progress_blocks_of(m)]
+
+        for index, attempt in enumerate(answers, start=1):
+            print(f"PROGRESS-PROOF chat.postMessage attempt {index}: {json.dumps(attempt)}")
+        print(
+            "PROGRESS-PROOF adapter results: "
+            + json.dumps(
+                {
+                    "first_ref_is_ts": bool(first.ref),
+                    "second_ref_equals_first": second_ref == first.ref,
+                    "second_error": second_error,
+                    "milestone_ref_is_new": bool(milestone_ack.ref)
+                    and milestone_ack.ref != first.ref,
+                }
+            )
+        )
+        print(
+            "PROGRESS-PROOF thread: "
+            + json.dumps(
+                {
+                    "messages_below_root": len(below_root),
+                    "progress_cards": len(cards),
+                    "milestones": len(milestones),
+                }
+            )
+        )
+
+        record = json.dumps({"answers": answers, "second_error": second_error})
+        assert first.ref, record
+        assert second_error is None, (
+            "the retry under the same client_msg_id raised; _adopt_posted_ts must "
+            f"handle this answer before the draft can merge: {record}"
+        )
+        assert second_ref == first.ref, f"the retry did not converge on the first card: {record}"
+        assert milestone_ack.ref and milestone_ack.ref != first.ref, record
+        assert len(cards) == 1, f"the thread shows {len(cards)} progress cards: {record}"
+        assert len(milestones) == 1, record
+        assert len(below_root) == 2, record
+    except _ProofError as exc:
+        pytest.fail(str(exc), pytrace=False)
+    finally:
+        web.close()

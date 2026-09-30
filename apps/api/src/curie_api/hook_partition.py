@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -235,39 +234,3 @@ def derive_partition(
             "letter or a digit",
         )
     return partition
-
-
-def conversation_id(agent_id: uuid.UUID, hook: str, partition: str | None = None) -> str:
-    """The thread a hook delivery lands on.
-
-    Per HOOK by default rather than per delivery, and that choice is load-bearing
-    in two directions. Per delivery would claim a fresh sandbox for every event,
-    and two rapid firings would run concurrently with no ordering at all. Sharing
-    one thread instead means a hook reuses its session and a second firing
-    arriving mid-run defers until the first finishes, which is exactly ADR-0079's
-    "jobs are outputs, not steering inputs" applied to a hook competing with
-    itself.
-
-    ADR-0134 narrows that to per PARTITION where the operator asks for it. A
-    partition is a thread with the lifetime a Slack thread ts has: the deliveries
-    about one pull request still serialize against each other, while deliveries
-    about different pull requests no longer do. Which is why a partition value
-    must be a stable identity of the thing and never a run id or a timestamp.
-
-    The three-segment prefix is preserved verbatim under a partition, so a
-    partitioned id is still disjoint from the agent's Slack thread ids and a hook
-    can never land in the middle of a human conversation.
-
-    Args:
-        agent_id: The agent this hook belongs to.
-        hook: The validated hook name.
-        partition: The derived partition value, or None for the unpartitioned id.
-
-    Returns:
-        The conversation key.
-    """
-
-    unpartitioned = f"hook:{agent_id}:{hook}"
-    if partition is None:
-        return unpartitioned
-    return f"{unpartitioned}:{partition}"

@@ -4,6 +4,8 @@ Date: 2026-09-20
 
 Status: Accepted
 
+The acceptance condition, the bounded SET LOCAL probe on the pooled connection factory, is still to be run.
+
 Accepted 2026-09-21 with explicit maintainer approval from Brian Conn, recorded
 on the publishing pull request (PR #2848, commit `9eda2941`). The decision was
 first published on `main` as ADR 0155; it is republished here on `next`, the
@@ -13,7 +15,7 @@ bringing `main`'s own ADR 0155 onto `next` at its original number and pushing
 this republish's number from 0162 (already reused by `next`'s own renumbered
 "WorkItems own durable execution identity" ADR during that reconciliation) to
 0166, the next free number as of this merge. The body below is that text,
-unchanged.
+with the Draft wording in the consequences aligned to this Accepted status.
 
 ## Context
 
@@ -182,8 +184,8 @@ tolerate an older runner.
 4. Eleven ordered, independently reviewable changes follow from this decision,
    each a migration plus a minimal module, and the system stays deployable after
    every one. The realizing code paths are tracked as a linked issue set filed
-   against this ADR at acceptance, per the division of labor in `AGENTS.md`; this
-   Draft authorizes none of them.
+   against this ADR at acceptance, per the division of labor in `AGENTS.md`.
+   This Accepted ADR authorizes that work. The issue set tracks it.
 5. The row level security step carries the highest blast radius in the set,
    because a misconfigured role or a missing `SET LOCAL` locks out a working
    deployment. It lands last, after every column it depends on exists, and it
@@ -191,10 +193,11 @@ tolerate an older runner.
 6. `packages/aci-protocol` gains additive fields on the queued turn and nothing
    else, under the existing semver and wire lock discipline
    ([ADR 0036](0036-aci-semver-and-reader-policy.md)).
-7. This ADR is a Draft. Per
+7. This ADR is Accepted. Per
    [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) as amended
    by [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
-   it authorizes no implementation until a maintainer publishes it as Accepted.
+   a maintainer has published it as Accepted, and that publication authorizes
+   implementation.
 
 ## Alternatives considered
 

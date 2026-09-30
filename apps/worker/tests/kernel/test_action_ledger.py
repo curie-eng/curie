@@ -11,26 +11,22 @@ ledger is about the signal the ledger must not disturb.
 from __future__ import annotations
 
 import asyncio
-import uuid
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, SideEffectFlag, TurnSource
+import pytest
+from aci_protocol import ErrorEvent, Final, SessionStatus, SideEffectFlag
 from curie_worker.actions import ActionBackendError, RecordedAction
 
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from queue_fixtures import qevent as _qevent  # noqa: E402
+
 DONE = SessionStatus.DONE
-
-
-def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> QueuedTurn:
-    return QueuedTurn(
-        event_id=event_id or uuid.uuid4().hex,
-        conversation_id=thread,
-        author="U1",
-        text=text,
-        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
-        received_at="2026-07-05T00:00:00+00:00",
-        source=TurnSource.SLACK,
-    )
+FAIL = SessionStatus.CLASSIFIED_FAILURE
 
 
 @dataclass
@@ -300,5 +296,153 @@ def test_a_call_that_never_came_back_is_not_on_the_receipt(make_harness) -> None
             await h.kernel.process_event(_qevent("scale it"))
 
             assert h.sink.last_text == "done"
+
+    asyncio.run(go())
+
+
+# --- The install's receipt mode (ADR-0180) ------------------------------------
+#
+# The mode is read where the reply text is assembled and nowhere else, so every
+# test here pairs what the person sees with what the platform still did: the
+# ledger rows and the no-retry marker must be the same in every mode.
+
+
+def _failed_call(call_id: str, tool: str = "file_document") -> list[SideEffectFlag]:
+    """The two frames of a call that reported failure."""
+
+    return [
+        SideEffectFlag(
+            tool=tool,
+            call_id=call_id,
+            arguments={"name": "acme-invoice.pdf"},
+            detail="non-idempotent tool executed",
+        ),
+        SideEffectFlag(
+            tool=tool,
+            call_id=call_id,
+            failed=True,
+            result={"ok": False, "summary": "filed acme-invoice.pdf"},
+            detail="non-idempotent tool completed",
+        ),
+    ]
+
+
+def _succeeded_and_failed() -> list[object]:
+    return [
+        *_call("toolu_01"),
+        *_failed_call("toolu_02"),
+        Final(text="done", status=DONE),
+    ]
+
+
+def test_all_mode_replies_exactly_as_the_default_install_does(make_harness) -> None:
+    """An explicit `all` is the default, byte for byte, on the same turn."""
+
+    async def go() -> None:
+        replies: list[str | None] = []
+        for overrides in ({}, {"turn_receipt": "all"}):
+            recorder = FakeRecorder()
+            async with make_harness(actions=recorder, **overrides) as h:
+                h.runner.default_script = _succeeded_and_failed()
+                await h.kernel.process_event(_qevent("file it", thread=f"th-{len(replies)}"))
+                replies.append(h.sink.last_text)
+
+        assert replies[0] == replies[1]
+        assert replies[0] == (
+            "done\n\n"
+            "_What I changed:_\n"
+            "• called `scale_deployment` — can be undone\n"
+            "• filed acme-invoice.pdf — failed — check before retrying"
+        )
+
+    asyncio.run(go())
+
+
+def test_failures_mode_ends_a_turn_with_nothing_failed_on_its_answer(make_harness) -> None:
+    """The staging call that filed nothing no longer trails the answer (#3462)."""
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder, turn_receipt="failures") as h:
+            h.runner.default_script = [
+                *_call("toolu_01", tool="stage_file"),
+                Final(text="Nothing was filed.", status=DONE),
+            ]
+            event = _qevent("stage it")
+            await h.kernel.process_event(event)
+
+            assert h.sink.last_text == "Nothing was filed."
+            # Recorded and marked exactly as before: only the reply changed.
+            assert [r["frame"].call_id for r in recorder.recorded] == ["toolu_01"]
+            assert [action_id for action_id, _ in recorder.completed] == ["a1"]
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_failures_mode_keeps_only_the_failed_line(make_harness) -> None:
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder, turn_receipt="failures") as h:
+            h.runner.default_script = _succeeded_and_failed()
+            event = _qevent("file it")
+            await h.kernel.process_event(event)
+
+            assert h.sink.last_text == (
+                "done\n\n"
+                "_What I changed:_\n"
+                "• filed acme-invoice.pdf — failed — check before retrying"
+            )
+            assert [action_id for action_id, _ in recorder.completed] == ["a1", "a2"]
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_off_mode_replies_with_the_answer_alone_even_after_a_failed_call(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder, turn_receipt="off") as h:
+            h.runner.default_script = _succeeded_and_failed()
+            event = _qevent("file it")
+            await h.kernel.process_event(event)
+
+            assert h.sink.last_text == "done"
+            # Both calls are still one record each, both completed.
+            assert [r["frame"].call_id for r in recorder.recorded] == ["toolu_01", "toolu_02"]
+            assert [action_id for action_id, _ in recorder.completed] == ["a1", "a2"]
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["all", "failures", "off"])
+def test_a_side_effect_still_blocks_retry_in_every_receipt_mode(make_harness, mode) -> None:
+    """ADR-0180 decision 5: the mode never reaches the no-retry rule.
+
+    A normally retryable classification after a side effect escalates to a
+    human after exactly one attempt, with the marker persisted, whichever mode
+    the install chose.
+    """
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder, turn_receipt=mode) as h:
+            h.runner.default_script = [
+                *_call("toolu_01"),
+                ErrorEvent(message="boom", classification="runner-error"),
+                Final(text="failed", status=FAIL),
+            ]
+            event = _qevent("scale it")
+            await h.kernel.process_event(event)
+
+            assert h.config.turn_receipt == mode
+            assert h.runner.opened == ["scale it"]
+            assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert [r["frame"].call_id for r in recorder.recorded] == ["toolu_01"]
 
     asyncio.run(go())

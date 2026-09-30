@@ -20,6 +20,9 @@ OUTPUT_KEYS = {
     "cluster": "cluster",
     "released-upgrade": "released_upgrade",
 }
+# Jobs behind these tiers each boot a kind cluster. Callers omit them when
+# the run should not pay for that.
+KIND_TIERS = frozenset({"cluster", "released-upgrade"})
 
 
 class RegistryError(ValueError):
@@ -153,6 +156,14 @@ def _needs_images(paths: list[str]) -> bool:
     return False
 
 
+RUNTIME_ASSERTION_DIR = "charts/curie/ci/runtime"
+
+
+def _is_runtime_assertion(path: str) -> bool:
+    parent, _, name = path.rpartition("/")
+    return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
+
+
 def _needs_cli_release(paths: list[str]) -> bool:
     if not paths:
         return True
@@ -227,6 +238,7 @@ def _render(
     pytest_needed: bool,
     images_needed: bool,
     cli_release_needed: bool,
+    released_upgrade_full: bool,
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -234,6 +246,9 @@ def _render(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
+    lines.append(
+        f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -244,6 +259,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
+    parser.add_argument(
+        "--omit-kind",
+        action="store_true",
+        help="Drop the cluster and released-upgrade tiers.",
+    )
     return parser
 
 
@@ -251,6 +271,7 @@ def _run() -> None:
     args = _parser().parse_args()
     registry = _load_registry(args.registry)
 
+    paths: list[str] = []
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -272,12 +293,31 @@ def _run() -> None:
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
 
+    if args.omit_kind:
+        selected.difference_update(KIND_TIERS)
+        # An added or changed cluster runtime assertion must run on the enforcing
+        # cluster rung before `E2E required` can pass (#3391), so omitting kind
+        # never drops the tier that proves it.
+        if any(_is_runtime_assertion(path) for path in paths):
+            selected.add("cluster")
+
+    # A pull request that selects released-upgrade runs one upgrade matrix
+    # smoke shard. The full matrix and the released chart upgrade jobs run only
+    # on pushes and dispatches (the nightly), which are the --push runs.
+    released_upgrade_full = args.push and "released-upgrade" in selected
+
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         raise RegistryError("GITHUB_OUTPUT is required")
     with Path(output_path).open("a", encoding="utf-8") as stream:
         stream.write(
-            _render(selected, pytest_needed, images_needed, cli_release_needed)
+            _render(
+                selected,
+                pytest_needed,
+                images_needed,
+                cli_release_needed,
+                released_upgrade_full,
+            )
         )
 
 

@@ -6,8 +6,9 @@ import json
 import socket
 import threading
 import urllib.parse
+import warnings
 from collections.abc import Callable
-from http.client import HTTPResponse
+from http.client import HTTPResponse, RemoteDisconnected
 
 import pytest
 from _support import (
@@ -21,6 +22,7 @@ from _support import (
     update,
     wait_until,
 )
+from curie_mail_adapter import egress
 from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
 
@@ -116,31 +118,64 @@ def test_oversize_rejection_survives_a_raised_configured_limit(
 
 
 def test_incomplete_headers_release_the_bounded_request_slots(
-    egress_url: str,
+    egress_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Held header blocks exhaust the slots, and the header deadline frees them.
+
+    The two halves use different header deadlines so neither races the other:
+    saturation holds slots under a deadline far longer than any runner stall,
+    while release uses a short one and waits for the server to cut each
+    trickling connection, proving the deadline is absolute rather than idle.
+    """
     parsed = urllib.parse.urlsplit(egress_url)
+    host = parsed.hostname or "127.0.0.1"
     sockets: list[socket.socket] = []
     stop = threading.Event()
     tricklers: list[threading.Thread] = []
 
     def trickle(connection: socket.socket) -> None:
-        while not stop.wait(0.25):
+        while not stop.wait(0.1):
             try:
                 connection.sendall(b"x")
             except OSError:
                 return
 
-    try:
+    def hold_slots() -> list[socket.socket]:
+        held: list[socket.socket] = []
         for _ in range(MAX_CONCURRENT_REQUESTS):
-            connection = socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port))
+            connection = socket.create_connection((host, parsed.port))
             connection.sendall(b"POST / HTTP/1.1\r\nHost: adapter\r\n")
+            held.append(connection)
             sockets.append(connection)
+        return held
+
+    def server_closed(connection: socket.socket) -> bool:
+        connection.settimeout(10.0)
+        try:
+            while connection.recv(1024):
+                pass
+        except TimeoutError:
+            return False
+        except OSError:
+            pass
+        return True
+
+    try:
+        monkeypatch.setattr(egress, "REQUEST_HEADER_SECONDS", 60.0)
+        saturating = hold_slots()
+        assert wait_until(lambda: get(egress_url)[0] == 503)
+        for connection in saturating:
+            connection.close()
+        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200)
+
+        monkeypatch.setattr(egress, "REQUEST_HEADER_SECONDS", 0.5)
+        expiring = hold_slots()
+        for connection in expiring:
             thread = threading.Thread(target=trickle, args=(connection,), daemon=True)
             thread.start()
             tricklers.append(thread)
-
-        assert wait_until(lambda: get(egress_url)[0] == 503)
-        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200, timeout=4.0)
+        assert all(server_closed(connection) for connection in expiring)
+        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200)
     finally:
         stop.set()
         for connection in sockets:
@@ -164,17 +199,53 @@ def test_chunked_authenticated_body_is_rejected(
         + f"X-Curie-Adapter-Secret: {EGRESS_SECRET}\r\n".encode()
         + b"Transfer-Encoding: chunked\r\n\r\n"
     )
-    try:
-        with socket.create_connection(
-            (parsed.hostname or "127.0.0.1", parsed.port), timeout=10
-        ) as connection:
-            connection.sendall(request)
-            response = HTTPResponse(connection)
-            response.begin()
-            status = response.status
-            response.read()
-    except OSError as error:
-        pytest.fail(f"chunked request transport failed before a response: {error}")
+    # A clean disconnect is not a refusal, so it is never accepted as a pass.
+    # It is retried because a loaded runner can miss the adapter's two-second
+    # incomplete-header deadline before the handler parses the request. A
+    # handler crash before the response can surface the same way, so the retry
+    # bounds that exposure rather than eliminating it: three clean disconnects
+    # in a row still fail.
+    disconnect_attempts: list[int] = []
+    for attempt in range(1, 4):
+        status = 0
+        remote_disconnected = False
+        try:
+            with socket.create_connection(
+                (parsed.hostname or "127.0.0.1", parsed.port), timeout=10
+            ) as connection:
+                connection.sendall(request)
+                response = HTTPResponse(connection)
+                response.begin()
+                status = response.status
+                response.read()
+        # RemoteDisconnected subclasses OSError, so this clause must come first.
+        except RemoteDisconnected:
+            remote_disconnected = True
+        except OSError as error:
+            pytest.fail(
+                "chunked request transport failed before a response on attempt "
+                f"{attempt}: {type(error).__name__}: {error}"
+            )
+        if remote_disconnected:
+            disconnect_attempts.append(attempt)
+            continue
+        assert status == 400, (
+            f"chunked request was not refused with 400 on attempt {attempt}: "
+            f"status={status}"
+        )
+        if disconnect_attempts:
+            # stacklevel=1 attributes the warning to this warn call inside the
+            # test; stacklevel=2 would point one frame up, into pytest's runner.
+            warnings.warn(
+                "chunked request received 400 only after RemoteDisconnected on "
+                f"attempt(s) {', '.join(str(number) for number in disconnect_attempts)}",
+                stacklevel=1,
+            )
+        break
+    else:
+        pytest.fail(
+            "chunked request never received the 400 refusal after 3 attempts; "
+            "transport_error=RemoteDisconnected"
+        )
 
-    assert status == 400
     assert mail.replies == []

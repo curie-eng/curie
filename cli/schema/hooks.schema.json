@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/hooks/v1.json",
+  "title": "curie hooks --json",
+  "description": "The dry-run plan, hook configuration, or hook signing secret returned by hook operator commands.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": { "const": true },
+        "plan": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["dry_run", "plan"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "agent": { "type": "string" },
+        "hook_partitions": { "type": ["object", "null"] },
+        "source_bindings": { "type": ["object", "null"] }
+      },
+      "required": ["id", "agent", "hook_partitions", "source_bindings"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "secret": { "type": "string" }
+      },
+      "required": ["secret"]
+    }
+  ]
+}

@@ -42,7 +42,7 @@ DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_TENANT_UUID = uuid.UUID(DEFAULT_TENANT_ID)
 STATIC_ID = "00000000-0000-0000-0000-000000000101"
 CANARY = "xoxb-CANARY-9f3a"
-RAW_TOKEN = "xoxb-123-SECRET"
+RAW_TOKEN = "xoxb-123-SECRET"  # gitleaks:allow -- fabricated test fixture, never a real Slack token
 # Rows this module creates outside provider_installations carry this prefix so
 # the cleanup fixture removes exactly them and never the default tenant.
 MARK = "pi-test-"
@@ -452,14 +452,24 @@ def _committed_tenant_and_principal() -> tuple[str, str]:
 # --- routes ----------------------------------------------------------------
 
 
+# A fixed id, not uuid.uuid4(): the id is collected into pytest's parametrize
+# ids at import time, and CI runs this suite under pytest-xdist (-n 4). A
+# fresh random value per worker process makes each worker collect a
+# DIFFERENT test id for the same case, which xdist reports as "different
+# tests were collected between gw.. and gw.." and fails the whole run. Safe
+# to reuse one id everywhere: require_api_key runs as a router-level
+# dependency, before any path operation touches the database.
+_MISSING_ID = "00000000-0000-0000-0000-0000000000fe"
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
         ("post", BASE),
         ("get", BASE),
-        ("get", f"{BASE}/{uuid.uuid4()}"),
-        ("patch", f"{BASE}/{uuid.uuid4()}"),
-        ("delete", f"{BASE}/{uuid.uuid4()}"),
+        ("get", f"{BASE}/{_MISSING_ID}"),
+        ("patch", f"{BASE}/{_MISSING_ID}"),
+        ("delete", f"{BASE}/{_MISSING_ID}"),
     ],
 )
 def test_routes_require_api_key(api: TestClient, method: str, path: str) -> None:
@@ -912,9 +922,9 @@ def _regclass(name: str) -> str | None:
 
 def test_bootstrap_tolerates_missing_table(isolated_migration_db: None) -> None:
     config = _alembic_config()
-    command.upgrade(config, "0052")
+    command.upgrade(config, "0071")
     try:
-        # A rolling upgrade can boot this image before 0053 is applied.
+        # A rolling upgrade can boot this image before this migration is applied.
         assert asyncio.run(_bootstrap_once(CANARY)) is False
         assert _regclass("curie.provider_installations") is None
     finally:
@@ -928,10 +938,13 @@ def test_lifespan_retries_until_table_appears(
     isolated_migration_db: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     config = _alembic_config()
-    command.upgrade(config, "0052")
+    # 0071, not further below: schema_min has since risen to 0070, so a real
+    # boot can only be one migration behind this one, never at an arbitrary
+    # earlier revision.
+    command.upgrade(config, "0071")
     try:
         with _app(env, CANARY):
-            # Boot succeeded below 0053; the migration now lands while the API runs.
+            # Boot succeeded below this migration; it now lands while the API runs.
             command.upgrade(config, "head")
             deadline = time.monotonic() + 15
             rows: list[dict[str, Any]] = []
@@ -1130,7 +1143,7 @@ _PASTED_CREDENTIALS = [
     "k8s-secret:x/lin_api_abc123",
     "k8s-secret:x/sk_live_abc",
     "k8s-secret:x/rk_live_abc",
-    "k8s-secret:x/AIzaSyA1b2c3",
+    "k8s-secret:x/AIzaSyA1b2c3",  # gitleaks:allow -- fabricated, not a real Google key
     "k8s-secret:x/eyJhbGciOiJIUzI1NiJ9.e30.sig",
     "env:AKIAIOSFODNN7EXAMPLE",
     "env:ASIAIOSFODNN7EXAMPLE",

@@ -74,6 +74,8 @@ class _FakeApi:
         self.request_timeouts: list[tuple[str, float]] = []
         self.quota: object | None = None
         self.quota_error: BaseException | None = None
+        self.pod: object | None = None
+        self.pod_error: BaseException | None = None
 
     def create_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, body: dict[str, Any]
@@ -120,13 +122,23 @@ class _FakeApi:
         *,
         _request_timeout: float,
     ) -> object:
-        self.request_timeouts.append(
-            (f"get:resourcequotas:{namespace}:{name}", _request_timeout)
-        )
+        self.request_timeouts.append((f"get:resourcequotas:{namespace}:{name}", _request_timeout))
         if self.quota_error is not None:
             raise self.quota_error
         assert self.quota is not None
         return self.quota
+
+    def read_namespaced_pod(
+        self,
+        name: str,
+        namespace: str,
+        *,
+        _request_timeout: float,
+    ) -> object:
+        self.request_timeouts.append((f"get:pods:{namespace}:{name}", _request_timeout))
+        if self.pod_error is not None:
+            raise self.pod_error
+        return self.pod
 
 
 def _client(api: _FakeApi) -> KubernetesSandboxClient:
@@ -272,9 +284,7 @@ def test_quota_headroom_reads_exact_quota_and_requires_every_resource(
     client = _client(api)
 
     assert client.quota_has_headroom(rejection, request_timeout_seconds=0.75)
-    assert api.request_timeouts == [
-        ("get:resourcequotas:test-ns:curie-sandbox-quota", 0.75)
-    ]
+    assert api.request_timeouts == [("get:resourcequotas:test-ns:curie-sandbox-quota", 0.75)]
 
 
 @pytest.mark.parametrize(
@@ -286,9 +296,7 @@ def test_quota_headroom_reads_exact_quota_and_requires_every_resource(
             used={"pods": "2"},
             hard={"pods": "2"},
         ),
-        QuotaRejection(
-            quota_name="curie-sandbox-quota", requested={}, used={}, hard={}
-        ),
+        QuotaRejection(quota_name="curie-sandbox-quota", requested={}, used={}, hard={}),
         QuotaRejection(
             quota_name="curie-sandbox-quota",
             requested={"pods": "1"},
@@ -424,9 +432,7 @@ def test_combined_quota_headroom_fails_when_one_resource_remains_full() -> None:
             status_used={"pods": "1"},
         ),
         _resource_quota(spec_hard={}, status_used={"pods": "1"}),
-        _resource_quota(
-            spec_hard={"pods": "2"}, status_hard={}, status_used={"pods": "1"}
-        ),
+        _resource_quota(spec_hard={"pods": "2"}, status_hard={}, status_used={"pods": "1"}),
         _resource_quota(spec_hard={"pods": "2"}, status_used={}),
         _resource_quota(
             spec_hard={"pods": "2"},
@@ -502,9 +508,7 @@ def test_bundle_ref_targets_init_containers_by_name() -> None:
     assert {"name": "CURIE_BUNDLE_REF", "value": "bundles/x.tar.gz"} in entries
 
     # And each bundle init container receives it by explicit containerName.
-    named = {
-        (e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e
-    }
+    named = {(e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e}
     for container in BUNDLE_INIT_CONTAINERS:
         assert named[(container, "CURIE_BUNDLE_REF")] == "bundles/x.tar.gz"
 
@@ -530,9 +534,7 @@ def test_bundle_version_reaches_the_runner_not_the_init_containers() -> None:
     entries = _env_entries(api)
 
     assert {"name": "CURIE_BUNDLE_VERSION", "value": "abc123def456"} in entries
-    named = {
-        (e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e
-    }
+    named = {(e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e}
     assert all(key[1] != "CURIE_BUNDLE_VERSION" for key in named)
 
 
@@ -605,6 +607,7 @@ def test_host_credentials_are_never_written_to_the_claim(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -619,6 +622,56 @@ def test_host_credentials_are_never_written_to_the_claim(
     assert denied_names.isdisjoint(claim_env_names)
     assert "CURIE_BUDGET" in claim_env_names
     assert "CURIE_CREDENTIALS" not in claim_env_names
+
+
+def test_the_caller_token_rides_the_claim_and_its_signing_key_never_does() -> None:
+    # ADR-0168 decision 7. The token is the sandbox's own short-lived identity
+    # and the runner needs it, so it is a claim entry like the runner token.
+    # The key that signs it is the worker's, and would let a sandbox mint a
+    # token naming any agent.
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-caller",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    entries = _env_entries(api)
+    assert {"name": "CURIE_CONNECTOR_CALLER_TOKEN", "value": "cct.payload.signature"} in entries
+    assert all(e.get("name") != "CURIE_CONNECTOR_CALLER_SIGNING_KEY" for e in entries)
+
+
+def test_no_slack_identity_token_reaches_the_claim() -> None:
+    """The k8s counterpart of
+    `test_create_claim_excludes_every_slack_identity_token_from_child_env`:
+    the same `filter_agent_child_env` backs both substrates, and this pins
+    the k8s claim's call site against the indexed Slack token prefixes."""
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-slack-identities",
+        pool="pool",
+        env={
+            "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+            "CURIE_SLACK_BOT_TOKEN__1": "placeholder",
+            "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+            "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+            "CURIE_SLACK_IDENTITIES": "[]",
+        },
+    )
+
+    claim_env_names = {entry["name"] for entry in _env_entries(api)}
+    assert claim_env_names.isdisjoint(
+        {
+            "CURIE_SLACK_BOT_TOKEN__0",
+            "CURIE_SLACK_BOT_TOKEN__1",
+            "CURIE_SLACK_APP_TOKEN__0",
+            "CURIE_SLACK_SIGNING_SECRET__0",
+        }
+    )
+    assert "CURIE_SLACK_IDENTITIES" in claim_env_names
 
 
 def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
@@ -688,9 +741,7 @@ def test_claim_view_classifies_live_resource_quota_condition() -> None:
         hard={"limits.cpu": "1m"},
     )
     assert view.ready_reason == "ReconcilerError"
-    assert view.ready_message == LIVE_QUOTA_REJECTED_CLAIM["status"]["conditions"][0][
-        "message"
-    ]
+    assert view.ready_message == LIVE_QUOTA_REJECTED_CLAIM["status"]["conditions"][0]["message"]
 
 
 def test_claim_view_classifies_issue_example_at_eight_of_eight() -> None:
@@ -711,28 +762,21 @@ def test_claim_view_classifies_issue_example_at_eight_of_eight() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("status", "True"), ("type", "Provisioned")],
+    [
+        pytest.param("status", "True", id="status-true"),
+        pytest.param("type", "Provisioned", id="type-provisioned"),
+        pytest.param("reason", "ProvisioningFailed", id="another-reason"),
+        pytest.param(
+            "message",
+            'Error seen: pods "curie-thread-example" is forbidden: User "system:serviceaccount:'
+            'curie1572:worker" cannot create resource "pods"',
+            id="reconciler-error-without-exceeded-quota-clause",
+        ),
+    ],
 )
 def test_quota_message_requires_failed_ready_condition(field: str, value: str) -> None:
     claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
     claim["status"]["conditions"][0][field] = value
-
-    assert _claim_view(claim).quota_rejection is None
-
-
-def test_quota_message_with_another_reason_is_not_classified() -> None:
-    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
-    claim["status"]["conditions"][0]["reason"] = "ProvisioningFailed"
-
-    assert _claim_view(claim).quota_rejection is None
-
-
-def test_reconciler_error_without_exceeded_quota_clause_is_not_classified() -> None:
-    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
-    claim["status"]["conditions"][0]["message"] = (
-        'Error seen: pods "curie-thread-example" is forbidden: User "system:serviceaccount:'
-        'curie1572:worker" cannot create resource "pods"'
-    )
 
     assert _claim_view(claim).quota_rejection is None
 
@@ -840,3 +884,66 @@ def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
     assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
     assert "additionalPodMetadata" not in body["spec"]
     assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"
+
+
+def _pod(*conditions: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(status=SimpleNamespace(conditions=list(conditions)))
+
+
+def _condition(type_: str, status: str, reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        type=type_,
+        status=status,
+        reason=reason,
+        message="0/1 nodes are available: 1 Insufficient cpu.",
+    )
+
+
+def test_unschedulable_pod_reports_the_scheduler_message() -> None:
+    """#3169: PodScheduled=False with reason Unschedulable is the no-room signal."""
+
+    api = _FakeApi()
+    api.pod = _pod(_condition("PodScheduled", "False", "Unschedulable"))
+
+    assert (
+        _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5)
+        == "0/1 nodes are available: 1 Insufficient cpu."
+    )
+    assert api.request_timeouts == [("get:pods:test-ns:sbx-1", 0.5)]
+
+
+@pytest.mark.parametrize(
+    "pod",
+    [
+        _pod(_condition("PodScheduled", "True")),
+        _pod(_condition("PodScheduled", "False", "SchedulerError")),
+        _pod(_condition("Ready", "False", "Unschedulable")),
+        _pod(),
+        SimpleNamespace(status=None),
+        None,
+    ],
+    ids=["scheduled", "other_reason", "other_type", "no_conditions", "no_status", "none"],
+)
+def test_a_scheduled_or_unknown_pod_is_not_unschedulable(pod: object) -> None:
+    api = _FakeApi()
+    api.pod = pod
+
+    assert _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        k8s_module.k8s_client.ApiException(status=404),
+        k8s_module.k8s_client.ApiException(status=403),
+        TimeoutError("pod read timed out"),
+    ],
+    ids=["missing", "forbidden", "timeout"],
+)
+def test_an_unreadable_pod_is_not_unschedulable(error: BaseException) -> None:
+    """Unknown pod state keeps today's claim-timeout failure, never a defer."""
+
+    api = _FakeApi()
+    api.pod_error = error
+
+    assert _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5) is None

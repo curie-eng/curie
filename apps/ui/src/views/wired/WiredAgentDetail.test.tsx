@@ -319,6 +319,95 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
       }),
     );
   });
+
+  // ADR-0168 decision 3: the read side returns a binding's identity, and the
+  // console shows it beside the address (only when it is not "default",
+  // since that is the pre-ADR Slack app every install already had -- showing
+  // it everywhere would carry no new information) and forwards it as the
+  // selector on a move or a removal.
+  it("shows a non-default identity beside the address and forwards it as the move selector", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [{ kind: "slack", address: "C0EXAMPLE1", adapter: "finance" }],
+      } as unknown as AgentOut,
+    ]);
+    renderDetail();
+
+    expect(await screen.findByTestId("channel-identity")).toHaveTextContent("finance");
+
+    const input = await screen.findByTestId("channel-input");
+    await user.clear(input);
+    await user.type(input, "C0EXAMPLE2");
+    await user.click(screen.getByTestId("channel-save"));
+    await waitFor(() =>
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "slack", address: "C0EXAMPLE1", adapter: "finance" },
+        { kind: "slack", address: "C0EXAMPLE2" },
+      ),
+    );
+  });
+
+  it("forwards a binding's identity as the remove selector", async () => {
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [{ kind: "slack", address: "C0EXAMPLE1", adapter: "finance" }],
+      } as unknown as AgentOut,
+    ]);
+    renderDetail();
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("surface-remove-0"));
+    await waitFor(() =>
+      expect(removeAgentSurface).toHaveBeenCalledWith("a1", {
+        kind: "slack",
+        address: "C0EXAMPLE1",
+        adapter: "finance",
+      }),
+    );
+  });
+
+  // A default (or unset) identity shows no suffix at all -- the ordinary case
+  // today, and the negative control for the test above.
+  it("shows no identity suffix for the default identity", async () => {
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [{ kind: "slack", address: "C0EXAMPLE1", adapter: "default" }],
+      } as unknown as AgentOut,
+    ]);
+    renderDetail();
+    expect(await screen.findByTestId("channel-input")).toHaveValue("C0EXAMPLE1");
+    expect(screen.queryByTestId("channel-identity")).not.toBeInTheDocument();
+  });
+
+  // Two bindings on the same address, distinguished only by identity, must
+  // render as two rows rather than one clobbering the other (ADR-0168
+  // decision 3). The editable rows key on position (#1525), so a shared pair
+  // cannot collide them.
+  it("renders two rows for two identities bound to the same address", async () => {
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [
+          { kind: "slack", address: "C0EXAMPLE1", adapter: "default" },
+          { kind: "slack", address: "C0EXAMPLE1", adapter: "finance" },
+        ],
+      } as unknown as AgentOut,
+    ]);
+    renderDetail();
+
+    const inputs = await screen.findAllByTestId("channel-input");
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toHaveValue("C0EXAMPLE1");
+    expect(inputs[1]).toHaveValue("C0EXAMPLE1");
+    // Exactly one of the two rows carries a non-default identity badge.
+    expect(await screen.findAllByTestId("channel-identity")).toHaveLength(1);
+    expect(screen.getByTestId("channel-identity")).toHaveTextContent("finance");
+  });
 });
 
 describe("WiredAgentDetail — model edit (#254)", () => {

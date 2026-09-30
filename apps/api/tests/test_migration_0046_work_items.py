@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0045"
 REVISION = "0046"
 REPO = "acme-corp/acme-bot"
@@ -24,28 +18,9 @@ CONVERSATION = "slack:C0EXAMPLE1:1700000000.000100"
 STAMP = datetime(2026, 9, 18, 12, tzinfo=UTC)
 
 
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                return [dict(row) for row in result.mappings().all()] if result.returns_rows else []
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
-
-
 def _rejects(statement: str, params: dict[str, Any]) -> None:
     with pytest.raises(DBAPIError) as excinfo:
-        _sql(statement, params)
+        sql_dicts(statement, params)
     assert getattr(excinfo.value.orig, "sqlstate", None) in {
         "23502",
         "23503",
@@ -57,7 +32,7 @@ def _rejects(statement: str, params: dict[str, Any]) -> None:
 
 def _seed_agent() -> uuid.UUID:
     agent_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"work-item-migration-{agent_id.hex[:8]}"},
     )
@@ -68,13 +43,13 @@ def _seed_agent_and_deployment() -> tuple[uuid.UUID, uuid.UUID]:
     agent_id = _seed_agent()
     version_id = uuid.uuid4()
     deployment_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agent_versions "
         "(id, agent_id, version_label, bundle_ref, created_by) "
         "VALUES (:id, :agent_id, 'v1', NULL, 'migration-test')",
         {"id": version_id, "agent_id": agent_id},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.deployments "
         "(id, agent_id, version_id, environment, status) "
         "VALUES (:id, :agent_id, :version_id, "
@@ -96,7 +71,7 @@ def _seed_lineage(
     repo_full_name: str = REPO,
 ) -> uuid.UUID:
     lineage_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.thread_publication_lineages "
         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
         "base_sha, branch, status, version, latest_revision) VALUES "
@@ -135,7 +110,7 @@ def _insert_work_item(
         "updated_at": STAMP,
     }
     values.update(overrides)
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.work_items "
         "(id, github_repository_id, github_issue_number, github_installation_id, "
         "agent_id, repo_full_name, conversation_id, publication_lineage_id, "
@@ -171,7 +146,7 @@ def _request_values(work_item_id: uuid.UUID, **overrides: Any) -> dict[str, Any]
 
 def _insert_request(work_item_id: uuid.UUID, **overrides: Any) -> uuid.UUID:
     values = _request_values(work_item_id, **overrides)
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, started_at, "
         "execution_deadline, terminal_at, terminal_cause, "
@@ -201,7 +176,7 @@ def _reject_request(work_item_id: uuid.UUID, **overrides: Any) -> None:
 def _constraint_definitions(table_name: str) -> list[str]:
     return [
         row["definition"].lower()
-        for row in _sql(
+        for row in sql_dicts(
             "SELECT pg_get_constraintdef(c.oid) AS definition "
             "FROM pg_constraint c "
             "JOIN pg_class r ON r.oid = c.conrelid "
@@ -214,18 +189,18 @@ def _constraint_definitions(table_name: str) -> list[str]:
 
 
 def test_0046_catalog_contract_and_round_trip(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, BELOW)
-    assert _sql(
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
+    assert sql_dicts(
         "SELECT to_regclass('curie.work_items') AS work_items, "
         "to_regclass('curie.execution_requests') AS execution_requests"
     ) == [{"work_items": None, "execution_requests": None}]
 
     command.upgrade(config, REVISION)
 
-    columns = _sql(
+    columns = sql_dicts(
         "SELECT table_name, column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' "
         "AND table_name IN ('work_items', 'execution_requests') "
@@ -332,7 +307,7 @@ def test_0046_catalog_contract_and_round_trip(
     ):
         assert token in request_checks
 
-    indexes = _sql(
+    indexes = sql_dicts(
         "SELECT indexdef FROM pg_indexes WHERE schemaname = 'curie' "
         "AND tablename = 'execution_requests'"
     )
@@ -350,7 +325,7 @@ def test_0046_catalog_contract_and_round_trip(
         for status in ("waiting", "running", "cancellation_requested")
     )
 
-    triggers = _sql(
+    triggers = sql_dicts(
         "SELECT r.relname AS table_name, t.tgname AS trigger_name, "
         "p.proname AS function_name, pg_get_triggerdef(t.oid) AS trigger_def, "
         "p.prosrc AS function_body "
@@ -401,11 +376,11 @@ def test_0046_catalog_contract_and_round_trip(
         assert token in trigger_bodies["execution_requests"]
 
     command.downgrade(config, BELOW)
-    assert _sql(
+    assert sql_dicts(
         "SELECT to_regclass('curie.work_items') AS work_items, "
         "to_regclass('curie.execution_requests') AS execution_requests"
     ) == [{"work_items": None, "execution_requests": None}]
-    assert _sql(
+    assert sql_dicts(
         "SELECT count(*) AS count FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
         "WHERE n.nspname = 'curie' "
@@ -414,7 +389,7 @@ def test_0046_catalog_contract_and_round_trip(
     ) == [{"count": 0}]
 
     command.upgrade(config, REVISION)
-    assert _sql(
+    assert sql_dicts(
         "SELECT to_regclass('curie.work_items')::text AS work_items, "
         "to_regclass('curie.execution_requests')::text AS execution_requests"
     ) == [
@@ -426,9 +401,9 @@ def test_0046_catalog_contract_and_round_trip(
 
 
 def test_0046_work_item_constraints_and_immutable_fields(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     agent_id = _seed_agent()
     second_agent_id = _seed_agent()
     work_item_id = _insert_work_item(agent_id)
@@ -502,7 +477,7 @@ def test_0046_work_item_constraints_and_immutable_fields(
             {"id": work_item_id, "value": value},
         )
 
-    _sql(
+    sql_dicts(
         "UPDATE curie.work_items SET cancelled_at = :cancelled_at WHERE id = :id",
         {"id": work_item_id, "cancelled_at": STAMP + timedelta(minutes=1)},
     )
@@ -514,9 +489,9 @@ def test_0046_work_item_constraints_and_immutable_fields(
 
 
 def test_0046_lineage_is_unique_restricted_and_write_once(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     agent_id, deployment_id = _seed_agent_and_deployment()
     lineage_id = _seed_lineage(agent_id, deployment_id)
     other_lineage_id = _seed_lineage(
@@ -559,12 +534,12 @@ def test_0046_lineage_is_unique_restricted_and_write_once(
         github_issue_number=39,
         publication_lineage_id=None,
     )
-    _sql(
+    sql_dicts(
         "UPDATE curie.work_items SET publication_lineage_id = :lineage_id "
         "WHERE id = :id",
         {"id": unlinked_id, "lineage_id": other_lineage_id},
     )
-    assert _sql(
+    assert sql_dicts(
         "SELECT publication_lineage_id::text AS lineage_id "
         "FROM curie.work_items WHERE id = :id",
         {"id": unlinked_id},
@@ -572,9 +547,9 @@ def test_0046_lineage_is_unique_restricted_and_write_once(
 
 
 def test_0046_request_identity_active_uniqueness_and_cascade(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     agent_id = _seed_agent()
     work_item_id = _insert_work_item(agent_id)
     request_id = _insert_request(work_item_id)
@@ -598,12 +573,12 @@ def test_0046_request_identity_active_uniqueness_and_cascade(
         terminal_cause="issue_cancelled",
     )
 
-    assert _sql(
+    assert sql_dicts(
         "SELECT id::text FROM curie.execution_requests WHERE id = :id",
         {"id": request_id},
     ) == [{"id": str(request_id)}]
-    _sql("DELETE FROM curie.agents WHERE id = :id", {"id": agent_id})
-    assert _sql(
+    sql_dicts("DELETE FROM curie.agents WHERE id = :id", {"id": agent_id})
+    assert sql_dicts(
         "SELECT "
         "(SELECT count(*) FROM curie.work_items WHERE id = :work_item_id) AS work_count, "
         "(SELECT count(*) FROM curie.execution_requests WHERE id = :request_id) "
@@ -699,19 +674,19 @@ def test_0046_request_identity_active_uniqueness_and_cascade(
     ],
 )
 def test_0046_rejects_invalid_request_state_shapes(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
     status: str,
     overrides: dict[str, Any],
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     work_item_id = _insert_work_item(_seed_agent())
     _reject_request(work_item_id, status=status, **overrides)
 
 
 def test_0046_deadline_arithmetic_and_request_fields_are_write_once(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     agent_id = _seed_agent()
     work_item_id = _insert_work_item(agent_id)
     other_work_item_id = _insert_work_item(
@@ -729,7 +704,7 @@ def test_0046_deadline_arithmetic_and_request_fields_are_write_once(
         )
 
     request_id = _insert_request(work_item_id)
-    _sql(
+    sql_dicts(
         "UPDATE curie.execution_requests SET status = 'running', "
         "started_at = :started_at, execution_deadline = :execution_deadline "
         "WHERE id = :id",
@@ -739,7 +714,7 @@ def test_0046_deadline_arithmetic_and_request_fields_are_write_once(
             "execution_deadline": STAMP + timedelta(seconds=1800),
         },
     )
-    assert _sql(
+    assert sql_dicts(
         "SELECT extract(epoch FROM execution_deadline - started_at)::integer "
         "AS seconds FROM curie.execution_requests WHERE id = :id",
         {"id": request_id},
@@ -791,13 +766,13 @@ def test_0046_deadline_arithmetic_and_request_fields_are_write_once(
         ),
     ):
         with pytest.raises(DBAPIError) as excinfo:
-            _sql(
+            sql_dicts(
                 f"UPDATE curie.execution_requests SET {assignment} WHERE id = :id",
                 {"id": request_id, **params},
             )
         assert getattr(excinfo.value.orig, "sqlstate", None) == "23514"
         assert "execution deadlines are write once" in str(excinfo.value.orig)
-        assert _sql(
+        assert sql_dicts(
             "SELECT status, started_at, execution_deadline "
             "FROM curie.execution_requests WHERE id = :id",
             {"id": request_id},

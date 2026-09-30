@@ -672,6 +672,39 @@ fn shorter_tag_alias_refuses_omitted_inventory_without_digest() {
 }
 
 #[test]
+fn shorter_tag_alias_falls_back_to_image_id_when_inventory_is_truncated() {
+    // #3352: a 50-entry Node.status.images is kubelet's nodeStatusMaxImages
+    // cap, so an absent name is unknown, not a mismatch. The running imageID
+    // digest in the requested repository is then the binding.
+    // https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/
+    for verb in ["status", "up"] {
+        let output = Fixture::new().run(verb, "alias-shorter-truncated");
+        assert!(
+            output.status.success(),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+    }
+    for scenario in [
+        "alias-shorter-truncated-wrong-repository",
+        "alias-shorter-truncated-opaque",
+    ] {
+        let output = Fixture::new().run("status", scenario);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(Fixture::json(&output)["healthy"], false, "{scenario}");
+    }
+}
+
+#[test]
 fn chart_default_alias_without_busybox_node_inventory_converges() {
     // The recording driver reads the shipped extractImage scalar. This is red
     // when that scalar is only busybox:1.36.1 because the ready init and

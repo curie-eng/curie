@@ -313,6 +313,7 @@ fn message_outcome_declared_variants() -> BTreeSet<String> {
 fn message_outcome_variant_name(value: &MessageOutcomeOutput) -> &'static str {
     match value {
         MessageOutcomeOutput::Replied { .. } => "Replied",
+        MessageOutcomeOutput::Failed { .. } => "Failed",
         MessageOutcomeOutput::NoEdit { .. } => "NoEdit",
         MessageOutcomeOutput::AwaitingApproval { .. } => "AwaitingApproval",
         MessageOutcomeOutput::TimedOut { .. } => "TimedOut",
@@ -340,6 +341,11 @@ fn message_outcome_samples() -> Vec<MessageOutcomeOutput> {
         MessageOutcomeOutput::Replied {
             thread: "1700000000.000100".to_string(),
             reply: "the answer is 42".to_string(),
+        },
+        MessageOutcomeOutput::Failed {
+            thread: "1700000000.000100".to_string(),
+            reply: "curie-turn-failure: max-turns\n\nThe run failed (max-turns).".to_string(),
+            failure_class: "max-turns".to_string(),
         },
         MessageOutcomeOutput::NoEdit {
             thread: "1700000000.000100".to_string(),
@@ -1063,8 +1069,8 @@ use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
 use curie::ops::{
-    ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
-    ClusterUpgradeOutput, PodRow,
+    ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput, ClusterUpgradeOutput,
+    PodRow,
 };
 use curie::release_accept::ReleaseAcceptOutput;
 use curie::secrets::SecretsListOutput;
@@ -1177,6 +1183,7 @@ fn skill_message_awaiting_approval_output_preserves_final_approval_fields() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("permission".to_string()),
         approval_granted_tool: Some("ExampleTool".to_string()),
+        approval_granted_arguments: None,
         approval_display: None,
         input_tokens: Some(10),
         output_tokens: Some(5),
@@ -1210,6 +1217,7 @@ fn skill_message_awaiting_approval_output_is_not_finalized() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("policy".to_string()),
         approval_granted_tool: None,
+        approval_granted_arguments: None,
         approval_display: None,
         input_tokens: None,
         output_tokens: None,
@@ -1247,6 +1255,7 @@ fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -1921,6 +1930,8 @@ fn doctor_output_validates() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
@@ -2001,6 +2012,8 @@ fn doctor_ready_tracks_the_checks() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
@@ -2332,6 +2345,7 @@ fn approvals_output_validates_all_variants() {
     let pending = ApprovalsOutput::Pending {
         agent: "d".to_string(),
         records: vec![approval_record()],
+        routes: Default::default(),
         truncated: false,
     };
     assert_valid("approvals.schema.json", &pending.to_json());
@@ -2557,32 +2571,6 @@ fn connector_build_output_validates_empty_and_populated() {
         }],
     };
     assert_valid("build.schema.json", &built.to_json());
-}
-
-#[test]
-fn cluster_rollback_output_validates_all_variants() {
-    let dry = ClusterRollbackOutput::DryRun(DryRunPlan {
-        lines: vec!["helm rollback".to_string()],
-    });
-    assert_valid("cluster-rollback.schema.json", &dry.to_json());
-    assert_valid(
-        "cluster-rollback.schema.json",
-        &ClusterRollbackOutput::Aborted.to_json(),
-    );
-    let rolled_back = ClusterRollbackOutput::RolledBack {
-        from_revision: 4,
-        to_revision: 3,
-        skipped: vec![],
-        forced: false,
-    };
-    assert_valid("cluster-rollback.schema.json", &rolled_back.to_json());
-    let forced = ClusterRollbackOutput::RolledBack {
-        from_revision: 5,
-        to_revision: 2,
-        skipped: vec![4, 3],
-        forced: true,
-    };
-    assert_valid("cluster-rollback.schema.json", &forced.to_json());
 }
 
 #[test]

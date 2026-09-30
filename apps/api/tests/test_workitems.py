@@ -1455,6 +1455,13 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
 
                     async def observe_lineage_lock_wait() -> None:
                         while True:
+                            # pg_stat_get_activity is STABLE. The first read in
+                            # this observer transaction freezes the activity
+                            # snapshot, so a cold connection that samples before
+                            # the waiter parks never sees it. Drop that snapshot
+                            # on every poll; pg_locks and pg_blocking_pids are
+                            # already volatile.
+                            await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
                             row = (
                                 await observer.execute(
                                     text(
@@ -1468,8 +1475,8 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                                     ),
                                     {"holder": holder_pid, "service": service_pid},
                                 )
-                            ).mappings().one()
-                            if (
+                            ).mappings().one_or_none()
+                            if row is not None and (
                                 row.wait_event_type == "Lock"
                                 and row.waiting_lock
                                 and row.blocked_by_holder
@@ -1952,5 +1959,214 @@ def test_an_opened_pull_request_completes_after_the_execution_deadline(
             "completed",
             "completed",
         )
+
+    with_session(body)
+
+
+async def _seed_transcript(session: AsyncSession, agent_id: uuid.UUID, thread: str) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO curie.thread_transcripts (id, agent_id, thread_key, value) "
+            "VALUES (:id, :agent, :thread, CAST('[{\"role\": \"user\"}]' AS jsonb))"
+        ),
+        {"id": uuid.uuid4(), "agent": agent_id, "thread": thread},
+    )
+    await session.commit()
+
+
+async def _transcript_threads(session: AsyncSession, agent_id: uuid.UUID) -> set[str]:
+    rows = await session.scalars(
+        text("SELECT thread_key FROM curie.thread_transcripts WHERE agent_id = :agent"),
+        {"agent": agent_id},
+    )
+    return set(rows)
+
+
+def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) -> None:
+    """ADR-0170 (#3070): the terminal transition deletes the thread's history."""
+
+    other_thread = "slack:C0EXAMPLE1:1700000000.000200"
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item = (await _item(session, agent_id)).work_item
+        running = await _start(session, await _request(session, item))
+        await _seed_transcript(session, agent_id, CONVERSATION)
+        await _seed_transcript(session, agent_id, other_thread)
+        request = running.request
+        assert request is not None
+
+        stale = await workitems.fail_execution(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=request.id,
+            cause="runner_escalated",
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=request.version + 1,
+        )
+        _conflict(stale, "stale_version")
+        assert await _transcript_threads(session, agent_id) == {CONVERSATION, other_thread}
+
+        failed = await workitems.fail_execution(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=request.id,
+            cause="runner_escalated",
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=request.version,
+        )
+        assert isinstance(failed, workitems.WorkItemOutcome), failed
+        assert failed.request is not None and failed.request.status == "failed"
+        assert await _transcript_threads(session, agent_id) == {other_thread}
+
+    with_session(body)
+
+
+def test_cancelling_a_waiting_work_item_expires_its_transcript(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        waiting = await _request(session, (await _item(session, agent_id)).work_item)
+        await _seed_transcript(session, agent_id, CONVERSATION)
+
+        cancelled = await workitems.request_cancellation(
+            session,
+            work_item_id=waiting.work_item.id,
+            expected_work_item_version=waiting.work_item.version,
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        assert cancelled.request is not None and cancelled.request.status == "cancelled"
+        assert await _transcript_threads(session, agent_id) == set()
+
+    with_session(body)
+
+
+def test_cancelling_a_work_item_with_no_active_request_expires_its_transcript(
+    clean_db: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item = (await _item(session, agent_id)).work_item
+        await _seed_transcript(session, agent_id, CONVERSATION)
+
+        cancelled = await workitems.request_cancellation(
+            session, work_item_id=item.id, expected_work_item_version=item.version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        assert cancelled.request is None
+        assert cancelled.work_item.cancelled_at is not None
+        assert await _transcript_threads(session, agent_id) == set()
+
+    with_session(body)
+
+
+# --- per-agent execution deadline (#3071) -----------------------------------
+
+
+async def _set_agent_deadline(
+    session: AsyncSession, agent_id: uuid.UUID, seconds: int | None
+) -> None:
+    await session.execute(
+        text("UPDATE curie.agents SET execution_deadline_seconds = :s WHERE id = :id"),
+        {"s": seconds, "id": agent_id},
+    )
+    await session.commit()
+
+
+async def _stored_deadline_span(session: AsyncSession, request_id: uuid.UUID) -> timedelta:
+    row = (
+        await session.execute(
+            text(
+                "SELECT execution_deadline - started_at AS span "
+                "FROM curie.execution_requests WHERE id = :id"
+            ),
+            {"id": request_id},
+        )
+    ).one()
+    assert isinstance(row.span, timedelta)
+    return row.span
+
+
+def test_start_uses_the_owning_agents_execution_deadline(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        await _set_agent_deadline(session, agent_id, 90)
+        item = await _item(session, agent_id)
+        running = await _start(session, await _request(session, item.work_item))
+        assert running.request is not None
+        assert await _stored_deadline_span(session, running.request.id) == timedelta(seconds=90)
+
+    with_session(body)
+
+
+def test_start_uses_1800_when_the_agent_deadline_is_null(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        # Another agent's override must not leak into this one's start.
+        await _set_agent_deadline(session, await _agent(session, "other-bot"), 90)
+        await _set_agent_deadline(session, agent_id, None)
+        item = await _item(session, agent_id)
+        running = await _start(session, await _request(session, item.work_item))
+        assert running.request is not None
+        assert await _stored_deadline_span(session, running.request.id) == timedelta(seconds=1800)
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("seconds", [59, 10801])
+def test_agent_execution_deadline_column_check_refuses_out_of_range(
+    clean_db: None, seconds: int
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        with pytest.raises(IntegrityError):
+            await _set_agent_deadline(session, agent_id, seconds)
+
+    with_session(body)
+
+
+async def _insert_running_with_span(session: AsyncSession, seconds: int) -> None:
+    agent_id = await _agent(session)
+    item_id = uuid.uuid4()
+    started_at = await _now(session)
+    await session.execute(
+        text(
+            "INSERT INTO curie.work_items "
+            "(id, github_repository_id, github_issue_number, "
+            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "version, next_sequence) VALUES "
+            "(:id, 101, 2573, 202, :agent, :repo, :conversation, 2, 2)"
+        ),
+        {"id": item_id, "agent": agent_id, "repo": REPO, "conversation": CONVERSATION},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.execution_requests "
+            "(id, work_item_id, sequence, status, wait_deadline, started_at, "
+            "execution_deadline, version, execution_attempts) VALUES "
+            "(:id, :item, 1, 'running', :wait, :started, :deadline, 2, 1)"
+        ),
+        {
+            "id": uuid.uuid4(),
+            "item": item_id,
+            "wait": started_at - timedelta(seconds=1),
+            "started": started_at,
+            "deadline": started_at + timedelta(seconds=seconds),
+        },
+    )
+    await session.commit()
+
+
+@pytest.mark.parametrize("seconds", [90, 10800])
+def test_execution_request_check_accepts_deadlines_up_to_10800(
+    clean_db: None, seconds: int
+) -> None:
+    with_session(lambda session: _insert_running_with_span(session, seconds))
+
+
+def test_execution_request_check_refuses_a_deadline_past_10800(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        with pytest.raises(IntegrityError) as excinfo:
+            await _insert_running_with_span(session, 10801)
+        assert "execution_requests_deadline_ck" in str(excinfo.value)
 
     with_session(body)

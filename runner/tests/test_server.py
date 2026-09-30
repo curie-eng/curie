@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 import anyio
+import pytest
 from aci_protocol import SessionStatus, parse_ndjson
 from aiohttp.test_utils import TestClient, TestServer
 from curie_runner import RunTracer, SideEffectClassifier, create_app
+from curie_runner import session as session_module
 from curie_runner.__main__ import build_runner
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
@@ -60,17 +62,13 @@ def _runner() -> tuple[SessionRunner, FakeModelSession]:
     return runner, fake
 
 
-def _boot_runner(
-    tmp_path: Path, *, managed_workspace: bool
-) -> tuple[SessionRunner, Path | None]:
+def _boot_runner(tmp_path: Path, *, managed_workspace: bool) -> tuple[SessionRunner, Path | None]:
     """Build the actual fake-model boot path with claim identity and workspace state."""
 
     plugin_dir = tmp_path / "bundle"
     manifest_dir = plugin_dir / ".claude-plugin"
     manifest_dir.mkdir(parents=True)
-    (manifest_dir / "plugin.json").write_text(
-        json.dumps({"name": "acme-bot"}), encoding="utf-8"
-    )
+    (manifest_dir / "plugin.json").write_text(json.dumps({"name": "acme-bot"}), encoding="utf-8")
     workspace_path: Path | None = None
     if managed_workspace:
         workspace_path = tmp_path / "workspace"
@@ -80,9 +78,7 @@ def _boot_runner(
             "CURIE_PLUGIN_DIR": str(plugin_dir),
             "CURIE_SESSION_ID": "session-acme-workspace",
             "CURIE_SANDBOX_ID": "sandbox-acme-workspace",
-            "CURIE_BUDGET": (
-                '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-            ),
+            "CURIE_BUDGET": ('{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'),
         }
     )
     return (
@@ -168,13 +164,16 @@ def test_event_header_uses_explicit_parent_and_missing_or_malformed_is_safe_root
     assert inherited.parent.span_id == int(parent_span_id, 16)
     assert missing.parent is None
     assert malformed.parent is None
-    assert len(
-        {
-            inherited.context.trace_id,
-            missing.context.trace_id,
-            malformed.context.trace_id,
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                inherited.context.trace_id,
+                missing.context.trace_id,
+                malformed.context.trace_id,
+            }
+        )
+        == 3
+    )
 
 
 def test_event_rejects_non_event_frame() -> None:
@@ -478,10 +477,7 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
             first = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
             first_epoch = first.headers[_TURN_EPOCH_HEADER]
             assert 32 <= len(first_epoch) <= 256
-            assert all(
-                character.isalnum() or character in "-_"
-                for character in first_epoch
-            )
+            assert all(character.isalnum() or character in "-_" for character in first_epoch)
             await session.entered[0].wait()
 
             unauthenticated = await client.post(
@@ -511,9 +507,7 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
             assert malformed.status == 400
             assert oversized.status == 400
 
-            guessed_epoch = (
-                ("A" if first_epoch[0] != "A" else "B") + first_epoch[1:]
-            )
+            guessed_epoch = ("A" if first_epoch[0] != "A" else "B") + first_epoch[1:]
             spoofed = await client.post(
                 "/v1/timeout",
                 headers={**_AUTH, _TURN_EPOCH_HEADER: guessed_epoch},
@@ -573,6 +567,126 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
     anyio.run(go)
 
 
+def test_capacity_admission_uses_the_turn_that_owns_the_lock() -> None:
+    async def go() -> None:
+        session = _EpochControlledSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+
+            async def control_status() -> dict[str, object]:
+                response = await client.get("/v1/status", headers=_AUTH)
+                assert response.status == 200
+                return await response.json()
+
+            assert (await control_status())["turn_epoch"] is None
+            probe = await client.get("/status")
+            assert "turn_epoch" not in await probe.json()
+
+            first = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
+            first_epoch = first.headers[_TURN_EPOCH_HEADER]
+            await session.entered[0].wait()
+            assert (await control_status())["turn_epoch"] == first_epoch
+
+            second = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            second_epoch = second.headers[_TURN_EPOCH_HEADER]
+            assert second_epoch != first_epoch
+            assert (await control_status())["turn_epoch"] == first_epoch
+            assert session.turn == 0
+
+            session.release[0].set()
+            await first.text()
+            with anyio.fail_after(2):
+                while (await control_status())["turn_epoch"] != second_epoch:
+                    await anyio.sleep(0.01)
+            assert session.turn == 0
+
+            stale = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: first_epoch},
+                json={"allow": True},
+            )
+            assert stale.status == 409
+            assert session.turn == 0
+            granted = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: second_epoch},
+                json={"allow": True},
+            )
+            assert granted.status == 200
+            await session.entered[1].wait()
+            assert session.turn == 1
+            session.release[1].set()
+            await second.text()
+            assert (await control_status())["turn_epoch"] is None
+
+            denied = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            denied_epoch = denied.headers[_TURN_EPOCH_HEADER]
+            with anyio.fail_after(2):
+                while (await control_status())["turn_epoch"] != denied_epoch:
+                    await anyio.sleep(0.01)
+            refusal = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: denied_epoch},
+                json={"allow": False},
+            )
+            assert refusal.status == 200
+            denied_events = parse_ndjson(await denied.text())
+            assert denied_events[-1].type == "final"
+            assert denied_events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+            assert session.turn == 1
+            assert (await control_status())["turn_epoch"] is None
+
+    anyio.run(go)
+
+
+def test_capacity_admission_without_grant_times_out_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "_CAPACITY_ADMISSION_TIMEOUT_S", 0.05)
+
+    async def go() -> None:
+        session = _EpochControlledSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            pending = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            with anyio.fail_after(2):
+                events = parse_ndjson(await pending.text())
+            assert events[-1].type == "final"
+            assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+            assert session.turn == -1
+            assert session.interrupts == 0
+            status = await client.get("/v1/status", headers=_AUTH)
+            assert (await status.json())["turn_epoch"] is None
+
+    anyio.run(go)
+
+
 def test_steer_without_auth_header_is_401() -> None:
     runner, _ = _runner()
     steer_frame = {"kind": "event", "type": "message", "text": "do X", "user": "U", "ts": "2"}
@@ -587,52 +701,35 @@ def test_steer_without_auth_header_is_401() -> None:
     anyio.run(go)
 
 
-def test_empty_token_passes_through() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
+@pytest.mark.parametrize(
+    "token",
+    [
         # An empty token is a falsy token: create_app must not gate, so a
         # header-less POST proceeds rather than 401-ing on an unusable token.
-        async with TestClient(TestServer(create_app(runner, token=""))) as client:
+        pytest.param("", id="empty-token"),
+        pytest.param(None, id="no-token-configured"),
+    ],
+)
+def test_unconfigured_token_passes_through(token: str | None) -> None:
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=token))) as client:
             resp = await client.post("/v1/event", json=_EVENT_FRAME)
             assert resp.status == 200
 
     anyio.run(go)
 
 
-def test_healthz_never_gated() -> None:
+@pytest.mark.parametrize("path", ["/healthz", "/status"])
+def test_probe_endpoints_never_gated(path: str) -> None:
     runner, _ = _runner()
 
     async def go() -> None:
         await runner.start()
         async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
-            resp = await client.get("/healthz")
-            assert resp.status == 200
-
-    anyio.run(go)
-
-
-def test_status_never_gated() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
-        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
-            resp = await client.get("/status")
-            assert resp.status == 200
-
-    anyio.run(go)
-
-
-def test_no_token_configured_passes_through() -> None:
-    runner, _ = _runner()
-
-    async def go() -> None:
-        await runner.start()
-        # An app built with token=None does not gate: a header-less POST proceeds.
-        async with TestClient(TestServer(create_app(runner, token=None))) as client:
-            resp = await client.post("/v1/event", json=_EVENT_FRAME)
+            resp = await client.get(path)
             assert resp.status == 200
 
     anyio.run(go)

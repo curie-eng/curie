@@ -230,6 +230,18 @@ fn read_kubeconfig() -> Result<serde_json::Value> {
     Ok(merge_kubeconfigs(&documents))
 }
 
+/// Context names in the operator's kubeconfig, for a remedy that names them.
+/// Best effort: an unreadable kubeconfig yields an empty list.
+pub fn available_contexts() -> Vec<String> {
+    read_kubeconfig()
+        .ok()
+        .and_then(|view| view.get("contexts").and_then(|c| c.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
 /// Resolve and pin the Kubernetes context for this `curie cluster` process.
 ///
 /// With an explicit name, any failure to read the kubeconfig or an unknown name is an

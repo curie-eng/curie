@@ -1,0 +1,36 @@
+name: Load CI images
+description: >-
+  Download the image archives the ci.yaml `ci-images` job built for this
+  workflow run and load them into the local Docker daemon as
+  `curie-ci/<name>:candidate`. The calling job must declare `needs: ci-images`.
+inputs:
+  images:
+    description: >-
+      Glob over image names, matched against the `ci-image-<name>` artifacts:
+      one name (`runner`) or a brace list (`{api,worker,ui}`).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download the image archives
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        pattern: ci-image-${{ inputs.images }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/ci-images
+    - name: Load the image archives
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.images }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        archives=("$RUNNER_TEMP"/ci-images/*.tar.zst)
+        if (( ${#archives[@]} == 0 )); then
+          echo "no ci-image-${IMAGES} archive was downloaded; does the job need ci-images?" >&2
+          exit 1
+        fi
+        for archive in "${archives[@]}"; do
+          zstd -dc "$archive" | docker load
+        done
+        rm -rf "$RUNNER_TEMP/ci-images"

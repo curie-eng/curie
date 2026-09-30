@@ -2,51 +2,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any
 
 import pytest
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
-from alembic.config import Config
-from curie_api.config import get_settings
-from curie_api.models import HookRun
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0047"
 REVISION = "0048"
 SLOT = datetime(2026, 9, 22, 16, 0, tzinfo=UTC)
 STARTED = datetime(2026, 9, 22, 16, 0, 5, tzinfo=UTC)
 
 
-def _config() -> Config:
-    config = Config()
-    config.set_main_option("script_location", str(ALEMBIC_DIR))
-    return config
-
-
-def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    async def run() -> list[dict[str, Any]]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                result = await connection.execute(text(statement), params or {})
-                if not result.returns_rows:
-                    return []
-                return [dict(row) for row in result.mappings().all()]
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(run())
-
-
 def _hook_runs_regclass() -> str | None:
-    rows = _sql("SELECT to_regclass('curie.hook_runs') AS name")
+    rows = sql_dicts("SELECT to_regclass('curie.hook_runs') AS name")
     name = rows[0]["name"]
     return None if name is None else str(name)
 
@@ -54,11 +25,11 @@ def _hook_runs_regclass() -> str | None:
 def _seed_agent_version() -> tuple[uuid.UUID, uuid.UUID]:
     agent_id = uuid.uuid4()
     version_id = uuid.uuid4()
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"acme-bot-{agent_id.hex[:8]}"},
     )
-    _sql(
+    sql_dicts(
         "INSERT INTO curie.agent_versions "
         "(id, agent_id, version_label, bundle_ref, created_by) "
         "VALUES (:id, :agent_id, 'v1', NULL, 'acme')",
@@ -73,40 +44,34 @@ def _insert_hook_run(
     slot_utc: datetime,
     outcome: str | None,
 ) -> None:
-    async def run() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            sessions = async_sessionmaker(engine, expire_on_commit=False)
-            async with sessions() as session:
-                session.add(
-                    HookRun(
-                        id=uuid.uuid4(),
-                        agent_id=agent_id,
-                        name="daily-digest",
-                        slot_utc=slot_utc,
-                        version_id=version_id,
-                        outcome=outcome,
-                        started_at=STARTED,
-                        ended_at=None,
-                    )
-                )
-                await session.commit()
-        finally:
-            await engine.dispose()
-
-    asyncio.run(run())
+    # Raw SQL, not the ORM model: the model tracks head, and later revisions
+    # add columns this revision does not have.
+    sql_dicts(
+        "INSERT INTO curie.hook_runs "
+        "(id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at) "
+        "VALUES (:id, :agent_id, 'daily-digest', :slot, :version_id, :outcome, "
+        ":started, NULL)",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": agent_id,
+            "slot": slot_utc,
+            "version_id": version_id,
+            "outcome": outcome,
+            "started": STARTED,
+        },
+    )
 
 
 def _hook_run_count() -> int:
-    rows = _sql("SELECT count(*) AS n FROM curie.hook_runs")
+    rows = sql_dicts("SELECT count(*) AS n FROM curie.hook_runs")
     return int(rows[0]["n"])
 
 
 def test_0048_creates_hook_runs_and_downgrade_drops_it(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    config = _config()
-    command.upgrade(config, REVISION)
+    config = alembic_config()
+    isolated_migration_db.at(REVISION)
     assert _hook_runs_regclass() is not None
     try:
         command.downgrade(config, BELOW)
@@ -119,9 +84,9 @@ def test_0048_creates_hook_runs_and_downgrade_drops_it(
 
 
 def test_0048_rejects_a_duplicate_slot_and_accepts_another(
-    isolated_migration_db: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    command.upgrade(_config(), REVISION)
+    isolated_migration_db.at(REVISION)
     agent_id, version_id = _seed_agent_version()
     _insert_hook_run(agent_id, version_id, SLOT, None)
     with pytest.raises(IntegrityError) as excinfo:
@@ -132,8 +97,8 @@ def test_0048_rejects_a_duplicate_slot_and_accepts_another(
     assert _hook_run_count() == 2
 
 
-def test_0048_rejects_deferred_outcome(isolated_migration_db: None) -> None:
-    command.upgrade(_config(), REVISION)
+def test_0048_rejects_deferred_outcome(isolated_migration_db: IsolatedMigrationDb) -> None:
+    isolated_migration_db.at(REVISION)
     agent_id, version_id = _seed_agent_version()
     with pytest.raises(IntegrityError) as excinfo:
         _insert_hook_run(agent_id, version_id, SLOT, "deferred")

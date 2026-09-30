@@ -15,6 +15,7 @@ from .models import (
     MessageLink,
     OutboundMessage,
 )
+from .progress import ProgressCard, ProgressCommand, ProgressMilestone
 from .reply import (
     NavAffordance,
     ReplyAck,
@@ -46,6 +47,9 @@ _MODELS = (
     ReplyPost,
     TurnCompleted,
     ReplyAck,
+    ProgressCard,
+    ProgressMilestone,
+    ProgressCommand,
 )
 
 

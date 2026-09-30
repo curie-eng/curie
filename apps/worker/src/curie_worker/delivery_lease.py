@@ -114,7 +114,52 @@ redis.call('PEXPIRE', state_key, tonumber(ARGV[5]))
 return {1, gen, deadline, string.format('%d', now)}
 """
 
-# Renew, with three independent fail-closed guards. KEYS: lease, delivery state.
+# Separate stream entries for one approval resume have separate PEL rows and
+# delivery leases. The event claim closes that gap without moving ordinary
+# deliveries onto an event id lease. It records its owner's lease key and entry
+# so a later claimant can distinguish a live winner from a stale claim. It is
+# granted only to a live, fenced PEL owner and expires on the same clock as that
+# owner's delivery lease.
+_CLAIM_RESUME_LUA = """
+local lease_key = KEYS[1]
+local state_key = KEYS[2]
+local resume_key = KEYS[3]
+local owner = ARGV[1]
+local stream = ARGV[4]
+local group = ARGV[5]
+local entry = ARGV[6]
+local consumer = ARGV[7]
+
+local pending = redis.call('XPENDING', stream, group, 'IDLE', 0, entry, entry, 1)
+if #pending == 0 then return {0, 'not-pending'} end
+if pending[1][2] ~= consumer then return {0, 'not-owner'} end
+if redis.call('GET', lease_key) ~= owner then return {0, 'not-owner-token'} end
+if redis.call('HGET', state_key, 'gen') ~= ARGV[2] then
+  return {0, 'stale-generation'}
+end
+local winner_owner = redis.call('HGET', resume_key, 'owner')
+if winner_owner then
+  local winner_lease_key = redis.call('HGET', resume_key, 'lease_key')
+  local winner_entry = redis.call('HGET', resume_key, 'entry_id')
+  if winner_owner == owner and winner_lease_key == lease_key and winner_entry == entry then
+    redis.call('PEXPIRE', resume_key, tonumber(ARGV[3]))
+    return {1, 'claimed'}
+  end
+  if winner_lease_key and winner_entry and
+     redis.call('GET', winner_lease_key) == winner_owner then
+    local winner_pending = redis.call(
+      'XPENDING', stream, group, 'IDLE', 0, winner_entry, winner_entry, 1
+    )
+    if #winner_pending ~= 0 then return {0, 'held'} end
+  end
+end
+redis.call('HSET', resume_key, 'owner', owner, 'lease_key', lease_key, 'entry_id', entry)
+redis.call('PEXPIRE', resume_key, tonumber(ARGV[3]))
+return {1, 'claimed'}
+"""
+
+# Renew, with three independent fail-closed guards. KEYS: lease, delivery state,
+# and the approval resume claim when this delivery holds one (empty otherwise).
 # ARGV: 1 owner token, 2 expected generation, 3 lease TTL ms, 4 state retention
 # ms, 5 stream, 6 group, 7 entry id, 8 consumer.
 #
@@ -136,6 +181,7 @@ return {1, gen, deadline, string.format('%d', now)}
 _HEARTBEAT_LUA = """
 local lease_key = KEYS[1]
 local state_key = KEYS[2]
+local resume_key = KEYS[3]
 local owner = ARGV[1]
 local stream = ARGV[5]
 local group = ARGV[6]
@@ -147,9 +193,13 @@ if #pending == 0 then return {0, 'not-pending'} end
 if pending[1][2] ~= consumer then return {0, 'not-owner'} end
 if redis.call('GET', lease_key) ~= owner then return {0, 'not-owner-token'} end
 if redis.call('HGET', state_key, 'gen') ~= ARGV[2] then return {0, 'stale-generation'} end
+if resume_key ~= '' and redis.call('HGET', resume_key, 'owner') ~= owner then
+  return {0, 'resume-claim-lost'}
+end
 
 redis.call('PEXPIRE', lease_key, tonumber(ARGV[3]))
 redis.call('PEXPIRE', state_key, tonumber(ARGV[4]))
+if resume_key ~= '' then redis.call('PEXPIRE', resume_key, tonumber(ARGV[3])) end
 redis.call('XCLAIM', stream, group, consumer, 0, entry, 'JUSTID')
 
 local t = redis.call('TIME')
@@ -157,15 +207,18 @@ local now = t[1] * 1000 + math.floor(t[2] / 1000)
 return {1, string.format('%d', now), redis.call('HGET', state_key, 'deadline_ms')}
 """
 
-# Compare-and-delete, the same idiom ``markers.py``'s ``_CLEAR_COMPLETION_LUA``
-# uses. A late ``__aexit__`` from an owner that already lost the fence must not
-# free the CURRENT owner's lease -- that would hand the delivery to a third
-# process while the real owner is still executing. There is no unconditional arm.
+# Compare-and-delete both claims independently. Terminal settlement can remove
+# the delivery lease before this call, but the resume claim still needs prompt
+# release. A late owner cannot delete either claim after another owner takes it.
 _RELEASE_LUA = """
+local released = 0
 if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
+  released = redis.call('DEL', KEYS[1])
 end
-return 0
+if KEYS[2] ~= '' and redis.call('HGET', KEYS[2], 'owner') == ARGV[1] then
+  released = released + redis.call('DEL', KEYS[2])
+end
+return released
 """
 
 
@@ -276,7 +329,11 @@ class DeliveryLease:
         self.owner = owner
         self.generation = generation
         self.budget = budget
+        self.resume_event_id: str | None = None
         self.lost = asyncio.Event()
+        self.entry_vanished = asyncio.Event()
+        self.settlement_lock = asyncio.Lock()
+        self.acknowledged = asyncio.Event()
 
     def remaining_s(self) -> float:
         return self.budget.remaining_s()
@@ -344,6 +401,47 @@ class DeliveryLeaseStore:
             self._config.delivery_state_key(stream, group, entry_id),
         )
 
+    def _resume_key(self, stream: str, group: str, event_id: str) -> str:
+        return f"{self._config.key_prefix}:resume-inflight:{stream}:{group}:{event_id}"
+
+    async def claim_resume(
+        self, lease: DeliveryLease, event_id: str, *, consumer: str
+    ) -> bool:
+        """Claim one approval resume across distinct stream entries.
+
+        A held claim means another entry is pending under a live delivery lease.
+        A refused delivery fence means the caller has lost authority, even if
+        its heartbeat has not noticed yet.
+        """
+        # Heartbeat must not observe the claim id before the atomic acquire has
+        # installed its key. If the reply is lost, release can still clear a
+        # claim the server granted because the id is recorded before the await.
+        async with lease.settlement_lock:
+            lease.raise_if_lost()
+            lease.resume_event_id = event_id
+            lease_key, state_key = self._keys(lease.stream, lease.group, lease.entry_id)
+            raw = await self._redis.eval(
+                _CLAIM_RESUME_LUA,
+                3,
+                lease_key,
+                state_key,
+                self._resume_key(lease.stream, lease.group, event_id),
+                lease.owner,
+                str(lease.generation),
+                str(int(self._config.delivery_lease_ttl_s * 1000)),
+                lease.stream,
+                lease.group,
+                lease.entry_id,
+                consumer,
+            )
+            if int(raw[0]) != 1:
+                if str(raw[1]) == "held":
+                    lease.resume_event_id = None
+                    return False
+                lease.lost.set()
+                raise LeaseLostError(f"approval resume claim refused: {raw[1]}")
+            return True
+
     async def acquire(
         self, stream: str, group: str, entry_id: str, *, consumer: str
     ) -> DeliveryLease:
@@ -398,6 +496,7 @@ class DeliveryLeaseStore:
         consumer: str,
         owner: str,
         generation: int,
+        resume_event_id: str | None,
     ) -> DeliveryBudget | None:
         """Renew the lease and reset same-owner PEL idle, or refuse.
 
@@ -408,12 +507,16 @@ class DeliveryLeaseStore:
         owner out.
         """
         lease_key, state_key = self._keys(stream, group, entry_id)
+        resume_key = (
+            self._resume_key(stream, group, resume_event_id) if resume_event_id else ""
+        )
         anchor_monotonic = time.monotonic()
         raw = await self._redis.eval(
             _HEARTBEAT_LUA,
-            2,
+            3,
             lease_key,
             state_key,
+            resume_key,
             owner,
             str(generation),
             str(int(self._config.delivery_lease_ttl_s * 1000)),
@@ -431,8 +534,52 @@ class DeliveryLeaseStore:
             anchor_monotonic=anchor_monotonic,
         )
 
+    async def entry_vanished(
+        self,
+        stream: str,
+        group: str,
+        entry_id: str,
+        *,
+        owner: str,
+    ) -> bool | None:
+        """Whether this exact delivery is gone and no other owner holds it.
+
+        True only when ``XRANGE`` of ``entry_id`` is empty, ``XPENDING`` of
+        that same id is empty, and the lease key is missing or still ``owner``.
+        False when the entry exists, the PEL row exists, or the lease token is
+        some other owner. None when any of those reads raises.
+        """
+        try:
+            rows = await self._redis.xrange(stream, min=entry_id, max=entry_id, count=1)
+            if rows:
+                return False
+            pending = await self._redis.xpending_range(
+                stream,
+                group,
+                min=entry_id,
+                max=entry_id,
+                count=1,
+            )
+            if pending:
+                return False
+            lease_key, _state_key = self._keys(stream, group, entry_id)
+            token = await self._redis.get(lease_key)
+            if token is None:
+                return True
+            if isinstance(token, bytes):
+                token = token.decode()
+            return token == owner
+        except Exception:  # noqa: BLE001 - an unreadable probe is not a vanished entry
+            return None
+
     async def release(
-        self, stream: str, group: str, entry_id: str, *, owner: str
+        self,
+        stream: str,
+        group: str,
+        entry_id: str,
+        *,
+        owner: str,
+        resume_event_id: str | None,
     ) -> bool:
         """Give up the lease, but only if it is still ours (compare-and-delete).
 
@@ -442,8 +589,11 @@ class DeliveryLeaseStore:
         Only :meth:`settle` removes it.
         """
         lease_key, _state_key = self._keys(stream, group, entry_id)
-        deleted = await self._redis.eval(_RELEASE_LUA, 1, lease_key, owner)
-        return int(deleted) == 1
+        resume_key = (
+            self._resume_key(stream, group, resume_event_id) if resume_event_id else ""
+        )
+        deleted = await self._redis.eval(_RELEASE_LUA, 2, lease_key, resume_key, owner)
+        return int(deleted) > 0
 
     async def settle(self, stream: str, group: str, entry_id: str) -> None:
         """Terminal cleanup: remove the lease AND the delivery state.

@@ -4,24 +4,33 @@ The API stores private patch state and resolves credentials. Kubernetes and
 GitHub side effects belong to the trusted worker publication reconciler.
 """
 
+import asyncio
+import logging
 import re
+import time
 import uuid
 from typing import Any, Literal, cast
 
 import httpx
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud
+from .. import crud, factory_ci, factory_progress
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import PublicationReviewReservation, ThreadPublicationLineage
+from ..models import (
+    ExecutionRequest,
+    Publication,
+    PublicationReviewReservation,
+    ThreadPublicationLineage,
+)
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
@@ -29,9 +38,19 @@ from ..publication_authority import (
     verify_publication_identity,
 )
 from ..publication_policy import policy_still_authorizes
+from ..publication_precheck_token import PublicationPrecheckClaims, metadata_digest, mint
+from ..publication_truth import (
+    PRECHECK_TIMEOUT_SECONDS,
+    PublicationPrecheckRefused,
+    PublicationPrecheckUnavailable,
+    read_publication_authority,
+    read_publication_metadata,
+)
 from ..repo_full_name import repo_url_path
 from ..repository_auth import resolve_repository_credential
 from ..schemas import (
+    PublicationContext,
+    PublicationContextMint,
     PublicationCreate,
     PublicationLineageAdvance,
     PublicationLineageOut,
@@ -42,6 +61,9 @@ from ..schemas import (
     ReviewRevisionReserve,
 )
 from ..workspace_policy import credential_mode, repository_is_allowed
+from .publication_precheck import precheck_error
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/publications",
@@ -59,6 +81,94 @@ _GITHUB_UNAVAILABLE_DETAIL = {
         "no model turn or publication was started."
     ),
 }
+
+
+@internal_router.post(
+    "/precheck/context",
+    response_model=PublicationContext,
+    responses={204: {"description": "The running execution has no existing pull request"}},
+    dependencies=[Depends(require_internal_worker_token)],
+)
+async def mint_publication_context(
+    data: PublicationContextMint,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+) -> PublicationContext | Response:
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    try:
+        async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
+            authority = await read_publication_authority(
+                session,
+                deployment_id=data.deployment_id,
+                work_item_id=data.work_item_id,
+                execution_request_id=data.execution_request_id,
+                runtime_epoch=data.runtime_epoch,
+            )
+            if authority is None:
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})
+            if authority.has_inflight_push:
+                raise PublicationPrecheckUnavailable
+            metadata = await read_publication_metadata(
+                authority, settings=settings, client=request.app.state.http_client
+            )
+            current = await read_publication_authority(
+                session,
+                deployment_id=data.deployment_id,
+                work_item_id=data.work_item_id,
+                execution_request_id=data.execution_request_id,
+                runtime_epoch=data.runtime_epoch,
+            )
+            if current is None:
+                raise PublicationPrecheckRefused
+            if current.has_inflight_push:
+                raise PublicationPrecheckUnavailable
+            if current != authority or int(current.execution_deadline.timestamp()) <= time.time():
+                raise PublicationPrecheckRefused
+    except PublicationPrecheckRefused:
+        raise precheck_error(
+            409, "invalid_context", "publication execution authority is no longer current"
+        ) from None
+    except (PublicationPrecheckUnavailable, TimeoutError):
+        raise precheck_error(
+            503, "precheck_unavailable", "current publication metadata could not be verified"
+        ) from None
+    claims = PublicationPrecheckClaims(
+        scope="publication.precheck",
+        agent_id=authority.agent_id,
+        deployment_id=authority.deployment_id,
+        work_item_id=authority.work_item_id,
+        execution_request_id=authority.execution_request_id,
+        runtime_epoch=authority.runtime_epoch,
+        conversation_id=authority.conversation_id,
+        lineage_id=authority.lineage_id,
+        lineage_version=authority.lineage_version,
+        expected_head=authority.expected_head,
+        queued_event_id=data.queued_event_id,
+        observed_title_sha256=metadata_digest(metadata.title),
+        observed_body_sha256=metadata_digest(metadata.body),
+        observed_at=metadata.observed_at,
+        iat=int(metadata.observed_at.timestamp()),
+        exp=int(authority.execution_deadline.timestamp()),
+    )
+    return PublicationContext(
+        agent_id=claims.agent_id,
+        deployment_id=claims.deployment_id,
+        work_item_id=claims.work_item_id,
+        execution_request_id=claims.execution_request_id,
+        runtime_epoch=claims.runtime_epoch,
+        conversation_id=claims.conversation_id,
+        lineage_id=claims.lineage_id,
+        lineage_version=claims.lineage_version,
+        expected_head=claims.expected_head,
+        queued_event_id=claims.queued_event_id,
+        observed_title=metadata.title,
+        observed_body_sha256=claims.observed_body_sha256,
+        observed_at=metadata.observed_at,
+        precheck_url=str(request.url_for("compare_publication_metadata")),
+        capability=mint(settings.api_key, claims),
+    )
 
 
 async def _publication_lineage_out(
@@ -273,13 +383,152 @@ async def create_publication(
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
+
+    if data.work_item_request_id is not None:
+        prior_paths = (
+            await session.scalars(
+                select(Publication.changed_paths).where(
+                    Publication.execution_request_id == data.work_item_request_id,
+                    Publication.status == "succeeded",
+                )
+            )
+        ).all()
+        changed_paths = [
+            path for paths in prior_paths for path in paths
+        ] + data.changed_paths
+        unselected = factory_ci._unselected_python_path(changed_paths)
+        if unselected is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "publication.required_python_ci_unselected",
+                    "message": f"required Python CI does not select {unselected}",
+                },
+            )
+        if factory_ci._python_paths(changed_paths):
+            try:
+                observation = await factory_progress.read_verification_observation(
+                    session, data.work_item_request_id
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_unreadable",
+                        "message": "stored verification preflight is unreadable",
+                    },
+                ) from exc
+            if observation is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_missing",
+                        "message": "verification preflight observation is missing",
+                    },
+                )
+            if observation.outcome == "failed":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "publication.verification_preflight_failed",
+                        "message": "verification preflight failed; rerun after fixing the failure",
+                    },
+                )
+            if observation.outcome == "unavailable":
+                body = data.body or ""
+                statements = (
+                    "In-sandbox verification was unavailable.",
+                    "Python (ruff + mypy + pytest) is pending proof.",
+                )
+                missing = [statement for statement in statements if statement not in body]
+                if missing:
+                    body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                    data = data.model_copy(update={"body": body})
+
+    async def metadata_check() -> None:
+        if patch:
+            return
+        if (
+            data.work_item_request_id is None
+            or data.work_item_runtime_epoch is None
+            or data.observed_title is None
+            or data.observed_body_sha256 is None
+            or data.observed_lineage_id is None
+            or data.observed_lineage_version is None
+            or data.title is None
+            or data.body is None
+        ):
+            raise crud.PublicationLineageConflict(
+                "publication.metadata_context_required",
+                "metadata-only publication requires a current factory observation",
+            )
+        execution = await session.get(ExecutionRequest, data.work_item_request_id)
+        if execution is None:
+            raise PublicationPrecheckRefused
+        authority = await read_publication_authority(
+            session,
+            deployment_id=data.deployment_id,
+            work_item_id=execution.work_item_id,
+            execution_request_id=data.work_item_request_id,
+            runtime_epoch=data.work_item_runtime_epoch,
+        )
+        if (
+            authority is None
+            or authority.has_inflight_push
+            or authority.conversation_id != data.conversation_id
+            or authority.repo_full_name.casefold() != data.repo_full_name.casefold()
+            or authority.lineage_id != data.observed_lineage_id
+            or authority.lineage_version != data.observed_lineage_version
+            or authority.expected_head != data.base_sha
+        ):
+            raise PublicationPrecheckRefused
+        metadata = await read_publication_metadata(
+            authority, settings=get_settings(), client=request.app.state.http_client
+        )
+        current = await read_publication_authority(
+            session,
+            deployment_id=data.deployment_id,
+            work_item_id=execution.work_item_id,
+            execution_request_id=data.work_item_request_id,
+            runtime_epoch=data.work_item_runtime_epoch,
+        )
+        if current != authority:
+            raise PublicationPrecheckRefused
+        if (
+            metadata_digest(metadata.title) != metadata_digest(data.observed_title)
+            or metadata_digest(metadata.body) != data.observed_body_sha256
+        ):
+            raise PublicationPrecheckRefused
+        if (metadata.title, metadata.body) == (data.title, data.body):
+            raise crud.PublicationLineageConflict(
+                "publication.no_change",
+                "neither files nor pull request metadata changed",
+            )
+
     try:
         publication, created = await crud.create_publication(
             session,
             data,
             patch=patch,
+            metadata_check=metadata_check,
             traceparent=traceparent,
         )
+    except PublicationPrecheckRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.metadata_stale",
+                "message": "pull request metadata or execution authority changed",
+            },
+        ) from exc
+    except (PublicationPrecheckUnavailable, TimeoutError) as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {
+                "code": "publication.metadata_unavailable",
+                "message": "current pull request metadata could not be verified",
+            },
+        ) from exc
     except crud.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except crud.PublicationLineageConflict as exc:
@@ -400,7 +649,33 @@ async def advance_publication_lineage(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
         ) from exc
+    await _replay_held_review_feedback(request, lineage)
     return await _publication_lineage_out(session, lineage)
+
+
+async def _replay_held_review_feedback(
+    request: Request, lineage: ThreadPublicationLineage
+) -> None:
+    """Admit review feedback held while this lineage awaited identity (#2962).
+
+    Best effort: the reconciler retries every pass, so a failure here only
+    delays the review and never fails the committed lineage advance.
+    """
+    if (
+        not get_settings().github_review_ingress_enabled
+        or lineage.status != "open"
+        or lineage.github_repository_id is None
+        or lineage.pr_number is None
+    ):
+        return
+    try:
+        async with asyncio.timeout(10):
+            await request.app.state.github_review_reconciler.replay_held(
+                repository_id=lineage.github_repository_id,
+                pr_number=lineage.pr_number,
+            )
+    except Exception:
+        logger.warning("held GitHub review replay after identity failed; reconciler retries")
 
 
 @router.get("", response_model=list[PublicationOut])

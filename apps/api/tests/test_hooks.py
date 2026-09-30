@@ -96,6 +96,7 @@ def _post(
     signature: str | None = None,
     delivery_id: str | None = "dlv-1",
     traceparent: str | None = None,
+    params: dict[str, str] | None = None,
 ) -> Any:
     """POST one delivery, signing with `secret` unless a signature is forced."""
 
@@ -108,7 +109,9 @@ def _post(
         headers["X-Curie-Delivery-Id"] = delivery_id
     if traceparent is not None:
         headers[TRACEPARENT_STREAM_FIELD] = traceparent
-    return client.post(f"/hooks/{agent_id}/{hook}", content=body, headers=headers)
+    return client.post(
+        f"/hooks/{agent_id}/{hook}", content=body, headers=headers, params=params
+    )
 
 
 @contextmanager
@@ -190,6 +193,143 @@ def test_a_signed_delivery_enqueues_a_webhook_turn_with_no_placeholder(
     # The payload reaches the agent, and the author is the platform, not a person.
     assert '{"issue": 42}' in turn.text
     assert turn.author == "hook:issues"
+
+
+def test_a_signed_delivery_can_target_a_preposted_reply_in_an_existing_conversation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """A trusted intake may make the normal worker answer an existing thread.
+
+    Removing either explicit target from the minted turn would make a Slack
+    email intake answer as a new top-level message instead of editing its
+    placeholder inside the source email thread.
+    """
+
+    agent_id = _bind(hooks_client, auth_headers, name="threadtargetagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b'{"subject":"ALARM: database unavailable"}',
+        secret=_secret_for(agent_id),
+        params={
+            "conversation_id": "1790706162.161449",
+            "placeholder": "1790706163.000200",
+        },
+    )
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["conversation_id"] == "1790706162.161449"
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.conversation_id == "1790706162.161449"
+    assert turn.reply_handle.placeholder == "1790706163.000200"
+    # Explicit message coordinates do not let the caller replace the bound
+    # channel route or its authenticated egress endpoint.
+    assert turn.reply_handle.kind == "email"
+    assert turn.reply_handle.channel == "threadtargetagent@example.test"
+    assert turn.reply_handle.endpoint == EMAIL_ENDPOINT
+    assert turn.reply_handle.adapter == EMAIL_ADAPTER
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"conversation_id": "1790706162.161449"},
+        {"placeholder": "1790706163.000200"},
+    ],
+)
+def test_an_incomplete_explicit_reply_target_is_refused_before_enqueue(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    params: dict[str, str],
+) -> None:
+    """A half-addressed reply must not silently fall back to a new message."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="halftargetagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=_secret_for(agent_id),
+        params=params,
+    )
+
+    assert answer.status_code == 422, answer.text
+    assert "conversation_id" in answer.text and "placeholder" in answer.text
+    assert _queued(valkey, runs_stream) == []
+
+
+def test_an_unsigned_caller_cannot_probe_explicit_target_validation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """Authentication precedes target validation, as it does for delivery ids."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="targetprobeagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        params={"conversation_id": "", "placeholder": ""},
+    )
+
+    assert answer.status_code == 401, answer.text
+    assert answer.json()["detail"] == "missing or invalid signature"
+    assert _queued(valkey, runs_stream) == []
+
+
+def test_a_duplicate_delivery_reports_the_original_explicit_conversation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """A retry cannot redirect a delivery after the first turn was queued."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="retargetagent")
+    secret = _secret_for(agent_id)
+    first = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=secret,
+        delivery_id="stable-email-root",
+        params={"conversation_id": "100.1", "placeholder": "100.2"},
+    )
+    duplicate = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=secret,
+        delivery_id="stable-email-root",
+        params={"conversation_id": "200.1", "placeholder": "200.2"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True
+    assert duplicate.json()["conversation_id"] == "100.1"
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.conversation_id == "100.1"
+    assert turn.reply_handle.placeholder == "100.2"
 
 
 def test_hook_ingress_producer_injects_the_http_parent_through_owned_enqueue(
@@ -508,6 +648,94 @@ def test_rotating_the_generation_invalidates_the_old_secret(
 
     accepted = _post(hooks_client, agent_id, "issues", body, signature=_sign(new, body))
     assert accepted.status_code == 200
+
+
+def test_operator_read_returns_the_current_secret_used_by_hook_ingress(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="readhookagent")
+
+    first = hooks_client.get(f"/agents/{agent_id}/hook-secret", headers=auth_headers)
+    second = hooks_client.get(f"/agents/{agent_id}/hook-secret", headers=auth_headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    secret = first.json()["secret"]
+    assert secret == second.json()["secret"] == _secret_for(agent_id)
+    assert "no-store" in first.headers["cache-control"].lower()
+
+    body = b'{"issue": 42}'
+    accepted = _post(hooks_client, agent_id, "issues", body, secret=secret)
+    assert accepted.status_code == 200, accepted.text
+    assert len(_queued(valkey, runs_stream)) == 1
+
+
+def test_operator_secret_read_requires_the_platform_api_key(
+    hooks_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="privatehookagent")
+    path = f"/agents/{agent_id}/hook-secret"
+
+    missing = hooks_client.get(path)
+    invalid = hooks_client.get(path, headers={"X-API-Key": "wrong-key"})
+
+    assert missing.status_code == 401, missing.text
+    assert invalid.status_code == 401, invalid.text
+    assert "secret" not in missing.text.lower()
+    assert "secret" not in invalid.text.lower()
+
+
+def test_operator_secret_read_refuses_an_unknown_agent(
+    hooks_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    unknown = hooks_client.get(f"/agents/{uuid.uuid4()}/hook-secret", headers=auth_headers)
+
+    assert unknown.status_code == 404, unknown.text
+    assert unknown.json()["detail"] == "agent not found"
+
+
+def test_operator_secret_read_tracks_rotation_and_ordinary_agent_reads_hide_it(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="rotatedreadagent")
+    path = f"/agents/{agent_id}/hook-secret"
+    first = hooks_client.get(path, headers=auth_headers)
+    assert first.status_code == 200, first.text
+    old = first.json()["secret"]
+
+    _bump_generation(agent_id)
+
+    rotated = hooks_client.get(path, headers=auth_headers)
+    assert rotated.status_code == 200, rotated.text
+    current = rotated.json()["secret"]
+    assert current != old
+    assert current == _secret_for(agent_id, generation=1)
+
+    body = b"{}"
+    refused = _post(hooks_client, agent_id, "issues", body, secret=old)
+    accepted = _post(hooks_client, agent_id, "issues", body, secret=current)
+    assert refused.status_code == 401, refused.text
+    assert accepted.status_code == 200, accepted.text
+    assert len(_queued(valkey, runs_stream)) == 1
+
+    ordinary_get = hooks_client.get(f"/agents/{agent_id}", headers=auth_headers)
+    ordinary_list = hooks_client.get("/agents", headers=auth_headers)
+    ordinary_patch = hooks_client.patch(
+        f"/agents/{agent_id}", json={"memory": True}, headers=auth_headers
+    )
+    for response in (ordinary_get, ordinary_list, ordinary_patch):
+        assert response.status_code == 200, response.text
+        assert old not in response.text
+        assert current not in response.text
+        assert '"hook_secret"' not in response.text
 
 
 def test_an_unknown_agent_answers_the_same_401_as_a_bad_signature(

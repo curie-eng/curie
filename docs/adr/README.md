@@ -180,8 +180,8 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 | 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
-| 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Accepted |
-| 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Superseded by [ADR-0156](0156-adapter-principal-with-a-scoped-credential.md) |
+| 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Superseded by [ADR-0166](0166-tenant-boundary-and-principal-identity-land-together.md) |
 | 0156 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0156-adapter-principal-with-a-scoped-credential.md) | Accepted |
 | 0157 | [Factory work dispatches from SQL over the runs stream](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md) | Accepted |
 | 0158 | [A custom connector is a bundle built HTTP MCP server that holds its own credential](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
@@ -191,4 +191,20 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0167 | [Agent and channel memory are written by the agent, guided by editable guidance](0167-agent-and-channel-memory-are-written-by-the-agent-guided-by-editable-guidance.md) | Draft |
+| 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
+| 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
+| 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
+| 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
+| 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
+| 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Accepted |
+| 0174 | [Publication prechecks use an execution scoped capability](0174-publication-prechecks-use-an-execution-scoped-capability.md) | Accepted |
+| 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
+| 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
+| 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
+| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
+| 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
+| 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
+| 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
+| 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
 <!-- END GENERATED: adr-index -->

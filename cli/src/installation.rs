@@ -928,7 +928,7 @@ comms:
 /// then Curie private storage. Mirrors `commands::secret_store_env`'s order --
 /// shell env beats the vault -- so `curie apply` and `curie skill up` disagree
 /// about nothing.
-fn resolve_credential(name: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_credential(name: &str) -> Result<Option<String>> {
     if let Ok(value) = std::env::var(name) {
         if !value.is_empty() {
             return Ok(Some(value));
@@ -1068,6 +1068,15 @@ pub struct LocalInstallationPlan {
     resolved: BTreeMap<String, String>,
     up: crate::ops::UpOpts,
     github_token: Option<String>,
+}
+
+impl LocalInstallationPlan {
+    /// Append typed `--set` values the file cannot express: `set:` renders as
+    /// `--set-string`, which would turn a NetworkPolicy port into a named port.
+    pub(crate) fn with_typed_sets(mut self, sets: impl IntoIterator<Item = String>) -> Self {
+        self.up.set.extend(sets);
+        self
+    }
 }
 
 struct EffectiveInstallationPlan {

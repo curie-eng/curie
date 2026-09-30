@@ -8,9 +8,11 @@
 
 mod support;
 
+#[path = "support/executable.rs"]
+mod test_executable;
+
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,22 +22,13 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
 }
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write stub executable");
-    let mut permissions = fs::metadata(path)
-        .expect("read stub metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make stub executable");
-}
-
 /// Stub docker/kubectl/helm for a default `curie/curie` install.
 ///
 /// `node_port` is the mock platform API's host port. Discovery prefers the UI
 /// `/api` proxy on that NodePort, same as `ops::discover_api_url`.
 fn install_cluster_stubs(tools: &Path, node_port: u16, api_key: &str) {
-    write_executable(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
-    write_executable(
+    test_executable::install(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
+    test_executable::install(
         tools.join("kubectl").as_path(),
         &format!(
             r#"#!/bin/sh
@@ -60,7 +53,7 @@ esac
             api_key = api_key
         ),
     );
-    write_executable(
+    test_executable::install(
         tools.join("helm").as_path(),
         r#"#!/bin/sh
 case "$*" in
@@ -77,8 +70,8 @@ esac
 /// Cluster tools that answer helm/kubectl enough for doctor to leave the
 /// laptop rung, but cannot discover a platform API URL or key.
 fn install_cluster_without_api(tools: &Path) {
-    write_executable(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
-    write_executable(
+    test_executable::install(tools.join("docker").as_path(), "#!/bin/sh\nexit 0\n");
+    test_executable::install(
         tools.join("kubectl").as_path(),
         r#"#!/bin/sh
 case "$*" in
@@ -88,7 +81,7 @@ case "$*" in
 esac
 "#,
     );
-    write_executable(
+    test_executable::install(
         tools.join("helm").as_path(),
         r#"#!/bin/sh
 case "$*" in

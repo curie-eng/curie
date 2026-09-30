@@ -7,6 +7,13 @@ configmapReload:
     enabled: false
 kube-state-metrics:
   enabled: true
+  # CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these
+  # labels through kube_deployment_labels and kube_statefulset_labels.
+  # kube-state-metrics exports no object labels by default, so without this
+  # both rules select nothing and stay silent.
+  metricLabelsAllowlist:
+    - deployments=[app.kubernetes.io/component,helm.sh/chart]
+    - statefulsets=[helm.sh/chart]
   resources:
     requests:
       cpu: 10m
@@ -137,9 +144,34 @@ serverFiles:
   alerting_rules.yml:
     groups:
       - name: curie-reliability
+        # CurieTaskFailure, CurieWorkerSupervisedRestartLoop,
+        # CurieReplyDeliveryRefused and CurieChannelTokenRotationFailed each
+        # have a second term for a new series. The SDK exports a counter only
+        # after its first measurement, so a series arrives at its first value
+        # with no zero before it, and increase() cannot see a first sample.
+        # Each process exports under its own `instance`, so a restarted
+        # process's counters are new series too.
+        # `X unless last_over_time(X[1h] offset O)` is a series with no sample
+        # in the hour ending O ago. O is the rule's window, so a new series'
+        # value counts as its increase over the same window increase() uses.
+        # The costs: a Prometheus with no history of a running process, such
+        # as a fresh install or a lost volume, treats every counter as new,
+        # and each one already at its threshold pages once, for up to its
+        # window. A series with no sample for longer than the 1h lookback
+        # plus the rule's `for` refires once when samples resume;
+        # CurieApplicationMetricsAbsent pages long before a gap that long.
+        # CurieTurnAcceptedStale uses the same term the other way round, to
+        # raise a count rather than to page; its own comment gives its costs.
+        #
+        # An install that sets api.approvalSweepIntervalSeconds to 0 or less
+        # records no curie_approval_pending and should drop that term from
+        # CurieApplicationMetricsAbsent.
         rules:
           - alert: CurieApplicationMetricsAbsent
-            expr: absent(curie_turn_accepted_total)
+            expr: |
+              absent(curie_queue_depth{service_name="curie-worker"})
+              or
+              absent(curie_approval_pending{service_name="curie-api"})
             for: 10m
             labels:
               severity: page
@@ -147,18 +179,63 @@ serverFiles:
             annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
-                No curie_turn_accepted_total series has been retained for 10
-                minutes. Treat missing metrics as a failure, not as a quiet
-                system.
+                curie_queue_depth or curie_approval_pending has had no sample
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
+            # Counted per label set, not per series: a restart leaves the old
+            # instance's series flat in the range, where a per-series count
+            # pages, and starts the new one's at its first turn. So both
+            # windows sum without `instance`, and the alert names no process.
+            # The 90m count adds the new-series term above, reading
+            # last_over_time(X[90m]) for X, so a new instance's first turn
+            # counts for the whole window: a process that took one turn and
+            # exited, including the runner's one-turn sandboxes, still counts
+            # after X drops it. The 7d gate adds no such term: with under
+            # seven days of history every live series looks new over 7d, and
+            # a term there would page every label set with a lifetime count
+            # above zero and no turn in 90 minutes. A label set with no series left in the 90m range,
+            # such as an old instance's after a restart with no turn since,
+            # counts as zero rather than absent. The costs: a label set whose
+            # only turns in seven days are new series' first samples, such as
+            # its first turn ever and then silence, is not armed; and a label
+            # set that stops recording for good pages for up to seven days,
+            # while its turns are still in the 7d range; and after a metrics
+            # gap longer than the 1h lookback every series looks new until 90
+            # minutes after samples resume, so the 90m count reads lifetime
+            # values and a canary that stopped around the gap stays hidden
+            # until then. CurieApplicationMetricsAbsent pages the gap itself.
             expr: |
               (
-                increase(curie_turn_accepted_total[90m]) == 0
-              )
+                sum without (instance) (
+                  (
+                    increase(curie_turn_accepted_total[90m])
+                    unless
+                    (
+                      last_over_time(curie_turn_accepted_total[90m])
+                      unless
+                      last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(curie_turn_accepted_total[90m])
+                    unless
+                    last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                  )
+                )
+                or
+                0 * sum without (instance) (
+                  increase(curie_turn_accepted_total[7d])
+                )
+              ) == 0
               and
-              (
-                increase(curie_turn_accepted_total[7d]) > 0
-              )
+              sum without (instance) (
+                increase(curie_turn_accepted_total[7d])
+              ) > 0
             for: 15m
             labels:
               severity: page
@@ -173,6 +250,15 @@ serverFiles:
               increase(
                 curie_turn_completed_total{outcome="classified_failure"}[15m]
               ) > 0
+              or
+              (
+                curie_turn_completed_total{outcome="classified_failure"}
+                unless
+                last_over_time(
+                  curie_turn_completed_total{outcome="classified_failure"}[1h]
+                  offset 15m
+                )
+              ) > 0
             for: 5m
             labels:
               severity: page
@@ -181,18 +267,42 @@ serverFiles:
               summary: A Curie turn completed as classified_failure
               description: >-
                 curie_turn_completed_total with outcome classified_failure
-                increased in the last 15 minutes.
+                increased in the last 15 minutes, counting a series' first
+                sample as an increase from zero.
           - alert: CurieQueueMessageAgeHigh
-            expr: curie_queue_message_age_seconds > 900
-            for: 10m
+            # Reads the consumer group's lag, not the message-age histogram:
+            # that records a message's age only when a worker takes it, so a
+            # queue that has stopped delivering records nothing there at all.
+            # Every worker process records the same stream's lag, and a
+            # restarted worker is a new series, so the lag is read without
+            # `instance`: one series per stream however many workers run,
+            # unbroken across a restart. min_over_time reads only the samples
+            # it has, so the count requires all 15 minute reads, or a series
+            # younger than 15 minutes, a fresh Prometheus's included, would
+            # fire 5 minutes after its first sample above 0. The cost: the
+            # worker records the lag as 0 when Valkey cannot compute it, which
+            # happens once entries inside the group's range are deleted, so an
+            # installation that trims the run stream loses this rule. This
+            # chart does not trim it. And the worker records the lag from its
+            # maintenance loop, which can wait on a full slot semaphore while
+            # every slot stays busy; the lag then stops arriving, this rule
+            # goes quiet, and CurieApplicationMetricsAbsent pages instead,
+            # since the queue-depth gauge stops with it.
+            expr: |
+              min_over_time(max without (instance) (curie_queue_lag)[15m:1m]) > 0
+              and
+              count_over_time(max without (instance) (curie_queue_lag)[15m:1m]) >= 15
+            for: 5m
             labels:
               severity: page
               component: curie-queue
             annotations:
-              summary: Oldest queued Curie message is older than 15 minutes
+              summary: Queued Curie messages have waited undelivered for 15 minutes
               description: >-
-                curie_queue_message_age_seconds has stayed above 900 for 10
-                minutes.
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
           - alert: CurieCompletionOutboxAgeHigh
             expr: curie_completion_outbox_age_seconds > 300
             for: 10m
@@ -224,6 +334,15 @@ serverFiles:
               increase(
                 curie_worker_supervised_restart_total{outcome="restart"}[30m]
               ) >= 3
+              or
+              (
+                curie_worker_supervised_restart_total{outcome="restart"}
+                unless
+                last_over_time(
+                  curie_worker_supervised_restart_total{outcome="restart"}[1h]
+                  offset 30m
+                )
+              ) >= 3
             for: 5m
             labels:
               severity: page
@@ -232,9 +351,9 @@ serverFiles:
               summary: A supervised worker task is crash-looping
               description: >-
                 curie_worker_supervised_restart_total with outcome restart
-                increased by three or more in 30 minutes for one operation.
-                The task is backing off and will be parked if it keeps
-                crashing.
+                increased by three or more in 30 minutes for one operation,
+                counting a series' first sample as an increase from zero. The
+                task is backing off and will be parked if it keeps crashing.
           - alert: CurieWorkerSupervisedTaskParked
             # A level check, not increase(): a parked task emits give_up once
             # and its series first appears already at 1 with no zero sample, so
@@ -256,6 +375,14 @@ serverFiles:
               increase(
                 curie_reply_delivery_total{outcome="failure"}[15m]
               ) >= 3
+              or
+              (
+                curie_reply_delivery_total{outcome="failure"}
+                unless
+                last_over_time(
+                  curie_reply_delivery_total{outcome="failure"}[1h] offset 15m
+                )
+              ) >= 3
             for: 10m
             labels:
               severity: page
@@ -264,7 +391,8 @@ serverFiles:
               summary: Repeated Curie reply delivery failures
               description: >-
                 curie_reply_delivery_total with outcome failure increased by
-                three or more in 15 minutes.
+                three or more in 15 minutes, counting a series' first sample
+                as an increase from zero.
           - alert: CurieChannelTokenRotationFailed
             expr: |
               increase(
@@ -272,6 +400,21 @@ serverFiles:
                   operation="/channels/token",
                   outcome="5xx"
                 }[1h]
+              ) > 0
+              or
+              (
+                curie_http_server_request_total{
+                  operation="/channels/token",
+                  outcome="5xx"
+                }
+                unless
+                last_over_time(
+                  curie_http_server_request_total{
+                    operation="/channels/token",
+                    outcome="5xx"
+                  }[1h]
+                  offset 1h
+                )
               ) > 0
             for: 5m
             labels:
@@ -281,12 +424,169 @@ serverFiles:
               summary: Channel-token HTTP rotation returned 5xx
               description: >-
                 curie_http_server_request_total for /channels/token with
-                outcome 5xx increased in the last hour.
-          - alert: CurieMailAdapterNotReady
+                outcome 5xx increased in the last hour, counting a series'
+                first sample as an increase from zero.
+          - alert: CurieQueueDeadLettered
+            # The worker records a message sent to the dead letter stream with
+            # outcome success. Any such message in 15m pages after 5m. The
+            # header explains why the second term counts a counter's first
+            # sample.
             expr: |
-              kube_deployment_status_replicas_unavailable{
-                deployment=~".*mail-adapter"
-              } > 0
+              increase(
+                curie_queue_dead_letter_total{outcome="success"}[15m]
+              ) > 0
+              or
+              (
+                curie_queue_dead_letter_total{outcome="success"}
+                unless
+                last_over_time(
+                  curie_queue_dead_letter_total{outcome="success"}[1h]
+                  offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-queue
+            annotations:
+              summary: A Curie message was dead lettered
+              description: >-
+                At least one message was dead lettered in 15 minutes, including
+                a new counter series. The turn needs operator investigation.
+          - alert: CurieSandboxClaimSlow
+            # Average claim duration across all worker instances, including
+            # failed, claimed, and reused outcomes. The first sample term
+            # counts the initial histogram counter value for a newly observed
+            # series, using the same 15m window as increase. The average must
+            # exceed 60 seconds for 5m.
+            expr: |
+              (
+                sum by (service_name, operation, outcome) (
+                  increase(
+                    curie_sandbox_claim_duration_seconds_sum{
+                      operation="claim"
+                    }[15m]
+                  )
+                  or
+                  (
+                    curie_sandbox_claim_duration_seconds_sum{
+                      operation="claim"
+                    }
+                    unless
+                    last_over_time(
+                      curie_sandbox_claim_duration_seconds_sum{
+                        operation="claim"
+                      }[1h] offset 15m
+                    )
+                  )
+                )
+                /
+                sum by (service_name, operation, outcome) (
+                  increase(
+                    curie_sandbox_claim_duration_seconds_count{
+                      operation="claim"
+                    }[15m]
+                  )
+                  or
+                  (
+                    curie_sandbox_claim_duration_seconds_count{
+                      operation="claim"
+                    }
+                    unless
+                    last_over_time(
+                      curie_sandbox_claim_duration_seconds_count{
+                        operation="claim"
+                      }[1h] offset 15m
+                    )
+                  )
+                )
+              ) > 60
+            for: 5m
+            labels:
+              severity: page
+              component: curie-sandbox
+            annotations:
+              summary: Sandbox claims are slow
+              description: >-
+                Completed sandbox claims averaged more than 60 seconds over 15
+                minutes. Check sandbox capacity and binding.
+          - alert: CurieSandboxCapacityRefused
+            # Page on any reclaim refusal caused by invalid quota, exhausted
+            # budget, lack of a safe route, or a refused retry during the last
+            # 15m.
+            expr: |
+              increase(
+                curie_sandbox_lifecycle_total{
+                  operation="reclaim",
+                  outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                }[15m]
+              ) > 0
+              or
+              (
+                curie_sandbox_lifecycle_total{
+                  operation="reclaim",
+                  outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                }
+                unless
+                last_over_time(
+                  curie_sandbox_lifecycle_total{
+                    operation="reclaim",
+                    outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                  }[1h] offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-sandbox
+            annotations:
+              summary: Sandbox capacity reclamation was refused
+              description: >-
+                A reclaim attempt was refused in 15 minutes because quota,
+                budget, or a safe route was unavailable.
+          - alert: CurieHistoryPersistenceFailed
+            # Page when transcript persistence hits either capacity limit in
+            # the last 15m, including the first sample of a new counter.
+            expr: |
+              increase(
+                curie_history_persistence_failure_total[15m]
+              ) > 0
+              or
+              (
+                curie_history_persistence_failure_total
+                unless
+                last_over_time(
+                  curie_history_persistence_failure_total[1h] offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-state
+            annotations:
+              summary: Curie transcript persistence hit a capacity limit
+              description: >-
+                Transcript persistence failed in 15 minutes because a value or
+                namespace capacity limit was reached.
+          - alert: CurieMailAdapterNotReady
+            # Two terms, because `unavailable > 0` alone cannot see a
+            # Deployment scaled to zero: kube-state-metrics reports
+            # unavailable as spec minus available, which is 0 - 0 there.
+            # The regex is `.*mail-adapter.*` because matchers are fully
+            # anchored and an installation names one adapter per mailbox
+            # with a suffix (`mail-adapter-brand`).
+            expr: |
+              (
+                kube_deployment_status_replicas_unavailable{
+                  deployment=~".*mail-adapter.*"
+                } > 0
+              )
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment=~".*mail-adapter.*"
+                } == 0
+              )
             for: 5m
             labels:
               severity: page
@@ -297,6 +597,368 @@ serverFiles:
                 The mail adapter Deployment has unavailable replicas. An
                 expired channel token fails /readyz and surfaces here without
                 inspecting a token value.
+          - alert: CurieConnectorNotReady
+            # A connector is one Deployment per (agent, connector), named
+            # `<release>-<agent>-mcp-<connector>`. Same two terms as the mail
+            # adapter, for the same reason. Nothing else in this file notices
+            # a connector down: its agent still answers, and says it cannot
+            # reach the systems it reads from.
+            expr: |
+              (
+                kube_deployment_status_replicas_unavailable{
+                  deployment=~".*-mcp-.*"
+                } > 0
+              )
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment=~".*-mcp-.*"
+                } == 0
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-connector
+            annotations:
+              summary: A connector Deployment is not serving
+              description: >-
+                A connector has no available replica, or has been scaled to
+                zero. Its agent still answers, and tells the person it cannot
+                reach the systems it reads from.
+          - alert: SreSlackEmailIntakeNotReady
+            # @spec SRE-EMAIL-3. The code ConfigMap is the durable opt-in
+            # marker: default SRE installs stay quiet, while deleting only the
+            # Deployment pages for as long as the install remains opted in.
+            # The historical term bridges a missing marker scrape for up to
+            # the shipped seven-day retention.
+            expr: |
+              sre_slack_email_intake_ready == 0
+              or
+              kube_deployment_status_replicas_unavailable{
+                deployment="sre-slack-email-intake"
+              } > 0
+              or
+              kube_deployment_spec_replicas{
+                deployment="sre-slack-email-intake"
+              } == 0
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                } > 0
+                unless on (namespace)
+                max by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    pod=~"sre-slack-email-intake-.*"
+                  }
+                )
+              )
+              or
+              (
+                kube_configmap_info{
+                  configmap="sre-slack-email-intake-code"
+                }
+                unless on (namespace)
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+              or
+              (
+                max_over_time(
+                  kube_deployment_spec_replicas{
+                    deployment="sre-slack-email-intake"
+                  }[7d]
+                ) > 0
+                unless
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+          - alert: SreSlackEmailIntakeRestarted
+            # @spec SRE-EMAIL-3. One restart is enough: all scan and dispatch
+            # failures are fatal by design. The second arm sees the first
+            # sample of a newly exported container counter.
+            expr: |
+              increase(
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }[15m]
+              ) > 0
+              or
+              (
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }
+                unless
+                last_over_time(
+                  kube_pod_container_status_restarts_total{
+                    container="intake",
+                    pod=~"sre-slack-email-intake-.*"
+                  }[1h] offset 15m
+                )
+              ) > 0
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake restarted
+              description: >-
+                The intake process restarted after a configuration, Slack,
+                file-download, hook, routing, or stale-placeholder failure.
+          - alert: CurieDispatcherRestartLoop
+            # Pod restarts, not CurieWorkerSupervisedRestartLoop's in-process
+            # counter: a dispatcher that crashes takes its counter with it.
+            # Same window and threshold as that rule so the two read alike.
+            expr: |
+              increase(
+                kube_pod_container_status_restarts_total{
+                  pod=~".*-dispatcher-.*"
+                }[30m]
+              ) >= 3
+            for: 5m
+            labels:
+              severity: page
+              component: curie-dispatcher
+            annotations:
+              summary: The dispatcher is crash-looping
+              description: >-
+                A dispatcher container restarted three or more times in 30
+                minutes. While it is down no Slack message reaches any agent,
+                and every other pod still looks healthy.
+          - alert: CurieNodeNotReady
+            # Two terms. The kubelet term reads this Prometheus's own scrape
+            # of each node (`up` on that job, whose instance is the node
+            # name), so it still fires when kube-state-metrics ran on the
+            # failed node and went down with it. Both aggregate to `node`, so
+            # a node failing both raises one alert and a kube-state-metrics
+            # reschedule keeps one label set. For the Ready term the `for`
+            # clock survives that only when the old and new pods overlap; a
+            # restart that misses a scrape still restarts it.
+            # status="true" == 0 also catches Unknown. Known false positive: a
+            # node this Prometheus can never scrape, such as a node pool
+            # behind a stricter network rule or a virtual node, reads up == 0
+            # and pages until it is excluded from the kubernetes-nodes job.
+            expr: |
+              max by (node) (
+                kube_node_status_condition{
+                  condition="Ready",
+                  status="true"
+                } == 0
+              )
+              or
+              max by (node) (
+                label_replace(
+                  up{job="kubernetes-nodes"} == 0,
+                  "node", "$1", "instance", "(.+)"
+                )
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: A node is not Ready or its kubelet is unreachable
+              description: >-
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
+          - alert: CuriePodCrashLooping
+            # Covers every namespace, not only Curie's. max_over_time because
+            # the waiting series exists only while the container waits, so
+            # each brief run between back-offs would drop it and restart the
+            # `for` clock. The init term is its own metric: while an init
+            # container crashes, the app container only waits as
+            # PodInitializing, so the first term alone never fires.
+            # Aggregated to namespace, pod and container, so a
+            # kube-state-metrics reschedule keeps one label set, and the 5m
+            # window bridges a restart's missed scrapes, so the clock survives
+            # a gap shorter than that.
+            expr: |
+              max by (namespace, pod, container) (
+                max_over_time(
+                  kube_pod_container_status_waiting_reason{
+                    reason="CrashLoopBackOff"
+                  }[5m]
+                )
+              ) >= 1
+              or
+              max by (namespace, pod, container) (
+                max_over_time(
+                  kube_pod_init_container_status_waiting_reason{
+                    reason="CrashLoopBackOff"
+                  }[5m]
+                )
+              ) >= 1
+            for: 10m
+            labels:
+              severity: page
+              component: curie-pod
+            annotations:
+              summary: A container is crash-looping
+              description: >-
+                A container or init container in any namespace has been in
+                CrashLoopBackOff for 10 minutes. It keeps failing on start and
+                waits longer before each retry.
+          - alert: CurieCoreWorkloadNotReady
+            # Selects Curie chart objects by the labels the kube-state-metrics
+            # allowlist above exports, not by name: a component of api,
+            # worker or dispatcher, and a helm.sh/chart of curie-*, which the
+            # chart sets from its own name and so holds under nameOverride.
+            # A vendored copy of the chart renamed away from `curie` selects
+            # nothing. Two terms as in the mail adapter rule, because
+            # unavailable is spec minus available and reads 0 at zero
+            # replicas. Aggregated to namespace and deployment, so a move
+            # from unavailable to scaled to zero keeps one label set and
+            # keeps firing.
+            expr: |
+              max by (namespace, deployment) (
+                (
+                  kube_deployment_status_replicas_unavailable > 0
+                  or
+                  kube_deployment_spec_replicas == 0
+                )
+                and on (namespace, deployment)
+                kube_deployment_labels{
+                  label_app_kubernetes_io_component=~"api|worker|dispatcher",
+                  label_helm_sh_chart=~"curie-.+"
+                }
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-core
+            annotations:
+              summary: A core Curie Deployment has an unavailable replica or is scaled to zero
+              description: >-
+                The api, worker or dispatcher of a Curie release has a replica
+                that is not available, such as a crashed pod or a rollout
+                whose new pod never became ready, or has been scaled to zero.
+                The api readiness probe queries the database, so a database
+                outage, including one outside the cluster, surfaces here as an
+                unavailable api.
+          - alert: CurieStateStoreNotReady
+            # Valkey and Postgres carry no component label, so the name
+            # suffix picks the store, and a helm.sh/chart of curie-*,
+            # exported by the allowlist above, keeps a same-named
+            # StatefulSet from another chart out. A vendored copy of the chart
+            # renamed away from `curie` selects nothing. Two terms, because
+            # ready < replicas reads 0 < 0 at zero replicas. Aggregated to
+            # namespace and statefulset, so a move from not ready to scaled
+            # to zero keeps one label set and keeps firing.
+            expr: |
+              max by (namespace, statefulset) (
+                (
+                  (
+                    kube_statefulset_status_replicas_ready
+                    <
+                    kube_statefulset_replicas
+                  )
+                  or
+                  kube_statefulset_replicas == 0
+                )
+                and on (namespace, statefulset)
+                kube_statefulset_labels{
+                  statefulset=~".+-(valkey|postgres)",
+                  label_helm_sh_chart=~"curie-.+"
+                }
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-state
+            annotations:
+              summary: Valkey or Postgres of a Curie release is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet of a Curie release has fewer
+                ready replicas than it asks for, or has been scaled to zero.
+                Every agent depends on both: Valkey carries the run queue and
+                Postgres the agents and their state.
+          - alert: CuriePersistentVolumeSpaceLow
+            # Covers every volume mounted on any node, in any namespace: each
+            # kubelet reports its own through the kubernetes-nodes scrape.
+            # The curie_source stamp is not a Curie or namespace filter; it
+            # only excludes series that did not come from this Prometheus's
+            # own scrape, such as ones remote-written into it. Aggregated to
+            # the claim, so a claim mounted on more than one node raises one
+            # alert.
+            expr: |
+              min by (namespace, persistentvolumeclaim) (
+                kubelet_volume_stats_available_bytes{
+                  curie_source="curie-sre-bot"
+                }
+                /
+                kubelet_volume_stats_capacity_bytes{
+                  curie_source="curie-sre-bot"
+                }
+              ) < 0.10
+            for: 15m
+            labels:
+              severity: page
+              component: curie-storage
+            annotations:
+              summary: A persistent volume has less than 10 percent free
+              description: >-
+                A persistent volume mounted on any node has stayed below 10
+                percent free for 15 minutes. A full volume stops the workload
+                that writes to it.
+          - alert: CurieKubeStateMetricsDown
+            # Two terms. `== 1` inside absent() covers both ways no target
+            # answers: a scrape that fails reads up 0 and is filtered out, and
+            # a target that vanished has no up series at all. The count term
+            # pages on any target at 0, so a second one answering (its
+            # self-monitoring port, another replica or shard) cannot hold the
+            # page quiet. Both yield the empty label set, so they raise one
+            # alert. The job matcher keeps it to this stack's own
+            # kubernetes-service-endpoints scrape, so a kube-state-metrics
+            # scraped by another job cannot hold it quiet either. `up` carries
+            # no curie_source stamp (see the header), so it is qualified by
+            # job instead.
+            expr: |
+              absent(
+                up{
+                  job="kubernetes-service-endpoints",
+                  app_kubernetes_io_name="kube-state-metrics"
+                } == 1
+              )
+              or
+              count(
+                up{
+                  job="kubernetes-service-endpoints",
+                  app_kubernetes_io_name="kube-state-metrics"
+                } == 0
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-kube-state-metrics
+            annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay
+                quiet whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (
@@ -337,6 +999,35 @@ serverFiles:
               description: >-
                 A curie_source=curie-sre-bot root filesystem has stayed below
                 20 percent free for 15 minutes.
+          # Kubelet eviction watches bytes, not inodes. A full inode table on
+          # the root filesystem (which backs host /tmp) breaks runc exec state,
+          # so every exec probe fails while DiskPressure stays False (#2870).
+          - alert: CurieRootInodesLow
+            expr: |
+              (
+                node_filesystem_files_free{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+                /
+                node_filesystem_files{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+              ) < 0.05
+            for: 15m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: Root filesystem has less than 5 percent of inodes free
+              description: >-
+                A curie_source=curie-sre-bot root filesystem has stayed below
+                5 percent free inodes for 15 minutes. Exec probes and kubectl
+                exec fail with no space left on device even while kubelet
+                reports DiskPressure=False.
           - alert: CurieDuplicateNodeExporter
             expr: |
               count(

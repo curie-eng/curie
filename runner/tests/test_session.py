@@ -9,7 +9,14 @@ import pytest
 from aci_protocol import ErrorEvent, Event, Final, Interrupt, SessionStatus, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    RateLimitEvent,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
+from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
 from curie_runner import session as session_module
 from curie_runner.adapter import ClaudeAgentSession, McpServerReconnector
@@ -25,6 +32,7 @@ from curie_runner.mcp_tool_capability import (
     ConnectorCapabilityFailure,
 )
 from curie_runner.session import SessionRunner
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -128,9 +136,10 @@ class _RecordingTranscriptStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.turns)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _BlockedTranscriptStore(_RecordingTranscriptStore):
@@ -139,15 +148,16 @@ class _BlockedTranscriptStore(_RecordingTranscriptStore):
         self.entered = anyio.Event()
         self.release = anyio.Event()
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         self.entered.set()
         await self.release.wait()
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _CapacityTranscriptStore(_RecordingTranscriptStore):
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         from curie_runner.history import HistoryCapacityError
 
         self.attempts.append(record)
@@ -160,7 +170,7 @@ class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
         self.entered = anyio.Event()
         self.cancelled = anyio.Event()
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         if len(self.attempts) == 1:
             self.entered.set()
@@ -169,6 +179,7 @@ class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
             finally:
                 self.cancelled.set()
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _ReplayExportSession(FakeModelSession):
@@ -244,6 +255,14 @@ def test_transcript_capacity_failure_precedes_terminal_final(
         append_attempts.append(await request.json())
         return web.Response(status=413, text=sensitive_body)
 
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"},
+            status=404,
+            headers={"X-Curie-Transcript-Max-Bytes": "65536"},
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -265,6 +284,7 @@ def test_transcript_capacity_failure_precedes_terminal_final(
             store = StateApiTranscriptStore(
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
+            assert await store.load() == []
             runner, _fake = _runner_with_history(store, tracer=RunTracer(provider))
             await runner.start()
             lines = [
@@ -439,13 +459,14 @@ def test_approval_capacity_failure_clears_pending_approval(script_factory) -> No
 
 def test_capacity_loss_stays_sticky_after_a_later_successful_append() -> None:
     class RecoveringStore(_RecordingTranscriptStore):
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             from curie_runner.history import HistoryCapacityError
 
             self.attempts.append(record)
             if len(self.attempts) == 1:
                 raise HistoryCapacityError(413)
             self.turns.append(record)
+            return record.harness_replay is not None
 
     store = RecoveringStore()
     runner, _fake = _runner_with_history(store)
@@ -539,7 +560,7 @@ def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
     assert runner.history_durable is False
 
 
-def test_cancellation_during_persistence_marks_loss_without_a_terminal() -> None:
+def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -> None:
     store = _FirstBlockedTranscriptStore()
     runner, fake = _runner_with_history(store)
     first_lines: list[str] = []
@@ -572,10 +593,12 @@ def test_cancellation_during_persistence_marks_loss_without_a_terminal() -> None
         ]
         return parse_ndjson("".join(second_lines))
 
-    second = anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        second = anyio.run(go)
     first = parse_ndjson("".join(first_lines))
     assert not any(isinstance(event, Final) for event in first)
     assert second[-1].status is SessionStatus.DONE
+    assert sum("turn end" in record.getMessage() for record in caplog.records) == 1
     assert [record.user for record in store.turns] == ["second"]
     assert fake.interrupts == 0
     assert runner.turn_active is False
@@ -767,6 +790,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
 
 def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     monkeypatch: pytest.MonkeyPatch,
+    caplog,
 ) -> None:
     """Closing at a suspended yield must not let abandonment store first."""
 
@@ -810,7 +834,13 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
         await turn.aclose()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert sum(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    ) == 1
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "runner_timeout"
@@ -1143,6 +1173,23 @@ class _OrderedTimeoutWireSession:
 
     async def receive_turn(self):
         if self.queries == 1:
+            if self.first_receive_entered.is_set() and any(
+                kind == "interrupt" for kind, _ in self.wire
+            ):
+                # The next turn's resync read of the abandoned first turn
+                # (#3425): the CLI ends a turn with its terminal result once it
+                # reads a written stop, whether or not the ack reached the runner.
+                self.wire.append(("drained", "first"))
+                yield ResultMessage(
+                    subtype="error_during_execution",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="sdk-session-PLACEHOLDER",
+                    result="",
+                )
+                return
             self.first_receive_entered.set()
             await self.end_first_receive.wait()
             return
@@ -1308,6 +1355,7 @@ def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> Non
         ("query", "first"),
         ("interrupt", 1),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
@@ -1335,6 +1383,7 @@ def test_timeout_cancelled_before_stop_write_uses_cleanup_before_next_query() ->
     assert session.wire == [
         ("query", "first"),
         ("interrupt", 2),
+        ("drained", "first"),
         ("query", "second"),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
@@ -1400,6 +1449,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
     session_type,
     expected_phase: str,
     expect_tool: bool,
+    caplog,
 ) -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -1436,7 +1486,9 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
             scope_holder[0].cancel()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert not any("turn end" in record.getMessage() for record in caplog.records)
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.phase"] == expected_phase
@@ -1461,6 +1513,57 @@ def test_turn_lifecycle_logged(caplog) -> None:
     assert any("turn start" in message and "user=U-log" in message for message in messages)
     assert any("turn end" in message and "status=done" in message for message in messages)
     assert any("tool call" in message and "tool=Bash" in message for message in messages)
+
+
+def test_no_tool_turn_start_log_carries_its_agent_run_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    fake = FakeModelSession(
+        lambda: [
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="fake-session",
+                result="done",
+                usage=None,
+            )
+        ]
+    )
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="no-tool-turn",
+    )
+    contexts: list[tuple[int, int]] = []
+
+    class CaptureStart(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "turn start" in record.getMessage():
+                context = trace.get_current_span().get_span_context()
+                contexts.append((context.trace_id, context.span_id))
+
+    logger = logging.getLogger("curie_runner.session")
+    capture = CaptureStart()
+    logger.addHandler(capture)
+    try:
+        with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+            events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    finally:
+        logger.removeHandler(capture)
+
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert events[-1].status == SessionStatus.DONE
+    assert not _span_named(spans, "execute_tool")
+    assert contexts == [(root.context.trace_id, root.context.span_id)]
 
 
 def test_bare_interrupt_yields_idle_final() -> None:
@@ -1573,12 +1676,16 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
         classifier=SideEffectClassifier(),
         trace_name="t",
     )
-    with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     messages = [record.getMessage() for record in caplog.records]
     assert [e.type for e in events] == ["error", "final"]
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in message and "status=classified-failure" in message
+        for message in messages
+    )
     assert any(
         record.levelno == logging.ERROR
         and "turn failed" in record.getMessage()
@@ -1682,6 +1789,36 @@ def test_transient_model_error_is_not_fast_failed() -> None:
     assert fake.interrupts == 0  # not aborted
 
 
+def test_model_error_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [AssistantMessage(content=[], model="m", error="unknown")]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "unclassified"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_rejected_rate_limit_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(status="rejected"),
+                uuid="u",
+                session_id="s",
+            )
+        ]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "rate-limit"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_budget_halt_logged(caplog) -> None:
     script = [
         AssistantMessage(
@@ -1702,10 +1839,15 @@ def test_budget_halt_logged(caplog) -> None:
     ]
     runner, _ = _runner(lambda: script, ceiling=10)
 
-    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    )
     assert any(
         record.levelno == logging.WARNING and "budget halt" in record.getMessage()
         for record in caplog.records

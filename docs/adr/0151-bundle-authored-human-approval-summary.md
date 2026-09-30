@@ -4,6 +4,12 @@ Date: 2026-09-10
 
 Status: Draft
 
+**Amended by [ADR-0179](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)**:
+the resolved card and the pause notice in decision 3, and alternative 4. A
+settled card now states its outcome in the header and the time on its verdict
+line, and the notice above a card in the requester's own thread is one line
+with no approval id.
+
 Implements [#2565](https://github.com/curie-eng/curie/issues/2565).
 Does not change [ADR-0035](0035-one-shot-post-approval-allowance.md) or
 [ADR-0046](0046-converged-approval-gates-and-durable-provenance.md): the

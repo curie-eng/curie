@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any
 
+import anyio
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -25,8 +27,14 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
 
 from .adapter import PartialMessageBoundary
-from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
+from .approval import (
+    APPROVAL_TOOL_NAME,
+    TURN_PROGRESS_TOOL_NAME,
+    ApprovalGate,
+    process_approval_request,
+)
 from .history import ConversationMessage
+from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
@@ -156,6 +164,67 @@ def approval_turn(summary: str, route: str | None = None) -> list[Any]:
     ]
 
 
+# Explicit test-only marker for deliberate progress (ADR 0130): the turn calls
+# the platform progress tool three times through the SAME handler the SDK tool
+# closes over, pausing between calls long enough for a person to steer it,
+# then answers. Without a capability each call gets the tool's soft answer and
+# nothing touches the network, like all fake-model behavior.
+PROGRESS_DEMO_MARKER = "[fake:progress-demo]"
+PROGRESS_DEMO_PAUSE_S = 2.0
+
+_PROGRESS_DEMO_CALLS: tuple[dict[str, str], ...] = (
+    {
+        "update_id": "demo-investigating",
+        "state": "investigating",
+        "summary": "Looking into the request",
+    },
+    {
+        "update_id": "demo-evidence",
+        "state": "investigating",
+        "summary": "Found the relevant evidence",
+        "milestone": "evidence",
+    },
+    {
+        "update_id": "demo-verification",
+        "state": "testing",
+        "summary": "Verified the result",
+        "milestone": "verification",
+    },
+)
+
+
+@dataclass(frozen=True)
+class _Pause:
+    """A scripted wait, so a live demo turn can be steered."""
+
+
+@dataclass(frozen=True)
+class _ProgressCall:
+    """A scripted progress call, answered by running the real handler."""
+
+    tool_use_id: str
+    arguments: dict[str, str]
+
+
+def progress_demo_turn() -> list[Any]:
+    """A long turn that reports progress at three transitions, then answers."""
+
+    script: list[Any] = [_assistant(TextBlock(text="Working through it"))]
+    for index, arguments in enumerate(_PROGRESS_DEMO_CALLS, start=1):
+        tool_use_id = f"p{index}"
+        script.append(_Pause())
+        script.append(
+            _assistant(ToolUseBlock(id=tool_use_id, name=TURN_PROGRESS_TOOL_NAME, input=arguments))
+        )
+        script.append(_ProgressCall(tool_use_id=tool_use_id, arguments=arguments))
+    script.append(_Pause())
+    script.append(
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8})
+    )
+    script.append(_result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}))
+    return script
+
+
 class FakeModelSession:
     """A ModelSession that replays a fixed script of SDK messages per turn.
 
@@ -194,8 +263,12 @@ class FakeModelSession:
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
+        turn_progress: TurnProgress | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        # The session's progress holder (ADR 0130); None when the tool is not
+        # mounted, which the demo answers as "not shown", like no capability.
+        self._turn_progress = turn_progress
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._emit_partial_boundaries = emit_partial_boundaries
@@ -232,6 +305,8 @@ class FakeModelSession:
             return approval_turn(summary, route=match.group(1))
         if REVERSIBLE_MARKER in last:
             return reversible_turn()
+        if PROGRESS_DEMO_MARKER in last:
+            return progress_demo_turn()
         return default_turn()
 
     async def connect(self) -> None:
@@ -250,6 +325,13 @@ class FakeModelSession:
         for message in self._script_factory():
             if self._interrupted and self._truncate_on_interrupt:
                 return
+            if isinstance(message, _Pause):
+                # Read at call time, so a test can shorten the demo's waits.
+                await anyio.sleep(PROGRESS_DEMO_PAUSE_S)
+                continue
+            if isinstance(message, _ProgressCall):
+                yield await self._answer_progress(message)
+                continue
             await self._apply_gate(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
                 yield PartialMessageBoundary(event_type="message_start")
@@ -262,6 +344,11 @@ class FakeModelSession:
                 # separate mechanism from the ``_interrupted`` truncation above,
                 # which models an OPERATOR stop and must keep working on its own.
                 return
+
+    async def _answer_progress(self, call: _ProgressCall) -> UserMessage:
+        """The offline fake acknowledges the marker without any network I/O."""
+
+        return _tool_result(call.tool_use_id, [{"type": "text", "text": NOT_SHOWN_TEXT}])
 
     async def _apply_gate(self, message: Any) -> None:
         """Run the permission gate over each ToolUseBlock and honor its decision.
@@ -305,7 +392,7 @@ class FakeModelSession:
                 continue
             if self._can_use_tool is not None:
                 decision = await self._can_use_tool(
-                    block.name, block.input, ToolPermissionContext()
+                    block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
                     self._halted = True

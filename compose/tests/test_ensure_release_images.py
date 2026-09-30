@@ -187,12 +187,16 @@ class TestWorkflowsInvokeTheHelper:
         assert "--build-missing" in runs
         assert "--profiles" in runs
 
-    def test_ci_local_release_builds_missing_images_from_the_same_helper(self) -> None:
+    def test_ci_local_release_asserts_every_image_from_the_same_helper(self) -> None:
+        # The CI rung loads images the ci-images job built once for the run, so
+        # it must not rebuild any; the helper only proves each one is present.
         source = CI_YAML.read_text()
         assert "compose/ensure_release_images.py" in source
         job = yaml.load(source, Loader=yaml.BaseLoader)["jobs"]["e2e-ladder-release"]
         runs = "\n".join(step.get("run", "") for step in job["steps"])
-        assert "--build-missing" in runs
+        assert "compose/ensure_release_images.py --profiles full" in runs
+        assert "--build-missing" not in runs
+        assert "xargs docker image inspect" in runs
 
     def test_ladder_preflight_calls_the_helper_instead_of_hardcoding_slack(self) -> None:
         text = LADDER.read_text()

@@ -17,7 +17,12 @@ use crate::ops::{plain, run_capture, OpsCommand};
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
 
-const STATUS_ARGS: [&str; 6] = [
+/// The pre-#3127 status invocation, kept as its own constant because a mixed
+/// version worker (older image than this CLI) refuses an unrecognized
+/// `--with-ttl` flag with a non-zero argparse exit. Callers retry with this
+/// once, within the same deadline, when the primary `STATUS_ARGS` exec ran
+/// but did not succeed.
+const LEGACY_STATUS_ARGS: [&str; 6] = [
     "python",
     "-m",
     "curie_worker.upgrade_drain",
@@ -26,12 +31,28 @@ const STATUS_ARGS: [&str; 6] = [
     "--json",
 ];
 
+const STATUS_ARGS: [&str; 7] = [
+    "python",
+    "-m",
+    "curie_worker.upgrade_drain",
+    "--mode",
+    "status",
+    "--json",
+    "--with-ttl",
+];
+
 /// The only claim-gate states an operator surface may act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaimsState {
     ClaimsEnabled,
-    Quiescing { since: String, revision: u64 },
-    QuiescingMetadataUnavailable,
+    Quiescing {
+        since: String,
+        revision: u64,
+        ttl_seconds: Option<u64>,
+    },
+    QuiescingMetadataUnavailable {
+        ttl_seconds: Option<u64>,
+    },
     Unknown,
 }
 
@@ -40,11 +61,23 @@ impl ClaimsState {
     /// proven marker to report.
     pub(crate) fn wait_reason(&self) -> Option<String> {
         match self {
-            Self::Quiescing { since, revision } => Some(format!(
-                "waiting for upgrade revision {revision} since {since}"
-            )),
-            Self::QuiescingMetadataUnavailable => {
-                Some("waiting for upgrade; marker metadata unavailable".to_string())
+            Self::Quiescing {
+                since,
+                revision,
+                ttl_seconds,
+            } => {
+                let mut reason = format!("waiting for upgrade revision {revision} since {since}");
+                if let Some(ttl_seconds) = ttl_seconds {
+                    reason.push_str(&format!("; marker expires in {ttl_seconds}s"));
+                }
+                Some(reason)
+            }
+            Self::QuiescingMetadataUnavailable { ttl_seconds } => {
+                let mut reason = "waiting for upgrade; marker metadata unavailable".to_string();
+                if let Some(ttl_seconds) = ttl_seconds {
+                    reason.push_str(&format!("; marker expires in {ttl_seconds}s"));
+                }
+                Some(reason)
             }
             Self::ClaimsEnabled | Self::Unknown => None,
         }
@@ -59,8 +92,13 @@ impl ClaimsState {
                 self.wait_reason()
                     .expect("a quiescing claim state has a wait reason")
             ),
-            Self::QuiescingMetadataUnavailable => {
-                "worker quiescing for upgrade; marker metadata unavailable".to_string()
+            Self::QuiescingMetadataUnavailable { ttl_seconds } => {
+                let mut detail =
+                    "worker quiescing for upgrade; marker metadata unavailable".to_string();
+                if let Some(ttl_seconds) = ttl_seconds {
+                    detail.push_str(&format!("; marker expires in {ttl_seconds}s"));
+                }
+                detail
             }
             Self::Unknown => "worker claim state unknown".to_string(),
         }
@@ -106,9 +144,23 @@ impl ClusterProbe {
             return ClusterObservation::unknown();
         };
         let observation = async {
-            let (executed, stdout, _) = run_capture(&cluster_exec_command(&self.namespace, &pod))
+            let (mut executed, mut stdout, _) =
+                run_capture(&cluster_exec_command(&self.namespace, &pod, &STATUS_ARGS))
+                    .await
+                    .ok()?;
+            if !executed {
+                // The exec process ran but exited non-zero: a mixed version
+                // worker's argparse rejects an unrecognized `--with-ttl`.
+                // Retry once with the pre-#3127 args, within the same
+                // deadline, before giving up on this pod (#3127).
+                (executed, stdout, _) = run_capture(&cluster_exec_command(
+                    &self.namespace,
+                    &pod,
+                    &LEGACY_STATUS_ARGS,
+                ))
                 .await
                 .ok()?;
+            }
             if !executed {
                 return None;
             }
@@ -132,6 +184,18 @@ struct StatusDocument {
     state: String,
     since: Value,
     revision: Value,
+    #[serde(default)]
+    ttl_seconds: Value,
+}
+
+/// `null`/absent -> no TTL claim. Any non-negative integer is a valid TTL.
+/// Anything else (negative, fractional, string, bool) is unparseable and the
+/// caller must fall back to `Unknown`.
+fn parse_ttl_seconds(value: &Value) -> Result<Option<u64>, ()> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_u64().map(Some).ok_or(())
 }
 
 fn valid_utc_rfc3339(value: &str) -> bool {
@@ -150,6 +214,10 @@ fn parse_status(stdout: &str) -> ClaimsState {
         return ClaimsState::Unknown;
     };
 
+    let Ok(ttl_seconds) = parse_ttl_seconds(&document.ttl_seconds) else {
+        return ClaimsState::Unknown;
+    };
+
     match document.state.as_str() {
         "claims_enabled" if document.since.is_null() && document.revision.is_null() => {
             ClaimsState::ClaimsEnabled
@@ -158,7 +226,7 @@ fn parse_status(stdout: &str) -> ClaimsState {
             ClaimsState::Unknown
         }
         "quiescing" if document.since.is_null() && document.revision.is_null() => {
-            ClaimsState::QuiescingMetadataUnavailable
+            ClaimsState::QuiescingMetadataUnavailable { ttl_seconds }
         }
         "quiescing" => {
             let Some(since) = document.since.as_str() else {
@@ -173,6 +241,7 @@ fn parse_status(stdout: &str) -> ClaimsState {
             ClaimsState::Quiescing {
                 since: since.to_string(),
                 revision,
+                ttl_seconds,
             }
         }
         _ => ClaimsState::Unknown,
@@ -230,7 +299,7 @@ fn cluster_selection_command(namespace: &str, release: &str) -> OpsCommand {
     )
 }
 
-fn cluster_exec_command(namespace: &str, pod: &str) -> OpsCommand {
+fn cluster_exec_command(namespace: &str, pod: &str, status_args: &[&str]) -> OpsCommand {
     let mut args = vec![
         plain("exec"),
         plain("-n"),
@@ -238,11 +307,11 @@ fn cluster_exec_command(namespace: &str, pod: &str) -> OpsCommand {
         plain(pod),
         plain("--"),
     ];
-    args.extend(STATUS_ARGS.into_iter().map(plain));
+    args.extend(status_args.iter().copied().map(plain));
     OpsCommand::new("kubectl", args)
 }
 
-fn local_exec_command(project: &str, compose_files: &[String]) -> OpsCommand {
+fn local_exec_command(project: &str, compose_files: &[String], status_args: &[&str]) -> OpsCommand {
     let mut args = vec![plain("compose"), plain("-p"), plain(project)];
     let files = if compose_files.is_empty() {
         vec![crate::local::DEFAULT_COMPOSE_FILE.to_string()]
@@ -253,7 +322,7 @@ fn local_exec_command(project: &str, compose_files: &[String]) -> OpsCommand {
         args.extend([plain("-f"), plain(file)]);
     }
     args.extend([plain("exec"), plain("-T"), plain(COMPOSE_WORKER_SERVICE)]);
-    args.extend(STATUS_ARGS.into_iter().map(plain));
+    args.extend(status_args.iter().copied().map(plain));
     OpsCommand::new("docker", args)
 }
 
@@ -291,9 +360,21 @@ pub(crate) async fn observe_cluster(namespace: &str, release: &str) -> ClusterOb
 /// entire child lifetime is covered by one deadline.
 pub(crate) async fn observe_local(project: &str, compose_files: &[String]) -> ClaimsState {
     let observation = async {
-        let (executed, stdout, _) = run_capture(&local_exec_command(project, compose_files))
+        let (mut executed, mut stdout, _) =
+            run_capture(&local_exec_command(project, compose_files, &STATUS_ARGS))
+                .await
+                .ok()?;
+        if !executed {
+            // Same mixed-version retry as the cluster path: an older worker
+            // rejects `--with-ttl` (#3127).
+            (executed, stdout, _) = run_capture(&local_exec_command(
+                project,
+                compose_files,
+                &LEGACY_STATUS_ARGS,
+            ))
             .await
             .ok()?;
+        }
         executed.then(|| parse_status(&stdout))
     };
 
@@ -302,4 +383,129 @@ pub(crate) async fn observe_local(project: &str, compose_files: &[String]) -> Cl
         .ok()
         .flatten()
         .unwrap_or(ClaimsState::Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SINCE: &str = "2026-09-25T10:00:00+00:00";
+
+    #[test]
+    fn status_args_ask_the_worker_for_ttl() {
+        assert_eq!(
+            STATUS_ARGS,
+            [
+                "python",
+                "-m",
+                "curie_worker.upgrade_drain",
+                "--mode",
+                "status",
+                "--json",
+                "--with-ttl",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_status_args_omit_with_ttl_and_are_a_prefix_of_status_args() {
+        assert_eq!(
+            LEGACY_STATUS_ARGS,
+            [
+                "python",
+                "-m",
+                "curie_worker.upgrade_drain",
+                "--mode",
+                "status",
+                "--json",
+            ]
+        );
+        assert_eq!(
+            &STATUS_ARGS[..LEGACY_STATUS_ARGS.len()],
+            LEGACY_STATUS_ARGS.as_slice()
+        );
+        assert_eq!(STATUS_ARGS.len(), LEGACY_STATUS_ARGS.len() + 1);
+        assert_eq!(STATUS_ARGS[LEGACY_STATUS_ARGS.len()], "--with-ttl");
+    }
+
+    #[test]
+    fn a_quiescing_document_carries_the_remaining_marker_ttl() {
+        let state = parse_status(&format!(
+            r#"{{"state":"quiescing","since":"{SINCE}","revision":7,"ttl_seconds":120}}"#
+        ));
+        assert_eq!(
+            state,
+            ClaimsState::Quiescing {
+                since: SINCE.to_string(),
+                revision: 7,
+                ttl_seconds: Some(120),
+            }
+        );
+        assert_eq!(
+            state.wait_reason().as_deref(),
+            Some(
+                "waiting for upgrade revision 7 since 2026-09-25T10:00:00+00:00; \
+                 marker expires in 120s"
+            )
+        );
+        assert!(state.status_diagnosis().contains("marker expires in 120s"));
+    }
+
+    #[test]
+    fn an_old_worker_document_without_ttl_still_parses() {
+        let state = parse_status(&format!(
+            r#"{{"state":"quiescing","since":"{SINCE}","revision":7}}"#
+        ));
+        assert_eq!(
+            state,
+            ClaimsState::Quiescing {
+                since: SINCE.to_string(),
+                revision: 7,
+                ttl_seconds: None,
+            }
+        );
+        let reason = state.wait_reason().unwrap();
+        assert_eq!(
+            reason,
+            "waiting for upgrade revision 7 since 2026-09-25T10:00:00+00:00"
+        );
+        assert_eq!(
+            parse_status(r#"{"state":"quiescing","since":null,"revision":null}"#),
+            ClaimsState::QuiescingMetadataUnavailable { ttl_seconds: None }
+        );
+        assert_eq!(
+            parse_status(r#"{"state":"claims_enabled","since":null,"revision":null}"#),
+            ClaimsState::ClaimsEnabled
+        );
+    }
+
+    #[test]
+    fn metadata_unavailable_quiescing_reports_the_ttl() {
+        let state =
+            parse_status(r#"{"state":"quiescing","since":null,"revision":null,"ttl_seconds":45}"#);
+        assert_eq!(
+            state,
+            ClaimsState::QuiescingMetadataUnavailable {
+                ttl_seconds: Some(45)
+            }
+        );
+        assert!(state
+            .wait_reason()
+            .unwrap()
+            .contains("marker expires in 45s"));
+    }
+
+    #[test]
+    fn a_negative_or_non_integer_ttl_is_unknown() {
+        for ttl in ["-1", "1.5", "\"120\"", "true"] {
+            let doc = format!(
+                r#"{{"state":"quiescing","since":"{SINCE}","revision":7,"ttl_seconds":{ttl}}}"#
+            );
+            assert_eq!(parse_status(&doc), ClaimsState::Unknown, "ttl {ttl}");
+            let doc = format!(
+                r#"{{"state":"quiescing","since":null,"revision":null,"ttl_seconds":{ttl}}}"#
+            );
+            assert_eq!(parse_status(&doc), ClaimsState::Unknown, "ttl {ttl}");
+        }
+    }
 }

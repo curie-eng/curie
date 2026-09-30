@@ -55,6 +55,11 @@ CONNECTORS_FILE = "connectors.yaml"
 # ending alphanumeric. Rejecting here beats a confusing apply-time failure.
 _NAME_MAX = 40
 
+# The reserved `admits` entry naming the agent the bundle is deployed as, so a
+# bundle admits its own agent without naming it and stays portable across
+# deploy targets (ADR-0168 decision 7).
+ADMITS_SELF = "self"
+
 
 class SecretRef(BaseModel):
     """A credential that already exists in the cluster (#1163).
@@ -145,6 +150,13 @@ class ConnectorSpec(BaseModel):
     # same expansion `.mcp.json` has always used -- so the value can be supplied
     # per machine with `--secret`, and the bundle stays safe to commit.
     unhosted_url: str | None = None
+
+    # The agents whose sandboxes may call this connector (ADR-0168 decision 7).
+    # None admits the deploying agent alone, the same as `[self]`, and `[]`
+    # admits no agent. A list is exact: it does not add the deploying agent, so
+    # a bundle that lists other agents and wants its own agent in lists
+    # `self` too. Entries are carried as written; nothing resolves `self` here.
+    admits: list[str] | None = None
 
     # -- remote form --
     url: str | None = None
@@ -265,12 +277,27 @@ class ConnectorSpec(BaseModel):
         return self.image is not None or self.build is not None
 
 
+class RunnerSpec(BaseModel):
+    """The bundle's own runner layer, built on the platform runner (ADR 0173).
+
+    Source only: the bundle declares where the layer is built from and
+    ``curie build`` records what it built to in ``connectors.lock.yaml``, so no
+    ``image:`` key exists here to be silently preferred over the lock.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    build: ConnectorBuild
+
+
 class ConnectorsFile(BaseModel):
     """The parsed ``connectors.yaml``."""
 
     model_config = ConfigDict(extra="forbid")
 
     connectors: dict[str, ConnectorSpec] = Field(default_factory=dict)
+    # Optional: every bundle that declares none keeps the platform runner.
+    runner: RunnerSpec | None = None
 
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
@@ -339,6 +366,18 @@ def _forges_the_render_join(name: str) -> bool:
     from .connector_render import connector_forges_join
 
     return connector_forges_join(name)
+
+
+def _shadows_a_direct_service(name: str, hosted: set[str]) -> bool:
+    """Whether a hosted connector's name is a sibling's direct Service name.
+
+    Deferred for the same circular import as ``_forges_the_render_join``, and
+    for the same reason the rule is the renderer's alone.
+    """
+
+    from .connector_render import shadows_a_direct_service
+
+    return shadows_a_direct_service(name, hosted)
 
 
 def _is_valid_name(name: str) -> bool:
@@ -448,6 +487,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
     except Exception as exc:  # pydantic ValidationError -- surface it verbatim
         return None, [("connectors.invalid", str(exc)[:400])]
 
+    hosted = {name for name, spec in parsed.connectors.items() if spec.is_hosted}
     for name, spec in parsed.connectors.items():
         where = f"connectors.{name}"
         if not _is_valid_name(name):
@@ -504,8 +544,22 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "render the same Service, Deployment, both NetworkPolicies and the "
                     "same `app.kubernetes.io/name` pod selector, handing one agent's "
                     "sandbox the other's connector and the credential bound to it "
-                    "(the connector is deliberately unauthenticated, ADR-0086) -- rename "
-                    "the connector so it does not start with `mcp-` or contain `-mcp-`",
+                    "(ADR-0086) -- rename the connector so it does not start with `mcp-` "
+                    "or contain `-mcp-`",
+                )
+            )
+        # ADR-0168 decision 7: with a caller proxy, hosted `x` also renders the
+        # Service `<x's object name>-direct`, which is hosted `x-direct`'s own
+        # object name.
+        if spec.is_hosted and _shadows_a_direct_service(name, hosted):
+            errors.append(
+                (
+                    "connectors.direct_service_collision",
+                    f"{where}: `{name}` renders the same Service name as the direct "
+                    f"Service Curie gives the hosted connector "
+                    f"`{name.removesuffix('-direct')}` on an install with a caller proxy "
+                    "(`<release>-<agent>-mcp-<connector>-direct`), so one would overwrite "
+                    "the other -- rename the connector so it does not end in `-direct`",
                 )
             )
         forms = [bool(spec.image), bool(spec.build), bool(spec.url)]
@@ -607,6 +661,40 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector with `env` and `args` instead",
                 )
             )
+        if spec.admits is not None and spec.url is not None:
+            errors.append(
+                (
+                    "connectors.remote_has_admits",
+                    f"{where}: `admits` lists the agents Curie lets reach a connector it "
+                    "hosts; a `url` connector is reached wherever it already runs, so "
+                    "the list would refuse nobody",
+                )
+            )
+        # The agent-name rule is deploy.yaml's (`deploy_targets._NAME_RE`), which
+        # is this module's pattern and cap. deploy_targets imports this module,
+        # so the rule cannot be imported back; a test pins the two equal.
+        seen_admitted: set[str] = set()
+        for admitted in spec.admits or []:
+            if admitted in seen_admitted:
+                continue
+            seen_admitted.add(admitted)
+            if admitted != ADMITS_SELF and not _is_valid_name(admitted):
+                errors.append(
+                    (
+                        "connectors.bad_admits_agent",
+                        f"{where}: admits lists `{admitted}`, which is neither "
+                        f"`{ADMITS_SELF}` nor an agent name: an agent name must be "
+                        "lowercase alphanumeric or dashes, start and end alphanumeric, "
+                        f"and be at most {_NAME_MAX} characters",
+                    )
+                )
+            elif spec.admits is not None and spec.admits.count(admitted) > 1:
+                errors.append(
+                    (
+                        "connectors.duplicate_admits",
+                        f"{where}: admits lists `{admitted}` more than once",
+                    )
+                )
         for declared in spec.secrets:
             if isinstance(declared, str):
                 continue
@@ -689,14 +777,18 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                             "would expand empty.",
                         )
                     )
-            elif len(secret_env_names) > 1:
+            elif len(secret_env_names) > 1 and any(isinstance(s, str) for s in spec.secrets):
+                # All-`SecretRef` connectors are exempt (#3057): a `SecretRef` is
+                # the server's own upstream credential, delivered only to the pod
+                # under ADR-0090, so it implies no client auth and there is no
+                # correct `bearer_secret` to name.
                 errors.append(
                     (
                         "connectors.bearer_secret_required",
-                        f"{where}: a hosted connector with more than one secret must "
-                        "set `bearer_secret` to the name the Authorization header "
-                        "expands. Picking secrets[0] is positional and binds every "
-                        "declared name into the sandbox.",
+                        f"{where}: a hosted connector with more than one secret, any "
+                        "of them a plain string, must set `bearer_secret` to the name "
+                        "the Authorization header expands. Picking secrets[0] is "
+                        "positional and binds every declared name into the sandbox.",
                     )
                 )
         seen_secret_names: set[str] = set()
@@ -731,5 +823,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                 errors.append(
                     ("connectors.bad_env_name", f"{where}: `{key}` is not a valid env var name")
                 )
+
+    if parsed.runner is not None:
+        _validate_build("runner", parsed.runner.build, errors)
 
     return (parsed if not errors else None), errors

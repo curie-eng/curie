@@ -27,6 +27,7 @@ _UUID = (
 )
 WORK_ITEM_EXECUTE_RE = re.compile(rf"^work-item-({_UUID})-execute-([1-9][0-9]*)$")
 WORK_ITEM_TERMINATE_RE = re.compile(rf"^work-item-({_UUID})-terminate$")
+WORK_ITEM_CI_RE = re.compile(rf"^work-item-({_UUID})-ci-([23])$")
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
 _MIN_HEARTBEAT_INTERVAL_S = 1.0
@@ -53,8 +54,13 @@ class WorkItemEvent:
     """Parsed work-item wake identity."""
 
     request_id: uuid.UUID
-    kind: Literal["execute", "terminate"]
+    kind: Literal["execute", "terminate", "ci"]
+    # The wake generation for ``execute``; the CI fix round for ``ci``.
     generation: int | None = None
+
+    @property
+    def is_ci_fix(self) -> bool:
+        return self.kind == "ci"
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,10 @@ class WorkItemAcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: str
+    # The repository the signed delivery bound to the WorkItem. None only on
+    # the synthetic grant an approval resume rebuilds, which keeps the
+    # thread's existing workspace selection.
+    repo_full_name: str | None
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,7 @@ class WorkItemStartGrant:
 @dataclass(frozen=True)
 class WorkItemRunning:
     request_id: uuid.UUID
+    work_item_id: uuid.UUID
     runtime_epoch: int
     execution_deadline: datetime
 
@@ -93,6 +104,13 @@ class WorkItemRequestView:
     runtime_epoch: int
     runtime_claim_name: str | None
     runtime_sandbox_name: str | None
+
+
+@dataclass(frozen=True)
+class WorkItemRuntimeOwner:
+    request_id: uuid.UUID
+    runtime_owner: str
+    runtime_epoch: int
 
 
 @dataclass(frozen=True)
@@ -117,13 +135,24 @@ class TerminationObservation:
 
 
 def parse_work_item_event_id(event_id: str) -> WorkItemEvent | None:
-    """Parse execute or terminate work-item event ids; None for any other namespace."""
+    """Parse execute, CI-continuation, or terminate work-item event ids.
+
+    Returns None for any other namespace. A ``ci`` id is a continuation turn of
+    the same running request; ``generation`` carries its fix round (2 or 3).
+    """
 
     matched = WORK_ITEM_EXECUTE_RE.fullmatch(event_id)
     if matched is not None:
         return WorkItemEvent(
             request_id=uuid.UUID(matched.group(1)),
             kind="execute",
+            generation=int(matched.group(2)),
+        )
+    matched = WORK_ITEM_CI_RE.fullmatch(event_id)
+    if matched is not None:
+        return WorkItemEvent(
+            request_id=uuid.UUID(matched.group(1)),
+            kind="ci",
             generation=int(matched.group(2)),
         )
     matched = WORK_ITEM_TERMINATE_RE.fullmatch(event_id)
@@ -192,6 +221,14 @@ class WorkItemDispatchClient:
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
                 conversation_id=str(body["conversation_id"]),
                 wait_deadline=str(body["wait_deadline"]),
+                # An API replica from before #2992 omits the field mid-rollout.
+                # The acquisition is already committed, so read absence as "no
+                # WorkItem repository" rather than failing the wake.
+                repo_full_name=(
+                    str(body["repo_full_name"])
+                    if body.get("repo_full_name") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -292,6 +329,7 @@ class WorkItemDispatchClient:
             body = response.json()
             return WorkItemRunning(
                 request_id=uuid.UUID(str(body["request_id"])),
+                work_item_id=uuid.UUID(str(body["work_item_id"])),
                 runtime_epoch=int(body["runtime_epoch"]),
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
             )
@@ -313,6 +351,7 @@ class WorkItemDispatchClient:
         runtime_epoch: int,
         outcome: str,
         cause: str,
+        detail: str | None,
     ) -> None:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/finish",
@@ -320,6 +359,7 @@ class WorkItemDispatchClient:
                 "runtime_epoch": runtime_epoch,
                 "outcome": outcome,
                 "cause": cause,
+                "detail": detail,
             },
         )
 
@@ -350,6 +390,49 @@ class WorkItemDispatchClient:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination",
             {"runtime_epoch": runtime_epoch, "observation": observation},
+        )
+
+    async def runtime_owners(
+        self, after: uuid.UUID | None = None
+    ) -> list[WorkItemRuntimeOwner]:
+        """One page of running requests and their owners, ordered by id."""
+
+        try:
+            response = await self._client.get(
+                f"{self._base}/v1/internal/work-items/runtime-owners",
+                params={"after": str(after)} if after is not None else None,
+                headers=self._headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise WorkItemTransportError(
+                "work-item dispatch endpoint is unreachable"
+            ) from exc
+        if response.status_code != 200:
+            raise WorkItemTransportError(
+                f"work-item runtime owners returned HTTP {response.status_code}"
+            )
+        try:
+            body = response.json()
+            return [
+                WorkItemRuntimeOwner(
+                    request_id=uuid.UUID(str(row["request_id"])),
+                    runtime_owner=str(row["runtime_owner"]),
+                    runtime_epoch=int(row["runtime_epoch"]),
+                )
+                for row in body["requests"]
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkItemTransportError(
+                "work-item runtime owners returned an unusable body"
+            ) from exc
+
+    async def declare_owner_lost(
+        self, request_id: uuid.UUID, *, owner: str, runtime_epoch: int
+    ) -> None:
+        await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/owner-lost",
+            {"owner": owner, "runtime_epoch": runtime_epoch},
         )
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
@@ -442,8 +525,10 @@ class WorkItemRun:
         on_stale: StopCallback,
     ) -> None:
         self.request_id = request_id
+        self.work_item_id = grant.work_item_id
         self.owner = owner
         self.generation = grant.generation
+        self.repo_full_name = grant.repo_full_name
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
@@ -506,7 +591,7 @@ class WorkItemRun:
             self.request_id, runtime_epoch=self.runtime_epoch
         )
 
-    async def finish(self, *, outcome: str, cause: str) -> None:
+    async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
         await self._client.finish(
@@ -514,6 +599,7 @@ class WorkItemRun:
             runtime_epoch=self.runtime_epoch,
             outcome=outcome,
             cause=cause,
+            detail=detail,
         )
         self.finished = True
 

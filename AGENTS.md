@@ -557,6 +557,13 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- worker vs CLI progress block ids -- the Slack progress card and milestone
+  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
+  edit from the turn's answer, can't share code across Python/Rust, so they are
+  frozen together in `tests/vectors/progress-blocks.json`.
+  [vector: `tests/vectors/progress-blocks.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
@@ -568,6 +575,11 @@ as a whole; remembered only):
   cannot share code, so they are frozen together in
   `tests/vectors/approval-ownership.json`.
   [vector: `tests/vectors/approval-ownership.json`]
+- API vs worker approval re-raise refusal code -- the 409 code
+  (`apps/api/src/curie_api/routers/approvals.py`) and the worker's refusal
+  match (`apps/worker/src/curie_worker/approvals.py`) cannot share code, so
+  they are frozen together in `tests/vectors/approval-reraise-refusal.json`.
+  [vector: `tests/vectors/approval-reraise-refusal.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
@@ -581,6 +593,14 @@ as a whole; remembered only):
   cannot share code across Python/Rust, so they are frozen together in
   `tests/vectors/eval-memory-isolation.json`.
   [vector: `tests/vectors/eval-memory-isolation.json`]
+- worker vs API workspace-selection refusal codes -- the 409 `detail.code`
+  values the API's selection router emits
+  (`apps/api/src/curie_api/routers/workspaces.py`) and the worker's prose map
+  (`_SELECTION_REFUSAL_MESSAGES` in `apps/worker/src/curie_worker/workspace.py`)
+  cannot share code because the worker does not import the API package at
+  runtime; the worker maps each code to its own prose and treats an unmapped
+  code as an invalid refusal response (#2684).
+  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
@@ -599,6 +619,24 @@ as a whole; remembered only):
 - CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
 - deploy-time validators vs the runtime loaders that re-parse the same value
   (share normalization code). [convention]
+- worker caller-token minter vs connector proxy verifier -- `mint`
+  (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
+  and the proxy may not import the worker, so both read one frozen corpus; the
+  CLI derives its generated public keys against the same seeds.
+  [vector: `tests/vectors/connector-caller-token.json`]
+- connector proxy refusal vs runner diagnosis -- the proxy's refusal body
+  (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
+  `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
+  ship in different images, so they are frozen together.
+  [vector: `tests/vectors/connector-caller-refusal.json`]
+- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
+  runner control headers and `turn.progress` token scope the worker mints
+  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
+  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
+  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
+  and the worker's pump reads, cross three images, so they are frozen together.
+  [vector: `tests/vectors/turn-progress-capability.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
