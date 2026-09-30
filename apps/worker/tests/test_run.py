@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import socket
 from collections.abc import Mapping
 from pathlib import Path
@@ -979,6 +980,7 @@ class _FakeRuntime:
         self.consumer = _FakeSupervisedTask(events, "runs")
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
+        self.deploy_notice_consumer = _FakeSupervisedTask(events, "deploy-notices")
         self.connector_loop = None
         self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
@@ -1050,6 +1052,50 @@ def test_run_supervises_the_cron_loop_until_shutdown(
 
     assert events.count("cron") == 1
     assert "cron-stopped" in events
+
+
+def test_sigterm_stops_the_deploy_notice_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime = _FakeRuntime(_FakeCardStore(events), events)
+
+    class StopGatedNotice:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def run(self) -> None:
+            self.started.set()
+            await self.stopped.wait()
+
+        def request_stop(self) -> None:
+            self.stopped.set()
+
+    notice = StopGatedNotice()
+    runtime.deploy_notice_consumer = notice  # type: ignore[assignment]
+
+    async def stopping_heartbeat(_file: Any, _interval: Any, shutdown: asyncio.Event) -> None:
+        await notice.started.wait()
+        handlers[signal.SIGTERM]()
+        await shutdown.wait()
+
+    handlers: dict[signal.Signals, Any] = {}
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda sig, handler: handlers.__setitem__(sig, handler),
+        )
+        await asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=1)
+
+    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
+    asyncio.run(exercise())
+    assert notice.started.is_set()
+    assert notice.stopped.is_set()
 
 
 def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:

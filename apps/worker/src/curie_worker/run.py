@@ -1006,6 +1006,8 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         rt.consumer.request_stop()
         rt.killswitch.request_stop()
         rt.eval_consumer.request_stop()
+        if rt.deploy_notice_consumer is not None:
+            rt.deploy_notice_consumer.request_stop()
         shutdown.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
