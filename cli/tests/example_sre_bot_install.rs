@@ -3477,6 +3477,22 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
         "Alloy values must not retain observability DNS: {alloy_values}"
     );
 
+    let prometheus_values = fixture.helm_values_file("prometheus-values.yaml");
+    assert!(
+        prometheus_values.contains("alert: CurieAlloyNoActiveLogFiles")
+            && prometheus_values.contains("alert: CurieAlloyLogDeliveryStopped"),
+        "rendered Prometheus values must carry both Alloy alerts: {prometheus_values}"
+    );
+    assert_eq!(
+        prometheus_values.matches("namespace=\"soak-obs\"").count(),
+        9,
+        "all Alloy alert matchers must use the selected namespace: {prometheus_values}"
+    );
+    assert!(
+        !prometheus_values.contains("namespace=\"observability\""),
+        "Alloy alerts must not retain default namespace: {prometheus_values}"
+    );
+
     let curie_values = fixture.helm_values_file("curie-values.yaml");
     assert!(
         curie_values.contains("tempo.soak-obs.svc.cluster.local")

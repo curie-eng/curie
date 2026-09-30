@@ -2529,6 +2529,12 @@ fn rewrite_observability_namespace(contents: &[u8], observability_namespace: &st
         &format!("namespace: {OBSERVABILITY_NAMESPACE}"),
         &format!("namespace: {observability_namespace}"),
     )
+    // PromQL string matchers in the shipped Alloy alerts are not YAML keys.
+    // They must follow --observability-namespace just like scrape targets do.
+    .replace(
+        &format!("namespace=\"{OBSERVABILITY_NAMESPACE}\""),
+        &format!("namespace=\"{observability_namespace}\""),
+    )
     .replace(
         &format!("kubernetes.io/metadata.name: {OBSERVABILITY_NAMESPACE}"),
         &format!("kubernetes.io/metadata.name: {observability_namespace}"),
