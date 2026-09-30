@@ -49,6 +49,7 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
             placeholder: Some(PLACEHOLDER_TS.into()),
             endpoint: Some(endpoint.to_string()),
             adapter: None,
+            identity: None,
         }),
         received_at: "2026-07-21T00:00:00Z".into(),
         // A resume continues the turn a person started, matching what
