@@ -126,7 +126,9 @@ detached turn before the intake rejects its receipt.
 Before scanning or posting a placeholder, startup fetches the running API's
 OpenAPI description without a hook signature and requires both `conversation_id`
 and `placeholder` query parameters on `POST /hooks/{agent_id}/{hook}`. Missing,
-unreadable, or incompatible descriptions stop startup before any hook can enqueue.
+unreadable, redirected, or incompatible descriptions stop startup before any
+hook can enqueue. Redirects are refused so a different service cannot advertise
+capabilities for the configured hook API.
 This checks reply-target support, not runtime read-only tool enforcement.
 
 The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
