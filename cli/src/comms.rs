@@ -143,24 +143,24 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     env.extend(otel_endpoint_env_override(o.minimal));
     env.push(("COMPOSE_PROJECT_NAME".into(), o.project.clone()));
     env.extend(o.stack_image_env.iter().cloned());
-    vec![OpsCommand::new(
-        "docker",
-        comms_compose_args(
-            o,
-            &["core", "slack"],
-            &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
-        ),
-    )
-    .with_env(env)
-    .with_secret_env({
-        let mut secret_env = vec![
-            ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
-            ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
-        ];
-        secret_env.extend(o.model_credentials.clone());
-        secret_env.extend(o.stack_secret_env.iter().cloned());
-        secret_env
-    })]
+    let mut model_credentials = vec![
+        ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
+        ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
+    ];
+    model_credentials.extend(o.model_credentials.iter().cloned());
+    vec![crate::local::with_stack_secret_env(
+        OpsCommand::new(
+            "docker",
+            comms_compose_args(
+                o,
+                &["core", "slack"],
+                &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+            ),
+        )
+        .with_env(env),
+        model_credentials,
+        o.stack_secret_env.clone(),
+    )]
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
@@ -181,17 +181,14 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
             "docker",
             comms_compose_args(o, &["core", "slack"], &["stop", "curie-dispatcher"]),
         ),
-        OpsCommand::new(
-            "docker",
-            comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
-        )
-        .with_env(worker_env)
-        .with_secret_env(
-            o.model_credentials
-                .iter()
-                .chain(&o.stack_secret_env)
-                .cloned()
-                .collect(),
+        crate::local::with_stack_secret_env(
+            OpsCommand::new(
+                "docker",
+                comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
+            )
+            .with_env(worker_env),
+            o.model_credentials.clone(),
+            o.stack_secret_env.clone(),
         ),
     ]
 }

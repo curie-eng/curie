@@ -1394,17 +1394,9 @@ fn is_loopback_destination(base_url: &str) -> bool {
     let Ok(endpoint) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    let Some(host) = endpoint.host_str() else {
-        return false;
-    };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    match host.parse::<std::net::IpAddr>() {
-        Ok(address) => address.is_loopback(),
-        Err(_) => host.eq_ignore_ascii_case("localhost"),
-    }
+    endpoint
+        .host_str()
+        .is_some_and(crate::oci_registry::is_loopback_host)
 }
 
 /// The stored per-install key for the local project this process targets, or

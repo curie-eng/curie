@@ -308,7 +308,7 @@ LOCAL_STACK_OWNED=0
 # Set to 1 only when the ladder set the key (generated, or adopted from a reused
 # stack's store), so rung_cluster can drop it again: a local key must never reach the cluster rung, which reads a set
 # CURIE_API_KEY as the release's key.
-LADDER_GENERATED_API_KEY=0
+LADDER_OWNS_API_KEY=0
 
 ensure_local_api_key() {
     if [[ -n "${CURIE_API_KEY:-}" ]]; then
@@ -316,7 +316,7 @@ ensure_local_api_key() {
     fi
     CURIE_API_KEY="$(python3 -c 'import os; print(os.urandom(32).hex())')" || return 1
     export CURIE_API_KEY
-    LADDER_GENERATED_API_KEY=1
+    LADDER_OWNS_API_KEY=1
 }
 
 # A reused stack runs on whatever key its own `local up` stored for this
@@ -338,7 +338,7 @@ adopt_stored_local_api_key() {
     [[ -n "$stored" ]] || return 0
     CURIE_API_KEY="$stored"
     export CURIE_API_KEY
-    LADDER_GENERATED_API_KEY=1
+    LADDER_OWNS_API_KEY=1
 }
 
 # The local observability proof owns one uniquely named Collector sink. It is
@@ -5500,9 +5500,9 @@ PYCLAIM
 
 rung_cluster() {
     # A key ensure_local_api_key generated belongs to the local stack only.
-    if (( LADDER_GENERATED_API_KEY )); then
+    if (( LADDER_OWNS_API_KEY )); then
         unset CURIE_API_KEY
-        LADDER_GENERATED_API_KEY=0
+        LADDER_OWNS_API_KEY=0
     fi
     if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
         CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"

@@ -31,7 +31,7 @@ pub const API_KEY_ENV: &str = "CURIE_LOCAL_API_KEY";
 /// Compose interpolation variable carrying the install's Postgres password.
 pub const POSTGRES_PASSWORD_ENV: &str = "CURIE_LOCAL_POSTGRES_PASSWORD";
 /// The Postgres password every install made before #3557 initialized its
-/// volume with. Kept for such a volume, see [`resolve_in`].
+/// volume with. Kept for such a volume, see [`resolve_with`].
 pub const LEGACY_POSTGRES_PASSWORD: &str = "postgres";
 
 /// Bytes of OS randomness behind each generated credential (64 hex chars).
@@ -100,11 +100,6 @@ pub fn path_in(config_dir: &Path, project: &str) -> Result<PathBuf> {
     Ok(config_dir.join("local").join(format!("{project}.json")))
 }
 
-/// The store path for `project` under the CLI's config dir.
-pub fn path(project: &str) -> Result<PathBuf> {
-    path_in(&crate::secrets::config_dir()?, project)
-}
-
 /// Read the stored credentials for `project` from `config_dir`. `Ok(None)` means
 /// no install has stored any; a file that exists but does not parse, or holds an
 /// empty value, is an error so `local up` never silently replaces a password the
@@ -131,61 +126,52 @@ pub fn load_in(config_dir: &Path, project: &str) -> Result<Option<LocalStackCred
     Ok(Some(creds))
 }
 
-/// [`load_in`] under the CLI's config dir.
-pub fn load(project: &str) -> Result<Option<LocalStackCredentials>> {
-    load_in(&crate::secrets::config_dir()?, project)
-}
-
 /// The pure core of [`resolve_for_up`]: every input is passed in, so it is
 /// testable without a docker daemon or this process's environment.
 ///
-/// - Stored credentials are reused, so a second `up` starts the same install.
+/// - `stored` credentials are reused, so a second `up` starts the same install.
 /// - With nothing stored, both are generated. The exception is a Postgres
 ///   volume that already exists: Postgres applies `POSTGRES_PASSWORD` only when
 ///   it initializes an empty data dir, so that volume still expects the legacy
 ///   `postgres` and a new password would lock the install out of its own data.
-///   `postgres_volume` is only consulted in that case. When docker cannot
-///   answer ([`VolumeProbe::Unknown`]) a persisting run refuses and writes
-///   nothing, because guessing "absent" would store a password the existing
-///   volume rejects. A `--dry-run` generates throwaway values instead.
+///   `postgres_volume` is only needed in that case (`None` when `stored` is
+///   `Some`). When docker cannot answer ([`VolumeProbe::Unknown`]) a persisting
+///   run refuses and writes nothing, because guessing "absent" would store a
+///   password the existing volume rejects. A `--dry-run` generates throwaway
+///   values instead.
 /// - A non-empty `explicit_api_key` (the operator's `CURIE_API_KEY`) becomes the
 ///   install's key. Verbs already prefer that env var, so a stack on any other
 ///   key would answer the operator with 401.
 /// - `persist` false (`--dry-run`) resolves the same answer and writes nothing.
-pub fn resolve_in(
+pub fn resolve_with(
     config_dir: &Path,
     project: &str,
+    stored: Option<LocalStackCredentials>,
     explicit_api_key: Option<&str>,
-    postgres_volume: impl FnOnce() -> VolumeProbe,
+    postgres_volume: Option<VolumeProbe>,
     persist: bool,
 ) -> Result<ResolvedStackCredentials> {
     let path = path_in(config_dir, project)?;
     let explicit = explicit_api_key.filter(|key| !key.is_empty());
-    let stored = load_in(config_dir, project)?;
-    let (mut credentials, mut changed) = match stored {
-        Some(creds) => (creds, false),
+    let mut changed = stored.is_none();
+    let mut credentials = match stored {
+        Some(creds) => creds,
         None => {
-            let postgres_password = match postgres_volume() {
-                VolumeProbe::Exists => LEGACY_POSTGRES_PASSWORD.to_string(),
-                VolumeProbe::Absent => crate::ops::random_hex(GENERATED_BYTES)?,
-                VolumeProbe::Unknown if persist => bail!(
+            let postgres_password = match postgres_volume {
+                Some(VolumeProbe::Exists) => LEGACY_POSTGRES_PASSWORD.to_string(),
+                Some(VolumeProbe::Absent) => crate::ops::random_hex(GENERATED_BYTES)?,
+                Some(VolumeProbe::Unknown) if persist => bail!(
                     "could not ask docker whether compose project {project:?} already has a \
                      Postgres volume, so its database password cannot be chosen safely. Start \
                      Docker and re-run `curie local up`."
                 ),
-                VolumeProbe::Unknown => crate::ops::random_hex(GENERATED_BYTES)?,
+                Some(VolumeProbe::Unknown) => crate::ops::random_hex(GENERATED_BYTES)?,
+                None => bail!("no stored credentials and no Postgres volume probe for {project:?}"),
             };
-            let api_key = match explicit {
-                Some(key) => key.to_string(),
-                None => crate::ops::random_hex(GENERATED_BYTES)?,
-            };
-            (
-                LocalStackCredentials {
-                    api_key,
-                    postgres_password,
-                },
-                true,
-            )
+            LocalStackCredentials {
+                api_key: crate::ops::random_hex(GENERATED_BYTES)?,
+                postgres_password,
+            }
         }
     };
     if let Some(key) = explicit {
@@ -202,20 +188,22 @@ pub fn resolve_in(
 
 /// Resolve the credentials a compose `up` for `project` starts the stack on,
 /// reading the operator's `CURIE_API_KEY` and, only when nothing is stored,
-/// probing docker for the project's Postgres volume. See [`resolve_in`].
+/// probing docker for the project's Postgres volume. See [`resolve_with`].
 pub async fn resolve_for_up(project: &str, persist: bool) -> Result<ResolvedStackCredentials> {
     let config_dir = crate::secrets::config_dir()?;
     let explicit = std::env::var("CURIE_API_KEY").ok();
-    let volume = if load_in(&config_dir, project)?.is_none() {
-        probe_postgres_volume(project).await
+    let stored = load_in(&config_dir, project)?;
+    let volume = if stored.is_none() {
+        Some(probe_postgres_volume(project).await)
     } else {
-        VolumeProbe::Absent
+        None
     };
-    resolve_in(
+    resolve_with(
         &config_dir,
         project,
+        stored,
         explicit.as_deref(),
-        || volume,
+        volume,
         persist,
     )
 }
@@ -244,7 +232,11 @@ pub fn running_stack_secret_env(project: &str) -> Result<Vec<(String, String)>> 
 /// the dev sentinel. Any failure (no file, unreadable file, no config dir)
 /// answers `None` so the caller keeps its sentinel rather than failing a parse.
 pub fn stored_api_key(project: &str) -> Option<String> {
-    load(project).ok().flatten().map(|creds| creds.api_key)
+    let config_dir = crate::secrets::config_dir().ok()?;
+    load_in(&config_dir, project)
+        .ok()
+        .flatten()
+        .map(|creds| creds.api_key)
 }
 
 /// Whether docker holds `<project>_postgres_data`, the named volume compose
@@ -302,8 +294,20 @@ mod tests {
 
     const PLACEHOLDER_KEY: &str = "explicit-placeholder-api-key";
 
-    fn no_volume() -> VolumeProbe {
-        VolumeProbe::Absent
+    const NO_VOLUME: VolumeProbe = VolumeProbe::Absent;
+
+    /// Load the store once and resolve, probing only when nothing is stored,
+    /// the same shape as `resolve_for_up`.
+    fn resolve_in(
+        config_dir: &Path,
+        project: &str,
+        explicit: Option<&str>,
+        probe: VolumeProbe,
+        persist: bool,
+    ) -> Result<ResolvedStackCredentials> {
+        let stored = load_in(config_dir, project)?;
+        let probe = stored.is_none().then_some(probe);
+        resolve_with(config_dir, project, stored, explicit, probe, persist)
     }
 
     fn is_hex64(value: &str) -> bool {
@@ -313,8 +317,8 @@ mod tests {
     #[test]
     fn fresh_install_generates_distinct_64_hex_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let a = resolve_in(dir.path(), "a", None, no_volume, false).unwrap();
-        let b = resolve_in(dir.path(), "b", None, no_volume, false).unwrap();
+        let a = resolve_in(dir.path(), "a", None, NO_VOLUME, false).unwrap();
+        let b = resolve_in(dir.path(), "b", None, NO_VOLUME, false).unwrap();
         let (a, b) = (a.credentials, b.credentials);
         for value in [&a.api_key, &a.postgres_password, &b.api_key] {
             assert!(
@@ -331,7 +335,7 @@ mod tests {
     #[test]
     fn persisted_credentials_are_private_and_reload_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let first = resolve_in(dir.path(), "curie", None, no_volume, true).unwrap();
+        let first = resolve_in(dir.path(), "curie", None, NO_VOLUME, true).unwrap();
         assert_eq!(first.path, dir.path().join("local").join("curie.json"));
         #[cfg(unix)]
         {
@@ -349,21 +353,14 @@ mod tests {
             Some(first.credentials.clone())
         );
         // A second `up` reuses them and never consults the volume probe.
-        let second = resolve_in(
-            dir.path(),
-            "curie",
-            None,
-            || panic!("probe must not run when credentials are stored"),
-            true,
-        )
-        .unwrap();
+        let second = resolve_in(dir.path(), "curie", None, VolumeProbe::Unknown, true).unwrap();
         assert_eq!(second.credentials, first.credentials);
     }
 
     #[test]
     fn an_existing_postgres_volume_keeps_the_legacy_password() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_in(dir.path(), "curie", None, || VolumeProbe::Exists, true).unwrap();
+        let resolved = resolve_in(dir.path(), "curie", None, VolumeProbe::Exists, true).unwrap();
         assert_eq!(
             resolved.credentials.postgres_password,
             LEGACY_POSTGRES_PASSWORD
@@ -381,7 +378,7 @@ mod tests {
     #[test]
     fn an_explicit_key_becomes_the_install_key_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let fresh = resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), no_volume, true)
+        let fresh = resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), NO_VOLUME, true)
             .unwrap()
             .credentials;
         assert_eq!(fresh.api_key, PLACEHOLDER_KEY);
@@ -394,7 +391,7 @@ mod tests {
             dir.path(),
             "curie",
             Some("second-placeholder-key"),
-            no_volume,
+            NO_VOLUME,
             true,
         )
         .unwrap()
@@ -407,7 +404,7 @@ mod tests {
     #[test]
     fn an_empty_explicit_key_is_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_in(dir.path(), "curie", Some(""), no_volume, false).unwrap();
+        let resolved = resolve_in(dir.path(), "curie", Some(""), NO_VOLUME, false).unwrap();
         assert!(is_hex64(&resolved.credentials.api_key));
     }
 
@@ -415,7 +412,7 @@ mod tests {
     fn dry_run_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let resolved =
-            resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), no_volume, false).unwrap();
+            resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), NO_VOLUME, false).unwrap();
         assert_eq!(resolved.credentials.api_key, PLACEHOLDER_KEY);
         assert!(!resolved.path.exists());
         assert!(!dir.path().join("local").exists());
@@ -427,7 +424,7 @@ mod tests {
         let path = path_in(dir.path(), "curie").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{not json").unwrap();
-        assert!(resolve_in(dir.path(), "curie", None, no_volume, true).is_err());
+        assert!(resolve_in(dir.path(), "curie", None, NO_VOLUME, true).is_err());
         std::fs::write(&path, r#"{"api_key":"","postgres_password":"placeholder"}"#).unwrap();
         assert!(load_in(dir.path(), "curie").is_err());
     }
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn an_unknown_volume_refuses_to_persist_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, true)
+        let err = resolve_in(dir.path(), "curie", None, VolumeProbe::Unknown, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("Start Docker"), "{err}");
@@ -446,7 +443,7 @@ mod tests {
             dir.path(),
             "curie",
             Some(PLACEHOLDER_KEY),
-            || VolumeProbe::Unknown,
+            VolumeProbe::Unknown,
             true
         )
         .is_err());
@@ -456,8 +453,7 @@ mod tests {
     #[test]
     fn an_unknown_volume_still_resolves_a_dry_run() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved =
-            resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, false).unwrap();
+        let resolved = resolve_in(dir.path(), "curie", None, VolumeProbe::Unknown, false).unwrap();
         assert!(is_hex64(&resolved.credentials.postgres_password));
         assert!(!dir.path().join("local").exists());
     }
@@ -465,8 +461,8 @@ mod tests {
     #[test]
     fn a_stored_install_ignores_an_unknown_volume() {
         let dir = tempfile::tempdir().unwrap();
-        let first = resolve_in(dir.path(), "curie", None, no_volume, true).unwrap();
-        let again = resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, true).unwrap();
+        let first = resolve_in(dir.path(), "curie", None, NO_VOLUME, true).unwrap();
+        let again = resolve_in(dir.path(), "curie", None, VolumeProbe::Unknown, true).unwrap();
         assert_eq!(again.credentials, first.credentials);
     }
 
@@ -505,7 +501,7 @@ mod tests {
     fn running_stack_env_carries_the_store_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let stored =
-            resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), no_volume, true).unwrap();
+            resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), NO_VOLUME, true).unwrap();
         let before = std::fs::read(&stored.path).unwrap();
         let env = running_stack_secret_env_in(dir.path(), "curie").unwrap();
         assert_eq!(env, compose_secret_env(&stored.credentials));

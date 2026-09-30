@@ -83,9 +83,9 @@ pub fn api_key_or_default(raw: &str) -> Result<String, String> {
     Ok(resolve_api_key(raw, env::var("CURIE_API_KEY").ok()))
 }
 
-/// The pure core of [`api_key_or_default`], with the env source passed in so
-/// the resolution is unit-testable without mutating this process's
-/// environment. Same shape as `ops.rs::resolve_up_credentials`.
+/// The pure core of [`api_key_or_default`], with the env source passed in so the
+/// resolution is unit-testable without mutating this process's environment.
+/// Same shape as `ops.rs::resolve_up_credentials`.
 fn resolve_api_key(raw: &str, env_value: Option<String>) -> String {
     if !raw.is_empty() {
         return raw.to_string();

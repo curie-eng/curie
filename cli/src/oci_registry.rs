@@ -82,7 +82,7 @@ impl ImageRef {
 /// Whether `host` (a bare host, IPv6 optionally bracketed, no port) is
 /// loopback: `localhost` or a loopback IP. Decided structurally, so a DNS name
 /// such as `127.registry.example.com` is not loopback.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))

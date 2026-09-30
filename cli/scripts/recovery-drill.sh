@@ -178,10 +178,11 @@ compose() {
 export_local_stack_credentials() {
     local store="${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT_NAME:-curie}.json"
     [[ -f "$store" ]] || die "curie local up stored no stack credentials at $store"
-    CURIE_LOCAL_API_KEY="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["api_key"])' "$store")" \
-        || die "could not read the API key from $store"
-    CURIE_LOCAL_POSTGRES_PASSWORD="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["postgres_password"])' "$store")" \
-        || die "could not read the Postgres password from $store"
+    local fields
+    fields="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["api_key"]); print(d["postgres_password"])' "$store")" \
+        || die "could not read the stack credentials from $store"
+    { IFS= read -r CURIE_LOCAL_API_KEY && IFS= read -r CURIE_LOCAL_POSTGRES_PASSWORD; } <<<"$fields" \
+        || die "could not read the stack credentials from $store"
     export CURIE_LOCAL_API_KEY CURIE_LOCAL_POSTGRES_PASSWORD
 }
 
