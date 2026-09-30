@@ -57,6 +57,10 @@ class HistoryError(RuntimeError):
     """A history reference could not be resolved or dereferenced."""
 
 
+class UnprovableAssistantGroupingError(HistoryError):
+    """Overlapping tool calls whose shared assistant message cannot be proven."""
+
+
 class HistoryAppendError(HistoryError):
     """The state API refused a transcript append."""
 
@@ -181,6 +185,9 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
 
     Roles or arrival order cannot establish a logical assistant identity. Tool
     pairing validates result provenance separately from group provenance.
+    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay, so the
+    overlap refusal reaches a caller only for overlap it could not isolate to
+    one turn (RUNNER-HISTORY-GROUP-4).
     """
 
     _validate_group_provenance(messages)
@@ -194,7 +201,7 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
             message.assistant_group is None
             or any(group != message.assistant_group for group in pending.values())
         ):
-            raise HistoryError(
+            raise UnprovableAssistantGroupingError(
                 "overlapping tool calls lack common proven assistant grouping; "
                 "start a fresh conversation"
             )
@@ -220,6 +227,71 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
                 ):
                     raise HistoryError("unmatched or duplicate history tool result")
                 del pending[identifier]
+
+
+# What a reduced turn says in place of tool activity that left no visible text.
+UNREPLAYABLE_TOOL_ACTIVITY_TEXT = (
+    "[This turn's tool activity could not be replayed; only its text is kept.]"
+)
+
+
+def _split_turns(messages: Sequence[ConversationMessage]) -> list[list[ConversationMessage]]:
+    """Split at each genuine user message; a tool result does not start a turn."""
+
+    turns: list[list[ConversationMessage]] = []
+    for message in messages:
+        starts = message.role == "user" and not is_tool_result_message(message)
+        if starts or not turns:
+            turns.append([])
+        turns[-1].append(message)
+    return turns
+
+
+def _visible_text(turn: Sequence[ConversationMessage]) -> list[ConversationMessage]:
+    """The turn's opening user message and one assistant message of its text blocks."""
+
+    opening = turn[0]
+    head = [opening] if opening.role == "user" and not is_tool_result_message(opening) else []
+    texts: list[dict[str, Any]] = []
+    for message in turn:
+        if message.role != "assistant":
+            continue
+        if isinstance(message.content, str):
+            texts.append({"type": "text", "text": message.content})
+            continue
+        texts.extend(
+            cast("dict[str, Any]", json.loads(json.dumps(dict(block))))
+            for block in message.content
+            if block.get("type") == "text"
+        )
+    if not texts:
+        texts = [{"type": "text", "text": UNREPLAYABLE_TOOL_ACTIVITY_TEXT}]
+    return [*head, ConversationMessage(role="assistant", content=texts)]
+
+
+def reduce_unprovable_overlap_turns(
+    messages: Sequence[ConversationMessage],
+) -> tuple[tuple[ConversationMessage, ...], int]:
+    """Replay each turn with unprovable overlapping tool calls as its visible text.
+
+    RUNNER-HISTORY-GROUP-4. Returns the replay and how many turns were reduced.
+    Only the overlap refusal reduces a turn; any other malformed history is left
+    for ``validate_assistant_groups`` to refuse over the whole replay.
+    """
+
+    replay: list[ConversationMessage] = []
+    reduced = 0
+    for turn in _split_turns(messages):
+        try:
+            validate_assistant_groups(turn)
+        except UnprovableAssistantGroupingError:
+            replay.extend(_visible_text(turn))
+            reduced += 1
+            continue
+        except HistoryError:
+            pass
+        replay.extend(turn)
+    return tuple(replay), reduced
 
 
 @dataclass(frozen=True)

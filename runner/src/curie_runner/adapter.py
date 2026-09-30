@@ -58,6 +58,7 @@ from .history import (
     ConversationMessage,
     HarnessReplayState,
     HistoryError,
+    reduce_unprovable_overlap_turns,
     validate_assistant_groups,
 )
 from .mcp_argv import install as install_mcp_argv_offload
@@ -281,6 +282,17 @@ def build_structured_resume(
         messages, native_eligible = _recover_assistant_groups(messages, checkpoint)
         if not native_eligible:
             checkpoint = ()
+    messages, reduced = reduce_unprovable_overlap_turns(messages)
+    if reduced:
+        # RUNNER-HISTORY-GROUP-4: the native checkpoint describes the rows this
+        # replay no longer carries.
+        checkpoint = ()
+        logger.warning(
+            "history replay kept only the text of turns whose overlapping tool calls"
+            " have no provable assistant grouping session=%s turns_reduced=%d",
+            curie_session_id,
+            reduced,
+        )
     validate_assistant_groups(messages)
     if checkpoint and not _checkpoint_keeps_system_prompt(checkpoint, system_prompt):
         logger.info(
