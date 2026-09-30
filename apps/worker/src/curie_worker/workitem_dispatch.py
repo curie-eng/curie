@@ -538,6 +538,9 @@ class WorkItemRun:
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
         self.execution_deadline: datetime | None = None
+        # The agent the run's turn belongs to, recorded when the turn registers,
+        # so a kill can drop the run if it is parked for approval (#3564).
+        self.agent_id: uuid.UUID | None = None
         self._client = client
         self._on_stop = on_stop
         self._on_stale = on_stale
