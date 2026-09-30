@@ -1754,17 +1754,53 @@ async fn run_install_command(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if let Some(target) = &command.helm_target {
         if is_helm_timeout(&stderr) {
-            let recovery = helm_pending_upgrade_recovery(target);
-            return Err(crate::exit::CliError::failure(format!(
-                "Helm timed out waiting for release {} in namespace {}: {}. Recover the pending upgrade with: {}",
+            let diagnostic = pending_pvc_diagnostic(&target.namespace).await;
+            let recovery = verified_helm_pending_upgrade_recovery(target).await;
+            let mut message = format!(
+                "Helm timed out waiting for release {} in namespace {}: {}. {}",
                 target.release,
                 target.namespace,
-                if stderr.is_empty() { "command timed out" } else { &stderr },
-                recovery,
-            ))
-            .with_fix(recovery)
-            .into());
+                if stderr.is_empty() {
+                    "command timed out"
+                } else {
+                    &stderr
+                },
+                diagnostic,
+            );
+            if let Some(recovery) = recovery {
+                message.push_str(&format!(
+                    " Helm reports pending-upgrade; after checking why it is pending, recover the release with: {recovery}"
+                ));
+                return Err(crate::exit::CliError::failure(message)
+                    .with_fix(recovery)
+                    .into());
+            }
+            return Err(crate::exit::CliError::failure(message).into());
         }
+    }
+    if command.program == "kubectl"
+        && is_helm_timeout(&stderr)
+        && args.iter().any(|arg| arg == "statefulset/tempo")
+        && args.iter().any(|arg| arg == "rollout")
+    {
+        let namespace = command
+            .helm_target
+            .as_ref()
+            .map(|target| target.namespace.as_str())
+            .or_else(|| {
+                args.iter()
+                    .position(|arg| arg == "--namespace")
+                    .and_then(|index| args.get(index + 1))
+                    .map(String::as_str)
+            })
+            .unwrap_or(OBSERVABILITY_NAMESPACE);
+        let diagnostic = pending_pvc_diagnostic(namespace).await;
+        bail!(
+            "`{}` failed: {}. {}",
+            command.display(chart),
+            stderr,
+            diagnostic
+        );
     }
     bail!(
         "`{}` failed: {}",
@@ -1789,6 +1825,175 @@ fn helm_pending_upgrade_recovery(target: &HelmTarget) -> String {
         "kubectl delete secret -n {} -l 'owner=helm,name={},status=pending-upgrade'",
         target.namespace, target.release
     )
+}
+
+async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<String> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new("helm")
+            .args([
+                "status",
+                &target.release,
+                "-n",
+                &target.namespace,
+                "-o",
+                "json",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !status.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).ok()?;
+    (value.get("name").and_then(serde_json::Value::as_str) == Some(target.release.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str)
+            == Some(target.namespace.as_str())
+        && value
+            .pointer("/info/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pending-upgrade"))
+    .then(|| helm_pending_upgrade_recovery(target))
+}
+
+async fn diagnostic_kubectl_json(namespace: &str, resource: &str) -> Result<serde_json::Value> {
+    let output = tokio::process::Command::new("kubectl")
+        .args(["get", resource, "-n", namespace, "-o", "json"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("reading {resource} for timeout diagnosis"))?;
+    if !output.status.success() {
+        bail!("kubectl get {resource} failed");
+    }
+    serde_json::from_slice(&output.stdout).context("invalid Kubernetes diagnosis JSON")
+}
+
+async fn pending_pvc_diagnostic(namespace: &str) -> String {
+    let hint = format!(
+        "Inspect storage with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
+    );
+    let read = async {
+        let pvcs = diagnostic_kubectl_json(namespace, "pvc").await?;
+        let pods = diagnostic_kubectl_json(namespace, "pods").await?;
+        let events = diagnostic_kubectl_json(namespace, "events").await?;
+        Ok::<_, anyhow::Error>((pvcs, pods, events))
+    };
+    match tokio::time::timeout(Duration::from_secs(5), read).await {
+        Ok(Ok((pvcs, pods, events))) => {
+            pending_pvc_warning(&pvcs, &pods, &events, namespace).unwrap_or(hint)
+        }
+        _ => hint,
+    }
+}
+
+fn pending_pvc_warning(
+    pvcs: &serde_json::Value,
+    pods: &serde_json::Value,
+    events: &serde_json::Value,
+    namespace: &str,
+) -> Option<String> {
+    let claims = pvcs.get("items")?.as_array()?;
+    let pod_items = pods.get("items")?.as_array()?;
+    let event_items = events.get("items")?.as_array()?;
+    for claim in claims {
+        if claim
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str)
+            != Some("Pending")
+        {
+            continue;
+        }
+        let Some(name) = claim
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if claim
+            .pointer("/metadata/namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(namespace)
+        {
+            continue;
+        }
+        let uid = claim
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str);
+        for event in event_items {
+            if event.get("type").and_then(serde_json::Value::as_str) != Some("Warning") {
+                continue;
+            }
+            let Some(object) = event
+                .get("involvedObject")
+                .or_else(|| event.get("regarding"))
+            else {
+                continue;
+            };
+            if object.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
+                continue;
+            }
+            let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(object_name) = object.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let object_uid = object.get("uid").and_then(serde_json::Value::as_str);
+            let direct = kind == "PersistentVolumeClaim"
+                && object_name == name
+                && (uid.is_none() || object_uid.is_none() || uid == object_uid);
+            let pod = kind == "Pod"
+                && pod_items.iter().any(|pod| {
+                    pod.pointer("/metadata/namespace")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(namespace)
+                        && pod
+                            .pointer("/metadata/name")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(object_name)
+                        && (object_uid.is_none()
+                            || pod
+                                .pointer("/metadata/uid")
+                                .and_then(serde_json::Value::as_str)
+                                == object_uid)
+                        && pod
+                            .pointer("/spec/volumes")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|volumes| {
+                                volumes.iter().any(|volume| {
+                                    volume
+                                        .pointer("/persistentVolumeClaim/claimName")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(name)
+                                })
+                            })
+                });
+            let reason = event
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Warning");
+            let message = event
+                .get("message")
+                .or_else(|| event.get("note"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if direct
+                || (pod
+                    && reason == "FailedScheduling"
+                    && message.to_ascii_lowercase().contains("unbound")
+                    && message
+                        .to_ascii_lowercase()
+                        .contains("persistentvolumeclaim"))
+            {
+                return Some(format!("Pending PVC {name} has Kubernetes Warning {reason}: {message}. Inspect `kubectl describe pvc {name} -n {namespace}`."));
+            }
+        }
+    }
+    None
 }
 
 async fn kubernetes_connector_kubeconfig(namespace: &str) -> Result<String> {
