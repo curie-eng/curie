@@ -912,3 +912,59 @@ def test_the_steer_route_refuses_a_different_access_with_409() -> None:
             await runner.close()
 
     assert anyio.run(go) == (409, 200)
+
+
+def _counting_runner(access: TurnToolAccess) -> tuple[SessionRunner, list[FakeModelSession]]:
+    """A runner whose factory builds a new fake session per call, all recorded."""
+
+    sessions: list[FakeModelSession] = []
+
+    def factory() -> FakeModelSession:
+        session = FakeModelSession(
+            default_turn, can_use_tool=front_can_use_tool(None, access), tool_access=access
+        )
+        sessions.append(session)
+        return session
+
+    runner = SessionRunner(
+        session_factory=factory,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        tool_access=access,
+    )
+    return runner, sessions
+
+
+def test_an_ordinary_turn_after_a_read_only_one_runs_on_a_fresh_session() -> None:
+    # @spec RUNNER-TOOL-ACCESS-11: the SDK session that carried the read-only
+    # prompt is closed before the unrestricted prompt is sent.
+    access = _access()
+    runner, sessions = _counting_runner(access)
+
+    probe, ordinary = _drive(
+        runner, _event("probe", tool_access=ToolAccess.READ_ONLY), _event("hello")
+    )
+
+    assert _final(probe).status is SessionStatus.DONE
+    assert _final(ordinary).status is SessionStatus.DONE
+    assert [s.queries for s in sessions] == [["probe"], ["hello"]]
+    assert sessions[0].connected is False, "the read-only session was left running"
+
+
+def test_turns_under_one_access_keep_their_session() -> None:
+    # @spec RUNNER-TOOL-ACCESS-11 RUNNER-TOOL-ACCESS-7: the controls; no
+    # replacement between two ordinary turns or two read-only turns.
+    access = _access()
+    ordinary_runner, ordinary_sessions = _counting_runner(access)
+    _drive(ordinary_runner, _event("one"), _event("two"))
+    assert [s.queries for s in ordinary_sessions] == [["one", "two"]]
+
+    restricted_runner, restricted_sessions = _counting_runner(_access())
+    _drive(
+        restricted_runner,
+        _event("probe", tool_access=ToolAccess.READ_ONLY),
+        _event("probe again", tool_access=ToolAccess.READ_ONLY),
+    )
+    assert [s.queries for s in restricted_sessions] == [["probe", "probe again"]]

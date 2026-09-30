@@ -32,6 +32,7 @@ import pytest
 from aci_protocol import Event, Final, SessionStatus, ToolAccess, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from claude_agent_sdk.types import SdkPluginConfig
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.approval import (
@@ -463,3 +464,198 @@ def test_an_ordinary_turn_runs_the_same_shell_write_through_the_front(
     assert result.get("is_error") is not True
     assert access.refused_call_ids == set()
     assert _points(reader) == {("builtin", "success"): 1}
+
+
+# --- a turn nobody prompted ----------------------------------------------------------
+#
+# Measured on the same CLI: a bundle hook marked ``async`` and ``asyncRewake`` that
+# exits 2 after its turn wakes the model on its own, and the runner, which reads one
+# result per prompt, then ends the NEXT prompt's turn on that wake turn's result. The
+# next prompt's own answer arrives later. If that prompt was read-only and the turn
+# after it is ordinary, its tool call would be decided under unrestricted access.
+
+
+def test_a_read_only_prompt_a_bundle_hook_delayed_never_runs_unrestricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUNNER-TOOL-ACCESS-11: the ordinary turn after it gets a fresh SDK session.
+
+    Read-only A, then the hook's wake, then read-only B (whose model answer is
+    slow and asks for a Bash write), then ordinary C at once. Red while C shares
+    B's CLI: B's write runs under C's access. The hook must have fired, or the
+    test proves nothing.
+    """
+
+    # @spec RUNNER-TOOL-ACCESS-11 RUNNER-TOOL-ACCESS-4
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    marker = tmp_path / "written-by-a-delayed-read-only-prompt"
+    fired = tmp_path / "rewake-fired"
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    bundle = tmp_path / "bundle"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    (bundle / "hooks").mkdir()
+    (bundle / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "acme-bot"}))
+    rewake = (
+        f"if [ ! -e {fired} ]; then touch {fired}; sleep 2; "
+        "echo 'acme reminder: recheck the ledger' >&2; exit 2; fi; exit 0"
+    )
+    (bundle / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "async": True,
+                                    "asyncRewake": True,
+                                    "command": rewake,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    def last_user_text(body: dict[str, Any]) -> str:
+        texts: list[str] = []
+        for message in body.get("messages") or ():
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            for block in blocks or ():
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(str(block.get("text", "")))
+                elif isinstance(block, dict) and block.get("type") == "tool_result":
+                    texts.append("<tool_result>")
+        return texts[-1] if texts else ""
+
+    async def model(request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        last = last_user_text(body)
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(request)
+        start = {
+            "id": "msg_stand_in",
+            "type": "message",
+            "role": "assistant",
+            "model": "stand-in",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        if body.get("tools") and "PROBE-B" in last:
+            await anyio.sleep(4)
+            stop = "tool_use"
+            block: dict[str, Any] = {
+                "type": "tool_use",
+                "id": _CALL_ID,
+                "name": "Bash",
+                "input": {},
+            }
+            delta: dict[str, Any] = {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"command": f"touch {marker}", "description": "w"}),
+            }
+        else:
+            stop = "end_turn"
+            block = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": f"answer to {last[:24]}"}
+        for event, data in (
+            ("message_start", {"type": "message_start", "message": start}),
+            (
+                "content_block_start",
+                {"type": "content_block_start", "index": 0, "content_block": block},
+            ),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop, "stop_sequence": None},
+                    "usage": {"output_tokens": 1},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ):
+            await response.write(_sse(event, data))
+        await response.write_eof()
+        return response
+
+    async def scenario() -> list[Final]:
+        app = web.Application()
+        app.router.add_post("/v1/messages", model)
+        app.router.add_route("*", "/{tail:.*}", _anything_else)
+        async with TestServer(app, host="127.0.0.1") as server:
+            access = TurnToolAccess(CLAUDE_READONLY_TOOLS)
+            options = build_options(
+                plugins=[SdkPluginConfig(type="local", path=str(bundle))],
+                model="claude-sonnet-5",
+                system_prompt="You read the acme ledger.",
+                max_turns=6,
+                max_budget_usd=None,
+                resume=None,
+                cwd=str(cwd),
+                hooks=front_pre_tool_use_hooks(None, access),
+                can_use_tool=None,
+                env={
+                    "ANTHROPIC_API_KEY": "sk-ant-placeholder",
+                    "ANTHROPIC_BASE_URL": str(server.make_url("")).rstrip("/"),
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "DISABLE_TELEMETRY": "1",
+                },
+            )
+            runner = SessionRunner(
+                session_factory=lambda: ClaudeAgentSession(options),
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="curie-run:acme-rewake",
+                session_id="session-PLACEHOLDER",
+                model="claude-sonnet-5",
+                tool_access=access,
+            )
+            finals: list[Final] = []
+            await runner.start()
+            try:
+                with anyio.fail_after(_TURN_TIMEOUT_S):
+                    for text, tool_access, pause in (
+                        ("PROBE-A read the ledger", ToolAccess.READ_ONLY, 5.0),
+                        ("PROBE-B read it again", ToolAccess.READ_ONLY, 0.0),
+                        ("an ordinary question", None, 7.0),
+                    ):
+                        lines = [
+                            line
+                            async for line in runner.run_turn(
+                                Event(
+                                    type="message",
+                                    text=text,
+                                    user="U0EXAMPLE1",
+                                    ts="1",
+                                    tool_access=tool_access,
+                                )
+                            )
+                        ]
+                        finals += [
+                            e for e in parse_ndjson("".join(lines)) if isinstance(e, Final)
+                        ]
+                        await anyio.sleep(pause)
+            finally:
+                await runner.close()
+            return finals
+
+    finals = anyio.run(scenario)
+
+    assert fired.exists(), "the bundle hook never woke the CLI; the scenario did not happen"
+    assert not marker.exists(), "a delayed read-only prompt's write ran unrestricted"
+    assert len(finals) == 3
+    # The ordinary turn answers its own prompt, not a read-only leftover.
+    assert finals[2].text == "answer to an ordinary question"
