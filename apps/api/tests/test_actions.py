@@ -19,10 +19,17 @@ What this file holds:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
 import pytest
+from curie_api import crud
+from curie_api.config import get_settings
+from curie_api.models import AgentAction
+from curie_api.schemas import ActionComplete
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -113,6 +120,45 @@ def test_a_call_that_reported_no_prior_state_is_not_undoable(
     assert response.json()["detail"] == "restarted"
 
 
+def test_a_completion_that_reported_nothing_stores_sql_null_not_json_null(
+    client: Any, auth_headers: Any
+) -> None:
+    """An unreported field stays absent in the row, not the JSON value ``null``.
+
+    Python reads both back as ``None``, so only SQL can tell them apart. A
+    ledger query such as ``prior_state IS NOT NULL`` must not count a record
+    with nothing to restore as holding a prior state (ADR-0117).
+    """
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(result=None, prior_state=None, target=None),
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    async def stored_nulls() -> tuple[Any, ...]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT result IS NULL, prior_state IS NULL,"
+                            " post_state IS NULL, target IS NULL"
+                            " FROM curie.agent_actions WHERE id = :id"
+                        ),
+                        {"id": uuid.UUID(action_id)},
+                    )
+                ).one()
+                return tuple(row)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(stored_nulls()) == (True, True, True, True)
+
+
 def test_a_failed_call_is_not_undoable(client: Any, auth_headers: Any) -> None:
     """Undoing a call that did not happen would be a write, not a restore."""
 
@@ -142,6 +188,52 @@ def test_a_completion_lands_once(client: Any, auth_headers: Any) -> None:
 
     assert second.status_code == 200
     assert second.json()["prior_state"] == {"spec": {"replicas": 3}}
+
+
+def test_two_sessions_with_a_stale_pending_record_cannot_replace_the_first_completion(
+    client: Any, auth_headers: Any
+) -> None:
+    """A delayed completion read before its rival committed must adopt the winner.
+
+    The two real Postgres sessions both load ``pending`` before either writes.
+    Serializing their commits afterwards makes the race deterministic: a plain
+    ORM read-modify-write would let the stale second session replace the first.
+    """
+
+    opened = client.post("/actions", json=_open_body(), headers=auth_headers)
+    action_id = uuid.UUID(opened.json()["id"])
+
+    async def contend() -> tuple[AgentAction, AgentAction, AgentAction]:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as first_session, sessions() as second_session:
+                first = await first_session.get(AgentAction, action_id)
+                second = await second_session.get(AgentAction, action_id)
+                assert first is not None and second is not None
+                assert first.status == second.status == "pending"
+                winner = await crud.complete_action(
+                    first_session,
+                    first,
+                    ActionComplete.model_validate(_complete_body(prior_state={"winner": 1})),
+                )
+                loser = await crud.complete_action(
+                    second_session,
+                    second,
+                    ActionComplete.model_validate(_complete_body(prior_state={"loser": 2})),
+                )
+                async with sessions() as check_session:
+                    stored = await check_session.get(AgentAction, action_id)
+                    assert stored is not None
+                    return winner, loser, stored
+        finally:
+            await engine.dispose()
+
+    winner, loser, stored = asyncio.run(contend())
+    assert winner.prior_state == {"winner": 1}
+    assert loser.prior_state == {"winner": 1}
+    assert stored.prior_state == {"winner": 1}
+    assert stored.result == {"ok": True, "summary": "scaled 3 to 10"}
 
 
 def test_a_conversation_reads_back_its_actions_in_order(
