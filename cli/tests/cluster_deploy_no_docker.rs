@@ -89,6 +89,7 @@ fn deploy_response(req: &support::Request) -> Response {
                 .to_string(),
             )
         }
+        ("GET", path) if path.starts_with("/deployments") => Response::json(200, "[]"),
         ("POST", "/deployments") => Response::json(
             201,
             &json!({
