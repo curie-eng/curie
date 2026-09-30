@@ -460,6 +460,13 @@ def test_success_notice_requires_opt_in_and_is_deduplicated(
     assert changed.status_code == 200
     assert changed.json()["deploy_notifications"] is True
 
+    # A new commit, because a notice announces a change of the active
+    # version; re-pushing the active sha changes nothing.
+    sha = _push_commit(
+        trusted_clone_base,
+        {"skills/gamma/SKILL.md": "---\nname: gamma\ndescription: does gamma\n---\n"},
+    )
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
     cursor = _notice_cursor()
     assert _post(client, "push", payload).json()["status"] == "deployed"
     notices = _notices_after(cursor)
