@@ -151,7 +151,9 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
     try:
         conn: socket.socket = raw
         if parsed.scheme == "rediss":
-            conn = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            conn = context.wrap_socket(raw, server_hostname=host)
 
         def reply() -> bytes:
             line = b""
