@@ -130,13 +130,16 @@ class Config:
         scan_not_before = required("SLACK_SCAN_NOT_BEFORE")
         canary_thread_ts = required("SLACK_CANARY_THREAD_TS")
         try:
-            float(scan_not_before)
-            float(canary_thread_ts)
+            floor = float(scan_not_before)
+            canary = float(canary_thread_ts)
         except ValueError as exc:
             raise ValueError(
                 "SLACK_SCAN_NOT_BEFORE and SLACK_CANARY_THREAD_TS must be Slack timestamps"
             ) from exc
-        if float(canary_thread_ts) < float(scan_not_before):
+        for name, value in (("SLACK_SCAN_NOT_BEFORE", floor), ("SLACK_CANARY_THREAD_TS", canary)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite nonnegative timestamp")
+        if canary < floor:
             raise ValueError("SLACK_CANARY_THREAD_TS must be at or after SLACK_SCAN_NOT_BEFORE")
         poll = _positive_float("POLL_SECONDS", "60")
         stale = _positive_float("PLACEHOLDER_STALE_SECONDS", "900")
@@ -164,8 +167,8 @@ def _positive_float(name: str, default: str) -> float:
         value = float(os.environ.get(name, default))
     except ValueError as exc:
         raise ValueError(f"{name} must be a number") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be greater than zero")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and greater than zero")
     return value
 
 
@@ -389,6 +392,32 @@ class CurieHookClient:
     def __init__(self, config: Config, *, send: Sender = _send) -> None:
         self.config = config
         self.send = send
+
+    def verify_target_capability(self) -> None:
+        """Refuse an older hook route before any Slack or hook side effect."""
+
+        parsed = urllib.parse.urlsplit(self.config.hook_url)
+        prefix, separator, _route = parsed.path.rpartition("/hooks/")
+        if not separator:
+            raise RuntimeError("Curie hook URL does not name a hooks route")
+        url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, prefix + "/openapi.json", "", "")
+        )
+        # Capability discovery carries neither the hook secret nor a delivery id.
+        request = urllib.request.Request(url, method="GET")
+        status, body = self.send(request, self.config.http_timeout_seconds)
+        if status != 200:
+            raise RuntimeError(f"Curie API capability discovery returned HTTP {status}")
+        try:
+            document = json.loads(body)
+            route = document["paths"]["/hooks/{agent_id}/{hook}"]
+            operation = route["post"]
+            parameters = route.get("parameters", []) + operation.get("parameters", [])
+            names = {parameter["name"] for parameter in parameters if parameter["in"] == "query"}
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise RuntimeError("Curie API capability description is invalid") from exc
+        if not {"conversation_id", "placeholder"}.issubset(names):
+            raise RuntimeError("Curie API does not support explicit hook reply targets")
 
     def deliver(
         self,
@@ -644,6 +673,7 @@ def main() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     slack = SlackClient(config)
     hook = CurieHookClient(config)
+    hook.verify_target_capability()
     state = ScanState()
     while True:
         started = time.time()

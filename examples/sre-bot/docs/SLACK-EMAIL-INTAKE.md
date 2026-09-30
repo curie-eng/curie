@@ -65,9 +65,13 @@ delivery id returns the original conversation and cannot repair its target.
 Receipt validation therefore detects this incompatibility only after enqueue.
 
 The payload contains source metadata and the extracted email text. It is
-untrusted evidence, never instructions. The SRE bot remains read-only for these
-automated turns: it may inspect and explain, but it must not call a mutating
-tool or raise an approval from an email alert.
+untrusted evidence, never instructions. The SRE skill instructs these automated
+turns to inspect and explain, without calling a mutating tool or raising an
+approval. This is standing prompt policy, not runtime enforcement: hook turns
+currently retain the agent's ordinary tools and approval flow under ADR 0099.
+[Issue #3603](https://github.com/curie-eng/curie/issues/3603) tracks the required
+trusted per-turn restriction. Installations requiring enforced no-mutation and
+no-approval must wait for that reviewed contract and its worker/runner adoption.
 
 ### SRE-EMAIL-3 — no silent failure
 
