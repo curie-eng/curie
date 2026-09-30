@@ -203,14 +203,19 @@ def test_tenant_scope_preserves_identity_links_on_downgrade(isolated_migration_d
         "INSERT INTO curie.provider_installations "
         "(id, tenant_id, provider, external_account_id) "
         "VALUES (:id, :tenant, 'slack', :account)",
-        {"id": installation_id, "tenant": DEFAULT_TENANT_ID, "account": f"T-{link_id.hex}"},
+        {"id": installation_id, "tenant": DEFAULT_TENANT_UUID, "account": f"T-{link_id.hex}"},
     )
     _sql(
         "INSERT INTO curie.identity_links "
-        "(id, tenant_id, bot_id, provider_installation_id, provider_native_id, verification_source) "
+        "(id, tenant_id, bot_id, provider_installation_id, "
+        "provider_native_id, verification_source) "
         "VALUES (:id, :tenant, :bot, :installation, 'U0EXAMPLE', 'admin_mapped')",
-        {"id": link_id, "tenant": DEFAULT_TENANT_ID, "bot": ids["agents"],
-         "installation": installation_id},
+        {
+            "id": link_id,
+            "tenant": DEFAULT_TENANT_UUID,
+            "bot": ids["agents"],
+            "installation": installation_id,
+        },
     )
     command.upgrade(config, "0074")
     assert "agent_channels_provider_installation_fkey" in _constraint_names("agent_channels")
