@@ -62,6 +62,33 @@ Slack binding independently of that delivery adapter (INGRESS-CANARY-1).
   retains prod-over-dev and most-recent ordering. A stale or undeployed named
   route cannot run or answer as a different identity.
 
+### Per-turn tool access
+
+The worker's half of TOOL-ACCESS in
+[the ACI producer seam](../../docs/interfaces/aci-producer/INTERFACE.md), for a
+queued turn whose `tool_access` is set (a canary sets `read-only`):
+
+- **WORKER-TOOL-ACCESS-1:** The worker forwards `QueuedTurn.tool_access`
+  unchanged as `Event.tool_access` on the turn it opens. A turn without it opens
+  exactly as before, with no extra runner call.
+- **WORKER-TOOL-ACCESS-2:** Before it opens a restricted turn, the worker reads
+  the status of the runner it is about to send the event to, over that
+  sandbox's own authenticated route, and opens the turn only when the value is
+  listed under `tool_access`. A status that answers without listing it means
+  the runner would run the turn unrestricted, so the model is never asked: the
+  reply is `This agent cannot start: its runner does not enforce read-only
+  tool access, so this turn was not run.`, and the delivery is not retried. A
+  status that cannot be read opens nothing either and is retried like any turn
+  the runner did not accept.
+- **WORKER-TOOL-ACCESS-3:** A restricted turn never steers a live turn. It
+  defers exactly as a job does (ADR-0079): when the thread has a live turn it
+  is not started, and the delivery stays pending for a later redelivery.
+- **WORKER-TOOL-ACCESS-4:** The worker never creates an approval from a
+  `read-only` turn. A runner final that nonetheless ends `awaiting-approval`
+  records no approval and posts no card; the turn is a failed turn, escalated
+  with the reply `This read-only turn asked for an approval, which it may not
+  do. No approval was created.`
+
 ## The eval lane (`curie_worker.eval`)
 
 Runs an eval suite against a plugin version and records the grid the eval matrix
