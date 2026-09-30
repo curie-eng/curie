@@ -863,6 +863,53 @@ def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
     assert _suppressed_counts(notice_metrics) == {"no_nonprod_recipient": 1}
 
 
+def test_concurrent_rejections_share_one_repository_notice_budget(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """@spec docs/operations.md#automatically-with-git-flow."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.schemas import WebhookResult
+    from redis.asyncio import Redis
+
+    _register_agent(client, auth_headers)
+    stream = f"test:deploy-notice:concurrent:{uuid.uuid4().hex}"
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        queue = DeployNoticeQueue(valkey, stream)
+
+        async def publish(n: int) -> int:
+            async with maker() as session:
+                return await queue.publish(
+                    session,
+                    WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}]),
+                    _push_payload("refs/heads/dev", f"{n:040x}", "file:///unused"),
+                    settings,
+                )
+
+        try:
+            published = await asyncio.gather(*(publish(n) for n in range(21)))
+            assert sum(published) == 20
+            assert published.count(0) == 1
+            assert await valkey.xlen(stream) == 20
+            async with maker() as session:
+                count = await session.scalar(
+                    text("SELECT count(*) FROM curie.deploy_notice_outbox WHERE stream = :stream"),
+                    {"stream": stream},
+                )
+                assert count == 20
+        finally:
+            await valkey.delete(stream)
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
 def test_deploy_notices_are_bounded_per_repository(
     client: Any,
     auth_headers: dict[str, str],
