@@ -752,6 +752,15 @@ def test_known_non_runtime_paths_select_no_e2e_tiers(
     _assert_selection(tmp_path, path, (), pytest_needed=pytest_needed)
 
 
+@pytest.mark.parametrize("root_file", APPROVED_ROOT_DOCS)
+def test_root_filename_directory_cannot_bypass_runtime_tiers(
+    tmp_path: Path,
+    root_file: str,
+) -> None:
+    # #1954: ignore the root file itself, never a directory with the same name.
+    _assert_selection(tmp_path, f"{root_file}/runtime-check.sh", BASE_TIERS)
+
+
 def test_unapproved_markdown_fallback_selects_all_base_tiers(tmp_path: Path) -> None:
     _assert_selection(tmp_path, "UNAPPROVED.md", BASE_TIERS)
 
@@ -1049,6 +1058,8 @@ rules:
   prefixes:
     charts: [cluster]
     charts/curie: [released-upgrade]
+  ignored_exact:
+    README.md: []
   ignored_prefixes:
     docs: []
 """
@@ -1093,6 +1104,38 @@ def test_selector_rejects_invalid_registries(
     registry.write_text(registry_text)
     completed, _output = _invoke_selector(tmp_path, "charts/example.yaml", registry=registry)
     assert completed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "README.md: [skill]",
+        "README.md/: []",
+        "/README.md: []",
+        "compose.dev.yaml: []",
+        "charts: []",
+    ],
+)
+def test_selector_rejects_invalid_exact_ignores(tmp_path: Path, entry: str) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(VALID_REGISTRY.replace("README.md: []", entry))
+    completed, output = _invoke_selector(tmp_path, "README.md", registry=registry)
+    assert completed.returncode != 0
+    assert not output
+
+
+def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(VALID_REGISTRY.replace("README.md: []", "charts/curie/README.md: []"))
+    ignored, ignored_output = _invoke_selector(
+        tmp_path, "charts/curie/README.md", registry=registry
+    )
+    sibling, sibling_output = _invoke_selector(
+        tmp_path, "charts/curie/README.md/runtime-check.sh", registry=registry
+    )
+    assert ignored.returncode == sibling.returncode == 0
+    assert ignored_output == _expected_output(pytest_needed=False)
+    assert sibling_output == _expected_output("cluster", "released-upgrade")
 
 
 def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Path) -> None:
