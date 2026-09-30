@@ -28,6 +28,7 @@ from curie_api import crud
 from curie_api.config import get_settings
 from curie_api.models import AgentAction
 from curie_api.schemas import ActionComplete
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("clean_db")
@@ -117,6 +118,45 @@ def test_a_call_that_reported_no_prior_state_is_not_undoable(
     assert response.json()["status"] == "succeeded"
     assert response.json()["undoable"] is False
     assert response.json()["detail"] == "restarted"
+
+
+def test_a_completion_that_reported_nothing_stores_sql_null_not_json_null(
+    client: Any, auth_headers: Any
+) -> None:
+    """An unreported field stays absent in the row, not the JSON value ``null``.
+
+    Python reads both back as ``None``, so only SQL can tell them apart. A
+    ledger query such as ``prior_state IS NOT NULL`` must not count a record
+    with nothing to restore as holding a prior state (ADR-0117).
+    """
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(result=None, prior_state=None, target=None),
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    async def stored_nulls() -> tuple[Any, ...]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT result IS NULL, prior_state IS NULL,"
+                            " post_state IS NULL, target IS NULL"
+                            " FROM curie.agent_actions WHERE id = :id"
+                        ),
+                        {"id": uuid.UUID(action_id)},
+                    )
+                ).one()
+                return tuple(row)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(stored_nulls()) == (True, True, True, True)
 
 
 def test_a_failed_call_is_not_undoable(client: Any, auth_headers: Any) -> None:
