@@ -1602,6 +1602,29 @@ def test_the_reserved_keys_do_not_count_toward_the_boot_limit() -> None:
     assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
 
 
+def test_malformed_fact_entries_do_not_count_toward_the_boot_limit() -> None:
+    # Boot shows only the facts `list()` parses, and `forget` cannot remove the
+    # rest, so a malformed `fact-*` entry must not take a slot.
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+    api.seed(AGENT_NS, f"fact-{'a' * 32}", "just a string")
+    api.seed(AGENT_NS, f"fact-{'b' * 32}", {"author": "U1", "stated_at": "2026-09-01T00:00:00Z"})
+    api.seed(AGENT_NS, f"fact-{'c' * 32}", {"statement": ""})
+    api.seed(AGENT_NS, f"fact-{'d' * 32}", {"statement": 42})
+    api.seed(AGENT_NS, "fact-not-a-uuid", _fact_value("odd key", "2026-09-01T00:00:00Z"))
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            store = _store(server)
+            assert len(await store.list()) == MAX_FACTS_PER_MEMORY - 1
+            await store.add(statement="still fits", author="U1", session_id="s")
+            assert len(await store.list()) == MAX_FACTS_PER_MEMORY
+
+    anyio.run(go)
+
+
 def test_remember_is_refused_when_memory_holds_the_boot_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
