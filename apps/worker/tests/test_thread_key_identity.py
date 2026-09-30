@@ -70,7 +70,19 @@ def test_named_cluster_message_uses_a_separate_thread_key() -> None:
     ) == "slack:sre-bot:C0EXAMPLE1:1700000000.000100"
 
 
-@pytest.mark.parametrize("identity", ["", " ", "SRE Bot", "sre/bot", "default "])
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "",
+        " ",
+        "SRE Bot",
+        "sre/bot",
+        "sre_bot",
+        "default ",
+        "curie-cluster-message",
+        "a" * 41,
+    ],
+)
 def test_invalid_relay_identity_cannot_reach_a_default_thread(identity: str) -> None:
     # @spec WORKER-CANARY-2: invalid input may never share default state.
     with pytest.raises(ValueError, match="identity"):

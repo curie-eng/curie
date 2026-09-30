@@ -343,6 +343,18 @@ def test_named_relay_selects_only_its_active_slack_binding() -> None:
                 adapter="sre-bot",
             )
             ids.append(named_id)
+            # @spec WORKER-CANARY-2: an out-of-band row can carry an adapter
+            # slug that is not a declared Slack identity name. It must not
+            # make an invalid relay selector runnable.
+            malformed_id = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"malformed-{token}",
+                max_usd=None,
+                max_tokens=None,
+                adapter="sre_bot",
+            )
+            ids.append(malformed_id)
             await _seed_deployment(
                 engine, agent_id=default_id, environment="prod", bundle_ref="default.zip"
             )
@@ -351,6 +363,9 @@ def test_named_relay_selects_only_its_active_slack_binding() -> None:
             )
             await _seed_deployment(
                 engine, agent_id=named_id, environment="prod", bundle_ref="named-prod.zip"
+            )
+            await _seed_deployment(
+                engine, agent_id=malformed_id, environment="prod", bundle_ref="malformed.zip"
             )
 
             resolver = _resolver(engine)
@@ -362,7 +377,7 @@ def test_named_relay_selects_only_its_active_slack_binding() -> None:
             assert named.bundle_ref == "named-prod.zip"
             assert unknown is None
             assert await resolver.undeployed_binding("slack", "missing-bot", channel) is None
-            for invalid in ("", " ", "SRE Bot", "sre/bot"):
+            for invalid in ("", " ", "SRE Bot", "sre/bot", "sre_bot", "a" * 41):
                 assert await resolver.resolve("slack", invalid, channel) is None
                 assert await resolver.undeployed_binding("slack", invalid, channel) is None
             # @spec WORKER-CANARY-5: after the named deployment disappears,
