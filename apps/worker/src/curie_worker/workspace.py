@@ -38,6 +38,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
+from curie_dispatcher.thread_context import without_quoted_context
+
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"
 WORKSPACE_SHA256_ENV = "CURIE_WORKSPACE_SHA256"
 WORKSPACE_MOUNT_PATH = "/workspace"
@@ -360,12 +362,16 @@ def trusted_repository_fact(message: str, *, ignore_message: bool) -> RepoFact |
     Job payloads (webhook/cron), verified-review bodies, and approval resume
     text (#2828, which quotes the gated tool arguments) are untrusted for
     repository selection. A coding target comes from operator mapping or an
-    already sticky thread row, never from a URL inside those documents.
+    already sticky thread row, never from a URL inside those documents. The
+    same holds for a Slack thread root quoted into a person's reply.
     """
 
     if ignore_message:
         return None
-    return parse_github_repo_fact(message)
+    # @spec slack-alert-followup-context: Repository selection. A thread root the
+    # dispatcher quoted into a person's reply is hook output, so it is removed
+    # before the person's own words are read.
+    return parse_github_repo_fact(without_quoted_context(message))
 
 
 def webhook_job_refuses_workspace(message: str) -> bool:

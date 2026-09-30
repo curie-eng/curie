@@ -66,6 +66,22 @@ def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def person_rooted_thread(**kwargs: Any) -> dict[str, Any]:
+    """Slack's ``conversations.replies`` answer for a thread a person started.
+
+    A threaded mention may look up its thread's root (spec
+    slack-alert-followup-context), so a harness built on a real ``WebClient``
+    answers that call here instead of reaching Slack. The parent message comes
+    first (https://docs.slack.dev/reference/methods/conversations.replies/),
+    and a person's root never belongs to the bot, so the turn is unchanged.
+    """
+    return {
+        "ok": True,
+        "messages": [{"ts": kwargs["ts"], "user": "U0PERSON", "text": "A person's root."}],
+        "has_more": False,
+    }
+
+
 class _TestTelemetry:
     """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
 
