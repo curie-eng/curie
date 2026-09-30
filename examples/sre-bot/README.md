@@ -76,6 +76,24 @@ Persistent volumes use the cluster's default storage class, including the
 default supplied by a stock kind cluster. See the complete executable sequence
 in [DEMO.md](DEMO.md#fresh-install).
 
+The live installer reads the runtime of every node the Alloy DaemonSet can
+run on before creating the Grafana Secret or installing charts. A uniform
+containerd or CRI-O cluster uses the checked-in Alloy CRI parser; a uniform
+Docker cluster uses a rendered Docker log mount and parser. Mixed or unknown
+runtimes are refused because Alloy runs as a DaemonSet, including on cordoned
+or temporarily NotReady nodes. `--dry-run` does not read node runtimes or
+mutate the cluster, and reports that this selection occurs on the live run.
+
+For a manual values-file install, the checked-in
+[`observability/alloy-values.yaml`](observability/alloy-values.yaml) targets
+CRI logs. On Docker nodes, change `alloy.mounts.dockercontainers` to `true`
+and replace `stage.cri { }` with `stage.docker { }` in that file before applying
+it. Ensure every node running Alloy uses the same log format. The manual
+Grafana chart install also requires a Secret named `grafana-admin` in the
+observability namespace with keys `admin-user` and `admin-password`; create
+or preserve it through your normal Secret-management process. The CLI
+installer handles this Secret without printing either value.
+
 If the selected release already records a model credential and
 `CURIE_CREDENTIALS` is not exported, the installer refuses before platform
 mutation because its declarative platform step would clear the credential and
