@@ -18,9 +18,9 @@ from aci_protocol import STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT
 from curie_api.config import get_settings
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
@@ -84,23 +84,26 @@ def reconciler_metrics(
 
 
 def _reconciler_metric_values(
-    reader: InMemoryMetricReader, name: str
-) -> dict[str, float]:
+    reader: InMemoryMetricReader,
+) -> dict[str, dict[str, float]]:
+    values: dict[str, dict[str, float]] = {
+        "curie.work_item.reconciler.step.failure": {},
+        "curie.work_item.reconciler.step.consecutive_failures": {},
+    }
     data = reader.get_metrics_data()
     if data is None:
-        return {}
-    values: dict[str, float] = {}
+        return values
     for resource_metrics in data.resource_metrics:
         assert resource_metrics.resource.attributes["service.name"] == "curie-api"
         for scope_metrics in resource_metrics.scope_metrics:
             for metric in scope_metrics.metrics:
-                if metric.name != name:
+                if metric.name not in values:
                     continue
                 for point in metric.data.data_points:
                     attributes = dict(point.attributes)
                     assert set(attributes) == {"service.name", "step"}
                     assert attributes["service.name"] == "curie-api"
-                    values[attributes["step"]] = point.value
+                    values[metric.name][attributes["step"]] = point.value
     return values
 
 
@@ -392,26 +395,20 @@ def test_each_step_failure_is_isolated_and_recovers_its_metrics(
         for count in (1, 2):
             await reconciler.run_once()
             assert observed == list(RECONCILER_STEPS) * count
-            assert _reconciler_metric_values(
-                reconciler_metrics, "curie.work_item.reconciler.step.failure"
-            ) == {label: count}
-            assert _reconciler_metric_values(
-                reconciler_metrics,
-                "curie.work_item.reconciler.step.consecutive_failures",
-            ) == {
+            values = _reconciler_metric_values(reconciler_metrics)
+            assert values["curie.work_item.reconciler.step.failure"] == {label: count}
+            assert values["curie.work_item.reconciler.step.consecutive_failures"] == {
                 name.removeprefix("_"): count if name == failed_step else 0
                 for name in RECONCILER_STEPS
             }
         failure_enabled = False
         await reconciler.run_once()
         assert observed == list(RECONCILER_STEPS) * 3
-        assert _reconciler_metric_values(
-            reconciler_metrics, "curie.work_item.reconciler.step.failure"
-        ) == {label: 2}
-        assert _reconciler_metric_values(
-            reconciler_metrics,
-            "curie.work_item.reconciler.step.consecutive_failures",
-        ) == {name.removeprefix("_"): 0 for name in RECONCILER_STEPS}
+        values = _reconciler_metric_values(reconciler_metrics)
+        assert values["curie.work_item.reconciler.step.failure"] == {label: 2}
+        assert values["curie.work_item.reconciler.step.consecutive_failures"] == {
+            name.removeprefix("_"): 0 for name in RECONCILER_STEPS
+        }
 
     _run(steps, runs_stream)
     failures = [
@@ -461,12 +458,12 @@ def test_step_cancellation_propagates_without_counting_a_failure(
 
     _run(steps, runs_stream)
     assert observed == list(RECONCILER_STEPS[: RECONCILER_STEPS.index(cancelled_step) + 1])
-    assert _reconciler_metric_values(
-        reconciler_metrics, "curie.work_item.reconciler.step.failure"
-    ) == {}
-    assert cancelled_step.removeprefix("_") not in _reconciler_metric_values(
-        reconciler_metrics, "curie.work_item.reconciler.step.consecutive_failures"
-    )
+    values = _reconciler_metric_values(reconciler_metrics)
+    assert values["curie.work_item.reconciler.step.failure"] == {}
+    assert values["curie.work_item.reconciler.step.consecutive_failures"] == {
+        name.removeprefix("_"): 0
+        for name in RECONCILER_STEPS[: RECONCILER_STEPS.index(cancelled_step)]
+    }
     assert _payloads(valkey, runs_stream) == []
 
 

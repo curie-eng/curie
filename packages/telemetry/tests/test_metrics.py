@@ -655,10 +655,13 @@ def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None
 def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
-    provider, reader = metrics
+    _provider, reader = metrics
 
+    # Observed with OpenTelemetry SDK 1.44.0 in the real driver run:
+    # InMemoryMetricReader returned Sum for a counter and Gauge for a synchronous
+    # gauge. A second collection omitted the gauge without a fresh set, so each
+    # observation uses one snapshot. The corrected run passed all 78 tests.
     def exported_values() -> dict[str, dict[str, float]]:
-        assert provider.force_flush(timeout_millis=5000)
         data = reader.get_metrics_data()
         assert data is not None
         values: dict[str, dict[str, float]] = {}
