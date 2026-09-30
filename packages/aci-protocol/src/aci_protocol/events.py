@@ -329,6 +329,12 @@ class SideEffectFlag(_OutboundBase):
     # frame, or a producer that predates this). A record is undoable only on a
     # successful outcome, so the outcome has to travel with the result.
     failed: bool | None = None
+    # Whether outbound redaction replaced anything inside ``result``. A scrubbed
+    # snapshot is no longer what the connector reported, and replaying it would
+    # write a placeholder over the live value, so a consumer must not treat a
+    # redacted ``result`` as restorable state (#1873). ``None`` means nothing was
+    # replaced or the producer predates this field.
+    redacted: bool | None = None
 
 
 OutboundEvent = Annotated[
