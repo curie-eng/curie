@@ -311,7 +311,9 @@ def test_invalid_observed_start_clears_group(monkeypatch, identifier):
     client = _ResponseClient([[_stream_start("msg_acme_example"), _stream_start(identifier)]])
     monkeypatch.setattr(adapter, "ClaudeSDKClient", lambda _options: client)
     session = ClaudeAgentSession(
-        build_options(plugins=[], model=None, system_prompt=None, max_turns=1, max_budget_usd=1)
+        build_options(
+            plugins=[], model=None, system_prompt=None, resume=None, max_turns=1, max_budget_usd=1
+        )
     )
 
     async def collect():
@@ -365,7 +367,7 @@ def test_actual_session_capture_keeps_results_but_clears_user_and_new_turn(monke
 
     store = Store()
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=2, max_budget_usd=1
+        plugins=[], model=None, system_prompt=None, resume=None, max_turns=2, max_budget_usd=1
     )
     runner = SessionRunner(
         session_factory=lambda: ClaudeAgentSession(options),
@@ -448,7 +450,7 @@ def test_accepted_steer_clears_capture_group(monkeypatch):
 
     store = Store()
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=2, max_budget_usd=1
+        plugins=[], model=None, system_prompt=None, resume=None, max_turns=2, max_budget_usd=1
     )
     runner = SessionRunner(
         session_factory=lambda: ClaudeAgentSession(options),
@@ -528,3 +530,54 @@ def test_stale_native_migration_requires_full_exact_portable_correspondence(tmp_
         assert [e["message"]["content"] for e in entries] == [m.content for m in messages]
         assert entries[0]["message"]["id"] == entries[3]["message"]["id"]
         assert all(e["type"] != "attachment" for e in entries)
+
+
+def test_compaction_omits_entire_old_assistant_group_across_rows():
+    old_first = _call(1).to_dict()
+    old_second = _call(2).to_dict()
+    # Tool input is opaque to text reduction: the budget must prune exchanges,
+    # rather than merely replace large result prose with a digest marker.
+    old_first["content"][0]["input"] = {"record": "acme-first-" + "x" * 3000}
+    old_second["content"][0]["input"] = {"record": "acme-second-" + "y" * 3000}
+    newer_call = _call(3, OTHER)
+    newer_result = _result(3, "acme newer exact result")
+    historical_text = "Acme older group context remains historical."
+    record = TurnRecord(
+        user="inspect",
+        assistant="done",
+        ts="2026-09-30T00:00:00Z",
+        messages=(
+            ConversationMessage(role="user", content="inspect"),
+            ConversationMessage.from_dict(old_first),
+            _result(1),
+            ConversationMessage.from_dict(
+                {
+                    "role": "assistant",
+                    "assistant_group": GROUP,
+                    "content": [{"type": "text", "text": historical_text}],
+                }
+            ),
+            ConversationMessage.from_dict(old_second),
+            _result(2),
+            newer_call,
+            newer_result,
+            ConversationMessage(role="assistant", content=[{"type": "text", "text": "done"}]),
+        ),
+    )
+    bounded = bound_turn_record(record, max_value_bytes=5500)
+    blocks = [
+        block
+        for message in bounded.messages
+        if isinstance(message.content, list)
+        for block in message.content
+    ]
+    # A cap that can fit after removing only the first pair must still remove
+    # both pairs of the proven same native group, including its text attribution.
+    assert {b["id"] for b in blocks if b.get("type") == "tool_use"} == {"call-acme-3"}
+    assert {b["tool_use_id"] for b in blocks if b.get("type") == "tool_result"} == {"call-acme-3"}
+    assert all(m.to_dict().get("assistant_group") != GROUP for m in bounded.messages)
+    assert newer_call in bounded.messages and newer_result in bounded.messages
+    assert any(b.get("text") == historical_text for b in blocks)
+    assert bounded.messages[0] == record.messages[0]
+    assert bounded.messages[-1] == record.messages[-1]
+    assert bounded.user == record.user and bounded.assistant == record.assistant
