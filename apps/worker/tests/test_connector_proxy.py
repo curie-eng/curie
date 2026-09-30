@@ -36,16 +36,77 @@ _REFUSAL = json.loads(
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
 _TOKEN = str(_VECTOR["minted"])
 _BEFORE_EXPIRY = int(_VECTOR["exp"]) - 10
+_GRANT_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+_GATED_TOOLS = ("github/merge_pull_request",)
+_CONNECTOR = "github"
+_MERGE_CALL = (
+    b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+    b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}'
+)
+
+
+def _canonical(arguments: dict[str, Any]) -> str:
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+class MemoryGrantStore:
+    """Shared stand-in for the grant spend. True only the first time a jti is spent."""
+
+    def __init__(self) -> None:
+        self._spent: set[str] = set()
+
+    def spend(self, jti: str, ttl: int) -> bool:
+        del ttl
+        if jti in self._spent:
+            return False
+        self._spent.add(jti)
+        return True
+
+
+def _grant_required_body() -> dict[str, Any]:
+    return next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == "grant_required")
+
+
+def _mint_grant(tool: str, arguments: dict[str, Any], *, jti: str) -> str:
+    from curie_worker.connector_grant import mint
+
+    token = mint(
+        _GRANT_SEED,
+        agent="acme-dev",
+        connector=_CONNECTOR,
+        tool=tool,
+        args=_canonical(arguments),
+        exp=int(_VECTOR["exp"]),
+        jti=jti,
+    )
+    prefix, _payload, _signature = token.split(".")
+    assert prefix == "ccg"
+    return token
 
 
 def _config(
-    upstream_port: int, *, admits: frozenset[str] = frozenset({"acme-dev"})
+    upstream_port: int,
+    *,
+    admits: frozenset[str] = frozenset({"acme-dev"}),
+    gated_tools: tuple[str, ...] = (),
+    connector: str = "",
+    grant_store: Any | None = None,
 ) -> server.ProxyConfig:
+    # Only the grant tests pass these. An empty gate must keep today's constructor
+    # call, or every existing refusal would fail before its own reason.
+    extra: dict[str, Any] = {}
+    if gated_tools:
+        extra["gated_tools"] = gated_tools
+    if connector:
+        extra["connector"] = connector
+    if grant_store is not None:
+        extra["grant_store"] = grant_store
     return server.ProxyConfig(
         listen_port=8480,
         upstream_port=upstream_port,
         public_keys=(caller.public_key(str(_VECTOR["public"])),),
         admits=admits,
+        **extra,
     )
 
 
@@ -95,6 +156,9 @@ async def _serving(
     admits: frozenset[str] = frozenset({"acme-dev"}),
     clock: float = _BEFORE_EXPIRY,
     upstream_port: int | None = None,
+    gated_tools: tuple[str, ...] = (),
+    connector: str = "",
+    grant_store: Any | None = None,
 ) -> AsyncIterator[tuple[_Upstream, TestServer]]:
     upstream = _Upstream()
     upstream_server = TestServer(upstream.app, handler_cancellation=True)
@@ -104,7 +168,14 @@ async def _serving(
     await upstream_server.start_server(auto_decompress=False)
     proxy = TestServer(
         server.make_app(
-            _config(upstream_port or upstream_server.port or 0, admits=admits), clock=lambda: clock
+            _config(
+                upstream_port or upstream_server.port or 0,
+                admits=admits,
+                gated_tools=gated_tools,
+                connector=connector,
+                grant_store=grant_store,
+            ),
+            clock=lambda: clock,
         ),
         handler_cancellation=True,
     )
@@ -124,6 +195,8 @@ def _run(body: Callable[[], Coroutine[Any, Any, None]]) -> None:
 def test_the_refusal_vector_carries_only_known_keys() -> None:
     assert set(_REFUSAL) == {"comment", "header", "status", "content_type", "vectors"}
     assert [v["refusal"] for v in _REFUSAL["vectors"]] == list(caller.REFUSALS)
+    assert caller.REFUSALS[-1] == caller.GRANT_REQUIRED == "grant_required"
+    assert server.GRANT_HEADER == "X-Curie-Connector-Grant"
     for vector in _REFUSAL["vectors"]:
         assert set(vector) == {"refusal", "body"}
     assert _REFUSAL["header"] == caller.HEADER
@@ -139,6 +212,9 @@ def test_each_refusal_answers_the_frozen_body_and_never_reaches_the_server(
     headers = {} if refusal == caller.MISSING else {caller.HEADER: _TOKEN}
     if refusal == caller.INVALID:
         headers = {caller.HEADER: "cct.not.valid"}
+    # An empty gate does not refuse, and {"x": 1} is not a tools/call, so this
+    # refusal is armed only by a gated tools/call with no grant header.
+    gated = refusal == "grant_required"
 
     async def go() -> None:
         async with _serving(
@@ -146,11 +222,19 @@ def test_each_refusal_answers_the_frozen_body_and_never_reaches_the_server(
             if refusal == caller.NOT_ADMITTED
             else frozenset({"acme-dev"}),
             clock=int(_VECTOR["exp"]) if refusal == caller.EXPIRED else _BEFORE_EXPIRY,
+            gated_tools=_GATED_TOOLS if gated else (),
+            connector=_CONNECTOR if gated else "",
         ) as (upstream, proxy):
             async with aiohttp.ClientSession() as client:
-                async with client.post(
-                    proxy.make_url("/mcp"), json={"x": 1}, headers=headers
-                ) as answer:
+                if gated:
+                    posted = client.post(
+                        proxy.make_url("/mcp"),
+                        data=_MERGE_CALL,
+                        headers={**headers, "Content-Type": "application/json"},
+                    )
+                else:
+                    posted = client.post(proxy.make_url("/mcp"), json={"x": 1}, headers=headers)
+                async with posted as answer:
                     assert answer.status == _REFUSAL["status"]
                     assert answer.content_type == _REFUSAL["content_type"]
                     # A 401 challenge sends the bundled CLI into OAuth discovery
@@ -533,3 +617,140 @@ def test_importing_the_proxy_loads_none_of_the_worker() -> None:
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == ""
+
+
+def _caller_headers(grant: str | None = None) -> dict[str, str]:
+    headers = {caller.HEADER: _TOKEN}
+    if grant is not None:
+        headers[server.GRANT_HEADER] = grant
+    return headers
+
+
+async def _post(proxy: TestServer, body: bytes, headers: dict[str, str]) -> tuple[int, str, Any]:
+    async with aiohttp.ClientSession() as client:
+        async with client.post(
+            proxy.make_url("/mcp"),
+            data=body,
+            headers={"Content-Type": "application/json", **headers},
+        ) as answer:
+            return answer.status, answer.content_type, await answer.json()
+
+
+def _gated(**kwargs: Any) -> Any:
+    return _serving(gated_tools=_GATED_TOOLS, connector=_CONNECTOR, **kwargs)
+
+
+# A gated tools/call needs one matching grant. Other methods and ungated tools
+# stay on the forward path, and the posted bytes are what the server receives.
+
+
+def test_a_gated_tools_call_without_a_grant_is_refused_and_never_reaches_the_server() -> None:
+    async def go() -> None:
+        async with _gated() as (upstream, proxy):
+            status, content_type, payload = await _post(proxy, _MERGE_CALL, _caller_headers())
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+
+    _run(go)
+
+
+def test_a_matching_grant_is_forwarded_once_and_a_replay_is_refused() -> None:
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-1")
+    headers = _caller_headers(grant)
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, _content_type, _payload = await _post(proxy, _MERGE_CALL, headers)
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [_MERGE_CALL]
+            assert caller.HEADER not in upstream.seen[0]["headers"]
+            assert server.GRANT_HEADER not in upstream.seen[0]["headers"]
+            status, content_type, payload = await _post(proxy, _MERGE_CALL, headers)
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert len(upstream.seen) == 1
+
+    _run(go)
+
+
+def test_a_second_proxy_sharing_the_grant_store_rejects_the_same_jti() -> None:
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-1")
+    headers = _caller_headers(grant)
+    store = MemoryGrantStore()
+
+    async def go() -> None:
+        async with _gated(grant_store=store) as (first_upstream, first_proxy):
+            status, _content_type, _payload = await _post(first_proxy, _MERGE_CALL, headers)
+            assert status == 201
+            assert [seen["body"] for seen in first_upstream.seen] == [_MERGE_CALL]
+            async with _gated(grant_store=store) as (second_upstream, second_proxy):
+                status, content_type, payload = await _post(second_proxy, _MERGE_CALL, headers)
+                assert status == _REFUSAL["status"]
+                assert content_type == _REFUSAL["content_type"]
+                assert payload == _grant_required_body()
+                assert second_upstream.seen == []
+            assert len(first_upstream.seen) == 1
+
+    _run(go)
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "jti"),
+    [("other_tool", {"n": 1}, "jti-tool"), ("merge_pull_request", {"n": 2}, "jti-args")],
+)
+def test_a_grant_for_another_tool_or_other_arguments_never_reaches_the_server(
+    tool: str, arguments: dict[str, int], jti: str
+) -> None:
+    grant = _mint_grant(tool, arguments, jti=jti)
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, content_type, payload = await _post(proxy, _MERGE_CALL, _caller_headers(grant))
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+
+    _run(go)
+
+
+def test_an_ungated_tools_call_is_forwarded_without_a_grant() -> None:
+    body = (
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"list_things","arguments":{}}}'
+    )
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, _content_type, _payload = await _post(proxy, body, _caller_headers())
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [body]
+
+    _run(go)
+
+
+def test_tools_list_is_forwarded_without_a_grant() -> None:
+    body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, _content_type, _payload = await _post(proxy, body, _caller_headers())
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [body]
+
+    _run(go)
+
+
+def test_a_post_that_is_not_a_tools_call_is_forwarded_without_a_grant() -> None:
+    body = b'{"x":1}'
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, _content_type, _payload = await _post(proxy, body, _caller_headers())
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [body]
+
+    _run(go)
