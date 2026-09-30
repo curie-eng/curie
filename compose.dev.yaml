@@ -590,6 +590,10 @@ services:
       - BUNDLE_BUCKET=curie-bundles
       - CURIE_WORKSPACE_BUCKET=curie-workspaces
       - CURIE_API_URL=http://localhost:28000
+      # The worker calls the platform API (eval reports, bindings, work items)
+      # with this key, so it must match curie-api's API_KEY. The Helm chart sets
+      # the same variable on the worker.
+      - CURIE_API_KEY=${CURIE_LOCAL_API_KEY:-curie-dev-key}
       - CURIE_INTERNAL_WORKER_TOKEN=curie-dev-worker-token
       # The worker runs host-net, so it self-dials the API at the published
       # localhost port above. But the runner containers it spawns join the
