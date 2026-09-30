@@ -5054,6 +5054,46 @@ def test_reply_handle_relay_adapter_survives_a_binding_that_names_its_identity(
     asyncio.run(go())
 
 
+def test_named_relay_resolves_named_binding_but_replies_through_relay(make_harness) -> None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-4: the selector and sink are distinct."""
+
+    class NamedBinding(_TokenBinding):
+        def __init__(self) -> None:
+            super().__init__("tok-route", uuid.uuid4())
+            self.seen: list[tuple[str, str | None, str]] = []
+
+        async def resolve(
+            self, kind: str, adapter: str | None, channel: str
+        ) -> _FakeResolved | None:
+            self.seen.append((kind, adapter, channel))
+            if adapter != "sre-bot":
+                return None
+            row = _FakeResolved(self._agent_id)
+            row.adapter = "sre-bot"
+            return row
+
+    async def go() -> None:
+        binding = NamedBinding()
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                qevent(
+                    "hi",
+                    thread="tNamedRelay",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                    identity="sre-bot",
+                )
+            )
+            assert binding.seen == [("slack", "sre-bot", "C1")]
+            assert h.runner.opened
+            routes = h.sink.routes_for("reply.update")
+            assert routes
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+
+    asyncio.run(go())
+
+
 def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
     async def go() -> None:
         binding = _TokenBinding("tok-24", uuid.uuid4())

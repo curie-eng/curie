@@ -24,9 +24,7 @@ sends as an `Authorization: Bearer` header on every ACI call to that sandbox
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
 > bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker. Per-channel
-> dev/prod bot-identity routing (the dispatcher carrying which bot was addressed)
-> is a git-flow/dispatcher refinement.
+> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
@@ -40,6 +38,29 @@ the resolver against the real compose Postgres (channel resolution, prod
 preference, unknown -> None, budget/env); the kill switch against real Valkey
 (flag gate, subscriber dispatch); and kernel-level behaviors (unmapped drop,
 boot-env on claim, killed-agent refusal, kill interrupts a live turn).
+
+### Named cluster-message canary routing
+
+The cluster-message relay delivers a Slack-kind turn whose reply handle uses
+`adapter=curie-cluster-message` for egress. Its optional `identity` selects the
+Slack binding independently of that delivery adapter (INGRESS-CANARY-1).
+
+- **WORKER-CANARY-1:** An absent identity selects the `default` Slack binding.
+  A declared named identity such as `sre-bot` selects only the binding with
+  that identity on the same channel. Ordinary Slack turns continue to select
+  their binding by `adapter`.
+- **WORKER-CANARY-2:** An unknown identity returns no binding. An empty or
+  malformed identity is refused before a sandbox claim. None of these cases
+  may fall back to `default`, including the bound-but-undeployed diagnostic.
+- **WORKER-CANARY-3:** A named relay turn's internal thread key includes its
+  selected identity. A default and named turn on one channel and conversation
+  cannot adopt each other's sandbox, history, lock, or approval state.
+- **WORKER-CANARY-4:** Resolved and bound-but-undeployed relay replies keep
+  `curie-cluster-message` as their egress adapter. The binding's Slack identity
+  never replaces the relay; ordinary Slack reply routing is unchanged.
+- **WORKER-CANARY-5:** Active deployment selection for the selected binding
+  retains prod-over-dev and most-recent ordering. A stale or undeployed named
+  route cannot run or answer as a different identity.
 
 ## The eval lane (`curie_worker.eval`)
 
