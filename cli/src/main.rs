@@ -4858,9 +4858,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // this same throwaway `LocalOpts` already exists to resolve.
                 local::resolve_stack_image_env(&mut model_opts).await;
                 // #3557: both directions recreate the api, which must come back
-                // on the install's own key and database password.
-                let stack =
-                    curie::local_stack_keys::resolve_for_up(model_opts.project(), !dry_run).await?;
+                // on the credentials the running stack uses: the stored ones,
+                // or none for a stack that predates the store. Only `local up`
+                // adopts CURIE_API_KEY or generates.
+                let stack_secret_env =
+                    curie::local_stack_keys::running_stack_secret_env(model_opts.project())?;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         project: model_opts.project().to_string(),
@@ -4875,9 +4877,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         minimal,
                         stack_image_env: model_opts.stack_image_env,
-                        stack_secret_env: curie::local_stack_keys::compose_secret_env(
-                            &stack.credentials,
-                        ),
+                        stack_secret_env,
                     })
                     .await?,
                 )

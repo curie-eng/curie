@@ -1438,17 +1438,17 @@ impl crate::ui::CliOutput for LocalUpOutput {
 
 /// Attach every masked secret a stack-starting compose child needs: the model
 /// credentials from [`apply_credential_plan`] and the install's own API key and
-/// Postgres password (#3557). `up`, `rebuild`, and `local comms` all go through
-/// here so the recreated services never start on different credentials than
-/// the rest of the stack (#853). `with_secret_env` replaces, so this is the one
-/// place the list is assembled.
+/// Postgres password (#3557), as `local_stack_keys` env pairs. `up` and
+/// `rebuild` both go through here so a recreated service never starts on
+/// different credentials than the rest of the stack (#853). `with_secret_env`
+/// replaces, so this is the one place the list is assembled.
 pub fn with_stack_secret_env(
     cmd: OpsCommand,
     model_credentials: Vec<(String, String)>,
-    stack: &crate::local_stack_keys::LocalStackCredentials,
+    stack_env: Vec<(String, String)>,
 ) -> OpsCommand {
     let mut secret_env = model_credentials;
-    secret_env.extend(crate::local_stack_keys::compose_secret_env(stack));
+    secret_env.extend(stack_env);
     cmd.with_secret_env(secret_env)
 }
 
@@ -1456,8 +1456,9 @@ pub fn with_stack_secret_env(
 /// is never printed; the console needs it as `?api_key=`.
 fn stack_key_note(path: &Path) -> String {
     format!(
-        "This install's API key is stored at {} (mode 0600). `curie local` verbs send it \
-         automatically; open the console with `?api_key=<that key>` appended.",
+        "This install's API key is the `api_key` field of {} (mode 0600). `curie local` \
+         verbs send it to localhost automatically; for the console, append \
+         `&api_key=<that key>` to its URL (`?api_key=<that key>` if it has no query).",
         path.display()
     )
 }
@@ -1587,7 +1588,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
     let cmd = with_stack_secret_env(
         up_command_with_model(&o, model.as_deref()),
         env_creds,
-        &stack.credentials,
+        crate::local_stack_keys::compose_secret_env(&stack.credentials),
     );
     if o.dry_run {
         return Ok(LocalUpOutput::DryRun(crate::ui::DryRunPlan {
@@ -1712,13 +1713,14 @@ pub async fn rebuild(mut o: LocalRebuildOpts) -> Result<LocalRebuildOutput> {
     // the stack's, not whatever this shell resolves.
     resolve_stack_image_env(&mut o.common).await;
     // #3557 under #853's rule: the recreated service must start on the same
-    // install credentials `up` started the stack on.
-    let stack =
-        crate::local_stack_keys::resolve_for_up(o.common.project(), !o.common.dry_run).await?;
+    // install credentials the running stack uses. Those are the stored ones, or
+    // none when the stack predates the store. Only `up` adopts CURIE_API_KEY or
+    // generates, so a rebuild never changes what the stack runs on.
+    let stack_env = crate::local_stack_keys::running_stack_secret_env(o.common.project())?;
     let cmd = with_stack_secret_env(
         rebuild_command(&o.common, &o.service, o.model.as_deref()),
         env_creds,
-        &stack.credentials,
+        stack_env,
     );
     if o.common.dry_run {
         return Ok(LocalRebuildOutput::DryRun(crate::ui::DryRunPlan {
@@ -3407,11 +3409,15 @@ mod tests {
             "ANTHROPIC_API_KEY".to_string(),
             "sk-PLACEHOLDER-model".to_string(),
         )];
-        let up = with_stack_secret_env(up_command(&o), model.clone(), &placeholder_stack());
+        let up = with_stack_secret_env(
+            up_command(&o),
+            model.clone(),
+            crate::local_stack_keys::compose_secret_env(&placeholder_stack()),
+        );
         let rebuild = with_stack_secret_env(
             rebuild_command(&o, "curie-api", None),
             model,
-            &placeholder_stack(),
+            crate::local_stack_keys::compose_secret_env(&placeholder_stack()),
         );
         for cmd in [&up, &rebuild] {
             assert_carries_stack_secrets(cmd);
@@ -3430,6 +3436,27 @@ mod tests {
                 "install credentials must never ride argv"
             );
         }
+    }
+
+    // #3557: a rebuild of a stack that predates the store passes no install
+    // credential, so compose's fallbacks keep matching what that stack runs.
+    #[test]
+    fn rebuild_with_no_store_passes_no_stack_secret_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = opts("compose.dev.yaml");
+        let stack_env =
+            crate::local_stack_keys::running_stack_secret_env_in(dir.path(), "curie").unwrap();
+        let rebuild = with_stack_secret_env(
+            rebuild_command(&o, "curie-api", None),
+            vec![("ANTHROPIC_API_KEY".into(), "sk-PLACEHOLDER-model".into())],
+            stack_env,
+        );
+        let names: Vec<&str> = rebuild.secret_env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["ANTHROPIC_API_KEY"]);
+        assert!(
+            !dir.path().join("local").exists(),
+            "rebuild must not write the store"
+        );
     }
 
     #[test]

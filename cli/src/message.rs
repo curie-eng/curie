@@ -76,41 +76,22 @@ pub const DEFAULT_API_KEY: &str = "curie-dev-key";
 /// Mirrors the rule already settled in `ops.rs::resolve_up_credentials`,
 /// `local.rs::model_mode_from_env`, and `secrets.rs::save_value`.
 ///
-/// When nothing was supplied (the flag is empty or the dev sentinel, and
-/// `$CURIE_API_KEY` is unset or empty), the key `curie local up` stored for the
-/// current compose project is sent instead (#3557), so a per-install key needs
-/// no flag. Resolving that project or reading the store never fails the parse:
-/// any error keeps the sentinel.
+/// The per-install key `curie local up` stores (#3557) is NOT substituted here:
+/// the parser does not know where the request goes. `ApiClient::new` swaps the
+/// sentinel for the stored key, and only for a loopback destination.
 pub fn api_key_or_default(raw: &str) -> Result<String, String> {
-    Ok(resolve_api_key(
-        raw,
-        env::var("CURIE_API_KEY").ok(),
-        stored_local_api_key,
-    ))
+    Ok(resolve_api_key(raw, env::var("CURIE_API_KEY").ok()))
 }
 
-/// The stored per-install key for the local project this process targets, or
-/// `None` on any failure.
-fn stored_local_api_key() -> Option<String> {
-    let resources = crate::local::current_resources().ok()?;
-    crate::local_stack_keys::stored_api_key(&resources.project)
-}
-
-/// The pure core of [`api_key_or_default`], with the env source and the stored
-/// key passed in so the resolution is unit-testable without mutating this
-/// process's environment or reading the config dir. `stored` runs only when
-/// nothing else supplied a key. Same shape as `ops.rs::resolve_up_credentials`.
-fn resolve_api_key(
-    raw: &str,
-    env_value: Option<String>,
-    stored: impl FnOnce() -> Option<String>,
-) -> String {
-    let env_value = env_value.filter(|value| !value.is_empty());
-    if !raw.is_empty() && (raw != DEFAULT_API_KEY || env_value.is_some()) {
+/// The pure core of [`api_key_or_default`], with the env source passed in so
+/// the resolution is unit-testable without mutating this process's
+/// environment. Same shape as `ops.rs::resolve_up_credentials`.
+fn resolve_api_key(raw: &str, env_value: Option<String>) -> String {
+    if !raw.is_empty() {
         return raw.to_string();
     }
     env_value
-        .or_else(|| stored().filter(|value| !value.is_empty()))
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_API_KEY.to_string())
 }
 
@@ -6757,84 +6738,29 @@ mod tests {
 
         // Flag omitted: clap hands the parser its `default_value`, which must
         // survive untouched whatever the env holds.
+        assert_eq!(resolve_api_key(DEFAULT_API_KEY, None), DEFAULT_API_KEY);
         assert_eq!(
-            resolve_api_key(DEFAULT_API_KEY, None, || None),
+            resolve_api_key(DEFAULT_API_KEY, Some(String::new())),
             DEFAULT_API_KEY
         );
-        assert_eq!(
-            resolve_api_key(DEFAULT_API_KEY, Some(String::new()), || None),
-            DEFAULT_API_KEY
-        );
-        assert_eq!(
-            resolve_api_key(DEFAULT_API_KEY, real(), || None),
-            DEFAULT_API_KEY
-        );
+        assert_eq!(resolve_api_key(DEFAULT_API_KEY, real()), DEFAULT_API_KEY);
 
         // Env-sourced (clap passes the env value through the parser): empty is
         // absent and falls back to the sentinel, non-empty passes through.
-        assert_eq!(
-            resolve_api_key("", Some(String::new()), || None),
-            DEFAULT_API_KEY
-        );
+        assert_eq!(resolve_api_key("", Some(String::new())), DEFAULT_API_KEY);
 
         // The bug: an explicitly empty flag must reconsider the env source,
         // because clap already resolved the flag ahead of `env` and will not.
-        assert_eq!(resolve_api_key("", real(), || None), "sk-real-from-env");
+        assert_eq!(resolve_api_key("", real()), "sk-real-from-env");
         // ...and with no env source at all it lands on the sentinel.
-        assert_eq!(resolve_api_key("", None, || None), DEFAULT_API_KEY);
+        assert_eq!(resolve_api_key("", None), DEFAULT_API_KEY);
 
         // An explicit non-empty flag still wins over the env source, and a real
         // credential survives byte-for-byte: normalize the empty case ONLY.
-        assert_eq!(
-            resolve_api_key("sk-explicit", real(), || None),
-            "sk-explicit"
-        );
-        assert_eq!(
-            resolve_api_key("sk-real-key-123", None, || None),
-            "sk-real-key-123"
-        );
+        assert_eq!(resolve_api_key("sk-explicit", real()), "sk-explicit");
+        assert_eq!(resolve_api_key("sk-real-key-123", None), "sk-real-key-123");
         // Including a key that happens to look like whitespace-padded input.
-        assert_eq!(resolve_api_key(" ", real(), || None), " ");
-    }
-
-    /// #3557: when nothing was supplied, the key `local up` stored for this
-    /// install is sent instead of the dev sentinel. Anything the operator
-    /// supplied still wins, and the store is not read when it would lose.
-    #[test]
-    fn resolve_api_key_falls_back_to_the_stored_install_key() {
-        let stored = || Some("stored-placeholder-key".to_string());
-        let unread = || -> Option<String> { panic!("store must not be read") };
-
-        // Nothing supplied: the flag default or an empty flag, env unset/empty.
-        assert_eq!(
-            resolve_api_key(DEFAULT_API_KEY, None, stored),
-            "stored-placeholder-key"
-        );
-        assert_eq!(
-            resolve_api_key("", Some(String::new()), stored),
-            "stored-placeholder-key"
-        );
-        // No store (or an unreadable one): the sentinel, as before.
-        assert_eq!(resolve_api_key("", None, || None), DEFAULT_API_KEY);
-        assert_eq!(
-            resolve_api_key("", None, || Some(String::new())),
-            DEFAULT_API_KEY
-        );
-
-        // The env key wins over the store.
-        assert_eq!(
-            resolve_api_key("", Some("env-placeholder".into()), unread),
-            "env-placeholder"
-        );
-        // An explicit non-sentinel flag wins over both.
-        assert_eq!(
-            resolve_api_key("flag-placeholder", None, unread),
-            "flag-placeholder"
-        );
-        assert_eq!(
-            resolve_api_key("flag-placeholder", Some("env-placeholder".into()), unread),
-            "flag-placeholder"
-        );
+        assert_eq!(resolve_api_key(" ", real()), " ");
     }
 
     /// The cluster tier's parsers carry no dev default, so "nothing supplied"

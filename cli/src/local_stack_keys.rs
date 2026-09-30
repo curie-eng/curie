@@ -14,8 +14,12 @@
 //! private-write path `curie secrets set` uses. A project is a separate stack
 //! with its own volumes, so it gets its own keys.
 //!
-//! Verbs never need to know the key: `message::api_key_or_default` sends the
-//! stored key whenever the operator supplied none.
+//! Verbs never need to know the key: `api::ApiClient::new` sends the stored key
+//! whenever the operator supplied none and the destination is loopback.
+//!
+//! Only `local up` generates, adopts `CURIE_API_KEY`, or writes the store.
+//! `local rebuild` and `local comms` recreate services of a stack that is
+//! already running, so they read the store and never change it.
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +52,18 @@ impl std::fmt::Debug for LocalStackCredentials {
             .field("postgres_password", &"<redacted>")
             .finish()
     }
+}
+
+/// What the docker probe for a project's Postgres volume found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeProbe {
+    /// Docker answered and the volume exists.
+    Exists,
+    /// Docker answered and reported no such volume.
+    Absent,
+    /// Docker could not answer: not installed, daemon unreachable, or any
+    /// other failure. The volume may well exist.
+    Unknown,
 }
 
 /// The credentials `local up` resolved, and where they live.
@@ -128,7 +144,10 @@ pub fn load(project: &str) -> Result<Option<LocalStackCredentials>> {
 ///   volume that already exists: Postgres applies `POSTGRES_PASSWORD` only when
 ///   it initializes an empty data dir, so that volume still expects the legacy
 ///   `postgres` and a new password would lock the install out of its own data.
-///   `postgres_volume_exists` is only consulted in that case.
+///   `postgres_volume` is only consulted in that case. When docker cannot
+///   answer ([`VolumeProbe::Unknown`]) a persisting run refuses and writes
+///   nothing, because guessing "absent" would store a password the existing
+///   volume rejects. A `--dry-run` generates throwaway values instead.
 /// - A non-empty `explicit_api_key` (the operator's `CURIE_API_KEY`) becomes the
 ///   install's key. Verbs already prefer that env var, so a stack on any other
 ///   key would answer the operator with 401.
@@ -137,7 +156,7 @@ pub fn resolve_in(
     config_dir: &Path,
     project: &str,
     explicit_api_key: Option<&str>,
-    postgres_volume_exists: impl FnOnce() -> bool,
+    postgres_volume: impl FnOnce() -> VolumeProbe,
     persist: bool,
 ) -> Result<ResolvedStackCredentials> {
     let path = path_in(config_dir, project)?;
@@ -146,10 +165,15 @@ pub fn resolve_in(
     let (mut credentials, mut changed) = match stored {
         Some(creds) => (creds, false),
         None => {
-            let postgres_password = if postgres_volume_exists() {
-                LEGACY_POSTGRES_PASSWORD.to_string()
-            } else {
-                crate::ops::random_hex(GENERATED_BYTES)?
+            let postgres_password = match postgres_volume() {
+                VolumeProbe::Exists => LEGACY_POSTGRES_PASSWORD.to_string(),
+                VolumeProbe::Absent => crate::ops::random_hex(GENERATED_BYTES)?,
+                VolumeProbe::Unknown if persist => bail!(
+                    "could not ask docker whether compose project {project:?} already has a \
+                     Postgres volume, so its database password cannot be chosen safely. Start \
+                     Docker and re-run `curie local up`."
+                ),
+                VolumeProbe::Unknown => crate::ops::random_hex(GENERATED_BYTES)?,
             };
             let api_key = match explicit {
                 Some(key) => key.to_string(),
@@ -182,18 +206,38 @@ pub fn resolve_in(
 pub async fn resolve_for_up(project: &str, persist: bool) -> Result<ResolvedStackCredentials> {
     let config_dir = crate::secrets::config_dir()?;
     let explicit = std::env::var("CURIE_API_KEY").ok();
-    let volume_exists = if load_in(&config_dir, project)?.is_none() {
-        postgres_volume_exists(project).await
+    let volume = if load_in(&config_dir, project)?.is_none() {
+        probe_postgres_volume(project).await
     } else {
-        false
+        VolumeProbe::Absent
     };
     resolve_in(
         &config_dir,
         project,
         explicit.as_deref(),
-        || volume_exists,
+        || volume,
         persist,
     )
+}
+
+/// The masked compose secret env for a verb that recreates services of an
+/// already-running stack (`local rebuild`, `local comms`): the stored
+/// credentials, or none at all when nothing is stored, in which case compose's
+/// fallbacks match what a stack started before the store existed runs. Never
+/// adopts `CURIE_API_KEY`, generates, or writes; only `local up` does.
+pub fn running_stack_secret_env_in(
+    config_dir: &Path,
+    project: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(load_in(config_dir, project)?
+        .as_ref()
+        .map(compose_secret_env)
+        .unwrap_or_default())
+}
+
+/// [`running_stack_secret_env_in`] under the CLI's config dir.
+pub fn running_stack_secret_env(project: &str) -> Result<Vec<(String, String)>> {
+    running_stack_secret_env_in(&crate::secrets::config_dir()?, project)
 }
 
 /// The stored API key for `project`, for verbs whose `--api-key` fell back to
@@ -204,18 +248,35 @@ pub fn stored_api_key(project: &str) -> Option<String> {
 }
 
 /// Whether docker holds `<project>_postgres_data`, the named volume compose
-/// creates for the stack's database. A missing docker, a stopped daemon, or any
-/// other failure reads as "no volume".
-async fn postgres_volume_exists(project: &str) -> bool {
-    tokio::process::Command::new("docker")
+/// creates for the stack's database. Only an answer from a reachable daemon
+/// counts: a missing docker, a stopped daemon, or any other failure is
+/// [`VolumeProbe::Unknown`], never "no volume".
+async fn probe_postgres_volume(project: &str) -> VolumeProbe {
+    let output = tokio::process::Command::new("docker")
         .args(["volume", "inspect", &format!("{project}_postgres_data")])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .output()
+        .await;
+    match output {
+        Ok(output) => classify_volume_inspect(output.status.success(), &output.stderr),
+        Err(_) => VolumeProbe::Unknown,
+    }
+}
+
+/// Classify `docker volume inspect`: success is [`VolumeProbe::Exists`]; a
+/// failure whose stderr says the volume does not exist is
+/// [`VolumeProbe::Absent`]; any other failure (daemon down, permission denied)
+/// is [`VolumeProbe::Unknown`].
+fn classify_volume_inspect(success: bool, stderr: &[u8]) -> VolumeProbe {
+    if success {
+        return VolumeProbe::Exists;
+    }
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("no such volume") {
+        VolumeProbe::Absent
+    } else {
+        VolumeProbe::Unknown
+    }
 }
 
 /// Write the store 0600 inside a 0700 directory.
@@ -241,8 +302,8 @@ mod tests {
 
     const PLACEHOLDER_KEY: &str = "explicit-placeholder-api-key";
 
-    fn no_volume() -> bool {
-        false
+    fn no_volume() -> VolumeProbe {
+        VolumeProbe::Absent
     }
 
     fn is_hex64(value: &str) -> bool {
@@ -302,7 +363,7 @@ mod tests {
     #[test]
     fn an_existing_postgres_volume_keeps_the_legacy_password() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_in(dir.path(), "curie", None, || true, true).unwrap();
+        let resolved = resolve_in(dir.path(), "curie", None, || VolumeProbe::Exists, true).unwrap();
         assert_eq!(
             resolved.credentials.postgres_password,
             LEGACY_POSTGRES_PASSWORD
@@ -369,6 +430,86 @@ mod tests {
         assert!(resolve_in(dir.path(), "curie", None, no_volume, true).is_err());
         std::fs::write(&path, r#"{"api_key":"","postgres_password":"placeholder"}"#).unwrap();
         assert!(load_in(dir.path(), "curie").is_err());
+    }
+
+    #[test]
+    fn an_unknown_volume_refuses_to_persist_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Start Docker"), "{err}");
+        assert!(!path_in(dir.path(), "curie").unwrap().exists());
+        assert!(!dir.path().join("local").exists());
+        // An explicit key does not change that: the password is still unknown.
+        assert!(resolve_in(
+            dir.path(),
+            "curie",
+            Some(PLACEHOLDER_KEY),
+            || VolumeProbe::Unknown,
+            true
+        )
+        .is_err());
+        assert!(!dir.path().join("local").exists());
+    }
+
+    #[test]
+    fn an_unknown_volume_still_resolves_a_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved =
+            resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, false).unwrap();
+        assert!(is_hex64(&resolved.credentials.postgres_password));
+        assert!(!dir.path().join("local").exists());
+    }
+
+    #[test]
+    fn a_stored_install_ignores_an_unknown_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = resolve_in(dir.path(), "curie", None, no_volume, true).unwrap();
+        let again = resolve_in(dir.path(), "curie", None, || VolumeProbe::Unknown, true).unwrap();
+        assert_eq!(again.credentials, first.credentials);
+    }
+
+    #[test]
+    fn volume_inspect_failures_are_classified_by_stderr() {
+        assert_eq!(classify_volume_inspect(true, b""), VolumeProbe::Exists);
+        assert_eq!(
+            classify_volume_inspect(
+                false,
+                b"Error response from daemon: get curie_postgres_data: no such volume"
+            ),
+            VolumeProbe::Absent
+        );
+        assert_eq!(
+            classify_volume_inspect(
+                false,
+                b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+            ),
+            VolumeProbe::Unknown
+        );
+        assert_eq!(classify_volume_inspect(false, b""), VolumeProbe::Unknown);
+    }
+
+    // `local rebuild` and `local comms` read the store; they never adopt an
+    // explicit key, generate, or write.
+    #[test]
+    fn running_stack_env_is_empty_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(running_stack_secret_env_in(dir.path(), "curie")
+            .unwrap()
+            .is_empty());
+        assert!(!dir.path().join("local").exists(), "nothing may be written");
+    }
+
+    #[test]
+    fn running_stack_env_carries_the_store_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored =
+            resolve_in(dir.path(), "curie", Some(PLACEHOLDER_KEY), no_volume, true).unwrap();
+        let before = std::fs::read(&stored.path).unwrap();
+        let env = running_stack_secret_env_in(dir.path(), "curie").unwrap();
+        assert_eq!(env, compose_secret_env(&stored.credentials));
+        assert_eq!(std::fs::read(&stored.path).unwrap(), before);
     }
 
     #[test]

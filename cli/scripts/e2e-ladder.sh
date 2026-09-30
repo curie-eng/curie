@@ -305,8 +305,8 @@ LOCAL_STACK_OWNED=0
 # CURIE_API_KEY becomes that key. The local rungs also curl the API directly
 # with ${CURIE_API_KEY:-curie-dev-key}, so before a `local up` this run owns,
 # one generated key is exported and the stack and the direct curls share it.
-# Set to 1 only when the ladder generated the key, so rung_cluster can drop it
-# again: a local key must never reach the cluster rung, which reads a set
+# Set to 1 only when the ladder set the key (generated, or adopted from a reused
+# stack's store), so rung_cluster can drop it again: a local key must never reach the cluster rung, which reads a set
 # CURIE_API_KEY as the release's key.
 LADDER_GENERATED_API_KEY=0
 
@@ -315,6 +315,28 @@ ensure_local_api_key() {
         return 0
     fi
     CURIE_API_KEY="$(python3 -c 'import os; print(os.urandom(32).hex())')" || return 1
+    export CURIE_API_KEY
+    LADDER_GENERATED_API_KEY=1
+}
+
+# A reused stack runs on whatever key its own `local up` stored for this
+# project. With CURIE_API_KEY unset, export that stored key so the direct curls
+# authenticate; never rotate it and never claim the stack. The key is read by
+# python and never echoed. rung_cluster drops it like a generated one.
+adopt_stored_local_api_key() {
+    if [[ -n "${CURIE_API_KEY:-}" ]]; then
+        return 0
+    fi
+    local store="${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT}.json"
+    [[ -f "$store" ]] || return 0
+    local stored
+    stored="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("api_key") or "")' "$store")" || {
+        echo "local: could not read the stored API key for compose project ${COMPOSE_PROJECT}." >&2
+        echo "fix: export CURIE_API_KEY with the reused stack's key, then re-run." >&2
+        return 1
+    }
+    [[ -n "$stored" ]] || return 0
+    CURIE_API_KEY="$stored"
     export CURIE_API_KEY
     LADDER_GENERATED_API_KEY=1
 }
@@ -4590,6 +4612,7 @@ rung_local() {
         # assert_model_mode below, off the reused stack's own running worker, and
         # a contradiction is a hard failure with a fix line.
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
+        adopt_stored_local_api_key || return 1
     else
         echo
         # local up is deliberately pinned to this checkout and builds the
@@ -4945,6 +4968,7 @@ rung_local_release() {
         # stack's mode is verified by assert_model_mode below rather than
         # disclaimed in a warning.
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
+        adopt_stored_local_api_key || return 1
     else
         echo
         echo "=== clear any stale volumes from a prior non-wiped teardown ==="

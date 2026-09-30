@@ -166,10 +166,12 @@ takes - see [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) when yo
 Visit the console at 
 
 ```bash
-http://localhost:28080/?api=1
+http://localhost:28080/?api=1&api_key=<key>
 ```
 
-to see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
+where `<key>` is this install's API key: the `api_key` field of
+`~/.config/curie/local/curie.json` (or `$CURIE_CONFIG_DIR/local/curie.json`), which
+`curie local up` generates on first run. There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
 approvals, and memory, which get more relevant once this plugin is deployed on Kubernetes in production.
 
 When done run the following command
