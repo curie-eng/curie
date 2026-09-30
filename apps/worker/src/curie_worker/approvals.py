@@ -28,7 +28,6 @@ from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, Qu
 from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
-from curie_telemetry.redact import redact_text
 
 from .workspace import WorkspaceSelectionRefused
 
@@ -264,13 +263,13 @@ def _coded_refusal(response: httpx.Response) -> str | None:
     except (KeyError, TypeError, ValueError):
         return None
     if isinstance(detail, str):
-        return redact_text(detail)[:_REFUSAL_MAX] if detail.strip() else None
+        return detail[:_REFUSAL_MAX] if detail.strip() else None
     if not isinstance(detail, dict):
         return None
     code, message = detail.get("code"), detail.get("message")
     if not isinstance(code, str) or not code or not isinstance(message, str):
         return None
-    return redact_text(f"{code}: {message}")[:_REFUSAL_MAX]
+    return f"{code}: {message}"[:_REFUSAL_MAX]
 
 
 class ApprovalRefused(Exception):

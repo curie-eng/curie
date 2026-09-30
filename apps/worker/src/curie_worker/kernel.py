@@ -902,6 +902,11 @@ class _ApprovalPause:
     created: bool
     failure_detail: str | None = None
 
+    @classmethod
+    def refused(cls, detail: str | None) -> _ApprovalPause:
+        clipped = redact_text(detail)[:_ESCALATION_DETAIL_MAX] if detail else None
+        return cls(created=False, failure_detail=clipped or None)
+
 
 @dataclass(frozen=True)
 class _PressureResult:
@@ -7451,10 +7456,7 @@ class Kernel:
                 exc.public_detail,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return _ApprovalPause(
-                created=False,
-                failure_detail=redact_text(exc.public_detail)[:_ESCALATION_DETAIL_MAX] or None,
-            )
+            return _ApprovalPause.refused(exc.public_detail)
         except ApprovalRefused as exc:
             # #2885: a person rejected this approval in this thread and nobody
             # has asked since. The API refused it and audited the refusal; the
@@ -7466,10 +7468,7 @@ class Kernel:
                 qevent.event_id,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return _ApprovalPause(
-                created=False,
-                failure_detail=redact_text(exc.public_detail)[:_ESCALATION_DETAIL_MAX] or None,
-            )
+            return _ApprovalPause.refused(exc.public_detail)
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -7486,12 +7485,7 @@ class Kernel:
                 failure_class="approval-create-failed",
             )
             refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
-            return _ApprovalPause(
-                created=False,
-                failure_detail=(
-                    redact_text(refusal)[:_ESCALATION_DETAIL_MAX] if refusal else None
-                ),
-            )
+            return _ApprovalPause.refused(refusal)
 
         if self._workspace is not None:
             async with self._lock.hold(self._config.lock_key(thread_key)):

@@ -280,7 +280,7 @@ def result_section(
         elif cause == "approval_create_failed" and detail is not None and detail.strip():
             # The API refusal can quote caller-supplied paths (#3617): one line,
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
-            inert = " ".join(detail.split()).replace("<!--", "<\u200b!--")
+            inert = _break_html_comments(" ".join(detail.split()))
             text += f"Details: {inert}\n"
         elif cause != "history_capacity" and detail is not None and detail.strip():
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
@@ -294,6 +294,10 @@ def result_section(
     return text
 
 
+def _break_html_comments(text: str) -> str:
+    return text.replace("<!--", "<\u200b!--")
+
+
 def _agent_message_block(message: str) -> str:
     """The agent's last message, fenced so GitHub renders none of it.
 
@@ -302,7 +306,7 @@ def _agent_message_block(message: str) -> str:
     broken because the marker scan reads the raw body.
     """
 
-    message = message.replace("<!--", "<\u200b!--")
+    message = _break_html_comments(message)
     longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"

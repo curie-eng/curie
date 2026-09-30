@@ -28,7 +28,7 @@ from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .workspace_policy import valid_allowlist_entry
+from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -714,8 +714,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
         policies: dict[str, dict[str, Any]] = {}
         for repo, policy in value.items():
-            parts = repo.split("/") if isinstance(repo, str) else []
-            if len(parts) != 2 or not all(parts):
+            if not isinstance(repo, str) or not valid_repository_name(repo):
                 raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
             if not isinstance(policy, dict) or set(policy) - {
                 "check",
