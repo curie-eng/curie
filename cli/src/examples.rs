@@ -888,6 +888,8 @@ pub fn observability_provision_plan(
     };
     let chart = Path::new(chart);
     let mut lines = vec![
+        "select the Alloy log parser from the cluster node runtimes on live installation"
+            .to_string(),
         format!("create namespace {observability_namespace} when it is absent"),
         format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
@@ -1859,13 +1861,47 @@ async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<S
     .then(|| helm_pending_upgrade_recovery(target))
 }
 
-async fn diagnostic_kubectl_json(namespace: &str, resource: &str) -> Result<serde_json::Value> {
-    let output = tokio::process::Command::new("kubectl")
+async fn diagnostic_kubectl_json(
+    namespace: &str,
+    resource: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value> {
+    let mut command = tokio::process::Command::new("kubectl");
+    command
         .args(["get", resource, "-n", namespace, "-o", "json"])
-        .kill_on_drop(true)
-        .output()
-        .await
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A kubectl exec-credential plugin may spawn descendants. Give this
+        // read-only diagnostic its own group so a timeout can stop all of it.
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
+        .spawn()
         .with_context(|| format!("reading {resource} for timeout diagnosis"))?;
+    let child_id = child.id();
+    let mut wait = Box::pin(child.wait_with_output());
+    let output = match tokio::time::timeout_at(deadline, &mut wait).await {
+        Ok(result) => {
+            result.with_context(|| format!("reading {resource} for timeout diagnosis"))?
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pgid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: this is the fresh process group created for our
+                // diagnostic child, never the CLI's own process group.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            // Reap the direct child after killing the group. The bounded wait
+            // also covers a credential plugin that kept an output pipe open.
+            let _ = tokio::time::timeout(Duration::from_millis(250), &mut wait).await;
+            bail!("kubectl get {resource} timed out during diagnosis");
+        }
+    };
     if !output.status.success() {
         bail!("kubectl get {resource} failed");
     }
@@ -1876,14 +1912,15 @@ async fn pending_pvc_diagnostic(namespace: &str) -> String {
     let hint = format!(
         "Inspect storage with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
     );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let read = async {
-        let pvcs = diagnostic_kubectl_json(namespace, "pvc").await?;
-        let pods = diagnostic_kubectl_json(namespace, "pods").await?;
-        let events = diagnostic_kubectl_json(namespace, "events").await?;
+        let pvcs = diagnostic_kubectl_json(namespace, "pvc", deadline).await?;
+        let pods = diagnostic_kubectl_json(namespace, "pods", deadline).await?;
+        let events = diagnostic_kubectl_json(namespace, "events", deadline).await?;
         Ok::<_, anyhow::Error>((pvcs, pods, events))
     };
-    match tokio::time::timeout(Duration::from_secs(5), read).await {
-        Ok(Ok((pvcs, pods, events))) => {
+    match read.await {
+        Ok((pvcs, pods, events)) => {
             pending_pvc_warning(&pvcs, &pods, &events, namespace).unwrap_or(hint)
         }
         _ => hint,
@@ -1955,11 +1992,11 @@ fn pending_pvc_warning(
                             .pointer("/metadata/name")
                             .and_then(serde_json::Value::as_str)
                             == Some(object_name)
-                        && (object_uid.is_none()
-                            || pod
-                                .pointer("/metadata/uid")
-                                .and_then(serde_json::Value::as_str)
-                                == object_uid)
+                        && object_uid.is_some()
+                        && pod
+                            .pointer("/metadata/uid")
+                            .and_then(serde_json::Value::as_str)
+                            == object_uid
                         && pod
                             .pointer("/spec/volumes")
                             .and_then(serde_json::Value::as_array)
@@ -3053,6 +3090,14 @@ struct ObjectMeta {
 struct NodeSpec {
     #[serde(default)]
     unschedulable: bool,
+    #[serde(default)]
+    taints: Vec<NodeTaint>,
+}
+
+#[derive(Deserialize)]
+struct NodeTaint {
+    key: String,
+    effect: String,
 }
 
 #[derive(Deserialize)]
@@ -3075,13 +3120,36 @@ enum LogRuntime {
     Docker,
 }
 
+fn alloy_can_schedule_on(node: &Node) -> bool {
+    // The checked-in Alloy values have no custom tolerations or hostNetwork.
+    // Kubernetes automatically adds only these DaemonSet tolerations.
+    // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+    node.spec
+        .taints
+        .iter()
+        .all(|taint| match taint.effect.as_str() {
+            "NoExecute" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/not-ready" | "node.kubernetes.io/unreachable"
+            ),
+            "NoSchedule" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/disk-pressure"
+                    | "node.kubernetes.io/memory-pressure"
+                    | "node.kubernetes.io/pid-pressure"
+                    | "node.kubernetes.io/unschedulable"
+            ),
+            _ => true,
+        })
+}
+
 fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
     if nodes.is_empty() {
         bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
     }
     let mut selected = None;
     let mut observed = Vec::new();
-    for node in nodes {
+    for node in nodes.iter().filter(|node| alloy_can_schedule_on(node)) {
         let version = node.status.node_info.container_runtime_version.as_str();
         let runtime = if version.starts_with("containerd://") || version.starts_with("cri-o://") {
             Some(LogRuntime::Cri)
@@ -3102,10 +3170,14 @@ fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
         match (selected, runtime) {
             (None, Some(runtime)) => selected = Some(runtime),
             (Some(previous), Some(runtime)) if previous == runtime => {}
-            _ => bail!("Alloy needs one supported log format across every node, including cordoned and NotReady nodes; found {}", observed.join(", ")),
+            _ => bail!("Alloy needs one supported log format across every eligible node, including cordoned and NotReady nodes; found {}", observed.join(", ")),
         }
     }
-    selected.ok_or_else(|| anyhow!("no supported node runtime; found {}", observed.join(", ")))
+    selected.ok_or_else(|| {
+        anyhow!(
+            "no nodes eligible for the Alloy DaemonSet have a supported runtime; inspect node taints and runtimes"
+        )
+    })
 }
 
 async fn preflight_log_runtime() -> Result<LogRuntime> {
@@ -3439,6 +3511,53 @@ mod tests {
             let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
             assert!(error.contains("node-a"), "{error}");
         }
+    }
+
+    #[test]
+    fn log_runtime_ignores_nodes_excluded_by_untolerated_taints() {
+        // The shipped Alloy DaemonSet has no custom tolerations. Kubernetes
+        // adds only the documented built-in DaemonSet tolerations.
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "worker"},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                },
+                {
+                    "metadata": {"name": "reserved-docker"},
+                    "spec": {"taints": [{"key": "dedicated", "effect": "NoSchedule", "value": "other"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                },
+                {
+                    "metadata": {"name": "cordoned-cri"},
+                    "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "cri-o://1.30"}}
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(select_log_runtime(&nodes.items).unwrap(), LogRuntime::Cri);
+    }
+
+    #[test]
+    fn log_runtime_refuses_when_no_nodes_are_eligible_for_alloy() {
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "metadata": {"name": "reserved"},
+                "spec": {"taints": [{"key": "dedicated", "effect": "NoExecute"}]},
+                "status": {"allocatable": {}, "conditions": [],
+                    "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+            }]
+        }))
+        .unwrap();
+        assert!(select_log_runtime(&nodes.items)
+            .unwrap_err()
+            .to_string()
+            .contains("no nodes eligible"));
     }
 
     fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {

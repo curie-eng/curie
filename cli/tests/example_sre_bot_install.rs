@@ -370,7 +370,10 @@ case " $* " in
         ;;
     *" get pvc "*|*" get persistentvolumeclaims "*)
         if [ "$CURIE_TEST_PVC_MODE" = "hang" ]; then
-            sleep 30
+            sleep 30 &
+            child_pid=$!
+            printf '%s\n' "$child_pid" > "$CURIE_TEST_PVC_CHILD_PID_PATH"
+            wait "$child_pid"
         fi
         printf '%s\n' "$CURIE_TEST_PVCS_JSON"
         exit 0
@@ -937,6 +940,10 @@ exit 64
             .env("CURIE_TEST_HELM_MODE", self.helm_mode)
             .env("CURIE_TEST_HELM_STATUS_MODE", self.helm_status_mode)
             .env("CURIE_TEST_PVC_MODE", self.pvc_mode)
+            .env(
+                "CURIE_TEST_PVC_CHILD_PID_PATH",
+                self._temp.path().join("pvc-child.pid"),
+            )
             .env("CURIE_TEST_TEMPO_ROLLOUT_MODE", self.tempo_rollout_mode)
             .env("CURIE_TEST_HELM_VALUES", &self.helm_values)
             .env("CURIE_TEST_GRAFANA_SECRET_MODE", self.grafana_secret_mode)
@@ -2874,6 +2881,39 @@ fn stale_pvc_warning_does_not_explain_a_new_pending_claim() {
 }
 
 #[test]
+fn uidless_old_pod_warning_does_not_explain_a_new_pending_claim() {
+    let pending_pod = json!({
+        "metadata":{"name":"tempo-0","namespace":"observability","uid":"pod-current"},
+        "spec":{"containers":[],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"tempo-data"}}]},
+        "status":{"phase":"Pending"}
+    });
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![pending_pod]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_tempo_rollout_mode("timeout")
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"tempo-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"FailedScheduling","message":"old unbound immediate PersistentVolumeClaims","involvedObject":{"kind":"Pod","name":"tempo-0","namespace":"observability"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("old unbound"), "{text}");
+    assert!(
+        text.contains("kubectl describe pvc -n observability"),
+        "{text}"
+    );
+}
+
+#[test]
 fn unrelated_pod_warning_does_not_explain_pending_pvc() {
     let pending_pod = json!({
         "metadata":{"name":"tempo-0","namespace":"observability","uid":"pod-current"},
@@ -2927,6 +2967,25 @@ fn hanging_pvc_diagnostic_keeps_the_original_helm_timeout_bounded() {
     );
     assert!(text.contains("context deadline exceeded"), "{text}");
     assert!(text.contains("kubectl get pvc -n observability"), "{text}");
+    #[cfg(unix)]
+    {
+        let pid = fs::read_to_string(fixture._temp.path().join("pvc-child.pid"))
+            .expect("diagnostic child PID");
+        let pid = pid.trim();
+        let process = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("inspect owned diagnostic child");
+        let state = String::from_utf8_lossy(&process.stdout);
+        let still_running = process.status.success() && !state.trim_start().starts_with('Z');
+        if still_running {
+            let _ = Command::new("kill").arg(pid).status();
+        }
+        assert!(
+            !still_running,
+            "owned diagnostic child survived timeout: {pid}"
+        );
+    }
 }
 
 #[test]
