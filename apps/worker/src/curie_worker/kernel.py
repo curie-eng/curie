@@ -512,6 +512,9 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
     {"rate-limit", "runner-error", "runner-timeout", "sandbox-terminated", "workspace-error"}
 )
 
+#: The class a restricted turn fails under when its runner cannot enforce it.
+TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
+
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
 # make a currently non-retryable token retryable.
@@ -533,6 +536,11 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
         # a retry would spend the same budget and stop at the same place.
         "max-turns",
+        # WORKER-TOOL-ACCESS-5: the runner's refusals of a restricted turn
+        # (``curie_runner.tool_access``), and the worker's own for a runner that
+        # cannot enforce one. Not retryable: the same runner refuses again.
+        TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+        "tool-access-refused",
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
@@ -2776,9 +2784,10 @@ class Kernel:
                 # sandbox. getattr: binding doubles may not carry the method, like the
                 # approval_routes probe below. See docs/interfaces/approval/INTERFACE.md.
                 grant_fn = getattr(self._binding, "approval_grant_tool", None)
+                # @spec WORKER-TOOL-ACCESS-4: never a grant for a restricted turn.
                 grant_tool = (
                     await grant_fn(qevent.event_id, resolved.agent_id)
-                    if grant_fn is not None
+                    if grant_fn is not None and qevent.tool_access is None
                     else None
                 )
                 if grant_tool:
@@ -4870,13 +4879,17 @@ class Kernel:
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
             return TurnOutcome(terminal_ok=True, start_failed=True)
         except ToolAccessUnenforced as exc:
-            # @spec WORKER-TOOL-ACCESS-2: answered once, never retried; the
-            # model was not asked.
+            # @spec WORKER-TOOL-ACCESS-2: a failed turn, escalated under its own
+            # class and never retried (the class is not retryable); the model
+            # was not asked.
             record_reclaimed_retry()
             release_order()
             logger.warning("turn start refused for %s: %s", qevent.event_id, exc)
-            await self._reply_for(qevent, route, exc.public_detail)
-            return TurnOutcome(terminal_ok=True, start_failed=True)
+            return TurnOutcome(
+                terminal_ok=False,
+                classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+            )
         except MissingAgentPoolError as exc:
             # Before the SandboxError clause below, which would retry it. The
             # pool appears only after an operator changes the release values,
@@ -5105,6 +5118,10 @@ class Kernel:
     ) -> TurnStream:
         """Serialize runner admission with the operator pause action."""
 
+        if event.tool_access is not None:
+            # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
+            # through here, the attachment handoff included.
+            await self._require_tool_access(handle, event.tool_access, remaining_s)
         extra: dict[str, Any] = {"capacity_admission": True} if capacity_admission else {}
         carry = _HOOK_RUN_CARRY.get()
         if carry is not None and carry.recorder is not None and carry.ref is not None:
@@ -5733,7 +5750,8 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable turn budget handoff boundary"
             )
-        if packs is not None and verified_review is None:
+        # @spec WORKER-TOOL-ACCESS-3: a restricted turn never gets a canned reply.
+        if packs is not None and verified_review is None and event.tool_access is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -6091,8 +6109,6 @@ class Kernel:
             self._register_run(agent_id, thread_key)
         turn: TurnStream | None = None
         try:
-            if event.tool_access is not None:
-                await self._require_tool_access(handle, event.tool_access, remaining_s)
             event, remaining_s = await self._bind_publication_context(
                 event,
                 queued_event_id=queued_event_id,
@@ -6146,11 +6162,17 @@ class Kernel:
         retries like any turn the runner did not accept.
         """
 
-        status = await self._runner.status(
-            handle.base_url,
-            token=handle.token or None,
-            remaining_s=None if remaining_s is None else min(2.0, remaining_s),
-        )
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token or None,
+                remaining_s=2.0 if remaining_s is None else min(2.0, remaining_s),
+            )
+        except (ValueError, TypeError) as exc:
+            # A body that is not JSON: not accepted, so retried, never run.
+            raise RunnerError("runner status was not readable") from exc
+        if not isinstance(status, dict):
+            raise RunnerError("runner status was not a JSON object")
         advertised = status.get(TOOL_ACCESS_STATUS_FIELD)
         if not isinstance(advertised, list) or access.value not in advertised:
             raise ToolAccessUnenforced(access)
@@ -7757,8 +7779,21 @@ class Kernel:
                 run=run,
                 remaining_s=left,
             )
+            if event.tool_access is not None:
+                # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
+                await self._require_tool_access(handle, event.tool_access, left)
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=left
+            )
+        except ToolAccessUnenforced as exc:
+            logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
             )
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
             # The agent never saw the prompt, so the ending is the runner's: the
