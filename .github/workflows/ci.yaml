@@ -1767,9 +1767,9 @@ jobs:
           fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
-      # Kind (the cluster rung, the released chart upgrade, and the upgrade
-      # matrix) stays on main. Next pull requests and pushes to next omit it.
-      # A dispatch, including the nightly run from main, keeps it.
+      # Kind normally stays on main. Next pull requests and pushes to next
+      # omit it except when a PR changes cluster runtime assertions or the
+      # released-upgrade jobs; a dispatch (including nightly) keeps it.
       - id: filter
         run: |
           set -euo pipefail
@@ -2202,6 +2202,24 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
+      # End to end connector identity (#3243, #3485). Its denials need a real
+      # API server of 1.30 or newer, which this kind node image is. The script
+      # names every object from RUN_ID and deletes them on exit.
+      - name: End to end connector identity is denied outside its scope
+        env:
+          CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
+          RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
+      # Per-agent runner resources (#3209, #3485). A render assertion that
+      # lives under ci/runtime, so it runs here through the receipt runner.
+      - name: Per-agent runner resource override renders
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/runner-resources-assertions.sh
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
@@ -3018,11 +3036,11 @@ jobs:
   # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 12 kind
   # runners. The shard lister stays on every PR so coverage cannot drift.
   #
-  # A pull request that selects released-upgrade runs only the smoke shard,
-  # s01: no failure injection, and it covers a fresh install, the N-1 to N
-  # upgrade with state, a same-version upgrade, and the soak refusal. Pushes
-  # to main and dispatches (the nightly kind run on next) run every shard,
-  # plus the released chart upgrade jobs above.
+  # An ordinary pull request that selects released-upgrade runs only the
+  # smoke shard, s01: no failure injection, covering fresh install, N-1 to N
+  # upgrade with state, same-version upgrade, and soak refusal. A PR editing
+  # these upgrade jobs, a push to main, or a dispatch (nightly on next) runs
+  # every shard plus the released chart upgrade jobs above.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -3261,10 +3279,9 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
           fi
-          # The released chart upgrade jobs run only on the full runs (push
-          # and dispatch). The matrix runs whenever released-upgrade is
-          # selected, one smoke shard on a pull request: a matrix job reports
-          # success only when every selected shard succeeded.
+          # Full runs include pushes, dispatches, and PRs editing an upgrade
+          # job. Ordinary PRs selecting released-upgrade run one smoke shard.
+          # The matrix reports success only when all selected shards succeed.
           released_upgrade_expected="skipped"
           if [[ "$RELEASED_UPGRADE_FULL" == "true" ]]; then
             released_upgrade_expected="success"

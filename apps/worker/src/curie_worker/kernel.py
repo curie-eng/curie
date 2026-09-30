@@ -123,6 +123,7 @@ from .binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
     BindingResolver,
+    binding_adapter_for_handle,
 )
 from .capacity_wait import (
     CapacityWaitExpired,
@@ -164,6 +165,7 @@ from .sandbox.types import (
     RouteState,
     SandboxError,
     SandboxHandle,
+    SandboxTermination,
     SuspendedThreadError,
     UnschedulableClaimError,
 )
@@ -377,11 +379,13 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         # never collide with a bound (kind, address).
         return scoped_conversation_id("@cron", qevent.hook_run.agent_id, qevent.conversation_id)
     handle = _reply_handle_for(qevent)
+    # @spec WORKER-CANARY-3: scope relay state by its binding identity while
+    # keeping the handle's adapter reserved for delivery.
     return scoped_conversation_id(
         handle.kind,
         handle.channel,
         qevent.conversation_id,
-        identity=route_identity(handle.kind, handle.adapter),
+        identity=route_identity(handle.kind, binding_adapter_for_handle(handle)),
     )
 
 
@@ -503,7 +507,7 @@ def _exception_reason(exc: BaseException) -> str:
 # check above still runs first, so a workspace failure that somehow arrives
 # after a side-effect frame escalates rather than replaying it.
 RETRYABLE_CLASSIFICATIONS = frozenset(
-    {"rate-limit", "runner-error", "runner-timeout", "workspace-error"}
+    {"rate-limit", "runner-error", "runner-timeout", "sandbox-terminated", "workspace-error"}
 )
 
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
@@ -530,7 +534,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
-WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
+WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
+    {"runner-timeout-unconfirmed", "sandbox-terminated"}
+)
 
 _ESCALATION_DETAIL_MAX = 300
 
@@ -552,6 +558,7 @@ _ESCALATION_CAUSES = {
     "budget-exceeded": "budget_exceeded",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
+    "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
     "history-persistence-error": "history_capacity",
     # #3401: max-turns and an unclassified runner failure used to collapse into
@@ -567,6 +574,23 @@ def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
     return _ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def _sandbox_termination_detail(termination: SandboxTermination) -> str:
+    """Render bounded, redacted Kubernetes diagnosis for terminal surfaces."""
+
+    reason = termination.reason
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", reason) is None:
+        reason = "Unknown"
+    lead = f"Kubernetes pod terminated: {reason}"
+    detail = termination.detail
+    if not isinstance(detail, str):
+        return f"{lead}."
+    safe_detail = " ".join(redact_text(detail).split())
+    if not safe_detail:
+        return f"{lead}."
+    max_detail = _ESCALATION_DETAIL_MAX - len(lead) - len(" ().")
+    return f"{lead} ({safe_detail[:max_detail]})."
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -2601,9 +2625,11 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
+                # @spec WORKER-CANARY-1 WORKER-CANARY-2: the relay's identity
+                # chooses the binding; its adapter stays on the reply route.
                 try:
                     resolved = await self._binding.resolve(
-                        handle.kind, handle.adapter, handle.channel
+                        handle.kind, binding_adapter_for_handle(handle), handle.channel
                     )
                 except AmbiguousRoute as exc:
                     await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
@@ -2614,7 +2640,11 @@ class Kernel:
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
                     try:
                         undeployed = (
-                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            # @spec WORKER-CANARY-2 WORKER-CANARY-4: use the
+                            # same binding selector for the diagnostic path.
+                            await undeployed_lookup(
+                                handle.kind, binding_adapter_for_handle(handle), handle.channel
+                            )
                             if undeployed_lookup is not None
                             else None
                         )
@@ -2846,6 +2876,7 @@ class Kernel:
             # so it cannot leak into another thread's turn. A reclaimed redelivery
             # starts fresh.
             workspace_inference = _WorkspaceInferenceCarry()
+            termination_detail: str | None = None
             attempt = 0
             while True:
                 attempt += 1
@@ -3088,6 +3119,8 @@ class Kernel:
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                if outcome.classification == "sandbox-terminated":
+                    termination_detail = outcome.error_message
                 if (
                     qevent.source is TurnSource.CRON
                     and retryable
@@ -3113,6 +3146,16 @@ class Kernel:
                     return
                 retryable = retryable and qevent.source is not TurnSource.CRON
                 if not retryable or attempt >= self._config.max_attempts:
+                    if (
+                        outcome.classification == "runner-error"
+                        and termination_detail is not None
+                    ):
+                        # Keep the final attempt's classification truthful while
+                        # carrying the earlier confirmed pod cause into both
+                        # terminal surfaces.
+                        outcome.error_message = (
+                            f"Earlier attempt: {termination_detail}"
+                        )[:_ESCALATION_DETAIL_MAX]
                     token = _display_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
@@ -4961,7 +5004,13 @@ class Kernel:
             )
             async with self._keep_route_alive(thread_key, routed.handle.claim_name):
                 outcome = await self._consume(
-                    qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                    qevent,
+                    route,
+                    turn,
+                    nav,
+                    agent_id,
+                    handle=routed.handle,
+                    workspace_inferred_repo=inferred,
                 )
                 outcome = await self._continue_unpublished(
                     qevent,
@@ -7679,7 +7728,13 @@ class Kernel:
         _lifecycle_event("runner.turn.started", "continuation")
         try:
             second = await self._consume(
-                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                qevent,
+                route,
+                turn,
+                nav,
+                agent_id,
+                handle=handle,
+                workspace_inferred_repo=inferred,
             )
         finally:
             turn.close()
@@ -7698,6 +7753,7 @@ class Kernel:
         nav: NavAffordance | None = None,
         agent_id: uuid.UUID | None = None,
         *,
+        handle: SandboxHandle,
         workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator(
@@ -7739,12 +7795,15 @@ class Kernel:
                 else lambda: self._terminal_reply_attempted.add(qevent.event_id)
             ),
         )
+        stream_started_at = datetime.now(UTC)
+        stream_reading = True
         try:
             # ``async with`` releases the aiohttp response on every exit path
             # (normal end, apply-frame error, or a mid-stream transport drop), so
             # the connection is never leaked.
             async with turn:
                 async for frame in turn:
+                    stream_reading = False
                     await self._apply_frame(frame, acc, reply, qevent, agent_id)
                     # ``Final`` is the protocol's terminal response event. Stop
                     # at that boundary so a late frame from a finishing runner
@@ -7752,6 +7811,7 @@ class Kernel:
                     # bounded retry/escalation decision.
                     if isinstance(frame, Final):
                         break
+                    stream_reading = True
         except (aiohttp.ClientError, TimeoutError) as exc:
             # Stream dropped mid-run (sandbox killed, network fault, or the
             # client's streaming budget expiring). No final.
@@ -7790,6 +7850,24 @@ class Kernel:
                 )
             else:
                 classification = "runner-error"
+                if stream_reading and isinstance(exc, aiohttp.ClientError):
+                    try:
+                        termination = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._substrate.pod_termination,
+                                handle,
+                                since=stream_started_at,
+                            ),
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        # Diagnosis is best effort; the original stream warning
+                        # above remains the operator record of this failure.
+                        pass
+                    else:
+                        if termination is not None:
+                            classification = "sandbox-terminated"
+                            acc.error_message = _sandbox_termination_detail(termination)
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,

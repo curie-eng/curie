@@ -76,6 +76,38 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
   Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
   the delivery arrived on (ADR-0168 decisions 2 and 3).
+  Its `text` is the person's message, except in a thread whose root this bot
+  posted: there the root is quoted ahead of it as untrusted context inside a
+  `<prior_assistant_reply>` block
+  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
+  with root slashes neutralized as XML entities so repository-looking alert
+  text stays inert even to an older worker's raw repository parser during a
+  rolling upgrade.
+
+  **Named relay identity contract (INGRESS-CANARY-1).** A disconnected cluster
+  message may use `adapter=curie-cluster-message` to select reply delivery and
+  set the optional `identity` on `ReplyHandle` to select a named Slack binding.
+  The producer constructs `QueuedTurn` with ordinary strict validation. The
+  identity survives serialization and worker decoding unchanged. An absent
+  identity selects `default`, preserving existing relay turns. The dependent
+  worker routing change must select the named binding and refuse unknown
+  identities instead of falling back to `default`; until that change lands,
+  named relay producers must not be enabled. For ordinary Slack turns,
+  `adapter` remains the identity and `identity` is absent. The two fields have
+  separate purposes only when the relay adapter occupies `adapter`.
+
+  **Per-turn tool access (TOOL-ACCESS-1, TOOL-ACCESS-6).** The optional
+  top-level `tool_access` on `QueuedTurn` may be `"read-only"`, restricting
+  that one turn to tools the runner classifies as read-only, with no approval
+  ever requested. The contract, including what the worker and the runner must
+  do with it, is stated once, under TOOL-ACCESS in the
+  [ACI producer seam](../aci-producer/INTERFACE.md). A turn producer sets it
+  only toward a worker and runner that implement it (TOOL-ACCESS-6): one that
+  does not decodes the field and drops it, and the turn then runs
+  unrestricted. No first-party ingress sets it (for example the Slack
+  dispatcher, the wire ingress and the API resume queue); an operator's own
+  synthetic producer, such as a canary on the disconnected cluster-message
+  relay, is the intended caller. An absent value is today's turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral

@@ -157,12 +157,15 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # "workspace-error" (#2004): a managed-workspace preparation failure before
     # the turn was ever accepted, named apart from "runner-error" for the same
     # reason -- and, being retryable, subject to the same crash-on-omission.
+    # "sandbox-terminated": a retryable sandbox termination is a distinct
+    # cause; omitting it makes the retry metric reject the classification.
     "retry_class": [
         "redelivery",
         "rate-limit",
         "runner-error",
         "runner-timeout",
         "workspace-error",
+        "sandbox-terminated",
     ],
 }
 _THREAD_ATTRIBUTES = {
@@ -241,6 +244,10 @@ _COMPLETION_OUTBOX_AGE_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["observe"],
     "outcome": ["retry"],
+}
+_SLACK_SOCKET_IDENTITY_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "state": ["configured", "connected"],
 }
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -419,7 +426,7 @@ _TOOL_RESULT_ATTRIBUTES = {
     "service.name": ["curie-runner"],
     "source": ["runner"],
     "origin": ["connector", "platform", "builtin"],
-    "outcome": ["success", "error", "awaiting_approval", "cancelled"],
+    "outcome": ["success", "error", "awaiting_approval", "cancelled", "refused", "unavailable"],
 }
 
 
@@ -569,6 +576,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Interactive turns by persisted capacity wait state.",
         False,
         _CAPACITY_WAIT_COUNT_ATTRIBUTES,
+    ),
+    "curie.slack.socket.identities": _definition(
+        "gauge",
+        "{identity}",
+        "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+        False,
+        _SLACK_SOCKET_IDENTITY_ATTRIBUTES,
     ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES

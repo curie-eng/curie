@@ -523,9 +523,23 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- $eventsEnabled := (get (.Values.otelCollector.kubernetesEvents | default dict) "enabled") -}}
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
+{{- end -}}
+{{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper.
+     Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
+{{- $noHelper := .Values.otelCollector.exportersWithoutExporterHelper | default dict -}}
+{{- range $name, $reason := $noHelper -}}
+{{- if not (hasKey $.Values.otelCollector.extraExporters $name) -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] names no configured exporter. Remove it, or add the exporter under otelCollector.extraExporters." $name) -}}
+{{- end -}}
+{{- if ne (first (splitList "/" $name)) "awsemf" -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] is invalid: only awsemf exporters may bypass exporterhelper durability validation on Collector 0.119.0." $name) -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $reason) (trim $reason)) -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] must give a reason, naming the exporter and the Collector version its schema was checked against." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
@@ -549,6 +563,7 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if not (hasKey $noHelper $name) -}}
 {{- $retry := get $config "retry_on_failure" -}}
 {{- if not (kindIs "map" $retry) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must configure retry_on_failure with enabled: true and finite max_interval/max_elapsed_time." $name) -}}
@@ -578,6 +593,7 @@ http
 {{- $queueSize := int (get $queue "queue_size") -}}
 {{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2135,9 +2151,9 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173).
+every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523).
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}

@@ -133,6 +133,99 @@ done
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Helm's reuse-values path renders new templates with the old chart defaults.
+# A normal -f render merges in new defaults and misses absent parent maps.
+echo "=== Rendering current templates with v0.10.3 retained values (#3505) ==="
+if ! git -C "$REPO_ROOT" cat-file -e 'v0.10.3:charts/curie/values.yaml' 2>/dev/null; then
+  git -C "$REPO_ROOT" fetch --quiet origin tag v0.10.3
+fi
+cp -a "$CHART" "$TMP/reuse-chart"
+git -C "$REPO_ROOT" show 'v0.10.3:charts/curie/values.yaml' > "$TMP/reuse-chart/values.yaml"
+if ! helm template curie "$TMP/reuse-chart" --namespace curie \
+    --output-dir "$TMP/reuse-render" > "$TMP/reuse-log" 2>&1; then
+  echo "FAIL: v0.10.3 retained values cannot render the current chart" >&2
+  cat "$TMP/reuse-log" >&2
+  exit 1
+fi
+test -s "$TMP/reuse-render/curie/templates/worker.yaml" || {
+  echo "FAIL: retained values render omitted the worker" >&2
+  exit 1
+}
+python3 - "$TMP/reuse-render/curie/templates/worker.yaml" <<'PYEOF'
+import sys, yaml
+docs = [doc for doc in yaml.safe_load_all(open(sys.argv[1])) if isinstance(doc, dict)]
+workers = [doc for doc in docs if doc.get("kind") == "Deployment" and doc["metadata"]["name"] == "curie-worker"]
+assert len(workers) == 1, "retained values render omitted the worker Deployment"
+env = workers[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+assert [entry["value"] for entry in env if entry["name"] == "CURIE_TURN_RECEIPT"] == ["all"]
+PYEOF
+
+# These options traverse workloads that a plain default render leaves out.
+REUSE_WIDE_ARGS=(
+  --set dispatcher.slack.appToken=xapp-render-assert
+  --set dispatcher.slack.botToken=xoxb-render-assert
+  --set inference.deploy=true
+  --set inference.persistence.enabled=true
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+  --set mailAdapter.persistence.existingClaim=render-assert-mail-state
+  --set agentSandbox.runner.credentials=dummy
+)
+if ! helm template curie "$TMP/reuse-chart" --namespace curie \
+    "${REUSE_WIDE_ARGS[@]}" --output-dir "$TMP/reuse-wide-render" \
+    > "$TMP/reuse-wide-log" 2>&1; then
+  echo "FAIL: v0.10.3 retained values cannot render enabled workloads" >&2
+  cat "$TMP/reuse-wide-log" >&2
+  exit 1
+fi
+test -s "$TMP/reuse-wide-render/curie/templates/mail-adapter.yaml" || {
+  echo "FAIL: retained values render omitted enabled workloads" >&2
+  exit 1
+}
+
+# An old release can gain a connector Secret without the newer key defaults.
+if ! helm template curie "$TMP/reuse-chart" --namespace curie \
+    --set connectorCaller.existingSecret=caller-keys \
+    --output-dir "$TMP/reuse-connector-render" > "$TMP/reuse-connector-log" 2>&1; then
+  echo "FAIL: v0.10.3 retained values cannot render a connector Secret" >&2
+  cat "$TMP/reuse-connector-log" >&2
+  exit 1
+fi
+python3 - "$TMP/reuse-connector-render/curie/templates/worker.yaml" \
+    "$TMP/reuse-connector-render/curie/templates/api.yaml" <<'PYEOF'
+import sys, yaml
+for path, name, key in zip(sys.argv[1:], ("CURIE_CONNECTOR_CALLER_SIGNING_KEY", "CURIE_CONNECTOR_CALLER_PUBLIC_KEY"), ("signingKey", "verifyKey")):
+    docs = [doc for doc in yaml.safe_load_all(open(path)) if isinstance(doc, dict)]
+    refs = []
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        for container in doc["spec"]["template"]["spec"]["containers"]:
+            refs.extend(entry["valueFrom"]["secretKeyRef"] for entry in container.get("env", []) if entry["name"] == name)
+    assert refs == [{"name": "caller-keys", "key": key}], (path, refs)
+PYEOF
+
+# Restore the unsafe read in a disposable chart and prove the gate rejects it.
+python3 - "$TMP/reuse-chart/templates/worker.yaml" <<'PYEOF'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+source = path.read_text()
+safe = '(get (.Values.connectorCaller | default dict) "existingSecret")'
+assert source.count(safe) == 1, "connector caller guard changed without updating the control"
+path.write_text(source.replace(safe, '.Values.connectorCaller.existingSecret'))
+PYEOF
+if helm template curie "$TMP/reuse-chart" --namespace curie \
+    --output-dir "$TMP/reuse-mutant-render" > "$TMP/reuse-mutant-log" 2>&1; then
+  echo "FAIL: an unsafe connector caller read passed the retained values gate" >&2
+  exit 1
+fi
+grep -q 'nil pointer.*existingSecret' "$TMP/reuse-mutant-log" || {
+  echo "FAIL: the retained values control failed for an unrelated reason" >&2
+  cat "$TMP/reuse-mutant-log" >&2
+  exit 1
+}
+
 SEALED="$TMP/sealed.yaml"
 DEV="$TMP/dev.yaml"
 

@@ -4,7 +4,10 @@ prometheus-pushgateway:
   enabled: false
 configmapReload:
   prometheus:
-    enabled: false
+    # Alert rules live in this chart-managed ConfigMap. Keep the reloader on so
+    # a Helm upgrade changes the rules Prometheus is actually serving without
+    # an undocumented manual pod restart (#2981).
+    enabled: true
 kube-state-metrics:
   enabled: true
   # CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these
@@ -167,6 +170,166 @@ serverFiles:
         # records no curie_approval_pending and should drop that term from
         # CurieApplicationMetricsAbsent.
         rules:
+          - alert: CurieAlloyNoActiveLogFiles
+            # up is scoped to the annotated Alloy DaemonSet pods by job,
+            # namespace, and pod. Prometheus-generated up has no curie_source
+            # stamp because metric relabeling runs before up is generated. The
+            # comparison on the right intentionally disappears for zero OR
+            # missing source gauges, so a healthy scrape still alerts.
+            expr: |
+              max by (namespace, pod, node) (
+                up{
+                  job="kubernetes-pods",
+                  namespace="observability",
+                  pod=~"alloy-.*"
+                } == 1
+              )
+              unless on (namespace, pod)
+              (
+                max by (namespace, pod) (
+                  loki_source_file_files_active_total{
+                    namespace="observability",
+                    curie_source="curie-sre-bot",
+                    component_id="loki.source.file.pod_logs"
+                  }
+                ) > 0
+              )
+            for: 10m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+          - alert: CurieAlloyLogDeliveryStopped
+            # The read and sent metrics have different component/endpoint
+            # labels in the pinned Alloy image. Aggregate independently by
+            # pod, then compare; a second healthy pod must not mask one that
+            # reads without sending. A first positive counter sample counts as
+            # new activity, but an old flat counter does not.
+            expr: |
+              (
+                sum by (namespace, pod, node) (
+                  (
+                    increase(loki_source_file_read_lines_total{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      component_id="loki.source.file.pod_logs"
+                    }[15m]) > 0
+                  )
+                  or
+                  (
+                    (
+                      last_over_time(loki_source_file_read_lines_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.source.file.pod_logs"
+                      }[15m])
+                      unless
+                      last_over_time(loki_source_file_read_lines_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.source.file.pod_logs"
+                      }[1h] offset 15m)
+                    ) > 0
+                  )
+                ) > 0
+              )
+              unless on (namespace, pod)
+              (
+                sum by (namespace, pod) (
+                  (
+                    increase(loki_write_sent_entries_total{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      component_id="loki.write.default"
+                    }[15m]) > 0
+                  )
+                  or
+                  (
+                    (
+                      last_over_time(loki_write_sent_entries_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.write.default"
+                      }[15m])
+                      unless
+                      last_over_time(loki_write_sent_entries_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.write.default"
+                      }[1h] offset 15m)
+                    ) > 0
+                  )
+                ) > 0
+              )
+              and on (namespace, pod)
+              max by (namespace, pod) (
+                up{
+                  job="kubernetes-pods",
+                  namespace="observability",
+                  pod=~"alloy-.*"
+                } == 1
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+          - alert: CurieAlloyScrapeMissing
+            # Both rules above need up == 1, so an Alloy pod Prometheus cannot
+            # scrape (up 0, a blocked metrics port) or never sees (no scrape
+            # annotation) leaves them silent while it ships nothing.
+            # kube-state-metrics reports how many Alloy pods the DaemonSet
+            # wants; fewer scrapeable pods than that pages. The zero term
+            # stands in for the count when no Alloy pod is up at all. A
+            # kube-state-metrics outage removes the left side and is
+            # CurieKubeStateMetricsDown's page, not this one.
+            expr: |
+              max by (namespace) (
+                kube_daemonset_status_desired_number_scheduled{
+                  namespace="observability",
+                  curie_source="curie-sre-bot",
+                  daemonset="alloy"
+                }
+              )
+              >
+              (
+                count by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    namespace="observability",
+                    pod=~"alloy-.*"
+                  } == 1
+                )
+                or on (namespace)
+                (
+                  0 * max by (namespace) (
+                    kube_daemonset_status_desired_number_scheduled{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      daemonset="alloy"
+                    }
+                  )
+                )
+              )
+            for: 10m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
           - alert: CurieApplicationMetricsAbsent
             expr: |
               absent(curie_queue_depth{service_name="curie-worker"})
@@ -642,13 +805,14 @@ serverFiles:
             # minutes and errors at least half of the connector's success and
             # error results, so an occasional model mistake, such as a
             # connector refusing a wrong argument, does not page. A call the
-            # runner's approval gate held (awaiting_approval) or an operator
-            # stop cut off (cancelled) counts toward neither. An error is any
-            # is_error result on a non-platform `mcp__` tool that the gate did
-            # not hold and no operator stop cut off: a connector's isError
-            # result or JSON-RPC error, a call the turn deadline cut off, and
-            # rarely a call refused before it reached the connector, as
-            # docs/interfaces/telemetry-otel/INTERFACE.md lists. A connector
+            # runner's approval gate held (awaiting_approval), the runner
+            # refused by policy or grant-argument check (refused), an operator
+            # stop cut off (cancelled), or the CLI rejected as an unavailable
+            # tool (unavailable) counts toward neither. An error is a
+            # connector's isError result or JSON-RPC error, or a call the turn
+            # deadline cut off, and rarely a runner-side deny outside the
+            # approval gate, as docs/interfaces/telemetry-otel/INTERFACE.md
+            # lists. A connector
             # that reports failure inside a success-shaped payload counts as a
             # success, and this rule cannot see it. The metric carries no
             # connector name. The runner logs one WARNING per failed call

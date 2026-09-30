@@ -2,7 +2,7 @@
 //! registry and its signal cleanup, and the two process runners
 //! (`run_capture`, `run_step`) every verb shells out through.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::process::Stdio;
 #[cfg(unix)]
@@ -547,6 +547,18 @@ pub(crate) fn require_on_path(bin: &str) -> Result<()> {
     }
 }
 
+/// Preserve the operating-system cause of a command invocation failure.
+/// A PATH hint is useful only for `NotFound`; claiming PATH for permission,
+/// resource, or text-file errors hid the errno needed to diagnose #2236.
+pub(crate) fn command_io_error(program: &str, error: std::io::Error) -> anyhow::Error {
+    let kind = error.kind();
+    if kind == std::io::ErrorKind::NotFound {
+        anyhow!("failed to invoke `{program}`: {error} (kind: {kind:?}); is it on PATH?")
+    } else {
+        anyhow!("failed to invoke `{program}`: {error} (kind: {kind:?})")
+    }
+}
+
 /// Run one command capturing stdout; returns (success, stdout, stderr).
 pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // Materialize any secret values into a private 0600 `-f` file so the secret
@@ -567,7 +579,7 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
         .kill_on_drop(true)
         .output()
         .await
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        .map_err(|error| command_io_error(&cmd.program, error))?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -588,7 +600,7 @@ pub(crate) async fn run_capture_with_stdin(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        .map_err(|error| command_io_error(&cmd.program, error))?;
     let write_result = match child.stdin.take() {
         Some(mut stdin) => stdin.write_all(input).await,
         None => Err(std::io::Error::other("child stdin pipe was unavailable")),
@@ -670,6 +682,34 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
+
+    #[tokio::test]
+    async fn spawn_failure_names_the_io_error_kind_and_cause() {
+        let missing = OpsCommand::new("curie-definitely-missing-2236", vec![]);
+        let error = run_capture(&missing).await.unwrap_err().to_string();
+        assert!(error.contains("NotFound"), "{error}");
+        assert!(
+            error.contains("No such file") || error.contains("not found"),
+            "{error}"
+        );
+        assert!(error.contains("PATH"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_path_spawn_failure_does_not_claim_the_program_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("not-executable");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let command = OpsCommand::new(&program.display().to_string(), vec![]);
+        let error = run_capture(&command).await.unwrap_err().to_string();
+        assert!(error.contains("PermissionDenied"), "{error}");
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(!error.contains("is it on PATH"), "{error}");
+    }
 
     #[test]
     fn with_env_stores_the_pairs() {

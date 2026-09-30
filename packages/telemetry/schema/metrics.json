@@ -323,10 +323,11 @@
           "rate-limit",
           "runner-error",
           "runner-timeout",
-          "workspace-error"
+          "workspace-error",
+          "sandbox-terminated"
         ]
       },
-      "cardinality_bound": 10
+      "cardinality_bound": 12
     },
     "curie.queue.dead_letter": {
       "type": "counter",
@@ -1036,6 +1037,22 @@
       },
       "cardinality_bound": 3
     },
+    "curie.slack.socket.identities": {
+      "type": "gauge",
+      "unit": "{identity}",
+      "description": "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "state": [
+          "configured",
+          "connected"
+        ]
+      },
+      "cardinality_bound": 2
+    },
     "curie.reply.delivery": {
       "type": "counter",
       "unit": "{reply}",
@@ -1686,10 +1703,12 @@
           "success",
           "error",
           "awaiting_approval",
-          "cancelled"
+          "cancelled",
+          "refused",
+          "unavailable"
         ]
       },
-      "cardinality_bound": 12
+      "cardinality_bound": 18
     }
   }
 }

@@ -437,6 +437,170 @@ def test_checks_that_disappear_after_a_failed_round_are_unverified() -> None:
     assert verdict.reason == "checks_disappeared"
 
 
+def _actions_run(
+    name: str,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    *,
+    run_id: int = 1,
+) -> dict[str, Any]:
+    run = _run(name, status=status, conclusion=conclusion, run_id=run_id)
+    run["app"] = {"slug": "github-actions"}
+    return run
+
+
+_PYTHON_PATH = "apps/api/src/curie_api/factory_ci.py"
+_PYTHON_AGGREGATE = "Python (ruff + mypy + pytest)"
+
+
+def _pytest_shards(status: str = "in_progress") -> list[dict[str, Any]]:
+    return [
+        _actions_run(
+            f"Python pytest (shard {shard}/3)",
+            status=status,
+            conclusion="success" if status == "completed" else None,
+            run_id=shard,
+        )
+        for shard in (1, 2, 3)
+    ]
+
+
+def test_in_progress_pytest_shards_keep_waiting_for_the_aggregate() -> None:
+    """The aggregate job does not exist until the shards finish (#3400, #3520)."""
+
+    verdict = _decide(
+        _detail(*_pytest_shards(), _actions_run("PR body (real newlines)", run_id=4)),
+        180,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+    assert verdict.kind != "unverified"
+
+
+def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        30,
+        changed_paths=[_PYTHON_PATH],
+        prior_round_had_checks=True,
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+
+
+def test_a_pending_status_keeps_the_missing_python_aggregate_waiting() -> None:
+    verdict = _decide(
+        _detail(
+            _actions_run("gitleaks (full history)"),
+            statuses=(_status("ci/pr-body", "pending"),),
+        ),
+        180,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+
+
+def test_a_visible_failure_still_fails_fast_while_pytest_shards_run() -> None:
+    verdict = _decide(
+        _detail(
+            *_pytest_shards(),
+            _actions_run("Fix pin verification", conclusion="failure", run_id=8),
+        ),
+        180,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "failing"
+    assert "Fix pin verification" in _names(verdict.failing)
+
+
+def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> None:
+    """GitHub creates the aggregate only after the shard jobs complete."""
+
+    verdict = _decide(
+        _detail(*_pytest_shards(status="completed")),
+        180,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+    expired = _decide(
+        _detail(*_pytest_shards(status="completed")),
+        1200,
+        changed_paths=[_PYTHON_PATH],
+    )
+    assert expired.kind == "unverified"
+    assert expired.reason == "required_python_ci_unrelated"
+
+
+def test_settled_non_shard_checks_without_the_python_aggregate_are_unverified() -> None:
+    verdict = _decide(
+        _detail(_actions_run("gitleaks (full history)"), _actions_run("cargo audit", run_id=2)),
+        180,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+
+
+def test_a_missing_python_aggregate_is_unverified_at_the_ci_deadline() -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        1200,
+        changed_paths=[_PYTHON_PATH],
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+
+
+def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
+    early = PUBLISHED + timedelta(seconds=200)
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        200,
+        changed_paths=[_PYTHON_PATH],
+        execution_deadline=early,
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+
+
+def test_python_changes_with_no_checks_follow_the_grace_window() -> None:
+    waiting = _decide(_detail(), 119, changed_paths=[_PYTHON_PATH])
+    assert waiting.kind == "pending"
+    assert waiting.reason == "required_python_ci_missing"
+    missing = _decide(_detail(), 180, changed_paths=[_PYTHON_PATH])
+    assert missing.kind == "unverified"
+    assert missing.reason == "required_python_ci_missing"
+
+
+def test_the_python_aggregate_is_judged_once_it_appears() -> None:
+    shards = _pytest_shards(status="completed")
+    running = _actions_run(_PYTHON_AGGREGATE, status="in_progress", run_id=9)
+    pending = _decide(_detail(*shards, running), 600, changed_paths=[_PYTHON_PATH])
+    assert pending.kind == "pending"
+    assert pending.reason is None
+
+    green = _actions_run(_PYTHON_AGGREGATE, run_id=9)
+    assert _decide(_detail(*shards, green), 600, changed_paths=[_PYTHON_PATH]).kind == "green"
+
+    failed = _actions_run(_PYTHON_AGGREGATE, conclusion="failure", run_id=9)
+    failed_verdict = _decide(_detail(*shards, failed), 600, changed_paths=[_PYTHON_PATH])
+    assert failed_verdict.kind == "failing"
+    assert failed_verdict.reason == "required_python_ci_failed"
+
+
 # --- decide: the CI deadline -----------------------------------------------------------
 
 

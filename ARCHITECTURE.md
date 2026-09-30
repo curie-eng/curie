@@ -742,8 +742,9 @@ tags) on every push to `main`. It also publishes a seventh image,
 **`ghcr.io/curie-eng/curie-worker-local`** (the worker-local overlay, built and
 merged by its own `worker-local-build` / `worker-local-merge` jobs). A `v*` tag
 additionally cuts a GitHub Release with CLI binaries for
-`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. It also runs the `chart`
-job, which packages the **Helm chart** and releases the **compose** artifact.
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and
+`aarch64-apple-darwin`. It also runs the `chart` job, which packages the **Helm
+chart** and releases the **compose** artifact.
 The chart and compose files are release artifacts in their own right: an
 operator installs from those, not from the images alone.
 

@@ -1165,7 +1165,7 @@ const GRAFANA_CONNECTOR_REFERENCE_KEYS: &[&str] = &[
     "grafanaConnector.secretKey",
 ];
 
-fn is_grafana_connector_reference_key(key: &str) -> bool {
+pub(crate) fn is_grafana_connector_reference_key(key: &str) -> bool {
     GRAFANA_CONNECTOR_REFERENCE_KEYS.contains(&key)
 }
 
@@ -1176,7 +1176,7 @@ fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
 }
 
-fn escape_helm_set_string_value(value: &str) -> String {
+pub(crate) fn escape_helm_set_string_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if matches!(ch, '\\' | ',' | '{' | '}') {
@@ -2310,7 +2310,7 @@ fn stamp_config_schema(opts: &mut UpOpts, outcome: &crate::config_migrate::Migra
     }
 }
 
-fn is_external_secret_ref_key(key: &str) -> bool {
+pub(crate) fn is_external_secret_ref_key(key: &str) -> bool {
     let leaf = key.rsplit('.').next().unwrap_or(key);
     leaf == "existingSecret"
         || leaf.ends_with("ExistingSecret")
@@ -3696,7 +3696,7 @@ impl RunningInstall {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+            .map_err(|error| command_io_error(&cmd.program, error))?;
         let mut stdout = child
             .stdout
             .take()
@@ -3736,9 +3736,7 @@ impl RunningInstall {
                         "failed to stop Helm after status error: {cleanup_error}"
                     ));
                 }
-                return Err(error).with_context(|| {
-                    format!("failed to invoke `{}`; is it on PATH?", self.program)
-                });
+                return Err(command_io_error(&self.program, error));
             }
         };
         let stdout = self

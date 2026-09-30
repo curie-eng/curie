@@ -311,6 +311,95 @@ def test_a_cluster_message_relay_turn_resolves_the_channels_default_binding() ->
     asyncio.run(go())
 
 
+def test_named_relay_selects_only_its_active_slack_binding() -> None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-2 WORKER-CANARY-5.
+
+    A pair with two identities must never answer an unknown name as default.
+    The selected named agent's active prod deployment wins over its dev one.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        ids: list[uuid.UUID] = []
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-{token}"
+            default_id = await _seed_agent(
+                engine, channel=channel, name=f"default-{token}", max_usd=None, max_tokens=None
+            )
+            ids.append(default_id)
+            named_id = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"sre-{token}",
+                max_usd=None,
+                max_tokens=None,
+                adapter="sre-bot",
+            )
+            ids.append(named_id)
+            # @spec WORKER-CANARY-2: an out-of-band row can carry an adapter
+            # slug that is not a declared Slack identity name. It must not
+            # make an invalid relay selector runnable.
+            malformed_id = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"malformed-{token}",
+                max_usd=None,
+                max_tokens=None,
+                adapter="sre_bot",
+            )
+            ids.append(malformed_id)
+            await _seed_deployment(
+                engine, agent_id=default_id, environment="prod", bundle_ref="default.zip"
+            )
+            await _seed_deployment(
+                engine, agent_id=named_id, environment="dev", bundle_ref="named-dev.zip"
+            )
+            await _seed_deployment(
+                engine, agent_id=named_id, environment="prod", bundle_ref="named-prod.zip"
+            )
+            await _seed_deployment(
+                engine, agent_id=malformed_id, environment="prod", bundle_ref="malformed.zip"
+            )
+
+            resolver = _resolver(engine)
+            default = await resolver.resolve("slack", "curie-cluster-message", channel)
+            named = await resolver.resolve("slack", "sre-bot", channel)
+            unknown = await resolver.resolve("slack", "missing-bot", channel)
+            assert default is not None and default.agent_id == default_id
+            assert named is not None and named.agent_id == named_id
+            assert named.bundle_ref == "named-prod.zip"
+            assert unknown is None
+            assert await resolver.undeployed_binding("slack", "missing-bot", channel) is None
+            for invalid in ("", " ", "SRE Bot", "sre/bot", "sre_bot", "a" * 41):
+                assert await resolver.resolve("slack", invalid, channel) is None
+                assert await resolver.undeployed_binding("slack", invalid, channel) is None
+            # @spec WORKER-CANARY-5: after the named deployment disappears,
+            # the same binding remains diagnostic-only and cannot use default.
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"DELETE FROM {_SCHEMA}.deployments WHERE agent_id = :id"),
+                    {"id": named_id},
+                )
+            assert await resolver.resolve("slack", "sre-bot", channel) is None
+            undeployed = await resolver.undeployed_binding("slack", "sre-bot", channel)
+            assert undeployed is not None and undeployed.agent_id == named_id
+            still_default = await resolver.resolve("slack", "curie-cluster-message", channel)
+            assert still_default is not None and still_default.agent_id == default_id
+        finally:
+            if ids:
+                await _cleanup(engine, ids)
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 def test_resolves_a_non_slack_binding_on_the_kind_address_pair() -> None:
     """T-A4, kind-independence half / AC4. Rewritten from PR 1's
     `test_resolves_a_non_slack_binding_on_address_alone`, which asserted the

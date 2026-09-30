@@ -70,6 +70,96 @@ Enforcement is only-when-configured: with the var unset the app is pass-through
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
 
+## Per-turn tool access
+
+The runner is the reference enforcement of TOOL-ACCESS in
+[the ACI producer seam](../docs/interfaces/aci-producer/INTERFACE.md). For a
+turn whose `Event.tool_access` is `read-only`:
+
+- **RUNNER-TOOL-ACCESS-1:** The tools classified read-only are the ones the
+  side-effect classifier already treats as read-only: the harness's declared
+  read-only built-ins (for the Claude harness `Read`, `Glob`, `Grep`, `LS`,
+  `NotebookRead`, `WebFetch`, `WebSearch`, `ToolSearch`, `TodoRead`) and each
+  live MCP tool whose server declared `readOnlyHint: true` on the boot probe,
+  less every tool an operator gate, a bundle approval gate or a `toolPolicy`
+  `approvalRequired` pattern names. The same set built at boot feeds both the
+  classifier and this check. The MCP half is each connector's own annotation:
+  a server that marks a tool `readOnlyHint: true` has classified it
+  read-only. Curie's platform tools are not read-only, including
+  `mcp__curie__request_approval` and `mcp__curie__report_progress`, which the
+  classifier treats as idempotent.
+- **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
+  The runner registers a PreToolUse callback for every tool and wraps every
+  other PreToolUse callback and the permission callback, so the read-only
+  decision is made first for each call: the approval gate records no pending
+  approval and spends no grant, the runner's own registration of the bundle's
+  PreToolUse commands does not run, and the call never reaches its tool or
+  connector. A deny from any callback wins, so no other callback can turn it
+  into an allow. A call whose tool name cannot be read is denied, and so is
+  every call when the decision itself fails. The denial does not end the turn:
+  the model receives the refusal as that call's error result and can still
+  answer. The CLI also loads the bundle as a plugin and runs the bundle's own
+  hook commands on their lifecycle events (PreToolUse, UserPromptSubmit, Stop,
+  SessionStart and the like), beside and concurrently with the runner's
+  callbacks, including for a call the front refuses; a bundle that ships its
+  hooks only in `hooks/hooks.json` has no runner registration at all. Those
+  commands are the bundle's code, not tools the model calls: they run on a
+  read-only turn as on any other, can change state the bundle keeps for later
+  turns, can start a CLI turn of their own (an `asyncRewake` hook), and cannot
+  turn the deny into an allow.
+- **RUNNER-TOOL-ACCESS-3:** The turn never ends `awaiting-approval` and its
+  `final` carries no approval field. A `request_approval` or `publish_changes`
+  call in it is denied like any other write and is not captured as a request.
+- **RUNNER-TOOL-ACCESS-4:** The access in force is the one sent with the most
+  recent prompt. It is set immediately before the prompt is sent and stays
+  until the next turn sends its own, so model activity left over from an
+  abandoned read-only turn remains read-only. A read-only turn accepts no
+  steer, and a `POST /v1/steer` whose `tool_access` differs from the live
+  turn's is refused with `409`. A read-only event runs only on a session that
+  has sent no unrestricted prompt, neither an ordinary turn nor any steer,
+  since it started or was reset. An unrestricted prompt can leave work the
+  CLI answers as turns of its own after the runner has moved on (a steer, a
+  background task's notification), and such a turn would shift a read-only
+  prompt out of its turn and past the next turn's change of access. A
+  read-only turn can start neither; the work a bundle's own hook can still
+  start is kept from ever running unrestricted by RUNNER-TOOL-ACCESS-11.
+- **RUNNER-TOOL-ACCESS-5:** `GET /status` and `GET /v1/status` carry
+  `"tool_access": ["read-only"]` while the session can enforce it: it was
+  built with enforcement and has sent no unrestricted prompt
+  (RUNNER-TOOL-ACCESS-4). Otherwise they carry `"tool_access": []`, so a
+  worker refuses the turn before sending it. A read-only event that arrives
+  anyway is answered with a classified-failure `final` whose error is
+  classified `tool-access-unenforced`, before any connector or model work.
+- **RUNNER-TOOL-ACCESS-6:** A denied call, including one denied because its
+  decision failed, counts as `refused` on `curie.tool.result` and never as a
+  connector `error`, so it logs no connector warning.
+- **RUNNER-TOOL-ACCESS-7:** With `tool_access` null the run is today's: the
+  fronting callbacks abstain and delegate unchanged, and the permission mode
+  is unchanged (`bypassPermissions` when the session has no approval gate).
+- **RUNNER-TOOL-ACCESS-8:** The offline fake model session applies the same
+  decision before it emulates any tool, and answers a denied call with an
+  error result in place of the scripted one, so the fake tier observes what
+  the real CLI does.
+- **RUNNER-TOOL-ACCESS-9:** A read-only event whose text, less leading
+  whitespace, begins with `/` is refused with a classified-failure `final`,
+  its error classified `tool-access-refused`, before the model is asked: the
+  CLI expands a slash command before any tool call, and a bundle command can
+  run shell with no PreToolUse event.
+- **RUNNER-TOOL-ACCESS-10:** A read-only turn does not use up an approved
+  action's one-shot boot grant. The grant stays for the next unrestricted
+  turn, the only kind that may spend it.
+- **RUNNER-TOOL-ACCESS-11:** The first unrestricted prompt after any read-only
+  prompt on a session is sent on a fresh SDK session, built exactly as
+  `POST /v1/reset` builds one. Nothing a read-only prompt left in the CLI, an
+  answer it still owes or a turn a bundle hook woke, can then run under
+  unrestricted access; while the old CLI shuts down, it refuses such a call
+  itself. The read-only turns' conversation is not carried into the new
+  session, which is rebuilt from the thread's history as it was at boot, and
+  that ordinary turn pays the cost of a new session (the old CLI's shutdown,
+  a fresh start, no warm prompt cache). The read-only turns are still
+  recorded in the thread's durable history, so a later boot of that thread
+  replays them.
+
 ## Environment
 
 - **ACI-frozen** (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,

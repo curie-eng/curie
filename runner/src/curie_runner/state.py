@@ -371,8 +371,8 @@ _STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp], ...] = (
 # against this set by EXACT equality rather than by the ``mcp__curie-state__``
 # prefix, because a prefix match also accepts every tool of an ambient MCP server
 # whose key merely BEGINS ``curie-state__`` (``mcp__curie-state__extra__bar``),
-# and ``strict_mcp_config`` is off so the CLI loads ambient project/user servers
-# beside the ones the runner mounts.
+# an ambient project/user server could once load beside the ones the runner
+# mounts. ``strict_mcp_config`` (#2899) now stops that; exactness is the second line.
 STATE_TOOL_NAMES: frozenset[str] = frozenset(
     f"mcp__{STATE_SERVER_NAME}__{tool_name}" for tool_name, _, _, _ in _STATE_TOOL_SPECS
 )

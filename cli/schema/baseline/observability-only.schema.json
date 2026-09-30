@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability-only/v1.json",
+  "title": "curie example sre-bot install --observability-only --json",
+  "description": "Receipt for the SRE observability stack; it does not claim a Curie release upgrade or bot deployment.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "observability_namespace": {"type": "string"},
+    "ready": {"const": true}
+  },
+  "required": ["observability_namespace", "ready"]
+}

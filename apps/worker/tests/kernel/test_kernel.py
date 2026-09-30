@@ -15,6 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +57,16 @@ from curie_worker.workspace import (
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from queue_fixtures import qevent, wait_until  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+from test_work_item_early_stop import (  # noqa: E402
+    ISSUE_PROMPT,
+    _Binding,
+    _PublicationApi,
+    _turn,
+    _WorkItems,
+    _Workspace,
+)
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -2720,6 +2731,146 @@ def test_transient_failure_retries_then_succeeds(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("reason", "detail"),
+    [
+        ("Evicted", 'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".'),
+        ("OOMKilled", "Memory limit exceeded"),
+    ],
+)
+def test_pod_termination_cause_reaches_terminal_notice(
+    make_harness, reason: str, detail: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = qevent("go")
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "sandbox-terminated" in h.sink.last_text
+            assert reason in h.sink.last_text
+            assert detail in h.sink.last_text
+            assert "Kubernetes pod terminated" in h.sink.last_text
+            assert h.fake_k8s.termination_queries
+            assert h.fake_k8s.termination_queries[0].startswith("sbx-")
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_stream_drop_without_pod_cause_remains_runner_error(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+
+            await h.kernel.process_event(qevent("go"))
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "runner-error" in h.sink.last_text
+            assert "sandbox-terminated" not in h.sink.last_text
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SimpleNamespace(
+                reason="Evicted", detail="The node was low on memory."
+            )
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Evicted" in finish["detail"]
+            assert "The node was low on memory." in finish["detail"]
+            assert "Kubernetes pod terminated" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            diagnoses = iter(
+                [
+                    SimpleNamespace(
+                        reason="Evicted",
+                        detail=(
+                            'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
+                            "token=exampleSecretValue123456 " + "x" * 400
+                        ),
+                    ),
+                    None,
+                ]
+            )
+
+            def diagnose(
+                name: str, *, request_timeout_seconds: float, since: datetime
+            ) -> SimpleNamespace | None:
+                h.fake_k8s.termination_queries.append(name)
+                return next(diagnoses)
+
+            monkeypatch.setattr(h.fake_k8s, "pod_termination", diagnose)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
+            # Factory work items intentionally suppress a direct reply. The
+            # terminal issue comment is built from the recorded finish below.
+            assert "runner-error" in caplog.text
+            assert "Earlier attempt" in caplog.text
+            assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in caplog.text
+            assert "exampleSecretValue123456" not in caplog.text
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "runner_escalated"
+            assert isinstance(finish["detail"], str)
+            assert "Earlier attempt" in finish["detail"]
+            assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
+            assert "exampleSecretValue123456" not in finish["detail"]
+            assert len(finish["detail"]) <= 300
+
+    asyncio.run(go())
+
+
 # Error-classification table, escalation half: the run escalates after a single
 # attempt and the reply names the classification, the detail, and the event_id.
 @pytest.mark.parametrize(
@@ -4898,6 +5049,46 @@ def test_reply_handle_relay_adapter_survives_a_binding_that_names_its_identity(
 
             routes = h.sink.routes_for("reply.update")
             assert routes, "the completed turn emitted no reply update"
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+
+    asyncio.run(go())
+
+
+def test_named_relay_resolves_named_binding_but_replies_through_relay(make_harness) -> None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-4: the selector and sink are distinct."""
+
+    class NamedBinding(_TokenBinding):
+        def __init__(self) -> None:
+            super().__init__("tok-route", uuid.uuid4())
+            self.seen: list[tuple[str, str | None, str]] = []
+
+        async def resolve(
+            self, kind: str, adapter: str | None, channel: str
+        ) -> _FakeResolved | None:
+            self.seen.append((kind, adapter, channel))
+            if adapter != "sre-bot":
+                return None
+            row = _FakeResolved(self._agent_id)
+            row.adapter = "sre-bot"
+            return row
+
+    async def go() -> None:
+        binding = NamedBinding()
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                qevent(
+                    "hi",
+                    thread="tNamedRelay",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                    identity="sre-bot",
+                )
+            )
+            assert binding.seen == [("slack", "sre-bot", "C1")]
+            assert h.runner.opened
+            routes = h.sink.routes_for("reply.update")
+            assert routes
             assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
 
     asyncio.run(go())

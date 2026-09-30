@@ -168,6 +168,11 @@ roleRef:
 {{- end }}
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := $runner.workspace }}
+{{- if $agent }}
+{{- with index (.Values.agentSandbox.workspaceSizeLimits | default dict) $agent }}
+{{- $wf = set (deepCopy $wf) "sizeLimit" . }}
+{{- end }}
+{{- end }}
 {{- $af := $runner.attachments | default dict }}
 {{/*
 The inbound-attachment lane is ONE switch. `worker.attachments.enabled` gates
@@ -853,6 +858,17 @@ spec:
 {{- end }}
 {{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" (toString $ref)) }}
 {{- fail (printf "agentSandbox.runnerImages.%s must be a digest reference <repository>@sha256:<64 hex> produced by curie build, got %q" $agent (toString $ref)) }}
+{{- end }}
+{{- end }}
+{{- range $agent, $limit := .Values.agentSandbox.workspaceSizeLimits | default dict }}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*(Ki|Mi|Gi|Ti)$" (toString $limit)) }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s must be a binary quantity such as 24Gi, got %q" $agent (toString $limit)) }}
+{{- end }}
+{{- if not $root.Values.agentSandbox.runner.workspace.enabled }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s is set but agentSandbox.runner.workspace.enabled is false, so no workspace volume renders" $agent) }}
 {{- end }}
 {{- end }}
 {{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}

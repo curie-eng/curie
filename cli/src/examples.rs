@@ -227,6 +227,7 @@ const PLATFORM_UPGRADE_SCRIPT: &[u8] =
 
 pub struct SreBotInstallOpts {
     pub observability: bool,
+    pub observability_only: bool,
     pub dry_run: bool,
     pub slack_channel: Option<String>,
     /// Install the upgrade path: the self-upgrade connector, the platform
@@ -264,6 +265,46 @@ impl InstallIdentity {
 pub enum SreBotInstallResult {
     DryRun(DryRunPlan),
     Installed(Box<commands::DeployOutput>),
+    ObservabilityInstalled(ObservabilityOnlyOutput),
+}
+
+pub struct ObservabilityOnlyOutput {
+    pub namespace: String,
+}
+
+impl CliOutput for ObservabilityOnlyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"observability_namespace": self.namespace, "ready": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!(
+            "SRE observability stack ready in namespace {}",
+            self.namespace
+        ));
+    }
+}
+
+pub struct SreBotRenderOpts {
+    pub out: PathBuf,
+    pub platform_upgrade: bool,
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+}
+
+pub struct SreBotRenderOutput {
+    pub path: PathBuf,
+}
+
+impl CliOutput for SreBotRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"bundle_dir": self.path, "rendered": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("SRE bot runtime bundle: {}", self.path.display()));
+    }
 }
 
 pub struct ObservabilityProvisionOpts {
@@ -540,6 +581,40 @@ fn read_access_command() -> InstallCommand {
 }
 
 pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallResult> {
+    if opts.observability_only {
+        let stack_commands = stack_install_commands(&opts.observability_namespace);
+        if opts.dry_run {
+            let mut lines = vec![format!(
+                "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
+                opts.observability_namespace
+            )];
+            lines.push(
+                "select the Alloy log parser from the cluster node runtimes on live installation"
+                    .to_string(),
+            );
+            lines.extend(
+                stack_commands
+                    .iter()
+                    .map(|command| command.display(Path::new("charts/curie"))),
+            );
+            return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
+        }
+        preflight_capacity(&opts.observability_namespace).await?;
+        let log_runtime = preflight_log_runtime().await?;
+        // Render before the first mutation, so a values mismatch refuses
+        // with the cluster untouched.
+        let workspace =
+            EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
+        ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+        for command in &stack_commands {
+            run_install_command(command, &workspace, Path::new("charts/curie")).await?;
+        }
+        return Ok(SreBotInstallResult::ObservabilityInstalled(
+            ObservabilityOnlyOutput {
+                namespace: opts.observability_namespace,
+            },
+        ));
+    }
     if !opts.observability {
         return Err(crate::exit::usage(
             "the SRE bot example installer currently requires --observability",
@@ -553,8 +628,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
 
     let identity = InstallIdentity::from_opts(&opts);
     let mut model = ModelCredential::resolve()?;
-
-    preflight_capacity(&identity.observability_namespace).await?;
 
     let resolved_chart = crate::artifacts::resolve_chart(
         None,
@@ -572,6 +645,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         let mut lines = vec![format!(
             "resolve {TEMPO_TAGGED_IMAGE} to its immutable OCI image index digest before cluster mutation"
         )];
+        lines.push(
+            "select the Alloy log parser from the cluster node runtimes on live installation"
+                .to_string(),
+        );
         lines.push(format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
             identity.observability_namespace
@@ -653,6 +730,8 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
     }
 
+    preflight_capacity(&identity.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
     let tempo_digest = resolve_tempo_index_digest().await?;
     let chart = crate::artifacts::ensure_cached(&resolved_chart).await?;
     crate::ops::require_on_path("helm")?;
@@ -665,7 +744,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         false => None,
     };
-    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        log_runtime,
+    )?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
@@ -719,6 +803,80 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
+    if opts.out.exists() {
+        return Err(crate::exit::usage(format!(
+            "render output {} already exists; choose a new directory",
+            opts.out.display()
+        )));
+    }
+    let tempo_digest = resolve_tempo_index_digest().await?;
+    let upgrade_digest = if opts.platform_upgrade {
+        Some(resolve_index_digest(SELF_UPGRADE_IMAGE_REPOSITORY, SELF_UPGRADE_IMAGE_TAG).await?)
+    } else {
+        None
+    };
+    let identity = InstallIdentity {
+        namespace: opts.namespace,
+        release: opts.release,
+        observability_namespace: opts.observability_namespace,
+    };
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        LogRuntime::Cri,
+    )?;
+    if let Some(parent) = opts
+        .out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating SRE bot render parent {}", parent.display()))?;
+    }
+    std::fs::create_dir(&opts.out)
+        .with_context(|| format!("creating SRE bot render output {}", opts.out.display()))?;
+    let copy_result = (|| -> Result<()> {
+        for (name, _) in BUNDLE_FILES {
+            if upgrade_digest.is_none()
+                && matches!(
+                    *name,
+                    "manifests/upgrade-role.yaml" | "manifests/platform-upgrade-role.yaml"
+                )
+            {
+                continue;
+            }
+            copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+        }
+        if upgrade_digest.is_some() {
+            for name in [
+                "manifests/platform-upgrade-configmap.yaml",
+                "manifests/platform-upgrade-cronjob.yaml",
+            ] {
+                copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = copy_result {
+        let _ = std::fs::remove_dir_all(&opts.out);
+        return Err(err);
+    }
+    Ok(SreBotRenderOutput { path: opts.out })
+}
+
+fn copy_rendered_file(source_root: &Path, out: &Path, name: &str) -> Result<()> {
+    let target = out.join(name);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(source_root.join(name), &target)
+        .with_context(|| format!("copying rendered SRE bot file {name}"))?;
+    Ok(())
+}
+
 pub fn observability_provision_plan(
     chart: &str,
     namespace: &str,
@@ -732,6 +890,8 @@ pub fn observability_provision_plan(
     };
     let chart = Path::new(chart);
     let mut lines = vec![
+        "select the Alloy log parser from the cluster node runtimes on live installation"
+            .to_string(),
         format!("create namespace {observability_namespace} when it is absent"),
         format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
@@ -767,8 +927,12 @@ pub async fn provision_observability(
     require_existing_release(&opts.release, &opts.namespace).await?;
     let chart = provision_chart(opts.chart.as_deref()).await?;
     preflight_capacity(&opts.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
+    // Render before the first mutation, so a values mismatch refuses with the
+    // cluster untouched.
+    let workspace =
+        EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
     ensure_grafana_admin_secret(&opts.observability_namespace).await?;
-    let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
     let identity = InstallIdentity {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
@@ -1588,7 +1752,7 @@ async fn run_install_command(
         .args(&args)
         .output()
         .await
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", command.program))?;
+        .map_err(|error| crate::ops::command_io_error(command.program, error))?;
     if output.status.success() {
         return Ok(());
     }
@@ -1596,17 +1760,53 @@ async fn run_install_command(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if let Some(target) = &command.helm_target {
         if is_helm_timeout(&stderr) {
-            let recovery = helm_pending_upgrade_recovery(target);
-            return Err(crate::exit::CliError::failure(format!(
-                "Helm timed out waiting for release {} in namespace {}: {}. Recover the pending upgrade with: {}",
+            let diagnostic = pending_pvc_diagnostic(&target.namespace).await;
+            let recovery = verified_helm_pending_upgrade_recovery(target).await;
+            let mut message = format!(
+                "Helm timed out waiting for release {} in namespace {}: {}. {}",
                 target.release,
                 target.namespace,
-                if stderr.is_empty() { "command timed out" } else { &stderr },
-                recovery,
-            ))
-            .with_fix(recovery)
-            .into());
+                if stderr.is_empty() {
+                    "command timed out"
+                } else {
+                    &stderr
+                },
+                diagnostic,
+            );
+            if let Some(recovery) = recovery {
+                message.push_str(&format!(
+                    " Helm reports pending-upgrade; after checking why it is pending, recover the release with: {recovery}"
+                ));
+                return Err(crate::exit::CliError::failure(message)
+                    .with_fix(recovery)
+                    .into());
+            }
+            return Err(crate::exit::CliError::failure(message).into());
         }
+    }
+    if command.program == "kubectl"
+        && is_helm_timeout(&stderr)
+        && args.iter().any(|arg| arg == "statefulset/tempo")
+        && args.iter().any(|arg| arg == "rollout")
+    {
+        let namespace = command
+            .helm_target
+            .as_ref()
+            .map(|target| target.namespace.as_str())
+            .or_else(|| {
+                args.iter()
+                    .position(|arg| arg == "--namespace")
+                    .and_then(|index| args.get(index + 1))
+                    .map(String::as_str)
+            })
+            .unwrap_or(OBSERVABILITY_NAMESPACE);
+        let diagnostic = pending_pvc_diagnostic(namespace).await;
+        bail!(
+            "`{}` failed: {}. {}",
+            command.display(chart),
+            stderr,
+            diagnostic
+        );
     }
     bail!(
         "`{}` failed: {}",
@@ -1631,6 +1831,210 @@ fn helm_pending_upgrade_recovery(target: &HelmTarget) -> String {
         "kubectl delete secret -n {} -l 'owner=helm,name={},status=pending-upgrade'",
         target.namespace, target.release
     )
+}
+
+async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<String> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new("helm")
+            .args([
+                "status",
+                &target.release,
+                "-n",
+                &target.namespace,
+                "-o",
+                "json",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !status.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).ok()?;
+    (value.get("name").and_then(serde_json::Value::as_str) == Some(target.release.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str)
+            == Some(target.namespace.as_str())
+        && value
+            .pointer("/info/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pending-upgrade"))
+    .then(|| helm_pending_upgrade_recovery(target))
+}
+
+async fn diagnostic_kubectl_json(
+    namespace: &str,
+    resource: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value> {
+    let mut command = tokio::process::Command::new("kubectl");
+    command
+        .args(["get", resource, "-n", namespace, "-o", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A kubectl exec-credential plugin may spawn descendants. Give this
+        // read-only diagnostic its own group so a timeout can stop all of it.
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("reading {resource} for timeout diagnosis"))?;
+    let child_id = child.id();
+    let mut wait = Box::pin(child.wait_with_output());
+    let output = match tokio::time::timeout_at(deadline, &mut wait).await {
+        Ok(result) => {
+            result.with_context(|| format!("reading {resource} for timeout diagnosis"))?
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pgid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: this is the fresh process group created for our
+                // diagnostic child, never the CLI's own process group.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            // Reap the direct child after killing the group. The bounded wait
+            // also covers a credential plugin that kept an output pipe open.
+            let _ = tokio::time::timeout(Duration::from_millis(250), &mut wait).await;
+            bail!("kubectl get {resource} timed out during diagnosis");
+        }
+    };
+    if !output.status.success() {
+        bail!("kubectl get {resource} failed");
+    }
+    serde_json::from_slice(&output.stdout).context("invalid Kubernetes diagnosis JSON")
+}
+
+async fn pending_pvc_diagnostic(namespace: &str) -> String {
+    let hint = format!(
+        "If a PVC is Pending, inspect it with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let read = async {
+        let pvcs = diagnostic_kubectl_json(namespace, "pvc", deadline).await?;
+        let pods = diagnostic_kubectl_json(namespace, "pods", deadline).await?;
+        let events = diagnostic_kubectl_json(namespace, "events", deadline).await?;
+        Ok::<_, anyhow::Error>((pvcs, pods, events))
+    };
+    match read.await {
+        Ok((pvcs, pods, events)) => {
+            pending_pvc_warning(&pvcs, &pods, &events, namespace).unwrap_or(hint)
+        }
+        _ => hint,
+    }
+}
+
+fn pending_pvc_warning(
+    pvcs: &serde_json::Value,
+    pods: &serde_json::Value,
+    events: &serde_json::Value,
+    namespace: &str,
+) -> Option<String> {
+    let claims = pvcs.get("items")?.as_array()?;
+    let pod_items = pods.get("items")?.as_array()?;
+    let event_items = events.get("items")?.as_array()?;
+    for claim in claims {
+        if claim
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str)
+            != Some("Pending")
+        {
+            continue;
+        }
+        let Some(name) = claim
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if claim
+            .pointer("/metadata/namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(namespace)
+        {
+            continue;
+        }
+        let uid = claim
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str);
+        for event in event_items {
+            if event.get("type").and_then(serde_json::Value::as_str) != Some("Warning") {
+                continue;
+            }
+            let Some(object) = event
+                .get("involvedObject")
+                .or_else(|| event.get("regarding"))
+            else {
+                continue;
+            };
+            if object.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
+                continue;
+            }
+            let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(object_name) = object.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let object_uid = object.get("uid").and_then(serde_json::Value::as_str);
+            let direct = kind == "PersistentVolumeClaim"
+                && object_name == name
+                && (uid.is_none() || object_uid.is_none() || uid == object_uid);
+            let pod = kind == "Pod"
+                && pod_items.iter().any(|pod| {
+                    pod.pointer("/metadata/namespace")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(namespace)
+                        && pod
+                            .pointer("/metadata/name")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(object_name)
+                        && object_uid.is_some()
+                        && pod
+                            .pointer("/metadata/uid")
+                            .and_then(serde_json::Value::as_str)
+                            == object_uid
+                        && pod
+                            .pointer("/spec/volumes")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|volumes| {
+                                volumes.iter().any(|volume| {
+                                    volume
+                                        .pointer("/persistentVolumeClaim/claimName")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(name)
+                                })
+                            })
+                });
+            let reason = event
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Warning");
+            let message = event
+                .get("message")
+                .or_else(|| event.get("note"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if direct
+                || (pod
+                    && reason == "FailedScheduling"
+                    && message.to_ascii_lowercase().contains("unbound")
+                    && message
+                        .to_ascii_lowercase()
+                        .contains("persistentvolumeclaim"))
+            {
+                return Some(format!("Pending PVC {name} has Kubernetes Warning {reason}: {message}. Inspect `kubectl describe pvc {name} -n {namespace}`."));
+            }
+        }
+    }
+    None
 }
 
 async fn kubernetes_connector_kubeconfig(namespace: &str) -> Result<String> {
@@ -1994,6 +2398,7 @@ impl EmbeddedWorkspace {
         tempo_digest: &str,
         identity: &InstallIdentity,
         upgrade_digest: Option<&str>,
+        log_runtime: LogRuntime,
     ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-install-{}-{}",
@@ -2003,7 +2408,7 @@ impl EmbeddedWorkspace {
         std::fs::create_dir(&root)
             .with_context(|| format!("creating embedded SRE bot workspace {}", root.display()))?;
         let workspace = Self { root };
-        workspace.write_observability_files(&identity.observability_namespace)?;
+        workspace.write_observability_files(&identity.observability_namespace, log_runtime)?;
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
                 let runtime = runtime_connector_declaration(
@@ -2060,7 +2465,10 @@ impl EmbeddedWorkspace {
         Ok(workspace)
     }
 
-    fn create_observability(observability_namespace: &str) -> Result<Self> {
+    fn create_observability(
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-observability-{}-{}",
             std::process::id(),
@@ -2073,7 +2481,7 @@ impl EmbeddedWorkspace {
             )
         })?;
         let workspace = Self { root };
-        workspace.write_observability_files(observability_namespace)?;
+        workspace.write_observability_files(observability_namespace, log_runtime)?;
         Ok(workspace)
     }
 
@@ -2094,9 +2502,18 @@ impl EmbeddedWorkspace {
         self.root.join("bundle")
     }
 
-    fn write_observability_files(&self, observability_namespace: &str) -> Result<()> {
+    fn write_observability_files(
+        &self,
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<()> {
         for (name, contents) in OBSERVABILITY_FILES {
             let rendered = rewrite_observability_namespace(contents, observability_namespace);
+            let rendered = if *name == "alloy-values.yaml" {
+                render_alloy_values(&rendered, log_runtime)?
+            } else {
+                rendered
+            };
             self.write(&Path::new("observability").join(name), &rendered)?;
         }
         Ok(())
@@ -2115,6 +2532,12 @@ fn rewrite_observability_namespace(contents: &[u8], observability_namespace: &st
     .replace(
         &format!("namespace: {OBSERVABILITY_NAMESPACE}"),
         &format!("namespace: {observability_namespace}"),
+    )
+    // PromQL string matchers in the shipped Alloy alerts are not YAML keys.
+    // They must follow --observability-namespace just like scrape targets do.
+    .replace(
+        &format!("namespace=\"{OBSERVABILITY_NAMESPACE}\""),
+        &format!("namespace=\"{observability_namespace}\""),
     )
     .replace(
         &format!("kubernetes.io/metadata.name: {OBSERVABILITY_NAMESPACE}"),
@@ -2677,12 +3100,136 @@ struct ObjectMeta {
 struct NodeSpec {
     #[serde(default)]
     unschedulable: bool,
+    #[serde(default)]
+    taints: Vec<NodeTaint>,
+}
+
+#[derive(Deserialize)]
+struct NodeTaint {
+    key: String,
+    effect: String,
 }
 
 #[derive(Deserialize)]
 struct NodeStatus {
     allocatable: BTreeMap<String, String>,
     conditions: Vec<NodeCondition>,
+    #[serde(rename = "nodeInfo", default)]
+    node_info: NodeInfo,
+}
+
+#[derive(Default, Deserialize)]
+struct NodeInfo {
+    #[serde(rename = "containerRuntimeVersion", default)]
+    container_runtime_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogRuntime {
+    Cri,
+    Docker,
+}
+
+fn alloy_can_schedule_on(node: &Node) -> bool {
+    // The checked-in Alloy values have no custom tolerations or hostNetwork.
+    // Kubernetes automatically adds only these DaemonSet tolerations.
+    // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+    // Condition taints are lifted by their controllers once the node is
+    // healthy or initialized, and the DaemonSet then places Alloy there, so a
+    // node behind one still decides the parser.
+    // https://kubernetes.io/docs/reference/labels-annotations-taints/
+    node.spec
+        .taints
+        .iter()
+        .filter(|taint| !is_transient_condition_taint(&taint.key))
+        .all(|taint| match taint.effect.as_str() {
+            "NoExecute" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/not-ready" | "node.kubernetes.io/unreachable"
+            ),
+            "NoSchedule" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/disk-pressure"
+                    | "node.kubernetes.io/memory-pressure"
+                    | "node.kubernetes.io/pid-pressure"
+                    | "node.kubernetes.io/unschedulable"
+            ),
+            _ => true,
+        })
+}
+
+fn is_transient_condition_taint(key: &str) -> bool {
+    matches!(
+        key,
+        "node.kubernetes.io/not-ready"
+            | "node.kubernetes.io/unreachable"
+            | "node.kubernetes.io/network-unavailable"
+            | "node.cloudprovider.kubernetes.io/uninitialized"
+    )
+}
+
+fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
+    if nodes.is_empty() {
+        bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
+    }
+    let mut selected = None;
+    let mut observed = Vec::new();
+    for node in nodes.iter().filter(|node| alloy_can_schedule_on(node)) {
+        let version = node.status.node_info.container_runtime_version.as_str();
+        let runtime = if version.starts_with("containerd://") || version.starts_with("cri-o://") {
+            Some(LogRuntime::Cri)
+        } else if version.starts_with("docker://") {
+            Some(LogRuntime::Docker)
+        } else {
+            None
+        };
+        observed.push(format!(
+            "{}={}",
+            node.metadata.name,
+            if version.is_empty() {
+                "<missing>"
+            } else {
+                version
+            }
+        ));
+        match (selected, runtime) {
+            (None, Some(runtime)) => selected = Some(runtime),
+            (Some(previous), Some(runtime)) if previous == runtime => {}
+            _ => bail!("Alloy needs one supported log format across every eligible node, including cordoned and NotReady nodes; found {}", observed.join(", ")),
+        }
+    }
+    selected.ok_or_else(|| {
+        anyhow!(
+            "no nodes eligible for the Alloy DaemonSet have a supported runtime; inspect node taints and runtimes"
+        )
+    })
+}
+
+async fn preflight_log_runtime() -> Result<LogRuntime> {
+    crate::ops::require_on_path("kubectl")?;
+    let nodes: KubeList<Node> = read_kubernetes_json(
+        &["get", "nodes", "-o", "json"],
+        "kubectl get nodes -o json",
+        "node container runtimes",
+    )
+    .await?;
+    select_log_runtime(&nodes.items)
+}
+
+fn render_alloy_values(contents: &[u8], runtime: LogRuntime) -> Result<Vec<u8>> {
+    if runtime == LogRuntime::Cri {
+        return Ok(contents.to_vec());
+    }
+    let text = std::str::from_utf8(contents).context("Alloy values are not UTF-8")?;
+    if text.matches("dockercontainers: false").count() != 1
+        || text.matches("stage.cri { }").count() != 1
+    {
+        bail!("embedded Alloy values no longer match the supported CRI template");
+    }
+    Ok(text
+        .replace("dockercontainers: false", "dockercontainers: true")
+        .replace("stage.cri { }", "stage.docker { }")
+        .into_bytes())
 }
 
 #[derive(Deserialize)]
@@ -2945,6 +3492,134 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_runtime_classifies_supported_node_versions() {
+        // Node.status.nodeInfo.containerRuntimeVersion is a runtime://version
+        // string; DaemonSet pods can tolerate cordoned and NotReady nodes.
+        // https://kubernetes.io/docs/reference/kubernetes-api/core/node-v1/
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        for (version, expected) in [
+            ("containerd://1.7.0", LogRuntime::Cri),
+            ("cri-o://1.30.0", LogRuntime::Cri),
+            ("docker://24.0.0", LogRuntime::Docker),
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            assert_eq!(select_log_runtime(&nodes.items).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn log_runtime_refuses_missing_or_unknown_node_version() {
+        for version in ["", "mystery://1"] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("node-a"), "{error}");
+        }
+    }
+
+    #[test]
+    fn log_runtime_ignores_nodes_excluded_by_untolerated_taints() {
+        // The shipped Alloy DaemonSet has no custom tolerations. Kubernetes
+        // adds only the documented built-in DaemonSet tolerations.
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "worker"},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                },
+                {
+                    "metadata": {"name": "reserved-docker"},
+                    "spec": {"taints": [{"key": "dedicated", "effect": "NoSchedule", "value": "other"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                },
+                {
+                    "metadata": {"name": "cordoned-cri"},
+                    "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "cri-o://1.30"}}
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(select_log_runtime(&nodes.items).unwrap(), LogRuntime::Cri);
+    }
+
+    #[test]
+    fn log_runtime_counts_nodes_behind_transient_condition_taints() {
+        // The node lifecycle controller and the cloud controller add these
+        // taints while a node is unhealthy or starting, then remove them. A
+        // DaemonSet pod lands there afterwards, so the node's runtime counts.
+        // https://kubernetes.io/docs/reference/labels-annotations-taints/
+        for key in [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+            "node.kubernetes.io/network-unavailable",
+            "node.cloudprovider.kubernetes.io/uninitialized",
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [
+                    {
+                        "metadata": {"name": "worker"},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                    },
+                    {
+                        "metadata": {"name": "recovering-docker"},
+                        "spec": {"taints": [
+                            {"key": key, "effect": "NoSchedule"},
+                            {"key": key, "effect": "NoExecute"}
+                        ]},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                    }
+                ]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("recovering-docker"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn log_runtime_refuses_when_no_nodes_are_eligible_for_alloy() {
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "metadata": {"name": "reserved"},
+                "spec": {"taints": [{"key": "dedicated", "effect": "NoExecute"}]},
+                "status": {"allocatable": {}, "conditions": [],
+                    "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+            }]
+        }))
+        .unwrap();
+        assert!(select_log_runtime(&nodes.items)
+            .unwrap_err()
+            .to_string()
+            .contains("no nodes eligible"));
+    }
 
     fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {
         serde_json::from_value(serde_json::json!({

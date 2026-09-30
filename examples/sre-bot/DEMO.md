@@ -90,7 +90,8 @@ Name `--workspace` on a followup deploy so the demo matches the documented
 command surface.
 
 ```bash
-curie cluster deploy --plugin-dir examples/sre-bot --workspace --slack-channel C0EXAMPLE1
+curie example sre-bot render --out ./sre-bot-runtime
+curie cluster deploy --plugin-dir ./sre-bot-runtime --workspace --slack-channel C0EXAMPLE1
 ```
 
 Create one disposable Deployment in `sre-demo` at one replica. Scale scenarios

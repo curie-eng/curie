@@ -264,6 +264,21 @@ def test_completion_outbox_inventory_is_bounded_and_has_no_identity_labels() -> 
             assert key not in {"event_id", "session", "run", "thread", "conversation_id"}
 
 
+def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label() -> None:
+    """Two series per dispatcher, so ``connected < configured`` is one comparison.
+
+    Which identity is down stays in the dispatcher's own log; a Slack identity
+    name is an identifier and never a metric attribute.
+    """
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.identities"]
+    assert definition["type"] == "gauge"
+    assert definition["attributes"] == {
+        "service.name": ["curie-dispatcher"],
+        "state": ["configured", "connected"],
+    }
+    assert definition["cardinality_bound"] == 2
+
+
 def test_last_success_age_has_one_series_across_failure_and_recovery(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
@@ -294,7 +309,10 @@ def test_last_success_age_has_one_series_across_failure_and_recovery(
     assert "outcome" not in matching[0].attributes
 
 
-def test_retry_metrics_separate_bounded_retry_causes() -> None:
+def test_retry_metrics_separate_bounded_retry_causes(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
     manifest = _read(_MANIFEST)["metrics"]
     queue = manifest["curie.queue.retry"]
     assert queue["attributes"] == {
@@ -306,9 +324,18 @@ def test_retry_metrics_separate_bounded_retry_causes() -> None:
             "runner-error",
             "runner-timeout",
             "workspace-error",
+            "sandbox-terminated",
         ],
     }
-    assert queue["cardinality_bound"] == 10
+    assert queue["cardinality_bound"] == 12
+    record_metric(
+        "curie.queue.retry",
+        attributes={
+            "service.name": "curie-worker",
+            "source": "worker",
+            "retry_class": "sandbox-terminated",
+        },
+    )
     reply = manifest["curie.reply.retry"]
     assert reply["attributes"] == {
         "service.name": ["curie-worker"],
@@ -600,7 +627,7 @@ def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
     connector. Red until the outcome domain declares it and
     ``schema/metrics.json`` is regenerated. Red again on any drift: a connector
     or tool name added as an attribute (the cardinality bound would no longer
-    be twelve), an origin or outcome value dropped or renamed, or the counter
+    be eighteen), an origin or outcome value dropped or renamed, or the counter
     made non-monotonic. The alert CurieConnectorToolErrors selects on exactly
     these values.
     """
@@ -615,9 +642,16 @@ def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
             "service.name": ["curie-runner"],
             "source": ["runner"],
             "origin": ["connector", "platform", "builtin"],
-            "outcome": ["success", "error", "awaiting_approval", "cancelled"],
+            "outcome": [
+                "success",
+                "error",
+                "awaiting_approval",
+                "cancelled",
+                "refused",
+                "unavailable",
+            ],
         },
-        "cardinality_bound": 12,
+        "cardinality_bound": 18,
     }
 
 

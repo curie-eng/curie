@@ -1,0 +1,20 @@
+2026-09-29T08:21:40.8475081Z === curie local message --json ===
+2026-09-29T08:21:41.0730148Z local: no-turn control kept app turn counters at zero while Collector accepted=38.0 and exported=40.0 metric points
+2026-09-29T08:23:11.6756952Z waiting for worker reply: ok (88s)
+2026-09-29T08:23:11.6758170Z continue this conversation: curie local message --continue "..."
+2026-09-29T08:23:11.6777832Z {"finalized":true,"reply":"Here's the weather in Denver for *Tuesday, September 29, 2026*:\n\n• *High:* 67°F (19.7°C)\n• *Low:* 57°F (14.1°C)\n• *Sky:* Overcast with slight rain showers, especially overnight and early morning\n• *Precipitation:* Light — about 1.4 mm total; bring an umbrella just in case\n• *Wind:* ~9 mph WNW; humidity ~68%; UV index 5.8 (moderate)\n\nOverall, a mild, cloudy fall day — a light jacket and umbrella are a good idea.\n\nSource: <https://exa.ai/library/weather/denver-colorado-united-states?latitude=39.7469&longitude=-104.9871&date=2026-09-29|Exa Weather Library>\n\n_What I changed:_\n• called `Skill` — non-idempotent tool completed","thread":"1790670101.156675"}
+2026-09-29T08:23:11.7028469Z local: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-29T08:23:11.7029169Z local: reply is not the fake sentinel (live negative control)
+2026-09-29T08:24:47.6242063Z Traceback (most recent call last):
+2026-09-29T08:24:47.6243750Z   File "<stdin>", line 191, in <module>
+2026-09-29T08:24:47.6244625Z AssertionError: healthy trace 04c420dff81bbdfc4fcc7101a70291ee contains an ERROR span
+2026-09-29T08:24:47.6441475Z 
+2026-09-29T08:24:47.6441921Z === teardown: curie local down ===
+2026-09-29T08:25:00.9785273Z stopping stack: ok (13.3s)
+2026-09-29T08:25:01.3097520Z removed 1 runner container(s)
+2026-09-29T08:25:01.3098042Z dev stack stopped
+2026-09-29T08:25:01.3098954Z volumes kept (fast restart with `curie local up`)
+2026-09-29T08:25:01.6372883Z ##[error]Process completed with exit code 1.
+2026-09-29T08:25:01.6498603Z Post job cleanup.
+2026-09-29T08:25:01.8980994Z ##[group]Generating build summary
+2026-09-29T08:25:01.9597869Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-AMsYZD/export

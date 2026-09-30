@@ -1049,18 +1049,30 @@ enum SreBotAction {
     /// Install Curie, its observability stack, and the SRE bot bundle.
     Install {
         /// Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack.
-        #[arg(long, required = true)]
+        #[arg(
+            long,
+            required_unless_present = "observability_only",
+            conflicts_with = "observability_only"
+        )]
         observability: bool,
+        /// Install only the observability stack; do not change the Curie release or deploy the bot.
+        #[arg(long, conflicts_with = "platform_upgrade")]
+        observability_only: bool,
         /// Print the ordered plan without mutating the cluster.
         #[arg(long)]
         dry_run: bool,
         /// Bind the installed bot to this Slack channel.
-        #[arg(long, value_name = "CHANNEL")]
+        #[arg(long, value_name = "CHANNEL", conflicts_with = "observability_only")]
         slack_channel: Option<String>,
         /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
         /// gates (route sre-approvals). Comma separated and repeatable.
         /// At least one explicit user is required.
-        #[arg(long, value_name = "USER_IDS", required = true)]
+        #[arg(
+            long,
+            value_name = "USER_IDS",
+            required_unless_present = "observability_only",
+            conflicts_with = "observability_only"
+        )]
         approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them. Applies
@@ -1088,8 +1100,30 @@ enum SreBotAction {
         /// Allow this GitHub repository, or `owner/*`, for runtime workspace
         /// selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie
         /// install.
-        #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
+        #[arg(
+            long = "workspace-repo",
+            value_name = "OWNER/REPO",
+            conflicts_with = "observability_only"
+        )]
         workspace_repo: Vec<String>,
+    },
+    /// Render the deployable SRE bot bundle without changing a cluster.
+    Render {
+        /// New directory where the runtime bundle will be written; existing paths are refused.
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+        /// Include the gated platform-upgrade connector and rendered manifests.
+        #[arg(long)]
+        platform_upgrade: bool,
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
     },
     /// Provision the observability stack on an existing Curie release and
     /// require the Grafana connector token. Does not install the platform
@@ -3157,8 +3191,9 @@ enum ClusterAction {
         /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
-        /// Target environment. Defaults to dev; a `--target` supplies it
-        /// instead, and an explicit value here still wins over the target.
+        /// Target environment. Infers the sole active deployment on redeploy,
+        /// or defaults to dev on a first deploy. A `--target` supplies it
+        /// instead, and an explicit value wins over the target.
         #[arg(long, value_enum)]
         env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
@@ -4192,6 +4227,42 @@ fn emit_boxed(out: Box<dyn curie::ui::CliOutput>) -> Result<()> {
     Ok(())
 }
 
+/// Select the runner image declared by a bundle.
+fn skill_runner_image(plugin_dir: &std::path::Path, image: Option<&str>) -> Result<String> {
+    if let Some(image) = image {
+        return Ok(image.to_string());
+    }
+
+    let declaration = curie::connector_build::load(plugin_dir)
+        .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+    if declaration.runner.is_some() {
+        let lock = curie::connector_build::load_lock(plugin_dir)
+            .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+        return lock
+            .and_then(|lock| lock.runner)
+            .map(|runner| runner.image)
+            .ok_or_else(|| {
+                curie::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Run `curie build --plugin-dir {}` first.",
+                    curie::connector_build::CONNECTORS_FILE,
+                    curie::connector_build::CONNECTOR_LOCK_FILE,
+                    plugin_dir.display(),
+                ))
+                .with_fix(format!(
+                    "Run `curie build --plugin-dir {}` first.",
+                    plugin_dir.display(),
+                ))
+                .into()
+            });
+    }
+
+    Ok(artifacts::resolve_image(
+        None,
+        artifacts::Channel::current(),
+        artifacts::version(),
+    ))
+}
+
 /// Dispatch one parsed command. No subcommand opens the interactive terminal,
 /// matching `curie interactive` / `curie ui`. Returns the command's
 /// `Result`; `main`
@@ -4215,6 +4286,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         }) => match action {
             SreBotAction::Install {
                 observability,
+                observability_only,
                 dry_run,
                 slack_channel,
                 platform_upgrade,
@@ -4225,6 +4297,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 approvers,
             } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
                 observability,
+                observability_only,
                 dry_run,
                 slack_channel,
                 platform_upgrade,
@@ -4238,7 +4311,24 @@ async fn run(command: Option<Command>) -> Result<()> {
             {
                 curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
                 curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+                curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => emit(ready),
             },
+            SreBotAction::Render {
+                out,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+            } => emit(
+                curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+                    out,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                })
+                .await?,
+            ),
             SreBotAction::ProvisionObservability {
                 namespace,
                 release,
@@ -4509,11 +4599,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 replace,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::start(StartOpts {
                     plugin_dir,
                     image,
@@ -4537,11 +4623,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 timeout,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::check(plugin_dir, image, timeout).await
             }
             SkillAction::Approvals {
@@ -4642,11 +4724,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 sampling,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = if model.is_empty() {
+                    artifacts::resolve_image(
+                        image.as_deref(),
+                        artifacts::Channel::current(),
+                        artifacts::version(),
+                    )
+                } else {
+                    let saved = curie::state::load(std::path::Path::new("."))?;
+                    let bundle_dir = saved
+                        .as_ref()
+                        .and_then(|state| state.bundle_snapshot_dir.as_deref())
+                        .or_else(|| saved.as_ref().map(|state| state.plugin_dir.as_str()))
+                        .unwrap_or(".");
+                    skill_runner_image(std::path::Path::new(bundle_dir), image.as_deref())?
+                };
                 commands::eval(
                     cases,
                     case_id,

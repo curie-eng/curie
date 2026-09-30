@@ -1,0 +1,26 @@
+2026-09-24T08:19:13.1131840Z === curie local message --json (release-compose stack) ===
+2026-09-24T08:19:19.6776513Z waiting for worker reply: ok (4.6s)
+2026-09-24T08:19:19.6778347Z continue this conversation: curie local message --continue "..."
+2026-09-24T08:19:19.6792806Z {"finalized":true,"reply":"The run failed (unclassified) after 1 attempt(s). model error: unknown event_id=EvSIM-41ac6726-09db-41e7-9e70-5369909f608f. Flagging for a human.","thread":"1790237953.162285"}
+2026-09-24T08:19:19.7064972Z local-release: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-24T08:19:19.7066622Z local-release: reply is not the fake sentinel (live negative control)
+2026-09-24T08:19:19.7067332Z 
+2026-09-24T08:19:19.7067797Z === curie local eval --dry-run (suite parity, release compose stack) ===
+2026-09-24T08:19:19.7358638Z local-release: suite parity asserted (name and count only, no ids) -- the tier's own loader reported: grade 1 case(s) from suite "weather" against the local tier
+2026-09-24T08:19:19.7359448Z 
+2026-09-24T08:19:19.7359642Z === curie local eval (release compose stack) ===
+2026-09-24T08:19:30.5008689Z sampling: 1 sample(s), majority
+2026-09-24T08:19:30.5009237Z case                   result  time
+2026-09-24T08:19:30.5010309Z reports-a-temperature  ✗ fail  0.0s
+2026-09-24T08:19:30.5016326Z reports-a-temperature replied: <no reply text>
+2026-09-24T08:19:30.5017113Z ⚠ warn  0/1 passed; 1 failed
+2026-09-24T08:19:30.5019109Z 
+2026-09-24T08:19:30.5019293Z === teardown: curie local down ===
+2026-09-24T08:19:43.4875184Z stopping stack: ok (13.0s)
+2026-09-24T08:19:43.7652080Z removed 1 runner container(s)
+2026-09-24T08:19:43.7652552Z volumes kept (fast restart with `curie local up`)
+2026-09-24T08:19:43.7652906Z dev stack stopped
+2026-09-24T08:19:43.7831606Z ##[error]Process completed with exit code 1.
+2026-09-24T08:19:43.7942412Z Post job cleanup.
+2026-09-24T08:19:44.0435562Z ##[group]Generating build summary
+2026-09-24T08:19:44.1134423Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-fOtlDJ/export

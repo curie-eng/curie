@@ -173,6 +173,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/api-service-nodeport-assertions.sh
 
+      - name: helm render assertions (NetworkPolicy warning)
+        run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
+
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
@@ -291,6 +294,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
+
+      - name: helm render assertions (exporters without exporterhelper)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-exporter-helper-optout-assertions.sh
 
       # Opt-in Kubernetes Events receiver for the collector (#2954): off by
       # default, namespace-scoped read-only RBAC, refused into nop-only logs.
