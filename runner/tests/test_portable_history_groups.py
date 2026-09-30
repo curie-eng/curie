@@ -581,3 +581,95 @@ def test_compaction_omits_entire_old_assistant_group_across_rows():
     assert bounded.messages[0] == record.messages[0]
     assert bounded.messages[-1] == record.messages[-1]
     assert bounded.user == record.user and bounded.assistant == record.assistant
+
+
+# Issue #3628 actual durable capture: native and portable each had 15 rows;
+# five tool_use rows differed only by caller={"type": "direct"}. Pinned SDK
+# 0.2.159 _internal.message_parser.parse_message constructs ToolUseBlock from
+# id/name/input only; the adapter projects those same meaningful fields. This
+# narrow observed metadata exception does not authorize dropping unknown fields.
+def _direct_caller_checkpoint(messages, difference=None):
+    import copy
+
+    entries = []
+    for index, message in enumerate(messages):
+        payload = copy.deepcopy(message.to_dict())
+        if message.role == "assistant":
+            payload["id"] = "msg_acme_original"
+            for block in payload["content"]:
+                if block.get("type") == "tool_use":
+                    block["caller"] = {"type": "direct"}
+        entries.append({"type": message.role, "uuid": f"acme-entry-{index}", "message": payload})
+    if difference == "unknown_field":
+        entries[0]["message"]["content"][0]["acme_unknown_metadata"] = "unverified"
+    elif difference == "content_extra":
+        entries[0]["message"]["content"].append({"type": "text", "text": "unmatched native text"})
+    elif difference == "input_change":
+        entries[0]["message"]["content"][0]["input"] = {"file_path": "/tmp/acme-different"}
+    elif difference == "result_change":
+        entries[2]["message"]["content"][0]["content"] = "different meaningful result"
+    elif difference == "non_direct_caller":
+        entries[0]["message"]["content"][0]["caller"] = {"type": "acme-unverified"}
+    entries.append(
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "prompt_snapshot",
+                "systemPrompt": ["old attachment available"],
+            },
+        }
+    )
+    return HarnessReplayState(harness="claude", kind="checkpoint", entries=tuple(entries))
+
+
+def test_pinned_sdk_projects_observed_direct_caller_metadata_only():
+    from claude_agent_sdk._internal.message_parser import parse_message
+    from curie_runner.adapter import model_message_to_conversation
+
+    portable = _call(1, None)
+    native = _direct_caller_checkpoint((portable,)).entries[0]["message"]
+    native["model"] = "acme-model"
+    actual_sdk_message = parse_message({"type": "assistant", "message": native})
+    projected = model_message_to_conversation(actual_sdk_message)
+    assert projected == portable
+    assert projected.content[0]["id"] == "call-acme-1"
+    assert projected.content[0]["input"] == portable.content[0]["input"]
+
+
+def test_legacy_direct_caller_projection_migrates_without_old_prompt(tmp_path):
+    messages = _interleaved(None)
+    checkpoint = _direct_caller_checkpoint(messages)
+    entries = _entries(
+        messages,
+        tmp_path,
+        harness_replay=checkpoint,
+        system_prompt="current attachment unavailable",
+    )
+    assert len(entries) == len(messages)
+    assert [(e["message"]["role"], e["message"]["content"]) for e in entries] == [
+        (m.role, m.content) for m in messages
+    ]
+    assert entries[0]["message"]["id"] == entries[1]["message"]["id"] == entries[3]["message"]["id"]
+    assert all(e["type"] != "attachment" for e in entries)
+
+
+@pytest.mark.parametrize(
+    "difference",
+    [
+        "unknown_field",
+        "content_extra",
+        "input_change",
+        "result_change",
+        "non_direct_caller",
+    ],
+)
+def test_direct_caller_migration_rejects_unknown_or_meaningful_differences(tmp_path, difference):
+    messages = _interleaved(None)
+    checkpoint = _direct_caller_checkpoint(messages, difference)
+    with pytest.raises(HistoryError, match="(?i)group"):
+        _entries(
+            messages,
+            tmp_path,
+            harness_replay=checkpoint,
+            system_prompt="current attachment unavailable",
+        )
