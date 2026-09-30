@@ -604,6 +604,38 @@ server_configs = [
 assert len(server_configs) == 1, f"expected one Prometheus config, found {len(server_configs)}"
 scrape_configs = at(server_configs[0], "scrape_configs")
 
+# The real Alloy DaemonSet pod, not its Service, must enter the shipped
+# namespace-scoped pod scrape job. A healthy but empty collector cannot be
+# detected by Prometheus if this annotation/render boundary is absent.
+alloy_daemonsets = [doc for doc in alloy_docs if doc.get("kind") == "DaemonSet"]
+assert len(alloy_daemonsets) == 1, "Alloy must render one DaemonSet"
+alloy_annotations = at(alloy_daemonsets[0], "spec", "template", "metadata").get("annotations") or {}
+assert alloy_annotations.get("prometheus.io/scrape") == "true", (
+    "Alloy pods must opt in to the shipped Prometheus pod scrape"
+)
+assert alloy_annotations.get("prometheus.io/path") == "/metrics"
+assert alloy_annotations.get("prometheus.io/port") == "12345"
+pod_jobs = [job for job in scrape_configs if job.get("job_name") == "kubernetes-pods"]
+assert len(pod_jobs) == 1, "Prometheus must render one kubernetes-pods scrape job"
+pod_job = pod_jobs[0]
+assert any(
+    config.get("role") == "pod"
+    and discovery_scope(config) == {RELEASE_NAMESPACE}
+    for config in pod_job.get("kubernetes_sd_configs", [])
+), "Alloy pod scrape must stay within the observability namespace"
+alloy_target = {
+    "__address__": "10.0.0.7:12345",
+    "__meta_kubernetes_namespace": RELEASE_NAMESPACE,
+    "__meta_kubernetes_pod_name": "alloy-example",
+    "__meta_kubernetes_pod_node_name": "node-example",
+    "__meta_kubernetes_pod_annotation_prometheus_io_scrape": alloy_annotations["prometheus.io/scrape"],
+    "__meta_kubernetes_pod_annotation_prometheus_io_path": alloy_annotations["prometheus.io/path"],
+    "__meta_kubernetes_pod_annotation_prometheus_io_port": alloy_annotations["prometheus.io/port"],
+}
+assert apply_relabel(alloy_target, pod_job.get("relabel_configs", [])) is not None, (
+    "the rendered kubernetes-pods job must retain the annotated Alloy pod"
+)
+
 if mutation == "scrape-namespace":
     for job in scrape_configs:
         for sd_config in job.get("kubernetes_sd_configs", []):
