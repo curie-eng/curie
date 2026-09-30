@@ -45,8 +45,8 @@ from queue_fixtures import qevent  # noqa: E402
 from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
 _REFUSAL = (
-    "This agent cannot start: its runner does not enforce read-only tool access, "
-    "so this turn was not run."
+    "This agent cannot start: its runner cannot enforce read-only tool access for "
+    "this turn, so the turn was not run."
 )
 _APPROVAL_REFUSAL = (
     "This read-only turn asked for an approval, which it may not do. "
@@ -335,6 +335,28 @@ def test_a_runner_that_cannot_enforce_is_never_sent_the_turn(
             await h.kernel.process_event(turn)
 
             assert session.queries == []
+            assert h.sink.last_text == _REFUSAL
+        assert _refused_builtin_calls(tool_results) == 0
+
+    asyncio.run(go())
+
+
+def test_a_runner_session_that_ran_an_ordinary_turn_is_not_sent_a_read_only_one(
+    make_harness, tmp_path: Path, tool_results: InMemoryMetricReader
+) -> None:
+    # @spec WORKER-TOOL-ACCESS-2: the real runner stops advertising read-only
+    # once its session has sent an unrestricted prompt (RUNNER-TOOL-ACCESS-4),
+    # and the worker reads that from the same runner before sending.
+    async def go() -> None:
+        runner = _booted_runner(tmp_path)
+        await runner.start()
+        async with make_harness(runner_app=create_runner_app(runner)) as h:
+            await h.kernel.process_event(_qevent("an ordinary question", thread="th-ro-11"))
+            assert h.sink.last_text is not None and h.sink.last_text.endswith("all done")
+
+            turn = _restricted(thread="th-ro-12")
+            await h.kernel.process_event(turn)
+
             assert h.sink.last_text == _REFUSAL
         assert _refused_builtin_calls(tool_results) == 0
 
