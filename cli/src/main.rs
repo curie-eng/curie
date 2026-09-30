@@ -740,6 +740,10 @@ enum Command {
     Example {
         #[command(subcommand)]
         action: ExampleAction,
+        /// Kubernetes context for every helm and kubectl call. Defaults to the
+        /// kubeconfig current-context, which is resolved once and pinned.
+        #[arg(long, global = true, value_name = "NAME")]
+        context: Option<String>,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -4282,73 +4286,85 @@ async fn run(command: Option<Command>) -> Result<()> {
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
             action: ExampleAction::SreBot { action },
-        }) => match action {
-            SreBotAction::Install {
-                observability,
-                observability_only,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-                observability,
-                observability_only,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            })
-            .await?
-            {
-                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
-                curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => emit(ready),
-            },
-            SreBotAction::Render {
-                out,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-            } => emit(
-                curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+            context,
+        }) => {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
+            match action {
+                SreBotAction::Install {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                })
+                .await?
+                {
+                    curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                    curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+                    curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => {
+                        emit(ready)
+                    }
+                },
+                SreBotAction::Render {
                     out,
                     platform_upgrade,
                     namespace,
                     release,
                     observability_namespace,
-                })
-                .await?,
-            ),
-            SreBotAction::ProvisionObservability {
-                namespace,
-                release,
-                observability_namespace,
-                chart,
-                dry_run,
-            } => match curie::examples::provision_observability(
-                curie::examples::ObservabilityProvisionOpts {
+                } => emit(
+                    curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+                        out,
+                        platform_upgrade,
+                        namespace,
+                        release,
+                        observability_namespace,
+                    })
+                    .await?,
+                ),
+                SreBotAction::ProvisionObservability {
                     namespace,
                     release,
                     observability_namespace,
                     chart,
                     dry_run,
+                } => match curie::examples::provision_observability(
+                    curie::examples::ObservabilityProvisionOpts {
+                        namespace,
+                        release,
+                        observability_namespace,
+                        chart,
+                        dry_run,
+                    },
+                )
+                .await?
+                {
+                    curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                    curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
                 },
-            )
-            .await?
-            {
-                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
-                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
-            },
-        },
+            }
+        }
         Some(Command::Build {
             tag,
             plugin_dir,
