@@ -25,6 +25,13 @@ its earlier state as historical and its current state as unverified. A collectiv
 claim such as "both refusal alerts are firing now" requires fresh evidence for
 both alerts; a shared symptom or prior root message does not supply it.
 
+A reported episode start and one current firing sample establish an episode
+identity and a state at the sample time. They do not prove continuous failures
+of the underlying service since that start. Elapsed episode time may be reported
+as elapsed episode time, but claims that turns were refused throughout a
+duration, or continuously since the start, require covering history of that
+behavior. Without that history, say the continuous impact is unverified.
+
 If the prior reply omitted the exact name, or available tools cannot identify
 that alarm, state that attribution and current state remain unverified. Ask for
 the original payload or provider read instead of substituting another rule.
