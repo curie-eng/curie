@@ -29,7 +29,7 @@ from .schemas import WebhookResult
 logger = logging.getLogger(__name__)
 
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_DEDUP_TTL_SECONDS = 86400
+_DEDUP_TTL_SECONDS = 31 * 86400
 _OUTBOX_BATCH = 100
 _OUTBOX_RETENTION = timedelta(days=30)
 _PUBLISH_ONCE = """
@@ -116,6 +116,8 @@ class DeployNoticeQueue:
                 encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
                 identity = f"{self._stream}\0{full_name}\0{ref}\0{sha}\0{agent.id}\0{encoded}"
                 digest = hashlib.sha256(identity.encode()).hexdigest()
+                notice["notice_key"] = digest
+                encoded = json.dumps(notice, sort_keys=True, separators=(",", ":"))
                 rows.append({"key": digest, "stream": self._stream, "payload": encoded})
         if not rows:
             return 0

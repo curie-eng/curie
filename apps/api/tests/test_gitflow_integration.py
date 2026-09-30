@@ -631,6 +631,7 @@ def test_notice_outbox_recovers_after_valkey_outage_and_api_restart(
                 assert rows[0].enqueued_at is None
                 assert rows[0].stream == stream
                 assert rows[0].attempts == 1
+                assert json.loads(rows[0].payload)["notice_key"] == rows[0].key
 
             await valkey.delete(stream)
             restarted = DeployNoticeQueue(valkey, stream)
@@ -656,12 +657,19 @@ def test_notice_outbox_recovers_after_valkey_outage_and_api_restart(
             notice = json.loads((await valkey.xrange(stream))[0][1]["payload"])
             assert notice["status"] == "rejected"
             assert notice["agent_name"] == "gitflow-agent"
+            assert notice["notice_key"] == row.key
         finally:
             await valkey.delete(stream)
             await valkey.aclose()
             await engine.dispose()
 
     asyncio.run(exercise())
+
+
+def test_notice_marker_lasts_beyond_outbox_retention() -> None:
+    from curie_api.deploy_notice import _DEDUP_TTL_SECONDS, _OUTBOX_RETENTION
+
+    assert _DEDUP_TTL_SECONDS > _OUTBOX_RETENTION.total_seconds()
 
 
 def test_webhook_reports_outbox_persistence_failure_instead_of_false_success(

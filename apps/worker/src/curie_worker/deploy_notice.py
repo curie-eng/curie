@@ -36,6 +36,7 @@ class DeployNotice(BaseModel):
     sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     environment: Literal["dev", "prod"] | None
     codes: list[str]
+    notice_key: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 def render_notice(notice: DeployNotice) -> str:
@@ -181,7 +182,11 @@ class DeployNoticeConsumer(StreamConsumer):
                     delivery_id=str(
                         uuid.uuid5(
                             uuid.NAMESPACE_URL,
-                            f"curie:deploy-notice:{self._stream}:{entry_id}",
+                            (
+                                f"curie:deploy-notice:{notice.notice_key}"
+                                if notice.notice_key is not None
+                                else f"curie:deploy-notice:{self._stream}:{entry_id}"
+                            ),
                         )
                     ),
                 )

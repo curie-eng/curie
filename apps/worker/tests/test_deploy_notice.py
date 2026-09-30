@@ -163,6 +163,78 @@ def test_malformed_notice_is_dead_lettered_and_acked(
     asyncio.run(go())
 
 
+def test_reenqueued_notice_keeps_one_slack_delivery_identity(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A lost SQL settlement can enqueue the same outbox row twice."""
+
+    async def go() -> None:
+        capture = Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        assert server.port is not None
+        config = WorkerConfig(
+            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
+            read_block_ms=100,
+            key_prefix=names["prefix"],
+        )
+        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        valkey = AsyncRedis(
+            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
+        )
+        consumer = DeployNoticeConsumer(
+            redis=valkey,
+            sink=sink,
+            config=config,
+            stream=names["stream"],
+            group=names["group"],
+            consumer="notice-reenqueue",
+            leases=DeliveryLeaseStore(valkey, config),
+        )
+        task = asyncio.create_task(consumer.run())
+        try:
+            notice = {
+                "address": "C0EXAMPLE1",
+                "identity": "ops",
+                "agent_name": "acme-dev",
+                "status": "deployed",
+                "sha": "a" * 40,
+                "environment": "dev",
+                "codes": [],
+                "notice_key": "b" * 64,
+            }
+            entries = [
+                await valkey.xadd(names["stream"], {"payload": json.dumps(notice)})
+                for _ in range(2)
+            ]
+            for _ in range(100):
+                if len(capture.requests) == 2:
+                    break
+                await asyncio.sleep(0.05)
+            assert len(capture.requests) == 2
+            # https://docs.slack.dev/reference/methods/chat.postMessage/
+            # documents client_msg_id; test_live.py pins the ambiguous-retry
+            # behavior against a real Slack test workspace.
+            assert {
+                json.loads(request["body"])["client_msg_id"]
+                for request in capture.requests
+            } == {
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"curie:deploy-notice:{notice['notice_key']}"))
+            }
+            for entry in entries:
+                assert await valkey.xpending_range(
+                    names["stream"], names["group"], min=entry, max=entry, count=1
+                ) == []
+        finally:
+            consumer.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+            await sink.aclose()
+            await valkey.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
 def test_notice_never_falls_back_to_another_slack_identity(
     sync_redis: redis.Redis, names: dict[str, str]
 ) -> None:
