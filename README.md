@@ -197,12 +197,13 @@ curie cluster deploy --plugin-dir . --repo <owner>/<name>
 curie cluster message "hello, are you there?"
 ```
 
-`--repo` binds this agent to the GitHub repository you will push this bundle to in step 4. A push
-is matched to an agent by its repo binding, so a push for an agent deployed without the binding
-matches nothing and is answered `ignored`, never becoming a version. That binding is set only when
-the agent is first created and cannot be changed afterwards, so substitute your own `owner/name`
-before running it: getting it wrong means deleting the agent and recreating it. See
-[`cli/README.md`](cli/README.md) for the lifecycle verbs.
+`--repo` binds this agent to the GitHub repository whose pushes will deploy
+it in step 4. A later deploy can bind an unbound agent; it refuses to replace
+an existing different binding. The API's `PATCH /agents/{id}` can explicitly
+change `repo_full_name`. The bundle's `deploy.yaml` selects the agent for the
+pushed branch's environment when several agents share that repository. See
+[`git-flow routing`](docs/operations.md#automatically-with-git-flow) for the
+single-agent fallback and target refusal codes.
 
 Plain `cluster up` infers Anthropic or OpenRouter egress from an unambiguous
 credential prefix. On minikube, the first admission attempt reports that its
@@ -244,9 +245,10 @@ the webhook and its secret (see [`docs/operations.md`](docs/operations.md#automa
 git push origin dev
 ```
 
-Every push is stored as an immutable, versioned bundle and deployed under your `dev` bot
-automatically. Merging to prod promotes that same version, not a rebuild, so you always
-know exactly what's live and can roll back to any version.
+A matching dev push stores an immutable, versioned bundle and deploys it under
+your dev bot. Merging that SHA to prod reuses the stored bundle. Each target agent
+owns its own Version row pointing to that object, so you can identify what is
+live and roll back to an earlier version.
 
 No Slack event loop, no queue, no sandbox plumbing to write. You asked the same bundle
 to run somewhere bigger, then told it to ship itself.

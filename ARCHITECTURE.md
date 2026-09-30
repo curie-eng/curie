@@ -78,20 +78,23 @@ on 2026-08-20.
 
 ### Git flow deploy
 
+The routing and bundle-reuse rows below were refreshed against `main` commit
+`8a100864b` on 2026-09-30.
+
 | Clause | Status | Evidence and limit |
 | --- | --- | --- |
 | Webhook push ingress verifies HMAC | ENFORCED | `apps/api/src/curie_api/routers/github.py::github_webhook` rejects before dispatch unless `gitflow.verify_signature` accepts the raw body and `X-Hub-Signature-256`. `apps/api/tests/test_gitflow_integration.py::test_invalid_signature_is_401` covers the route. `apps/api/src/curie_api/commitpoller.py::CommitPoller` is a separate outbound GitHub API ingress without HMAC. |
 | Webhook and commit poller ingress converge on one push flow | ENFORCED | `apps/api/src/curie_api/routers/github.py` and `apps/api/src/curie_api/commitpoller.py` both hand a push payload to `apps/api/src/curie_api/gitflow.py::process_push`. `apps/api/tests/test_commitpoller.py::test_the_payload_is_shaped_like_a_real_webhook` pins the poller payload shape used by that flow. |
 | Only configured deploy branch refs deploy | ENFORCED | `apps/api/src/curie_api/gitflow.py::environment_for_ref` accepts only exact configured `refs/heads/` values. `test_environment_for_ref_requires_exact_head_ref` and `test_non_deploy_branch_is_ignored` reject tags and other branches. |
-| A deploy archives the pushed SHA | ENFORCED | `apps/api/src/curie_api/gitflow.py::process_push` validates a full SHA and `clone_and_archive` runs `git archive` against the stored repository binding. `test_clone_and_archive_rejects_invalid_sha_before_any_subprocess`, `test_clone_hands_git_the_derived_origin_not_the_payload_url`, and `test_dev_push_deploys_dev_bot` pin that path. |
+| A newly fetched bundle archives the pushed SHA | ENFORCED | `apps/api/src/curie_api/gitflow.py::process_push` validates the SHA format and clone origin on both paths. Dev always calls `clone_and_archive`; prod skips the remote when a stored bundle for that SHA exists in the bound repository. `test_clone_and_archive_rejects_invalid_sha_before_any_subprocess`, `test_clone_hands_git_the_derived_origin_not_the_payload_url`, and `test_dev_push_deploys_dev_bot` pin the archive path. |
 | A pushed bundle is validated | ENFORCED | `gitflow.process_push` calls `deploy.validate_archive`, `bundles.extract_and_validate`, and `plugin_format.validate_bundle`. `apps/api/tests/test_gitflow_integration.py::test_malformed_bundle_push_is_rejected` proves an invalid archive cannot become a deployment. |
 | A dev push stores a version and dev deployment | ENFORCED | `gitflow.process_push` calls `crud.create_version_row`, `deploy.store_bundle`, and `crud.create_deployment_row`. `apps/api/tests/test_gitflow_integration.py::test_dev_push_deploys_dev_bot` proves the bundle, version, and deployment in Postgres and RustFS. |
 | Version bundles are write once | VALIDATED-ONLY | `apps/api/src/curie_api/routers/bundles.py::upload_bundle` rejects sequential replacement with 409, and `apps/api/tests/test_bundles.py::test_bundles_are_immutable` pins that behavior. `apps/api/src/curie_api/crud.py::attach_bundle` has no compare and swap, so concurrent uploads are not an enforced immutability invariant. |
 | A new dev bundle fans out one eval job | ENFORCED | `gitflow.process_push` enqueues only for a newly built dev bundle. `apps/api/tests/test_evalqueue_integration.py::test_dev_push_fans_out_prod_push_does_not` proves the Valkey stream write, and `test_redelivered_dev_push_does_not_refan_out` proves deduplication. |
 | A graded eval posts its commit status | VALIDATED-ONLY | `apps/api/src/curie_api/routers/evals.py::report_eval` maps a report through `GitHubStatusReporter.report_eval`, and `apps/api/tests/test_github_checks.py::test_report_eval_posts_the_exact_commit_status` pins that payload. It needs a GitHub token, and `apps/worker/src/curie_worker/eval/stream.py` treats worker reporting failure as nonfatal. |
 | A red eval blocks prod promotion | RESERVED | `apps/api/src/curie_api/gitflow.py::process_push` does not read an eval result or commit status before creating a prod deployment. Curie does not configure or verify external repository branch protection. |
-| A prod deployment reuses an existing built version | ENFORCED | `gitflow.get_version_by_commit` and `_sibling_bundle` reuse stored artifacts when present. `test_main_push_promotes_and_reuses_the_built_version` and `test_prod_promotes_the_exact_artifact_dev_validated` require shared version identity or `bundle_ref` and commit SHA. |
-| A prod push requires a prebuilt dev artifact | RESERVED | `gitflow.process_push` archives and validates before checking for an existing version, then creates or repairs a bundle for either environment. `test_partial_version_is_rebuilt_not_reused` confirms this repair path, so a prod first push can build and deploy. |
+| A prod deployment reuses an existing stored bundle | ENFORCED | `gitflow.get_version_by_commit` and `_sibling_bundle` reuse stored artifacts when present. Each target agent owns its own Version row; sibling rows share `bundle_ref` and commit SHA. `test_main_push_promotes_and_reuses_the_built_version` and `test_prod_promotes_the_exact_artifact_dev_validated` cover same-agent and sibling-agent reuse. |
+| A prod push requires a prebuilt dev artifact | RESERVED | `gitflow.process_push` looks for a stored bundle before cloning on prod. If none exists, it archives and validates, then creates or repairs a bundle. `test_partial_version_is_rebuilt_not_reused` confirms this repair path, so a prod first push can build and deploy. |
 | Webhook and manual deployments share persistence | ENFORCED | Webhooks use `crud.create_version_row` and `crud.create_deployment_row`; `apps/api/src/curie_api/routers/agents.py` and `apps/api/src/curie_api/routers/deployments.py` use the same CRUD rows. |
 | Listed clients use the same bundle validator | ENFORCED | The webhook calls `deploy.validate_archive`; `apps/ui/src/views/wired/WiredAgentDetail.tsx` calls `createVersion`, `uploadBundle`, and `createDeployment`; the upload route uses that validator. `cli/src/api.rs` follows the sequence, pinned by the deploy contract test in `cli/tests/api_deploy.rs`. |
 | The server enforces one deployment pipeline | VALIDATED-ONLY | Listed clients follow the intended sequence, but `schemas.VersionCreate` accepts `bundle_ref` and `apps/api/src/curie_api/routers/deployments.py` permits a deployment with no bundle because `revalidate_stored_bundle` returns when `bundle_ref` is absent. Client behavior is validated, not a server invariant. |
@@ -383,17 +386,22 @@ Three properties keep an approval from becoming a standing permission:
 
 ## Pushing agent versions with git (deploy flow)
 
-A push is verified with an HMAC (Hash-based Message Authentication Code)
-signature. The delivery that **builds** the bundle -- archiving, validating,
-and storing it as an immutable versioned bundle -- is a **dev-branch** push,
-which then fans out its eval suite as a CI check. A **prod-branch** push
-promotes that same artifact without rebuilding: if the pushed sha already has
-a stored bundle for this repository, the promote fetches its bytes straight
-from the object store and skips both the clone and the re-validation, which is
-why a prod promote does not need access to the git remote (#1211). Either way
-the deployed artifact is still the exact object that was validated when it was
-first built; the promote only re-checks its bounds against current caps
-(`deploy.revalidate_stored_bundle`, ADR-0059 decision 3). One diagram, both
+The webhook verifies each push with an HMAC (Hash-based Message Authentication
+Code) signature. The API maps its ref to the configured dev or prod environment,
+finds repository-bound candidate agents, then reads the bundle's `deploy.yaml`
+to select one target agent. Missing or empty targets fall back only when one
+agent is bound; a declared map with no matching environment is ignored. The
+operator routing rules and refusals are documented in
+[`docs/operations.md`](docs/operations.md#automatically-with-git-flow).
+
+A **dev-branch** delivery always clones, archives and validates, even on
+redelivery. A **prod-branch** delivery with a stored bundle for the pushed SHA
+reads those bytes and targets from the object store, skipping the remote clone
+and full validation (#1211). Without a stored bundle, prod builds it too.
+Every target agent owns its own Version row; dev and prod rows can point to the
+same immutable object. The promote still checks stored-bundle bounds under
+current caps (`deploy.revalidate_stored_bundle`, ADR-0059 decision 3). Newly
+built dev bundles fan out evals; prod deployments do not. One diagram, both
 branches:
 
 There are **two ways a push reaches this flow**, and they converge immediately.
@@ -423,8 +431,10 @@ sequenceDiagram
         API->>API: clone_and_archive(sha)
         API->>PF: validate_bundle(archived tree)
         PF-->>API: ValidationResult (path-qualified errors)
-        API->>S3: store immutable versioned bundle
-        API->>PG: create Version + Deployment (env=dev)
+        API->>API: select dev target (or sole bound agent fallback)
+        API->>PG: find or create target agent Version
+        API->>S3: store bundle if newly built, otherwise reuse stored object
+        API->>PG: attach bundle_ref and create Deployment (env=dev)
         Note over API: the dev bot now serves this sha
         API->>V: XADD curie:evals {job} (deduped)
         W->>V: XREADGROUP (separate eval consumer group)
@@ -433,16 +443,24 @@ sequenceDiagram
         W->>API: POST /evals/report
         API->>GH: set commit status (pass/fail)
     else push to prod branch
-        API->>PG: find the already-built Version for this sha
-        API->>PG: create Deployment (env=prod)
-        Note over API: promotes the same artifact, no rebuild
+        API->>PG: find stored bundle for sha across repo-bound agents
+        alt stored bundle exists
+            API->>S3: read immutable bundle and deploy.yaml
+        else no stored bundle
+            API->>API: clone_and_archive(sha), validate bundle
+        end
+        API->>API: select prod target (or sole bound agent fallback)
+        API->>PG: find or create target agent Version
+        API->>S3: store bundle only if no reusable object exists
+        API->>PG: attach bundle_ref and create Deployment (env=prod)
+        Note over API: sibling Versions share an object, not a row
     end
 ```
 
 - **Git-flow fan-out** in [`apps/api/src/curie_api/gitflow.py`](apps/api/src/curie_api/gitflow.py):
   - HMAC signature verify at [`::verify_signature`](apps/api/src/curie_api/gitflow.py)
   - archive at [`::clone_and_archive`](apps/api/src/curie_api/gitflow.py)
-  - the branch fan-out itself at [`::process_push`](apps/api/src/curie_api/gitflow.py) — one function that resolves the ref to an environment ([`::environment_for_ref`](apps/api/src/curie_api/gitflow.py)), then either archives+validates+stores+creates a Version and enqueues its evals (dev, deduped on redelivery) or **promotes the already-built artifact without rebuilding** (prod)
+  - the branch fan-out itself at [`::process_push`](apps/api/src/curie_api/gitflow.py) — one function that resolves the ref to an environment ([`::environment_for_ref`](apps/api/src/curie_api/gitflow.py)), then either archives+validates+stores+creates a Version and enqueues its evals (dev, deduped on redelivery) or **reuses a stored bundle without fetching the remote when available** (prod). Each target agent owns a Version row; sibling rows can share one immutable stored object
 
   The webhook receiver is at [`apps/api/src/curie_api/routers/github.py::github_webhook`](apps/api/src/curie_api/routers/github.py).
 - **Eval stream** `curie:evals` is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EVAL_STREAM`](apps/api/src/curie_api/evalqueue.py)) and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
