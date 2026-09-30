@@ -906,7 +906,9 @@ def test_a_captured_delivery_resent_under_a_new_delivery_id_is_refused(
 
 @pytest.mark.parametrize(
     "offset_s",
-    [-(hook_signing.TOLERANCE_S + 1), hook_signing.TOLERANCE_S + 1],
+    # Generous offsets so request latency cannot carry a future stamp back into
+    # the window; the exact boundary is pinned by the deterministic verify test.
+    [-(hook_signing.TOLERANCE_S + 60), hook_signing.TOLERANCE_S + 60],
     ids=["too-old", "too-far-in-the-future"],
 )
 def test_a_correctly_signed_delivery_outside_the_window_is_refused(
@@ -955,8 +957,17 @@ def test_a_delivery_just_inside_the_window_is_accepted(
 
 @pytest.mark.parametrize(
     "template",
-    [None, "", "12a", "{now}a", "+{now}", "{now}.0"],
-    ids=["missing", "empty", "letters", "trailing-letter", "plus-sign", "decimal"],
+    [None, "", "12a", "{now}a", "+{now}", "{now}.0", "9" * 400, "1" * 13],
+    ids=[
+        "missing",
+        "empty",
+        "letters",
+        "trailing-letter",
+        "plus-sign",
+        "decimal",
+        "four-hundred-digits",
+        "thirteen-digits",
+    ],
 )
 def test_a_missing_or_malformed_timestamp_is_refused(
     hooks_client: TestClient,
@@ -968,7 +979,9 @@ def test_a_missing_or_malformed_timestamp_is_refused(
 ) -> None:
     """The signature itself is valid over whatever timestamp was presented, and
     the `{now}` cases name the current second, so the refusal is the digits-only
-    check alone rather than the window, answered as a bad signature."""
+    check alone rather than the window, answered as a bad signature. The
+    over-long digit strings would overflow the window arithmetic if converted, so
+    they pin the length bound: a 401, never a 500."""
 
     agent_id = _bind(hooks_client, auth_headers, name="badstampagent")
     body = b"{}"
@@ -989,6 +1002,48 @@ def test_a_missing_or_malformed_timestamp_is_refused(
     assert refused.status_code == 401, refused.text
     assert refused.json()["detail"] == "missing or invalid signature"
     assert _queued(valkey, runs_stream) == []
+
+
+def test_a_signature_cannot_be_moved_across_the_id_and_body_boundary(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """Id `d` with body `hello.world` and id `d.hello` with body `world` sign the
+    same bytes. The first is an honest delivery; the second reuses its signature
+    to carry a different body under a fresh dedupe key, and must be refused."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="boundaryagent")
+    ts = _now()
+    signature = _sign(_secret_for(agent_id), b"hello.world", timestamp=ts, delivery_id="d")
+
+    original = _post(
+        hooks_client,
+        agent_id,
+        "issues",
+        b"hello.world",
+        signature=signature,
+        delivery_id="d",
+        timestamp=ts,
+    )
+    assert original.status_code == 200, original.text
+    assert len(_queued(valkey, runs_stream)) == 1
+
+    shifted = _post(
+        hooks_client,
+        agent_id,
+        "issues",
+        b"world",
+        signature=signature,
+        delivery_id="d.hello",
+        timestamp=ts,
+    )
+
+    assert shifted.status_code == 401, shifted.text
+    assert shifted.json()["detail"] == "missing or invalid signature"
+    assert len(_queued(valkey, runs_stream)) == 1
 
 
 def test_a_retry_re_signed_with_a_fresh_timestamp_is_a_duplicate(
@@ -1080,3 +1135,23 @@ def test_the_production_signer_matches_the_pinned_wire_format() -> None:
     assert hook_signing.sign("s", timestamp="1800000000", delivery_id="d-1", body=body) == _sign(
         "s", body, timestamp="1800000000", delivery_id="d-1"
     )
+
+
+def test_verify_refuses_a_dotted_delivery_id_and_sign_will_not_produce_one() -> None:
+    """A signature correctly computed over a dotted id is still refused, since the
+    dot is the delimiter; the production signer raises rather than emit one."""
+
+    secret = "dot-secret"
+    body = b"world"
+    stamp = "1800000000"
+
+    assert not hook_signing.verify(
+        secret,
+        timestamp=stamp,
+        delivery_id="d.hello",
+        body=body,
+        header=_sign(secret, body, timestamp=stamp, delivery_id="d.hello"),
+        now=1_800_000_000.0,
+    )
+    with pytest.raises(ValueError):
+        hook_signing.sign(secret, timestamp=stamp, delivery_id="d.hello", body=body)

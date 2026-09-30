@@ -63,8 +63,9 @@ another hardcoded handler. The five that exist:
 - **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
   `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over
   `X-Curie-Timestamp`, `X-Curie-Delivery-Id` and the raw body (signed as
-  `{timestamp}.{delivery_id}.` followed by the body), refuses a timestamp more
-  than 5 minutes from the server clock with the same 401 as a bad signature,
+  `{timestamp}.{delivery_id}.` followed by the body; the delivery id may not
+  contain `.`, which would make that boundary ambiguous), refuses a timestamp
+  more than 5 minutes from the server clock with the same 401 as a bad signature,
   claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the

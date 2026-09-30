@@ -34,6 +34,12 @@ into the signature ties one signature to one dedupe key; binding a timestamp and
 refusing any outside ``TOLERANCE_S`` bounds how long a captured request is worth
 anything at all. There is one scheme and no body-only fallback: a verifier that
 still accepted the old shape would reopen exactly what this closes.
+
+The ``.`` is the delimiter, so both boundaries must be fixed for the material to
+parse one way only. A digits-only timestamp fixes the first. A delivery id that
+may contain ``.`` would leave the second movable, letting bytes shift between the
+id and the body under one signature. A delivery id therefore may not contain
+``.``; ``sign`` refuses one and ``verify`` rejects one.
 """
 
 from __future__ import annotations
@@ -62,6 +68,12 @@ TIMESTAMP_HEADER = "X-Curie-Timestamp"
 # long. Delivery receipts never expire once enqueued (``delivery``), so a
 # retry inside the window that reuses its delivery id is still deduplicated.
 TOLERANCE_S = 300
+
+# The longest timestamp string ``verify`` will convert. Twelve digits covers unix
+# seconds for tens of thousands of years; anything longer cannot be in the window,
+# and an unbounded digit string would make ``int()`` or the float subtraction
+# raise (a 500) instead of refusing with the uniform 401.
+MAX_TIMESTAMP_DIGITS = 12
 
 # The label that separates this derivation from every other use of ``api_key``.
 # Without it a hook secret and some future token derived from the same key over
@@ -98,8 +110,14 @@ def sign(secret: str, *, timestamp: str, delivery_id: str, body: bytes) -> str:
         timestamp: The integer unix-seconds time sent in ``TIMESTAMP_HEADER``.
         delivery_id: The id sent in ``DELIVERY_HEADER``.
         body: The exact request body bytes.
+
+    Raises:
+        ValueError: ``delivery_id`` contains ``.``, the material delimiter, which
+            would let bytes shift between the id and the body.
     """
 
+    if "." in delivery_id:
+        raise ValueError("a hook delivery id may not contain '.'")
     digest = hmac.new(secret.encode(), _material(timestamp, delivery_id, body), hashlib.sha256)
     return "sha256=" + digest.hexdigest()
 
@@ -119,7 +137,10 @@ def verify(
     delivery id is signed because it is the deduplication key: left unsigned, a
     captured body could be resent under a new id and accepted as a new delivery.
     The timestamp is signed, and refused outside ``TOLERANCE_S`` of ``now``, so a
-    captured request stops being usable at all once the window passes.
+    captured request stops being usable at all once the window passes. A
+    delivery id containing ``.`` is refused before any HMAC is computed: the dot
+    is the material delimiter, so such an id would make the id and body boundary
+    ambiguous.
 
     The raw bytes are signed, never a re-serialization: any parse-then-dump round
     trip can change whitespace or key order, and a signature checked against
@@ -148,6 +169,10 @@ def verify(
     # ASCII digits only: ``int()`` alone would also take a sign, whitespace,
     # underscores and non-ASCII digits, each a second spelling of one time.
     if not timestamp or not (timestamp.isascii() and timestamp.isdigit()):
+        return False
+    if len(timestamp) > MAX_TIMESTAMP_DIGITS:
+        return False
+    if "." in delivery_id:
         return False
     current = time.time() if now is None else now
     if abs(current - int(timestamp)) > TOLERANCE_S:

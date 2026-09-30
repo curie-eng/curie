@@ -7,6 +7,8 @@ assigns a stable delivery id, stamps the current unix time, signs
 POSTs to ``POST /hooks/{agent}/{hook}`` with ``X-Curie-Timestamp`` and
 ``X-Curie-Delivery-Id`` alongside the signature. Curie refuses a timestamp more
 than five minutes from its clock, so the forwarder must be roughly in sync.
+The delivery id must not contain "." (the signed-material delimiter); the hex ids
+this adapter assigns never do.
 
 Environment:
   CURIE_HOOK_URL       Full ingest URL, including agent id and hook name
