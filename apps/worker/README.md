@@ -62,6 +62,43 @@ Slack binding independently of that delivery adapter (INGRESS-CANARY-1).
   retains prod-over-dev and most-recent ordering. A stale or undeployed named
   route cannot run or answer as a different identity.
 
+### Per-turn tool access
+
+The worker's half of TOOL-ACCESS in
+[the ACI producer seam](../../docs/interfaces/aci-producer/INTERFACE.md), for a
+queued turn whose `tool_access` is set (a canary sets `read-only`):
+
+- **WORKER-TOOL-ACCESS-1:** The worker forwards `QueuedTurn.tool_access`
+  unchanged as `Event.tool_access` on the turn it opens. A turn without it opens
+  exactly as before, with no extra runner call.
+- **WORKER-TOOL-ACCESS-2:** Whichever path opens a restricted turn on a
+  runner (a fresh claim, a replacement, an attachment handoff, a work-item
+  continuation), the worker first reads the status of that runner, from that
+  sandbox's own address with its own token when it has one, and opens the
+  turn only when the value is listed under `tool_access`. A status that
+  answers without it means the runner would run the turn unrestricted, or
+  cannot enforce it on this session, so the model is never asked: the turn
+  fails once, escalated with the class `tool-access-unenforced` and the text
+  `This agent cannot start: its runner cannot enforce read-only tool access
+  for this turn, so the turn was not run.`, and is not retried. A status that
+  cannot be read, or is not a JSON object, opens nothing and is retried like
+  any turn the runner did not accept. The read is bounded to two seconds.
+- **WORKER-TOOL-ACCESS-3:** A restricted turn never steers a live turn: when
+  the thread has one, it is not started and the delivery stays pending for a
+  later redelivery, as a job's does (ADR-0079), and a capacity wake re-parks
+  it instead. It never takes a greeting or help pack's canned reply, which
+  would answer it without a runner.
+- **WORKER-TOOL-ACCESS-4:** The worker never creates an approval from a
+  `read-only` turn and never delivers an approval grant to its boot. A runner
+  final that nonetheless ends `awaiting-approval` records no approval and
+  posts no card; the turn is a failed turn, escalated with the reply `This
+  read-only turn asked for an approval, which it may not do. No approval was
+  created.`
+- **WORKER-TOOL-ACCESS-5:** The runner's own refusal classes for a restricted
+  turn, `tool-access-unenforced` and `tool-access-refused`, are platform error
+  classes: a turn the runner refuses escalates under its class, never as
+  `unclassified`.
+
 ## The eval lane (`curie_worker.eval`)
 
 Runs an eval suite against a plugin version and records the grid the eval matrix

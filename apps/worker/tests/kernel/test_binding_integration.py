@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import curie_worker.binding as binding_module
-from aci_protocol import Final, SessionStatus, TextDelta
+from aci_protocol import Final, SessionStatus, TextDelta, ToolAccess
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -798,6 +798,28 @@ def test_fresh_thread_non_matching_message_runs_a_normal_turn(make_harness) -> N
             assert len(h.fake_k8s.claim_envs) == 1
             assert h.sink.last_text != _GREET
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_a_read_only_greeting_is_never_answered_from_the_pack(make_harness) -> None:
+    # @spec WORKER-TOOL-ACCESS-3: the canned reply would answer a probe with no
+    # runner at all, so a restricted turn goes to the runner like any other.
+    async def go() -> None:
+        packs = {"greeting": {"enabled": True, "phrases": ["hi", "hello"], "reply": _GREET}}
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="MODEL", status=DONE)]
+            h.runner.tool_access_enforced = ["read-only"]
+            ev = _qevent("hi", channel="C-bound", thread="tGreetReadOnly").model_copy(
+                update={"tool_access": ToolAccess.READ_ONLY}
+            )
+
+            await h.kernel.process_event(ev)
+
+            assert h.sink.last_text == "MODEL"
+            assert h.runner.opened == ["hi"]
+            assert h.runner.event_bodies[0]["tool_access"] == "read-only"
 
     asyncio.run(go())
 

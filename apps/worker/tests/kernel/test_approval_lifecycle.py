@@ -636,6 +636,7 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
             SimpleNamespace(
                 text="Continue https://github.com/acme-corp/acme-bot",
                 user="U0REQUEST1",
+                tool_access=None,
             ),
             {},
             queued_event_id="test-event",
@@ -779,6 +780,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
         event = SimpleNamespace(
             text="Continue https://github.com/acme-corp/acme-bot",
             user="U0REQUEST1",
+            tool_access=None,
         )
 
         first = await kernel._route_and_start(
@@ -2839,6 +2841,38 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             assert "CURIE_APPROVAL_GRANT_TOOL" not in fresh_env
             assert "CURIE_APPROVAL_GRANT_ARGUMENTS" not in fresh_env
             assert "CURIE_APPROVAL_DECISION" not in fresh_env
+
+    asyncio.run(go())
+
+
+def test_a_read_only_turn_never_boots_with_an_approval_grant(make_harness) -> None:
+    """WORKER-TOOL-ACCESS-4: even carrying an approval resume's event id.
+
+    A resume event id is platform-minted, so a read-only turn wearing one is
+    forged or misrouted; either way no grant reaches its boot.
+    """
+
+    # @spec WORKER-TOOL-ACCESS-4
+    async def go() -> None:
+        from aci_protocol import ToolAccess
+        from curie_api.resumequeue import resume_event_id
+
+        grant_event = resume_event_id(uuid.uuid4())
+        binding = GrantBinding(grant_event_id=grant_event, grant_tool="mcp__github__create_issue")
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+            h.runner.tool_access_enforced = ["read-only"]
+            await h.kernel.process_event(
+                _qevent(
+                    "proceed with the approved action",
+                    thread="th-grant-read-only",
+                    event_id=grant_event,
+                ).model_copy(update={"tool_access": ToolAccess.READ_ONLY})
+            )
+            env = h.fake_k8s.claim_envs[-1]
+            assert env is not None
+            assert "CURIE_APPROVAL_GRANT_TOOL" not in env
+            assert "CURIE_APPROVAL_GRANT_ARGUMENTS" not in env
 
     asyncio.run(go())
 
