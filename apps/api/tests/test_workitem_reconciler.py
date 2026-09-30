@@ -7,6 +7,7 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime
+from functools import wraps
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +19,10 @@ from curie_api.config import get_settings
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from curie_telemetry import build_resource, configure_meter_provider
+from curie_telemetry import metrics as telemetry_metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -30,6 +35,21 @@ ADDRESS = "C0EXAMPLE1"
 WIRE_CONVERSATION = "1700000000.000100"
 OBJECTIVE = "Reconcile the admitted work item"
 REQUESTER = "U0REQUEST1"
+RECONCILER_STEPS = (
+    "_settle_publications",
+    "_expire_waiting",
+    "_request_deadline_cancellations",
+    "_request_owner_lost_cancellations",
+    "_publish_terminate_wakes",
+    "_settle_overdue_cancellations",
+    "_readmit_pending",
+    "_reconcile_missed_labels",
+    "_sync_status_comments",
+    "_redispatch_lapsed_acquisitions",
+    "_publish_execute_wakes",
+)
+
+
 @pytest.fixture
 def allowlisted(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
@@ -38,6 +58,50 @@ def allowlisted(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def reconciler_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[InMemoryMetricReader]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.7.0",
+            service_instance_id="acme-api-reconciler",
+            deployment_environment="test",
+        ),
+    )
+    monkeypatch.setattr(telemetry_metrics, "_provider", None)
+    monkeypatch.setattr(telemetry_metrics, "_instruments", {})
+    configure_meter_provider(provider)
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+
+
+def _reconciler_metric_values(
+    reader: InMemoryMetricReader, name: str
+) -> dict[str, float]:
+    data = reader.get_metrics_data()
+    if data is None:
+        return {}
+    values: dict[str, float] = {}
+    for resource_metrics in data.resource_metrics:
+        assert resource_metrics.resource.attributes["service.name"] == "curie-api"
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != name:
+                    continue
+                for point in metric.data.data_points:
+                    attributes = dict(point.attributes)
+                    assert set(attributes) == {"service.name", "step"}
+                    assert attributes["service.name"] == "curie-api"
+                    values[attributes["step"]] = point.value
+    return values
 
 
 class _SessionTracker:
@@ -237,6 +301,175 @@ def test_run_once_creates_the_group_then_publishes_a_readable_execute_wake(
     assert payload["author"] == REQUESTER
 
 
+def test_status_comment_failure_still_publishes_a_readable_execute_wake(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail_status_comments(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected status comment failure")
+
+    monkeypatch.setattr(
+        "curie_api.workitem_reconciler.factory_notices.sync_status_comments",
+        fail_status_comments,
+    )
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        client: aioredis.Redis,
+    ) -> uuid.UUID:
+        async with maker() as session:
+            facts = _facts(await _agent_with_channel(session))
+            admitted = await admit(session, facts)
+            assert admitted.request is not None
+            request_id = facts.request_id
+        await reconciler.run_once()
+        async with maker() as session:
+            row = await _request_row(session, request_id)
+            assert row.published_generation == row.dispatch_generation == 1
+        assert isinstance(client, _XaddSpy)
+        assert client.in_transaction == [False]
+        return request_id
+
+    request_id = _run(steps, runs_stream, spy_xadd=True)
+    delivered = valkey.xreadgroup(_group(), "reader", {runs_stream: ">"}, count=10)
+    assert len(delivered) == 1
+    _stream, entries = delivered[0]
+    assert len(entries) == 1
+    payload = json.loads(entries[0][1][STREAM_PAYLOAD_FIELD])
+    assert payload["event_id"] == f"work-item-{request_id}-execute-1"
+    assert payload["conversation_id"] == WIRE_CONVERSATION
+    assert payload["text"] == OBJECTIVE
+    assert payload["author"] == REQUESTER
+    assert any(
+        "sync_status_comments" in record.getMessage()
+        and record.exc_info is not None
+        and str(record.exc_info[1]) == "injected status comment failure"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("failed_step", RECONCILER_STEPS)
+def test_each_step_failure_is_isolated_and_recovers_its_metrics(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reconciler_metrics: InMemoryMetricReader,
+    caplog: pytest.LogCaptureFixture,
+    failed_step: str,
+) -> None:
+    observed: list[str] = []
+    failure_enabled = True
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        nonlocal failure_enabled
+
+        def track(step_name: str) -> None:
+            original = getattr(reconciler, step_name)
+
+            @wraps(original)
+            async def tracked_step() -> None:
+                observed.append(step_name)
+                if step_name == failed_step and failure_enabled:
+                    raise RuntimeError(f"injected {step_name} failure")
+                await original()
+
+            monkeypatch.setattr(reconciler, step_name, tracked_step)
+
+        for step_name in RECONCILER_STEPS:
+            track(step_name)
+        label = failed_step.removeprefix("_")
+        for count in (1, 2):
+            await reconciler.run_once()
+            assert observed == list(RECONCILER_STEPS) * count
+            assert _reconciler_metric_values(
+                reconciler_metrics, "curie.work_item.reconciler.step.failure"
+            ) == {label: count}
+            assert _reconciler_metric_values(
+                reconciler_metrics,
+                "curie.work_item.reconciler.step.consecutive_failures",
+            ) == {
+                name.removeprefix("_"): count if name == failed_step else 0
+                for name in RECONCILER_STEPS
+            }
+        failure_enabled = False
+        await reconciler.run_once()
+        assert observed == list(RECONCILER_STEPS) * 3
+        assert _reconciler_metric_values(
+            reconciler_metrics, "curie.work_item.reconciler.step.failure"
+        ) == {label: 2}
+        assert _reconciler_metric_values(
+            reconciler_metrics,
+            "curie.work_item.reconciler.step.consecutive_failures",
+        ) == {name.removeprefix("_"): 0 for name in RECONCILER_STEPS}
+
+    _run(steps, runs_stream)
+    failures = [
+        record
+        for record in caplog.records
+        if record.exc_info is not None
+        and str(record.exc_info[1]) == f"injected {failed_step} failure"
+    ]
+    assert len(failures) == 2
+    assert all(failed_step.removeprefix("_") in record.getMessage() for record in failures)
+    assert _payloads(valkey, runs_stream) == []
+
+
+@pytest.mark.parametrize("cancelled_step", RECONCILER_STEPS)
+def test_step_cancellation_propagates_without_counting_a_failure(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reconciler_metrics: InMemoryMetricReader,
+    cancelled_step: str,
+) -> None:
+    observed: list[str] = []
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        def track(step_name: str) -> None:
+            original = getattr(reconciler, step_name)
+
+            @wraps(original)
+            async def tracked_step() -> None:
+                observed.append(step_name)
+                if step_name == cancelled_step:
+                    raise asyncio.CancelledError("injected cancellation")
+                await original()
+
+            monkeypatch.setattr(reconciler, step_name, tracked_step)
+
+        for step_name in RECONCILER_STEPS:
+            track(step_name)
+        with pytest.raises(asyncio.CancelledError, match="injected cancellation"):
+            await reconciler.run_once()
+
+    _run(steps, runs_stream)
+    assert observed == list(RECONCILER_STEPS[: RECONCILER_STEPS.index(cancelled_step) + 1])
+    assert _reconciler_metric_values(
+        reconciler_metrics, "curie.work_item.reconciler.step.failure"
+    ) == {}
+    assert cancelled_step.removeprefix("_") not in _reconciler_metric_values(
+        reconciler_metrics, "curie.work_item.reconciler.step.consecutive_failures"
+    )
+    assert _payloads(valkey, runs_stream) == []
+
+
 def test_xadd_does_not_run_inside_a_sql_transaction(
     clean_db: None,
     allowlisted: None,
@@ -291,8 +524,11 @@ def test_crash_between_xadd_and_fence_republishes_the_same_event_id(
             facts = _facts(await _agent_with_channel(session))
             await admit(session, facts)
             request_id = facts.request_id
-        with pytest.raises(RuntimeError, match="injected fence failure"):
-            await reconciler.run_once()
+        await reconciler.run_once()
+        async with maker() as session:
+            row = await _request_row(session, request_id)
+            assert row.published_generation is None
+            assert row.dispatch_generation == 1
         await asyncio.sleep(1.2)
         await reconciler.run_once()
         async with maker() as session:
@@ -331,8 +567,7 @@ def test_lost_xadd_leaves_the_row_due_for_the_next_pass(
         original_xadd = client.xadd
         client.xadd = fail_xadd  # type: ignore[method-assign]
         try:
-            with pytest.raises(RuntimeError, match="injected xadd failure"):
-                await reconciler.run_once()
+            await reconciler.run_once()
         finally:
             client.xadd = original_xadd  # type: ignore[method-assign]
         async with maker() as session:
@@ -524,4 +759,3 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
 
 def test_suite_create_app_does_not_start_the_work_item_reconciler(client: Any) -> None:
     assert client.app.state.work_item_reconciler_task is None
-
