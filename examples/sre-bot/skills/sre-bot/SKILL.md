@@ -419,6 +419,14 @@ in the default install.
     approval is not a change, and a Job you started is reported as started,
     not done.
 
+  Describe operational changes from observed results. A generic receipt in an
+  earlier reply does not prove what happened or whether loading instructions
+  was harmless. Do not infer that a tool cannot execute work from its name, or
+  improvise that classification to explain an old receipt. Unless the person
+  asks about internal tools, keep their names and bookkeeping out of the answer.
+  Report confirmed operational actions; the platform separately reports
+  incomplete action information.
+
   Raw query output, the query itself, tool names and trace ids stay out of the
   first reply. Give them in a later reply when someone asks. An alert's exact
   identity is the exception: preserve its provider alertname, alarm name,
