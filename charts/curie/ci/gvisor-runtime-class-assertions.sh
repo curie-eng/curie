@@ -26,9 +26,11 @@
 #      is gvisor, RUNNER_TEMPLATES includes curie-runner, and with an acme
 #      runner image digest it also includes curie-agent-acme-runner. The
 #      probe command defines check_runner_sandbox_template_class.
-#   7. That function, extracted from the rendered command (not copied here),
-#      exits non-zero and reports FAIL plus the template name when the
-#      SandboxTemplate class is empty, and exits 0 when the class is gvisor.
+#   7. The rendered probe command (the Job container /bin/bash -c script, not
+#      an extracted function) exits non-zero when the SandboxTemplate class is
+#      empty. Its output contains the bad-template line (FAIL and curie-runner)
+#      and SECURITY PROBE: FAIL. With the class set to gvisor it exits 0,
+#      prints SECURITY PROBE: PASS, and does not print FAIL: SandboxTemplate.
 #
 # Runnable locally and from CI. Fails loudly.
 set -euo pipefail
@@ -286,14 +288,6 @@ def assert_probe(path, required_tokens):
     )
 
 
-def write_function(path, dest):
-    docs = load_docs(path)
-    container = probe_container(docs, path)
-    body = extract_function(command_script(container, path))
-    pathlib.Path(dest).write_text(body + "\n")
-    print(f"  ok: extracted {FUNCTION_NAME} from the rendered probe command")
-
-
 def main():
     path = sys.argv[1]
     mode = sys.argv[2]
@@ -311,9 +305,6 @@ def main():
         return
     if mode == "probe":
         assert_probe(path, sys.argv[3:])
-        return
-    if mode == "extract":
-        write_function(path, sys.argv[3])
         return
     die(f"unknown mode {mode!r}")
 
@@ -358,66 +349,233 @@ PROBE_ACME_RENDER="$(render_chart probe-acme \
   --set "agentSandbox.runnerImages.acme=${ACME_DIGEST}")"
 python3 "$CHECKER" "$PROBE_ACME_RENDER" probe curie-runner curie-agent-acme-runner
 
-echo "=== Assertion 7: extracted probe function fails closed, then passes on gvisor ==="
-FN_FILE="$TMP/check_runner_sandbox_template_class.sh"
-python3 "$CHECKER" "$PROBE_RENDER" extract "$FN_FILE"
+echo "=== Assertion 7: rendered probe fails closed, then passes on gvisor ==="
+PROBE_ENV="$TMP/probe-env.sh"
+PROBE_SCRIPT="$TMP/probe-script.sh"
+python3 - "$PROBE_RENDER" "$PROBE_ENV" "$PROBE_SCRIPT" <<'PY'
+import pathlib
+import re
+import shlex
+import sys
+
+import yaml
+
+path, env_out, script_out = sys.argv[1:]
+docs = [doc for doc in yaml.safe_load_all(pathlib.Path(path).read_text()) if doc]
+jobs = [doc for doc in docs if doc.get("kind") == "Job"]
+if len(jobs) != 1:
+    raise SystemExit(f"{path}: expected exactly one Job, found {len(jobs)}")
+containers = (
+    jobs[0].get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+)
+probes = [container for container in containers if container.get("name") == "probe"]
+if len(probes) != 1:
+    raise SystemExit(f"{path}: expected exactly one probe container, found {len(probes)}")
+container = probes[0]
+lines = []
+for entry in container.get("env") or []:
+    if not isinstance(entry, dict) or set(entry) != {"name", "value"}:
+        raise SystemExit(f"{path}: probe env entry must be one literal name/value, got {entry!r}")
+    name = entry["name"]
+    value = entry["value"]
+    if not isinstance(name, str) or not isinstance(value, str):
+        raise SystemExit(f"{path}: probe env name/value must be strings, got {entry!r}")
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+        raise SystemExit(f"{path}: probe env name is not a shell identifier: {name!r}")
+    lines.append(f"export {name}={shlex.quote(value)}")
+if not lines:
+    raise SystemExit(f"{path}: probe container has no env")
+pathlib.Path(env_out).write_text("\n".join(lines) + "\n")
+command = container.get("command") or []
+if (
+    len(command) != 3
+    or command[0] != "/bin/bash"
+    or command[1] != "-c"
+    or not isinstance(command[2], str)
+    or command[2] == ""
+):
+    raise SystemExit(f"{path}: probe command is not [/bin/bash, -c, script]")
+pathlib.Path(script_out).write_text(command[2])
+PY
 
 STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"
-cat > "$STUB_BIN/kubectl" <<'EOF'
-#!/usr/bin/env bash
-# Stub for: kubectl get sandboxtemplate <name> -n <ns> -o jsonpath={.spec.podTemplate.spec.runtimeClassName}
-set -euo pipefail
-want='jsonpath={.spec.podTemplate.spec.runtimeClassName}'
-if [[ $# -eq 7 && "$1" == "get" && "$2" == "sandboxtemplate" && "$4" == "-n" && "$6" == "-o" && "$7" == "$want" ]]; then
+CURL_COUNT="$TMP/curl-count"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf 'COUNT_FILE=%q\n' "$CURL_COUNT"
+  cat <<'EOF'
+# One process per kubectl call. The curl reply sequence lives in COUNT_FILE.
+args=("$@")
+len=${#args[@]}
+
+has_exact() {
+  local want="$1"
+  local arg
+  for arg in "${args[@]}"; do
+    [[ "$arg" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+contains_substr() {
+  local needle="$1"
+  local arg
+  for arg in "${args[@]}"; do
+    [[ "$arg" == *"$needle"* ]] && return 0
+  done
+  return 1
+}
+
+has_seq() {
+  local -a seq=("$@")
+  local slen=${#seq[@]}
+  local i j
+  local -i limit
+  (( slen > 0 && len >= slen )) || return 1
+  limit=$((len - slen))
+  i=0
+  while (( i <= limit )); do
+    j=0
+    while (( j < slen )); do
+      [[ "${args[$((i + j))]}" == "${seq[$j]}" ]] || break
+      j=$((j + 1))
+    done
+    (( j == slen )) && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+match_runtime_class_get() {
+  local i
+  local -i limit
+  (( len >= 7 )) || return 1
+  limit=$((len - 7))
+  i=0
+  while (( i <= limit )); do
+    if [[ "${args[$i]}" == get \
+      && "${args[$((i + 1))]}" == sandboxtemplate \
+      && "${args[$((i + 3))]}" == -n \
+      && "${args[$((i + 5))]}" == -o \
+      && "${args[$((i + 6))]}" == 'jsonpath={.spec.podTemplate.spec.runtimeClassName}' ]]; then
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+if match_runtime_class_get; then
   if [[ -n "${FIXTURE_RUNTIME_CLASS:-}" ]]; then
     printf '%s\n' "$FIXTURE_RUNTIME_CLASS"
   fi
   exit 0
 fi
-echo "unexpected kubectl invocation: $*" >&2
-exit 1
+if has_seq get networkpolicy; then
+  exit 1
+fi
+if has_seq create token; then
+  printf '%s\n' probe-token
+  exit 0
+fi
+if has_seq auth can-i get secret/sp-agent-a-creds; then
+  printf '%s\n' yes
+  exit 0
+fi
+if has_seq auth can-i get secret/sp-agent-b-creds; then
+  printf '%s\n' no
+  exit 0
+fi
+if has_seq auth can-i list secrets; then
+  printf '%s\n' no
+  exit 0
+fi
+if has_exact exec && contains_substr curl; then
+  n=0
+  if [[ -f "$COUNT_FILE" ]]; then
+    n=$(<"$COUNT_FILE")
+  fi
+  case "$n" in
+    ''|*[!0-9]*) n=0 ;;
+  esac
+  n=$((n + 1))
+  printf '%s\n' "$n" >"$COUNT_FILE"
+  case "$n" in
+    1) printf 'rc=0\n' ;;
+    2) printf 'rc=28\n' ;;
+    3) printf 'rc=28\n' ;;
+    4) printf 'rc=0\n' ;;
+    5) printf 'rc=28\n' ;;
+  esac
+  exit 0
+fi
+if has_exact exec && contains_substr nslookup; then
+  exit 0
+fi
+if has_exact exec && contains_substr 'nc '; then
+  if [[ -n "${DT_ALLOWED_POD:-}" ]] && contains_substr "$DT_ALLOWED_POD"; then
+    printf 'rc=0\n'
+  else
+    printf 'rc=1\n'
+  fi
+  exit 0
+fi
+if has_exact run && { contains_substr sp-gvisor-check || contains_substr runtimeClassName; }; then
+  printf '%s\n' 'Error from server (NotFound): runtimeclasses.node.k8s.io "gvisor" not found'
+  exit 0
+fi
+exit 0
 EOF
+} >"$STUB_BIN/kubectl"
 chmod 0755 "$STUB_BIN/kubectl"
 
-run_extracted() {
+run_rendered_probe() {
   local fixture_class="$1"
   local log="$2"
+  printf '0\n' >"$CURL_COUNT"
   set +e
-  PATH="$STUB_BIN:$PATH" \
+  PATH="${STUB_BIN}:${PATH}" \
     FIXTURE_RUNTIME_CLASS="$fixture_class" \
-    REQUIRED_RUNTIME_CLASS=gvisor \
-    NS=curie \
-    RUNNER_TEMPLATES=curie-runner \
     bash --noprofile --norc -c '
-fail=0
+set -euo pipefail
+set -a
 source "$1"
-check_runner_sandbox_template_class
-exit "$fail"
-' bash "$FN_FILE" >"$log" 2>&1
+set +a
+script=""
+IFS= read -r -d "" script < "$2" || true
+bash -c "$script"
+' bash "$PROBE_ENV" "$PROBE_SCRIPT" >"$log" 2>&1
   local rc=$?
   set -e
   printf '%s\n' "$rc"
 }
 
 EMPTY_LOG="$TMP/probe-empty.log"
-EMPTY_RC="$(run_extracted "" "$EMPTY_LOG")"
+EMPTY_RC="$(run_rendered_probe "" "$EMPTY_LOG")"
 if [[ "$EMPTY_RC" -eq 0 ]]; then
-  fail "empty SandboxTemplate class: check_runner_sandbox_template_class exited 0; output: $(cat "$EMPTY_LOG")"
+  fail "empty SandboxTemplate class: rendered probe exited 0; log: $(cat "$EMPTY_LOG")"
 fi
-if ! grep -Eq '(^|[^[:alnum:]_])FAIL([^[:alnum:]_]|$)' "$EMPTY_LOG"; then
-  fail "empty SandboxTemplate class: output missing the word FAIL: $(cat "$EMPTY_LOG")"
+if ! grep -F 'FAIL: SandboxTemplate' "$EMPTY_LOG" | grep -F 'curie-runner' >/dev/null; then
+  fail "empty SandboxTemplate class: log missing the bad-template line (FAIL and curie-runner): $(cat "$EMPTY_LOG")"
 fi
-if ! grep -Eq '(^|[^[:alnum:]_-])curie-runner([^[:alnum:]_-]|$)' "$EMPTY_LOG"; then
-  fail "empty SandboxTemplate class: output missing template name curie-runner: $(cat "$EMPTY_LOG")"
+if ! grep -F 'SECURITY PROBE: FAIL' "$EMPTY_LOG" >/dev/null; then
+  fail "empty SandboxTemplate class: log missing SECURITY PROBE: FAIL: $(cat "$EMPTY_LOG")"
 fi
-echo "  ok: empty class exits non-zero and reports FAIL for curie-runner"
+echo "  ok: empty class: rendered probe exits non-zero and reports FAIL for curie-runner"
 
 GVISOR_LOG="$TMP/probe-gvisor.log"
-GVISOR_RC="$(run_extracted gvisor "$GVISOR_LOG")"
+GVISOR_RC="$(run_rendered_probe gvisor "$GVISOR_LOG")"
 if [[ "$GVISOR_RC" -ne 0 ]]; then
-  fail "gvisor SandboxTemplate class: check_runner_sandbox_template_class exited ${GVISOR_RC}; output: $(cat "$GVISOR_LOG")"
+  fail "gvisor SandboxTemplate class: rendered probe exited ${GVISOR_RC}; log: $(cat "$GVISOR_LOG")"
 fi
-echo "  ok: gvisor class exits 0"
+if ! grep -F 'SECURITY PROBE: PASS' "$GVISOR_LOG" >/dev/null; then
+  fail "gvisor SandboxTemplate class: log missing SECURITY PROBE: PASS: $(cat "$GVISOR_LOG")"
+fi
+if grep -F 'FAIL: SandboxTemplate' "$GVISOR_LOG" >/dev/null; then
+  fail "gvisor SandboxTemplate class: log contains FAIL: SandboxTemplate: $(cat "$GVISOR_LOG")"
+fi
+echo "  ok: gvisor class: rendered probe exits 0 with SECURITY PROBE: PASS"
 
-echo "PASS: real-model auto with empty lookup stamps gvisor on every runner SandboxTemplate, fake-model and mode off omit it, the admission expression follows that class, and the security probe fails when curie-runner lacks gvisor"
+echo "PASS: real-model auto with empty lookup stamps gvisor on every runner SandboxTemplate, fake-model and mode off omit it, the admission expression follows that class, and the rendered security probe fails when curie-runner lacks gvisor and passes when the class is gvisor"
