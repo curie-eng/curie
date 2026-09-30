@@ -90,8 +90,8 @@ def _verdict(action: dict[str, Any]) -> str:
     return _UNDECLARED
 
 
-def _generic_bash(action: dict[str, Any]) -> bool:
-    if action.get("tool") != "Bash" or action.get("status") != "succeeded":
+def _generic_native(action: dict[str, Any]) -> bool:
+    if action.get("tool") not in {"Bash", "Skill"} or action.get("status") != "succeeded":
         return False
     if action.get("undoable") or action.get("detail") not in _GENERIC_DETAILS:
         return False
@@ -103,7 +103,7 @@ def _generic_bash(action: dict[str, Any]) -> bool:
 def _read_only_bash(action: dict[str, Any]) -> bool:
     """Suppress only plain commands whose stored arguments show a read."""
 
-    if not _generic_bash(action):
+    if action.get("tool") != "Bash" or not _generic_native(action):
         return False
     arguments = action.get("arguments")
     command = arguments.get("command") if isinstance(arguments, dict) else None
@@ -143,10 +143,12 @@ def render_receipt(
     failures: list[int] = []
     grouped: dict[str, int] = {}
     for action in visible:
-        generic_bash = _generic_bash(action)
+        generic_native = _generic_native(action)
+        request = "Shell" if action.get("tool") == "Bash" else "Instruction"
         line = (
-            "• Bash calls; changes not described"
-            if generic_bash
+            f"• {request} request completed; changes were not summarized "
+            "and undo information is incomplete"
+            if generic_native
             else f"• {_described(action)} — {_verdict(action)}"
         )
         if action.get("status") == "failed":
@@ -160,10 +162,7 @@ def render_receipt(
         counts.append(1)
 
     for i, line in enumerate(lines):
-        if line == "• Bash calls; changes not described":
-            noun = "call" if counts[i] == 1 else "calls"
-            lines[i] = f"• {counts[i]} Bash {noun}; changes not described"
-        elif counts[i] > 1:
+        if counts[i] > 1:
             lines[i] = f"{line} ({counts[i]} calls)"
     if len(lines) > _MAX_LINES:
         # A turn with a hundred calls used to end with a hundred lines, and the
