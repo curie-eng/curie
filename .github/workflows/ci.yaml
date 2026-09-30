@@ -49,10 +49,13 @@ jobs:
                   for key, value in node.value:
                       if isinstance(key, yaml.ScalarNode) and key.value == "uses":
                           yield value
-                      yield from uses_nodes(value, seen)
+                  children = (value for key, value in node.value)
               elif isinstance(node, yaml.SequenceNode):
-                  for value in node.value:
-                      yield from uses_nodes(value, seen)
+                  children = iter(node.value)
+              else:
+                  return
+              for child in children:
+                  yield from uses_nodes(child, seen)
 
           errors = []
           checked = 0
