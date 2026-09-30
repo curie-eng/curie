@@ -376,8 +376,8 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
         return None
     if not callers:
         raise ValueError(
-            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
-            "to one operator and \"no limit\" to the next. Send null to let "
+            'allowed_callers must not be empty: an empty list reads as "nobody" '
+            'to one operator and "no limit" to the next. Send null to let '
             "everyone talk to the bot through this binding, or list at least one "
             "caller id."
         )
@@ -395,7 +395,7 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
                     "binding's callers are exact ids starting with U, W or B "
                     "(e.g. U0123ABCD), never a @handle, a display name or an "
                     "email. Find a person's id in their profile, under "
-                    "\"Copy member ID\"."
+                    '"Copy member ID".'
                 )
         elif kind == EMAIL_KIND:
             if not _EMAIL_CALLER.match(caller):
@@ -1898,11 +1898,11 @@ class PublicationCreate(BaseModel):
     def _safe_changed_paths(cls, value: list[str]) -> list[str]:
         for path in value:
             parts = path.split("/")
-            if tuple(part.casefold() for part in parts[:2]) == (
-                ".github",
-                "workflows",
-            ):
+            folded = tuple(part.casefold() for part in parts)
+            if folded[:2] == (".github", "workflows"):
                 raise ValueError("GitHub workflow changes cannot be published by this capability")
+            if folded[:1] == (".github",):
+                raise ValueError("GitHub metadata changes cannot be published by this capability")
             if (
                 not path
                 or path.startswith("/")

@@ -740,6 +740,10 @@ enum Command {
     Example {
         #[command(subcommand)]
         action: ExampleAction,
+        /// Kubernetes context for every helm and kubectl call. Defaults to the
+        /// kubeconfig current-context, which is resolved once and pinned.
+        #[arg(long, global = true, value_name = "NAME")]
+        context: Option<String>,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -4272,7 +4276,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Try { keep }) => {
             let image =
                 artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
-            commands::try_first_run(keep, image).await
+            emit(commands::try_first_run(keep, image).await?)
         }
         Some(Command::Init {
             name,
@@ -4282,73 +4286,85 @@ async fn run(command: Option<Command>) -> Result<()> {
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
             action: ExampleAction::SreBot { action },
-        }) => match action {
-            SreBotAction::Install {
-                observability,
-                observability_only,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-                observability,
-                observability_only,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            })
-            .await?
-            {
-                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
-                curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => emit(ready),
-            },
-            SreBotAction::Render {
-                out,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-            } => emit(
-                curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+            context,
+        }) => {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
+            match action {
+                SreBotAction::Install {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                })
+                .await?
+                {
+                    curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                    curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+                    curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => {
+                        emit(ready)
+                    }
+                },
+                SreBotAction::Render {
                     out,
                     platform_upgrade,
                     namespace,
                     release,
                     observability_namespace,
-                })
-                .await?,
-            ),
-            SreBotAction::ProvisionObservability {
-                namespace,
-                release,
-                observability_namespace,
-                chart,
-                dry_run,
-            } => match curie::examples::provision_observability(
-                curie::examples::ObservabilityProvisionOpts {
+                } => emit(
+                    curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+                        out,
+                        platform_upgrade,
+                        namespace,
+                        release,
+                        observability_namespace,
+                    })
+                    .await?,
+                ),
+                SreBotAction::ProvisionObservability {
                     namespace,
                     release,
                     observability_namespace,
                     chart,
                     dry_run,
+                } => match curie::examples::provision_observability(
+                    curie::examples::ObservabilityProvisionOpts {
+                        namespace,
+                        release,
+                        observability_namespace,
+                        chart,
+                        dry_run,
+                    },
+                )
+                .await?
+                {
+                    curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                    curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
                 },
-            )
-            .await?
-            {
-                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
-                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
-            },
-        },
+            }
+        }
         Some(Command::Build {
             tag,
             plugin_dir,
@@ -4688,14 +4704,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     name,
                     plugin_dir,
                     url,
-                } => {
-                    let classified_failure =
-                        commands::skill_hook_fire(&plugin_dir, &name, url).await?;
-                    if classified_failure {
-                        std::process::exit(1);
-                    }
-                    Ok(())
-                }
+                } => emit(commands::skill_hook_fire(&plugin_dir, &name, url).await?),
             },
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
@@ -4706,14 +4715,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 event_type,
                 url,
                 r#continue,
-            } => {
-                let classified_failure =
-                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
-                if classified_failure {
-                    std::process::exit(1);
-                }
-                Ok(())
-            }
+            } => emit(commands::send(&text, &user, event_type.into(), url, r#continue).await?),
             SkillAction::Eval {
                 cases,
                 case_id,
@@ -4857,6 +4859,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // the running stack's tag here, alongside the credential plan
                 // this same throwaway `LocalOpts` already exists to resolve.
                 local::resolve_stack_image_env(&mut model_opts).await;
+                // #3557: both directions recreate the api, which must come back
+                // on the credentials the running stack uses: the stored ones,
+                // or none for a stack that predates the store. Only `local up`
+                // adopts CURIE_API_KEY or generates.
+                let stack_secret_env =
+                    curie::local_stack_keys::running_stack_secret_env(model_opts.project())?;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         project: model_opts.project().to_string(),
@@ -4871,6 +4879,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         minimal,
                         stack_image_env: model_opts.stack_image_env,
+                        stack_secret_env,
                     })
                     .await?,
                 )

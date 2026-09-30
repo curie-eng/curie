@@ -48,7 +48,8 @@ rules:
     cli/src/ops: [released-upgrade]
     packages: [skill, local, local-release, cluster]
     examples: [skill, local, local-release, cluster]
-  ignored_prefixes:
+  # Root documentation filenames are exact paths, never directory ignores.
+  ignored_exact:
     AGENTS.md: []
     ARCHITECTURE.md: []
     CLAUDE.md: []
@@ -61,8 +62,9 @@ rules:
     SECURITY.md: []
     SUPPORT.md: []
     TRADEMARKS.md: []
-    docs: []
     llms.txt: []
+  ignored_prefixes:
+    docs: []
     apps/ui: []
     apps/dispatcher: []
     scripts: []

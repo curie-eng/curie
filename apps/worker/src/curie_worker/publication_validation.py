@@ -18,6 +18,18 @@ from .workspace import (
 
 MAX_PATCH_BYTES = 900_000
 _SAFE_GIT_MODES = {"000000", "100644", "100755"}
+GITHUB_WORKFLOW_REFUSAL = "GitHub workflow changes cannot be published by this capability"
+GITHUB_METADATA_REFUSAL = "GitHub metadata changes cannot be published by this capability"
+OPERATOR_PROTECTED_REFUSAL = (
+    "operator-protected path changes cannot be published by this capability"
+)
+UNSAFE_PATH_REFUSAL = "snapshot contains an unsafe repository path"
+_REFUSAL_PRIORITY = (
+    GITHUB_WORKFLOW_REFUSAL,
+    GITHUB_METADATA_REFUSAL,
+    OPERATOR_PROTECTED_REFUSAL,
+    UNSAFE_PATH_REFUSAL,
+)
 
 
 def publication_git_environment(home: Path) -> dict[str, str]:
@@ -33,34 +45,59 @@ def publication_git_environment(home: Path) -> dict[str, str]:
     )
 
 
-def _safe_changed_path(path: str) -> bool:
+def normalize_protected_publication_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Reject protected-path entries a repository-relative check cannot apply."""
+
+    normalized: list[str] = []
+    for path in paths:
+        pure = PurePosixPath(path)
+        if (
+            not path
+            or path.startswith("/")
+            or "\\" in path
+            or pure.is_absolute()
+            or any(part in ("", ".", "..") for part in pure.parts)
+        ):
+            raise ValueError("protected publication paths must be repository-relative paths")
+        normalized.append("/".join(pure.parts))
+    return tuple(normalized)
+
+
+def publication_path_refusal(path: str, protected_paths: tuple[str, ...]) -> str | None:
+    """Return the named refusal for one changed path, or None when it may publish."""
+
     pure = PurePosixPath(path)
-    return bool(
+    structurally_safe = bool(
         path
         and not path.startswith("/")
         and "\\" not in path
         and not pure.is_absolute()
         and all(part not in ("", ".", "..") for part in pure.parts)
         and pure.parts[0].casefold() != ".git"
-        and tuple(part.casefold() for part in pure.parts[:2])
-        != (".github", "workflows")
     )
+    if not structurally_safe:
+        return UNSAFE_PATH_REFUSAL
+    folded = tuple(part.casefold() for part in pure.parts)
+    if folded[:2] == (".github", "workflows"):
+        return GITHUB_WORKFLOW_REFUSAL
+    if folded[0] == ".github":
+        return GITHUB_METADATA_REFUSAL
+    for entry in protected_paths:
+        entry_parts = tuple(part.casefold() for part in PurePosixPath(entry).parts)
+        if folded[: len(entry_parts)] == entry_parts:
+            return OPERATOR_PROTECTED_REFUSAL
+    return None
 
 
-def _validate_changed_paths(paths: tuple[str, ...]) -> None:
-    if any(
-        tuple(part.casefold() for part in PurePosixPath(path).parts[:2])
-        == (".github", "workflows")
-        for path in paths
-    ):
-        raise WorkspacePreparationError(
-            "publication-validation",
-            "GitHub workflow changes cannot be published by this capability",
-        )
-    if not all(_safe_changed_path(path) for path in paths):
-        raise WorkspacePreparationError(
-            "publication-validation", "snapshot contains an unsafe repository path"
-        )
+def _safe_changed_path(path: str, protected_paths: tuple[str, ...]) -> bool:
+    return publication_path_refusal(path, protected_paths) is None
+
+
+def _validate_changed_paths(paths: tuple[str, ...], protected_paths: tuple[str, ...]) -> None:
+    refusals = [publication_path_refusal(path, protected_paths) for path in paths]
+    for reason in _REFUSAL_PRIORITY:
+        if reason in refusals:
+            raise WorkspacePreparationError("publication-validation", reason)
 
 
 def validate_snapshot_against_base(
@@ -71,6 +108,7 @@ def validate_snapshot_against_base(
     max_patch_bytes: int = MAX_PATCH_BYTES,
     scratch_root: Path | None = None,
     git_timeout_seconds: int = 30,
+    protected_paths: tuple[str, ...],
 ) -> None:
     """Rehash the private base and prove the binary patch applies to it."""
 
@@ -101,7 +139,8 @@ def validate_snapshot_against_base(
         raise WorkspacePreparationError(
             "publication-validation", "snapshot changed paths have no patch"
         )
-    _validate_changed_paths(snapshot.changed_paths)
+    protected_paths = normalize_protected_publication_paths(protected_paths)
+    _validate_changed_paths(snapshot.changed_paths, protected_paths)
 
     scratch = Path(
         tempfile.mkdtemp(
@@ -153,15 +192,19 @@ def validate_snapshot_against_base(
                 timeout=git_timeout_seconds,
                 check=True,
             )
-            base_tree = subprocess.run(
-                ["git", "write-tree"],
-                cwd=checkout,
-                env=git_env,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=git_timeout_seconds,
-                check=True,
-            ).stdout.decode("ascii").strip()
+            base_tree = (
+                subprocess.run(
+                    ["git", "write-tree"],
+                    cwd=checkout,
+                    env=git_env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=git_timeout_seconds,
+                    check=True,
+                )
+                .stdout.decode("ascii")
+                .strip()
+            )
             subprocess.run(
                 ["git", "apply", "--check", "--binary", str(patch_file)],
                 cwd=checkout,
@@ -204,21 +247,26 @@ def validate_snapshot_against_base(
             derived_paths = tuple(
                 sorted(path for path in derived_raw.decode("utf-8").split("\0") if path)
             )
+            _validate_changed_paths(derived_paths, protected_paths)
             declared_paths = tuple(sorted(snapshot.changed_paths))
             if len(set(declared_paths)) != len(declared_paths) or declared_paths != derived_paths:
                 raise WorkspacePreparationError(
                     "publication-validation",
                     "snapshot changed_paths do not exactly match the validated patch",
                 )
-            raw_diff = subprocess.run(
-                ["git", "diff", "--cached", "--raw", "-z", "--no-renames", base_tree],
-                cwd=checkout,
-                env=git_env,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=git_timeout_seconds,
-                check=True,
-            ).stdout.decode("utf-8", errors="strict").split("\0")
+            raw_diff = (
+                subprocess.run(
+                    ["git", "diff", "--cached", "--raw", "-z", "--no-renames", base_tree],
+                    cwd=checkout,
+                    env=git_env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=git_timeout_seconds,
+                    check=True,
+                )
+                .stdout.decode("utf-8", errors="strict")
+                .split("\0")
+            )
             for index in range(0, len(raw_diff) - 1, 2):
                 header = raw_diff[index].split()
                 if len(header) < 5:

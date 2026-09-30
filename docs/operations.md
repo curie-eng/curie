@@ -71,7 +71,8 @@ curie cluster status --context <your-production-context>
 
 ## Installing and inspecting the Curie platform on the cluster
 
-Every `curie cluster` verb takes `--context <NAME>`. The CLI resolves the
+Every `curie cluster` verb, and every `curie example sre-bot` verb, takes
+`--context <NAME>`. The CLI resolves the
 context once, prints `Kubernetes context: <NAME> (cluster <CLUSTER>)` on stderr,
 and pins it for every `helm` and `kubectl` call it makes, including any ambient
 `HELM_KUBECONTEXT`. Without the flag it pins the kubeconfig current-context. A
@@ -999,9 +1000,13 @@ upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade`. After that upgrade it deletes those agents'
 SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
 starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
-layer until their owners rebuild with `curie build` and redeploy. Both checks need
-docker buildx and registry access to resolve runner digests: without it, `curie
-cluster deploy` refuses and `curie cluster upgrade` clears every layer.
+layer until their owners rebuild with `curie build` and redeploy. Both checks
+resolve runner digests by reading the registry directly, so the operator host
+needs no docker. A registry that refuses anonymous reads falls back to `docker
+buildx imagetools` and its registry login when docker is on PATH. When no digest
+can be resolved, `curie cluster deploy` refuses and `curie cluster upgrade`
+clears every layer; setting the chart value `agentSandbox.runner.digest` pins
+the runner so no lookup is needed.
 
 For a run that can last three hours, set an illustrative $100 USD cap after
 deploying the agent:
@@ -1029,6 +1034,17 @@ Factory execution waits in PostgreSQL rather than on the runs-stream pending
 list. Admission, acquire, start, heartbeat, finish, and termination are internal
 worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
 publishes execute and terminate wakes onto `curie:runs`.
+
+Reconciler steps fail independently: each failure logs the step and traceback,
+and execute wakes continue despite an unrelated step failure. OpenTelemetry
+records the `curie.work_item.reconciler.step.failure` counter and
+`curie.work_item.reconciler.step.consecutive_failures` gauge with
+`service.name=curie-api` and a `step` attribute drawn from a fixed set of labels.
+The gauge increments for each consecutive failing pass, resets to zero after a
+successful pass for that step, and starts fresh when the API process restarts.
+For example, configure an alert in your metrics backend when a step's gauge is
+`>= 3`. This alert is not installed automatically; the default metrics exporter
+is `nop`, so an explicit metrics backend may be needed.
 
 The knobs are `CURIE_WORK_ITEM_*` on the API (settable through `api.extraEnv`
 until chart-owned values land):

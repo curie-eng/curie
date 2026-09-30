@@ -332,6 +332,7 @@ def test_a_runner_that_cannot_enforce_is_never_sent_the_turn(
     async def go() -> None:
         session = FakeModelSession()
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
             tracer=RunTracer(None),

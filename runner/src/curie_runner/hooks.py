@@ -32,6 +32,7 @@ from plugin_format import HookMatcherConfig, PluginManifest, resolve_manifest
 from pydantic import TypeAdapter, ValidationError
 
 from .mcp_tool_capability import ConnectorAvailability
+from .subprocess_env import shell_and_hook_env
 
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 
@@ -191,7 +192,7 @@ async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) ->
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=plugin_root,
-            env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+            env=shell_and_hook_env(os.environ, extra={"CLAUDE_PLUGIN_ROOT": str(plugin_root)}),
             start_new_session=True,
         )
         out, err = await asyncio.wait_for(

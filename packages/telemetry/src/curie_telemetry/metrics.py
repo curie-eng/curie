@@ -401,6 +401,22 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+_WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "step": [
+        "settle_publications",
+        "expire_waiting",
+        "request_deadline_cancellations",
+        "request_owner_lost_cancellations",
+        "publish_terminate_wakes",
+        "settle_overdue_cancellations",
+        "readmit_pending",
+        "reconcile_missed_labels",
+        "sync_status_comments",
+        "redispatch_lapsed_acquisitions",
+        "publish_execute_wakes",
+    ],
+}
 _EVAL_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["eval"],
@@ -618,6 +634,20 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.work_item.reconciler.step.failure": _definition(
+        "counter",
+        "{failure}",
+        "Failed WorkItem reconciler steps.",
+        True,
+        _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES,
+    ),
+    "curie.work_item.reconciler.step.consecutive_failures": _definition(
+        "gauge",
+        "{pass}",
+        "Consecutive failed passes for each WorkItem reconciler step.",
+        False,
+        _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES,
     ),
     "curie.eval.process": _definition(
         "counter", "{job}", "Eval processing outcomes.", True, _EVAL_ATTRIBUTES

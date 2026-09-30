@@ -18,6 +18,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
 from curie_worker.publication_loop import (
@@ -33,7 +34,6 @@ from curie_worker.publication_store import (
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
 from curie_worker.slack_sink import UnconfiguredSlackIdentityError
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -726,6 +726,42 @@ def _loop(
 def _job_env(resources: Any) -> dict[str, str]:
     container = resources.job["spec"]["template"]["spec"]["containers"][0]
     return {item["name"]: item["value"] for item in container["env"]}
+
+
+@pytest.mark.parametrize(
+    "html_base", ["https://github.com", "https://github.example.com/forge"]
+)
+async def test_publication_markers_accept_the_configured_html_origin(
+    publication: Any, html_base: str
+) -> None:
+    url = f"{html_base}/acme-corp/acme-bot/pull/123"
+    marker = publication._marker_url(f"Publishing\nCURIE_PR_URL={url}\n")
+
+    assert marker == url
+    assert publication._validated_pr_url(
+        _work(publication), marker, github_html_base=html_base
+    ) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        PR_URL,
+        "https://other.example.com/forge/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/acme-corp/acme-bot/pull/123",
+        "https://github.example.com/forge/acme-corp/other-bot/pull/123",
+    ],
+)
+async def test_enterprise_publication_markers_refuse_a_foreign_html_origin(
+    publication: Any, url: str
+) -> None:
+    marker = publication._marker_url(f"CURIE_PR_URL={url}\n")
+    assert marker == url
+
+    with pytest.raises(PublicationReconcileError, match="repository"):
+        publication._validated_pr_url(
+            _work(publication), marker, github_html_base="https://github.example.com/forge"
+        )
 
 
 async def test_publication_card_outbox_posts_and_remembers_before_ack(
@@ -1649,11 +1685,7 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
     engine: AsyncEngine = create_async_engine(_DB_URL)
     schema: str | None = None
     try:
-        try:
-            async with engine.connect():
-                pass
-        except SQLAlchemyError as exc:
-            pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+        await pg_connect_or_skip(engine)
 
         schema = f"test_publication_{uuid.uuid4().hex}"
         durable = PostgresPublicationStore(

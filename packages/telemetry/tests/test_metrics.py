@@ -24,8 +24,10 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
+    Gauge,
     InMemoryMetricReader,
     PeriodicExportingMetricReader,
+    Sum,
 )
 from opentelemetry.trace import (
     NonRecordingSpan,
@@ -38,6 +40,21 @@ _PACKAGE_ROOT = Path(__file__).parent.parent
 _MANIFEST = _PACKAGE_ROOT / "schema" / "metrics.json"
 _COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.119.0"
 _PROMETHEUS_HISTORY_METRIC = "curie_history_persistence_failure_total"
+_RECONCILER_STEPS = [
+    "settle_publications",
+    "expire_waiting",
+    "request_deadline_cancellations",
+    "request_owner_lost_cancellations",
+    "publish_terminate_wakes",
+    "settle_overdue_cancellations",
+    "readmit_pending",
+    "reconcile_missed_labels",
+    "sync_status_comments",
+    "redispatch_lapsed_acquisitions",
+    "publish_execute_wakes",
+]
+_RECONCILER_FAILURE_METRIC = "curie.work_item.reconciler.step.failure"
+_RECONCILER_CONSECUTIVE_METRIC = "curie.work_item.reconciler.step.consecutive_failures"
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -619,6 +636,105 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     assert definition["cardinality_bound"] == 14
 
 
+def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None:
+    manifest = _read(_MANIFEST)["metrics"]
+    for name, instrument_type, monotonic in (
+        (_RECONCILER_FAILURE_METRIC, "counter", True),
+        (_RECONCILER_CONSECUTIVE_METRIC, "gauge", False),
+    ):
+        definition = manifest[name]
+        assert definition["type"] == instrument_type
+        assert definition["monotonic"] is monotonic
+        assert definition["attributes"] == {
+            "service.name": ["curie-api"],
+            "step": _RECONCILER_STEPS,
+        }
+        assert definition["cardinality_bound"] == 11
+
+
+def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    _provider, reader = metrics
+
+    # Observed with OpenTelemetry SDK 1.44.0 in the real driver run:
+    # InMemoryMetricReader returned Sum for a counter and Gauge for a synchronous
+    # gauge. A second collection omitted the gauge without a fresh set, so each
+    # observation uses one snapshot. The corrected run passed all 78 tests.
+    def exported_values() -> dict[str, dict[str, float]]:
+        data = reader.get_metrics_data()
+        assert data is not None
+        values: dict[str, dict[str, float]] = {}
+        for resource_metrics in data.resource_metrics:
+            for scope_metrics in resource_metrics.scope_metrics:
+                for metric in scope_metrics.metrics:
+                    if metric.name not in (
+                        _RECONCILER_FAILURE_METRIC,
+                        _RECONCILER_CONSECUTIVE_METRIC,
+                    ):
+                        continue
+                    if metric.name == _RECONCILER_FAILURE_METRIC:
+                        assert isinstance(metric.data, Sum)
+                        assert metric.data.is_monotonic is True
+                    else:
+                        assert isinstance(metric.data, Gauge)
+                    points = values.setdefault(metric.name, {})
+                    for point in metric.data.data_points:
+                        attributes = dict(point.attributes)
+                        assert set(attributes) == {"service.name", "step"}
+                        assert attributes["service.name"] == "curie-api"
+                        assert attributes["step"] not in points
+                        points[attributes["step"]] = point.value
+        return values
+
+    for count in (1, 2):
+        for step in _RECONCILER_STEPS:
+            attributes = {"service.name": "curie-api", "step": step}
+            record_metric(_RECONCILER_FAILURE_METRIC, attributes=attributes)
+            record_metric(_RECONCILER_CONSECUTIVE_METRIC, count, attributes=attributes)
+        expected = {step: count for step in _RECONCILER_STEPS}
+        assert exported_values() == {
+            _RECONCILER_FAILURE_METRIC: expected,
+            _RECONCILER_CONSECUTIVE_METRIC: expected,
+        }
+
+    for step in _RECONCILER_STEPS:
+        record_metric(
+            _RECONCILER_CONSECUTIVE_METRIC,
+            0,
+            attributes={"service.name": "curie-api", "step": step},
+        )
+    assert exported_values() == {
+        _RECONCILER_FAILURE_METRIC: dict.fromkeys(_RECONCILER_STEPS, 2),
+        _RECONCILER_CONSECUTIVE_METRIC: dict.fromkeys(_RECONCILER_STEPS, 0),
+    }
+
+
+@pytest.mark.parametrize(
+    "metric_name", (_RECONCILER_FAILURE_METRIC, _RECONCILER_CONSECUTIVE_METRIC)
+)
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"service.name": "curie-worker"}, "outside its declared domain"),
+        ({"step": "_sync_status_comments"}, "outside its declared domain"),
+        ({"step": "acme-request-1"}, "outside its declared domain"),
+        ({"request_id": "acme-request-1"}, "undeclared attribute"),
+    ],
+)
+def test_reconciler_step_metrics_reject_unbounded_or_undeclared_labels(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    metric_name: str,
+    overrides: dict[str, str],
+    match: str,
+) -> None:
+    del metrics
+    attributes = {"service.name": "curie-api", "step": "sync_status_comments"}
+    attributes.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        record_metric(metric_name, attributes=attributes)
+
+
 def test_tool_result_counts_calls_by_origin_and_outcome_only() -> None:
     """The runner's tool result counter carries no identifier of the tool.
 
@@ -866,6 +982,7 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             sandbox_id = f"sandbox-example-{index}"
             forbidden_values.update((session_id, user_id, event_id, sandbox_id))
             runner = SessionRunner(
+                held_secrets=frozenset(),
                 session_factory=FakeModelSession,
                 ceiling=0,
                 tracer=RunTracer(None),

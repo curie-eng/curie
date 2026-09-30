@@ -1187,11 +1187,18 @@ sandbox and renders whenever an in-chart store is deployed.
 | Rail | What ships | Values |
 |---|---|---|
 | 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock. Arbitrary internet AND `169.254.169.254` are denied by construction. | `security.networkPolicy.*` |
-| 2. Per-agent secret isolation | Least-privilege runner ServiceAccount (no secret get/list, token not mounted). The per-agent `resourceNames`-scoped Role is bound by the control plane per agent. | `agentSandbox.runner.serviceAccount.*` |
+| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries. The release runner ServiceAccount has no bound Role or mounted Kubernetes API token by default. The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
 | 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
+
+**Credential access.** A sandbox can inspect credentials injected into its own
+process, including any explicitly configured shared model credential. Operators
+who add credentials, mount a Kubernetes API token, or grant runner RBAC change
+the default boundary. Claim 2 of the security probe uses two real SandboxClaims
+and their bound runners to verify scoped connector delivery, absence of an API
+token, and explicit Kubernetes rejection of Secret GET and list requests.
 
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
@@ -1255,14 +1262,15 @@ non-enforcing CNI.
 (default `auto`):
 
 - **`auto`** -- at install/upgrade time the chart looks up the `gvisor`
-  RuntimeClass. Present -> runner pods use it. Absent -> pods run without it and
-  `NOTES.txt` warns. Never blocks the install, so a bare install works on any
-  cluster. (Helm's `lookup` returns empty under `helm template`/--dry-run, so a
-  templated render always shows the no-gvisor shape.) This never-blocks behavior
-  applies to the fake-model default only; enabling a real model
-  (`fakeModel=false` or `inference.deploy`) under `auto` renders the blocking
+  RuntimeClass. A real model (`fakeModel=false` or `inference.deploy`) stamps
+  that class on runner pods even when lookup is empty, so `helm template`,
+  Argo CD, and Flux show the gVisor shape. That same path renders the blocking
   `preflight-gvisor` hook, so a runsc-less real-model install fails closed
-  instead of silently running on the host kernel.
+  instead of silently running on the host kernel. Fake-model auto still omits
+  the class when lookup is empty (a templated render shows the no-gvisor shape)
+  and `NOTES.txt` warns; when lookup finds the class, those pods use it. That
+  never-blocks path is the fake-model default, so a bare install works on any
+  cluster.
 - **`require`** -- always stamp the RuntimeClass AND run the `preflight-gvisor`
   hook, which blocks the install with a clear remediation if the runtimeclass is
   missing or downgraded to runc. The fail-hard production posture.
@@ -1689,6 +1697,15 @@ an approval request: it cannot publish without a managed workspace. Human
 approval is the default. An operator can set one agent's publication policy to
 automatic, and publication still runs outside the sandbox. No GitHub credential
 is mounted into the sandbox.
+
+Publication refuses every change under `.github/`, including workflows,
+composite actions, and `CODEOWNERS`, plus any extra repository-relative path
+in `worker.publication.protectedPaths` (`CURIE_PUBLICATION_PROTECTED_PATHS`
+on the worker). The publication job pushes the branch to the base repository,
+not a fork, so a `push` or `pull_request` workflow in that repository runs
+the changed files with the repository's Actions secrets before a person
+reviews the pull request. Keep those secrets in GitHub environments that
+require reviewers.
 
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its

@@ -6699,6 +6699,16 @@ export const commandManifest = {
     },
     {
       "about": "Install a complete first party example workflow",
+      "args": [
+        {
+          "global": true,
+          "help": "Kubernetes context for every helm and kubectl call. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        }
+      ],
       "hidden": false,
       "name": "example",
       "subcommands": [

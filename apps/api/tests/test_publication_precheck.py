@@ -29,6 +29,8 @@ from curie_api.github_app import _RESOLVERS
 from fastapi.testclient import TestClient
 
 from apps.api.tests.test_publications import (
+    ENTERPRISE_API_URL,
+    ENTERPRISE_HTML_BASE,
     FIRST_REVISION_SHA,
     PR_NUMBER,
     PR_URL,
@@ -78,11 +80,20 @@ def precheck_case(
     request: pytest.FixtureRequest,
 ) -> Iterator[dict[str, Any]]:
     client, _ = publication_stack
+    forge = getattr(request, "param", None)
+    html_base = "https://github.com"
+    if forge is not None:
+        html_base = forge["html_base"]
+        monkeypatch.setenv("GITHUB_API_URL", forge["api_url"])
+        monkeypatch.setenv("GITHUB_CLONE_BASE", html_base)
+        get_settings.cache_clear()
+    pr_url = f"{html_base}/{REPO}/pull/{PR_NUMBER}"
     conversation = f"precheck-{uuid.uuid4().hex}"
     deployment, first = _open_lineage(
         client,
         auth_headers,
         conversation_id=conversation,
+        pr_url=pr_url,
     )
     _execute(
         "UPDATE curie.publications SET status = 'succeeded' WHERE id = :id",
@@ -172,7 +183,7 @@ def precheck_case(
     truth: dict[str, Any] = {
         "number": PR_NUMBER,
         "node_id": PR_NODE_ID,
-        "html_url": PR_URL,
+        "html_url": pr_url,
         "state": "open",
         "merged": False,
         "title": OBSERVED_TITLE,
@@ -201,7 +212,7 @@ def precheck_case(
             )
         assert request.headers["authorization"] == "Bearer fixture-precheck-app-token"
         assert request.method == "GET"
-        assert request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
+        assert request.url.path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}")
         if provider_status["value"] == 302:
             return httpx.Response(
                 302, headers={"Location": "https://attacker.example.com/collect"}
@@ -230,6 +241,7 @@ def precheck_case(
             "provider_status": provider_status,
             "calls": calls,
             "queued_event_id": str(uuid.uuid4()),
+            "html_base": html_base,
         }
     finally:
         client.app.state.http_client = original
@@ -275,7 +287,7 @@ def _pull_reads(case: dict[str, Any]) -> list[httpx.Request]:
     return [
         request
         for request in case["calls"]
-        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
+        if request.url.path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}")
     ]
 
 
@@ -375,6 +387,17 @@ def test_mint_binds_running_request_and_comparison_reads_fresh_truth_without_wri
     assert _durable_snapshot() == before
 
 
+@pytest.mark.parametrize(
+    "precheck_case",
+    [
+        pytest.param(None, id="public"),
+        pytest.param(
+            {"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE},
+            id="enterprise",
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize("case_kind", ["changed", "unchanged", "external_edit"])
 def test_metadata_only_admission_rechecks_current_pull_request(
     precheck_case: dict[str, Any], case_kind: str
@@ -421,6 +444,92 @@ def test_metadata_only_admission_rechecks_current_pull_request(
             "SELECT id FROM curie.publications WHERE id <> :id",
             {"id": uuid.UUID(case["publication_id"])},
         ) == []
+
+
+@pytest.mark.parametrize(
+    "precheck_case",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+def test_enterprise_publication_precheck_preserves_forge_identity(
+    precheck_case: dict[str, Any],
+) -> None:
+    case = precheck_case
+    before = _durable_snapshot()
+    context = _mint(case)
+
+    unchanged = _compare(case, context, title=OBSERVED_TITLE, body=OBSERVED_BODY)
+    changed = _compare(case, context, title="Corrected title", body="Corrected body.\n")
+
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json() == {"result": "unchanged"}
+    assert changed.status_code == 200, changed.text
+    assert changed.json() == {"result": "metadata_changed"}
+    assert len(_pull_reads(case)) == 3
+    assert all(
+        str(request.url) == f"{ENTERPRISE_API_URL}/repos/{REPO}/pulls/{PR_NUMBER}"
+        for request in _pull_reads(case)
+    )
+    assert _rows(
+        "SELECT pr_url FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": uuid.UUID(case["lineage_id"])},
+    ) == [{"pr_url": f"{ENTERPRISE_HTML_BASE}/{REPO}/pull/{PR_NUMBER}"}]
+    assert _durable_snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "precheck_case",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+@pytest.mark.parametrize("stage", ["stored_lineage", "provider", "comparison", "admission"])
+def test_enterprise_publication_precheck_refuses_public_github_identity(
+    precheck_case: dict[str, Any], stage: str
+) -> None:
+    case = precheck_case
+    context = _mint(case) if stage in {"comparison", "admission"} else None
+    if stage == "stored_lineage":
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET pr_url = :url WHERE id = :id",
+            {"id": uuid.UUID(case["lineage_id"]), "url": PR_URL},
+        )
+    else:
+        case["truth"]["html_url"] = PR_URL
+    before = _durable_snapshot()
+    case["calls"].clear()
+
+    if stage == "comparison":
+        assert context is not None
+        refused = _compare(case, context, title="Corrected title", body="Corrected body.\n")
+    elif stage == "admission":
+        assert context is not None
+        payload = _publication_payload(
+            case["deployment"]["id"],
+            patch=b"",
+            base_sha=FIRST_REVISION_SHA,
+            conversation_id=context["conversation_id"],
+        )
+        payload.update(
+            changed_paths=[],
+            reply_conversation_id=case["reply_conversation_id"],
+            title=OBSERVED_TITLE,
+            body="Corrected body.\n",
+            work_item_request_id=str(case["request_id"]),
+            work_item_runtime_epoch=7,
+            observed_title=context["observed_title"],
+            observed_body_sha256=context["observed_body_sha256"],
+            observed_lineage_id=context["lineage_id"],
+            observed_lineage_version=context["lineage_version"],
+        )
+        refused = case["client"].post(
+            "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+        )
+    else:
+        refused = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+
+    assert refused.status_code == 503, refused.text
+    assert _durable_snapshot() == before
+    assert len(_pull_reads(case)) == (0 if stage == "stored_lineage" else 1)
 
 
 def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
