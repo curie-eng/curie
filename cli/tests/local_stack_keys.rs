@@ -223,7 +223,10 @@ fn dry_run_passes_stored_credentials_masked() {
     seed_credentials(dir.path(), DEFAULT_PROJECT);
     let out = local_up_dry_run(dir.path(), None);
     let text = output_text(&out);
-    assert!(out.status.success(), "local up --dry-run must succeed; {text}");
+    assert!(
+        out.status.success(),
+        "local up --dry-run must succeed; {text}"
+    );
     for (name, value) in [
         ("CURIE_LOCAL_API_KEY", STORED_API_KEY),
         ("CURIE_LOCAL_POSTGRES_PASSWORD", STORED_PG_PASSWORD),
@@ -245,7 +248,10 @@ fn dry_run_without_a_stored_file_does_not_create_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = local_up_dry_run(dir.path(), None);
     let text = output_text(&out);
-    assert!(out.status.success(), "local up --dry-run must succeed; {text}");
+    assert!(
+        out.status.success(),
+        "local up --dry-run must succeed; {text}"
+    );
     for name in ["CURIE_LOCAL_API_KEY=", "CURIE_LOCAL_POSTGRES_PASSWORD="] {
         assert!(
             text.contains(name),
@@ -264,7 +270,10 @@ fn dry_run_uses_an_explicit_curie_api_key_as_the_install_key() {
     let explicit = "explicit-up-key-placeholder";
     let out = local_up_dry_run(dir.path(), Some(explicit));
     let text = output_text(&out);
-    assert!(out.status.success(), "local up --dry-run must succeed; {text}");
+    assert!(
+        out.status.success(),
+        "local up --dry-run must succeed; {text}"
+    );
     let expected = format!("CURIE_LOCAL_API_KEY={}", masked(explicit));
     assert!(
         text.contains(&expected),

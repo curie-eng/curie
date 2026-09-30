@@ -301,6 +301,24 @@ fi
 # when the ladder started is reused and left alone.
 LOCAL_STACK_OWNED=0
 
+# `curie local up` gives every install its own API key (#3557), and an exported
+# CURIE_API_KEY becomes that key. The local rungs also curl the API directly
+# with ${CURIE_API_KEY:-curie-dev-key}, so before a `local up` this run owns,
+# one generated key is exported and the stack and the direct curls share it.
+# Set to 1 only when the ladder generated the key, so rung_cluster can drop it
+# again: a local key must never reach the cluster rung, which reads a set
+# CURIE_API_KEY as the release's key.
+LADDER_GENERATED_API_KEY=0
+
+ensure_local_api_key() {
+    if [[ -n "${CURIE_API_KEY:-}" ]]; then
+        return 0
+    fi
+    CURIE_API_KEY="$(python3 -c 'import os; print(os.urandom(32).hex())')" || return 1
+    export CURIE_API_KEY
+    LADDER_GENERATED_API_KEY=1
+}
+
 # The local observability proof owns one uniquely named Collector sink. It is
 # deliberately separate from the product Collector: querying the product's own
 # exporter would only prove configuration, while this receiver proves bytes
@@ -4609,6 +4627,7 @@ rung_local() {
         # failure leaves the trap disowning a stack this run created, stranding
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
+        ensure_local_api_key || return 1
         LOCAL_STACK_OWNED=1
         DOCKER_HOST="$daemon_endpoint" BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
         pin_local_source_images
@@ -4952,6 +4971,7 @@ rung_local_release() {
             up_args+=(--minimal)
         fi
         echo "=== curie ${up_args[*]} ==="
+        ensure_local_api_key || return 1
         LOCAL_STACK_OWNED=1
         "$BIN" "${up_args[@]}"
     fi
@@ -5455,6 +5475,11 @@ PYCLAIM
 }
 
 rung_cluster() {
+    # A key ensure_local_api_key generated belongs to the local stack only.
+    if (( LADDER_GENERATED_API_KEY )); then
+        unset CURIE_API_KEY
+        LADDER_GENERATED_API_KEY=0
+    fi
     if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
         CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
         CURIE_RELEASE="${CURIE_RELEASE-curie}"

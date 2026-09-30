@@ -18,7 +18,9 @@
 #
 # Host ports use a distinctive 2xxxx block (host port = "2" + the service's
 # container port) to avoid common service defaults and stay below the OS
-# ephemeral port range (32768+):
+# ephemeral port range (32768+). Every published port binds 127.0.0.1 only, so
+# the stack is not reachable from the network (Docker publishing bypasses host
+# firewalls, and a bare "host:container" mapping listens on every interface):
 #   Curie Console ... http://localhost:28080
 #   Langfuse UI ....... http://localhost:23000
 #   Postgres .......... localhost:25432
@@ -44,7 +46,7 @@
 name: curie
 
 x-langfuse-env: &langfuse-env
-  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+  DATABASE_URL: postgresql://postgres:${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
   SALT: ${LANGFUSE_SALT:-dev-salt-change-me}
   ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
   TELEMETRY_ENABLED: "false"
@@ -87,10 +89,12 @@ services:
     profiles: *core_profiles
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      # `curie local up` supplies a per-install password stored with the install;
+      # the fallback exists only for raw `docker compose up` (CI).
+      POSTGRES_PASSWORD: ${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: postgres
     ports:
-      - "25432:5432"
+      - "127.0.0.1:25432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -107,7 +111,7 @@ services:
     environment:
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
     ports:
-      - "26379:6379"
+      - "127.0.0.1:26379:6379"
     volumes:
       - valkey_data:/data
     healthcheck:
@@ -125,8 +129,8 @@ services:
     environment:
       CLICKHOUSE_PASSWORD: clickhouse
     ports:
-      - "28123:8123"
-      - "29009:9000"
+      - "127.0.0.1:28123:8123"
+      - "127.0.0.1:29009:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - clickhouse_logs:/var/log/clickhouse-server
@@ -158,8 +162,8 @@ services:
       RUSTFS_SECRET_KEY: rustfssecret
       RUSTFS_OBS_LOG_DIRECTORY: /logs
     ports:
-      - "29000:9000"
-      - "29001:9001"
+      - "127.0.0.1:29000:9000"
+      - "127.0.0.1:29001:9001"
     volumes:
       - rustfs_data:/data
       - rustfs_logs:/logs
@@ -216,7 +220,7 @@ services:
     # data tier stays off it.
     networks: [default, curie_runner]
     ports:
-      - "21434:11434"
+      - "127.0.0.1:21434:11434"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -273,7 +277,7 @@ services:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "23000:3000"
+      - "127.0.0.1:23000:3000"
     environment:
       <<: *langfuse-env
       NEXTAUTH_URL: http://localhost:23000
@@ -325,8 +329,8 @@ services:
       - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
       - otel_collector_storage:/var/lib/otelcol/storage
     ports:
-      - "24317:4317"
-      - "24318:4318"
+      - "127.0.0.1:24317:4317"
+      - "127.0.0.1:24318:4318"
       - "127.0.0.1:28888:8888"
     mem_limit: 256m
     stop_signal: SIGTERM
@@ -369,7 +373,7 @@ services:
         condition: service_healthy
     command: ["python", "-m", "curie_api.schema_compat", "upgrade"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/postgres
+      DATABASE_URL: postgresql+asyncpg://postgres:${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
       DB_SCHEMA: curie
     restart: "no"
 
@@ -404,9 +408,10 @@ services:
       curie-migrate:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/postgres
+      DATABASE_URL: postgresql+asyncpg://postgres:${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
       DB_SCHEMA: curie
-      API_KEY: curie-dev-key
+      # Per-install key from `curie local up`; the fallback is for raw compose only.
+      API_KEY: ${CURIE_LOCAL_API_KEY:-curie-dev-key}
       # Dedicated Slack approval-principal attestation key. It is independent
       # from API_KEY so an administrator holding the platform key cannot forge
       # the authenticated Slack identity/channel evidence accepted by the API.
@@ -454,7 +459,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
     ports:
-      - "28000:8000"
+      - "127.0.0.1:28000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 5s
@@ -482,7 +487,7 @@ services:
     environment:
       CURIE_API_TARGET: http://curie-api:8000
     ports:
-      - "28080:8080"
+      - "127.0.0.1:28080:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/ || exit 1"]
       interval: 5s
@@ -577,7 +582,7 @@ services:
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
       - VALKEY_PASSWORD=${VALKEY_PASSWORD:-valkeypass}
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:25432/postgres
+      - DATABASE_URL=postgresql+asyncpg://postgres:${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}@localhost:25432/postgres
       - DB_SCHEMA=curie
       - S3_ENDPOINT_URL=http://localhost:29000
       - S3_ACCESS_KEY=rustfs
@@ -726,7 +731,7 @@ services:
       CURIE_API_URL: http://curie-api:8000
       # Mirrors curie-api's API_KEY so resolve calls authenticate. Wired
       # explicitly rather than relying on the two defaults happening to match.
-      CURIE_API_KEY: curie-dev-key
+      CURIE_API_KEY: ${CURIE_LOCAL_API_KEY:-curie-dev-key}
       # Same independent attestation key the API verifies. Do not reuse
       # CURIE_API_KEY: that would let any platform-key holder mint chat proof.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}

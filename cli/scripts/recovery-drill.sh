@@ -170,6 +170,21 @@ compose() {
     docker compose -f "$COMPOSE_FILE" --profile core "$@"
 }
 
+# `curie local up` starts the stack on per-install credentials it stores at
+# <config dir>/local/<project>.json (#3557). This drill later recreates
+# curie-worker with raw `docker compose`, which would otherwise interpolate the
+# dev fallbacks and point the worker at a Postgres password the database never
+# had. Export the stored pair so every raw compose call below agrees with it.
+export_local_stack_credentials() {
+    local store="${CURIE_CONFIG_DIR:-$HOME/.config/curie}/local/${COMPOSE_PROJECT_NAME:-curie}.json"
+    [[ -f "$store" ]] || die "curie local up stored no stack credentials at $store"
+    CURIE_LOCAL_API_KEY="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["api_key"])' "$store")" \
+        || die "could not read the API key from $store"
+    CURIE_LOCAL_POSTGRES_PASSWORD="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["postgres_password"])' "$store")" \
+        || die "could not read the Postgres password from $store"
+    export CURIE_LOCAL_API_KEY CURIE_LOCAL_POSTGRES_PASSWORD
+}
+
 local_stack_running() {
     docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}' | grep -q .
 }
@@ -332,6 +347,7 @@ bring_up_local() {
     STACK_OWNED=1
     log "bringing up local stack (fake model, minimal profile) for recovery drill"
     run_unlocked "$BIN" local up --minimal
+    export_local_stack_credentials
     local i
     for i in $(seq 1 60); do
         if curl -fsS http://localhost:28000/health >/dev/null 2>&1; then
