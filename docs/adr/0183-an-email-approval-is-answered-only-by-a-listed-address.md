@@ -7,8 +7,9 @@ Status: Draft
 Today, when a bot asks for approval in an email thread, the only person who can
 answer is the person who asked. This ADR replaces that with a list: a route
 names the email addresses that may approve, the same way a Slack route names
-the Slack users who may approve. A reply counts only when the mail adapter has
-verified who sent it and that address is on the list. With no list, nobody can
+the Slack users who may approve. A reply counts only when it passes the mail adapter's inbound gate and its
+sender address is on the list. The gate checks provider verdicts; it does not
+prove control of the named mailbox. With no list, nobody can
 approve by email, and the bot flags the request for a human instead of waiting.
 
 This ADR amends [ADR-0177](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md):
@@ -27,10 +28,12 @@ It builds on [ADR-0106](0106-an-approver-is-an-authenticated-principal.md),
   holds Slack user ids (`users`) or a Slack user group (`group`).
 - **Inbound allowlist**: who may talk to the bot at all. That is the binding's
   `allowed_callers` (ADR-0175), and the mail adapter's own allowed senders.
-- **Verified sender**: the address the mail adapter's inbound gate
-  authenticated. It is the same gate that authenticates anyone who writes to
-  the bot: the provider's SPF, DKIM and DMARC verdict, or the equivalent check a
-  mail adapter documents as its inbound gate. This ADR adds no new check.
+- **Verified sender**: shorthand here for the bare address carried by a message
+  that passed the mail adapter's inbound gate: the provider's SPF, DKIM and DMARC
+  verdict, or the equivalent check a mail adapter documents as its inbound gate.
+  These verdicts authenticate the sending domain, not control of the named
+  mailbox. Curie performs no additional sender authentication. This ADR adds no
+  new check; accepting that limitation is an explicit acceptance condition.
 
 ## Context
 
@@ -50,8 +53,8 @@ the inbound allowlist, exactly as a Slack route's approvers are separate from
 who may talk to the bot in that channel. Being allowed to talk to a bot is not
 the same as being allowed to approve what it does.
 
-The requester-only rule does not meet the ruling. The requester is verified,
-but nobody wrote their address down as an approver.
+The requester-only rule does not meet the ruling. The requester's message passes
+the inbound gate, but nobody wrote their address down as an approver.
 
 ## Decision
 
@@ -86,8 +89,9 @@ card shown in email reads only `emails`.
 A reply in an email thread with a pending approval goes through these checks,
 in this order, and stops at the first that fails:
 
-1. **The inbound gate.** The adapter verifies the sender, exactly as for any
-   message to the bot. A message that fails is dropped before anything else.
+1. **The inbound gate.** The adapter checks the provider's verdicts, exactly as
+   for any message to the bot. This does not prove control of the named mailbox.
+   A message that fails is dropped before anything else.
 2. **The inbound allowlist.** A sender the mailbox does not admit is refused
    before any approval logic runs. The adapter applies its own list, and the
    platform applies the binding's `allowed_callers` again when the answer
@@ -173,6 +177,9 @@ principal on a Slack approver set.
   [`docs/adr/AGENTS.md`](AGENTS.md).
 - The maintainer confirms that the requester-only rule is retired rather than
   kept as the default when no list is given.
+- The maintainer explicitly accepts the domain-authentication limitation above
+  for approval answers, or requires stronger mailbox verification in a revised
+  Draft before acceptance. The quoted ruling alone does not decide this tradeoff.
 
 ## Alternatives considered
 
@@ -187,5 +194,5 @@ principal on a Slack approver set.
    would make the list a filter on one person, not a set of approvers, unlike
    every Slack approver set.
 4. **Wait for identity links (ADR-0166, #2910).** Rejected by the ruling:
-   email approvals are needed before that lands, and a list of verified
-   addresses is enough to meet it.
+   email approvals are needed before that lands. Whether the current inbound
+   gate provides enough identity assurance remains an explicit acceptance question.
