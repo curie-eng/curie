@@ -16,7 +16,7 @@ explicitly and gated on the caller's `audit_columns`, for the same reason --
 Two things are exposed:
 
 1. `fence_identity_tables` -- `SET LOCAL lock_timeout` then `LOCK TABLE
-   curie.agent_channels, curie.approvals IN ACCESS EXCLUSIVE MODE` inside the
+   <schema>.agent_channels, <schema>.approvals IN ACCESS EXCLUSIVE MODE` inside the
    revision's own transaction (`alembic/env.py` sets
    `transaction_per_migration=True`), so the preflight, the backfill and the
    constraint tightening commit as one unit and a binding cannot move between
@@ -84,10 +84,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 
-SCHEMA = "curie"
 APPROVALS = "approvals"
 CHANNELS = "agent_channels"
 AUDIT = "approval_audit_entries"
@@ -97,13 +97,31 @@ AUDIT = "approval_audit_entries"
 #: writer that touches both tables (`crud.delete_agent`, publication create)
 #: takes them in that order. See the module docstring for the reader cycle this
 #: order cannot exclude and why deadlock detection resolving it is safe.
-FENCED_TABLES = (f"{SCHEMA}.{CHANNELS}", f"{SCHEMA}.{APPROVALS}")
+FENCED_TABLES = (CHANNELS, APPROVALS)
 
 #: The STRONGEST mode any fencing revision needs. See the module docstring: a
 #: weaker fence followed by the revision's own ACCESS EXCLUSIVE DDL is a lock
 #: upgrade, and a lock upgrade against a reader-that-becomes-a-writer is a
 #: deadlock, not a wait.
 LOCK_MODE = "ACCESS EXCLUSIVE"
+
+
+def _schema() -> str:
+    """The configured app schema, as `alembic/env.py` handed it to Alembic.
+
+    `env.py` pins `version_table_schema` to `db_schema` from the API settings,
+    so the running migration context is where this module learns the schema
+    without importing `curie_api.config` (see the import contract above).
+    """
+
+    schema: str | None = op.get_context().version_table_schema
+    if not schema:
+        raise RuntimeError(
+            "the migration fence needs the app schema, but this Alembic context "
+            "has no version_table_schema; run it through apps/api/alembic/env.py"
+        )
+    return schema
+
 
 #: The one reply kind whose egress identity is legitimately implicit: Slack
 #: replies go back through the worker's configured Slack origin, so a Slack
@@ -210,7 +228,8 @@ def _blockers(conn: Connection, own_pid: int | None) -> str:
     # Literal identifiers rather than bind params: this runs on asyncpg, whose
     # protocol cannot infer a type for a parameter in a position like this and
     # errors out -- which would abort the fence's transaction before the LOCK.
-    # The values are module constants, never operator input.
+    # The values are module constants and configured schema, never operator input.
+    schema = _schema()
     query = sa.text(
         f"""
         SELECT c.relname AS table_name,
@@ -222,7 +241,7 @@ def _blockers(conn: Connection, own_pid: int | None) -> str:
         JOIN pg_class c ON c.oid = l.relation
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stat_activity a ON a.pid = l.pid
-        WHERE n.nspname = '{SCHEMA}'
+        WHERE n.nspname = '{schema}'
           AND c.relname IN ('{APPROVALS}', '{CHANNELS}')
           AND l.granted
         ORDER BY c.relname, l.pid
@@ -235,7 +254,7 @@ def _blockers(conn: Connection, own_pid: int | None) -> str:
     if not rows:
         return "no other session held either table when the fence was attempted"
     return "; ".join(
-        f"pid {row.pid} holds {row.mode} on {SCHEMA}.{row.table_name} "
+        f"pid {row.pid} holds {row.mode} on {schema}.{row.table_name} "
         f"(state {row.state or 'unknown'}, query {(row.query or '').strip()!r})"
         for row in rows
     )
@@ -260,9 +279,11 @@ def fence_identity_tables(conn: Connection, *, lock_timeout_ms: int | None = Non
     except Exception:  # pragma: no cover - only affects the diagnostic filter
         own_pid = None
 
+    schema = _schema()
     conn.execute(sa.text(f"SET LOCAL lock_timeout = '{timeout_ms}ms'"))
     blockers = _blockers(conn, own_pid)
-    statement = f"LOCK TABLE {', '.join(FENCED_TABLES)} IN {LOCK_MODE} MODE"
+    tables = ", ".join(f"{schema}.{table}" for table in FENCED_TABLES)
+    statement = f"LOCK TABLE {tables} IN {LOCK_MODE} MODE"
     try:
         conn.execute(sa.text(statement))
     except DBAPIError as error:
@@ -271,8 +292,8 @@ def fence_identity_tables(conn: Connection, *, lock_timeout_ms: int | None = Non
             f"`{statement}` was refused -- {blockers}. "
             "Refusing BEFORE any schema or row was mutated, so this database is "
             "exactly as it was and re-running the upgrade is safe. Settle or stop "
-            f"the writer above -- it holds {SCHEMA}.{APPROVALS} or "
-            f"{SCHEMA}.{CHANNELS} -- or raise the bound with "
+            f"the writer above -- it holds {schema}.{APPROVALS} or "
+            f"{schema}.{CHANNELS} -- or raise the bound with "
             f"{LOCK_TIMEOUT_ENV}, then re-run this migration."
         ) from error
 
@@ -457,11 +478,12 @@ def _already_honored(conn: Connection, *, declaration: Declaration) -> bool:
     established.
     """
 
+    schema = _schema()
     row = conn.execute(
         sa.text(
             f"""
             SELECT 1
-            FROM {SCHEMA}.{AUDIT}
+            FROM {schema}.{AUDIT}
             WHERE approval_id = CAST(:id AS uuid)
               AND action = CAST(:action AS text)
               AND evidence ->> 'declared_reply_kind' = CAST(:kind AS text)
@@ -522,6 +544,7 @@ def honor_declarations(
     if not declarations:
         return set()
 
+    schema = _schema()
     path = declarations_document_path()
     known = set(unreconstructable)
     reconstructable: list[str] = []
@@ -532,7 +555,7 @@ def honor_declarations(
         if _already_honored(conn, declaration=declaration):
             continue
         exists = conn.execute(
-            sa.text(f"SELECT 1 FROM {SCHEMA}.{APPROVALS} WHERE id = CAST(:id AS uuid)"),
+            sa.text(f"SELECT 1 FROM {schema}.{APPROVALS} WHERE id = CAST(:id AS uuid)"),
             {"id": approval_id},
         ).first()
         (reconstructable if exists else unknown).append(approval_id)
@@ -585,7 +608,7 @@ def honor_declarations(
         conn.execute(
             sa.text(
                 f"""
-                UPDATE {SCHEMA}.{APPROVALS}
+                UPDATE {schema}.{APPROVALS}
                 {statement}
                 WHERE id = CAST(:id AS uuid)
                 """
@@ -599,7 +622,7 @@ def honor_declarations(
         # row that resumes with no credential.
         resulting_kind, resulting_adapter = conn.execute(
             sa.text(
-                f"SELECT reply_kind, reply_adapter FROM {SCHEMA}.{APPROVALS} "
+                f"SELECT reply_kind, reply_adapter FROM {schema}.{APPROVALS} "
                 "WHERE id = CAST(:id AS uuid)"
             ),
             {"id": approval_id},
@@ -664,6 +687,7 @@ def _append_audit_entry(
     }
     # `created_at` is left to its server default, and every other column is
     # dropped unless the caller says it exists at this revision.
+    schema = _schema()
     columns = [column for column in values if column in audit_columns]
     placeholders = [
         "CAST(:evidence AS jsonb)" if column == "evidence" else f":{column}"
@@ -671,7 +695,7 @@ def _append_audit_entry(
     ]
     conn.execute(
         sa.text(
-            f"INSERT INTO {SCHEMA}.{AUDIT} ({', '.join(columns)}) "
+            f"INSERT INTO {schema}.{AUDIT} ({', '.join(columns)}) "
             f"VALUES ({', '.join(placeholders)})"
         ),
         {column: values[column] for column in columns},

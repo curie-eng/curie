@@ -543,7 +543,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
-        hook_runs=HookRunRecorder(engine),
+        hook_runs=HookRunRecorder(engine, config.db_schema),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
