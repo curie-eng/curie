@@ -1255,14 +1255,15 @@ non-enforcing CNI.
 (default `auto`):
 
 - **`auto`** -- at install/upgrade time the chart looks up the `gvisor`
-  RuntimeClass. Present -> runner pods use it. Absent -> pods run without it and
-  `NOTES.txt` warns. Never blocks the install, so a bare install works on any
-  cluster. (Helm's `lookup` returns empty under `helm template`/--dry-run, so a
-  templated render always shows the no-gvisor shape.) This never-blocks behavior
-  applies to the fake-model default only; enabling a real model
-  (`fakeModel=false` or `inference.deploy`) under `auto` renders the blocking
+  RuntimeClass. A real model (`fakeModel=false` or `inference.deploy`) stamps
+  that class on runner pods even when lookup is empty, so `helm template`,
+  Argo CD, and Flux show the gVisor shape. That same path renders the blocking
   `preflight-gvisor` hook, so a runsc-less real-model install fails closed
-  instead of silently running on the host kernel.
+  instead of silently running on the host kernel. Fake-model auto still omits
+  the class when lookup is empty (a templated render shows the no-gvisor shape)
+  and `NOTES.txt` warns; when lookup finds the class, those pods use it. That
+  never-blocks path is the fake-model default, so a bare install works on any
+  cluster.
 - **`require`** -- always stamp the RuntimeClass AND run the `preflight-gvisor`
   hook, which blocks the install with a clear remediation if the runtimeclass is
   missing or downgraded to runc. The fail-hard production posture.

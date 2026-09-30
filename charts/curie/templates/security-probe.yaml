@@ -74,6 +74,9 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, rolebindings]
     verbs: [create, delete, get]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: [sandboxtemplates]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -277,6 +280,14 @@ spec:
               value: {{ .Values.security.probe.blockedTarget | quote }}
             - name: RC
               value: {{ include "curie.gvisor.className" . | quote }}
+            - name: REQUIRED_RUNTIME_CLASS
+              value: {{ include "curie.gvisor.requiredRuntimeClassName" . | quote }}
+            - name: RUNNER_TEMPLATES
+              {{- $runnerTemplates := list (printf "%s-runner" (include "curie.fullname" .)) }}
+              {{- range $agent := include "curie.agentSandboxPoolAgents" . | fromJsonArray }}
+              {{- $runnerTemplates = append $runnerTemplates (printf "%s-agent-%s-runner" (include "curie.fullname" $) $agent) }}
+              {{- end }}
+              value: {{ join " " $runnerTemplates | quote }}
             - name: EGRESS_POD
               value: {{ include "curie.fullname" . }}-egress-probe
             - name: NETSHOOT
@@ -526,11 +537,27 @@ spec:
               fi
 
               # ================= Claim 4: gVisor availability =======================
-              # Namespaced pod-admission probe (no cluster RBAC): try to schedule a
-              # pod UNDER the runtimeclass; admission tells us if it exists, and the
-              # kernel string tells us if it is actually enforced (vs downgraded).
+              # Namespaced checks (no cluster RBAC). Read each runner SandboxTemplate
+              # class first; an empty class is a mismatch, not a skip. Then schedule
+              # a throwaway pod under the runtimeclass: admission tells us if it
+              # exists, and the kernel string tells us if it is enforced.
+              check_runner_sandbox_template_class() {
+                if [ -z "${REQUIRED_RUNTIME_CLASS:-}" ]; then
+                  return 0
+                fi
+                local name got
+                for name in ${RUNNER_TEMPLATES}; do
+                  got="$(kubectl get sandboxtemplate "$name" -n "$NS" -o jsonpath='{.spec.podTemplate.spec.runtimeClassName}' 2>/dev/null || true)"
+                  if [ "$got" != "$REQUIRED_RUNTIME_CLASS" ]; then
+                    echo "FAIL: SandboxTemplate ${name} runtimeClassName is '${got}', want '${REQUIRED_RUNTIME_CLASS}'"
+                    fail=1
+                  fi
+                done
+                return 0
+              }
               echo ""
               echo "== Claim 4: gVisor RuntimeClass =="
+              check_runner_sandbox_template_class
               if [ -z "$RC" ]; then
                 echo "SKIP: security.gvisor.mode is off (kernel isolation disabled)."
               else
