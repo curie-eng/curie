@@ -55,6 +55,16 @@ _APPROVAL_REFUSAL = (
 _qevent = functools.partial(qevent, received_at="2026-09-30T00:00:00+00:00")
 
 
+def _assert_refused(h: object) -> None:
+    """WORKER-TOOL-ACCESS-2: a failed turn, marked and completed escalated."""
+
+    sink = h.sink  # type: ignore[attr-defined]
+    assert sink.last_text is not None
+    assert sink.last_text.startswith("curie-turn-failure: tool-access-unenforced\n\n")
+    assert _REFUSAL in sink.last_text
+    assert [c.outcome for c in sink.completions][-1] == "escalated"
+
+
 def _restricted(text: str = "Reply with exactly: nonce-0001", **kwargs: object) -> QueuedTurn:
     turn = _qevent(text, **kwargs)  # type: ignore[arg-type]
     return turn.model_copy(update={"tool_access": ToolAccess.READ_ONLY})
@@ -132,7 +142,7 @@ def test_a_runner_that_does_not_advertise_read_only_never_runs_the_turn(
 
             assert h.runner.opened == []
             assert h.runner.queried == []
-            assert h.sink.last_text == _REFUSAL
+            _assert_refused(h)
             assert await h.async_redis.exists(h.config.done_key(turn.event_id))
 
     asyncio.run(go())
@@ -148,7 +158,7 @@ def test_a_runner_advertising_other_values_never_runs_the_turn(make_harness) -> 
             await h.kernel.process_event(turn)
 
             assert h.runner.opened == []
-            assert h.sink.last_text == _REFUSAL
+            _assert_refused(h)
 
     asyncio.run(go())
 
@@ -166,7 +176,7 @@ def test_an_unreadable_runner_status_opens_nothing_and_is_retried(make_harness) 
                 await h.kernel.process_event(turn)
 
             assert h.runner.opened == []
-            assert h.sink.last_text != _REFUSAL
+            assert h.sink.last_text is None or _REFUSAL not in h.sink.last_text
             assert not await h.async_redis.exists(h.config.done_key(turn.event_id))
 
     asyncio.run(go())
@@ -335,7 +345,7 @@ def test_a_runner_that_cannot_enforce_is_never_sent_the_turn(
             await h.kernel.process_event(turn)
 
             assert session.queries == []
-            assert h.sink.last_text == _REFUSAL
+            _assert_refused(h)
         assert _refused_builtin_calls(tool_results) == 0
 
     asyncio.run(go())
@@ -357,7 +367,103 @@ def test_a_runner_session_that_ran_an_ordinary_turn_is_not_sent_a_read_only_one(
             turn = _restricted(thread="th-ro-12")
             await h.kernel.process_event(turn)
 
-            assert h.sink.last_text == _REFUSAL
+            _assert_refused(h)
         assert _refused_builtin_calls(tool_results) == 0
+
+    asyncio.run(go())
+
+
+# --- the advertisement read itself -----------------------------------------------
+
+
+def _fail_the_advertisement_read(
+    h: object, monkeypatch: pytest.MonkeyPatch, answer: object
+) -> list[int]:
+    """Make only the tool access status read misbehave; every other read is real.
+
+    ``answer`` is raised when it is an exception, returned otherwise. The busy
+    read on the job branch must keep answering, or the turn would defer on it
+    and never reach the check under test.
+    """
+
+    kernel = h.kernel  # type: ignore[attr-defined]
+    real = kernel._runner.status
+    hits: list[int] = []
+
+    async def status(*args: object, **kwargs: object) -> object:
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == "_require_tool_access":
+                hits.append(1)
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+            frame = frame.f_back  # type: ignore[assignment]
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(kernel._runner, "status", status)
+    monkeypatch.setattr(kernel, "_backoff", lambda _attempt: 0.0)
+    return hits
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [OSError("status blip"), ["read-only"], "read-only"],
+    ids=["unreadable", "a-json-list", "a-json-string"],
+)
+def test_a_bad_advertisement_read_never_opens_the_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch, answer: object
+) -> None:
+    # @spec WORKER-TOOL-ACCESS-2: an unreadable or non-object status opens
+    # nothing, is retried like any turn the runner did not accept, and is not
+    # the refusal (which would claim the runner was read).
+    async def go() -> None:
+        async with make_harness(max_attempts=2) as h:
+            h.runner.tool_access_enforced = ["read-only"]
+            hits = _fail_the_advertisement_read(h, monkeypatch, answer)
+            turn = _restricted(thread="th-ro-13")
+
+            await h.kernel.process_event(turn)
+
+            assert len(hits) == 2, "each attempt reads the advertisement once"
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert h.sink.last_text.startswith("curie-turn-failure: runner-error")
+            assert _REFUSAL not in h.sink.last_text
+
+    asyncio.run(go())
+
+
+def test_the_runners_refusal_classes_are_platform_classes() -> None:
+    # @spec WORKER-TOOL-ACCESS-5: a turn the runner refuses escalates under its
+    # own class; the runner's constants are the source, read here directly.
+    from curie_runner.tool_access import (
+        TOOL_ACCESS_REFUSED_CLASSIFICATION,
+        TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+    )
+    from curie_worker.kernel import PLATFORM_ERROR_CLASSIFICATIONS, _display_error_classification
+
+    for classification in (
+        TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+        TOOL_ACCESS_REFUSED_CLASSIFICATION,
+    ):
+        assert classification in PLATFORM_ERROR_CLASSIFICATIONS
+        assert _display_error_classification(classification) == classification
+
+
+def test_a_turn_the_runner_itself_refuses_escalates_under_its_class(
+    make_harness, tmp_path: Path, tool_results: InMemoryMetricReader
+) -> None:
+    # @spec WORKER-TOOL-ACCESS-5: a read-only slash command passes the worker's
+    # check and is refused by the real runner (RUNNER-TOOL-ACCESS-9).
+    async def go() -> None:
+        runner = _booted_runner(tmp_path)
+        await runner.start()
+        async with make_harness(runner_app=create_runner_app(runner)) as h:
+            await h.kernel.process_event(_restricted("/acme-bot:probe", thread="th-ro-14"))
+
+            assert h.sink.last_text is not None
+            assert h.sink.last_text.startswith("curie-turn-failure: tool-access-refused")
+            assert [c.outcome for c in h.sink.completions][-1] == "escalated"
 
     asyncio.run(go())

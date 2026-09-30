@@ -47,6 +47,7 @@ from aci_protocol import (
     ReplyHandle,
     SessionStatus,
     TextDelta,
+    ToolAccess,
     TurnSource,
 )
 from curie_worker.attachments import AttachmentResolutionError
@@ -493,6 +494,56 @@ def test_a_file_on_an_idle_retained_thread_replaces_the_claim_and_reaches_runner
             assert lane.resolve_calls[0]["ids"] == ["F2"]
             assert lane.discard_calls == []
             assert probe_budgets[:2] == [5.0, 5.0]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("advertised", [None, ["read-only"]], ids=["unadvertised", "advertised"])
+def test_a_read_only_file_turn_is_checked_on_the_runner_it_hands_off_to(
+    make_harness, advertised: list[str] | None
+) -> None:
+    """WORKER-TOOL-ACCESS-2 on the attachment handoff, which once skipped it.
+
+    The file turn replaces the retained claim and starts on a second runner.
+    That runner's own status decides: unadvertised, nothing restricted is
+    sent and the turn escalates; advertised, the event carries read-only.
+    """
+
+    # @spec WORKER-TOOL-ACCESS-2
+    async def go() -> None:
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._workspace = _WorkspaceProbe(  # type: ignore[assignment]
+                h.substrate, selected_repo=None
+            )
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="ok", status=DONE)]
+                runner.tool_access_enforced = advertised
+
+            await h.kernel.process_event(_qevent("first", thread="tReadOnlyFile"))
+            restricted = _qevent(
+                "read the file",
+                thread="tReadOnlyFile",
+                attachments=[Attachment(id="F9", name="probe.txt", mime_type="text/plain")],
+            ).model_copy(update={"tool_access": ToolAccess.READ_ONLY})
+
+            await h.kernel.process_event(restricted)
+
+            assert len(h.fake_k8s.claim_envs) == 2, "the file turn did not hand off"
+            claim = next(iter(h.fake_k8s.claims))
+            second = h.runners[h.fake_k8s.assigned_ports[h.fake_k8s.claims[claim].sandbox_name]]
+            assert second.opened != ["first"], "the handoff reused the first runner"
+            sent = [b.get("tool_access") for r in h.runners.values() for b in r.event_bodies]
+            assert second.status_headers, "the handoff runner's status was never read"
+            if advertised is None:
+                assert "read-only" not in sent
+                assert h.sink.last_text is not None
+                assert h.sink.last_text.startswith("curie-turn-failure: tool-access-unenforced")
+            else:
+                assert second.event_bodies[-1]["tool_access"] == "read-only"
+                assert h.sink.last_text == "ok"
 
     asyncio.run(go())
 
