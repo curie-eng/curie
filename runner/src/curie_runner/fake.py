@@ -31,6 +31,7 @@ from claude_agent_sdk.types import (
 from .adapter import PartialMessageBoundary
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
 from .history import ConversationMessage
+from .tool_access import TurnToolAccess
 
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
@@ -190,6 +191,12 @@ class FakeModelSession:
     fake's offline no-op guarantee. Tests may inject Curie's in-process
     ``pre_tool_use_hook`` callback explicitly to exercise the real hook decision
     shape without running bundle code.
+
+    ``tool_access`` is the session's shared per-turn tool access
+    (RUNNER-TOOL-ACCESS-8). A call it refuses is decided first, before any
+    emulated tool (the approval request) runs, and is answered the way the real
+    CLI answers a PreToolUse deny: an error result carrying the refusal, in
+    place of whatever result the script had for that call. The turn continues.
     """
 
     def __init__(
@@ -206,8 +213,14 @@ class FakeModelSession:
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
+        tool_access: TurnToolAccess | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        self._tool_access = tool_access
+        # Per turn: the calls ``tool_access`` refused, whose scripted results are
+        # replaced, and the refusal results not yet delivered.
+        self._refused_ids: set[str] = set()
+        self._pending_refusals: list[UserMessage] = []
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._pre_tool_use_hook = pre_tool_use_hook
@@ -254,19 +267,27 @@ class FakeModelSession:
         self.queries.append(text)
         self._interrupted = False
         self._halted = False
+        self._refused_ids = set()
+        self._pending_refusals = []
 
     async def interrupt(self) -> None:
         self.interrupts += 1
         self._interrupted = True
 
     async def receive_turn(self) -> AsyncIterator[Any]:
-        for message in self._script_factory():
+        for scripted in self._script_factory():
             if self._interrupted and self._truncate_on_interrupt:
                 return
+            message = self._without_refused_results(scripted)
+            if message is None:
+                continue
             denied_messages = await self._apply_gate(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
                 yield PartialMessageBoundary(event_type="message_start")
             yield message
+            refusals, self._pending_refusals = self._pending_refusals, []
+            for refusal in refusals:
+                yield refusal
             if denied_messages is not None:
                 for denied_message in denied_messages:
                     yield denied_message
@@ -305,6 +326,20 @@ class FakeModelSession:
         for block in message.content:
             if not isinstance(block, ToolUseBlock):
                 continue
+            if self._tool_access is not None:
+                # @spec RUNNER-TOOL-ACCESS-8: the read-only decision comes before
+                # anything this fake emulates, as the front does on the real path.
+                reason = self._tool_access.refuse(block.name, block.id)
+                if reason is not None:
+                    self._refused_ids.add(block.id)
+                    self._pending_refusals.append(
+                        _tool_result(
+                            block.id,
+                            f"PreToolUse:{block.name} hook error: {reason}",
+                            is_error=True,
+                        )
+                    )
+                    continue
             if block.name == APPROVAL_TOOL_NAME and self._approval_gate is not None:
                 # Run the real decision table so the container fake tier resolves
                 # the route (sole-route auto-bind, unknown-route refusal) and sets
@@ -361,6 +396,22 @@ class FakeModelSession:
                         _result(is_error=True, subtype="error_during_execution"),
                     )
         return None
+
+    def _without_refused_results(self, message: Any) -> Any:
+        """``message`` less any scripted result for a call this turn refused."""
+
+        if not self._refused_ids or not isinstance(message, UserMessage):
+            return message
+        if isinstance(message.content, str):
+            return message
+        kept = [
+            block
+            for block in message.content
+            if not (isinstance(block, ToolResultBlock) and block.tool_use_id in self._refused_ids)
+        ]
+        if not kept:
+            return None
+        return UserMessage(content=kept)
 
     async def close(self) -> None:
         self.connected = False

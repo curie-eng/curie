@@ -33,6 +33,7 @@ from aci_protocol import (
     Final,
     Interrupt,
     SessionStatus,
+    ToolAccess,
     ToolNote,
     parse_ndjson_line,
     to_ndjson_line,
@@ -74,6 +75,11 @@ from .memory import (
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
+from .tool_access import (
+    ENFORCED_TOOL_ACCESS,
+    TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+    TurnToolAccess,
+)
 from .translate import TurnState, translate_message
 from .usage_report import UsageSink
 
@@ -215,6 +221,9 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     durable Approval record.
     """
 
+    if state.tool_access is not None:
+        # @spec RUNNER-TOOL-ACCESS-3: a restricted turn never pauses for a human.
+        return final
     runner_halted_the_turn = (
         state.approval_halt_requested and state.error_classification is None
     )
@@ -288,8 +297,13 @@ class SessionRunner:
         progress_activity: ProgressActivity | None = None,
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
+        tool_access: TurnToolAccess | None = None,
     ) -> None:
         self._factory = session_factory
+        # The per-turn tool access every call decision reads (RUNNER-TOOL-ACCESS-2).
+        # None means this session cannot enforce one, so it refuses a restricted
+        # turn rather than run it unrestricted (RUNNER-TOOL-ACCESS-5).
+        self._tool_access = tool_access
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
@@ -464,6 +478,24 @@ class SessionRunner:
         """Whether every completed logical turn is present in durable replay."""
 
         return self._history_durable
+
+    @property
+    def enforced_tool_access(self) -> tuple[str, ...]:
+        """The tool access values this session enforces, for ``/status``.
+
+        @spec RUNNER-TOOL-ACCESS-5
+        """
+
+        if self._tool_access is None:
+            return ()
+        return tuple(access.value for access in ENFORCED_TOOL_ACCESS)
+
+    @property
+    def live_tool_access(self) -> ToolAccess | None:
+        """The tool access of the live turn, or None when no turn is live."""
+
+        state = self._active_state
+        return state.tool_access if self._turn_open and state is not None else None
 
     async def remember(
         self,
@@ -706,15 +738,19 @@ class SessionRunner:
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
-    async def steer(self, text: str) -> bool:
+    async def steer(self, text: str, *, tool_access: ToolAccess | None = None) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
         Returns False when no turn is active (the finish-race boundary F1 owns:
         the caller falls back to opening a fresh turn). The steered output appears
-        on the already-open turn's NDJSON stream.
+        on the already-open turn's NDJSON stream. A steer under a different tool
+        access than the live turn's is refused the same way, so neither message
+        runs under the other's access (RUNNER-TOOL-ACCESS-4).
         """
 
         if self._session is None or not self._turn_open or not self._turn_ready:
+            return False
+        if self._active_state is None or self._active_state.tool_access != tool_access:
             return False
         await self._session.query(text)
         if self._active_state is not None:
@@ -836,7 +872,7 @@ class SessionRunner:
             # sent, so steer is refused and a stop is recorded without an SDK
             # interrupt that no query is there to receive.
             self._turn_ready = False
-            state = TurnState()
+            state = TurnState(tool_access=event.tool_access)
             self._active_state = state
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
@@ -912,6 +948,39 @@ class SessionRunner:
                                 )
                                 return
                             self._admission_gate = None
+                        if event.tool_access is not None and (
+                            self._tool_access is None
+                            or event.tool_access not in ENFORCED_TOOL_ACCESS
+                        ):
+                            # @spec RUNNER-TOOL-ACCESS-5: a restricted turn this
+                            # session cannot enforce never reaches a connector
+                            # or the model; running it unrestricted is the one
+                            # outcome TOOL-ACCESS-4 exists to prevent.
+                            self._turn_open = False
+                            self._turn_ready = False
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = "classified_failure"
+                            gen.finish_turn(
+                                interrupt_requested=False,
+                                classified_failure=True,
+                            )
+                            terminal_for_log = True
+                            yield to_ndjson_line(
+                                ErrorEvent(
+                                    message=(
+                                        f"this runner cannot enforce tool access "
+                                        f"{event.tool_access.value!r}; the turn was not run"
+                                    ),
+                                    classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                                )
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run refused",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
+                            return
                         if self._history_capacity_exceeded:
                             self._history_loss_observed = True
                             self._history_durable = False
@@ -1239,6 +1308,9 @@ class SessionRunner:
         gen.query_observed()
         # The prompt text never reaches OTel (e2e ladder gate); record its size only.
         gen.observe_prompt(event.text)
+        if self._tool_access is not None:
+            # @spec RUNNER-TOOL-ACCESS-4: in force from this prompt until the next.
+            self._tool_access.begin(event.tool_access)
         self._result_pending = True
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
@@ -1612,6 +1684,11 @@ class SessionRunner:
                 outcome = "success"
             elif self._interrupt_requested and not self._timeout_requested:
                 outcome = "cancelled"
+            elif self._tool_access is not None and call_id in self._tool_access.refused_call_ids:
+                # @spec RUNNER-TOOL-ACCESS-6: the read-only front refused this
+                # exact call before it ran, so its error result is the refusal
+                # and says nothing about the tool or its connector.
+                outcome = "refused"
             elif gate is not None and call_id in gate.held_call_ids:
                 outcome = "awaiting_approval"
             elif gate is not None and call_id in gate.refused_call_ids:

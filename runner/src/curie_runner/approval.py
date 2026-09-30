@@ -749,6 +749,19 @@ class ApprovalGate:
             return None
         return self.grantable_by_route.get(route)
 
+    def requires_approval(self, tool_name: str) -> bool:
+        """Whether a call to ``tool_name`` would need an approval, read-only.
+
+        @spec RUNNER-TOOL-ACCESS-1: a read-only turn cannot request one, so the
+        tool access check refuses these before the gate is consulted. The same
+        membership ``_decide_gate`` blocks on, with no state touched.
+        """
+
+        return (
+            tool_name in self.required
+            or _tool_policy_outcome(self, tool_name) is ToolPolicyDecision.APPROVAL_REQUIRED
+        )
+
     def reset(self) -> None:
         self.pending_summary = None
         self.pending_display = None

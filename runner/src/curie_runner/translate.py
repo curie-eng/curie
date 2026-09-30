@@ -28,6 +28,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
 )
 from claude_agent_sdk import (
@@ -134,6 +135,10 @@ def _is_credit_exhausted(error: str, provider_text: str) -> bool:
 class TurnState:
     """Mutable per-turn state threaded through translation."""
 
+    # The turn's tool access (RUNNER-TOOL-ACCESS-3). Under ``READ_ONLY`` the
+    # approval and publication requests below are never captured: the calls
+    # are refused before they execute, so there is no request to report.
+    tool_access: ToolAccess | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
     # The summary passed to the approval-request tool (ADR-0010), captured off
@@ -322,14 +327,15 @@ def _translate_assistant(
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
-            if block.name == PLATFORM_PUBLISH_TOOL_NAME:
+            # @spec RUNNER-TOOL-ACCESS-3: a read-only turn captures no request.
+            if block.name == PLATFORM_PUBLISH_TOOL_NAME and state.tool_access is None:
                 # Wire-level capture only (#2294). The session decides what to
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.
                 state.publication_calls.append(
                     (block.id, block.input if isinstance(block.input, dict) else {})
                 )
-            if block.name == APPROVAL_TOOL_NAME:
+            if block.name == APPROVAL_TOOL_NAME and state.tool_access is None:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path
                 # (executed in-process tool) and the fake path (scripted
