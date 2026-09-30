@@ -16,6 +16,7 @@ from aci_protocol import (
     ReplyHandle,
     TurnSource,
 )
+from channel_protocol.work_item_events import execute_event_id, terminate_event_id
 from curie_telemetry import record_metric
 from redis.exceptions import ResponseError
 from sqlalchemy import exists, func, select
@@ -567,7 +568,7 @@ class WorkItemReconciler:
             )
             return None
         return QueuedTurn(
-            event_id=f"work-item-{request_id}-execute-{generation}",
+            event_id=execute_event_id(request_id, generation),
             conversation_id=request.reply_conversation_id,
             author=request.requester,
             text=request.objective,
@@ -591,7 +592,7 @@ class WorkItemReconciler:
             )
         for item in published:
             turn = QueuedTurn(
-                event_id=f"work-item-{item.request_id}-terminate",
+                event_id=terminate_event_id(item.request_id),
                 conversation_id=item.reply_conversation_id,
                 author=item.requester or "work-item",
                 text="terminate",

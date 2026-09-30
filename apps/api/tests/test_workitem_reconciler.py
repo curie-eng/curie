@@ -15,6 +15,7 @@ import pytest
 import redis
 import redis.asyncio as aioredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT
+from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
@@ -299,6 +300,9 @@ def test_run_once_creates_the_group_then_publishes_a_readable_execute_wake(
     assert len(entries) == 1
     payload = json.loads(entries[0][1][STREAM_PAYLOAD_FIELD])
     assert payload["event_id"] == f"work-item-{request_id}-execute-1"
+    assert parse_work_item_event_id(payload["event_id"]) == WorkItemEventId(
+        request_id, "execute", 1
+    )
     assert payload["conversation_id"] == WIRE_CONVERSATION
     assert payload["text"] == OBJECTIVE
     assert payload["author"] == REQUESTER
@@ -743,6 +747,9 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
         if payload["event_id"] == f"work-item-{request_id}-terminate"
     ]
     assert len(terminate) == 1
+    assert parse_work_item_event_id(terminate[0]["event_id"]) == WorkItemEventId(
+        request_id, "terminate", None
+    )
     wake = terminate[0]
     assert wake["text"] == "terminate"
     assert wake["conversation_id"] == WIRE_CONVERSATION
