@@ -6,6 +6,8 @@ requires-python = ">=3.13"
 dependencies = [
     "redis>=8.1.0",
     "pytest>=8.3",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
 ]
 
 [build-system]

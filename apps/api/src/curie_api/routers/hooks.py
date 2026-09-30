@@ -28,6 +28,16 @@ refusing: a per-request id disables idempotency silently, and a content digest
 makes an identical payload undeliverable forever, because a delivery receipt
 deliberately never expires. Refusing names the header and is fixed in the
 upstream's configuration.
+
+**The delivery id and a timestamp are signed with the body (#3554).** The
+signature covers ``X-Curie-Timestamp``, ``X-Curie-Delivery-Id`` and the raw body
+(see ``hook_signing``), so a captured body cannot be resent under a fresh id to
+dodge deduplication, and a timestamp outside ``hook_signing.TOLERANCE_S`` is
+refused with the same 401 as a bad signature. The two defenses meet cleanly:
+inside the window a retry that reuses its id is deduplicated, because a delivery
+receipt is written without an expiry once enqueued (``delivery._ENQUEUE_SCRIPT``)
+and so outlives every window; outside it, the request is refused before the
+receipt is ever consulted.
 """
 
 from __future__ import annotations
@@ -98,10 +108,6 @@ _CLAIM_PREFIX = "curie:hook"
 # signature", "bad signature" and "no such agent", so a caller cannot use the
 # route to discover which agent ids exist.
 _AUTH_DETAIL = "missing or invalid signature"
-
-# The header an upstream names its delivery with.
-_DELIVERY_HEADER = "X-Curie-Delivery-Id"
-
 
 class HookAccepted(BaseModel):
     """The hook receipt. ``duplicate`` says whether THIS request enqueued.
@@ -342,6 +348,7 @@ async def ingest_hook(
     tool_access: ToolAccess | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
+    x_curie_timestamp: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
     """Verify one hook delivery and enqueue it as a turn.
 
@@ -362,7 +369,10 @@ async def ingest_hook(
        refused without the server ever HMAC-ing it;
     3. the agent row, which unavoidably precedes authentication here (see the
        module docstring);
-    4. the SIGNATURE over the raw body;
+    4. the SIGNATURE over the timestamp, delivery id and raw body, with the
+       timestamp required and inside ``hook_signing.TOLERANCE_S``; a missing
+       delivery id is verified as the empty string, so an absent id is only
+       reported to a caller who could sign;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
     6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
@@ -388,13 +398,19 @@ async def ingest_hook(
     secret = hook_signing.derive(
         settings.api_key, agent_id=str(agent.id), generation=agent.hook_generation
     )
-    if not hook_signing.verify(secret, raw, x_curie_signature_256):
+    if not hook_signing.verify(
+        secret,
+        timestamp=x_curie_timestamp,
+        delivery_id=x_curie_delivery_id or "",
+        body=raw,
+        header=x_curie_signature_256,
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
     if not x_curie_delivery_id:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"{_DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
+            f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
             "stable upstream id is what keeps a retried delivery from running the "
             "agent twice",
         )

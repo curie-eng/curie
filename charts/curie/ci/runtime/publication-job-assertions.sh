@@ -183,6 +183,7 @@ NAMESPACE_CREATED=1
 kc label namespace "$NAMESPACE" curie-publication-proof=owned >/dev/null
 
 FIXTURE_DNS="$FIXTURE_SERVICE.$NAMESPACE.svc.cluster.local"
+FIXTURE_HTML_BASE="https://$FIXTURE_DNS:8443"
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
   -subj "/CN=Curie publication fixture CA" \
   -addext "basicConstraints=critical,CA:TRUE" \
@@ -212,7 +213,7 @@ COPY fixture-ca.crt /usr/local/share/ca-certificates/curie-publication-fixture.c
 RUN update-ca-certificates \
     && git config --system \
       'url.git://$FIXTURE_DNS:9418/acme-bot.git.insteadOf' \
-      'https://github.com/acme-corp/acme-bot.git'
+      '$FIXTURE_HTML_BASE/acme-corp/acme-bot.git'
 COPY publication_service.py /opt/curie-publication-fixture/server.py
 USER 1000:1000
 EOF
@@ -263,6 +264,8 @@ spec:
         - /tls/tls.crt
         - --key
         - /tls/tls.key
+        - --html-base
+        - "$FIXTURE_HTML_BASE"
       ports:
         - name: https
           containerPort: 8443
@@ -393,7 +396,7 @@ CURIE_PUBLICATION_KUBECONFIG="$PRIVATE_KUBECONFIG" \
 CURIE_PUBLICATION_NAMESPACE="$NAMESPACE" \
 CURIE_PUBLICATION_RUNNER_IMAGE="$FIXTURE_IMAGE" \
 CURIE_PUBLICATION_FIXTURE_API="https://127.0.0.1:$FIXTURE_PORT" \
-CURIE_PUBLICATION_FIXTURE_CLUSTER_API="https://$FIXTURE_DNS:8443" \
+CURIE_PUBLICATION_FIXTURE_CLUSTER_API="$FIXTURE_HTML_BASE" \
 CURIE_PUBLICATION_FIXTURE_CA="$TMP_DIR/ca.crt" \
 TEST_DATABASE_URL="$DATABASE_URL" \
   env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT \

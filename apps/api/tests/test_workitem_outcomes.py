@@ -940,6 +940,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 pr_node_id="PR_example_123",
                 base_ref="main",
             ),
+            github_html_base="https://github.com",
         )
         opened = await session.execute(
             text(

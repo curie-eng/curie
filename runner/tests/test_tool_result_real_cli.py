@@ -308,6 +308,7 @@ def _run_turn(
                 },
             )
             runner = SessionRunner(
+                held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,
                 tracer=RunTracer(None),

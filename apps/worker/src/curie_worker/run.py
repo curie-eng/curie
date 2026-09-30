@@ -543,7 +543,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
-        hook_runs=HookRunRecorder(engine),
+        hook_runs=HookRunRecorder(engine, config.db_schema),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
@@ -923,11 +923,12 @@ def _build_publication_loop(
         store=store,
         credentials=PublicationCredentialClient(
             api_base_url=config.api_base_url,
+            github_html_base=config.publication_github_html_base,
             worker_token=config.internal_worker_token,
             client=http,
         ),
         cluster=cluster,
-        github=GitHubPublicationLookup(http),
+        github=GitHubPublicationLookup(http, api_base_url=config.publication_github_api_url),
         lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,

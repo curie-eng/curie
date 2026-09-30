@@ -40,6 +40,7 @@ from typing import Any
 
 import curie_worker.binding as binding_module
 import pytest
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.binding import (
     APPROVAL_REQUIRED_ENV,
     BUDGET_ENV,
@@ -55,7 +56,7 @@ from curie_worker.binding import (
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox_token import verify
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _DB_URL = os.environ.get(
@@ -242,11 +243,7 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -285,11 +282,7 @@ def test_a_cluster_message_relay_turn_resolves_the_channels_default_binding() ->
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -322,11 +315,7 @@ def test_named_relay_selects_only_its_active_slack_binding() -> None:
         engine = create_async_engine(_DB_URL)
         ids: list[uuid.UUID] = []
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -417,11 +406,7 @@ def test_resolves_a_non_slack_binding_on_the_kind_address_pair() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             address = f"acme-room-{token}"
@@ -483,11 +468,7 @@ def test_two_agents_share_one_address_under_different_kinds() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             shared = f"shared-{token}"
@@ -544,11 +525,7 @@ def test_bound_agent_without_active_deployment_is_identified() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C0EXAMPLE1-{token}"
@@ -602,11 +579,7 @@ def test_an_unbound_kind_on_a_bound_address_resolves_to_none() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -647,11 +620,7 @@ def test_prod_deployment_wins_over_dev() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -702,11 +671,7 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -753,11 +718,7 @@ def test_two_bindings_on_one_agent_both_resolve_to_the_same_deployment() -> None
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             # The placeholder ids the plan pins, namespaced per run: the route
@@ -814,11 +775,7 @@ def test_a_second_binding_does_not_shadow_the_first() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             first = f"C0EXAMPLE1-{token}"
@@ -871,11 +828,7 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             # Reap any schema an earlier run leaked: the drop below is a
             # `finally`, which a SIGKILL or a hung query skips. Every name
@@ -1150,11 +1103,7 @@ def test_deployment_pointing_at_another_agents_version_does_not_resolve() -> Non
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1199,11 +1148,7 @@ def test_behavior_packs_round_trip_and_parse() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1243,11 +1188,7 @@ def test_no_packs_parses_to_all_off_default() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1275,11 +1216,7 @@ def test_unknown_channel_resolves_to_none() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable: {exc}")
+            await pg_connect_or_skip(engine)
             resolved = await _resolver(engine).resolve(
                 "slack", None, f"C-nonexistent-{uuid.uuid4().hex}"
             )
@@ -1296,11 +1233,7 @@ def test_resolves_approval_required_tools_into_boot_env() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1340,11 +1273,7 @@ def test_boot_env_forwards_scoped_state_tokens_not_the_raw_key() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1425,11 +1354,7 @@ def test_resolves_approval_routes_from_the_agent_row() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1483,11 +1408,7 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1524,11 +1445,7 @@ def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             agent_id = await _seed_agent(
@@ -1586,11 +1503,7 @@ def test_reserved_connector_secret_is_dropped_order_independently() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1655,6 +1568,11 @@ def test_resolve_agent_picks_prod_then_most_recent_without_a_binding() -> None:
         engine = create_async_engine(_DB_URL)
         agent_ids: list[uuid.UUID] = []
         try:
+            await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
+        try:
             token = uuid.uuid4().hex[:8]
             agent_id = await _seed_unbound_agent(engine, name=f"unbound-{token}")
             agent_ids.append(agent_id)
@@ -1703,6 +1621,11 @@ def test_resolve_agent_misses_without_an_active_deployment_or_agent() -> None:
         engine = create_async_engine(_DB_URL)
         agent_ids: list[uuid.UUID] = []
         try:
+            await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
+        try:
             token = uuid.uuid4().hex[:8]
             undeployed = await _seed_unbound_agent(engine, name=f"undeployed-{token}")
             agent_ids.append(undeployed)
@@ -1733,11 +1656,7 @@ def test_a_slack_turn_with_no_adapter_resolves_the_default_row() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1771,11 +1690,7 @@ def test_a_slack_turn_with_adapter_default_resolves_the_same_default_row() -> No
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1809,11 +1724,7 @@ def test_a_slack_turn_with_a_named_adapter_does_not_resolve_the_default_row() ->
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
@@ -1842,11 +1753,7 @@ def test_two_agents_on_one_slack_channel_answer_their_own_identity() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
             first = await _seed_agent(
@@ -1885,11 +1792,7 @@ def test_one_agent_on_one_slack_channel_under_two_identities_answers_both() -> N
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
             agent_id = await _seed_agent(
@@ -1923,11 +1826,7 @@ def test_a_non_slack_turn_with_an_adapter_resolves_only_its_own_row() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
 
             token = uuid.uuid4().hex[:8]
             address = f"acme-room-{token}"
@@ -2002,11 +1901,7 @@ def test_a_routeless_turn_on_a_pair_two_agents_bind_is_refused() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             routed, routeless, address = await _seed_routeless_beside_routed(
                 engine, token, deploy_routeless=True
@@ -2034,11 +1929,7 @@ def test_a_routeless_turn_is_refused_when_only_the_other_agent_is_deployed() -> 
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             routed, routeless, address = await _seed_routeless_beside_routed(
                 engine, token, deploy_routeless=False
@@ -2069,11 +1960,7 @@ def test_a_turn_naming_its_adapter_still_resolves_beside_a_routeless_binding() -
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             routed, routeless, address = await _seed_routeless_beside_routed(
                 engine, token, deploy_routeless=True
@@ -2095,11 +1982,7 @@ def test_one_agent_holding_a_routeless_binding_beside_its_own_route_resolves() -
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             address = f"ops-{token}@example.com"
             agent_id = await _seed_agent(

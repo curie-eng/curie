@@ -32,7 +32,7 @@ spec:
   {{- with .Values.api.ingress.className }}
   ingressClassName: {{ . | quote }}
   {{- end }}
-  {{- if .Values.api.ingress.tls.enabled }}
+  {{- if (.Values.api.ingress.tls).enabled }}
   tls:
     - hosts:
         - {{ required "api.ingress.host is required when the ingress is enabled" .Values.api.ingress.host | quote }}

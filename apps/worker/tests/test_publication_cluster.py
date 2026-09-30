@@ -45,7 +45,6 @@ REPO_FULL_NAME = "acme-corp/acme-bot"
 OWNER_NAME = "publication-owner"
 SERVICE_ACCOUNT = "publication-runner"
 AUTHORIZATION = "Bearer fixture-token"
-PULL_URL = f"https://github.com/{REPO_FULL_NAME}/pull/1"
 ADOPT_ID = uuid.UUID("20000001-2222-4222-8222-000000000001")
 MISMATCH_ID = uuid.UUID("20000002-2222-4222-8222-000000000002")
 FAILURE_ID = uuid.UUID("20000003-2222-4222-8222-000000000003")
@@ -71,6 +70,10 @@ def _required(name: str) -> str:
 
 def _namespace() -> str:
     return _required("CURIE_PUBLICATION_NAMESPACE")
+
+
+def _pull_url() -> str:
+    return f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}/pull/1"
 
 
 def _cluster() -> KubernetesPublicationCluster:
@@ -115,7 +118,7 @@ def _payload(
         revision_id=publication_id,
         revision_number=1,
         repo_full_name=REPO_FULL_NAME,
-        clean_clone_url=f"https://github.com/{REPO_FULL_NAME}.git",
+        clean_clone_url=f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}.git",
         base_sha=base_sha,
         expected_prior_head=base_sha,
         expected_remote_head=None,
@@ -136,6 +139,15 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(
         cafile=_required("CURIE_PUBLICATION_FIXTURE_CA")
     )
+
+
+async def _forward_fixture_request(request: httpx.Request) -> None:
+    """Reach the fixture port forward while retaining its configured forge identity."""
+    if str(request.url).startswith(_required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API") + "/"):
+        forwarded = httpx.URL(_required("CURIE_PUBLICATION_FIXTURE_API"))
+        request.url = request.url.copy_with(
+            scheme=forwarded.scheme, host=forwarded.host, port=forwarded.port
+        )
 
 
 async def _fixture_get(path: str) -> httpx.Response:
@@ -239,7 +251,7 @@ async def test_success_markers_cannot_authorize_a_mismatched_job() -> None:
         "/bin/bash",
         "-c",
         (
-            f"printf '%s\\n' 'CURIE_PR_URL={PULL_URL}' "
+            f"printf '%s\\n' 'CURIE_PR_URL={_pull_url()}' "
             "'CURIE_PR_NUMBER=1' "
             f"'CURIE_COMMIT_SHA={'b' * 40}'"
         ),
@@ -250,7 +262,7 @@ async def test_success_markers_cannot_authorize_a_mismatched_job() -> None:
 
     observation = await _wait_terminal(cluster, resources.names.job)
     assert observation.phase == "succeeded"
-    assert observation.pr_url == PULL_URL
+    assert observation.pr_url == _pull_url()
     assert observation.pr_number == 1
     assert observation.commit_sha == "b" * 40
 
@@ -268,7 +280,7 @@ class _Credentials:
     async def redeem(self, publication_id: uuid.UUID) -> PublicationCredential:
         self.calls.append(publication_id)
         return PublicationCredential(
-            clean_clone_url=f"https://github.com/{REPO_FULL_NAME}.git",
+            clean_clone_url=f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}.git",
             authorization_header=AUTHORIZATION,
         )
 
@@ -405,14 +417,17 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
         credentials = _Credentials()
         replies = _Replies()
         transcript = _Transcript()
-        async with httpx.AsyncClient(verify=_ssl_context(), timeout=10) as client:
+        async with httpx.AsyncClient(
+            verify=_ssl_context(), timeout=10,
+            event_hooks={"request": [_forward_fixture_request]},
+        ) as client:
             reconciler = PublicationReconciler(
                 store=store,
                 credentials=credentials,
                 cluster=cluster,
                 github=GitHubPublicationLookup(
                     client,
-                    api_base_url=_required("CURIE_PUBLICATION_FIXTURE_API"),
+                    api_base_url=_required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API"),
                 ),
                 replies=replies,
                 # This Job fails before any success marker, so the API is never called.
@@ -530,11 +545,11 @@ async def test_generated_script_pushes_and_creates_pull_request() -> None:
     observation = await _wait_terminal(cluster, resources.names.job)
     assert observation.phase == "succeeded", observation.error
     assert observation.error is None
-    assert observation.pr_url == PULL_URL
+    assert observation.pr_url == _pull_url()
     assert observation.pr_number == 1
     assert observation.commit_sha is not None
     assert observation.commit_sha != base_sha
-    assert f"CURIE_PR_URL={PULL_URL}" in observation.logs
+    assert f"CURIE_PR_URL={_pull_url()}" in observation.logs
     assert "CURIE_PR_NUMBER=1" in observation.logs
     assert f"CURIE_COMMIT_SHA={observation.commit_sha}" in observation.logs
 
@@ -551,7 +566,7 @@ async def test_generated_script_pushes_and_creates_pull_request() -> None:
     assert pulls_response.status_code == 200, pulls_response.text
     pulls = pulls_response.json()
     assert len(pulls) == 1
-    assert pulls[0]["html_url"] == PULL_URL
+    assert pulls[0]["html_url"] == _pull_url()
     assert pulls[0]["head"]["sha"] == observation.commit_sha
     assert pulls[0]["head"]["ref"] == payload.branch
     assert pulls[0]["base"]["sha"] == base_sha

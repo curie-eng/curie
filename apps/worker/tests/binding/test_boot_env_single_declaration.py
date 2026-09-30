@@ -198,6 +198,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
         "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
         "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+        "CURIE_PUBLICATION_PROTECTED_PATHS",
         "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
@@ -305,6 +306,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the ambient ones by name. Renaming a BootEnv key cannot move these.
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        # Same SDK-owned credential names. The runner's shell filter lists them
+        # so Bash drops them; they are not BootEnv keys.
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
