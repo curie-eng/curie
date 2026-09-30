@@ -374,3 +374,53 @@ def test_complete_retained_identity_allows_fresh_exact_read_without_original_pay
         "A complete retained diagnostic tuple plus a fresh exact provider read can verify current "
         "state even when the original raw payload is unavailable."
     )
+
+
+@pytest.mark.parametrize(
+    "unsupported_secondary_state",
+    [
+        "Both refusal alerts are firing now, so it is worth checking them together.",
+        "AcmeSandboxCapacityRefused is firing now.",
+        "AcmeSandboxCapacityRefused is still firing.",
+    ],
+    ids=["collective-current-claim", "named-firing-now", "named-still-firing"],
+)
+def test_exact_original_read_does_not_refresh_secondary_alert_current_state(
+    unsupported_secondary_state: str,
+) -> None:
+    # This case supplies one fresh provider read, for the original alarm only.
+    # The secondary capacity rule's state is carried from a prior root and has
+    # not been read again. The actual replay's collective "Both refusal alerts
+    # are firing now" conclusion therefore exceeded the tool evidence.
+    with pytest.raises(AssertionError):
+        assert_alert_identity_reply(
+            "exact-current-read", CURRENT + " " + unsupported_secondary_state
+        )
+
+
+def test_exact_original_read_allows_secondary_state_as_explicit_historical_context() -> None:
+    reply = CURRENT + (
+        " The prior root reported AcmeSandboxCapacityRefused firing at 10:30Z, with fingerprint "
+        "fedcba9876543210. I have not read that separate rule again, so its current state is "
+        "unverified; I cannot say both alerts are firing now."
+    )
+    assert_alert_identity_reply("exact-current-read", reply)
+
+
+def test_each_named_alert_needs_its_own_fresh_read_before_current_state_claim() -> None:
+    assert any(
+        re.search(r"each|every", item, re.IGNORECASE)
+        and re.search(r"named alert|alert.*rule|rule.*alert", item, re.IGNORECASE)
+        and re.search(
+            r"own fresh read|separate fresh read|fresh read for each", item, re.IGNORECASE
+        )
+        and re.search(r"current state|currently|firing now", item, re.IGNORECASE)
+        for item in _policy_items()
+    ), "Each named alert needs its own fresh read before reporting its current state."
+    assert any(
+        re.search(r"prior|previous|earlier", item, re.IGNORECASE)
+        and re.search(r"secondary|related|separate rule", item, re.IGNORECASE)
+        and re.search(r"historical", item, re.IGNORECASE)
+        and re.search(r"read again|re-read|reread", item, re.IGNORECASE)
+        for item in _policy_items()
+    ), "A prior secondary rule's state stays historical until that rule is read again."
