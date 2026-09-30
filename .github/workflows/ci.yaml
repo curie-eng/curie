@@ -53,7 +53,7 @@ jobs:
               elif isinstance(node, yaml.SequenceNode):
                   children = iter(node.value)
               else:
-                  return
+                  children = ()
               for child in children:
                   yield from uses_nodes(child, seen)
 
@@ -80,14 +80,13 @@ jobs:
                       continue
                   value = node.value
                   # Local actions use this repository's checked out code.
-                  if value.startswith(("actions/", "./")):
-                      continue
-                  checked += 1
-                  if not re.fullmatch(r"[^/\s@]+/[^\s@]+@[0-9a-fA-F]{40}", value):
-                      errors.append((path, line, "third party action requires a full 40 hex commit SHA"))
-                  comment = comments.get(node.end_mark.line, "")
-                  if not re.search(r"#\s*v[0-9]+(?:\.[0-9]+)*\b", comment):
-                      errors.append((path, line, "third party action requires a version comment on its uses line"))
+                  if not value.startswith(("actions/", "./")):
+                      checked += 1
+                      if not re.fullmatch(r"[^/\s@]+/[^\s@]+@[0-9a-fA-F]{40}", value):
+                          errors.append((path, line, "third party action requires a full 40 hex commit SHA"))
+                      comment = comments.get(node.end_mark.line, "")
+                      if not re.search(r"#\s*v[0-9]+(?:\.[0-9]+)*\b", comment):
+                          errors.append((path, line, "third party action requires a version comment on its uses line"))
           for path, line, message in errors:
               print(f"::error file={path},line={line}::{message}")
           if errors:
