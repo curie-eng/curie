@@ -3647,7 +3647,7 @@ impl ClusterTargetSources {
         let Some((action_name, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
         };
-        let action_matches = if action_name == "hooks" {
+        let action_matches = if matches!(action_name, "hooks" | "console") {
             let Some((_, hook_matches)) = action_matches.subcommand() else {
                 return Self::default();
             };
