@@ -926,6 +926,12 @@ def test_best_effort_still_falls_back_to_default_when_present() -> None:
 # investigation happened, cost real money, and the answer was dropped.
 
 
+# Slack thread_ts identifies another message's ts:
+# https://docs.slack.dev/reference/methods/chat.postMessage/
+# The assistant status method documents channel_id, thread_ts and status:
+# https://docs.slack.dev/reference/methods/assistant.threads.setStatus/
+# The None posting fallback and empty-string status fallback are existing Curie
+# behavior being pinned here, not a claim Slack accepts arbitrary conversation ids.
 _CONVERSATION_CASES = [
     pytest.param("hook:acme-bot:alert", None, id="hook"),
     pytest.param("", None, id="empty"),
