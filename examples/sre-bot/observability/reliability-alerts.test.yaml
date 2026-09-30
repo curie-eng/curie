@@ -1138,6 +1138,116 @@ tests:
                 sample as an increase from zero. The runner logs one WARNING per
                 failed call naming the connector server and tool.
 
+  # A connector every call finds unavailable: the runner's connector
+  # exclusion denied each one because the connector failed its startup probe,
+  # or the CLI answered that its server no longer advertises the tool. The
+  # connector never saw these calls, so CurieConnectorToolErrors, which counts
+  # a connector's own error answers, stays quiet. Same window, new-series term
+  # and thresholds as that rule: one sandbox's first export at 10m, three
+  # unavailable results and nothing else. Pending at 10m, firing from 15m,
+  # resolved at 25m when the offset hour first reads the 10m sample.
+  - name: connector tools unavailable fire on a new runner series' first sample
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tools are unavailable to their agents
+              description: >-
+                curie_tool_result_total with origin connector and outcome
+                unavailable increased by three or more in 15 minutes and was at
+                least half of the connector success, error and unavailable
+                results, counting a series' first sample as an increase from
+                zero. The agent is calling a connector that failed its startup
+                probe in the sandbox, or a tool its server no longer advertises.
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tools are unavailable to their agents
+              description: >-
+                curie_tool_result_total with origin connector and outcome
+                unavailable increased by three or more in 15 minutes and was at
+                least half of the connector success, error and unavailable
+                results, counting a series' first sample as an increase from
+                zero. The agent is calling a connector that failed its startup
+                probe in the sandbox, or a tool its server no longer advertises.
+      - eval_time: 25m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+
+  # Three unavailable results among thirteen: the model called one tool its
+  # connector no longer offers while the connector answered everything else.
+  # Below the ratio, so it does not page.
+  - name: connector tools unavailable stay quiet when most connector calls succeed
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+
+  # Every connector result unavailable, but only two of them. Short of three.
+  - name: two unavailable connector calls stay quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x6 1x6 2x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+
+  # Two unavailable results beside five calls the runner refused, such as a
+  # bundle's own guardrail. A refusal is the agent's policy working, not a
+  # connector out of reach; counted in, it would make seven and fire.
+  - name: refused connector calls do not count as unavailable
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="refused",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolsUnavailable
+        exp_alerts: []
+
   # The dispatcher down is the quietest failure an installation has: every pod
   # is Running, nothing errors, and no Slack message reaches any agent.
   # CurieWorkerSupervisedRestartLoop watches the worker's own supervised-task
