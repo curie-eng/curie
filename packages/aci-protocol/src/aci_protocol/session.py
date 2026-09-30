@@ -202,6 +202,20 @@ def _fake_model_or_none(raw: str | None) -> bool | None:
     return raw.strip().lower() in ("1", "true", "yes")
 
 
+def _switch_or_none(raw: str | None) -> bool | None:
+    """Parse an explicit on/off switch whose absence means something of its own.
+
+    ``1``/``true`` is on and ``0``/``false`` is off, case-insensitively; absent
+    or blank is ``None`` (unset), which is not the same as off. Any other value
+    reads as off, the same way ``_fake_model_or_none`` treats values outside its
+    truthy set, so a typo never turns a feature on.
+    """
+
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in ("1", "true")
+
+
 def _stripped_or_none(raw: str | None) -> str | None:
     """Strip, then treat blank as unset.
 
@@ -333,6 +347,17 @@ class BootEnv(_AciModel):
     # also the runner's signal to mount the memory tools.
     channel_memory_ref: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_CHANNEL_MEMORY_REF", "worker")
+    )
+    # Whether the agent may write channel memory this turn (#3659, for #3621),
+    # sent by the worker as ``1``/``0``. Three states:
+    # - True: the memory tools mount.
+    # - False: channel memory is still readable, but there are no memory tools
+    #   and no guidance about writing it.
+    # - None: an older worker that predates the flag. The runner then falls
+    #   back to the channel ref: a present ``channel_memory_ref`` means writes
+    #   are on, so a new runner behind an old worker keeps today's behaviour.
+    memory_writes: bool | None = Field(
+        default=None, json_schema_extra=_env("CURIE_MEMORY_WRITES", "worker")
     )
     # The durable state store exposed to bundle code (#249, epic #23). state_url
     # is the agent's state namespace base on the API state router
@@ -578,6 +603,7 @@ class BootEnv(_AciModel):
         history_token: str | None = None,
         memory_token: str | None = None,
         channel_memory_ref: str | None = None,
+        memory_writes: bool | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
@@ -645,6 +671,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("memory_token")] = memory_token
         if channel_memory_ref:
             env[cls.env_key("channel_memory_ref")] = channel_memory_ref
+        if memory_writes is not None:
+            env[cls.env_key("memory_writes")] = "1" if memory_writes else "0"
         if state_url:
             env[cls.env_key("state_url")] = state_url
         if state_token:
@@ -691,6 +719,8 @@ class BootEnv(_AciModel):
             env[self.env_key("memory_token")] = self.memory_token
         if self.channel_memory_ref is not None:
             env[self.env_key("channel_memory_ref")] = self.channel_memory_ref
+        if self.memory_writes is not None:
+            env[self.env_key("memory_writes")] = "1" if self.memory_writes else "0"
         if self.connector_release is not None:
             env[self.env_key("connector_release")] = self.connector_release
         if self.connector_agent is not None:
@@ -774,6 +804,7 @@ class BootEnv(_AciModel):
             history_token=_str_or_none(env.get("CURIE_HISTORY_TOKEN")),
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
             channel_memory_ref=_str_or_none(env.get("CURIE_CHANNEL_MEMORY_REF")),
+            memory_writes=_switch_or_none(env.get("CURIE_MEMORY_WRITES")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
             progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),

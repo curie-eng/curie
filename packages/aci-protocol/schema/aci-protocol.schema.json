@@ -591,6 +591,22 @@
           ],
           "title": "Memory Token"
         },
+        "memory_writes": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_MEMORY_WRITES",
+          "producer": [
+            "worker"
+          ],
+          "title": "Memory Writes"
+        },
         "metrics_temporality_preference": {
           "anyOf": [
             {
@@ -1804,6 +1820,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.10",
-  "title": "ACI Protocol v0.5.10"
+  "protocolVersion": "0.5.11",
+  "title": "ACI Protocol v0.5.11"
 }
