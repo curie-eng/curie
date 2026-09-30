@@ -296,4 +296,5 @@ def test_fresh_native_resume_preserves_interleaved_tool_results(native_runtime):
     _assert_three_unique_results(grouped)
     assert _results(grouped) == expected
     assert "[Tool result missing due to internal error]" not in json.dumps(grouped)
-    assert proof["stripped_refusal"] and "group" in proof["stripped_refusal"].lower()
+    # @spec RUNNER-HISTORY-GROUP-4: without its groups the turn is text only.
+    assert proof["stripped_rows"] >= 1 and proof["stripped_tool_rows"] == 0

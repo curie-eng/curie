@@ -8,6 +8,8 @@ The local native transport pin separately tests the SDK's normalization.
 """
 
 import hashlib
+import json
+import logging
 
 import anyio
 import pytest
@@ -157,9 +159,84 @@ def test_legacy_sequential_needs_no_native_checkpoint(tmp_path):
     assert all("assistant_group" not in m.to_dict() for m in messages)
 
 
-def test_legacy_ambiguous_overlap_refused_before_hydration(tmp_path):
-    with pytest.raises(HistoryError, match="(?i)group"):
-        _entries(_interleaved(None), tmp_path)
+def _text(role, text):
+    if role == "user":
+        return ConversationMessage(role="user", content=text)
+    return ConversationMessage(role="assistant", content=[{"type": "text", "text": text}])
+
+
+def _thinking():
+    return ConversationMessage(
+        role="assistant", content=[{"type": "thinking", "thinking": "", "signature": "acme-sig"}]
+    )
+
+
+def _rows(entries):
+    return [(e["message"]["role"], e["message"]["content"]) for e in entries]
+
+
+def _tool_ids(entries):
+    return {
+        block.get("id") or block.get("tool_use_id")
+        for e in entries
+        if isinstance(e["message"]["content"], list)
+        for block in e["message"]["content"]
+        if block.get("type") in ("tool_use", "tool_result")
+    }
+
+
+def _reduced_turn(user_text, assistant_texts):
+    return [
+        ("user", user_text),
+        ("assistant", [{"type": "text", "text": text} for text in assistant_texts]),
+    ]
+
+
+# The shape of a durable hook thread written before group capture: a sequential
+# turn, a turn whose second batch ran two calls at once, then a later turn.
+def _legacy_thread():
+    earlier = (_text("user", "acme first alert"), _call(1, None), _result(1),
+               _text("assistant", "acme first answer"))
+    ambiguous = (_text("user", "acme second alert"), _thinking(), _call(2, None), _result(2),
+                 _thinking(), _call(3, None), _call(4, None), _result(3), _result(4),
+                 _text("assistant", "acme second "), _text("assistant", "answer"))
+    later = (_text("user", "acme third alert"), _text("assistant", "acme third answer"))
+    return earlier, ambiguous, later
+
+
+def test_legacy_ambiguous_overlap_turn_replays_as_its_text(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    earlier, ambiguous, later = _legacy_thread()
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries((*earlier, *ambiguous, *later), tmp_path)
+    assert _rows(entries) == [
+        *[(m.role, m.content) for m in earlier],
+        *_reduced_turn("acme second alert", ["acme second ", "answer"]),
+        *[(m.role, m.content) for m in later],
+    ]
+    assert _tool_ids(entries) == {"call-acme-1"}
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "session=acme-thread" in warning.getMessage()
+    assert "turns_reduced=1" in warning.getMessage()
+    assert "acme second" not in warning.getMessage()
+
+
+def test_ambiguous_overlap_with_no_text_says_its_tools_were_not_replayed(tmp_path):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    entries = _entries(_interleaved(None), tmp_path)
+    assert _tool_ids(entries) == set()
+    ((role, content),) = _rows(entries)
+    assert role == "assistant"
+    assert "could not be replayed" in json.dumps(content)
+
+
+def test_reduction_leaves_other_malformed_history_refused(tmp_path):
+    """@spec RUNNER-HISTORY-GROUP-4, RUNNER-HISTORY-GROUP-5"""
+    earlier, ambiguous, later = _legacy_thread()
+    duplicate = (_text("user", "acme again"), _call(1, None), _result(1))
+    with pytest.raises(HistoryError, match="duplicate"):
+        _entries((*earlier, *ambiguous, *duplicate), tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -514,13 +591,16 @@ def test_stale_native_migration_requires_full_exact_portable_correspondence(tmp_
     )
     checkpoint = HarnessReplayState(harness="claude", kind="checkpoint", entries=tuple(native))
     if mismatch:
-        with pytest.raises(HistoryError, match="(?i)group"):
-            _entries(
-                messages,
-                tmp_path,
-                harness_replay=checkpoint,
-                system_prompt="current attachment unavailable",
-            )
+        # @spec RUNNER-HISTORY-GROUP-4: the unproven checkpoint is set aside.
+        entries = _entries(
+            messages,
+            tmp_path,
+            harness_replay=checkpoint,
+            system_prompt="current attachment unavailable",
+        )
+        assert _tool_ids(entries) == set()
+        assert "unmatched native authority" not in json.dumps(entries)
+        assert all(e["type"] != "attachment" for e in entries)
     else:
         entries = _entries(
             messages,
@@ -666,23 +746,29 @@ def test_legacy_direct_caller_projection_migrates_without_old_prompt(tmp_path):
     ],
 )
 def test_direct_caller_migration_rejects_unknown_or_meaningful_differences(tmp_path, difference):
+    # @spec RUNNER-HISTORY-GROUP-4: an unproven checkpoint is set aside and the
+    # overlapping turn replays as its text; nothing native is imported.
     messages = _interleaved(None)
     checkpoint = _direct_caller_checkpoint(messages, difference)
-    with pytest.raises(HistoryError, match="(?i)group"):
-        _entries(
-            messages,
-            tmp_path,
-            harness_replay=checkpoint,
-            system_prompt="current attachment unavailable",
-        )
+    entries = _entries(
+        messages,
+        tmp_path,
+        harness_replay=checkpoint,
+        system_prompt="current attachment unavailable",
+    )
+    assert _tool_ids(entries) == set()
+    assert all(e["type"] != "attachment" for e in entries)
+    assert "unmatched native text" not in json.dumps(entries)
 
 
 def test_pending_overlap_requires_same_proven_group_not_merely_populated_tokens(tmp_path):
     # Design item 6: B is not evidence that B's request belongs to pending A.
     # The valid result-A -> group-B dependent sequence is covered separately.
+    # @spec RUNNER-HISTORY-GROUP-4: reduced to its text, never merged or submitted.
     messages = (_call(1, GROUP), _call(2, OTHER), _result(1), _result(2))
-    with pytest.raises(HistoryError, match="(?i)group"):
-        _entries(messages, tmp_path)
+    entries = _entries(messages, tmp_path)
+    assert _tool_ids(entries) == set()
+    assert all("id" not in e["message"] for e in entries)
 
 
 def test_idless_native_cache_cannot_bypass_proven_portable_group(tmp_path):
