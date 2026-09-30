@@ -682,6 +682,76 @@ def test_an_unknown_id_is_reported_as_not_found(
 
 
 # --------------------------------------------------------------------------- #
+# 2a. Nothing is saved without a memory tool call (#3625)
+#
+# A compound request ("sign every reply in every channel", plus an aside) drew
+# the harness ``Skill`` tool instead of ``remember``, and the agent then said it
+# had "noted that as a standing instruction" with nothing saved. The guidance and
+# the ``remember`` description must both say that a memory tool call is the only
+# way anything is kept, and that the agent must not claim a save it did not make.
+# These pin short, stable phrases, not whole paragraphs, so the prose can be
+# reworded without breaking them. The API's copy of the guidance is held to this
+# text byte for byte by tests/test_memory_guidance_parity.py.
+# --------------------------------------------------------------------------- #
+
+# The rule: "nothing is saved" (or "kept") and, later in the same sentence,
+# "unless" -- the condition being a memory tool call.
+_NOTHING_UNLESS = re.compile(r"nothing is (?:saved|kept)[^.]*\bunless\b", re.IGNORECASE)
+# The ban on claiming: a negated "say"/"claim"/"tell", followed in the same
+# sentence by one of the claim words ("saved", "noted", "remember").
+_NO_CLAIM = re.compile(
+    r"(?:do not|don't|never|must not)\s+(?:say|claim|tell)[^.]*\b(?:saved|noted|remember)",
+    re.IGNORECASE,
+)
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def test_default_guidance_says_nothing_is_kept_without_a_memory_tool_call() -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    rules = [s for s in _sentences(DEFAULT_GUIDANCE) if _NOTHING_UNLESS.search(s)]
+    assert rules, DEFAULT_GUIDANCE
+    # The sentence carrying the rule names the tool whose success makes a save real.
+    assert any("remember" in s for s in rules), rules
+
+
+def test_default_guidance_forbids_claiming_a_save_that_did_not_happen() -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    assert _NO_CLAIM.search(DEFAULT_GUIDANCE), DEFAULT_GUIDANCE
+
+
+def _published_descriptions(options: Any) -> dict[str, str]:
+    """The live name and description of every tool the booted ``curie`` server lists."""
+
+    async def listed(instance: Any) -> list[tuple[str, str]]:
+        entry = instance.get_request_handler("tools/list")
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return [(tool.name, tool.description or "") for tool in result.tools]
+
+    instance = options.mcp_servers[APPROVAL_SERVER_NAME]["instance"]
+    return {
+        f"mcp__{APPROVAL_SERVER_NAME}__{name}": description
+        for name, description in anyio.run(listed, instance)
+    }
+
+
+def test_remember_description_says_it_is_the_only_way_to_keep_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, _prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
+    description = _published_descriptions(options)[REMEMBER]
+    lowered = description.lower()
+    # "the only way" to keep something for later: no other tool saves.
+    assert "only way" in lowered, description
+    # A request phrased as a standing instruction means calling this tool.
+    assert "standing instruction" in lowered, description
+
+
+# --------------------------------------------------------------------------- #
 # 3. The toolPolicy exemption set
 # --------------------------------------------------------------------------- #
 

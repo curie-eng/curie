@@ -12,6 +12,7 @@ A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -1598,3 +1599,144 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
         and "fallback" in record.getMessage().lower()
         for record in caplog.records
     ), caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# #3625: a compound "make this stick" request either saves or does not claim to
+# --------------------------------------------------------------------------- #
+#
+# Found live: with the memory tools mounted, a message asking for a reply
+# signature "in every channel" plus a private aside drew the harness ``Skill``
+# tool, no ``remember`` call, and the reply "I've noted that as a standing
+# instruction". Nothing was saved. The property pinned here holds whichever
+# choice the model makes: a reply that claims a save must be backed by a
+# ``remember`` (or ``update``) call that reached the store and left a fact there.
+
+
+class _InProcessFactsStore:
+    """A fake memory namespace with the ``MemoryFactsStore`` surface the tools use.
+
+    Only the memory tools call ``add``/``update``, so ``writes`` is the record of
+    every successful ``remember``/``update`` call this turn.
+    """
+
+    def __init__(self) -> None:
+        self.facts: dict[str, dict[str, str]] = {}
+        self.writes: list[tuple[str, str]] = []
+
+    async def list(self) -> list[Any]:
+        return []
+
+    async def add(self, *, statement: str, author: str, session_id: str) -> str:
+        fact_id = f"fact-{uuid4().hex}"
+        self.facts[fact_id] = {"statement": statement, "author": author}
+        self.writes.append(("remember", statement))
+        return fact_id
+
+    async def update(self, fact_id: str, *, statement: str, author: str, session_id: str) -> None:
+        from curie_runner.memory_facts import FactNotFound
+
+        if fact_id not in self.facts:
+            raise FactNotFound(fact_id)
+        self.facts[fact_id] = {"statement": statement, "author": author}
+        self.writes.append(("update", statement))
+
+    async def forget(self, fact_id: str) -> None:
+        from curie_runner.memory_facts import FactNotFound
+
+        if self.facts.pop(fact_id, None) is None:
+            raise FactNotFound(fact_id)
+
+
+_COMPOUND_MEMORY_REQUEST = (
+    "From now on, sign every reply you send in every channel with"
+    ' "-- Curie, on duty". Make this stick. Also, just between us, I think the'
+    " Thursday standup runs long, but don't repeat that to anyone."
+)
+
+# A reply claiming the instruction was kept. Small and loose on purpose, so a
+# rewording of the same claim still counts as one.
+_SAVE_CLAIM = re.compile(
+    r"\bnoted\b|\bsaved\b|\bremember|standing instruction|from now on,? i(?:'ll| will)\b",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.skipif(
+    not _HAS_CRED,
+    reason="no live credential (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) in env",
+)
+def test_live_compound_request_saves_or_does_not_claim_to() -> None:
+    from curie_runner.__main__ import _compose_system_prompt
+    from curie_runner.approval import build_memory_tools
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE, MemoryTurn
+
+    channel_store = _InProcessFactsStore()
+    agent_store = _InProcessFactsStore()
+    turn = MemoryTurn()
+    session_id = "live-memory-compound"
+    memory_tools = build_memory_tools(
+        agent_store=agent_store,  # type: ignore[arg-type]
+        channel_store=channel_store,  # type: ignore[arg-type]
+        turn=turn,
+        session_id=session_id,
+    )
+    # The production composition: the default memory guidance ahead of the
+    # bundle's own prompt, as a boot with the tools mounted and no operator
+    # guidance builds it.
+    system_prompt = _compose_system_prompt(
+        "You are a helpful team assistant deployed in a chat workspace.",
+        None,
+        model=None,
+        guidance_preamble=DEFAULT_GUIDANCE,
+    )
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=system_prompt,
+        max_turns=6,
+        max_budget_usd=1.0,
+        resume=None,
+        mcp_servers={
+            APPROVAL_SERVER_NAME: build_approval_server(
+                None, include_request_approval=False, memory_tools=memory_tools
+            )
+        },
+    )
+    runner = SessionRunner(
+        session_factory=lambda: ClaudeAgentSession(options),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name=session_id,
+        session_id=session_id,
+        memory_turn=turn,
+    )
+
+    async def go() -> list[str]:
+        await runner.start()
+        try:
+            return [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text=_COMPOUND_MEMORY_REQUEST, user="U-live", ts="1.0")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    events = parse_ndjson("".join(anyio.run(go)))
+    final = events[-1]
+    assert final.type == "final"
+    reply = final.text or "".join(e.text for e in events if e.type == "text_delta")
+    writes = channel_store.writes + agent_store.writes
+    stored = {**channel_store.facts, **agent_store.facts}
+    claim = _SAVE_CLAIM.search(reply)
+    if claim is None:
+        # No claim, so nothing is owed; the turn simply did not say it saved.
+        return
+    assert writes, (
+        f"the reply claims a save ({claim.group(0)!r}) but no remember/update call "
+        f"reached the store: {reply!r}"
+    )
+    assert stored, f"the reply claims a save but the store holds no fact: {reply!r}"
