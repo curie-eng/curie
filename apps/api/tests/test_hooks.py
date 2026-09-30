@@ -905,10 +905,10 @@ def test_a_captured_delivery_resent_under_a_new_delivery_id_is_refused(
 
 
 @pytest.mark.parametrize(
-    "offset_s",
-    # Generous offsets so request latency cannot carry a future stamp back into
-    # the window; the exact boundary is pinned by the deterministic verify test.
-    [-(hook_signing.TOLERANCE_S + 60), hook_signing.TOLERANCE_S + 60],
+    "direction",
+    # A sign, not an offset: the tolerance is read in the body, so collecting
+    # this module never depends on the signing module's attributes.
+    [-1, 1],
     ids=["too-old", "too-far-in-the-future"],
 )
 def test_a_correctly_signed_delivery_outside_the_window_is_refused(
@@ -916,12 +916,15 @@ def test_a_correctly_signed_delivery_outside_the_window_is_refused(
     auth_headers: dict[str, str],
     valkey: redis.Redis,
     runs_stream: str,
-    offset_s: int,
+    direction: int,
     clean_db: None,
 ) -> None:
     """A valid signature over a stale or future timestamp buys nothing, and the
     refusal is the same answer as a bad signature."""
 
+    # A generous margin so request latency cannot carry a future stamp back into
+    # the window; the exact boundary is pinned by the deterministic verify test.
+    offset_s = direction * (hook_signing.TOLERANCE_S + 60)
     agent_id = _bind(hooks_client, auth_headers, name=f"windowagent{offset_s > 0:d}")
     ts = str(int(time.time()) + offset_s)
 
