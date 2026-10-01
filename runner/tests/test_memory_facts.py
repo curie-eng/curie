@@ -1573,6 +1573,96 @@ def test_writes_on_or_unset_mounts_the_tools_and_claims_them(
     assert gate.memory_tools_mounted is True
 
 
+# The writes-off notice (#3621) ---------------------------------------------------
+#
+# With writes off the agent has no memory tools, so it must be told that nothing
+# said here is kept, or it "saves" through some other tool and says it did. The
+# notice text is pinned only by these minimal, case-insensitive substrings:
+#   - "turned off"            (saving memory is turned off for this agent)
+#   - "not be kept"           (nothing said here will be kept for later)
+#   - "never say" ... "saved" (in one sentence: never claim to have saved it)
+
+_NEVER_SAY_SAVED = re.compile(r"never say[^.]*\bsaved\b", re.IGNORECASE)
+
+
+def _has_writes_off_notice(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return (
+        "turned off" in lowered
+        and "not be kept" in lowered
+        and _NEVER_SAY_SAVED.search(prompt) is not None
+    )
+
+
+def test_writes_off_boot_prompt_says_saving_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    caplog.set_level(logging.INFO, logger="curie_runner")
+    options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=False
+    )
+
+    assert prompt is not None
+    assert "turned off" in prompt.lower(), prompt
+    assert "not be kept" in prompt.lower(), prompt
+    assert _NEVER_SAY_SAVED.search(prompt), prompt
+    # The notice sits where the guidance would: above the bundle prompt.
+    assert prompt.lower().index("not be kept") < prompt.index(BUNDLE_PROMPT)
+    # The channel facts still show; the guidance and the tools do not.
+    for line in _CHANNEL_LINES:
+        assert line in prompt, prompt
+    assert DEFAULT_GUIDANCE.strip() not in prompt
+    assert not (MEMORY_TOOLS & _published(options)), _published(options)
+    assert _only_facts_line(caplog).group("guidance") == "none"
+
+
+@pytest.mark.parametrize("writes", [True, None], ids=["writes-on", "older-worker"])
+def test_writes_on_boot_prompt_carries_guidance_not_the_off_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writes: bool | None
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=writes
+    )
+    assert prompt is not None
+    assert DEFAULT_GUIDANCE.strip() in prompt
+    assert not _has_writes_off_notice(prompt), prompt
+    assert "not be kept" not in prompt.lower(), prompt
+
+
+@pytest.mark.parametrize("writes", [False, None], ids=["writes-off", "unset"])
+def test_an_unbound_turn_gets_no_writes_off_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writes: bool | None
+) -> None:
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=False, writes=writes
+    )
+    assert prompt is not None
+    assert not _has_writes_off_notice(prompt), prompt
+    assert "not be kept" not in prompt.lower(), prompt
+
+
+def test_writes_off_never_reads_the_operator_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L3: guidance is read only when writes are on. A custom guidance is
+    # stored, so a boot that read it would GET the key; the preamble's own gate
+    # would still hide the text, which is why the request itself is counted.
+    operator = "OPERATOR-GUIDANCE-MARKER"
+    api = _seeded_api(guidance=operator)
+    _options, prompt = _boot_options(monkeypatch, tmp_path, api, channel=True, writes=False)
+
+    guidance_gets = [
+        path for method, path, _ in api.requests if method == "GET" and path.endswith("/guidance")
+    ]
+    assert guidance_gets == [], api.requests
+    assert prompt is not None
+    assert operator not in prompt
+
+
 # --------------------------------------------------------------------------- #
 # #3620: each fact line names who stated it
 # --------------------------------------------------------------------------- #
