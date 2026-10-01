@@ -65,6 +65,36 @@
           "maximum": 10800,
           "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
         },
+        "githubFactoryPythonCi": {
+          "type": "object",
+          "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["check", "paths"],
+            "properties": {
+              "check": {
+                "type": "string",
+                "minLength": 1
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^/].*[^/]$|^[^/]$"
+                }
+              },
+              "pendingCheckPrefix": {
+                "type": ["string", "null"],
+                "minLength": 1
+              }
+            }
+          }
+        },
         "githubFactoryMention": {
           "type": "string",
           "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
@@ -122,13 +152,13 @@
           "type": "integer",
           "minimum": 60,
           "maximum": 10800,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds)."
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 10800,
-          "description": "Positive per-request ceiling for runner work, at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
@@ -215,6 +245,10 @@
             "reconcileMaxAttempts": {"type": "integer", "minimum": 1, "maximum": 100},
             "jobActiveDeadlineSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
             "gitCommandTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+            "protectedPaths": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1, "maxLength": 512}
+            },
             "githubHttpsCidrs": {
               "type": "array",
               "minItems": 1,

@@ -126,6 +126,13 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                         }
                     }
                 }
+                // The manifest records unconditional `required` args, but does
+                // not yet express clap's `required_unless_present` relation.
+                // Exercise the valid stack-only form of this conditional CLI
+                // grammar; the full form is covered by example_sre_bot_install.
+                if path.join(" ") == "example sre-bot install" {
+                    required.push("--observability-only".to_string());
+                }
                 out.push((path, required));
             }
         }
@@ -186,6 +193,17 @@ fn every_dry_run_verb_emits_json_object() {
             "`curie {}` under --json must emit a JSON object, got: {stdout}",
             argv.join(" ")
         );
+        if path.join(" ") == "example sre-bot install" {
+            assert!(
+                output.status.success(),
+                "stack-only plan must parse: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                parsed["dry_run"], true,
+                "must exercise the plan, not an error: {stdout}"
+            );
+        }
     }
 }
 
@@ -1021,9 +1039,28 @@ fn reset_thread_output_json_shape_is_pinned() {
             thread_key: "t-1".to_string(),
             requested: true,
             released: true,
+            route_existed: None,
         }
         .to_json(),
         json!({"agent": "weather", "thread_key": "t-1", "requested": true, "released": true})
+    );
+    // #3699: the key appears only when the API reported the outcome.
+    assert_eq!(
+        ResetThreadOutput::Done {
+            agent: "weather".to_string(),
+            thread_key: "t-1".to_string(),
+            requested: true,
+            released: true,
+            route_existed: Some(true),
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "thread_key": "t-1",
+            "requested": true,
+            "released": true,
+            "route_existed": true
+        })
     );
 }
 

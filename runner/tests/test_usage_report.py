@@ -217,6 +217,7 @@ def test_the_report_is_awaited_before_the_final_event_is_yielded() -> None:
             calls.append((got, primary_model, len(lines)))
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=_Session,
         ceiling=0,
         tracer=RunTracer(None),
@@ -417,6 +418,7 @@ def test_the_session_runner_observes_every_assistant_message_before_the_report()
             calls.append(("report", got))
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=_Session,
         ceiling=0,
         tracer=RunTracer(None),

@@ -1710,3 +1710,23 @@ def test_hook_claim_lease_shorter_than_the_budget_is_refused(
     with pytest.raises(ValueError) as exc_info:
         _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=599.0)
     assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("api_url", "html_base"),
+    [
+        ("https://api.github.com", "https://github.com"),
+        ("https://api.github.com/", "https://github.com"),
+        ("https://github.example.com/api/v3", "https://github.example.com"),
+        ("https://github.example.com/api/v3/", "https://github.example.com"),
+        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
+        ("https://github.example.com:8443/forge/api/v3/", "https://github.example.com:8443/forge"),
+    ],
+)
+def test_publication_html_base_is_derived_from_the_configured_api_url(
+    monkeypatch: pytest.MonkeyPatch, api_url: str, html_base: str
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", api_url)
+
+    assert WorkerConfig().publication_github_html_base == html_base

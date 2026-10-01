@@ -150,6 +150,42 @@ async def test_a_structured_reply_without_a_prior_is_still_not_undoable() -> Non
     assert seen[0]["body"]["prior_state"] is None
 
 
+async def test_a_redacted_snapshot_never_produces_an_undoable_action() -> None:
+    """A scrubbed prior state is not a restore; it is a placeholder a restore would write.
+
+    The runner redacts a held secret or a token-shaped value inside the result
+    before the frame leaves the sandbox, and says so. Forwarding that snapshot
+    would give the ledger a row that looks undoable and whose undo sets the
+    resource's value to ``[REDACTED:...]`` (#1873). With neither state recorded,
+    the row is not undoable and the receipt says so.
+    """
+
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
+    result = {
+        "summary": "rotated acme-api's token",
+        "prior": {"env": [{"name": "API_TOKEN", "value": "[REDACTED:held_secret]"}]},
+        "post": {"env": [{"name": "API_TOKEN", "value": "[REDACTED:held_secret]"}]},
+        "target": {"kind": "Deployment", "name": "acme-api"},
+    }
+
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(
+                tool="set_env", call_id="c", failed=False, result=result, redacted=True
+            ),
+        )
+
+    body = seen[0]["body"]
+    assert body["prior_state"] is None
+    assert body["post_state"] is None
+    # What the call acted on and what it said stay on the record: they are what a
+    # person reads, and neither is replayed.
+    assert body["target"] == {"kind": "Deployment", "name": "acme-api"}
+    assert body["result"] == result
+    assert body["failed"] is False
+
+
 async def test_a_refused_write_is_raised_not_swallowed() -> None:
     """A record the platform failed to write is a hole in its account of a change.
 

@@ -197,15 +197,16 @@ run a pod as the platform upgrader, one approved call away.
 For manual deployment, apply
 [the Kubernetes access manifest](examples/sre-bot/manifests/kubernetes-access.yaml),
 construct a kubeconfig for `sre-bot-kubernetes`, store it under the owned
-connector key `K8S_KUBECONFIG`, deploy the unchanged bundle, bind the approval
+connector key `K8S_KUBECONFIG`, render and deploy the runtime bundle, bind the approval
 route it declares, and deploy again:
 
 ```bash
-curie cluster deploy --plugin-dir examples/sre-bot
+curie example sre-bot render --out ./sre-bot-runtime
+curie cluster deploy --plugin-dir ./sre-bot-runtime
 curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
   --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
-curie cluster deploy --plugin-dir examples/sre-bot
+curie cluster deploy --plugin-dir ./sre-bot-runtime
 ```
 
 Drop `--route-approvers` only if Slack channel members should be the sole

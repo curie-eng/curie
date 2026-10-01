@@ -40,8 +40,9 @@
 //!
 //! 1. the fullname discovery, the kubeconfig host read and the chart-Secret
 //!    name listing -- nothing any of them needs is known only after another;
-//! 2. the `curie-ui` Service read (needs the fullname) alongside `helm list -n
-//!    curie --all` (issued only because the Secret listing came back empty);
+//! 2. the `curie-ui` and `curie-api` Service reads (both need the fullname; one
+//!    resolver reads them together, #1130) alongside `helm list -n curie --all`
+//!    (issued only because the Secret listing came back empty);
 //! 3. the four `gather` probes -- docker, the kube context, the helm version
 //!    and `helm list -n curie -o json`;
 //! 4. the two `helm get values` reads, computed and operator-supplied, plus
@@ -133,6 +134,8 @@ RULES = {
         '{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":30080}]}}\n',
     ("kubectl", ("get", "svc", "curie-langfuse-web", "-n", "curie", "-o", "json")):
         '{"spec":{"type":"ClusterIP","ports":[{"port":3000}]}}\n',
+    ("kubectl", ("get", "svc", "curie-api", "-n", "curie", "-o", "json")):
+        '{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30800}]}}\n',
     ("kubectl", ("get", "svc", "curie-api", "-n", "curie", "-o",
                  "jsonpath={.spec.ports[?(@.nodePort)].nodePort}")): "30800",
     # -- chart Secret name listing: EMPTY on purpose (see the module doc) ---
@@ -322,7 +325,7 @@ fn probe_stages(log: &str) -> (usize, usize, Vec<String>, Vec<String>) {
     (intervals.len(), stages, duplicates, unexpected)
 }
 
-/// `expected_calls` pins the documented probe set from the module doc (16 for
+/// `expected_calls` pins the documented probe set from the module doc (17 for
 /// `doctor`, 11 for `cluster status`) exactly, so a probe silently added or
 /// dropped fails here rather than only showing up as a stage-count wobble.
 fn assert_fanout(
@@ -443,7 +446,7 @@ fn doctor_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("doctor", &fixture, 5, 16, wall_ms);
+    assert_fanout("doctor", &fixture, 5, 17, wall_ms);
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,

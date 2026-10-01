@@ -1632,6 +1632,203 @@
         "title": "ApprovalAuditOut",
         "type": "object"
       },
+      "ApprovalCreateOut": {
+        "description": "Display attribution for creation, separate from the durable turn author.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "gate_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Kind"
+          },
+          "granted_tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Tool"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "resolution_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Note"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          },
+          "resolved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved By"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "conversation_id",
+          "author",
+          "summary",
+          "reply_channel",
+          "reply_placeholder",
+          "reply_endpoint",
+          "dedupe_key",
+          "route",
+          "card_channel",
+          "gate_kind",
+          "granted_tool",
+          "status",
+          "expires_at",
+          "resolved_by",
+          "resolution_note",
+          "created_at",
+          "resolved_at"
+        ],
+        "title": "ApprovalCreateOut",
+        "type": "object"
+      },
       "ApprovalIdentityFactsOut": {
         "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
         "properties": {
@@ -4006,7 +4203,7 @@
         "type": "object"
       },
       "HookAccepted": {
-        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None when the landing thread is not knowable from this request: a\npending twin still mid-flight, a stream an operator has trimmed, or the 202\nno-claim case where this request enqueued nothing and nothing is yet known.",
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None on an ordinary 202 pending/no-claim receipt, which attests no\naccepted turn. An unavailable completed turn or a restricted pending retry\nreturns 409 because its original tool policy cannot be verified.\n\n``tool_access`` is the queued policy, not proof of worker support, runner\nexecution or delivery. A completed duplicate must match the original policy.",
         "properties": {
           "conversation_id": {
             "anyOf": [
@@ -4037,6 +4234,16 @@
               }
             ],
             "title": "Stream Id"
+          },
+          "tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -5871,7 +6078,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.",
         "properties": {
           "attachments": {
             "default": [],
@@ -5924,6 +6131,16 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -5937,7 +6154,7 @@
         "type": "object"
       },
       "ReplyHandle": {
-        "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` carries no endpoint, because its route is the worker's\nconfigured Slack origin, and names its identity in ``adapter`` (ADR-0168\ndecision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).\n``adapter`` is optional at the schema so a third-party or pre-upgrade\nproducer is not rejected outright, but every first-party mint site sets it\nexplicitly.",
+        "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` carries no endpoint, because its route is the worker's\nconfigured Slack origin, and names its identity in ``adapter`` (ADR-0168\ndecision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).\n``adapter`` is optional at the schema so a third-party or pre-upgrade\nproducer is not rejected outright, but every first-party mint site sets it\nexplicitly.\n\n``identity`` is an optional Slack binding selector for a disconnected\ncluster message whose reserved ``adapter`` selects reply delivery. An absent\nvalue retains the default identity. Ordinary Slack turns continue to name\ntheir identity in ``adapter`` (INGRESS-CANARY-1).",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -5964,6 +6181,17 @@
               }
             ],
             "title": "Endpoint"
+          },
+          "identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity"
           },
           "kind": {
             "title": "Kind",
@@ -6978,11 +7206,22 @@
         "type": "object"
       },
       "ThreadResetState": {
-        "description": "Whether a thread has a pending forced-sandbox-release request (#713).",
+        "description": "Whether a thread has a pending forced-sandbox-release request (#713).\n\n``route_existed`` is what the worker found when it drained the reset\n(#3699). None while the reset is pending, and when no outcome is recorded\n(the record expired, or the worker predates this field). False when the\ndrained reset matched no route, so nothing was released -- usually a key\nbuilt by hand that left out a named bot's identity segment. True when a\nroute existed and was released.",
         "properties": {
           "requested": {
             "title": "Requested",
             "type": "boolean"
+          },
+          "route_existed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Existed"
           }
         },
         "required": [
@@ -7010,6 +7249,14 @@
         },
         "title": "TipsPackConfig",
         "type": "object"
+      },
+      "ToolAccess": {
+        "description": "Which tools one turn may execute (TOOL-ACCESS-1, TOOL-ACCESS-3).\n\nCarried as ``QueuedTurn.tool_access`` and ``Event.tool_access``. Null means\nthe turn runs exactly as it always has. On a server that advertises it\nunder ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), ``READ_ONLY`` restricts\nthe turn to tools the server explicitly classifies as read-only, denies\nevery other tool before it executes, and never requests an approval. A\nworker or server that does not implement the contract decodes the value and\ndrops it (TOOL-ACCESS-6).\n\nAn enum, not free text (TOOL-ACCESS-2): an unknown value is refused on the\nwire, never read as null, because reading it as null would run a restricted\nturn unrestricted. A second value is a breaking change, decided on its own.",
+        "enum": [
+          "read-only"
+        ],
+        "title": "ToolAccess",
+        "type": "string"
       },
       "TraceTree": {
         "description": "A trace plus its reconstructed observation tree.",
@@ -7236,7 +7483,7 @@
       },
       "VerificationObservation": {
         "additionalProperties": false,
-        "description": "Exact sandbox command result recorded before the model starts.",
+        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers.",
         "properties": {
           "blocked_services": {
             "items": {
@@ -7246,11 +7493,30 @@
             "title": "Blocked Services",
             "type": "array"
           },
+          "check": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,31}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
           "command": {
-            "maxLength": 180,
-            "minLength": 1,
-            "title": "Command",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 180,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
           },
           "exit_status": {
             "anyOf": [
@@ -7277,13 +7543,15 @@
             "enum": [
               "passed",
               "unavailable",
-              "failed"
+              "failed",
+              "not_declared"
             ],
             "title": "Outcome",
             "type": "string"
           }
         },
         "required": [
+          "check",
           "command",
           "outcome",
           "exit_status",
@@ -11617,7 +11885,7 @@
     },
     "/agents/{agent_id}/threads/{thread_key}/reset": {
       "get": {
-        "description": "Poll whether a forced reset (the POST above) is still outstanding for\nthis thread (#735). ``requested`` is True from the moment the POST enqueues\nthe request until the worker's maintenance tick drains it AND\n``release_thread`` actually completes, then False.\n\nWhy this exists: the POST returns as soon as the request is *queued*, but the\nrelease only happens on the worker's maintenance tick (up to\n``reclaim_interval_s`` -- 30s by default -- later). Without a way to observe\ncompletion, the natural operator workflow \"reset the thread, then send a\nmessage to confirm\" adopts the still-live pre-reset sandbox and reads a\nstale answer, indistinguishable from \"the reset did not work\" (#735). A\ncaller that must not adopt the pre-reset sandbox polls this until it reads\nFalse before sending the next message; the CLI ``reset-thread`` verb does\nexactly that on the operator's behalf. Mirrors ``GET .../kill``.\n\nThe signal flips only after the release LANDS, not at claim time (#812, was\n#806 incomplete). The worker SPOPs the request to claim it, then moves it\ninto an in-progress set that ``is_pending`` also reads, clearing it only once\n``release_thread`` succeeds. So this stays True across the whole release, and\na release that raises or times out leaves it True -- the CLI reports the\nreset as unconfirmed rather than a false \"released\". Reading only the request\nset would flip to done the instant the request was SPOPped, before -- and\nindependent of whether -- the sandbox was actually released.",
+        "description": "Poll whether a forced reset (the POST above) is still outstanding for\nthis thread (#735). ``requested`` is True from the moment the POST enqueues\nthe request until the worker's maintenance tick drains it AND\n``release_thread`` actually completes, then False.\n\nWhy this exists: the POST returns as soon as the request is *queued*, but the\nrelease only happens on the worker's maintenance tick (up to\n``reclaim_interval_s`` -- 30s by default -- later). Without a way to observe\ncompletion, the natural operator workflow \"reset the thread, then send a\nmessage to confirm\" adopts the still-live pre-reset sandbox and reads a\nstale answer, indistinguishable from \"the reset did not work\" (#735). A\ncaller that must not adopt the pre-reset sandbox polls this until it reads\nFalse before sending the next message; the CLI ``reset-thread`` verb does\nexactly that on the operator's behalf. Mirrors ``GET .../kill``.\n\nThe signal flips only after the release LANDS, not at claim time (#812, was\n#806 incomplete). The worker SPOPs the request to claim it, then moves it\ninto an in-progress set that ``is_pending`` also reads, clearing it only once\n``release_thread`` succeeds. So this stays True across the whole release, and\na release that raises or times out leaves it True -- the CLI reports the\nreset as unconfirmed rather than a false \"released\". Reading only the request\nset would flip to done the instant the request was SPOPped, before -- and\nindependent of whether -- the sandbox was actually released.\n\nOnce the reset is no longer pending, ``route_existed`` says what the drain\nfound (#3699): False when the key matched no route, so nothing was released\nand the sandbox the caller meant to free is still claimed; True when a route\nexisted and was released. It stays None while the reset is pending and when\nthe worker recorded no outcome (expired, or a worker that predates it), so a\ncaller treats None as unknown, not as success or failure.",
         "operationId": "get_thread_reset_state_agents__agent_id__threads__thread_key__reset_get",
         "parameters": [
           {
@@ -12355,7 +12623,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApprovalOut"
+                  "$ref": "#/components/schemas/ApprovalCreateOut"
                 }
               }
             },
@@ -14146,7 +14414,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id and raw body, with the\n   timestamp required and inside ``hook_signing.TOLERANCE_S``; a missing\n   delivery id is verified as the empty string, so an absent id is only\n   reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -14249,6 +14517,22 @@
             }
           },
           {
+            "in": "query",
+            "name": "tool_access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ToolAccess"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool Access"
+            }
+          },
+          {
             "in": "header",
             "name": "x-curie-signature-256",
             "required": false,
@@ -14278,6 +14562,22 @@
                 }
               ],
               "title": "X-Curie-Delivery-Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-timestamp",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Timestamp"
             }
           }
         ],

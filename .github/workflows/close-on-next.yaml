@@ -29,13 +29,15 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: read
 
 jobs:
   reconcile:
     name: Label or close issues fixed on next
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:

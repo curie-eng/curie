@@ -2036,3 +2036,212 @@ def test_runtime_reads_lists_and_appends_from_the_transcript_table(
     transcripts, legacy = _transcript_storage(aid)
     assert transcripts == [("thread-one", expected, second.json()["version"])]
     assert legacy == []
+
+
+# --------------------------------------------------------------------------- #
+# Who removed what (#3673)
+# --------------------------------------------------------------------------- #
+# A delete through the state router leaves one structured line naming the
+# agent, scope, namespace, key, whether anything was removed and which kind of
+# credential made the call -- never the stored value -- plus a bounded counter.
+_STATE_MUTATION_LOGGER = "curie_api.state_mutation"
+_SECRET_VALUE = "value-that-must-never-be-logged"
+
+
+def _mutation_records(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [r for r in caplog.records if r.name == _STATE_MUTATION_LOGGER]
+
+
+@pytest.fixture
+def mutation_metrics(
+    client: Any,
+) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-mutation-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _mutation_points(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> list[tuple[int, dict[str, str]]]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    if data is None:
+        return []
+    return [
+        (int(point.value), dict(point.attributes))
+        for resource_metrics in data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        if metric.name == "curie.state.mutation"
+        for point in metric.data.data_points
+    ]
+
+
+def test_deleting_a_state_key_records_who_removed_what(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/approvals/thread-1"
+    put = client.put(url, json={"value": {"note": _SECRET_VALUE}}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        deleted = client.delete(url, headers=auth_headers)
+    assert deleted.status_code == 204, deleted.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    fields = records[0].state_mutation
+    assert fields == {
+        "op": "delete",
+        "agent_id": aid,
+        "scope": "shared",
+        "namespace": "approvals",
+        "key": "thread-1",
+        "removed": True,
+        "principal": "platform",
+    }
+    message = records[0].getMessage()
+    # The rendered line is what reaches the JSON stderr stream, which keeps no
+    # extra fields, so every field must be in it too.
+    for part in (
+        "op=delete",
+        f"agent_id={aid}",
+        "scope=shared",
+        "namespace=approvals",
+        "key=thread-1",
+        "removed=true",
+        "principal=platform",
+    ):
+        assert part in message, message
+    assert _SECRET_VALUE not in message
+    assert _SECRET_VALUE not in repr(fields)
+
+
+def test_deleting_a_missing_state_key_is_recorded_as_nothing_removed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        deleted = client.delete(f"/agents/{aid}/state/approvals/absent", headers=auth_headers)
+    assert deleted.status_code == 204, deleted.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    assert records[0].state_mutation["removed"] is False
+    assert records[0].state_mutation["key"] == "absent"
+    assert "removed=false" in records[0].getMessage()
+
+
+@pytest.mark.parametrize(("scope", "principal"), [("state", "state"), ("state.app", "app")])
+def test_a_scoped_token_delete_names_its_credential_kind(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+    scope: str,
+    principal: str,
+) -> None:
+    aid = _agent(client, auth_headers)
+    token = mint(get_settings().api_key, agent=aid, scope=scope, exp=_FAR_FUTURE)
+    headers = {"X-API-Key": token}
+    url = f"/agents/{aid}/state/notes/k"
+    assert client.put(url, json={"value": 1}, headers=headers).status_code == 200
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1
+    assert records[0].state_mutation["principal"] == principal
+    assert f"principal={principal}" in records[0].getMessage()
+    assert token not in records[0].getMessage()
+
+
+def test_a_binding_scoped_delete_names_its_binding_scope(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/bindings/slack/C000000S01/notes/k"
+    assert client.put(url, json={"value": 1}, headers=auth_headers).status_code == 200
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=auth_headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1
+    assert records[0].state_mutation["scope"] == "slack:C000000S01"
+    assert records[0].state_mutation["removed"] is True
+
+
+def test_deleting_a_transcript_records_the_thread_it_removed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-audit"
+    appended = client.post(
+        f"{url}/append",
+        json={"item": {"user": _SECRET_VALUE, "assistant": "done"}},
+        headers=auth_headers,
+    )
+    assert appended.status_code == 200, appended.text
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=auth_headers).status_code == 204
+        assert client.delete(url, headers=auth_headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert [r.state_mutation["removed"] for r in records] == [True, False]
+    assert all(r.state_mutation["namespace"] == "transcript" for r in records)
+    assert all(r.state_mutation["key"] == "thread-audit" for r in records)
+    assert all(_SECRET_VALUE not in r.getMessage() for r in records)
+
+
+def test_state_mutations_are_counted_by_operation_and_bounded_namespace(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    mutation_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    # Namespaces are caller-chosen, so the label folds every namespace other
+    # than the platform's reserved ones into one series. A delete that removed
+    # nothing is logged but is not a mutation.
+    aid = _agent(client, auth_headers)
+    for namespace in ("approvals", "notes"):
+        url = f"/agents/{aid}/state/{namespace}/k"
+        assert client.put(url, json={"value": 1}, headers=auth_headers).status_code == 200
+        assert client.delete(url, headers=auth_headers).status_code == 204
+    absent = client.delete(f"/agents/{aid}/state/notes/absent", headers=auth_headers)
+    assert absent.status_code == 204
+
+    assert _mutation_points(mutation_metrics) == [
+        (2, {"service.name": "curie-api", "op": "delete", "namespace": "other"})
+    ]

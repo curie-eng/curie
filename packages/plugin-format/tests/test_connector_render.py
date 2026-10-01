@@ -28,11 +28,35 @@ HOSTED = ConnectorSpec(
 REMOTE = ConnectorSpec(url="https://mcp.internal/mcp", headers={"Authorization": "Bearer ${T}"})
 
 
+# A hosted render with no caller proxy is a named failure. Success-path
+# fixtures pass a proxy unless a test is the empty-key refusal itself.
+_DEFAULT_PROXY = object()
+
+
+def _caller_proxy() -> r.ConnectorProxy:
+    return r.ConnectorProxy(
+        image="ghcr.io/curie-eng/curie-worker:0.0.0",
+        public_keys=("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",),
+    )
+
+
+def _admitted_sandbox(release: str, app_name: str, agent: str) -> dict[str, str]:
+    """Ingress peer labels: the release sandbox selector plus the owning agent.
+
+    ``sandbox_selector`` itself stays the chart's runner-sandbox labels. The
+    agent label is only on the ingress ``from`` peer.
+    """
+
+    return {**r.sandbox_selector(release, app_name), "curietech.ai/agent": agent}
+
+
 def _objs(
     release: str = "acme-bot",
     app: str = "acme-bot",
     spec: ConnectorSpec = HOSTED,
+    proxy: object = _DEFAULT_PROXY,
 ) -> list[dict]:
+    resolved = _caller_proxy() if proxy is _DEFAULT_PROXY else proxy
     return r.render(
         release=release,
         agent="acme-bot",
@@ -41,6 +65,7 @@ def _objs(
         connector="grafana",
         spec=spec,
         secret_name="conn-secrets",
+        proxy=resolved,  # type: ignore[arg-type]
     )
 
 
@@ -141,6 +166,7 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
             connector="g",
             spec=HOSTED,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     )
     assert np["spec"]["podSelector"]["matchLabels"] == {
@@ -160,6 +186,7 @@ def test_two_releases_do_not_select_each_others_sandboxes() -> None:
             connector="g",
             spec=HOSTED,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     )
     b = _egress_np(
@@ -171,6 +198,7 @@ def test_two_releases_do_not_select_each_others_sandboxes() -> None:
             connector="g",
             spec=HOSTED,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     )
     assert a["spec"]["podSelector"] != b["spec"]["podSelector"]
@@ -306,6 +334,7 @@ def test_two_agents_in_one_release_do_not_share_object_names() -> None:
             connector="grafana",
             spec=DEV,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     ]
     prod = [
@@ -318,6 +347,7 @@ def test_two_agents_in_one_release_do_not_share_object_names() -> None:
             connector="grafana",
             spec=PROD,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     ]
     assert not set(dev) & set(prod), f"agents share object names: {dev} vs {prod}"
@@ -336,6 +366,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
             connector="grafana",
             spec=DEV,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Service"
     )
@@ -349,6 +380,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
             connector="grafana",
             spec=PROD,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Service"
     )
@@ -413,6 +445,7 @@ def _render_connector(agent: str, connector: str, release: str = "curie") -> lis
         connector=connector,
         spec=DEV,
         secret_name="s",
+        proxy=_caller_proxy(),
     )
 
 
@@ -771,6 +804,7 @@ def _dep(agent: str = "acme-dev", spec: ConnectorSpec = HOSTED_WITH_HOSTS) -> di
             connector="grafana",
             spec=spec,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Deployment"
     )
@@ -886,6 +920,7 @@ def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
             connector="g",
             spec=spec,
             secret_name="curie-owned",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Deployment"
     )
@@ -914,6 +949,7 @@ def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -
             connector="g",
             spec=spec,
             secret_name="curie-owned",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Deployment"
     )
@@ -940,6 +976,7 @@ def test_a_referenced_secret_is_not_optional() -> None:
             connector="g",
             spec=spec,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
         if o["kind"] == "Deployment"
     )
@@ -1167,17 +1204,16 @@ def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
             connector="connector-c",
             spec=HOSTED,
             secret_name="connector-secret",
+            proxy=_caller_proxy(),
         )
     )
     src = np["spec"]["ingress"][0]["from"]
     assert len(src) == 1, "exactly one source: the sandbox"
-    assert src[0]["podSelector"]["matchLabels"] == {
-        "app.kubernetes.io/name": "app-name",
-        "app.kubernetes.io/instance": "release-r",
-        "app.kubernetes.io/component": "runner-sandbox",
-    }
     assert set(src[0]) == {"podSelector"}
-    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name")
+    assert src[0]["podSelector"]["matchLabels"] == _admitted_sandbox(
+        "release-r", "app-name", "agent-a"
+    )
+    assert "curietech.ai/agent" not in r.sandbox_selector("release-r", "app-name")
 
 
 # This sits BESIDE the test above, which already goes red on the same mutation
@@ -1226,9 +1262,12 @@ def test_ingress_source_peer_is_namespace_scoped_by_omission() -> None:
         "sandbox-labelled pods in EVERY namespace, which the unlabelled same-namespace "
         "cluster probe cannot observe (#1502)"
     )
-    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name"), (
-        "the peer must still name exactly this release's sandbox on the pod axis; "
-        "the namespace axis is held closed by omission, not by these labels"
+    assert src[0]["podSelector"]["matchLabels"] == _admitted_sandbox(
+        "release-r", "app-name", "acme-bot"
+    ), (
+        "the peer must still name exactly this release's sandbox on the pod axis, "
+        "plus the owning agent; the namespace axis is held closed by omission, "
+        "not by these labels"
     )
 
 
@@ -1244,21 +1283,26 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
         connector="connector-c",
         spec=HOSTED,
         secret_name="connector-secret",
+        proxy=_caller_proxy(),
     )
     ing = _ingress_np(objs)
     egr = _egress_np(objs)
     # The two policies must select OPPOSITE ends of the same hop: egress is
     # attached to the sandbox, ingress to the connector. Swapping them still
     # parses and still applies -- it just protects the wrong pod.
+    sandbox = r.sandbox_selector("release-r", "app-name")
     assert ing["spec"]["podSelector"] != egr["spec"]["podSelector"]
     assert (
         ing["spec"]["podSelector"]["matchLabels"]
         == egr["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]
     ), "ingress must select the pod the egress rule points AT"
-    assert (
-        egr["spec"]["podSelector"]["matchLabels"]
-        == ing["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
-    ), "ingress must admit the pod the egress rule is attached to"
+    # Egress stays the release-wide sandbox selector. The agent label is only
+    # on the ingress from peer, so the two are no longer the same map.
+    assert egr["spec"]["podSelector"]["matchLabels"] == sandbox
+    assert "curietech.ai/agent" not in egr["spec"]["podSelector"]["matchLabels"]
+    assert ing["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"] == _admitted_sandbox(
+        "release-r", "app-name", "agent-a"
+    )
     dep = next(o for o in objs if o["kind"] == "Deployment")
     assert ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"][
         "labels"
@@ -1266,8 +1310,10 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
 
 
 def test_ingress_is_port_scoped_to_the_connector_port() -> None:
+    # A proxied render opens the proxy port, which is the port the Service
+    # lands on after DNAT, not the server's own port.
     ports = _ingress_np(_objs())["spec"]["ingress"][0]["ports"]
-    assert ports == [{"protocol": "TCP", "port": HOSTED.port}]
+    assert ports == [{"protocol": "TCP", "port": r.caller_proxy_port(HOSTED)}]
 
 
 def test_ingress_uses_a_podselector_never_an_ipblock() -> None:
@@ -1289,6 +1335,7 @@ def test_two_releases_do_not_admit_each_others_sandboxes() -> None:
             connector="g",
             spec=HOSTED,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     )
     b = _ingress_np(
@@ -1300,9 +1347,67 @@ def test_two_releases_do_not_admit_each_others_sandboxes() -> None:
             connector="g",
             spec=HOSTED,
             secret_name="s",
+            proxy=_caller_proxy(),
         )
     )
     assert a["spec"]["ingress"][0]["from"] != b["spec"]["ingress"][0]["from"]
+
+
+def _ingress_peer_labels(agent: str, *, through_render: bool) -> dict[str, str]:
+    if through_render:
+        policy = _ingress_np(
+            r.render(
+                release="release-r",
+                agent=agent,
+                namespace="namespace-n",
+                app_name="app-name",
+                connector="connector-c",
+                spec=HOSTED,
+                secret_name="connector-secret",
+                proxy=_caller_proxy(),
+            )
+        )
+    else:
+        policy = r.render_ingress_networkpolicy(
+            "release-r",
+            agent,
+            "app-name",
+            "connector-c",
+            HOSTED,
+            proxy=_caller_proxy(),
+        )
+    return policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+
+
+def test_ingress_from_selects_the_owning_agent_and_not_another() -> None:
+    # The pod axis is per agent. A sandbox labeled for agent B must not match
+    # agent A's ingress peer, and the egress policy stays release-wide.
+    sandbox = r.sandbox_selector("release-r", "app-name")
+    assert "curietech.ai/agent" not in sandbox
+    for through_render in (False, True):
+        agent_a = _ingress_peer_labels("agent-a", through_render=through_render)
+        agent_b = _ingress_peer_labels("agent-b", through_render=through_render)
+        assert agent_a == _admitted_sandbox("release-r", "app-name", "agent-a")
+        assert agent_b == _admitted_sandbox("release-r", "app-name", "agent-b")
+        assert agent_b["curietech.ai/agent"] not in agent_a.values()
+        assert agent_a["curietech.ai/agent"] not in agent_b.values()
+    rendered = r.render(
+        release="release-r",
+        agent="agent-a",
+        namespace="namespace-n",
+        app_name="app-name",
+        connector="connector-c",
+        spec=HOSTED,
+        secret_name="connector-secret",
+        proxy=_caller_proxy(),
+    )
+    assert _egress_np(rendered)["spec"]["podSelector"]["matchLabels"] == sandbox
+    direct = r.render_ingress_networkpolicy(
+        "release-r", "agent-a", "app-name", "connector-c", HOSTED
+    )
+    assert direct["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"] == (
+        _admitted_sandbox("release-r", "app-name", "agent-a")
+    )
 
 
 def test_the_two_policies_do_not_collide_on_name() -> None:
@@ -1358,7 +1463,10 @@ def test_a_wrong_egress_port_leaves_rail_1_denying_the_port_the_connector_listen
     # times out with no policy error anywhere to say why.
     spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", port=port)
     egress = _egress_np(_objs(spec=spec))["spec"]["egress"][0]
-    assert egress["ports"] == [{"protocol": "TCP", "port": port}]
+    # With a caller proxy the policy matches the proxy port after DNAT, not the
+    # server port the declaration named.
+    assert egress["ports"] == [{"protocol": "TCP", "port": r.caller_proxy_port(spec)}]
+    assert port not in [item["port"] for item in egress["ports"]]
 
 
 @pytest.mark.parametrize("port", [9876, 9999])
@@ -1426,7 +1534,7 @@ def test_the_guard_fires_before_any_object_is_produced() -> None:
     # A guard that ran per-object would emit a Service and a NetworkPolicy for a
     # connector that can never start, and a caller applying the partial list
     # leaves them orphaned in the namespace.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="connectors.lock.yaml"):
         r.render(
             release="acme-rel",
             agent="acme-bot",
@@ -1435,6 +1543,7 @@ def test_the_guard_fires_before_any_object_is_produced() -> None:
             connector="k8s-write",
             spec=_build_spec(),
             secret_name="conn-secrets",
+            proxy=_caller_proxy(),
         )
 
 
@@ -1772,12 +1881,19 @@ def _policy_ports(objs: dict[str, dict]) -> list[int]:
 
 # @spec ADR-0168 d7
 def test_without_a_proxy_a_connector_renders_as_it_did() -> None:
-    objs = _by_kind(_objs())
-    assert list(_containers(objs)) == ["server"]
-    assert objs["Service"]["spec"]["ports"] == [
-        {"name": "http", "port": HOSTED.port, "targetPort": "http"}
-    ]
-    assert _policy_ports(objs) == [HOSTED.port, HOSTED.port]
+    # A hosted connector with no caller proxy is refused by name. Rendering it
+    # anyway would publish an ungated credential holder.
+    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
+        r.render(
+            release="acme-bot",
+            agent="acme-bot",
+            namespace="acme-bot",
+            app_name="acme-bot",
+            connector="grafana",
+            spec=HOSTED,
+            secret_name="conn-secrets",
+            proxy=None,
+        )
 
 
 # @spec ADR-0168 d7
@@ -1912,9 +2028,19 @@ def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_
 
 # @spec ADR-0168 d7
 def test_without_a_proxy_there_is_no_direct_service() -> None:
-    assert [o["metadata"]["name"] for o in _objs() if o["kind"] == "Service"] == [
-        r.object_name("acme-bot", "acme-bot", "grafana")
-    ]
+    # There is no rendered Service at all: a hosted connector without a caller
+    # key fails closed before any object is produced.
+    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
+        r.render(
+            release="acme-bot",
+            agent="acme-bot",
+            namespace="acme-bot",
+            app_name="acme-bot",
+            connector="grafana",
+            spec=HOSTED,
+            secret_name="conn-secrets",
+            proxy=None,
+        )
 
 
 # @spec ADR-0168 d7
@@ -1979,8 +2105,8 @@ def test_a_proxy_with_an_unusable_pull_setting_is_refused(pull: dict[str, object
 
 def _server(spec: ConnectorSpec) -> dict:
     (dep,) = [o for o in _objs(spec=spec) if o["kind"] == "Deployment"]
-    (container,) = dep["spec"]["template"]["spec"]["containers"]
-    return container
+    containers = dep["spec"]["template"]["spec"]["containers"]
+    return next(container for container in containers if container["name"] == "server")
 
 
 def test_connector_gets_a_tcp_readiness_probe_on_its_own_port() -> None:

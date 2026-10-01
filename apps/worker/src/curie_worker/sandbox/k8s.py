@@ -11,6 +11,8 @@ the k8scratch e2e test.
 
 from __future__ import annotations
 
+import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,6 +30,7 @@ from .types import (
     ClaimView,
     OperatingMode,
     QuotaRejection,
+    SandboxTermination,
     SandboxView,
     filter_agent_child_env,
 )
@@ -217,6 +220,111 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
         service_fqdn=status.get("serviceFQDN") or None,
         operating_mode=str((obj.get("spec") or {}).get("operatingMode", "Running")),
     )
+
+
+def _safe_termination_reason(raw: object, *, fallback: str = "Terminated") -> str:
+    # Pod and Event reasons are API data. Keep a single short diagnostic token;
+    # never pass arbitrary event messages into replies or issue comments.
+    if isinstance(raw, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", raw):
+        return raw
+    return fallback
+
+
+def _safe_pod_message(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    # Kubernetes messages are untrusted free text. Extract only the shape
+    # needed to explain the observed EmptyDir eviction; never publish a raw
+    # message or rely on generic secret redaction to recognize every format.
+    match = re.search(
+        r'Usage of EmptyDir volume "([a-z0-9][a-z0-9.-]{0,62})" '
+        r'exceeds the limit "([0-9]{1,12}(?:Ki|Mi|Gi|Ti|Pi|Ei)?)"',
+        raw,
+    )
+    if match is None:
+        return None
+    volume, limit = match.groups()
+    return f'Usage of EmptyDir volume "{volume}" exceeds the limit "{limit}"'
+
+
+def _recent(moment: object, *, since: datetime) -> bool:
+    return isinstance(moment, datetime) and moment.tzinfo is not None and moment >= since
+
+
+def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
+    status = getattr(pod, "status", None)
+    phase = getattr(status, "phase", None)
+    reason = getattr(status, "reason", None)
+    if phase == "Failed" and reason == "Evicted":
+        return SandboxTermination("Evicted", _safe_pod_message(getattr(status, "message", None)))
+
+    for container in getattr(status, "container_statuses", None) or []:
+        if getattr(container, "name", None) != "runner":
+            continue
+        terminated = getattr(getattr(container, "state", None), "terminated", None)
+        if terminated is None:
+            continue
+        exit_code = getattr(terminated, "exit_code", None)
+        detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
+        return SandboxTermination(
+            _safe_termination_reason(getattr(terminated, "reason", None)), detail
+        )
+
+    # A restarted runner can be Running by the time the drop is diagnosed.
+    # Only OOMKilled is strong enough evidence in last_state: another old
+    # termination may predate this turn and must not relabel a network drop.
+    for container in getattr(status, "container_statuses", None) or []:
+        if getattr(container, "name", None) != "runner":
+            continue
+        terminated = getattr(getattr(container, "last_state", None), "terminated", None)
+        if getattr(terminated, "reason", None) == "OOMKilled" and _recent(
+            getattr(terminated, "finished_at", None), since=since
+        ):
+            exit_code = getattr(terminated, "exit_code", None)
+            detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
+            return SandboxTermination("OOMKilled", detail)
+
+    if phase in {"Failed", "Succeeded"}:
+        return SandboxTermination(
+            _safe_termination_reason(
+                reason,
+                fallback="Failed" if phase == "Failed" else "Completed",
+            )
+        )
+    return None
+
+
+def _event_termination(
+    events: Any, *, pod_name: str, pod_uid: str | None, since: datetime
+) -> SandboxTermination | None:
+    # Event lists are name filtered at the API, then checked here as well.
+    # A readable pod's UID prevents an old event for a reused name from being
+    # attributed to this runner.
+    matches: list[SandboxTermination] = []
+    for event in getattr(events, "items", None) or []:
+        involved = getattr(event, "involved_object", None)
+        if (
+            getattr(involved, "kind", None) != "Pod"
+            or getattr(involved, "name", None) != pod_name
+            or (pod_uid is not None and getattr(involved, "uid", None) != pod_uid)
+        ):
+            continue
+        event_time = (
+            getattr(getattr(event, "series", None), "last_observed_time", None)
+            or getattr(event, "last_timestamp", None)
+            or getattr(event, "event_time", None)
+            or getattr(getattr(event, "metadata", None), "creation_timestamp", None)
+        )
+        if not _recent(event_time, since=since):
+            continue
+        reason = getattr(event, "reason", None)
+        if reason in {"Evicted", "OOMKilled", "OOMKilling"}:
+            matches.append(SandboxTermination(_safe_termination_reason(reason)))
+    for preferred in ("Evicted", "OOMKilled", "OOMKilling"):
+        for match in matches:
+            if match.reason == preferred:
+                return match
+    return None
 
 
 class KubernetesSandboxClient:
@@ -446,6 +554,28 @@ class KubernetesSandboxClient:
 
     # -- Sandbox (core group) ------------------------------------------------
 
+    def warm_pool_exists(self, name: str) -> bool:
+        """Whether this namespace already has the named SandboxWarmPool.
+
+        A missing pool is false. Any other API error propagates so the caller
+        can keep today's pool choice instead of failing the claim.
+        """
+
+        try:
+            self._api.get_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxwarmpools",
+                name,
+                _request_timeout=5,
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float
     ) -> SandboxView | None:
@@ -511,6 +641,51 @@ class KubernetesSandboxClient:
                 message = getattr(condition, "message", None)
                 return message if isinstance(message, str) and message else "Unschedulable"
         return None
+
+    def pod_termination(
+        self, name: str, *, since: datetime, request_timeout_seconds: float
+    ) -> SandboxTermination | None:
+        """Read exact pod state and a bounded set of its events within one budget."""
+
+        deadline = time.monotonic() + request_timeout_seconds
+        pod: Any = None
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name,
+                self._namespace,
+                _request_timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except Exception:  # noqa: BLE001 - diagnosis is best effort
+            pass
+        status_termination = _pod_termination(pod, since=since) if pod is not None else None
+        pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
+        event_termination: SandboxTermination | None = None
+        if time.monotonic() < deadline:
+            try:
+                events = self._core_api.list_namespaced_event(
+                    self._namespace,
+                    field_selector=f"involvedObject.kind=Pod,involvedObject.name={name}",
+                    limit=20,
+                    _request_timeout=max(0.001, deadline - time.monotonic()),
+                )
+                event_termination = _event_termination(
+                    events, pod_name=name, pod_uid=pod_uid, since=since
+                )
+            except Exception:  # noqa: BLE001 - pod state still provides evidence
+                pass
+        if status_termination is not None and status_termination.reason not in {
+            "Failed",
+            "Terminated",
+            "Error",
+        }:
+            return status_termination
+        if event_termination is not None and (
+            event_termination.reason == "Evicted"
+            or pod is None
+            or status_termination is not None
+        ):
+            return event_termination
+        return status_termination
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         self._api.patch_namespaced_custom_object(

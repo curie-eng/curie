@@ -396,6 +396,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 thread_key: "C1:1700000000.000100".to_string(),
                 requested: true,
                 released: true,
+                route_existed: Some(true),
             },
         ],
     );

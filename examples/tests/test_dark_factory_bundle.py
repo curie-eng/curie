@@ -382,7 +382,7 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "untrusted" in section.lower()
     assert ".github/" in section
     assert "Could not complete:" in section
-    assert "1800" in section
+    assert "10800" in section
     assert "does not act on them yet" not in section
 
 

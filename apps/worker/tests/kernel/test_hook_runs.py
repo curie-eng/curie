@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -30,7 +31,7 @@ from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore
 from curie_worker.hook_runs import HookRunRecorder, HookRunRecorderError
 from curie_worker.sandbox import QuotaRejection
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 
 def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
@@ -309,7 +310,7 @@ def test_pause_after_runner_admission_does_not_defer_started_run(
 
     async def go() -> None:
         async with make_hook_run() as run:
-            recorder = HookRunRecorder(run.engine)
+            recorder = HookRunRecorder(run.engine, "curie")
             async with recorder.start_guard(run.ref) as allowed:
                 assert allowed
             async with run.engine.begin() as conn:
@@ -423,7 +424,7 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
         ) as h:
-            await HookRunRecorder(run.engine).close(run.ref, "deferred")
+            await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred")
             deferred, ended_at = await run.state() or (None, None)
             assert deferred == "deferred"
             assert ended_at is not None
@@ -719,7 +720,7 @@ def test_closing_the_same_run_twice_counts_one_durable_outcome(
 
     async def go() -> None:
         async with make_hook_run() as run:
-            recorder = HookRunRecorder(run.engine)
+            recorder = HookRunRecorder(run.engine, "curie")
             await recorder.close(run.ref, "ran")
             await recorder.close(run.ref, "ran")
 
@@ -1141,5 +1142,111 @@ def test_renew_refuses_a_claim_the_next_fire_already_reclaimed(make_hook_run) ->
         async with make_hook_run() as run:
             assert await run.recorder().renew(run.ref, 600.0) is True  # type: ignore[attr-defined]
             assert await run.lease_expires_at() is not None
+
+    asyncio.run(go())
+
+
+def test_recorder_reads_and_writes_the_configured_schema() -> None:
+    """The recorder honors ``db_schema`` rather than a hardcoded ``curie`` (#3566).
+
+    The tables are cloned from the migrated ``curie`` ones into a throwaway
+    schema, and the run row exists ONLY there, so a recorder that still names
+    ``curie`` finds no row: ``get`` returns None and ``close`` raises missing.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(
+            os.environ.get(
+                "TEST_DATABASE_URL",
+                os.environ.get(
+                    "DATABASE_URL",
+                    "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
+                ),
+            )
+        )
+        schema = f"hook_runs_{uuid.uuid4().hex[:12]}"
+        agent_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+        ref = HookRunRef(
+            agent_id=str(agent_id),
+            name="nightly",
+            slot_utc="2026-09-22T03:00:00+00:00",
+        )
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+                for table in ("hook_runs", "schedule_controls"):
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE {schema}.{table} "
+                            f"(LIKE curie.{table} INCLUDING ALL)"
+                        )
+                    )
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {schema}.hook_runs "
+                        "(id, agent_id, name, slot_utc, version_id, started_at, "
+                        "lease_expires_at) VALUES (:id, :agent_id, :name, "
+                        ":slot_utc, :version_id, now(), now())"
+                    ),
+                    {
+                        "id": run_id,
+                        "agent_id": agent_id,
+                        "name": ref.name,
+                        "slot_utc": datetime(2026, 9, 22, 3, 0, tzinfo=UTC),
+                        "version_id": uuid.uuid4(),
+                    },
+                )
+
+            recorder = HookRunRecorder(engine, schema)
+            async with recorder.start_guard(ref) as allowed:
+                assert allowed
+            state = await recorder.get(ref)
+            assert state is not None and state.outcome is None
+            assert await recorder.renew(ref, 60.0)
+            await recorder.close(ref, "ran")
+
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            f"SELECT outcome, ended_at, lease_expires_at > now() "
+                            f"AS renewed FROM {schema}.hook_runs WHERE id = :id"
+                        ),
+                        {"id": run_id},
+                    )
+                ).one()
+                in_curie = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM curie.hook_runs WHERE id = :id"),
+                        {"id": run_id},
+                    )
+                ).scalar_one()
+            assert row.outcome == "ran"
+            assert row.ended_at is not None
+            assert row.renewed
+            assert in_curie == 0
+
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {schema}.schedule_controls "
+                        "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                    ),
+                    {"agent_id": agent_id, "name": ref.name},
+                )
+                await conn.execute(
+                    text(
+                        f"UPDATE {schema}.hook_runs SET outcome = NULL, "
+                        "ended_at = NULL WHERE id = :id"
+                    ),
+                    {"id": run_id},
+                )
+            async with recorder.start_guard(ref) as allowed:
+                assert not allowed
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await engine.dispose()
 
     asyncio.run(go())

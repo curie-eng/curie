@@ -43,6 +43,7 @@ SANDBOX_POD="netpol-probe-sandbox"
 OUTSIDE_POD="netpol-probe-outside"
 DENY_TARGET_POD="netpol-probe-deny-target"
 FOREIGN_POD="netpol-probe-foreign"
+OTHER_AGENT_POD="netpol-probe-other-agent"
 
 # Non-blocking on the way out: the run is over, nothing waits on the pods.
 # The pod is deleted; $FOREIGN_NS itself deliberately is NOT. Deleting a
@@ -52,7 +53,7 @@ FOREIGN_POD="netpol-probe-foreign"
 # the same race cleanup_and_settle exists to avoid, one level up. An empty
 # namespace is inert; the pod is the thing that must not leak.
 cleanup() {
-  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
+  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" "$OTHER_AGENT_POD" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$FOREIGN_NS" delete pod "$FOREIGN_POD" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -62,7 +63,7 @@ cleanup() {
 # `wait --for=Ready` then passes on a pod that is on its way out and every exec
 # after it fails for reasons that have nothing to do with policy.
 cleanup_and_settle() {
-  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
+  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" "$OTHER_AGENT_POD" \
     --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
   kubectl -n "$FOREIGN_NS" delete pod "$FOREIGN_POD" \
     --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
@@ -348,18 +349,87 @@ CONNECTOR_COUNT="${#CONNECTORS[@]}"
   || fail "found 0 connector Services in $NS; connector NetworkPolicy enforcement would be vacuous"
 echo "  ok  connector Service count: $CONNECTOR_COUNT"
 
+# `<release>-<agent>-mcp-<connector>`. Names without that agent segment keep
+# the unlabeled sandbox probe, which is the release-wide selector only.
+owning_agent() {
+  local name="$1"
+  local prefix="${RELEASE}-"
+  local rest agent
+  case "$name" in
+    "$prefix"*) rest="${name#"$prefix"}" ;;
+    *) return 1 ;;
+  esac
+  case "$rest" in
+    *-mcp-*) agent="${rest%%-mcp-*}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$agent" ] || return 1
+  printf '%s' "$agent"
+}
+
+OTHER_AGENT_VALUE=""
+ensure_other_agent_probe() {
+  local owner="$1"
+  local value="not-${owner}"
+  if [ "$value" = "$OTHER_AGENT_VALUE" ]; then
+    return 0
+  fi
+  OTHER_AGENT_VALUE="$value"
+  kubectl -n "$NS" apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $OTHER_AGENT_POD
+  labels:
+    app.kubernetes.io/name: $APP
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: ${value}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: $PROBE_IMAGE
+      command: ["sleep", "600"]
+YAML
+  kubectl -n "$NS" wait --for=condition=Ready "pod/$OTHER_AGENT_POD" --timeout=180s >/dev/null \
+    || fail "the other-agent probe did not become ready"
+}
+
 for svc in "${CONNECTORS[@]}"; do
   kubectl -n "$NS" rollout status "deployment/$svc" --timeout=180s >/dev/null 2>&1 \
     || fail "connector Deployment $svc did not become ready"
 
   PORT="$(kubectl -n "$NS" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')"
-  kubectl -n "$NS" exec "$SANDBOX_POD" -- \
-    curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null \
-    || fail "the sandbox cannot reach connector Service $svc:$PORT.
+  AGENT="$(owning_agent "$svc" || true)"
+  SANDBOX_MISS="the sandbox cannot reach connector Service $svc:$PORT.
 
 Its egress rule is applied but not matching. The usual cause is an ipBlock of
 the Service ClusterIP: kube-proxy DNATs the destination to a pod IP before
 NetworkPolicy is evaluated, so such a rule can never match (ADR-0086)."
+  if [ -n "$AGENT" ]; then
+    kubectl -n "$NS" label pod "$SANDBOX_POD" "curietech.ai/agent=${AGENT}" --overwrite >/dev/null
+    ensure_other_agent_probe "$AGENT"
+    if kubectl -n "$NS" exec "$OTHER_AGENT_POD" -- \
+         curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null; then
+      fail "a sandbox wearing curietech.ai/agent=${OTHER_AGENT_VALUE} reached connector Service $svc:$PORT; ingress is not limited to the owning agent"
+    fi
+    echo "  ok  other-agent probe cannot reach connector $svc:$PORT"
+    reached=0
+    for _ in 1 2 3 4 5; do
+      if kubectl -n "$NS" exec "$SANDBOX_POD" -- \
+           curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null; then
+        reached=1
+        break
+      fi
+      sleep 1
+    done
+    [ "$reached" = 1 ] || fail "$SANDBOX_MISS"
+  else
+    kubectl -n "$NS" exec "$SANDBOX_POD" -- \
+      curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null \
+      || fail "$SANDBOX_MISS"
+  fi
   echo "  ok  sandbox reaches connector $svc:$PORT"
 
   if kubectl -n "$NS" exec "$OUTSIDE_POD" -- \

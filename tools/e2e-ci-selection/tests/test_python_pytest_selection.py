@@ -256,6 +256,13 @@ def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
     assert shards["strategy"]["matrix"]["shard"] == list(range(1, SHARD_COUNT + 1))
 
 
+def test_python_shards_require_postgres_and_valkey_tests() -> None:
+    # The matrix job covers every shard, so job-level env reaches all of them.
+    env = _python_job("python-pytest")["env"]
+    assert env["CI_REQUIRE_POSTGRES_TESTS"] == "1"
+    assert env["CI_REQUIRE_VALKEY_TESTS"] == "1"
+
+
 def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
     named = _named_steps("python-pytest")
     decision = named["Decide whether compose and pytest are needed"]
@@ -278,7 +285,11 @@ def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
     assert f"--ci-shard ${{{{ matrix.shard }}}}/{SHARD_COUNT}" in command
     # One automatic rerun, and every rerun test listed in the summary.
     assert "--reruns 1" in command
-    assert "-rR" in command.split()
+    # pytest keeps only the last -r option, so one token must carry both the
+    # rerun (R) and skip (s) report characters.
+    report_tokens = [token for token in command.split() if token.startswith("-r")]
+    assert len(report_tokens) == 1, report_tokens
+    assert {"R", "s"} <= set(report_tokens[0][2:])
 
     # The required job boots no stack and runs no suite of its own.
     required = _named_steps()

@@ -210,6 +210,8 @@ def test_ready_is_unavailable_when_select_on_agents_is_denied(
 
 def test_agents_require_api_key(client: Any) -> None:
     assert client.get("/agents").status_code == 401
+    assert client.get("/agents", headers={"X-API-Key": ""}).status_code == 401
+    assert client.get("/agents", headers={"X-API-Key": "   "}).status_code == 401
     assert (
         client.get("/agents", headers={"X-API-Key": "wrong"}).status_code == 401
     )
@@ -219,6 +221,25 @@ def test_agents_accept_valid_key(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     assert client.get("/agents", headers=auth_headers).status_code == 200
+
+
+def test_operator_principal_requires_nonblank_platform_key(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    for headers in ({}, {"X-API-Key": ""}, {"X-API-Key": "   "}, {"X-API-Key": "wrong"}):
+        response = client.post(
+            "/approvals/principals/operator",
+            headers=headers,
+            json={"subject": "operator-example"},
+        )
+        assert response.status_code == 401
+
+    accepted = client.post(
+        "/approvals/principals/operator",
+        headers=auth_headers,
+        json={"subject": "operator-example"},
+    )
+    assert accepted.status_code == 201
 
 
 def test_scoped_state_token_is_rejected_on_a_crud_route(client: Any) -> None:

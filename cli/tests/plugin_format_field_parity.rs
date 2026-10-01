@@ -166,17 +166,12 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
 fn connector_build_rs_has_no_plugin_format_field_parity_violations() {
     // The third mirror site (ADR 0113). Without this per-file test the gate's
     // `UndeclaredStruct` check never walks `cli/src/connector_build.rs` at all,
-    // and the `non_mirrors` entries `cli/plugin-format-mirrors.json` carries
-    // for its structs are decoration rather than enforcement: a new
-    // `Deserialize` mirror of a frozen connector shape could land undeclared.
+    // and a new `Deserialize` mirror of a frozen connector shape could land
+    // undeclared.
     //
-    // The FIELD comparison is deliberately a no-op for these structs today,
-    // because `plugin-format.schema.json` carries no `Connector*` `$defs`
-    // (`schema_export.py` imports only from `.models`), which is why they are
-    // declared as non_mirrors and why `tests/vectors/connector-fields.json`
-    // exists alongside this gate rather than being redundant with it. When the
-    // schema-export follow-up lands, those entries move to `mirrors` and this
-    // test starts comparing fields too, with no change here.
+    // Since the schema export carries the connector and lock models (#1128),
+    // these structs are declared as `mirrors`, so this test also compares
+    // their fields against the exported `$defs`.
     let src = repo_text("cli/src/connector_build.rs");
     let schema = plugin_format_schema_as_components();
     let manifest = repo_json("cli/plugin-format-mirrors.json");

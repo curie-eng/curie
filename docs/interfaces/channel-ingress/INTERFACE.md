@@ -76,6 +76,41 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
   Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
   the delivery arrived on (ADR-0168 decisions 2 and 3).
+  Its `text` is the person's message, except in a thread whose root this bot
+  posted: there the root is quoted ahead of it as untrusted context inside a
+  `<prior_assistant_reply>` block
+  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
+  with root slashes neutralized as XML entities so repository-looking alert
+  text stays inert even to an older worker's raw repository parser during a
+  rolling upgrade.
+
+  **Named relay identity contract (INGRESS-CANARY-1).** A disconnected cluster
+  message may use `adapter=curie-cluster-message` to select reply delivery and
+  set the optional `identity` on `ReplyHandle` to select a named Slack binding.
+  The producer constructs `QueuedTurn` with ordinary strict validation. The
+  identity survives serialization and worker decoding unchanged. An absent
+  identity selects `default`, preserving existing relay turns. The worker
+  selects the named binding and refuses unknown identities instead of falling
+  back to `default` (WORKER-CANARY-1 to 5 in `apps/worker/README.md`). The
+  first-party producer is `curie cluster message`'s disconnected relay lane and
+  `curie cluster eval`: each sets `identity` from the `--agent` binding it
+  selected, and leaves it absent for a `default` binding. The connected Slack
+  transport does not carry it. For ordinary Slack turns,
+  `adapter` remains the identity and `identity` is absent. The two fields have
+  separate purposes only when the relay adapter occupies `adapter`.
+
+  **Per-turn tool access (TOOL-ACCESS-1, TOOL-ACCESS-6).** The optional
+  top-level `tool_access` on `QueuedTurn` may be `"read-only"`, restricting
+  that one turn to tools the runner classifies as read-only, with no approval
+  ever requested. The contract, including what the worker and the runner must
+  do with it, is stated once, under TOOL-ACCESS in the
+  [ACI producer seam](../aci-producer/INTERFACE.md). A turn producer sets it
+  only toward a worker and runner that implement it (TOOL-ACCESS-6): one that
+  does not decodes the field and drops it, and the turn then runs
+  unrestricted. No first-party ingress sets it (for example the Slack
+  dispatcher, the wire ingress and the API resume queue); an operator's own
+  synthetic producer, such as a canary on the disconnected cluster-message
+  relay, is the intended caller. An absent value is today's turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
@@ -325,16 +360,19 @@ incomplete adapter coverage and conformance.
   bind under the generic non-empty rule. There is still no multi-channel adapter
   framework (#27). The routing pair removes the binding ambiguity; it does not by
   itself give other kinds a registered address shape.
-- **Still leaks — attachment resolution.** The only `AttachmentFilePort`
-  implementation is `SlackFileClient`
-  (`apps/worker/src/curie_worker/attachments.py::SlackFileClient`): Slack
-  `files.info` / `url_private_download` with the bot token (`url_private` 302s
-  to `slack-files.com`, which the no-redirect transport refuses to follow), wired from
-  `apps/worker/src/curie_worker/run.py::build` regardless of the turn's channel
-  kind. The kernel (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`)
-  never checks `reply_handle.kind`. A missing `files:read` scope degrades
-  attachments only (4a71d99f). Discord and email simply do not emit attachments
-  today.
+- **Fixed (#3678, ADR-0153) — attachment resolution.** The kernel hands the
+  turn's reply handle to the lane
+  (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`), and the
+  lane picks the file port from its kind
+  (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
+  `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /
+  `url_private_download` with the bot token; a missing `files:read` scope degrades
+  attachments only, 4a71d99f). Every other kind goes to
+  `apps/worker/src/curie_worker/attachments.py::ChannelPortFileClient`, which fetches
+  `GET {endpoint}/attachments/{id}` from the binding's own adapter with that adapter's
+  egress secret. The channel-port ingress carries the references on `TurnIn.attachments`
+  (`apps/api/src/curie_api/routers/channels.py::TurnIn`). Discord and the first-party
+  mail adapter do not emit attachments yet.
 
 ## Cross-links
 

@@ -37,7 +37,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -55,6 +55,10 @@ HISTORY_TOKEN_ENV = BootEnv.env_key("history_token")
 
 class HistoryError(RuntimeError):
     """A history reference could not be resolved or dereferenced."""
+
+
+class UnprovableAssistantGroupingError(HistoryError):
+    """Overlapping tool calls whose shared assistant message cannot be proven."""
 
 
 class HistoryAppendError(HistoryError):
@@ -107,6 +111,7 @@ class ConversationMessage:
 
     role: str
     content: JsonContent
+    assistant_group: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.role not in ("user", "assistant"):
@@ -117,9 +122,19 @@ class ConversationMessage:
             isinstance(block, Mapping) for block in self.content
         ):
             raise HistoryError("conversation content blocks must be JSON objects")
+        if self.assistant_group is not None and (
+            self.role != "assistant"
+            or not isinstance(self.assistant_group, str)
+            or len(self.assistant_group) != 64
+            or any(char not in "0123456789abcdef" for char in self.assistant_group)
+        ):
+            raise HistoryError("invalid portable assistant group")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"role": self.role, "content": _json_copy(self.content)}
+        data = {"role": self.role, "content": _json_copy(self.content)}
+        if self.assistant_group is not None:
+            data["assistant_group"] = self.assistant_group
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ConversationMessage:
@@ -134,7 +149,149 @@ class ConversationMessage:
             blocks = [dict(block) for block in content]
         else:
             raise HistoryError("conversation content blocks must be JSON objects")
-        return cls(role=role, content=blocks)
+        return cls(role=role, content=blocks, assistant_group=data.get("assistant_group"))
+
+
+def is_tool_result_message(message: ConversationMessage) -> bool:
+    """A tool response is not a new human/steer causal boundary."""
+
+    return (
+        message.role == "user"
+        and isinstance(message.content, list)
+        and bool(message.content)
+        and all(block.get("type") == "tool_result" for block in message.content)
+    )
+
+
+def _validate_group_provenance(messages: Sequence[ConversationMessage]) -> None:
+    """Validate causal boundaries before either replay or group compaction."""
+    seen_groups: set[str] = set()
+    current_group: str | None = None
+    for message in messages:
+        if message.role == "assistant":
+            group = message.assistant_group
+            if group != current_group:
+                if group is not None:
+                    if group in seen_groups:
+                        raise HistoryError("assistant group reused after a causal boundary")
+                    seen_groups.add(group)
+                current_group = group
+        elif not is_tool_result_message(message):
+            current_group = None
+
+
+def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
+    """Refuse unprovable overlapping fragments before native SDK hydration.
+
+    Roles or arrival order cannot establish a logical assistant identity. Tool
+    pairing validates result provenance separately from group provenance.
+    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay, so the
+    overlap refusal reaches a caller only for overlap it could not isolate to
+    one turn (RUNNER-HISTORY-GROUP-4).
+    """
+
+    _validate_group_provenance(messages)
+    seen_calls: set[str] = set()
+    pending: dict[str, str | None] = {}
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        calls = [block for block in message.content if block.get("type") == "tool_use"]
+        if calls and pending and (
+            message.assistant_group is None
+            or any(group != message.assistant_group for group in pending.values())
+        ):
+            raise UnprovableAssistantGroupingError(
+                "overlapping tool calls lack common proven assistant grouping; "
+                "start a fresh conversation"
+            )
+        for block in message.content:
+            kind = block.get("type")
+            if kind == "tool_use":
+                identifier = block.get("id")
+                if (
+                    message.role != "assistant"
+                    or not isinstance(identifier, str)
+                    or not identifier
+                    or identifier in seen_calls
+                ):
+                    raise HistoryError("invalid or duplicate history tool call")
+                seen_calls.add(identifier)
+                pending[identifier] = message.assistant_group
+            elif kind == "tool_result":
+                identifier = block.get("tool_use_id")
+                if (
+                    message.role != "user"
+                    or not isinstance(identifier, str)
+                    or identifier not in pending
+                ):
+                    raise HistoryError("unmatched or duplicate history tool result")
+                del pending[identifier]
+
+
+# What a reduced turn says in place of tool activity that left no visible text.
+UNREPLAYABLE_TOOL_ACTIVITY_TEXT = (
+    "[This turn's tool activity could not be replayed; only its text is kept.]"
+)
+
+
+def _split_turns(messages: Sequence[ConversationMessage]) -> list[list[ConversationMessage]]:
+    """Split at each genuine user message; a tool result does not start a turn."""
+
+    turns: list[list[ConversationMessage]] = []
+    for message in messages:
+        starts = message.role == "user" and not is_tool_result_message(message)
+        if starts or not turns:
+            turns.append([])
+        turns[-1].append(message)
+    return turns
+
+
+def _visible_text(turn: Sequence[ConversationMessage]) -> list[ConversationMessage]:
+    """The turn's opening user message and one assistant message of its text blocks."""
+
+    opening = turn[0]
+    head = [opening] if opening.role == "user" and not is_tool_result_message(opening) else []
+    texts: list[dict[str, Any]] = []
+    for message in turn:
+        if message.role != "assistant":
+            continue
+        if isinstance(message.content, str):
+            texts.append({"type": "text", "text": message.content})
+            continue
+        texts.extend(
+            cast("dict[str, Any]", json.loads(json.dumps(dict(block))))
+            for block in message.content
+            if block.get("type") == "text"
+        )
+    if not texts:
+        texts = [{"type": "text", "text": UNREPLAYABLE_TOOL_ACTIVITY_TEXT}]
+    return [*head, ConversationMessage(role="assistant", content=texts)]
+
+
+def reduce_unprovable_overlap_turns(
+    messages: Sequence[ConversationMessage],
+) -> tuple[tuple[ConversationMessage, ...], int]:
+    """Replay each turn with unprovable overlapping tool calls as its visible text.
+
+    RUNNER-HISTORY-GROUP-4. Returns the replay and how many turns were reduced.
+    Only the overlap refusal reduces a turn; any other malformed history is left
+    for ``validate_assistant_groups`` to refuse over the whole replay.
+    """
+
+    replay: list[ConversationMessage] = []
+    reduced = 0
+    for turn in _split_turns(messages):
+        try:
+            validate_assistant_groups(turn)
+        except UnprovableAssistantGroupingError:
+            replay.extend(_visible_text(turn))
+            reduced += 1
+            continue
+        except HistoryError:
+            pass
+        replay.extend(turn)
+    return tuple(replay), reduced
 
 
 @dataclass(frozen=True)
@@ -450,6 +607,13 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
     # Calls sharing an assistant or result message form one group. Keeping an
     # unmatched call protects its whole group, including pending approval data.
     neighbors: dict[int, set[int]] = {}
+    assistant_groups: dict[str, int] = {}
+    for index, message in enumerate(messages):
+        assistant_group = message.get("assistant_group")
+        if assistant_group is not None:
+            previous = assistant_groups.setdefault(assistant_group, index)
+            neighbors.setdefault(index, set()).add(previous)
+            neighbors.setdefault(previous, set()).add(index)
     for identifier in uses.keys() | results.keys():
         calls = uses.get(identifier, [])
         replies = results.get(identifier, [])
@@ -506,7 +670,9 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
             content = message["content"]
             retained_blocks: list[dict[str, Any]] = []
             omitted_blocks: list[dict[str, Any]] = []
-            for block in content:
+            for block in (
+                [{"type": "text", "text": content}] if isinstance(content, str) else content
+            ):
                 if block.get("type") in (
                     "tool_use", "tool_result", "thinking", "redacted_thinking"
                 ):
@@ -554,6 +720,7 @@ def bound_turn_record(
     if max_value_bytes <= 0:
         raise HistoryError("history value byte cap must be positive")
 
+    _validate_group_provenance(record.messages)
     raw = record.to_dict()
     if _state_value_size(raw) <= max_value_bytes:
         return record

@@ -7,14 +7,12 @@
 // So the CLI carries hand mirrors of shapes and derivations that
 // `packages/plugin-format` owns, in a language that cannot import them.
 //
-// The usual gate does not cover this seam. `curie dev field-parity` compares a
-// Rust struct against `packages/plugin-format/schema/plugin-format.schema.json`,
-// and `schema_export.py` imports only from `.models`, so the committed schema
-// carries no `Connector*` `$defs` at all -- the connector structs are declared
-// in `cli/plugin-format-mirrors.json`'s `non_mirrors` array and the field
-// comparison is a no-op for them today. This file is the seam instead: it reads
-// the same six corpora the Python suite reads, so a change made in one
-// language and not the other fails that language's suite.
+// `curie dev field-parity` compares the connector structs' field NAMES against
+// `packages/plugin-format/schema/plugin-format.schema.json` (#1128), but a field
+// list says nothing about validation codes, lock resolution or DNS derivation.
+// This file is that half of the seam: it reads the same six corpora the Python
+// suite reads, so a change made in one language and not the other fails that
+// language's suite.
 //
 //   tests/vectors/connector-build-decl.json      the `build:` declaration
 //   tests/vectors/connector-lock.json            connectors.lock.yaml + apply_lock

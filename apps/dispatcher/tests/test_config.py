@@ -104,6 +104,32 @@ def test_alias_wins_over_bare_field_name(monkeypatch: pytest.MonkeyPatch) -> Non
     assert DispatcherConfig().stream == "intended:stream"
 
 
+# @spec slack-alert-followup-context: Context cache and restart behavior
+def test_thread_context_cache_defaults_and_env_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root context keeps the 30-day default and reads only its explicit aliases."""
+
+    _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
+
+    defaults = DispatcherConfig()
+    assert defaults.thread_context_cache_prefix == "curie:slack-root-context:"
+    assert defaults.thread_context_ttl_seconds == 30 * 24 * 60 * 60
+
+    monkeypatch.setenv("THREAD_CONTEXT_CACHE_PREFIX", "stray:prefix:")
+    monkeypatch.setenv("THREAD_CONTEXT_TTL_SECONDS", "60")
+    unchanged = DispatcherConfig()
+    assert unchanged.thread_context_cache_prefix == "curie:slack-root-context:"
+    assert unchanged.thread_context_ttl_seconds == 30 * 24 * 60 * 60
+
+    monkeypatch.setenv("CURIE_THREAD_CONTEXT_CACHE_PREFIX", "intended:prefix:")
+    monkeypatch.setenv("CURIE_THREAD_CONTEXT_TTL_SECONDS", "86400")
+    overridden = DispatcherConfig()
+    assert overridden.thread_context_cache_prefix == "intended:prefix:"
+    assert overridden.thread_context_ttl_seconds == 86400
+
+
 def test_field_name_kwargs_still_populate() -> None:
     """populate_by_name construction (used by tests) is unchanged."""
     config = DispatcherConfig(

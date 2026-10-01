@@ -53,7 +53,7 @@ from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeAdmissionApi, FakeSocketClient, _authorize
+from .conftest import FakeAdmissionApi, FakeSocketClient, _authorize, person_rooted_thread
 from .test_dispatch import BOT_TS, _drain, _events_api_request
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,9 @@ def _build_harness(
     web_client = WebClient(token="xoxb-test")
     post_message: Any = chat_post_message or MagicMock(return_value={"ts": BOT_TS})
     web_client.chat_postMessage = post_message  # type: ignore[method-assign]
+    web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
+        side_effect=person_rooted_thread
+    )
 
     collector = _RecordCollector()
     logger = logging.getLogger(f"curie_dispatcher.test.{uuid.uuid4().hex}")

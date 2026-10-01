@@ -33,6 +33,7 @@ def qevent(
     placeholder: str | None = "p-1",
     endpoint: str | None = None,
     adapter: str | None = None,
+    identity: str | None = None,  # @spec WORKER-CANARY-1
     source: TurnSource = TurnSource.SLACK,
     attachments: Sequence[Attachment] = (),
     hook_run: HookRunRef | None = None,
@@ -50,6 +51,7 @@ def qevent(
             placeholder=placeholder,
             endpoint=endpoint,
             adapter=adapter,
+            identity=identity,
         ),
         received_at=received_at,
         source=source,

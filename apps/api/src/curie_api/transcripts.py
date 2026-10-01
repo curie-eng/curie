@@ -289,16 +289,17 @@ async def remove(
     scope: str | None,
     key: str,
     expected_version: int | None,
-) -> None:
+) -> bool:
     """Delete a thread's transcript. With ``expected_version`` a moved or
-    missing row is a 409 (#2820). Commits."""
+    missing row is a 409 (#2820). Commits. Returns whether a transcript row
+    existed to delete."""
     row = await get(session, agent_id, scope, key)
     if expected_version is None:
         if row is not None:
             await session.delete(row)
         await _delete_pre_identity(session, agent_id, scope, [key])
         await session.commit()
-        return
+        return row is not None
     stored = row.version if row is not None else None
     deleted = None
     if row is not None and stored == expected_version:
@@ -320,6 +321,7 @@ async def remove(
         raise HTTPException(
             status.HTTP_409_CONFLICT, f"version mismatch: expected {expected_version}, {found}"
         )
+    return True
 
 
 async def list_threads(
