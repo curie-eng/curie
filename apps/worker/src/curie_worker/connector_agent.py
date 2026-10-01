@@ -222,7 +222,8 @@ def reconcile_agent(
             "provisioned in this namespace; run `curie cluster deploy` once "
             "for this agent, or move the connector to a referenced secret"
         )
-        logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
+        # Not logged here: a skip recurs every pass until someone acts, so the
+        # loop logs it once per transition instead (#1215).
         skipped = reason
         # The plan carried is the one actually executed, not the one computed --
         # reporting applies that were never attempted would make the outcome
@@ -285,7 +286,6 @@ def prune_agent(
         # cluster round-trip, matching reconcile_agent's no-op early return.
         return AgentOutcome(agent=agent, skipped=reason, plan=computed, report=ApplyReport())
 
-    logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
     return _execute_and_report(
         client, computed, agent=agent, namespace=namespace, skipped=reason
     )

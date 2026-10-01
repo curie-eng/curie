@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection, MutableMapping
+from collections.abc import Collection, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -65,11 +65,16 @@ from plugin_format.yaml_loader import safe_load_unique
 logger = logging.getLogger(__name__)
 
 # What a hosted connector's entry carries when the worker minted a caller token
-# (ADR-0168 decision 7). A placeholder, like every other `${VAR}` in these
-# entries: the MCP client expands it from the sandbox env, so no value is
-# written anywhere.
+# (ADR-0168 decision 7). derive_mcp_servers writes a placeholder, like every
+# other `${VAR}` in these entries. The runner expands it in memory and drops
+# the env name before a shell or hook can read the token.
 CALLER_HEADER = "X-Curie-Caller"
 _CALLER_PLACEHOLDER = f"${{{BootEnv.env_key('connector_caller_token')}}}"
+# Not a BootEnv field. The worker writes this after render_worker, and only a
+# boot that actually holds a grant puts the placeholder on a hosted entry.
+GRANT_HEADER = "X-Curie-Connector-Grant"
+_GRANT_ENV = "CURIE_CONNECTOR_TOOL_GRANT"
+_GRANT_PLACEHOLDER = "${CURIE_CONNECTOR_TOOL_GRANT}"
 
 
 def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
@@ -93,6 +98,17 @@ def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
         )
         return None
     return parsed
+
+
+def declared_secret_names(plugin_dir: str | Path) -> frozenset[str]:
+    """Names from the same validated connector declaration the runner mounts."""
+
+    declared = _read(plugin_dir)
+    if declared is None:
+        return frozenset()
+    return frozenset(
+        name for spec in declared.connectors.values() for name in spec.secret_names()
+    )
 
 
 def _allowlist(plugin_dir: str | Path, agent: str) -> frozenset[str] | None:
@@ -127,6 +143,7 @@ def derive_mcp_servers(
     agent: str | None,
     namespace: str | None,
     caller_header: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The MCP server entries for this bundle's declared connectors.
 
@@ -207,14 +224,17 @@ def derive_mcp_servers(
     # Only a Service Curie created gets the token. The scope-less branch above
     # returns first, so a fallback URL never sees it, and a remote connector is
     # somebody else's server.
+    grant_value = ""
+    if env is not None:
+        grant_value = str(env.get(_GRANT_ENV, "")).strip()
     if caller_header:
         for name, spec in declared.connectors.items():
             if spec.is_hosted:
                 entry = entries[name]
-                entries[name] = {
-                    **entry,
-                    "headers": {**entry.get("headers", {}), CALLER_HEADER: _CALLER_PLACEHOLDER},
-                }
+                headers = {**entry.get("headers", {}), CALLER_HEADER: _CALLER_PLACEHOLDER}
+                if grant_value:
+                    headers[GRANT_HEADER] = _GRANT_PLACEHOLDER
+                entries[name] = {**entry, "headers": headers}
     return entries
 
 
@@ -305,6 +325,33 @@ def materialize_hosted_bearer_headers(
         dropped.add(name)
     drop_connector_secret_names(env, dropped)
     return frozenset(dropped)
+
+
+def materialize_connector_caller_headers(
+    servers: dict[str, Any],
+    *envs: MutableMapping[str, str],
+) -> None:
+    """Expand hosted ``X-Curie-Caller`` in memory and drop the token from env.
+
+    ``derive_mcp_servers`` keeps ``${CURIE_CONNECTOR_CALLER_TOKEN}`` so the
+    value is not written into the bundle. The MCP client would otherwise
+    expand it from the sandbox env, which Bash and hooks can read. The runner
+    copies the token into the header here, then removes the name from every
+    mapping it was given.
+    """
+
+    name = BootEnv.env_key("connector_caller_token")
+    value = next((env.get(name) for env in envs if env.get(name)), None)
+    placeholder = f"${{{name}}}"
+    if value:
+        for server in servers.values():
+            if not isinstance(server, dict):
+                continue
+            headers = server.get("headers")
+            if isinstance(headers, dict) and headers.get(CALLER_HEADER) == placeholder:
+                headers[CALLER_HEADER] = value
+    for env in envs:
+        env.pop(name, None)
 
 
 def drop_connector_secret_names(env: MutableMapping[str, str], names: Collection[str]) -> None:

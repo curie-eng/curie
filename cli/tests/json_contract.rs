@@ -2238,8 +2238,18 @@ fn reset_thread_output_validates_both_variants() {
         thread_key: "C1:U1".to_string(),
         requested: true,
         released: false,
+        route_existed: None,
     };
     assert_valid("reset-thread.schema.json", &done.to_json());
+    // #3699: a confirmed release names the route it found.
+    let confirmed = ResetThreadOutput::Done {
+        agent: "d".to_string(),
+        thread_key: "C1:U1".to_string(),
+        requested: true,
+        released: true,
+        route_existed: Some(true),
+    };
+    assert_valid("reset-thread.schema.json", &confirmed.to_json());
     let dry = ResetThreadOutput::DryRun(DryRunPlan {
         lines: vec!["POST /reset".to_string()],
     });

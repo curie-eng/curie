@@ -101,6 +101,7 @@ async def mint_publication_context(
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
             authority = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=data.deployment_id,
                 work_item_id=data.work_item_id,
                 execution_request_id=data.execution_request_id,
@@ -115,6 +116,7 @@ async def mint_publication_context(
             )
             current = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=data.deployment_id,
                 work_item_id=data.work_item_id,
                 execution_request_id=data.execution_request_id,
@@ -194,6 +196,7 @@ async def _publication_lineage_out(
 def _validated_github_pr_truth(
     payload: Any,
     *,
+    github_html_base: str,
     repo_full_name: str,
     pr_number: int,
     pr_url: str,
@@ -208,7 +211,7 @@ def _validated_github_pr_truth(
     remote_state = payload.get("state")
     merged = payload.get("merged")
     head = payload.get("head")
-    expected_url = f"https://github.com/{repo_full_name}/pull/{pr_number}"
+    expected_url = f"{github_html_base}/{repo_full_name}/pull/{pr_number}"
     if (
         not isinstance(number, int)
         or isinstance(number, bool)
@@ -295,6 +298,7 @@ async def _refresh_publication_lineage_from_github(
     try:
         remote_state, actual_head_sha = _validated_github_pr_truth(
             response.json(),
+            github_html_base=settings.github_html_base,
             repo_full_name=lineage.repo_full_name,
             pr_number=lineage.pr_number,
             pr_url=lineage.pr_url,
@@ -376,7 +380,8 @@ async def create_publication(
         patch = data.decoded_patch()
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    patch_limit_bytes = get_settings().publication_patch_max_bytes
+    settings = get_settings()
+    patch_limit_bytes = settings.publication_patch_max_bytes
     if len(patch) > patch_limit_bytes:
         raise HTTPException(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -396,7 +401,8 @@ async def create_publication(
         changed_paths = [
             path for paths in prior_paths for path in paths
         ] + data.changed_paths
-        unselected = factory_ci._unselected_python_path(changed_paths)
+        python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
+        unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -407,7 +413,7 @@ async def create_publication(
             )
         if factory_ci._python_paths(changed_paths):
             try:
-                observation = await factory_progress.read_verification_observation(
+                observations = await factory_progress.read_verification_observations(
                     session, data.work_item_request_id
                 )
             except ValueError as exc:
@@ -418,7 +424,7 @@ async def create_publication(
                         "message": "stored verification preflight is unreadable",
                     },
                 ) from exc
-            if observation is None:
+            if not observations:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -426,7 +432,11 @@ async def create_publication(
                         "message": "verification preflight observation is missing",
                     },
                 )
-            if observation.outcome == "failed":
+            # A Python check can be declared under any id, so every stored check
+            # counts: any failure refuses a Python change and any unavailable check
+            # stamps the unavailable disclosure. Only when nothing was unavailable
+            # does a missing ``python`` check stamp the not-declared pair.
+            if factory_progress.failed_verification(observations) is not None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -434,16 +444,27 @@ async def create_publication(
                         "message": "verification preflight failed; rerun after fixing the failure",
                     },
                 )
-            if observation.outcome == "unavailable":
-                body = data.body or ""
+            pending_proof = (
+                f"{python_ci.check} is pending proof."
+                if python_ci is not None
+                else "Repository CI is pending proof."
+            )
+            statements: tuple[str, ...] = ()
+            if any(observation.outcome == "unavailable" for observation in observations):
                 statements = (
                     "In-sandbox verification was unavailable.",
-                    "Python (ruff + mypy + pytest) is pending proof.",
+                    pending_proof,
                 )
-                missing = [statement for statement in statements if statement not in body]
-                if missing:
-                    body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
-                    data = data.model_copy(update={"body": body})
+            elif factory_progress.python_verification(observations) is None:
+                statements = (
+                    "No in-sandbox Python verification check was declared.",
+                    pending_proof,
+                )
+            body = data.body or ""
+            missing = [statement for statement in statements if statement not in body]
+            if missing:
+                body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:
@@ -467,6 +488,7 @@ async def create_publication(
             raise PublicationPrecheckRefused
         authority = await read_publication_authority(
             session,
+            github_html_base=settings.github_html_base,
             deployment_id=data.deployment_id,
             work_item_id=execution.work_item_id,
             execution_request_id=data.work_item_request_id,
@@ -483,10 +505,11 @@ async def create_publication(
         ):
             raise PublicationPrecheckRefused
         metadata = await read_publication_metadata(
-            authority, settings=get_settings(), client=request.app.state.http_client
+            authority, settings=settings, client=request.app.state.http_client
         )
         current = await read_publication_authority(
             session,
+            github_html_base=settings.github_html_base,
             deployment_id=data.deployment_id,
             work_item_id=execution.work_item_id,
             execution_request_id=data.work_item_request_id,
@@ -588,25 +611,30 @@ async def advance_publication_lineage(
     session: SessionDep,
     request: Request,
 ) -> PublicationLineageOut:
+    settings = get_settings()
     try:
         publication = await crud.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
         conflict = crud.publication_lineage_outcome_conflict(
-            publication, publication.lineage, data
+            publication,
+            publication.lineage,
+            data,
+            github_html_base=settings.github_html_base,
         )
         if conflict is not None:
             raise conflict
         identity = await verify_publication_identity(
             publication.lineage,
             data,
-            get_settings(),
+            settings,
             request.app.state.http_client,
         )
         lineage = await crud.advance_publication_lineage(
             session,
             publication_id,
             data,
+            github_html_base=settings.github_html_base,
             identity=identity,
         )
     except PublicationRemoteTerminal as exc:

@@ -10,7 +10,7 @@ defaults as a `helm test`. Five claims:
      permissive NetworkPolicy alongside Rail 1's (issue #765). Claim 1d
      additionally proves declared BYO runner peers are reachable and an
      undeclared control stays BLOCKED (issue #2369).
-  2. cross-agent secret isolation via per-agent RBAC scoping.
+  2. connector credential isolation in real claimed runner sandboxes.
   3. runner containers are non-root with a read-only rootfs.
   4. gVisor RuntimeClass enforced (reported testable / not-testable honestly;
      enforcement itself is asserted by the preflight-gvisor hook).
@@ -29,7 +29,7 @@ metadata:
   annotations:
     "helm.sh/hook": test
     "helm.sh/hook-weight": "-5"
-    # Privileged RBAC (can read namespace secrets) must NOT outlive the test:
+    # Fixture Secret access and resource creation must not outlive the test:
     # clean up whether the test succeeds or fails, and re-create on the next run.
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
 ---
@@ -42,7 +42,7 @@ metadata:
   annotations:
     "helm.sh/hook": test
     "helm.sh/hook-weight": "-5"
-    # Privileged RBAC (can read namespace secrets) must NOT outlive the test:
+    # Fixture Secret access and resource creation must not outlive the test:
     # clean up whether the test succeeds or fails, and re-create on the next run.
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
 rules:
@@ -56,24 +56,31 @@ rules:
     resources: [pods/log]
     verbs: [get]
   - apiGroups: [""]
-    # The probe only create/deletes its own test secrets by name; the "can-i
-    # list secrets" isolation check runs under the agent token (a
-    # SelfSubjectAccessReview needs no list grant here). Do not add `list`:
-    # it would let this hook enumerate and read every secret in the namespace.
+    # Kubernetes cannot restrict Secret creation by resourceNames.
     resources: [secrets]
-    verbs: [create, delete, get]
-  - apiGroups: [""]
-    resources: [serviceaccounts]
-    verbs: [create, delete, get]
-  - apiGroups: [""]
-    resources: [serviceaccounts/token]
     verbs: [create]
+  - apiGroups: [""]
+    # Read and deletion are limited to the two synthetic fixture Secrets.
+    resources: [secrets]
+    resourceNames:
+      - {{ printf "%s-agent-sp-a-connector-secrets" (include "curie.fullname" .) | quote }}
+      - {{ printf "%s-agent-sp-b-connector-secrets" (include "curie.fullname" .) | quote }}
+    verbs: [delete, get]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
     verbs: [create, delete, get, list]
-  - apiGroups: [rbac.authorization.k8s.io]
-    resources: [roles, rolebindings]
+  - apiGroups: [extensions.agents.x-k8s.io]
+    resources: [sandboxtemplates, sandboxwarmpools]
     verbs: [create, delete, get]
+  - apiGroups: [extensions.agents.x-k8s.io]
+    resources: [sandboxclaims]
+    verbs: [create, delete, get, list, watch]
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [delete, get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -233,6 +240,32 @@ spec:
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- $probeRuntimeClass := include "curie.gvisor.runtimeClassName" . | trim -}}
+{{- $probeRoot := deepCopy . -}}
+{{/* Preserve the release's resolved kernel isolation before enabling fake mode. */}}
+{{- if $probeRuntimeClass -}}
+{{- $_ := set $probeRoot.Values.security.gvisor "mode" "require" -}}
+{{- $_ := set $probeRoot.Values.security.gvisor "runtimeClassName" $probeRuntimeClass -}}
+{{- else -}}
+{{- $_ := set $probeRoot.Values.security.gvisor "mode" "off" -}}
+{{- end -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner "fakeModel" true -}}
+{{- $_ := set $probeRoot.Values.inference "deploy" false -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner.bundleFetch "enabled" false -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner.workspace "enabled" false -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner.attachments "enabled" false -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner "extraEnv" list -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.runner "pluginDir" "/tmp/curie-security-probe" -}}
+{{- $_ := set $probeRoot.Values.agentSandbox.warmPool "replicas" 0 -}}
+{{- $_ := set $probeRoot.Values.otelCollector "deploy" false -}}
+{{- $_ := set $probeRoot.Values.otelCollector "endpoint" "" -}}
+{{- $_ := set $probeRoot.Values.otelCollector "headers" "" -}}
+{{- $_ := set $probeRoot.Values.otelCollector "headersExistingSecret" "" -}}
+{{- $_ := set $probeRoot.Values.otelCollector "telemetryDisabled" true -}}
+{{/* The real runner validates a bundle even in fake mode. Bootstrap only
+     fixture data, then execute its normal module entrypoint. */}}
+{{- $probeBootstrap := "        - name: runner\n          command: [\"/bin/sh\", \"-c\"]\n          args:\n            - |\n              set -eu\n              mkdir -p \"$CURIE_PLUGIN_DIR/.claude-plugin\"\n              printf '%s\\n' '{\"name\":\"acme-security-probe\"}' > \"$CURIE_PLUGIN_DIR/.claude-plugin/plugin.json\"\n              exec python3 -m curie_runner\n" -}}
+{{- $probeLabels := printf "  podTemplate:\n    metadata:\n      labels:\n        curie.io/security-probe: %s\n" (include "curie.fullname" . | quote) -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -245,7 +278,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 300
+  activeDeadlineSeconds: 900
   template:
     metadata:
       labels:
@@ -277,6 +310,14 @@ spec:
               value: {{ .Values.security.probe.blockedTarget | quote }}
             - name: RC
               value: {{ include "curie.gvisor.className" . | quote }}
+            - name: REQUIRED_RUNTIME_CLASS
+              value: {{ include "curie.gvisor.requiredRuntimeClassName" . | quote }}
+            - name: RUNNER_TEMPLATES
+              {{- $runnerTemplates := list (printf "%s-runner" (include "curie.fullname" .)) }}
+              {{- range $agent := include "curie.agentSandboxPoolAgents" . | fromJsonArray }}
+              {{- $runnerTemplates = append $runnerTemplates (printf "%s-agent-%s-runner" (include "curie.fullname" $) $agent) }}
+              {{- end }}
+              value: {{ join " " $runnerTemplates | quote }}
             - name: EGRESS_POD
               value: {{ include "curie.fullname" . }}-egress-probe
             - name: NETSHOOT
@@ -334,14 +375,48 @@ spec:
             - |
               set -u
               fail=0
+              sp_claims=(); sp_sandboxes=(); sp_templates=(); sp_pools=()
+              sp_secrets=(); sp_policies=(); sp_descendants=()
               cleanup() {
+                local cleanup_failed=0 claim sandbox selector service object found attempt
+                for claim in "${sp_claims[@]}"; do
+                  sandbox=$(kubectl get sandboxclaim "$claim" -n "$NS" --ignore-not-found -o jsonpath='{.status.sandbox.name}') || cleanup_failed=1
+                  if [ -n "$sandbox" ]; then
+                    sp_sandboxes+=("$sandbox")
+                    selector=$(kubectl get sandbox "$sandbox" -n "$NS" --ignore-not-found -o jsonpath='{.status.selector}') || cleanup_failed=1
+                    if [ -n "$selector" ]; then
+                      found=$(kubectl get pods -n "$NS" -l "$selector" -o name) || cleanup_failed=1
+                      for object in $found; do sp_descendants+=("$object"); done
+                    fi
+                    service=$(kubectl get sandbox "$sandbox" -n "$NS" --ignore-not-found -o jsonpath='{.status.service}') || cleanup_failed=1
+                    [ -z "$service" ] || sp_descendants+=("service/$service")
+                  fi
+                done
+                [ "${#sp_claims[@]}" = 0 ] || kubectl delete sandboxclaim "${sp_claims[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                [ "${#sp_sandboxes[@]}" = 0 ] || kubectl delete sandbox "${sp_sandboxes[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                [ "${#sp_pools[@]}" = 0 ] || kubectl delete sandboxwarmpool "${sp_pools[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                [ "${#sp_templates[@]}" = 0 ] || kubectl delete sandboxtemplate "${sp_templates[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                [ "${#sp_secrets[@]}" = 0 ] || kubectl delete secret "${sp_secrets[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                [ "${#sp_policies[@]}" = 0 ] || kubectl delete networkpolicy "${sp_policies[@]}" -n "$NS" --ignore-not-found --wait=false >/dev/null || cleanup_failed=1
+                for object in "${sp_claims[@]/#/sandboxclaim/}" "${sp_sandboxes[@]/#/sandbox/}" \
+                  "${sp_pools[@]/#/sandboxwarmpool/}" "${sp_templates[@]/#/sandboxtemplate/}" \
+                  "${sp_secrets[@]/#/secret/}" "${sp_policies[@]/#/networkpolicy/}" "${sp_descendants[@]}"; do
+                  for attempt in $(seq 1 30); do
+                    found=$(kubectl get "$object" -n "$NS" --ignore-not-found -o name) || { cleanup_failed=1; break; }
+                    [ -n "$found" ] || break
+                    sleep 1
+                  done
+                  if [ -n "$found" ]; then
+                    echo "RESULT: FAIL: fixture cleanup left ${object}"
+                    cleanup_failed=1
+                  fi
+                done
                 kubectl delete pod "$EGRESS_POD" sp-gvisor-check -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
                 kubectl delete pod "$DT_ALLOWED_POD" "$DT_DENIED_POD" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
                 kubectl delete networkpolicy "$ALLOW_ALL_NP" "$BROAD_ALLOW_NP" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                kubectl delete secret sp-agent-a-creds sp-agent-b-creds -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                kubectl delete serviceaccount sp-agent-a -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                kubectl delete role sp-agent-a -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                kubectl delete rolebinding sp-agent-a -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
+                if [ "$cleanup_failed" != 0 ]; then trap - EXIT; exit 1; fi
+                sp_claims=(); sp_sandboxes=(); sp_templates=(); sp_pools=()
+                sp_secrets=(); sp_policies=(); sp_descendants=()
               }
               trap cleanup EXIT
 
@@ -507,30 +582,198 @@ spec:
 
               # ================= Claim 2: cross-agent secret isolation ==============
               echo ""
-              echo "== Claim 2: cross-agent secret isolation (per-agent RBAC scoping) =="
-              kubectl create secret generic sp-agent-a-creds -n "$NS" --from-literal=token=AAA >/dev/null
-              kubectl create secret generic sp-agent-b-creds -n "$NS" --from-literal=token=BBB >/dev/null
-              kubectl create serviceaccount sp-agent-a -n "$NS" >/dev/null
-              kubectl create role sp-agent-a -n "$NS" --verb=get --resource=secrets --resource-name=sp-agent-a-creds >/dev/null
-              kubectl create rolebinding sp-agent-a -n "$NS" --role=sp-agent-a --serviceaccount="${NS}:sp-agent-a" >/dev/null
-              TOK=$(kubectl create token sp-agent-a -n "$NS")
-              a_get=$(kubectl --token="$TOK" -n "$NS" auth can-i get secret/sp-agent-a-creds 2>/dev/null || true)
-              b_get=$(kubectl --token="$TOK" -n "$NS" auth can-i get secret/sp-agent-b-creds 2>/dev/null || true)
-              lst=$(kubectl --token="$TOK" -n "$NS" auth can-i list secrets 2>/dev/null || true)
-              echo "agent-a get own secret: ${a_get}   get agent-b secret: ${b_get}   list secrets: ${lst}"
-              if [ "$a_get" = yes ] && [ "$b_get" = no ] && [ "$lst" = no ]; then
-                echo "RESULT: PASS - agent-a reads only its own credential; cannot read agent-b or list."
+              echo "== Claim 2: connector isolation in claimed runner sandboxes =="
+              claim2() {
+                local prefix={{ include "curie.fullname" . | quote }}
+                local secret_a="${prefix}-agent-sp-a-connector-secrets" secret_b="${prefix}-agent-sp-b-connector-secrets"
+                local policy="${prefix}-security-probe-api" agent object existing created create_rc name
+                local claim pool sandbox selector pod pods token_paths
+                local pod_a pod_b
+                local bound_pods=()
+                local runner_sa={{ if .Values.agentSandbox.runner.serviceAccount.create }}{{ printf "%s-runner" (include "curie.fullname" .) | quote }}{{ else }}default{{ end }}
+                for object in "secret/$secret_a" "secret/$secret_b" "networkpolicy/$policy" \
+                  "sandboxtemplate/${prefix}-agent-sp-a-runner" "sandboxtemplate/${prefix}-agent-sp-b-runner" \
+                  "sandboxwarmpool/${prefix}-agent-sp-a-runner-pool" "sandboxwarmpool/${prefix}-agent-sp-b-runner-pool" \
+                  "sandboxclaim/${prefix}-security-probe-a" "sandboxclaim/${prefix}-security-probe-b"; do
+                  existing=$(kubectl get "$object" -n "$NS" --ignore-not-found -o name) || return 1
+                  if [ -n "$existing" ]; then
+                    echo "RESULT: FAIL: refusing preexisting fixture ${object}"
+                    return 1
+                  fi
+                done
+                kubectl create secret generic "$secret_a" -n "$NS" --from-literal=CURIE_SECURITY_PROBE_SECRET=AAA >/dev/null || return 1
+                sp_secrets+=("$secret_a")
+                kubectl create secret generic "$secret_b" -n "$NS" --from-literal=CURIE_SECURITY_PROBE_SECRET=BBB --from-literal=CURIE_SECURITY_PROBE_B_ONLY=BBB >/dev/null || return 1
+                sp_secrets+=("$secret_b")
+                create_rc=0
+                created=$(kubectl create -n "$NS" -f - -o name <<'PROBE_SANDBOXES'
+              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-a" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "AAA")) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
+              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-b" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "BBB" "CURIE_SECURITY_PROBE_B_ONLY" "BBB")) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
+              PROBE_SANDBOXES
+                ) || create_rc=$?
+                for object in $created; do
+                  name=${object##*/}
+                  case "$object" in
+                    sandboxtemplate.*/*) sp_templates+=("$name");;
+                    sandboxwarmpool.*/*) sp_pools+=("$name");;
+                    *) echo "RESULT: FAIL: unexpected fixture ${object}"; return 1;;
+                  esac
+                done
+                [ "$create_rc" = 0 ] || return 1
+                API_CA=$(base64 < /var/run/secrets/kubernetes.io/serviceaccount/ca.crt | tr -d '\n') || return 1
+                [ -n "$API_CA" ] || return 1
+                assert_runner() {
+                  kubectl exec -i -n "$NS" "$1" -c runner -- python3 - "$2" "$NS" "$3" "$4" "$API_CA" <<'PROBE_RUNNER'
+              import base64
+              import json
+              import os
+              from pathlib import Path
+              import ssl
+              import sys
+              import time
+              import urllib.error
+              import urllib.request
+
+              expected, namespace, own, other, ca = sys.argv[1:]
+              if os.environ.get("CURIE_SECURITY_PROBE_SECRET") != expected:
+                  raise SystemExit("FAIL: own connector sentinel is wrong or absent")
+              exclusive = os.environ.get("CURIE_SECURITY_PROBE_B_ONLY")
+              if (expected == "AAA" and exclusive is not None) or (expected == "BBB" and exclusive != "BBB"):
+                  raise SystemExit("FAIL: connector exclusive key crossed the agent boundary")
+              foreign = "BBB" if expected == "AAA" else "AAA"
+              if any(foreign in value for value in os.environ.values()):
+                  raise SystemExit("FAIL: foreign connector sentinel is present")
+              if Path("/var/run/secrets/kubernetes.io/serviceaccount/token").exists():
+                  raise SystemExit("FAIL: Kubernetes ServiceAccount token is mounted")
+              print("own credential present; foreign credential absent; API token absent", flush=True)
+              context = ssl.create_default_context(cadata=base64.b64decode(ca, validate=True).decode())
+              base = "https://kubernetes.default.svc"
+
+              # Unauthenticated requests are rejected with HTTP 401:
+              # https://kubernetes.io/docs/reference/access-authn-authz/authentication/
+              # Observed with anonymous auth disabled: tokenless claimed runners
+              # received Kubernetes Status objects with code 401 for /version,
+              # named Secret GET, and namespace Secret list requests.
+              def request(path):
+                  for attempt in range(5):
+                      try:
+                          try:
+                              with urllib.request.urlopen(base + path, context=context, timeout=8) as response:
+                                  status, body = response.status, response.read(65536)
+                          except urllib.error.HTTPError as response:
+                              status, body = response.code, response.read(65536)
+                          document = json.loads(body)
+                          if not isinstance(document, dict):
+                              raise SystemExit("FAIL: invalid Kubernetes API response")
+                          return status, document
+                      except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                          if attempt == 4:
+                              raise
+                          time.sleep(1)
+
+              status, document = request("/version")
+              valid_version = status == 200 and bool(document.get("gitVersion"))
+              rejected_version = status in (401, 403) and document.get("kind") == "Status" and document.get("code") == status
+              if not (valid_version or rejected_version):
+                  raise SystemExit("FAIL: Kubernetes API reachability control failed")
+              print("reachable Kubernetes API; /version HTTP %s" % status, flush=True)
+              for label, path in (
+                  ("own Secret GET", "/api/v1/namespaces/%s/secrets/%s" % (namespace, own)),
+                  ("other Secret GET", "/api/v1/namespaces/%s/secrets/%s" % (namespace, other)),
+                  ("Secret list", "/api/v1/namespaces/%s/secrets" % namespace),
+              ):
+                  status, document = request(path)
+                  if status not in (401, 403) or document.get("kind") != "Status" or document.get("code") != status:
+                      raise SystemExit("FAIL: %s did not receive Kubernetes authorization rejection" % label)
+                  print("%s rejected HTTP %s" % (label, status), flush=True)
+              PROBE_RUNNER
+                }
+                for agent in a b; do
+                  claim="${prefix}-security-probe-${agent}"
+                  pool="${prefix}-agent-sp-${agent}-runner-pool"
+                  kubectl create -n "$NS" -f - <<EOF >/dev/null || return 1
+              apiVersion: extensions.agents.x-k8s.io/v1beta1
+              kind: SandboxClaim
+              metadata:
+                name: ${claim}
+              spec:
+                warmPoolRef:
+                  name: ${pool}
+              EOF
+                  sp_claims+=("$claim")
+                  kubectl wait --for=condition=Ready "sandboxclaim/$claim" -n "$NS" --timeout=120s >/dev/null || return 1
+                  [ "$(kubectl get sandboxclaim "$claim" -n "$NS" -o jsonpath='{.spec.warmPoolRef.name}')" = "$pool" ] || return 1
+                  sandbox=$(kubectl get sandboxclaim "$claim" -n "$NS" -o jsonpath='{.status.sandbox.name}') || return 1
+                  [ -n "$sandbox" ] || { echo "RESULT: FAIL: claim has no sandbox binding"; return 1; }
+                  sp_sandboxes+=("$sandbox")
+                  selector=$(kubectl get sandbox "$sandbox" -n "$NS" -o jsonpath='{.status.selector}') || return 1
+                  [ -n "$selector" ] || return 1
+                  pods=$(kubectl get pods -n "$NS" -l "$selector" -o jsonpath='{.items[*].metadata.name}') || return 1
+                  read -r -a bound_pods <<< "$pods"
+                  [ "${#bound_pods[@]}" = 1 ] || { echo "RESULT: FAIL: sandbox must bind exactly one Pod"; return 1; }
+                  pod=${bound_pods[0]}
+                  sp_descendants+=("pod/$pod")
+                  [ "$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Sandbox")].name}')" = "$sandbox" ] || return 1
+                  [ "$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.metadata.labels.curietech\.ai/agent}')" = "sp-$agent" ] || return 1
+                  [ "$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.spec.serviceAccountName}')" = "$runner_sa" ] || return 1
+                  token_paths=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.spec.volumes[*].projected.sources[*].serviceAccountToken.path}') || return 1
+                  [ -z "$token_paths" ] || { echo "RESULT: FAIL: unexpected projected ServiceAccount token"; return 1; }
+                  kubectl wait --for=condition=Ready "pod/$pod" -n "$NS" --timeout=120s >/dev/null || return 1
+                  [ "$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.metadata.labels.curie\.io/security-probe}')" = "$prefix" ] || return 1
+                  echo "claim ${claim} bound sandbox ${sandbox} runner Pod ${pod}"
+                  if [ "$agent" = a ]; then pod_a=$pod; else pod_b=$pod; fi
+                done
+                # API translation varies by CNI; only these verified fixture Pods
+                # receive temporary broad egress, and they hold synthetic keys only.
+                kubectl create -n "$NS" -f - <<EOF >/dev/null || return 1
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata:
+                name: ${policy}
+              spec:
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+                    curie.io/security-probe: ${prefix}
+                policyTypes: [Egress]
+                egress:
+                  - {}
+              EOF
+                sp_policies+=("$policy")
+                assert_runner "$pod_a" AAA "$secret_a" "$secret_b" || return 1
+                assert_runner "$pod_b" BBB "$secret_b" "$secret_a" || return 1
+              }
+              if claim2; then
+                cleanup
+                echo "RESULT: PASS: claimed runners receive only their own connector credentials and cannot fetch or list Secrets"
               else
-                echo "RESULT: FAIL - expected yes/no/no, got ${a_get}/${b_get}/${lst}"
+                cleanup
+                echo "RESULT: FAIL: claimed runner credential isolation"
                 fail=1
               fi
 
               # ================= Claim 4: gVisor availability =======================
-              # Namespaced pod-admission probe (no cluster RBAC): try to schedule a
-              # pod UNDER the runtimeclass; admission tells us if it exists, and the
-              # kernel string tells us if it is actually enforced (vs downgraded).
+              # Namespaced checks (no cluster RBAC). Read each runner SandboxTemplate
+              # class first; an empty class is a mismatch, not a skip. Then schedule
+              # a throwaway pod under the runtimeclass: admission tells us if it
+              # exists, and the kernel string tells us if it is enforced.
+              check_runner_sandbox_template_class() {
+                if [ -z "${REQUIRED_RUNTIME_CLASS:-}" ]; then
+                  return 0
+                fi
+                local name got
+                for name in ${RUNNER_TEMPLATES}; do
+                  got="$(kubectl get sandboxtemplate "$name" -n "$NS" -o jsonpath='{.spec.podTemplate.spec.runtimeClassName}' 2>/dev/null || true)"
+                  if [ "$got" != "$REQUIRED_RUNTIME_CLASS" ]; then
+                    echo "FAIL: SandboxTemplate ${name} runtimeClassName is '${got}', want '${REQUIRED_RUNTIME_CLASS}'"
+                    fail=1
+                  fi
+                done
+                return 0
+              }
               echo ""
               echo "== Claim 4: gVisor RuntimeClass =="
+              check_runner_sandbox_template_class
               if [ -z "$RC" ]; then
                 echo "SKIP: security.gvisor.mode is off (kernel isolation disabled)."
               else
@@ -606,6 +849,8 @@ spec:
               echo ""
               echo "== Claim 3 (non-root + read-only rootfs) runs as the separate hardening test pod =="
               echo ""
+              cleanup
+              trap - EXIT
               [ "$fail" = 0 ] && echo "SECURITY PROBE: PASS" || echo "SECURITY PROBE: FAIL"
               exit $fail
 {{- end }}

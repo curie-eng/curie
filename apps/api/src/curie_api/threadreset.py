@@ -26,6 +26,10 @@ request into ``THREAD_RESET_INFLIGHT_SET`` for the duration of the release and
 clears it only on success. Reading membership of ``THREAD_RESET_SET`` alone
 would flip to done the instant the worker SPOPs the request (at CLAIM time),
 before -- and independent of whether -- the release actually completed.
+
+The worker also records what a drained reset found (#3699): a key that matches no
+route releases nothing, and ``result`` lets the API tell the caller so instead of
+leaving a wrong key indistinguishable from a working reset.
 """
 
 import redis.asyncio as redis
@@ -44,6 +48,15 @@ THREAD_RESET_SET = "curie:thread-reset-requests"
 # same cross-service-constant pattern as ``THREAD_RESET_SET``.
 THREAD_RESET_INFLIGHT_SET = "curie:thread-reset-inflight"
 
+# Outcome of a drained reset (#3699): this prefix plus the thread key holds
+# ``released`` when the worker found a route to release and ``no-route`` when the
+# key matched none, so nothing was released. The worker writes it before it clears
+# the in-progress marker and lets it expire after an hour; ``request`` deletes it
+# so a fresh request never reads an earlier reset's outcome. Frozen with the
+# worker copy (``apps/worker/src/curie_worker/consumer.py``) in
+# tests/vectors/thread-reset-set.json.
+THREAD_RESET_RESULT_PREFIX = "curie:thread-reset-result:"
+
 
 class ThreadResetRequests:
     """Requests (from the API) and drains (from the worker) pending thread
@@ -54,8 +67,24 @@ class ThreadResetRequests:
 
     async def request(self, thread_key: str) -> None:
         """Queue ``thread_key`` for a forced sandbox release. Idempotent --
-        adding an already-pending thread is a no-op (a Valkey SET member)."""
+        adding an already-pending thread is a no-op (a Valkey SET member).
+
+        Deletes the previous reset's recorded outcome first, so the caller who
+        polls after this request can never read the result of an earlier one
+        (#3699)."""
+        await self._client.delete(f"{THREAD_RESET_RESULT_PREFIX}{thread_key}")
         await self._client.sadd(THREAD_RESET_SET, thread_key)
+
+    async def result(self, thread_key: str) -> str | None:
+        """The worker's recorded outcome for the last drained reset of this
+        thread, or None when none is recorded (expired, never drained, or a
+        worker that predates the record). ``released`` means a route existed and
+        was released; ``no-route`` means the key matched no route and nothing was
+        released (#3699)."""
+        raw = await self._client.get(f"{THREAD_RESET_RESULT_PREFIX}{thread_key}")
+        if raw is None:
+            return None
+        return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
 
     async def is_pending(self, thread_key: str) -> bool:
         """True while a forced reset for this thread is outstanding: either still

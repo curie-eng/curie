@@ -49,7 +49,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from .config import resolve_otlp_endpoint, resolve_otlp_protocol
-from .logging import configure_service_logging
+from .logging import configure_service_logging, install_library_log_backstop
 from .metrics import configure_meter_provider
 from .resource import build_resource, deployment_environment, service_instance_id
 from .tracing import configure_tracer_provider
@@ -374,5 +374,9 @@ def bootstrap_service_telemetry(
         service_name=service_name,
         logger_provider=logger_provider,
         level=level,
+    )
+    install_library_log_backstop(
+        service_name=service_name,
+        logger_provider=logger_provider,
     )
     return ServiceTelemetry(tracer_provider, logger_provider, meter_provider)

@@ -80,7 +80,15 @@ ACTIVITY: dict[str, Any] = {
     "tool_calls": 37,
     "last_tool": "Bash",
 }
-VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
+PYTHON_COMMAND = "uv run pytest runner/tests -q"
+NOT_DECLARED: dict[str, Any] = {
+    "check": None,
+    "command": None,
+    "outcome": "not_declared",
+    "exit_status": None,
+    "missing_binaries": [],
+    "blocked_services": [],
+}
 
 
 def progress_token(
@@ -426,26 +434,54 @@ def test_a_token_whose_work_item_has_no_active_request_is_409(admitted: Any) -> 
     "observation",
     [
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 0,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "unavailable",
             "exit_status": None,
             "missing_binaries": ["uv"],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "failed",
             "exit_status": 1,
             "missing_binaries": [],
             "blocked_services": [],
         },
+        {
+            "check": "python",
+            "command": "uv run pytest -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "check": "rust",
+            "command": "cargo test --locked",
+            "outcome": "unavailable",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": ["package_registry"],
+        },
+        NOT_DECLARED,
+    ],
+    ids=[
+        "python-passed",
+        "python-unavailable",
+        "python-failed",
+        "other-declared-command",
+        "rust-declared-command",
+        "not-declared",
     ],
 )
 def test_runner_verification_is_stored_as_structured_evidence_before_model_progress(
@@ -491,7 +527,8 @@ def test_verification_token_is_bound_to_the_path_request(admitted: Any) -> None:
     _label(client, github, second_number)
     second = _request(second_number)["id"]
     observation = {
-        "command": VERIFICATION_COMMAND,
+        "check": "python",
+        "command": PYTHON_COMMAND,
         "outcome": "passed",
         "exit_status": 0,
         "missing_binaries": [],
@@ -511,12 +548,14 @@ def test_verification_token_is_bound_to_the_path_request(admitted: Any) -> None:
     "observation",
     [
         {
+            "check": "python",
             "outcome": "passed",
             "exit_status": 0,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
+            "check": "python",
             "command": "   ",
             "outcome": "passed",
             "exit_status": 0,
@@ -524,70 +563,72 @@ def test_verification_token_is_bound_to_the_path_request(admitted: Any) -> None:
             "blocked_services": [],
         },
         {
-            "command": "uv run pytest -q",
-            "outcome": "passed",
-            "exit_status": 0,
-            "missing_binaries": [],
-            "blocked_services": [],
-        },
-        {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "unknown",
             "exit_status": None,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 1,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 0,
             "missing_binaries": ["uv"],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "unavailable",
             "exit_status": 127,
             "missing_binaries": ["uv"],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "failed",
             "exit_status": None,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "failed",
             "exit_status": 0,
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "unavailable",
             "exit_status": None,
             "missing_binaries": ["uv", "uv"],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "unavailable",
             "exit_status": None,
             "missing_binaries": [],
             "blocked_services": ["postgres", "postgres"],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 0,
             "missing_binaries": [],
@@ -595,23 +636,80 @@ def test_verification_token_is_bound_to_the_path_request(admitted: Any) -> None:
             "model_result": "pretend success",
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "missing_binaries": [],
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 0,
             "blocked_services": [],
         },
         {
-            "command": VERIFICATION_COMMAND,
+            "check": "python",
+            "command": PYTHON_COMMAND,
             "outcome": "passed",
             "exit_status": 0,
             "missing_binaries": [],
         },
+        # #3521: the declared check id and the not_declared shape.
+        {
+            "command": PYTHON_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "check": None,
+            "command": PYTHON_COMMAND,
+            "outcome": "unavailable",
+            "exit_status": None,
+            "missing_binaries": ["uv"],
+            "blocked_services": [],
+        },
+        {
+            "check": "python",
+            "command": None,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "check": "Python",
+            "command": PYTHON_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "check": "1python",
+            "command": PYTHON_COMMAND,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {
+            "check": "python",
+            "command": "x" * 181,
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+        {**NOT_DECLARED, "command": PYTHON_COMMAND},
+        {**NOT_DECLARED, "check": "python"},
+        {**NOT_DECLARED, "exit_status": 0},
+        {**NOT_DECLARED, "missing_binaries": ["uv"]},
+        {**NOT_DECLARED, "blocked_services": ["postgres"]},
+        {**NOT_DECLARED, "outcome": "unavailable"},
     ],
 )
 def test_malformed_verification_is_rejected_without_persisting_evidence(
@@ -636,14 +734,16 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
     _label(client, github, number)
     request_id = _request(number)["id"]
     first_observation = {
-        "command": VERIFICATION_COMMAND,
+        "check": "python",
+        "command": PYTHON_COMMAND,
         "outcome": "unavailable",
         "exit_status": None,
         "missing_binaries": ["uv"],
         "blocked_services": [],
     }
     second_observation = {
-        "command": VERIFICATION_COMMAND,
+        "check": "python",
+        "command": PYTHON_COMMAND,
         "outcome": "passed",
         "exit_status": 0,
         "missing_binaries": [],
@@ -664,6 +764,91 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
     ]
 
 
+def _declared(check: str, command: str) -> dict[str, Any]:
+    return {
+        "check": check,
+        "command": command,
+        "outcome": "passed",
+        "exit_status": 0,
+        "missing_binaries": [],
+        "blocked_services": [],
+    }
+
+
+def _note(observation: dict[str, Any]) -> str:
+    return json.dumps(observation, sort_keys=True, separators=(",", ":"))
+
+
+def test_python_check_id_is_the_api_python_gate_key() -> None:
+    from curie_api.factory_progress import PYTHON_CHECK_ID
+
+    assert PYTHON_CHECK_ID == "python"
+
+
+def test_two_declared_checks_are_recorded_on_one_request(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9721
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    python = _declared("python", PYTHON_COMMAND)
+    rust = _declared("rust", "cargo test --locked")
+
+    first = verification(client, request_id, python)
+    second = verification(client, request_id, rust)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": _note(python), "loop_round": None},
+        {"phase": "verification_preflight", "note": _note(rust), "loop_round": None},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first_observation", "second_observation"),
+    [
+        (
+            _declared("python", PYTHON_COMMAND),
+            _declared("python", "uv run pytest -q"),
+        ),
+        (_declared("python", PYTHON_COMMAND), NOT_DECLARED),
+        (NOT_DECLARED, _declared("python", PYTHON_COMMAND)),
+        (NOT_DECLARED, NOT_DECLARED),
+    ],
+    ids=[
+        "duplicate-check-id",
+        "not-declared-after-a-check",
+        "check-after-not-declared",
+        "second-not-declared",
+    ],
+)
+def test_conflicting_second_verification_is_rejected_like_a_duplicate(
+    admitted: Any,  # noqa: F811
+    first_observation: dict[str, Any],
+    second_observation: dict[str, Any],
+) -> None:
+    client, github, _sink = admitted
+    number = 9722
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    first = verification(client, request_id, first_observation)
+    conflicting = verification(client, request_id, second_observation)
+
+    assert first.status_code == 201, first.text
+    assert conflicting.status_code == 409, conflicting.text
+    assert conflicting.json()["code"] == "verification_exists"
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": _note(first_observation),
+            "loop_round": None,
+        }
+    ]
+
+
 def test_a_stale_request_cannot_record_verification_for_its_replacement(
     admitted: Any,  # noqa: F811
 ) -> None:
@@ -679,7 +864,8 @@ def test_a_stale_request_cannot_record_verification_for_its_replacement(
     assert [row["status"] for row in rows] == ["failed", "waiting"]
     second = rows[1]["id"]
     observation = {
-        "command": VERIFICATION_COMMAND,
+        "check": "python",
+        "command": PYTHON_COMMAND,
         "outcome": "unavailable",
         "exit_status": None,
         "missing_binaries": ["uv"],

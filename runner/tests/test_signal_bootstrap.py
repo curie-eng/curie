@@ -158,6 +158,14 @@ def test_runner_process_bootstraps_logs_and_metrics_without_endpoint_and_keeps_s
         service_logger.handlers[:] = original_handlers
         service_logger.setLevel(original_level)
         service_logger.propagate = original_propagate
+        root_logger = logging.getLogger()
+        retained_root_handlers: list[logging.Handler] = []
+        for handler in root_logger.handlers:
+            if getattr(handler, "_curie_library_backstop", False):
+                handler.close()
+                continue
+            retained_root_handlers.append(handler)
+        root_logger.handlers[:] = retained_root_handlers
 
 
 def test_runner_process_shuts_down_signal_providers_when_server_fails(
@@ -202,6 +210,7 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
     provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
     configure_meter_provider(provider)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
         tracer=RunTracer(None),

@@ -8,6 +8,7 @@ cap, a failed reviewer call, and the publication and comment gates.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,9 @@ from typing import Any
 
 import pytest
 import yaml
+from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND
+from curie_api import factory_ci
+from curie_api.workitem_outcomes import CiDetail
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = REPO_ROOT / "examples" / "dark-factory"
@@ -124,6 +128,41 @@ def test_infers_the_diff_reviewer_and_forces_foreground(session: Session) -> Non
         },
     )
     assert out["updatedInput"]["subagent_type"] == DIFF
+    assert out["updatedInput"]["run_in_background"] is False
+
+
+def test_backgrounded_bash_build_is_denied_before_the_agent_ends_its_turn(
+    session: Session,
+) -> None:
+    out = session.pre(
+        "Bash",
+        {
+            "command": "cargo build --locked",
+            "description": "Build the project and wait for completion",
+            "run_in_background": True,
+        },
+    )
+
+    assert out["permissionDecision"] == "deny"
+    reason = out["permissionDecisionReason"].lower()
+    assert "foreground" in reason
+    assert "end your turn" in reason
+
+
+@pytest.mark.parametrize("run_in_background", [False, None])
+def test_foreground_bash_build_is_allowed(
+    session: Session, run_in_background: bool | None
+) -> None:
+    tool_input: dict[str, Any] = {
+        "command": "cargo build --locked",
+        "description": "Build the project and wait for completion",
+    }
+    if run_in_background is not None:
+        tool_input["run_in_background"] = run_in_background
+
+    out = session.pre("Bash", tool_input)
+
+    assert out["permissionDecision"] == "allow"
     assert out["updatedInput"]["run_in_background"] is False
 
 
@@ -320,7 +359,7 @@ def test_hooks_json_registers_every_event() -> None:
     pre = re.compile(hooks["PreToolUse"][0]["matcher"])
     for tool in ("Agent", "Task", PUBLISH, COMMENT):
         assert pre.fullmatch(tool), tool
-    assert not pre.fullmatch("Bash")
+    assert pre.fullmatch("Bash")
     for entries in hooks.values():
         assert entries[0]["hooks"][0]["command"].endswith("hooks/review_gate.py")
 
@@ -458,3 +497,35 @@ def test_a_new_ordinary_message_after_a_ci_round_needs_plan_review_again(
     s.fire("UserPromptSubmit", prompt=ISSUE)
     diff = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
     assert diff["permissionDecision"] == "deny"
+
+
+def test_the_bundle_ci_marker_follows_the_platform_round_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails when CI_MAX_ROUNDS is raised until the bundle's marker regex follows."""
+
+    # Loading the hook must not leave a __pycache__ inside the shipped bundle.
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    spec = importlib.util.spec_from_file_location("dark_factory_review_gate", HOOK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    detail = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha="a1" * 20,
+        check_runs=[],
+        statuses=[],
+        annotations={},
+    )
+    for round_ in range(CI_FIRST_FIX_ROUND, factory_ci.CI_MAX_ROUNDS + 1):
+        text = factory_ci.continuation_text(
+            "https://github.com/acme-corp/acme-bot/issues/9",
+            "https://github.com/acme-corp/acme-bot/pull/77",
+            "a1" * 20,
+            round_,
+            detail,
+        )
+        matched = module._CI_ROUND.match(text.split("\n")[1])
+        assert matched is not None, f"bundle marker misses round {round_}"
+        assert int(matched.group(1)) == round_

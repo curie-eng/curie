@@ -6,6 +6,9 @@
 #   CURIE_E2E_IDENTITY_CONTEXT=<kube context> bash \
 #     charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
 #
+# CI runs it through tools/runtime-assertion-gate/run.sh in the kind cluster
+# job e2e-cluster-chart-regressions (#3485).
+#
 # It renders ONLY templates/e2e-connector-identity.yaml under a unique release
 # name, applies it, and then acts as the connector's service account through
 # impersonation, so every request is authorized and admitted by the API server

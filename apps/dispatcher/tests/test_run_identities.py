@@ -53,7 +53,11 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     class RecordingHandler:
         def __init__(self, app: App, app_token: str) -> None:
             calls.handlers.append((app, app_token))
-            self.client = SimpleNamespace(message_listeners=[])
+            self.client = SimpleNamespace(
+                message_listeners=[],
+                connect=lambda: None,
+                is_connected=lambda: False,
+            )
 
         def connect(self) -> None:
             pass
@@ -231,7 +235,8 @@ def test_a_stock_connections_log_lines_name_no_identity(
 
     assert (
         "curie-run-identities-stock: exactly one Curie release may connect to a "
-        "given Slack app; disconnect extra clients"
+        "given Slack app; disconnect extra clients "
+        "(Slack reports 2 connections, 1 of them this client's)"
     ) in messages
     assert "socket mode connected identity=curie-run-identities-stock" in messages
 
@@ -267,7 +272,8 @@ def test_two_identities_log_lines_each_name_their_own_identity(
     for name in ("default", "ops-bot"):
         assert (
             "curie-run-identities-two: exactly one Curie release may connect to a "
-            f"given Slack app; disconnect extra clients of Slack identity {name}"
+            f"given Slack app; disconnect extra clients of Slack identity {name} "
+            "(Slack reports 2 connections, 1 of them this client's)"
         ) in messages
         connected_line = (
             f"socket mode connected identity=curie-run-identities-two slack_identity={name}"

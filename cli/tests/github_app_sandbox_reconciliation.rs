@@ -326,6 +326,9 @@ if tool == "helm":
         sys.stdout.write(body)
         raise SystemExit(0)
     if verb == "upgrade":
+        if scenario == "helm-upgrade-hang":
+            # Model delayed interpreter startup before the shim can record its pid.
+            time.sleep(0.25)
         event("helm:upgrade")
         (root / "upgraded").touch()
         if scenario in ("ownership-loss", "unreconciled", "helm-upgrade-hang", "post-missing-write-fence-drift", "restore-create-then-drift", "helm-failed-successor-with-loss"):
@@ -565,7 +568,7 @@ impl FakeCluster {
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel())
             .env("CURIE_GITHUB_API_URL", &self.github.base_url);
         if scenario == "helm-upgrade-hang" {
-            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "150");
+            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "1000");
         }
         command
             .output()
@@ -605,12 +608,18 @@ fn combined(output: &Output) -> String {
 }
 
 fn process_exited(pid: u32) -> bool {
-    let process = PathBuf::from("/proc").join(pid.to_string());
     let deadline = Instant::now() + Duration::from_secs(2);
-    while process.exists() && Instant::now() < deadline {
+    while Instant::now() < deadline {
+        let status = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .expect("inspect child process");
+        if !status.status.success() || status.stdout.is_empty() {
+            return true;
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
-    !process.exists()
+    false
 }
 
 fn stdout_json(output: &Output) -> serde_json::Value {
@@ -2033,7 +2042,8 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
     let output = cluster.run("helm-upgrade-hang", false);
     let elapsed = started.elapsed();
     let events = cluster.events();
-    // The 150 ms child deadline is followed by several recovery subprocesses.
+    // The one second child deadline includes delayed Python shim startup and is
+    // followed by several recovery subprocesses.
     // Under nextest's partition-wide load those process launches can take a
     // couple of seconds even though the hung Helm child was killed on time.
     // Keep the wall bound far below the production Helm timeout without

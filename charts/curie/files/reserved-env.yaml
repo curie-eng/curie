@@ -44,6 +44,7 @@ worker:
   CURIE_PUBLICATION_OWNER_NAME: worker.publication.ownerName
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_PRIORITY_CLASS_NAME: priorityClasses.platform.name
+  CURIE_PUBLICATION_PROTECTED_PATHS: worker.publication.protectedPaths
   CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS: worker.publication.reconcileIntervalSeconds
   CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS: worker.publication.reconcileMaxAttempts
   CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS: worker.publication.resultMaxAttempts
@@ -59,6 +60,7 @@ worker:
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   CURIE_SLACK_TRUSTED_ORIGINS: worker.slackTrustedOrigins
   CURIE_STATUS_TEXT: worker.statusText
+  CURIE_STREAM_RETENTION_MIN_AGE_S: worker.streamRetention.minAgeSeconds
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS: worker.suspendedRouteTtlSeconds
   CURIE_TERMINATION_GRACE_PERIOD_S: worker.terminationGracePeriodSeconds
   CURIE_TURN_RECEIPT: worker.turnReceipt
@@ -66,6 +68,7 @@ worker:
   CURIE_UPGRADE_REVISION: the Helm release revision (remove this override)
   CURIE_WARM_POOL: worker.warmPool
   CURIE_WORK_ITEM_MAX_TURNS: worker.workItemMaxTurns
+  CURIE_WORKER_MAX_CONCURRENCY: worker.maxConcurrency
   CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS: worker.workspace.archiveTimeoutSeconds
   CURIE_WORKSPACE_BUCKET: worker.workspace.bucket
   CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS: worker.workspace.cloneTimeoutSeconds
@@ -124,6 +127,7 @@ api:
   GITHUB_CLONE_BASE: api.githubCloneBase
   GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
+  GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel
   GITHUB_FACTORY_MENTION: api.githubFactoryMention

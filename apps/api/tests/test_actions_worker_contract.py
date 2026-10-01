@@ -22,11 +22,20 @@ import httpx
 import pytest
 from aci_protocol import SideEffectFlag
 from curie_worker.actions import ActionClient
+from curie_worker.receipt import render_receipt
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 
-async def _round_trip(app: Any) -> dict[str, Any]:
+_SNAPSHOT: dict[str, Any] = {
+    "ok": True,
+    "prior": {"spec": {"replicas": 3}},
+    "post": {"spec": {"replicas": 10}},
+    "target": {"kind": "Deployment", "name": "api"},
+}
+
+
+async def _round_trip(app: Any, result: dict[str, Any] | None = None) -> dict[str, Any]:
     """One side-effecting call, both frames, through the real stack."""
 
     async with httpx.AsyncClient(
@@ -54,12 +63,7 @@ async def _round_trip(app: Any) -> dict[str, Any]:
                 tool="scale_deployment",
                 call_id="toolu_01",
                 failed=False,
-                result={
-                    "ok": True,
-                    "prior": {"spec": {"replicas": 3}},
-                    "post": {"spec": {"replicas": 10}},
-                    "target": {"kind": "Deployment", "name": "api"},
-                },
+                result=_SNAPSHOT if result is None else result,
                 detail="non-idempotent tool completed",
             ),
         )
@@ -89,3 +93,28 @@ def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backe
     assert row["target"] == {"kind": "Deployment", "name": "api"}
     assert row["status"] == "succeeded"
     assert row["undoable"] is True
+
+
+def test_a_call_that_never_reported_what_it_left_is_not_offered_as_undoable(
+    client: Any, anyio_backend: Any
+) -> None:
+    """Prior and target without post: the undo route refuses it, so nothing may offer it.
+
+    The route compares the live resource against ``post`` and answers
+    ``refused_uncomparable`` without one. The row and the receipt rendered from it
+    have to agree with that refusal rather than promise a restore (#1861).
+    """
+
+    import anyio
+
+    reply = {key: value for key, value in _SNAPSHOT.items() if key != "post"}
+    row = anyio.run(_round_trip, client.app, reply)
+
+    assert row["prior_state"] == {"spec": {"replicas": 3}}
+    assert row["target"] == {"kind": "Deployment", "name": "api"}
+    assert row["post_state"] is None
+    assert row["undoable"] is False
+    receipt = render_receipt([row])
+    assert receipt is not None
+    assert "cannot be undone" in receipt
+    assert "restore information recorded" not in receipt

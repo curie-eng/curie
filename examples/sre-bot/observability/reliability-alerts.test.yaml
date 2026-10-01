@@ -937,6 +937,320 @@ tests:
         alertname: CurieConnectorNotReady
         exp_alerts: []
 
+  # A connector that is up but answers its tool calls with errors leaves every
+  # turn done: the model tells the person it could not read the system.
+  # curie_tool_result_total is the runner's count of tool results by origin and
+  # outcome. Runner series are per sandbox process (`instance`), and a runner
+  # sandbox usually lives for one turn, so its series' first sample already
+  # carries that turn's errors and the rule counts it as an increase from zero.
+  # Both counts sum without (instance, outcome), so the alert names no process
+  # and no outcome.
+  #
+  # One sandbox's first export at 10m: three errors and one success, then flat.
+  # The new-series term holds from 10m to 24m, when the offset hour first reads
+  # the 10m sample. Errors are 3 of 4 results. Pending at 10m, firing from 15m,
+  # resolved at 25m.
+  - name: connector tool errors fire on a new runner series' first sample
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 25m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two sandboxes, two errors and one success each: neither reaches three on
+  # its own. a's first export is at 10m and b's at 12m, so the sum is four
+  # errors of six results from 12m until a's new-series term ends at 24m.
+  # Pending at 12m, firing from 17m, one alert with no instance label.
+  - name: connector tool errors fire when they are spread over two runner instances
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-b"}'
+        values: '_x12 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-b"}'
+        values: '_x12 1x30'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 25m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # A sandbox that has served turns since before 0m: one error and one success
+  # already counted. Three more errors at 31m, 32m and 33m and no success, so
+  # increase() reads three (a little more, extrapolated) from 33m until 44m,
+  # when the window no longer holds the sample before the first new error.
+  # Pending at 33m, firing from 38m, resolved at 45m once the errors stop.
+  - name: connector tool errors on a long-running runner fire, then recover when the errors stop
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '1x30 2 3 4x40'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '1x72'
+    alert_rule_test:
+      - eval_time: 37m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 44m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+      - eval_time: 45m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Three errors, but among thirteen results: a connector that fails now and
+  # then while mostly answering is below the ratio.
+  - name: connector tool errors stay quiet when most connector calls succeed
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Every connector result an error, but only two of them: first exported at 1
+  # and then 2, with no success series at all. Short of three on either term.
+  - name: two connector tool errors stay quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x6 1x6 2x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two connector errors beside five failed builtin and platform calls. A
+  # builtin tool such as Read and Curie's own tools are not connectors; counted
+  # in, they would make seven and fire.
+  - name: builtin and platform tool errors do not count toward connector errors
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="builtin",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="platform",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Two connector errors beside five calls the runner's approval gate held. A
+  # held call arrives as an error result but never reached the connector;
+  # counted in, it would make seven and fire.
+  - name: connector calls held for approval do not count as connector errors
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="awaiting_approval",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Runner refusals and CLI unknown-tool answers never entered an MCP server.
+  # They must not make two real connector errors look like the three-error
+  # minimum. The next case checks the ratio independently.
+  - name: refused and unavailable calls do not page a healthy connector
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 2x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="refused",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieConnectorToolErrors
+        exp_alerts: []
+
+  # Three errors and one success are a failing connector even beside ten
+  # runner/CLI refusals. Counting those refusals in the denominator would hide
+  # the real 3-of-4 error ratio.
+  - name: refused and unavailable calls do not dilute connector error ratio
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="refused",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="unavailable",instance="acme-runner-a"}'
+        values: '_x10 5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+
+  # Nor do held calls dilute the ratio: three errors and one success among the
+  # connector's own answers, beside ten held calls. The ratio counts success
+  # and error only, so it is 3 of 4 and fires; counting the held calls would
+  # make it 3 of 14 and hide the failing connector.
+  - name: connector calls held for approval do not dilute the connector error ratio
+    interval: 1m
+    input_series:
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="error",instance="acme-runner-a"}'
+        values: '_x10 3x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="success",instance="acme-runner-a"}'
+        values: '_x10 1x30'
+      - series: 'curie_tool_result_total{service_name="curie-runner",source="runner",origin="connector",outcome="awaiting_approval",instance="acme-runner-a"}'
+        values: '_x10 10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieConnectorToolErrors
+        exp_alerts:
+          - exp_labels:
+              component: curie-connector
+              origin: connector
+              service_name: curie-runner
+              severity: page
+              source: runner
+            exp_annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
+
   # The dispatcher down is the quietest failure an installation has: every pod
   # is Running, nothing errors, and no Slack message reaches any agent.
   # CurieWorkerSupervisedRestartLoop watches the worker's own supervised-task
@@ -3373,4 +3687,231 @@ tests:
                 namespace capacity limit was reached.
       - eval_time: 16m
         alertname: CurieHistoryPersistenceFailed
+        exp_alerts: []
+
+  # These are per DaemonSet pod. The pinned Alloy image exposes source metrics
+  # with component_id/component_path (and read path), but write metrics with
+  # component_id/component_path/host/tenant. Prometheus adds pod/namespace/node.
+  # Unlike scraped Alloy metrics, Prometheus-generated up has no curie_source.
+  - name: zero file source pages only the broken Alloy pod
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-broken",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-healthy",node="node-b"}'
+        values: '1x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '0x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '2x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-broken
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: missing source gauge pages but failed scrape does not
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-no-files",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-down",node="node-b"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-no-files
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: quiet attached collector does not page
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-quiet",node="node-a"}'
+        values: '1x25'
+      - series: 'loki_source_file_files_active_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.source.file.pod_logs",component_path="/"}'
+        values: '1x25'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/quiet.log"}'
+        values: '0x25'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-quiet",node="node-a",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts: []
+
+  - name: fresh reads with zero writes page only the broken pod
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-broken",node="node-a"}'
+        values: '1x31'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-healthy",node="node-b"}'
+        values: '1x31'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '0+1x30'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/b.log"}'
+        values: '0+1x30'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-broken",node="node-a",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0x31'
+      - series: 'loki_write_sent_entries_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-healthy",node="node-b",component_id="loki.write.default",component_path="/",host="loki:3100",tenant=""}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-broken
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+
+  - name: first positive read counter with absent write counter pages
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-new",node="node-a"}'
+        values: '1x31'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-new",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '_x15 5x16'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-new
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+
+  - name: old flat read counter stays quiet without write counter
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-old",node="node-a"}'
+        values: '1x41'
+      - series: 'loki_source_file_read_lines_total{curie_source="curie-sre-bot",namespace="observability",pod="alloy-old",node="node-a",component_id="loki.source.file.pod_logs",component_path="/",path="/var/log/pods/a.log"}'
+        values: '5x41'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieAlloyLogDeliveryStopped
+        exp_alerts: []
+
+  # Both per-pod Alloy rules need up == 1, so an Alloy pod Prometheus cannot
+  # scrape (up 0) or never sees leaves them silent while it ships nothing.
+  # kube-state-metrics says how many Alloy pods the DaemonSet wants; paging on
+  # fewer scrapeable pods than that closes the gap.
+  - name: an unscrapeable Alloy pod pages though the per-pod rules cannot see it
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '2x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-a",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-b",node="node-b"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
+      - eval_time: 10m
+        alertname: CurieAlloyNoActiveLogFiles
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              pod: alloy-a
+              node: node-a
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+
+  - name: no scrapeable Alloy pod at all pages
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '1x25'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieAlloyScrapeMissing
+        exp_alerts:
+          - exp_labels:
+              namespace: observability
+              component: curie-log-collection
+              severity: page
+            exp_annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
+
+  - name: every wanted Alloy pod scraped stays quiet, other DaemonSets and namespaces aside
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy"}'
+        values: '2x25'
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="observability",daemonset="alloy-other"}'
+        values: '5x25'
+      - series: 'kube_daemonset_status_desired_number_scheduled{curie_source="curie-sre-bot",job="kubernetes-service-endpoints",namespace="elsewhere",daemonset="alloy"}'
+        values: '3x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-a",node="node-a"}'
+        values: '1x25'
+      - series: 'up{job="kubernetes-pods",namespace="observability",pod="alloy-b",node="node-b"}'
+        values: '1x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieAlloyScrapeMissing
         exp_alerts: []

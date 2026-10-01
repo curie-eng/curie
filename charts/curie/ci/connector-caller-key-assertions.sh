@@ -3,11 +3,12 @@
 # Render assertions for the connector caller key pair (ADR-0168 decision 7).
 #
 # The worker signs each sandbox's caller token, and the API renders the public
-# half into every hosted connector's caller proxy. Six properties:
+# half into every hosted connector's caller proxy. Eight properties:
 #
 #   (a) A stock install references the signing key from the worker alone and
 #       the public key from the API alone, both from the release Secret, which
-#       holds them empty. Empty mints no token and renders no proxy.
+#       holds them empty. Empty mints no token, and the API refuses to render a
+#       hosted connector (#3552).
 #   (b) Values supplied inline land in the release Secret and nowhere else: the
 #       signing value appears exactly once in the whole render.
 #   (c) With connectorCaller.existingSecret named, the worker reads the signing
@@ -18,6 +19,13 @@
 #   (e) The proxy image is the worker's own image, digest pin included.
 #   (f) The proxy pulls as the worker does: the API is handed the worker's pull
 #       policy and the names of its pull secrets.
+#   (g) Dev defaults on and no pair set ship the published dev pair, so a dev
+#       install can deploy a hosted connector. The chart's own exact "true"
+#       test decides it: dev defaults off, " true", or an operator pair ships
+#       no published key.
+#   (h) The api and worker roll when the caller pair they trust changes:
+#       leaving dev mode or supplying a pair changes both pods' checksum, the
+#       same render does not, and the checksum carries no signing key.
 set -euo pipefail
 
 # NOTE: read variables with a herestring, never `printf ... | cmd`; see
@@ -178,6 +186,66 @@ elif [[ "$SECRETS" != "api api - ghcr-pull,mirror-pull" ]]; then
     fail "the proxy pull secrets are not the worker's: ${SECRETS:-nothing}"
 else
     echo "ok: the proxy pulls with the worker's policy and pull secrets"
+fi
+
+# -- (g) ----------------------------------------------------------------------
+PUBLISHED_SIGNING="Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE="
+PUBLISHED_VERIFY="tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c="
+DEV="$(render "$CHART" -f "$CHART/values-dev.yaml")"
+if [[ "$(secret_value connectorCallerSigningKey <<<"$DEV")" != "$PUBLISHED_SIGNING" ]]; then
+    fail "a dev install did not ship the published signing key"
+elif [[ "$(secret_value connectorCallerVerifyKey <<<"$DEV")" != "$PUBLISHED_VERIFY" ]]; then
+    fail "a dev install did not ship the published public key"
+else
+    echo "ok: a dev install with no pair ships the published dev pair"
+fi
+for off in "security.allowDevDefaults=false" "security.allowDevDefaults= true" "security.allowDevDefaults=true "; do
+    SEALED="$(render "$CHART" -f "$CHART/values-dev.yaml" --set-string "$off")"
+    if [[ -n "$(secret_value connectorCallerSigningKey <<<"$SEALED")$(secret_value connectorCallerVerifyKey <<<"$SEALED")" ]]; then
+        fail "dev defaults not exactly true ($off) still shipped a caller key"
+    else
+        echo "ok: dev defaults not exactly true ($off) ship no caller key"
+    fi
+done
+CHOSEN="$(render "$CHART" -f "$CHART/values-dev.yaml" \
+    --set connectorCaller.signingKey=SIGNING-SENTINEL --set connectorCaller.verifyKey=VERIFY-SENTINEL)"
+if [[ "$(secret_value connectorCallerSigningKey <<<"$CHOSEN")" != "SIGNING-SENTINEL" ]] \
+    || [[ "$(secret_value connectorCallerVerifyKey <<<"$CHOSEN")" != "VERIFY-SENTINEL" ]]; then
+    fail "the published dev pair shadowed an operator pair"
+else
+    echo "ok: an operator pair wins over the published dev pair"
+fi
+
+# -- (h) ----------------------------------------------------------------------
+# Prints the checksum/connector-caller annotation of the api and worker pods.
+caller_checksums() {
+    python3 -c '
+import sys, yaml
+for doc in yaml.safe_load_all(sys.stdin):
+    if not doc or doc.get("kind") != "Deployment":
+        continue
+    component = doc["metadata"].get("labels", {}).get("app.kubernetes.io/component")
+    if component in ("api", "worker"):
+        annotations = doc["spec"]["template"]["metadata"].get("annotations") or {}
+        print(component, annotations.get("checksum/connector-caller", "-"))
+' | sort
+}
+DEV_SUMS="$(caller_checksums <<<"$DEV")"
+read -r _ DEV_API _ DEV_WORKER <<<"$(tr '\n' ' ' <<<"$DEV_SUMS")"
+SEALED_SUMS="$(caller_checksums <<<"$(render "$CHART" -f "$CHART/values-dev.yaml" --set-string security.allowDevDefaults=false)")"
+INLINE_SUMS="$(caller_checksums <<<"$INLINE")"
+if [[ "$DEV_API" == "-" || "$DEV_WORKER" == "-" || "$DEV_API" != "$DEV_WORKER" ]]; then
+    fail "the api and worker do not carry one connector caller checksum: $DEV_SUMS"
+elif [[ "$DEV_SUMS" != "$(caller_checksums <<<"$(render "$CHART" -f "$CHART/values-dev.yaml")")" ]]; then
+    fail "the same dev render produced a different connector caller checksum"
+elif [[ "$SEALED_SUMS" == "$DEV_SUMS" ]]; then
+    fail "leaving dev mode did not change the connector caller checksum, so the pods keep the published pair"
+elif [[ "$INLINE_SUMS" == "$(caller_checksums <<<"$DEFAULT")" ]]; then
+    fail "supplying a caller pair did not change the connector caller checksum"
+elif [[ "$(caller_checksums <<<"$(render "$CHART" --set connectorCaller.signingKey=OTHER-SIGNING --set connectorCaller.verifyKey=VERIFY-SENTINEL)")" != "$INLINE_SUMS" ]]; then
+    fail "the connector caller checksum depends on the signing key, which it must not carry"
+else
+    echo "ok: the api and worker roll when the trusted caller pair changes, and only then"
 fi
 
 exit "$FAILED"

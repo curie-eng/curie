@@ -22,8 +22,10 @@ the connector's address.
 
 import logging
 import uuid
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from .. import crud
@@ -189,7 +191,7 @@ async def _refuse(
     code: int,
     authorizer: str = "conflict-check",
     evidence: dict[str, object] | None = None,
-) -> None:
+) -> NoReturn:
     """Record the refusal, then raise it.
 
     Committed before the exception, so the reason outlives the HTTP response
@@ -207,6 +209,9 @@ async def _refuse(
             authorized=False,
             reason=reason,
             evidence=evidence,
+            # A stale contender may start its transaction before the winner
+            # but insert its refusal afterward. now() uses transaction start.
+            created_at=func.clock_timestamp(),
         )
     )
     await session.commit()
@@ -322,6 +327,15 @@ async def undo_action(
 
     assert action.target is not None and action.prior_state is not None  # narrowed above
     claimed = await crud.claim_action_undo(session, action, actor=data.actor)
+    if claimed is None:
+        await _refuse(
+            session,
+            action,
+            data,
+            kind="refused_already_undone",
+            reason="this action was already undone",
+            code=status.HTTP_409_CONFLICT,
+        )
     session.add(
         ActionAuditEntry(
             action_id=action.id,
@@ -331,6 +345,7 @@ async def undo_action(
             authorizer=authorizer,
             authorized=True,
             evidence={"restoring": action.prior_state},
+            created_at=func.clock_timestamp(),
         )
     )
     await session.commit()

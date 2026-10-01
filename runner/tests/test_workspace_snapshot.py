@@ -216,6 +216,7 @@ def test_snapshot_refuses_missing_empty_and_wrong_repository(
 def _runner() -> SessionRunner:
     fake = FakeModelSession()
     return SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),

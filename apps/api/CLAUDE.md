@@ -95,7 +95,8 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   clone, a **prod-branch** push looks up a stored bundle for that sha across
   every agent bound to the repository (ADR-0091), fetches its bytes from the
   object store, and reads `deploy.yaml` out of them to route the push; it
-  still only creates a new `Deployment` row. A prod promote of an
+  creates the target agent's own `Version` row when needed, pointing to the
+  same stored object, and creates a new `Deployment` row. A prod promote of an
   already-bundled sha therefore needs no access to the git remote -- which
   matters because the platform's GitHub credential can expire or be revoked
   without stopping webhook delivery (#1211). A **dev-branch** push is not

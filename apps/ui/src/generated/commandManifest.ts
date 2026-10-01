@@ -4897,7 +4897,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
+              "help": "Target environment. Infers the sole active deployment on redeploy, or defaults to dev on a first deploy. A `--target` supplies it instead, and an explicit value wins over the target",
               "id": "env",
               "long": "env",
               "positional": false,
@@ -6787,6 +6787,16 @@ export const commandManifest = {
     },
     {
       "about": "Install a complete first party example workflow",
+      "args": [
+        {
+          "global": true,
+          "help": "Kubernetes context for every helm and kubectl call. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        }
+      ],
       "hidden": false,
       "name": "example",
       "subcommands": [
@@ -6808,7 +6818,19 @@ export const commandManifest = {
                     "true",
                     "false"
                   ],
-                  "required": true
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Install only the observability stack; do not change the Curie release or deploy the bot",
+                  "id": "observability_only",
+                  "long": "observability-only",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
                 },
                 {
                   "global": false,
@@ -6836,7 +6858,7 @@ export const commandManifest = {
                   "id": "approvers",
                   "long": "approvers",
                   "positional": false,
-                  "required": true
+                  "required": false
                 },
                 {
                   "global": false,
@@ -6895,6 +6917,67 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "install"
+            },
+            {
+              "about": "Render the deployable SRE bot bundle without changing a cluster",
+              "args": [
+                {
+                  "global": false,
+                  "help": "New directory where the runtime bundle will be written; existing paths are refused",
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Include the gated platform-upgrade connector and rendered manifests",
+                  "id": "platform_upgrade",
+                  "long": "platform-upgrade",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "render"
             },
             {
               "about": "Provision the observability stack on an existing Curie release and require the Grafana connector token. Does not install the platform and does not deploy the SRE bot",
@@ -7018,7 +7101,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
+          "help": "Target environment. Defaults to dev",
           "id": "env",
           "long": "env",
           "positional": false,

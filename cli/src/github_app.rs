@@ -19,9 +19,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 
 use crate::ops::{
     helm_history_cmd, parse_helm_history, plain, require_on_path, resolve_existing_secret_ref,
@@ -1103,35 +1101,21 @@ async fn create_sandbox_inner(
     );
     let body = serde_norway::to_string(&recovery_manifest)
         .context("could not serialize a sandbox recovery object")?;
-    let mut child = tokio::process::Command::new("kubectl")
-        .args([
-            "create",
-            "-n",
-            ownership.namespace,
-            "-f",
-            "-",
-            &format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to invoke `kubectl`; is it on PATH?")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("could not open kubectl stdin for sandbox recovery")?;
-    stdin
-        .write_all(body.as_bytes())
+    let create = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("create"),
+            plain("-n"),
+            plain(ownership.namespace),
+            plain("-f"),
+            plain("-"),
+            plain(format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}")),
+        ],
+    );
+    let (ok, _stdout, _stderr) = crate::ops::run_capture_with_stdin(&create, body.as_bytes())
         .await
         .context("could not send a sandbox recovery object to kubectl")?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .context("could not wait for kubectl sandbox recovery")?;
-    if !output.status.success() {
+    if !ok {
         anyhow::bail!("kubectl could not recreate {} {}", object.kind, object.name);
     }
     Ok(())

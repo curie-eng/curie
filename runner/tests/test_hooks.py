@@ -9,9 +9,143 @@ import time
 from pathlib import Path
 
 import anyio
+import pytest
 from curie_runner import hooks, load_bundle_hooks
+from curie_runner.__main__ import build_runner
 from curie_runner.approval import ApprovalGate, build_approval_hook
-from curie_runner.mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
+from curie_runner.config import RunnerConfig
+from curie_runner.mcp_tool_capability import (
+    ConnectorAvailability,
+    ConnectorCapabilityFailure,
+    McpToolCapabilityProbe,
+)
+from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
+
+
+def _factory_session_options(tmp_path, monkeypatch, *, progress_url=None, progress_token=None):
+    monkeypatch.delenv(PROGRESS_URL_ENV, raising=False)
+    monkeypatch.delenv(PROGRESS_TOKEN_ENV, raising=False)
+    if progress_url is not None:
+        monkeypatch.setenv(PROGRESS_URL_ENV, progress_url)
+    if progress_token is not None:
+        monkeypatch.setenv(PROGRESS_TOKEN_ENV, progress_token)
+
+    plugin = tmp_path / ".claude-plugin"
+    plugin.mkdir()
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "factory-hook-wiring"}), encoding="utf-8"
+    )
+    config = RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": str(tmp_path),
+            "CURIE_SESSION_ID": "s-factory-hooks",
+            "CURIE_SANDBOX_ID": "b-factory-hooks",
+            "CURIE_BUDGET": '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}',
+        }
+    )
+    runner = build_runner(
+        config,
+        mcp_capability=McpToolCapabilityProbe(
+            complete=True,
+            has_potential_write_tool=False,
+            tool_count=0,
+        ),
+    )
+    return runner._factory()._options
+
+
+def test_factory_progress_credentials_wire_foreground_guard_into_session_options(
+    tmp_path, monkeypatch
+) -> None:
+    options = _factory_session_options(
+        tmp_path,
+        monkeypatch,
+        progress_url="http://progress.example/v1/work-item-progress/test",
+        progress_token="test-progress-token",
+    )
+
+    assert options.hooks is not None
+    matcher = next(
+        matcher
+        for matcher in options.hooks["PreToolUse"]
+        if matcher.matcher == "Bash|Agent|Task"
+    )
+    (callback,) = matcher.hooks
+    denied = anyio.run(
+        callback,
+        {"tool_name": "Bash", "tool_input": {"command": "cargo build", "run_in_background": True}},
+        "tuid",
+        None,
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("progress_url", "progress_token"),
+    [
+        pytest.param(None, "test-progress-token", id="missing-url"),
+        pytest.param(
+            "http://progress.example/v1/work-item-progress/test", None, id="missing-token"
+        ),
+    ],
+)
+def test_factory_foreground_guard_is_absent_without_both_progress_credentials(
+    tmp_path, monkeypatch, progress_url, progress_token
+) -> None:
+    options = _factory_session_options(
+        tmp_path,
+        monkeypatch,
+        progress_url=progress_url,
+        progress_token=progress_token,
+    )
+
+    # Only the per-turn tool access front (RUNNER-TOOL-ACCESS-2), which every
+    # session carries; no factory foreground guard.
+    assert options.hooks is not None
+    (matcher,) = options.hooks["PreToolUse"]
+    assert matcher.matcher is None
+    assert [callback.__qualname__ for callback in matcher.hooks] == [
+        "front_pre_tool_use_hooks.<locals>.front"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "run_in_background", "expected"),
+    [
+        pytest.param("Bash", True, "deny", id="background-bash"),
+        pytest.param("Bash", False, "allow", id="foreground-bash"),
+        pytest.param("Bash", None, "allow", id="bash-defaults-to-foreground"),
+        pytest.param("Agent", True, "deny", id="background-agent"),
+        pytest.param("Agent", None, "deny", id="agent-background-default"),
+        pytest.param("Agent", False, "allow", id="foreground-agent"),
+        pytest.param("Task", True, "deny", id="background-task"),
+        pytest.param("Task", None, "deny", id="task-background-default"),
+        pytest.param("Task", False, "allow", id="foreground-task"),
+    ],
+)
+def test_factory_foreground_guard_decides_from_explicit_background_setting(
+    tool_name: str, run_in_background: bool | None, expected: str
+) -> None:
+    (matcher,) = hooks.build_factory_foreground_hooks()["PreToolUse"]
+    assert matcher.matcher == "Bash|Agent|Task"
+    (callback,) = matcher.hooks
+    tool_input = {"command": "cargo build --locked"}
+    if run_in_background is not None:
+        tool_input["run_in_background"] = run_in_background
+
+    out = anyio.run(
+        callback,
+        {"tool_name": tool_name, "tool_input": tool_input},
+        "tuid",
+        None,
+    )
+
+    decision = out.get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+    assert decision == expected
+    if expected == "deny":
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"].lower()
+        assert "foreground" in reason
+        assert "end your turn" in reason
 
 
 def _bundle(tmp_path: Path, hooks: object) -> str:
@@ -117,6 +251,41 @@ def test_first_denying_command_short_circuits(tmp_path: Path) -> None:
 
     out = anyio.run(go)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_command_hook_env_omits_platform_credentials(monkeypatch, tmp_path) -> None:
+    """A bundle hook subprocess must not see platform credentials.
+
+    The runner process still holds them (the parent env is unchanged). The
+    hook's own environment does not, and it still receives ordinary config
+    plus CLAUDE_PLUGIN_ROOT.
+    """
+
+    monkeypatch.setenv("CURIE_RUNNER_TOKEN", "runner-sentinel")
+    monkeypatch.setenv("CURIE_STATE_TOKEN", "sbx.example-state")
+    monkeypatch.setenv("CURIE_MEMORY_TOKEN", "sbx.example-memory")
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_TOKEN", "cct.example-caller")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-PLACEHOLDER")
+    monkeypatch.setenv("CURIE_MODEL", "claude-sonnet-5")
+    captured = tmp_path / "hook-env.txt"
+
+    async def go() -> dict:
+        return await hooks._run_command_hook(
+            f"env > {captured}",
+            {"tool_name": "Bash", "tool_input": {}},
+            tmp_path,
+        )
+
+    anyio.run(go)
+    rendered = captured.read_text(encoding="utf-8")
+    assert "runner-sentinel" not in rendered
+    assert "sbx.example-state" not in rendered
+    assert "sbx.example-memory" not in rendered
+    assert "cct.example-caller" not in rendered
+    assert "sk-ant-PLACEHOLDER" not in rendered
+    assert "CURIE_MODEL=claude-sonnet-5" in rendered
+    assert f"CLAUDE_PLUGIN_ROOT={tmp_path}" in rendered
+    assert os.environ["CURIE_RUNNER_TOKEN"] == "runner-sentinel"
 
 
 def test_command_hook_kills_child_on_timeout(monkeypatch, tmp_path) -> None:

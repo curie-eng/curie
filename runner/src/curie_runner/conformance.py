@@ -27,6 +27,7 @@ def _build_runner() -> SessionRunner:
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="conformance",
+        held_secrets=frozenset(),
     )
 
 

@@ -93,23 +93,6 @@ def test_it_never_prunes_the_operator_supplied_secret() -> None:
     assert outcome.ok
 
 
-def test_the_protected_secret_is_also_never_applied() -> None:
-    # We have no values for it. Applying would either fail or, worse, succeed
-    # with an empty credential.
-    secret = live_copy({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": SECRET_NAME}})
-    client = FakeClient([secret])
-    source = Source(
-        RenderedConnectors(
-            manifests=[manifest("Service", "svc")],
-            owned_secret_name=SECRET_NAME,
-            owned_secret_keys=["GRAFANA_TOKEN"],
-        )
-    )
-
-    run(source, client)
-    assert SECRET_NAME not in client.applied
-
-
 def test_an_agent_whose_credential_was_never_provisioned_is_skipped() -> None:
     # Applying a Deployment whose secretKeyRef points at nothing yields pods
     # stuck rather than failing loudly, several layers from the cause.

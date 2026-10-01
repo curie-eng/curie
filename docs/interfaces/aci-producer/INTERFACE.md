@@ -69,7 +69,64 @@ Setup is read from the environment via `SessionConfig.from_env`
 `CURIE_*` mapping in `to_env` (`packages/aci-protocol/src/aci_protocol/session.py::SessionConfig.to_env`).
 Conformance is proven by `run_conformance(<your producer>)`, which must return `passed=True`.
 
+### Per-turn tool access (TOOL-ACCESS)
+
+A turn producer, the component that enqueues a `QueuedTurn`, can restrict what
+that one turn may execute, for example a synthetic availability probe that must
+never act. The restriction travels with the turn, not with the sandbox, so
+ordinary turns on the same install are untouched.
+
+- **TOOL-ACCESS-1:** `QueuedTurn` and `Event` each carry an optional
+  `tool_access`, a `ToolAccess` string or null, defaulting to null. The one
+  value is `read-only`. An absent or null value means the turn runs exactly as
+  it did before the field existed: no tool is added, removed, denied or gated
+  differently, and approvals behave as before.
+- **TOOL-ACCESS-2:** `tool_access` is an enum, not free text, and its spelling is
+  exact. A consumer decoding the wire rejects an unknown value; it never reads
+  one as null. A value added later is therefore a breaking change under the
+  change-class table in `packages/CLAUDE.md`, decided on its own.
+- **TOOL-ACCESS-3:** On a server that advertises it (TOOL-ACCESS-4),
+  `read-only` means that, for the whole turn, including any steer delivered
+  into it, only tools the server explicitly classifies as read-only may
+  execute. Every other tool, including one the server has no
+  classification for, is denied before it executes, and the model is told it
+  was denied. The turn never requests an approval and never ends
+  `awaiting-approval`: a tool that needs approval is denied even when it is
+  classified read-only, and the server's own approval request tool (for the
+  reference runner, `mcp__curie__request_approval`) is denied too.
+- **TOOL-ACCESS-4:** An ACI server that enforces tool access advertises the
+  values it enforces as a JSON list under the key `tool_access` on
+  `GET /status` and `GET /v1/status`. A server that omits the key enforces
+  none. A consumer must not deliver an `Event` carrying a `tool_access` value
+  that the same server it is about to send it to does not advertise, because a
+  server that does not enforce the field ignores it and would run the turn
+  unrestricted. It refuses that turn instead.
+- **TOOL-ACCESS-5:** On a server that advertises a tool access, `POST /v1/steer`
+  joins the live turn only when the steer frame's `tool_access` equals the
+  live turn's. Otherwise it answers `409`, so
+  the caller opens its own turn and neither message runs under the other's
+  access.
+- **TOOL-ACCESS-6:** A worker that implements this contract forwards
+  `QueuedTurn.tool_access` as `Event.tool_access` under TOOL-ACCESS-4, never
+  steers a restricted turn into a live turn, and never creates an approval
+  from a `read-only` turn: an `awaiting-approval` ending on one is a failed
+  turn. A worker that does not implement it ignores or drops the field,
+  whatever its protocol version, so a turn producer sets `tool_access` only
+  toward workers known to implement TOOL-ACCESS-6, and ones whose runners
+  advertise it under TOOL-ACCESS-4.
+- **TOOL-ACCESS-7:** A consumer that compares a turn it received with a copy it
+  stored earlier compares the decoded models, each read tolerantly, never the
+  raw JSON, so a turn stored before `tool_access` existed still matches the
+  same turn decoded after it. The comparison covers only the fields the
+  comparing consumer models, so a field that grants authority must be modelled
+  by that consumer before any worker acts on it.
+
 ## Implementations today
+
+The reference runner enforces and advertises `read-only` (RUNNER-TOOL-ACCESS
+in [`runner/README.md`](../../../runner/README.md)), and the worker forwards
+`QueuedTurn.tool_access` only to a runner that advertises it (WORKER-TOOL-ACCESS
+in [`apps/worker/README.md`](../../../apps/worker/README.md)).
 
 One producer (the runner, `runner/src/curie_runner/adapter.py`, a `ModelSession` wrapping
 `ClaudeSDKClient`) plus the in-library `reference_producer` used by the conformance suite. The

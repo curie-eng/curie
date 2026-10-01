@@ -56,6 +56,7 @@ def _event(text: str = "hello") -> Event:
 
 def _runner(session: FakeModelSession) -> SessionRunner:
     return SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -278,6 +279,7 @@ def test_budget_halt_outranks_approval() -> None:
     async def go() -> None:
         session = FakeModelSession(lambda: approval_turn("Anything"))
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=1,  # the approval turn reports 8 output tokens; the halt trips
             tracer=RunTracer(None),
@@ -512,6 +514,7 @@ def test_blocked_turn_ends_awaiting_approval() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
             tracer=RunTracer(None),
@@ -558,6 +561,7 @@ def test_permission_block_outranks_grantless_policy_request() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
             tracer=RunTracer(None),
@@ -1429,6 +1433,7 @@ def test_blocked_turn_final_carries_the_route() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
             tracer=RunTracer(None),
@@ -1543,6 +1548,7 @@ async def _run_policy_turn(
         can_use_tool=_executing_approval_callback(gate),
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -1646,6 +1652,7 @@ async def _run_container_fake_policy_turn(
         approval_gate=gate,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -2151,6 +2158,7 @@ def test_permission_gate_grants_the_denied_tool_name() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
             tracer=RunTracer(None),
@@ -2261,6 +2269,7 @@ async def _run_resumed_turn(
 
     session = FakeModelSession(lambda: list(script), can_use_tool=can_use_tool)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=ceiling,
         tracer=RunTracer(None),

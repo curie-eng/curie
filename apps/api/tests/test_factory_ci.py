@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from channel_protocol import work_item_events
+from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api import factory_ci, workitems
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
@@ -29,10 +31,7 @@ ISSUE_URL = "https://github.com/acme-corp/acme-bot/issues/9101"
 PUBLISHED = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
 DEADLINE = PUBLISHED + timedelta(seconds=1800)
 CONTRACT_MARKER = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
-WORKER_EVENT_RE = re.compile(
-    r"^work-item-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-ci-([23])$"
-)
+CI_ROUNDS = range(work_item_events.CI_FIRST_FIX_ROUND, work_item_events.CI_MAX_ROUNDS + 1)
 
 PERMANENT = [
     "app_not_configured",
@@ -45,6 +44,27 @@ PERMANENT = [
     "no_head_sha",
 ]
 TRANSIENT = ["timeout", "observation_busy", "github_rate_limited", "github_error"]
+
+
+# Curie's own layout, configured per repository since #3617. Defined here rather
+# than imported so the tests pin the operator-facing values. Built per test, not
+# at import, so this module still collects against a tree without the policy
+# and the fix pin attributes that failure to the pinned test.
+def curie_python_ci() -> factory_ci.PythonCiPolicy:
+    return factory_ci.PythonCiPolicy(
+        check="Python (ruff + mypy + pytest)",
+        paths=(
+            "apps",
+            "runner",
+            "cli",
+            "adapters",
+            "packages",
+            "examples/tests",
+            "tools",
+            "release",
+        ),
+        pending_check_prefix="Python pytest (shard ",
+    )
 
 
 def _run(
@@ -89,6 +109,7 @@ def _decide(detail: CiDetail, seconds: float, **kwargs: Any) -> Any:
     kwargs.setdefault("execution_deadline", DEADLINE)
     kwargs.setdefault("ci_wait_seconds", 1200)
     kwargs.setdefault("changed_paths", [])
+    kwargs.setdefault("python_ci", None)
     return factory_ci.decide(
         detail,
         now=PUBLISHED + timedelta(seconds=seconds),
@@ -118,7 +139,9 @@ def test_later_non_python_fix_cannot_drop_prior_python_ci_requirement() -> None:
     skipped = _run("Python (ruff + mypy + pytest)", conclusion="skipped")
     skipped["app"] = {"slug": "github-actions"}
 
-    verdict = _decide(_detail(skipped), 130, changed_paths=changed_paths)
+    verdict = _decide(
+        _detail(skipped), 130, changed_paths=changed_paths, python_ci=curie_python_ci()
+    )
 
     assert verdict.kind == "unverified"
     assert verdict.reason == "required_python_ci_skipped"
@@ -144,18 +167,24 @@ def test_ci_causes_match_the_literal_set_in_workitems() -> None:
 
 def test_continuation_event_id_is_the_worker_contract() -> None:
     request_id = uuid.uuid4()
-    for round_ in (2, 3):
+    for round_ in CI_ROUNDS:
         event_id = factory_ci.continuation_event_id(request_id, round_)
-        assert event_id == f"work-item-{request_id}-ci-{round_}"
-        matched = WORKER_EVENT_RE.fullmatch(event_id)
-        assert matched is not None
-        assert matched.group(2) == str(round_)
+        assert parse_work_item_event_id(event_id) == WorkItemEventId(request_id, "ci", round_)
+
+
+def test_the_round_bound_and_key_are_the_shared_ones() -> None:
+    request_id = uuid.uuid4()
+    assert factory_ci.CI_MAX_ROUNDS is work_item_events.CI_MAX_ROUNDS
+    assert factory_ci.ci_key(request_id, 2) == work_item_events.ci_round_key(request_id, 2)
 
 
 def test_marker_is_the_bundle_contract() -> None:
-    line = f"Curie wait_ci round 2 of 3: the checks on {PR_URL} failed at {HEAD}."
-    assert factory_ci.MARKER.match(line) is not None
-    assert CONTRACT_MARKER.match(line) is not None
+    for round_ in CI_ROUNDS:
+        text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, round_, _failing_detail())
+        assert factory_ci.MARKER.match(text.split("\n")[1]) is not None
+    for round_ in (work_item_events.CI_FIRST_FIX_ROUND - 1, factory_ci.CI_MAX_ROUNDS + 1):
+        line = f"Curie wait_ci round {round_} of {factory_ci.CI_MAX_ROUNDS}: the checks failed."
+        assert factory_ci.MARKER.match(line) is None
 
 
 def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:
@@ -435,6 +464,344 @@ def test_checks_that_disappear_after_a_failed_round_are_unverified() -> None:
     verdict = _decide(_detail(), 300, prior_round_had_checks=True)
     assert verdict.kind == "unverified"
     assert verdict.reason == "checks_disappeared"
+
+
+def _actions_run(
+    name: str,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    *,
+    run_id: int = 1,
+) -> dict[str, Any]:
+    run = _run(name, status=status, conclusion=conclusion, run_id=run_id)
+    run["app"] = {"slug": "github-actions"}
+    return run
+
+
+_PYTHON_PATH = "apps/api/src/curie_api/factory_ci.py"
+_PYTHON_AGGREGATE = "Python (ruff + mypy + pytest)"
+
+
+def _pytest_shards(status: str = "in_progress") -> list[dict[str, Any]]:
+    return [
+        _actions_run(
+            f"Python pytest (shard {shard}/3)",
+            status=status,
+            conclusion="success" if status == "completed" else None,
+            run_id=shard,
+        )
+        for shard in (1, 2, 3)
+    ]
+
+
+def test_in_progress_pytest_shards_keep_waiting_for_the_aggregate() -> None:
+    """The aggregate job does not exist until the shards finish (#3400, #3520)."""
+
+    verdict = _decide(
+        _detail(*_pytest_shards(), _actions_run("PR body (real newlines)", run_id=4)),
+        180,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+    assert verdict.kind != "unverified"
+
+
+def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        30,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+        prior_round_had_checks=True,
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+
+
+def test_a_pending_status_keeps_the_missing_python_aggregate_waiting() -> None:
+    verdict = _decide(
+        _detail(
+            _actions_run("gitleaks (full history)"),
+            statuses=(_status("ci/pr-body", "pending"),),
+        ),
+        180,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+
+
+def test_a_visible_failure_still_fails_fast_while_pytest_shards_run() -> None:
+    verdict = _decide(
+        _detail(
+            *_pytest_shards(),
+            _actions_run("Fix pin verification", conclusion="failure", run_id=8),
+        ),
+        180,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "failing"
+    assert "Fix pin verification" in _names(verdict.failing)
+
+
+def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> None:
+    """GitHub creates the aggregate only after the shard jobs complete."""
+
+    verdict = _decide(
+        _detail(*_pytest_shards(status="completed")),
+        180,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+    expired = _decide(
+        _detail(*_pytest_shards(status="completed")),
+        1200,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+    assert expired.kind == "unverified"
+    assert expired.reason == "required_python_ci_unrelated"
+
+
+def test_settled_non_shard_checks_without_the_python_aggregate_are_unverified() -> None:
+    verdict = _decide(
+        _detail(_actions_run("gitleaks (full history)"), _actions_run("cargo audit", run_id=2)),
+        180,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+
+
+def test_a_missing_python_aggregate_is_unverified_at_the_ci_deadline() -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        1200,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+
+
+def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
+    early = PUBLISHED + timedelta(seconds=200)
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        200,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=curie_python_ci(),
+        execution_deadline=early,
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+
+
+def test_python_changes_with_no_checks_follow_the_grace_window() -> None:
+    waiting = _decide(_detail(), 119, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
+    assert waiting.kind == "pending"
+    assert waiting.reason == "required_python_ci_missing"
+    missing = _decide(_detail(), 180, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
+    assert missing.kind == "unverified"
+    assert missing.reason == "required_python_ci_missing"
+
+
+def test_the_python_aggregate_is_judged_once_it_appears() -> None:
+    shards = _pytest_shards(status="completed")
+    paths = {"changed_paths": [_PYTHON_PATH], "python_ci": curie_python_ci()}
+    running = _actions_run(_PYTHON_AGGREGATE, status="in_progress", run_id=9)
+    pending = _decide(_detail(*shards, running), 600, **paths)
+    assert pending.kind == "pending"
+    assert pending.reason is None
+
+    green = _actions_run(_PYTHON_AGGREGATE, run_id=9)
+    assert _decide(_detail(*shards, green), 600, **paths).kind == "green"
+
+    failed = _actions_run(_PYTHON_AGGREGATE, conclusion="failure", run_id=9)
+    failed_verdict = _decide(_detail(*shards, failed), 600, **paths)
+    assert failed_verdict.kind == "failing"
+    assert failed_verdict.reason == "required_python_ci_failed"
+
+
+# --- decide: per-repository Python CI policy (#3617) -----------------------------------
+
+_OUTSIDE_PATH = "unitconv/convert.py"
+
+
+def test_decide_requires_the_python_ci_policy_keyword() -> None:
+    parameter = inspect.signature(factory_ci.decide).parameters["python_ci"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_an_outside_python_layout_without_a_policy_is_judged_on_its_own_checks() -> None:
+    """acme-corp/acme-fixture: a root package and a plain unittest job."""
+
+    paths = {"changed_paths": [_OUTSIDE_PATH], "python_ci": None}
+    running = _decide(_detail(_actions_run("unittest", status="in_progress")), 60, **paths)
+    assert running.kind == "pending"
+    assert running.reason is None
+
+    green = _decide(_detail(_actions_run("unittest")), 180, **paths)
+    assert green.kind == "green"
+    assert green.reason is None
+
+    failed = _decide(_detail(_actions_run("unittest", conclusion="failure")), 180, **paths)
+    assert failed.kind == "failing"
+    assert failed.reason is None
+    assert _names(failed.failing) == {"unittest"}
+
+
+@pytest.mark.parametrize("seconds", [30, 180, 1200])
+def test_an_outside_python_layout_never_reports_a_required_python_ci_reason(
+    seconds: float,
+) -> None:
+    for detail in (
+        _detail(),
+        _detail(_actions_run("unittest")),
+        _detail(_actions_run("unittest", conclusion="skipped")),
+        _detail(_actions_run("unittest", status="queued")),
+    ):
+        verdict = _decide(detail, seconds, changed_paths=[_OUTSIDE_PATH], python_ci=None)
+        assert not (verdict.reason or "").startswith("required_python_ci")
+
+
+def test_without_a_policy_no_python_path_is_unselected() -> None:
+    assert factory_ci._unselected_python_path([_OUTSIDE_PATH], None) is None
+    assert factory_ci._unselected_python_path(["examples/coder/foo.py"], None) is None
+
+
+def test_the_curie_policy_still_refuses_an_unselected_path() -> None:
+    assert (
+        factory_ci._unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
+        == "examples/coder/foo.py"
+    )
+    assert factory_ci._unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
+    verdict = _decide(
+        _detail(_actions_run(_PYTHON_AGGREGATE)),
+        180,
+        changed_paths=["examples/coder/foo.py"],
+        python_ci=curie_python_ci(),
+    )
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
+
+
+def custom_python_ci() -> factory_ci.PythonCiPolicy:
+    return factory_ci.PythonCiPolicy(check="Unit tests", paths=("src",))
+
+
+def test_a_custom_policy_selects_only_its_paths() -> None:
+    assert factory_ci._unselected_python_path(["src/widget.py"], custom_python_ci()) is None
+    assert factory_ci._unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
+        "srcx/widget.py"
+    )
+    assert factory_ci._unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
+
+
+def test_a_custom_policy_requires_its_own_check_name() -> None:
+    paths = {"changed_paths": ["src/widget.py"], "python_ci": custom_python_ci()}
+    green = _decide(_detail(_actions_run("Unit tests")), 180, **paths)
+    assert green.kind == "green"
+
+    # Curie's aggregate name means nothing to this repository.
+    other = _decide(_detail(_actions_run(_PYTHON_AGGREGATE)), 180, **paths)
+    assert other.kind == "unverified"
+    assert other.reason == "required_python_ci_unrelated"
+
+    skipped = _decide(_detail(_actions_run("Unit tests", conclusion="skipped")), 180, **paths)
+    assert skipped.kind == "unverified"
+    assert skipped.reason == "required_python_ci_skipped"
+
+    failed = _decide(_detail(_actions_run("Unit tests", conclusion="failure")), 180, **paths)
+    assert failed.kind == "failing"
+    assert failed.reason == "required_python_ci_failed"
+
+
+def test_a_policy_without_a_pending_prefix_does_not_wait_on_shard_names() -> None:
+    paths = {"changed_paths": ["src/widget.py"], "python_ci": custom_python_ci()}
+    verdict = _decide(_detail(*_pytest_shards(status="completed")), 180, **paths)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_unrelated"
+
+
+def test_a_custom_pending_prefix_keeps_waiting_for_its_aggregate() -> None:
+    policy = factory_ci.PythonCiPolicy(
+        check="Unit tests", paths=("src",), pending_check_prefix="Unit shard "
+    )
+    shard = _actions_run("Unit shard 1", run_id=3)
+    verdict = _decide(_detail(shard), 180, changed_paths=["src/widget.py"], python_ci=policy)
+    assert verdict.kind == "pending"
+    assert verdict.reason == "required_python_ci_missing"
+
+
+def test_python_ci_policy_is_frozen() -> None:
+    with pytest.raises(AttributeError):
+        curie_python_ci().check = "other"  # type: ignore[misc]
+    assert curie_python_ci().pending_check_prefix == "Python pytest (shard "
+    assert factory_ci.PythonCiPolicy(check="c", paths=("p",)).pending_check_prefix is None
+
+
+def test_the_python_ci_policy_setting_defaults_to_empty() -> None:
+    settings = Settings()
+    assert settings.github_factory_python_ci == {}
+    assert factory_ci.python_ci_policy(settings, "curie-eng/curie") is None
+
+
+def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
+    settings = Settings(
+        GITHUB_FACTORY_PYTHON_CI=json.dumps(
+            {
+                "curie-eng/curie": {
+                    "check": "Python (ruff + mypy + pytest)",
+                    "paths": list(curie_python_ci().paths),
+                    "pendingCheckPrefix": "Python pytest (shard ",
+                },
+                "Acme/Widgets": {
+                    "check": "Unit tests",
+                    "paths": ["src"],
+                    "pendingCheckPrefix": None,
+                },
+            }
+        )
+    )
+    assert factory_ci.python_ci_policy(settings, "Curie-Eng/Curie") == curie_python_ci()
+    assert factory_ci.python_ci_policy(settings, "acme/widgets") == custom_python_ci()
+    assert factory_ci.python_ci_policy(settings, "acme-corp/acme-fixture") is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"curie-eng/curie": {"check": "", "paths": ["apps"]}},
+        {"curie-eng/curie": {"check": "Python", "paths": []}},
+        {"curie-eng/curie": {"check": "Python", "paths": ["/apps"]}},
+        {"curie-eng/curie": {"check": "Python", "paths": ["apps/"]}},
+        {"curie": {"check": "Python", "paths": ["apps"]}},
+        {"curie-eng/curie/extra": {"check": "Python", "paths": ["apps"]}},
+    ],
+    ids=["empty-check", "empty-paths", "leading-slash", "trailing-slash", "no-owner", "3-parts"],
+)
+def test_an_invalid_python_ci_policy_is_rejected_at_boot(value: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(GITHUB_FACTORY_PYTHON_CI=json.dumps(value))
 
 
 # --- decide: the CI deadline -----------------------------------------------------------

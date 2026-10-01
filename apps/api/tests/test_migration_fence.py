@@ -1019,3 +1019,66 @@ def test_the_refusal_is_self_sufficient_for_a_blocked_installation(
 
     # And it names the transport the operator hands the completed document to.
     assert DECLARATIONS_ENV in message, message
+
+
+def _lock_fence_in(schema: str | None) -> list[tuple[str, str]]:
+    """Run `fence_identity_tables` under an Alembic context for ``schema``.
+
+    Returns the (schema, table) pairs this backend then holds ACCESS EXCLUSIVE
+    on, read inside the fence's own transaction.
+    """
+
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+    from curie_api.migration_fence import fence_identity_tables
+    from sqlalchemy.engine import Connection
+
+    def fence(conn: Connection) -> list[tuple[str, str]]:
+        opts = {} if schema is None else {"version_table_schema": schema}
+        with Operations.context(MigrationContext.configure(conn, opts=opts)):
+            fence_identity_tables(conn)
+        rows = conn.execute(
+            text(
+                "SELECT n.nspname, c.relname FROM pg_locks l "
+                "JOIN pg_class c ON c.oid = l.relation "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE l.pid = pg_backend_pid() AND l.mode = 'AccessExclusiveLock' "
+                "AND c.relname IN ('agent_channels', 'approvals') "
+                "ORDER BY n.nspname, c.relname"
+            )
+        ).all()
+        return [(row.nspname, row.relname) for row in rows]
+
+    async def go() -> list[tuple[str, str]]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                return await conn.run_sync(fence)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def test_the_fence_locks_the_configured_schema_not_a_hardcoded_curie(migrated: None) -> None:
+    """`env.py` hands Alembic `db_schema`; the fence locks THAT schema (#3566).
+
+    The identity tables are cloned into a throwaway schema, so a fence that
+    still names `curie` would lock `curie.*` and leave the clones untouched.
+    """
+
+    schema = f"fence_{uuid.uuid4().hex[:12]}"
+    sql_rows(f'CREATE SCHEMA "{schema}"')
+    try:
+        for table in ("agent_channels", "approvals"):
+            sql_rows(f"CREATE TABLE {schema}.{table} (LIKE curie.{table} INCLUDING ALL)")
+        assert _lock_fence_in(schema) == [(schema, "agent_channels"), (schema, "approvals")]
+    finally:
+        sql_rows(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_the_fence_refuses_a_context_with_no_configured_schema(migrated: None) -> None:
+    """No schema from `env.py` is a refusal, never a silent fall back to `curie`."""
+
+    with pytest.raises(RuntimeError, match="version_table_schema"):
+        _lock_fence_in(None)

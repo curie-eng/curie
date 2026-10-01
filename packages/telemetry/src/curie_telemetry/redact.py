@@ -120,6 +120,24 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("channel_token"),
     ),
     RedactionRule(
+        "sandbox_token",
+        # The sandbox state token minter uses two unpadded base64url segments.
+        re.compile(
+            r"(?<![A-Za-z0-9_-])sbx\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        ),
+        _placeholder("sandbox_token"),
+    ),
+    RedactionRule(
+        "connector_caller_token",
+        # The connector caller minter uses the same base64url segment alphabet.
+        re.compile(
+            r"(?<![A-Za-z0-9_-])cct\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        ),
+        _placeholder("connector_caller_token"),
+    ),
+    RedactionRule(
         "secret_json_field",
         re.compile(
             r'(?<![A-Za-z0-9])("(?:[A-Za-z0-9]+_)*(?:secret_access_key|private_key|credential|secret|password|'

@@ -67,6 +67,7 @@ class PublicationMetadata:
 async def read_publication_authority(
     session: AsyncSession,
     *,
+    github_html_base: str,
     deployment_id: uuid.UUID,
     work_item_id: uuid.UUID,
     execution_request_id: uuid.UUID,
@@ -140,7 +141,7 @@ async def read_publication_authority(
         return None
     if (
         lineage.pr_number <= 0
-        or lineage.pr_url != f"https://github.com/{lineage.repo_full_name}/pull/{lineage.pr_number}"
+        or lineage.pr_url != f"{github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
         or lineage.head_sha is None
         or re.fullmatch(r"[0-9a-f]{40}", lineage.head_sha) is None
         or lineage.github_repository_id is None
@@ -229,7 +230,7 @@ async def read_publication_metadata(
         or payload["number"] != authority.pr_number
         or payload.get("node_id") != authority.pr_node_id
         or payload.get("html_url")
-        != f"https://github.com/{authority.repo_full_name}/pull/{authority.pr_number}"
+        != f"{settings.github_html_base}/{authority.repo_full_name}/pull/{authority.pr_number}"
         or payload.get("state") != "open"
         or payload.get("merged") is not False
         or not isinstance(head, dict)

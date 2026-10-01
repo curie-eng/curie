@@ -29,7 +29,7 @@ from curie_dispatcher.relevance import DropReason, classify
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize
+from .conftest import FakeSocketClient, _authorize, person_rooted_thread
 from .test_dispatch import BOT_TS, _drain, _events_api_request
 from .test_inbound_relevance import (
     _drop_reasons_logged,
@@ -54,6 +54,9 @@ def _deliver(
     web_client = WebClient(token="xoxb-test")
     post = MagicMock(return_value={"ts": BOT_TS})
     web_client.chat_postMessage = post  # type: ignore[method-assign]
+    web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
+        side_effect=person_rooted_thread
+    )
     collector = _RecordCollector()
     logger = logging.getLogger(f"curie_dispatcher.test.{uuid.uuid4().hex}")
     logger.setLevel(logging.DEBUG)

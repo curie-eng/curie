@@ -3,7 +3,11 @@
 
 This creates its own kind cluster and binds a chart-rendered SandboxTemplate to
 a probe Pod.  It intentionally does not run the sandbox controller, create a
-SandboxClaim, call a model, or prove a hostname-stable allowlist.
+SandboxClaim, call a model, or prove a hostname-stable allowlist. AF_INET6
+mapped addresses exercise the IPv4 policy path; this IPv4-only kind cluster
+does not prove native IPv6 NetworkPolicy enforcement. The metadata attempt
+records refusal, but cannot attribute it to policy because that destination
+may have no route in the test cluster.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ class Check:
         self.pod = "registry-egress-probe"
         self.commands: list[dict[str, Any]] = []
         self.phases: dict[str, dict[str, int]] = {}
+        self.ipv6_probes: dict[str, dict[str, int]] = {}
         self.cluster_attempted = False
         self.chart_sha256 = ""
         self.temp: tempfile.TemporaryDirectory[str] | None = None
@@ -184,6 +189,37 @@ exit "$rc"
                 f"{phase}: expected TCP and pip exit {expected}, got "
                 f"{tcp.returncode} and {pip.returncode}"
             )
+
+    def probe_ipv6(self, phase: str, registry_ip: str) -> None:
+        code = (
+            "import socket,sys; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); "
+            "s.settimeout(3); "
+            "\ntry: s.connect((sys.argv[1],443)); print('TCP443_CONNECTED')"
+            "\nexcept OSError as e: print('TCP443_REFUSED',type(e).__name__); sys.exit(1)"
+        )
+        expected_registry = 0 if phase == "admitted" else 1
+        results = {}
+        for name, address, expected in (
+            ("registry_mapped", f"::ffff:{registry_ip}", expected_registry),
+            ("metadata_mapped", "::ffff:169.254.169.254", 1),
+        ):
+            result = self.run(
+                f"tcp6-{phase}-{name}",
+                self.kubectl(
+                    "exec", "-n", self.namespace, self.pod, "-c", "runner",
+                    "--", "python", "-c", code, address,
+                ),
+                timeout=15,
+                check=False,
+            )
+            results[name] = result.returncode
+            marker = "TCP443_CONNECTED" if expected == 0 else "TCP443_REFUSED"
+            if result.returncode != expected or marker not in result.stdout:
+                raise AssertionError(
+                    f"{phase} {name}: expected AF_INET6 {marker} and exit {expected}, "
+                    f"got exit {result.returncode}; see command log"
+                )
+        self.ipv6_probes[phase] = results
 
     def execute(self) -> None:
         for tool in ("docker", "kind", "kubectl", "helm"):
@@ -360,6 +396,7 @@ exit "$rc"
         ips = sorted({ip for values in answers.values() for ip in values})
         control_ip = ips[0]
         self.probe("denied", control_ip)
+        self.probe_ipv6("denied", control_ip)
 
         admitted_values_data = copy.deepcopy(base_values)
         admitted_values_data["security"]["networkPolicy"]["allowedEgress"] = [
@@ -381,6 +418,7 @@ exit "$rc"
         )
         time.sleep(3)
         self.probe("admitted", control_ip)
+        self.probe_ipv6("admitted", control_ip)
         pip_report = self.run(
             "pip-report-admitted",
             self.kubectl(
@@ -402,6 +440,7 @@ exit "$rc"
         )
         time.sleep(3)
         self.probe("revoked", control_ip)
+        self.probe_ipv6("revoked", control_ip)
         live_pod = self.run(
             "live-pod",
             self.kubectl("get", "pod", self.pod, "-n", self.namespace, "-o", "json"),
@@ -487,8 +526,13 @@ def main() -> int:
             "chart_sha256": check.chart_sha256,
             "kind_image": KIND_IMAGE,
             "calico": {"url": CALICO_URL, "sha256": CALICO_SHA256},
-            "scope": "chart-rendered bound Pod only; no controller, claim, model, or publication",
+            "scope": (
+                "chart-rendered bound Pod only; AF_INET6 mapped sockets use IPv4 policy; "
+                "metadata refusal is not attributed to policy; no native IPv6, "
+                "controller, claim, model, or publication proof"
+            ),
             "phases": check.phases,
+            "ipv6_probes": check.ipv6_probes,
             "error": error,
             "cleanup_error": cleanup_error,
         }

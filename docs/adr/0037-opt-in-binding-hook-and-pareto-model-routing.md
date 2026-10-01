@@ -8,10 +8,10 @@ Implementation tracked in epic [#473](https://github.com/curie-eng/curie/issues/
 
 ## Context
 
-A prospective NTT engagement asks for a model router: phase 1 is static
+A prospective customer engagement asks for a model router: phase 1 is static
 rules-based routing (task type to model -- simple code to a cheap model,
 complex code to a frontier model, pluggable targets), phase 2 uses a model to
-make the routing decision over free-form chat text. Independent of NTT, the
+make the routing decision over free-form chat text. Independent of that engagement, the
 same mechanism is the cost-optimization lever for any deployment running more
 than one model.
 
@@ -130,7 +130,7 @@ candidates considered.
   built as a separable library. The Curie binding hook is consumer one; a
   standalone licensable facade or other platforms are future consumers.
 - Non-LLM route targets (for example OCR pipelines) are the genuinely novel
-  slice of the NTT ask -- no shipped router does this -- and are explicitly
+  slice of that customer request -- no shipped router does this -- and are explicitly
   out of scope for this port: they are handler dispatch above the model seam,
   not model selection.
 - Opt-out cost is zero. A bundle without a `routing` block exercises no new

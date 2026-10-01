@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 
-from .. import crud
+from .. import crud, state_mutation
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep
@@ -358,6 +358,17 @@ async def edit_memory(
     entry.value = replacement
     entry.version += 1
     await session.commit()
+    # This router is platform-key only (require_api_key), so the principal is
+    # always the platform key (#3673).
+    state_mutation.record(
+        op="edit",
+        agent_id=agent_id,
+        scope=None,
+        namespace=MEMORY_NAMESPACE,
+        key=MEMORY_LOG_KEY,
+        index=index,
+        principal="platform",
+    )
     return _to_out(index, updated, entry.version)
 
 
@@ -386,4 +397,14 @@ async def delete_memory(
     entry.value = [*records[:index], *records[index + 1 :]]
     entry.version += 1
     await session.commit()
+    state_mutation.record(
+        op="delete",
+        agent_id=agent_id,
+        scope=None,
+        namespace=MEMORY_NAMESPACE,
+        key=MEMORY_LOG_KEY,
+        index=index,
+        removed=True,
+        principal="platform",
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

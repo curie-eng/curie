@@ -277,8 +277,10 @@ types.** The Pydantic models are the source of truth and a committed JSON Schema
 `packages/plugin-format/tests/test_schema_compat.py`, but there is **no generated Rust or TS** in
 the package (contrast `packages/aci-protocol/generated/`). The CLI hand-mirrors the format in
 Rust and is kept honest by `cli/plugin-format-mirrors.json` plus `curie dev field-parity`
-(`cli/scripts/check-field-parity.sh`). That gate only sees `schema_export` models;
-Connector* field honesty is `tests/vectors/connector-fields.json`. The TypeScript (UI)
+(`cli/scripts/check-field-parity.sh`). The export covers the three Curie-only root files as well
+as the Claude-Code-shaped ones, so a field change to `connectors.yaml`, `connectors.lock.yaml` or
+`deploy.yaml` fails the same drift gate, and the CLI's connector and lock structs are declared
+mirrors of those `$defs`. The TypeScript (UI)
 consumer remains a hand-written
 mirror. It also carries no `PROTOCOL_VERSION`; the
 format is pinned to the Claude Code shape and the models are lenient by design so future Claude

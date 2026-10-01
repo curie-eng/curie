@@ -442,7 +442,7 @@ impl crate::ui::CliOutput for InitOutput {
 }
 
 /// Scaffold and drive the existing local skill path for one first reply.
-pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
+pub async fn try_first_run(keep: bool, image: String) -> Result<SkillMessageOutput> {
     const DEMO_NAME: &str = "curie-demo";
     const DEMO_PROMPT: &str = "hello, are you there?";
 
@@ -546,36 +546,27 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     .await;
     let teardown = stop(None, &dir).await;
 
-    let classified_failure = match message {
-        Ok(classified_failure) => classified_failure,
-        Err(message_err) => {
-            if let Err(cleanup_err) = &teardown {
-                ui.warn(&format!(
-                    "could not tear down the demo at {}: {cleanup_err}",
-                    dir.display()
-                ));
-            } else if !keep {
-                if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-                    ui.warn(&format!(
-                        "could not remove temporary demo at {}: {cleanup_err}",
-                        dir.display()
-                    ));
-                }
-            }
-            return Err(message_err);
-        }
-    };
-
     if let Err(cleanup_err) = teardown {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        let message = format!(
             "could not tear down the demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        ui.note(&format!(
+        );
+        let remedy = format!(
             "recover with: cd {} && curie skill down",
-            dir.display()
+            crate::ops::shell_quote(&dir.display().to_string())
+        );
+        let payload = serde_json::json!({ "error": &message, "fix": &remedy });
+        let failure = crate::exit::CliError::failure(message.clone())
+            .with_fix(remedy.clone())
+            .into();
+        return Err(crate::exit::operator_context(
+            crate::exit::with_json_payload(failure, payload),
+            message,
+            Some(remedy),
         ));
-        std::process::exit(1);
     }
 
     if keep {
@@ -586,19 +577,19 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
         };
         ui.note(&format!("kept ./curie-demo; next: {next}"));
     } else if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        return Err(crate::exit::CliError::failure(format!(
             "could not remove temporary demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        std::process::exit(1);
+        ))
+        .into());
     } else {
         ui.note(&format!("removed temporary demo at {}", dir.display()));
     }
 
-    if classified_failure {
-        std::process::exit(1);
-    }
-    Ok(())
+    message
 }
 
 /// Tags `docker build` applies for one platform image.
@@ -624,11 +615,22 @@ pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
     tags
 }
 
+/// The `docker build` command line [`build_image`] runs from the repo root,
+/// as it announces it and as a `local up --build --dry-run` plan lists it.
+pub(crate) fn build_image_command_line(dockerfile: &str, tag: &str) -> String {
+    let rendered = platform_image_tags(dockerfile, tag)
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("docker build -f {dockerfile} {rendered} .")
+}
+
 /// Build one platform image. The single `docker build` invocation for Curie
 /// images: `curie build` and `curie local up --build` both route here (#1931).
 pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
-    if !on_path("docker") {
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -649,13 +651,9 @@ pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
         args.push(image_tag.clone());
     }
     args.push(".".to_string());
-    let rendered = tags
-        .iter()
-        .map(|image_tag| format!("-t {image_tag}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     ui.note(&format!(
-        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
+        "=== {} (in {}) ===",
+        build_image_command_line(dockerfile, tag),
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
@@ -1616,7 +1614,7 @@ impl crate::ui::CliOutput for BumpVersionOutput {
 
 /// Bail with a friendly pointer when a required tool is not on PATH.
 fn require_tool(bin: &str, hint: &str) -> Result<()> {
-    if on_path(bin) {
+    if crate::ops::on_path(bin) {
         Ok(())
     } else {
         bail!("{hint}")
@@ -1652,13 +1650,6 @@ async fn docker_image_exists(tag: &str) -> Result<bool> {
         .await
         .context("failed to invoke docker")?;
     Ok(status.success())
-}
-
-/// Whether `bin` resolves on PATH.
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false)
 }
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
@@ -3987,7 +3978,7 @@ pub async fn send(
     event_type: EventType,
     url: Option<String>,
     r#continue: bool,
-) -> Result<bool> {
+) -> Result<SkillMessageOutput> {
     let url = resolve_url(url)?;
     let saved = state::load(Path::new(".")).unwrap_or(None);
     let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
@@ -4005,10 +3996,8 @@ pub async fn send(
             .context("resetting the runner conversation before message")?;
     }
 
-    // Under `--json`, answer tokens are suppressed on stdout (they route through
-    // `ui.answer`), so a streamed turn would exit 0 with empty stdout (#485).
-    // Accumulate the full reply and emit one JSON object at the end instead. The
-    // human path is unchanged: it streams live and this buffer is never emitted.
+    // Buffer the reply for the caller's typed result while the human path
+    // streams live. Callers emit success only after their cleanup has finished.
     let json = ui.json();
     let mut reply = String::new();
 
@@ -4042,9 +4031,8 @@ pub async fn send(
                 // pace with no per-delta newline. Track mid-line state so a later
                 // note closes an un-terminated line first.
                 Some(TurnPart::Token(token)) => {
-                    if json {
-                        reply.push_str(&token);
-                    } else {
+                    reply.push_str(&token);
+                    if !json {
                         ui.answer(&token);
                     }
                     streamed = true;
@@ -4081,34 +4069,32 @@ pub async fn send(
         step.clear();
     }
 
-    if let Some(final_event @ OutboundEvent::Final { status, .. }) = events.last() {
-        // Under `--json`, project the real final frame into one buffered turn
-        // object (reply, status, and approval metadata) rather than the
-        // streamed/human trailer (#485, #2108). Emit BEFORE any exit so a
-        // classified failure still carries its data to the consumer.
-        if json {
-            let output = SkillMessageOutput::from_final(std::mem::take(&mut reply), final_event)
-                .expect("the matched outbound event is final");
-            ui.emit(&output);
-            return Ok(*status == SessionStatus::ClassifiedFailure);
-        }
+    if let Some(final_event @ OutboundEvent::Final { status, text, .. }) = events.last() {
         // Close the streamed answer on stdout only if the last thing written was
         // un-terminated token text; if a note already added its own newline (or
         // the last token ended in one) skip it to avoid a blank line. The status
-        // trailer is a diagnostic -> stderr.
+        // trailer is rendered by the caller after success.
         if streamed && !at_line_start {
             ui.print_tokens("\n");
         }
-        ui.note(&format!("-- final ({})", status_str(status)));
-        return Ok(*status == SessionStatus::ClassifiedFailure);
+        if *status == SessionStatus::ClassifiedFailure {
+            let detail = text.trim();
+            let message = if detail.is_empty() {
+                "runner turn ended with classified-failure".to_string()
+            } else {
+                format!("runner turn ended with classified-failure: {detail}")
+            };
+            return Err(crate::exit::CliError::failure(message).into());
+        }
+        return SkillMessageOutput::from_final(reply, final_event)
+            .context("runner stream ended without a final frame");
     }
-    Ok(false)
+    bail!("runner stream ended without a final frame")
 }
 
-/// Output of `skill message` under `--json`: the full buffered reply, final
-/// session status, and approval metadata copied from the runner's final frame.
-/// The human path streams tokens live and never builds this; it exists so
-/// `--json` emits one complete object instead of empty stdout (#485, #2108).
+/// Successful streamed turn result with the full reply, final session status,
+/// and approval metadata. Human answer tokens already streamed in send, so
+/// rendering this result adds only the final status.
 #[derive(Debug)]
 pub struct SkillMessageOutput {
     pub reply: String,
@@ -4184,7 +4170,6 @@ impl crate::ui::CliOutput for SkillMessageOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        ui.answer(&self.reply);
         ui.note(&format!("-- final ({})", self.status));
     }
 }
@@ -5113,7 +5098,8 @@ pub struct DeployOpts {
     /// the workspace field so the server can carry the previous value forward.
     pub workspace: WorkspaceIntent,
     /// None means the caller did not pass --env, so a declared target may
-    /// supply it. An explicit flag still wins (ADR-0089).
+    /// supply it. Without a target, cluster deploy infers the sole active
+    /// environment. An explicit flag still wins (ADR-0089).
     pub env: Option<DeployEnv>,
     pub label: Option<String>,
     /// Per-agent connector secret NAMES to bind on deploy (ADR-0009, #429). Each
@@ -5603,19 +5589,12 @@ async fn prepare_deploy_with_commit_sha(
         None => None,
     };
 
-    // A target states its environment, which is the point: the flag's `dev`
-    // default is what let a prod workflow deploy to dev in silence (#1166).
-    let env_owned = opts
+    // A target states its environment. An explicit flag still wins, and an
+    // omitted environment is resolved after the agent lookup below (#3504).
+    let requested_env = opts
         .env
         .map(|e| e.as_str().to_string())
-        .or_else(|| resolved.as_ref().map(|r| r.env.clone()))
-        .unwrap_or_else(|| "dev".to_string());
-    let env = env_owned.as_str();
-    ui.note(&format!(
-        "deploying {plugin_name} ({} bytes) to {} [{env}]",
-        archive.len(),
-        opts.api_url,
-    ));
+        .or_else(|| resolved.as_ref().map(|r| r.env.clone()));
 
     // Resolve each --secret NAME to a value (env wins, else the host vault) so
     // the connector secret is bound on the agent for the worker to forward into
@@ -5734,6 +5713,70 @@ async fn prepare_deploy_with_commit_sha(
             &channel,
             opts.tier,
         )?;
+        let env = if opts.tier == DeployTier::Cluster && (opts.env.is_some() || resolved.is_none())
+        {
+            let deployments = client.list_deployments(&agent.id).await?;
+            let active_environments: BTreeSet<&str> = deployments
+                .iter()
+                .filter(|deployment| deployment.status == "active")
+                .map(|deployment| deployment.environment.as_str())
+                .collect();
+            match requested_env {
+                Some(env) => {
+                    if !active_environments.is_empty()
+                        && !active_environments.contains(env.as_str())
+                    {
+                        let current = active_environments
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let additional = if active_environments.len() == 1 {
+                            "a second environment"
+                        } else {
+                            "another environment"
+                        };
+                        ui.note(&format!(
+                            "explicit environment {env} differs from the current active \
+                             environment {current} of agent {agent_name}; creating {additional}"
+                        ));
+                    }
+                    env
+                }
+                None => match active_environments.len() {
+                    0 => "dev".to_string(),
+                    1 => {
+                        let env = active_environments
+                            .first()
+                            .expect("one active environment")
+                            .to_string();
+                        ui.note(&format!(
+                            "inferred environment {env} from the active deployments of agent \
+                             {agent_name}"
+                        ));
+                        env
+                    }
+                    _ => {
+                        return Err(crate::exit::usage(format!(
+                            "agent {agent_name} has active deployments in multiple environments \
+                             ({}); pass --env or --target to choose the deployment environment",
+                            active_environments
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                },
+            }
+        } else {
+            requested_env.unwrap_or_else(|| "dev".to_string())
+        };
+        ui.note(&format!(
+            "deploying {plugin_name} ({} bytes) to {} [{env}]",
+            archive.len(),
+            opts.api_url,
+        ));
         client
             .prepare_deploy(
                 agent,
@@ -5747,10 +5790,11 @@ async fn prepare_deploy_with_commit_sha(
                 opts.workspace,
             )
             .await
+            .map(|outcome| (outcome, env))
     }
     .await;
-    let outcome = match prepared {
-        Ok(outcome) => outcome,
+    let (outcome, env) = match prepared {
+        Ok(prepared) => prepared,
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
@@ -5766,7 +5810,7 @@ async fn prepare_deploy_with_commit_sha(
         outcome,
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         requested_repo: opts.repo,
         deploy_targets_yaml,
         connect_hint: opts.connect_hint,
@@ -6504,6 +6548,11 @@ pub enum ResetThreadOutput {
         /// release the sandbox within the wait window (#735). False means the
         /// release is still pending -- queued, but not yet confirmed drained.
         released: bool,
+        /// The API reported that the drained reset found a route and released
+        /// it (#3699). `None` when it reported nothing (an older API, or the
+        /// outcome expired, or the release is still pending). A reset that
+        /// matched no route is an error, never a `Done`.
+        route_existed: Option<bool>,
     },
 }
 
@@ -6516,8 +6565,15 @@ impl crate::ui::CliOutput for ResetThreadOutput {
                 thread_key,
                 requested,
                 released,
+                route_existed,
             } => {
-                serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released})
+                let mut out = serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released});
+                // Present only when the API reported the outcome, so an older API
+                // leaves the payload exactly as it was.
+                if let Some(route_existed) = route_existed {
+                    out["route_existed"] = serde_json::json!(route_existed);
+                }
+                out
             }
         }
     }
@@ -6602,9 +6658,13 @@ pub async fn reset_thread(
     // unconfirmed, still pending".
     let wait = cl.step("waiting for the sandbox to be released");
     let deadline = Instant::now() + RESET_RELEASE_TIMEOUT;
+    let mut route_existed = None;
     let released = loop {
         match client.thread_reset_state(&agent.id, &thread_key).await {
-            Ok(state) if !state.requested => break true,
+            Ok(state) if !state.requested => {
+                route_existed = state.route_existed;
+                break true;
+            }
             Ok(_) => {}
             Err(_) => break false,
         }
@@ -6613,6 +6673,19 @@ pub async fn reset_thread(
         }
         tokio::time::sleep(RESET_RELEASE_POLL_INTERVAL).await;
     };
+    // The worker drained the reset but the key matched no route, so nothing was
+    // released and the sandbox the operator meant to free is still claimed
+    // (#3699). Say so rather than print "released".
+    if released && route_existed == Some(false) {
+        wait.fail("no route matched");
+        return Err(crate::exit::CliError::usage(
+            "no route matched this thread key; nothing was released",
+        )
+        .with_fix(
+            "check the thread key; a named bot's key carries its identity as its own segment (kind:identity:channel:conversation)",
+        )
+        .into());
+    }
     if released {
         wait.done("released");
     } else {
@@ -6624,6 +6697,7 @@ pub async fn reset_thread(
         thread_key,
         requested: true,
         released,
+        route_existed,
     })
 }
 
@@ -9559,7 +9633,11 @@ pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
 }
 
 /// `skill hook fire`: run the named hook against the local runner. No run row.
-pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+pub async fn skill_hook_fire(
+    plugin_dir: &Path,
+    name: &str,
+    url: Option<String>,
+) -> Result<SkillMessageOutput> {
     let prompt = hook_prompt(plugin_dir, name)?;
     send(&prompt, "hook", SendType::Job.into(), url, false).await
 }
@@ -14114,7 +14192,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     if let Some(runner) = &decl.runner {
         cb::check_runner_source(&plugin_dir, runner)?;
     }
-    if !on_path("docker") {
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -14662,10 +14740,32 @@ async fn run_registry_preflight(
     }
     let node_archs = node_architectures(&out);
 
+    // The registry is read natively first, so a host without docker can still
+    // deploy (#3503); docker, when present, is the fallback that honors a
+    // registry login.
+    let docker = crate::ops::on_path("docker");
     for entry in targets {
-        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
-        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
-        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+        let inspect = match crate::oci_registry::fetch_manifest(&entry.image).await {
+            Ok(manifest) => Ok(String::from_utf8_lossy(&manifest.raw).into_owned()),
+            Err(native) if docker => {
+                let (ok, raw, err) =
+                    crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+                if ok {
+                    Ok(raw)
+                } else {
+                    Err(format!("{native:#}; docker also failed: {}", err.trim()))
+                }
+            }
+            Err(native) => Err(format!(
+                "{native:#}, and `docker` is not on PATH to ask with a registry login"
+            )),
+        };
+        registry_preflight(
+            &entry.image,
+            inspect.as_deref().map_err(Clone::clone),
+            &node_archs,
+            &entry.platforms,
+        )?;
     }
     Ok(())
 }
@@ -14927,7 +15027,15 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
+    let caller_key = crate::connector_caller::generate_keypair()?;
+    let overlay = cb::compose_overlay(
+        lock,
+        decl,
+        identity,
+        project,
+        plugin_dir,
+        Some(&caller_key.verify_key),
+    )?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
@@ -15110,6 +15218,7 @@ async fn start_skill_connectors(
                 cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
             }
         }
+        let caller_key = crate::connector_caller::generate_keypair()?;
         let start = docker::ConnectorStartSpec::from_declaration(
             connector,
             spec,
@@ -15119,6 +15228,7 @@ async fn start_skill_connectors(
             project,
             plugin_dir,
             &secret_values,
+            Some(&caller_key.verify_key),
         )?;
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await

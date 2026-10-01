@@ -723,7 +723,8 @@ def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
         "@modelcontextprotocol/server-github@2025.4.8"
     ]
     assert _dockerfile_global_npm_operands(dark_factory) == [
-        "@modelcontextprotocol/server-github@2025.4.8"
+        "@modelcontextprotocol/server-github@2025.4.8",
+        "pnpm@9.15.9",
     ]
     assert _dockerfile_global_npm_operands(mean_tester) == [
         "@zencoderai/slack-mcp-server@0.0.1",

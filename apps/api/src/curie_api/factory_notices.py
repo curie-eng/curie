@@ -95,6 +95,10 @@ _CAUSE_TEXT = {
         "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
     ),
     "runner_timeout": "the run took longer than its time limit.",
+    "sandbox_terminated": (
+        "the sandbox terminated before the run finished. Check the Kubernetes "
+        "reason below, then retry after addressing the sandbox failure."
+    ),
     "workspace_error": "the repository workspace could not be prepared for the run.",
     "history_capacity": (
         "conversation history capacity exceeded. Work may have happened. "
@@ -111,8 +115,8 @@ _CAUSE_TEXT = {
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
-        "the requested approval could not be created. Check the publication "
-        "request or approval service, then retry."
+        "the publication request was refused, so no pull request was opened. "
+        "Read the details for the reason, fix it, then retry."
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
@@ -142,8 +146,10 @@ _CAUSE_TEXT = {
     ),
 }
 
-# The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
-_CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+# Infrastructure and CI causes carry details, not a provider message.
+_DETAIL_CAUSES = frozenset(
+    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
@@ -153,7 +159,7 @@ _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
 # Failed runs that still need a person, including the classes that used to
 # collapse into runner_escalated (#3401). The status card reads this set.
 NEEDS_HUMAN_CAUSES = frozenset(
-    {"runner_escalated", "unclassified", "max_turns", "ci_failed"}
+    {"runner_escalated", "sandbox_terminated", "unclassified", "max_turns", "ci_failed"}
 )
 
 
@@ -173,6 +179,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "model_error": "server-error",
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
+    "sandbox_terminated": "sandbox-terminated",
     "workspace_error": "workspace-error",
 }
 _BACKTICK_RUN = re.compile(r"`+")
@@ -270,8 +277,13 @@ def result_section(
         text = f"Could not complete: {cause_text(cause)}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
+        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+            # The API refusal can quote caller-supplied paths (#3617): one line,
+            # so it cannot add a ``Cause:`` line, and no HTML comment opener.
+            inert = _break_html_comments(" ".join(detail.split()))
+            text += f"Details: {inert}\n"
         elif cause != "history_capacity" and detail is not None and detail.strip():
-            label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
+            label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
         failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
@@ -282,6 +294,10 @@ def result_section(
     return text
 
 
+def _break_html_comments(text: str) -> str:
+    return text.replace("<!--", "<\u200b!--")
+
+
 def _agent_message_block(message: str) -> str:
     """The agent's last message, fenced so GitHub renders none of it.
 
@@ -290,7 +306,7 @@ def _agent_message_block(message: str) -> str:
     broken because the marker scan reads the raw body.
     """
 
-    message = message.replace("<!--", "<\u200b!--")
+    message = _break_html_comments(message)
     longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"

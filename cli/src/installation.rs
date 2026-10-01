@@ -338,7 +338,40 @@ impl Installation {
             .into());
         }
         for (key, value) in &self.set {
+            if !valid_helm_set_path(key) {
+                bail!(
+                    "set key `{key}` is not a safe Helm value path. Use dot-separated ASCII \
+                     letters, digits, `_` or `-`, with optional numeric indexes such as \
+                     `worker.extraEnv[0].name`."
+                );
+            }
             let trimmed = value.trim();
+            if !trimmed.is_empty() && is_inline_extra_env_value_key(key) {
+                bail!(
+                    "set.{key} cannot carry an inline extraEnv value because curie.yaml is \
+                     committed and an opaque value cannot be proven non-secret. Use a modeled \
+                     chart field for ordinary configuration or valueFrom.secretKeyRef for a \
+                     credential."
+                );
+            }
+            if !trimmed.is_empty()
+                && !is_supported_empty_secret_clear(key, value)
+                && (set_key_is_secret_bearing(key)
+                    || otel_workload_headers_are_sensitive(key, trimmed))
+            {
+                bail!(
+                    "set.{key} is a secret-bearing chart key and cannot carry an inline value. \
+                     This file is committed -- use a modeled credential field that names an \
+                     environment variable or Curie secret, or use an empty string to clear it."
+                );
+            }
+            if let Some(prefix) = secret_prefix(trimmed) {
+                bail!(
+                    "set.{key} looks like a secret VALUE (starts with `{prefix}`) and cannot be \
+                     committed in curie.yaml. Put the value in the environment or `curie secrets \
+                     set`, then use a modeled credential field that names it."
+                );
+            }
             if ["true", "false", "null"]
                 .iter()
                 .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
@@ -402,20 +435,17 @@ impl Installation {
     /// false positive would reject a legitimate variable name, and this is a
     /// guard rail, not the security boundary. `gitleaks` in CI remains that.
     fn reject_secret_shaped(value: &Option<String>, field: &str) -> Result<()> {
-        const SECRET_PREFIXES: &[&str] = &["sk-", "xoxb-", "xapp-", "ghp_", "github_pat_"];
         let Some(v) = value else { return Ok(()) };
         let trimmed = v.trim();
         if trimmed.is_empty() {
             bail!("{field} must name a variable, not be empty");
         }
-        for prefix in SECRET_PREFIXES {
-            if trimmed.starts_with(prefix) {
-                bail!(
-                    "{field} looks like a secret VALUE (starts with `{prefix}`), not the \
-                     NAME of a variable holding one. This file is committed -- put the \
-                     value in the environment or `curie secrets set`, and name it here."
-                );
-            }
+        if let Some(prefix) = secret_prefix(trimmed) {
+            bail!(
+                "{field} looks like a secret VALUE (starts with `{prefix}`), not the \
+                 NAME of a variable holding one. This file is committed -- put the \
+                 value in the environment or `curie secrets set`, and name it here."
+            );
         }
         Ok(())
     }
@@ -478,7 +508,14 @@ impl Installation {
     pub fn helm_set_strings(&self) -> Vec<String> {
         self.set
             .iter()
-            .map(|(key, value)| format!("{key}={value}"))
+            .map(|(key, value)| {
+                let value = if is_supported_empty_secret_clear(key, value) {
+                    value.clone()
+                } else {
+                    crate::ops::escape_helm_set_string_value(value)
+                };
+                format!("{key}={value}")
+            })
             .collect()
     }
 
@@ -513,6 +550,173 @@ impl Installation {
         }
         names
     }
+}
+
+fn secret_prefix(value: &str) -> Option<&'static str> {
+    const SECRET_PREFIXES: &[&str] = &["sk-", "xoxb-", "xapp-", "ghp_", "github_pat_"];
+    SECRET_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| value.starts_with(prefix))
+}
+
+/// A single Helm values path, excluding every character that can start a
+/// second assignment in the `--set-string` grammar. Dots retain their normal
+/// path meaning and numeric indexes keep array-valued chart settings usable.
+fn valid_helm_set_path(key: &str) -> bool {
+    fn valid_segment(segment: &str) -> bool {
+        let bytes = segment.as_bytes();
+        let mut index = 0;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric()
+                || bytes[index] == b'_'
+                || bytes[index] == b'-')
+        {
+            index += 1;
+        }
+        if index == 0 {
+            return false;
+        }
+        while index < bytes.len() {
+            if bytes[index] != b'[' {
+                return false;
+            }
+            index += 1;
+            let digits = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if index == digits || bytes.get(index) != Some(&b']') {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    !key.is_empty() && key.split('.').all(valid_segment)
+}
+
+/// `set:` is an escape hatch for unmodeled chart settings, not a second secret
+/// transport. Refuse key shapes that conventionally hold material while still
+/// allowing reference fields such as `existingSecret`, `secretName`, and
+/// `secretKey` to name Kubernetes Secret resources and entries.
+fn set_key_is_secret_bearing(key: &str) -> bool {
+    if is_current_secret_name_reference_key(key) {
+        return false;
+    }
+    let reference_leaf = crate::ops::is_external_secret_ref_key(key)
+        || crate::ops::is_grafana_connector_reference_key(key);
+    let segments = key.split('.').collect::<Vec<_>>();
+    segments.iter().enumerate().any(|(index, segment)| {
+        if reference_leaf && index + 1 == segments.len() {
+            return false;
+        }
+        let name = segment
+            .split_once('[')
+            .map_or(*segment, |(name, _)| name)
+            .to_ascii_lowercase();
+        name.contains("credential")
+            || name.ends_with("token")
+            || name.ends_with("password")
+            || name.ends_with("secret")
+            || name.ends_with("secrets")
+            || name.ends_with("privatekey")
+            || name.ends_with("apikey")
+            || name.ends_with("encryptionkey")
+            || name.ends_with("accesskey")
+            || name.ends_with("secretkey")
+            || name.ends_with("signingkey")
+            || name.ends_with("authheader")
+            || name_is_sensitive_header(&name)
+            || name == "salt"
+    })
+}
+
+/// Secret resource names are safe declarations, but only for chart paths that
+/// currently consume them as Kubernetes references. Keep this allowlist
+/// narrower than the generic `*Secret` spelling so value maps such as
+/// `agentSandbox.connectorSecrets` still fail closed.
+fn is_current_secret_name_reference_key(key: &str) -> bool {
+    if key == "api.migrate.provenanceDeclarationsSecret" {
+        return true;
+    }
+
+    const IMAGE_PULL_SECRET_ROOTS: &[&str] = &[
+        "api",
+        "dispatcher",
+        "mailAdapter",
+        "worker",
+        "ui",
+        "agentSandbox.runner",
+    ];
+    IMAGE_PULL_SECRET_ROOTS.iter().any(|root| {
+        let Some(index_and_name) = key.strip_prefix(&format!("{root}.imagePullSecrets[")) else {
+            return false;
+        };
+        let Some(index) = index_and_name.strip_suffix("].name") else {
+            return false;
+        };
+        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Mirror the chart's sensitive-header name vocabulary from `_helpers.tpl`.
+/// Header names commonly use `-`/`_`, so suffix checks alone miss
+/// `Authorization`, `Proxy-Authorization`, and `X-API-Key`.
+fn name_is_sensitive_header(name: &str) -> bool {
+    let words = name.split(['-', '_']).collect::<Vec<_>>();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "authorization" | "token" | "secret" | "password" | "credential"
+        )
+    }) || words.windows(2).any(|pair| pair == ["api", "key"])
+        || name == "apikey"
+}
+
+/// `otelCollector.headers` is one comma/semicolon/whitespace-delimited string,
+/// so its secret-bearing name lives in the value instead of the Helm path.
+/// Mirror the workload-header regex in the chart helper.
+fn otel_workload_headers_are_sensitive(key: &str, value: &str) -> bool {
+    key == "otelCollector.headers"
+        && value
+            .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+            .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+            .map(str::to_ascii_lowercase)
+            .any(|name| name_is_sensitive_header(&name))
+}
+
+/// This exact empty object is the chart's typed clear for the worker credential
+/// map. It carries no credential material, while admitting any other object on
+/// the same path would reopen the committed-inline-secret lane.
+fn is_supported_empty_secret_clear(key: &str, value: &str) -> bool {
+    key == "worker.adapterCredentials" && value == "{}"
+}
+
+fn is_inline_extra_env_value_key(key: &str) -> bool {
+    fn is_indexed_extra_env(segment: &str) -> bool {
+        let Some(mut suffix) = segment.strip_prefix("extraEnv") else {
+            return false;
+        };
+        let mut saw_index = false;
+        while let Some(after_open) = suffix.strip_prefix('[') {
+            let Some((index, rest)) = after_open.split_once(']') else {
+                return false;
+            };
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return false;
+            }
+            saw_index = true;
+            suffix = rest;
+        }
+        saw_index && suffix.is_empty()
+    }
+
+    let segments = key.split('.').collect::<Vec<_>>();
+    segments.windows(2).any(|pair| {
+        is_indexed_extra_env(pair[0]) && (pair[1] == "value" || pair[1].starts_with("value["))
+    })
 }
 
 /// Chart keys `set:` still accepts as strings, mapped to the modeled field that
@@ -2802,42 +3006,219 @@ mod diff_tests {
         }
     }
 
-    #[tokio::test]
-    async fn explicit_model_credential_set_survives_the_environment() {
-        let local = {
-            let _lock = crate::PROCESS_ENV_LOCK.lock().await;
-            let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
-            env.set(
-                "CURIE_MODEL_CREDENTIALS",
-                "model credential from environment",
+    #[test]
+    fn nonempty_inline_secret_set_paths_are_rejected() {
+        // Current chart inline credential fields. ExistingSecret/Key siblings
+        // name Kubernetes Secret resources and remain legitimate declarations.
+        for key in [
+            "agentSandbox.runner.credentials",
+            "api.githubToken",
+            "dispatcher.slack.appToken",
+            "dispatcher.slack.botToken",
+            "dispatcher.slack.signingSecret",
+            "sealing.privateKey",
+            "sealing.previousPrivateKey",
+            "mailAdapter.agentmail.apiKey",
+            "mailAdapter.channelToken",
+            "mailAdapter.egressSecret",
+            "worker.adapterCredentials",
+            "postgres.auth.password",
+            "valkey.password",
+            "rustfs.auth.accessKey",
+            "rustfs.auth.secretKey",
+            "langfuse.encryptionKey",
+            "langfuse.nextauthSecret",
+            "connectorCaller.signingKey",
+            "api.githubToken[0]",
+            "worker.adapterCredentials.acme",
+            "agentSandbox.connectorSecrets.acme.GRAFANA_TOKEN",
+            "agentSandbox.connectorSecrets.acme.APIExistingSecret",
+            "custom.imagePullSecrets[0].name",
+            "api.migrate.provenanceDeclarationsSecret.value",
+            "otelCollector.otlpAuthHeader",
+            "otelCollector.extraExporters.backend.headers.Authorization",
+            "otelCollector.extraExporters.backend.headers.Proxy-Authorization",
+            "otelCollector.extraExporters.backend.headers.X-API-Key",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  {key}: opaque-placeholder\n"
             );
-            let cfg = Installation::parse(concat!(
-                "version: 1\n",
-                "install:\n",
-                "  namespace: acme\n",
-                "  release: acme\n",
-                "credentials:\n",
-                "  model: CURIE_MODEL_CREDENTIALS\n",
-                "set:\n",
-                "  agentSandbox.runner.credentials: model credential from set\n",
-            ))
-            .expect("configuration parses");
-            plan_installation(cfg, true).expect("installation plans")
-        };
+            assert!(
+                Installation::parse(&config).is_err(),
+                "{key} must not accept an inline credential in set"
+            );
+        }
+    }
 
-        // `Skip`: this fixture's `up.chart` is empty, so a probe would shell out
-        // to a real `kubectl` and `helm template ""`.
-        let plan = complete_installation_plan(local, StatefulProbe::Skip)
-            .await
-            .expect("completed plan");
+    #[test]
+    fn the_empty_worker_credential_map_remains_a_clear_not_an_inline_secret() {
+        let config = concat!(
+            "version: 1\n",
+            "install:\n  namespace: acme\n  release: acme\n",
+            "set:\n  worker.adapterCredentials: '{}'\n",
+        );
+        let cfg = Installation::parse(config)
+            .expect("the chart's typed empty worker credential map remains supported");
+        assert_eq!(cfg.helm_set_strings(), ["worker.adapterCredentials={}"]);
+
+        for value in [
+            "{\"mail-adapter\":\"opaque-placeholder\"}",
+            "{ }",
+            " {} ",
+            "[]",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  worker.adapterCredentials: {value:?}\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "only the exact empty-object clear may use the inline credential-map path: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_shaped_values_are_rejected_on_unmodeled_set_paths() {
+        for value in [
+            "sk-ant-placeholder",
+            "xoxb-placeholder",
+            "xapp-placeholder",
+            "ghp_placeholder",
+            "github_pat_placeholder",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  example.label: {value}\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "token-shaped value must not bypass validation through example.label"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_header_strings_reject_sensitive_names_and_allow_benign_metadata() {
+        for value in [
+            "Authorization=Bearer opaque-placeholder",
+            "tenant=acme;token=opaque-placeholder",
+            "tenant=acme, API-Key=opaque-placeholder",
+            "tenant=acme,X-API-Key=opaque-placeholder",
+            "tenant=acme,X_API_KEY=opaque-placeholder",
+            "tenant=acme;Proxy-Authorization=opaque-placeholder",
+            "tenant=acme X-Auth-Token=opaque-placeholder",
+            "tenant=acme;client-secret=opaque-placeholder",
+            "tenant=acme password=opaque-placeholder",
+            "tenant=acme,backend_credential=opaque-placeholder",
+            "tenant=acme\nAuthorization=opaque-placeholder",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  otelCollector.headers: {value:?}\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "sensitive OTLP workload header was accepted: {value}"
+            );
+        }
+
+        for value in [
+            "tenant=acme",
+            "x-tenant-id=acme;region=us-west",
+            "X-Request-ID=placeholder traceparent=placeholder tokenizer=plain",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  otelCollector.headers: {value:?}\n"
+            );
+            Installation::parse(&config)
+                .unwrap_or_else(|error| panic!("benign workload header was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn set_values_are_escaped_as_one_helm_assignment() {
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n  namespace: acme\n  release: acme\n",
+            "set:\n  example.label: 'plain,api.githubToken=opaque'\n",
+        ))
+        .expect("ordinary string override parses");
 
         assert_eq!(
-            plan.desired
-                .get(crate::ops::MODEL_CREDENTIAL_KEY)
-                .map(String::as_str),
-            Some("model credential from set"),
-            "the explicit set value must remain in the desired map"
+            cfg.helm_set_strings(),
+            [r"example.label=plain\,api.githubToken=opaque"]
         );
+    }
+
+    #[test]
+    fn set_keys_cannot_inject_a_second_helm_assignment() {
+        for key in [
+            "example.label,api.githubToken",
+            "example.label=ignored,api.githubToken",
+            r"example\.label",
+            "example.{label}",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  '{key}': opaque-placeholder\n"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "unsafe Helm path {key:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_reference_set_paths_remain_allowed() {
+        for key in [
+            "api.githubTokenExistingSecret",
+            "api.githubTokenExistingSecretKey",
+            "mailAdapter.channelTokenExistingSecret",
+            "mailAdapter.channelTokenExistingSecretKey",
+            "grafanaConnector.secretName",
+            "grafanaConnector.secretKey",
+            "api.migrate.provenanceDeclarationsSecret",
+            "api.imagePullSecrets[0].name",
+            "dispatcher.imagePullSecrets[0].name",
+            "mailAdapter.imagePullSecrets[0].name",
+            "worker.imagePullSecrets[0].name",
+            "ui.imagePullSecrets[0].name",
+            "agentSandbox.runner.imagePullSecrets[0].name",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n  {key}: reference-name\n"
+            );
+            Installation::parse(&config)
+                .unwrap_or_else(|error| panic!("{key} reference was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn extra_env_rejects_all_inline_values_but_allows_secret_references() {
+        for entries in [
+            "  worker.extraEnv[0].name: GITHUB_TOKEN\n  worker.extraEnv[0].value: opaque-placeholder\n",
+            "  worker.extraEnv[0].name: GITHUB_PAT\n  worker.extraEnv[0].value: opaque-placeholder\n",
+            "  worker.extraEnv[0].name: AUTHORIZATION\n  worker.extraEnv[0].value: opaque-placeholder\n",
+            "  worker.extraEnv[0].name: PROVIDER_BASE_URL\n  worker.extraEnv[0].value: https://provider.example.com/v1\n",
+            "  worker.extraEnv[0].name: GITHUB_PAT\n  worker.extraEnv[0].value[0]: opaque-placeholder\n",
+            "  worker.extraEnv[0][0].value: opaque-placeholder\n",
+            "  api.extraEnv[0].value: opaque-placeholder\n",
+        ] {
+            let config = format!(
+                "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n{entries}"
+            );
+            assert!(
+                Installation::parse(&config).is_err(),
+                "inline or unbound extraEnv value was accepted"
+            );
+        }
+
+        let reference = concat!(
+            "version: 1\ninstall:\n  namespace: acme\n  release: acme\nset:\n",
+            "  worker.extraEnv[0].name: GITHUB_TOKEN\n",
+            "  worker.extraEnv[0].valueFrom.secretKeyRef.name: provider-secret\n",
+            "  worker.extraEnv[0].valueFrom.secretKeyRef.key: token\n",
+        );
+        Installation::parse(reference)
+            .unwrap_or_else(|error| panic!("safe extraEnv declaration was rejected: {error}"));
     }
 
     #[test]

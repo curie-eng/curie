@@ -20,7 +20,12 @@ named as its own prerequisite. Changes no isolation boundary:
 > `spike/adr-0121-restore-executor`.
 
 ADR-0117 states, in its consequences, that a snapshot's secrets "pass through the
-existing redaction path". **That is not true today, in either direction.**
+existing redaction path, which means some resources are honestly not snapshot-able
+and must report themselves irreversible rather than storing credentials in the
+control plane". **The redaction path it names does not cover a snapshot today, in
+either direction.** Its fallback does hold, and this ADR keeps it: a connector
+with no usable sealing key reports its actions irreversible (decision 3), which is
+ADR-0117's own answer applied per connector.
 
 [`packages/telemetry/src/curie_telemetry/redact.py`](../../packages/telemetry/src/curie_telemetry/redact.py)
 declares its own scope in one line: `REDACTION_BOUNDARIES = ("stdout",
@@ -108,13 +113,20 @@ conflict check compares a version token instead of a state.**
 4. **The conflict check compares a version token.** A sealed box is
    non-deterministic, so ciphertexts of the same state differ and ADR-0117's
    state comparison cannot survive sealing. The connector reports the version its
-   call left -- `resourceVersion`, an ETag, a generation counter -- and an undo
-   carries the version observed now. The platform compares two opaque strings.
+   call left, a token that moves when the state the action wrote moves (for
+   example `metadata.generation` on a Kubernetes object with a spec and a status,
+   an ETag, or a generation counter), and an undo carries the version observed
+   now. The platform compares two opaque strings.
 
    This is a better question than state equality, not merely a compatible one. It
    catches a change that reverted to the same value, which a state comparison
-   silently permits, and it does not false-positive on fields that churn on their
-   own.
+   silently permits. It avoids a false positive on fields that churn on their own
+   only when the token ignores them, so the tokens are not interchangeable.
+   `metadata.generation` moves on a spec change and not on a controller's status
+   write. `resourceVersion` moves on every write to the object, status included,
+   so a connector that reported it would refuse the undo of a Deployment whose
+   spec nobody touched. Choosing the token that tracks what the action changed is
+   the connector's job, since only the connector knows the resource.
 
 5. **A resource with no version token has no conflict check, and its actions are
    not undoable.** Deny-by-default, the same rule the rest of this design runs
