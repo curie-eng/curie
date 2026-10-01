@@ -194,7 +194,7 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
         printf '%s\n' 'Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress' >&2
         exit 1
     fi
-    if { [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; } && { [ "$gvisor_mode" = "require" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "false" ]; }; }; then
+    if { [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-retry" ] || [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; } && { [ "$gvisor_mode" = "require" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "false" ]; }; }; then
         : > "$CURIE_TEST_HELM_PENDING"
         graceful_exit() {
             signal="$1"
@@ -375,6 +375,33 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
         *)
             # The general cluster-up admission observer lists namespaced Events
             # as JSON. Keep this independent from the gVisor preflight stream.
+            case "$CURIE_TEST_EVENT_MODE" in
+                stale-preflight-retry|stale-preflight-rerun|stale-preflight-workload)
+                    if [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-retry" ] && [ ! -s "${CURIE_TEST_UNINSTALL_LOG:-}" ]; then
+                        printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[]}'
+                        exit 0
+                    fi
+                    preflight_count_file="${CURIE_TEST_EVENT_LOG}.preflight-count"
+                    count=0
+                    if [ -f "$preflight_count_file" ]; then
+                        count=$(cat "$preflight_count_file")
+                    fi
+                    count=$((count + 1))
+                    printf '%s\n' "$count" > "$preflight_count_file"
+                    printf '%s%s%s' \
+                        '{"apiVersion":"v1","kind":"EventList","items":[{"metadata":{"uid":"stale-preflight-event-uid","namespace":"target-namespace","creationTimestamp":"2026-09-30T12:00:00Z"},"involvedObject":{"kind":"Job","namespace":"target-namespace","name":"acme-runtime-preflight-gvisor","uid":"stale-preflight-job-uid"},"reason":"FailedCreate","message":"Error creating: pods \"acme-runtime-preflight-gvisor-\" is forbidden: pod rejected: RuntimeClass \"gvisor\" not found","count":' \
+                        "$count" \
+                        ',"lastTimestamp":"2026-09-30T12:00:00Z"}'
+                    if [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-workload" ]; then
+                        printf '%s%s%s' \
+                            ',{"metadata":{"uid":"workload-failed-create-uid","namespace":"target-namespace","creationTimestamp":"2026-09-30T12:00:00Z"},"involvedObject":{"kind":"ReplicaSet","namespace":"target-namespace","name":"acme-worker-controller-7f68c9","uid":"workload-replicaset-uid"},"reason":"FailedCreate","message":"Error creating: pods \"acme-worker-controller-7f68c9\" is forbidden: serviceaccount \"target-namespace:acme-worker-controller\" not found","count":' \
+                            "$count" \
+                            ',"lastTimestamp":"2026-09-30T12:00:00Z"}'
+                    fi
+                    printf '%s\n' ']}'
+                    exit 0
+                    ;;
+            esac
             printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[]}'
             exit 0
             ;;
@@ -407,10 +434,14 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
             printf 'unexpected Event UID snapshot invocation: %s\n' "$*" >&2
             exit 64
         fi
-        if [ "$CURIE_TEST_EVENT_MODE" = "matching" ]; then
+        if [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-retry" ]; then
             printf '%s\n' 'existing-event-uid'
         fi
         exit 0
+    fi
+    if [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-rerun" ] || [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-workload" ]; then
+        printf '%s\n' 'a stale preflight rerun does not render the gVisor Job, so a dedicated watch is unexpected' >&2
+        exit 64
     fi
     if [ "$watch" != "true" ] || [ "$watch_only" = "true" ] || [ "$output_watch_events" != "true" ] || [ "$combined_jsonpath" != "true" ] || [ "$unit_separator_jsonpath" != "true" ]; then
         printf 'unexpected list and watch invocation: %s\n' "$*" >&2
@@ -439,7 +470,7 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
         sleep 30
         exit 0
     fi
-    if [ "$CURIE_TEST_EVENT_MODE" = "matching" ]; then
+    if [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-retry" ]; then
         printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
             'ADDED' 'existing-event-uid' 'Job' 'target-namespace' 'acme-runtime-preflight-gvisor' 'FailedCreate' \
             'Error creating: pods "stale-added-preflight-example" is forbidden: pod rejected: RuntimeClass "stale-added" not found'
@@ -454,7 +485,7 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
         exit 64
     fi
     sleep 0.15
-    if [ "$CURIE_TEST_EVENT_MODE" = "matching" ]; then
+    if [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-retry" ]; then
         printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
             'MODIFIED' 'existing-event-uid' 'Job' 'target-namespace' 'acme-runtime-preflight-gvisor' 'FailedCreate' \
             'Error creating: pods "stale-modified-preflight-example" is forbidden: pod rejected: RuntimeClass "stale-modified" not found'
@@ -472,6 +503,33 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
         "$event_type" "$event_uid" 'Job' 'target-namespace' 'acme-runtime-preflight-gvisor' 'FailedCreate' "$message"
     sleep 30
     exit 0
+fi
+
+if [ "$1" = "get" ] && [ "$2" = "deployments,statefulsets,daemonsets,replicasets,jobs" ]; then
+    case "$CURIE_TEST_EVENT_MODE" in
+        stale-preflight-retry|stale-preflight-rerun|stale-preflight-workload)
+            case " $* " in
+                *" -n target-namespace "*) ;;
+                *)
+                    printf 'unexpected controller list: %s\n' "$*" >&2
+                    exit 64
+                    ;;
+            esac
+            case " $* " in
+                *" -o json "*|*" -o=json "*) ;;
+                *)
+                    printf 'unexpected controller list: %s\n' "$*" >&2
+                    exit 64
+                    ;;
+            esac
+            printf '%s' '{"apiVersion":"v1","kind":"List","items":[{"kind":"Job","metadata":{"name":"acme-runtime-preflight-gvisor","namespace":"target-namespace","uid":"stale-preflight-job-uid","labels":{"app.kubernetes.io/instance":"target-release","app.kubernetes.io/managed-by":"Helm"},"annotations":{"helm.sh/hook":"pre-install,pre-upgrade"}}}'
+            if [ "$CURIE_TEST_EVENT_MODE" = "stale-preflight-workload" ]; then
+                printf '%s' ',{"kind":"Deployment","metadata":{"name":"acme-worker-controller","namespace":"target-namespace","uid":"workload-deployment-uid","annotations":{"meta.helm.sh/release-name":"target-release","meta.helm.sh/release-namespace":"target-namespace"}}},{"kind":"ReplicaSet","metadata":{"name":"acme-worker-controller-7f68c9","namespace":"target-namespace","uid":"workload-replicaset-uid","ownerReferences":[{"controller":true,"kind":"Deployment","name":"acme-worker-controller","uid":"workload-deployment-uid"}]}}'
+            fi
+            printf '%s\n' ']}'
+            exit 0
+            ;;
+    esac
 fi
 
 printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -1463,4 +1521,90 @@ fn apply_refuses_a_pending_only_revision() {
     );
     fixture.assert_no_failed_revision_discard();
     fixture.assert_no_event_watch();
+}
+
+fn assert_general_failed_create_query(fixture: &Fixture) {
+    let invocations = fs::read_to_string(&fixture.event_log).unwrap_or_default();
+    assert!(
+        invocations.lines().any(|line| {
+            (line.contains("get events") || line.contains("get event"))
+                && line.contains("reason=FailedCreate")
+                && !line.contains("involvedObject.name=")
+        }),
+        "the general admission watcher must list FailedCreate events without a Job name selector:\n{invocations}"
+    );
+}
+
+/// Issue #3618: a leftover hook Job must not make the general admission
+/// watcher abort gVisor retry or a later up that no longer renders the Job.
+#[test]
+fn stale_gvisor_preflight_job_does_not_reject_retry_or_rerun() {
+    let retry = Fixture::new("stale-preflight-retry", "foreign", OPENROUTER_CREDENTIAL);
+    let (output, elapsed) = retry.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "a stale preflight Job must not abort the gVisor retry\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the retry must still beat the fake Helm deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
+    );
+    assert_automatic_gvisor_recovery_narration(&shown);
+    assert_eq!(retry.upgrade_count(), 2);
+    assert_eq!(retry.uninstall_count(), 1);
+    retry.assert_failed_revision_discarded_before_retry();
+    retry.assert_graceful_helm_interruption();
+    retry.assert_children_stopped();
+    assert_general_failed_create_query(&retry);
+
+    let rerun = Fixture::new("stale-preflight-rerun", "absent", "");
+    let (output, elapsed) = rerun.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "a later up must ignore a stale preflight FailedCreate\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a nonrendering up must not wait on the stale preflight Job, elapsed {elapsed:?}\nstderr:\n{shown}"
+    );
+    assert_eq!(rerun.upgrade_count(), 1);
+    rerun.assert_no_failed_revision_discard();
+    assert!(
+        !shown.contains("admission rejected"),
+        "a stale preflight Job is not an admission rejection:\n{shown}"
+    );
+    assert_general_failed_create_query(&rerun);
+}
+
+/// Issue #3618: ignoring the stale hook Job must not hide a rendered workload
+/// admission failure that arrives in the same Event list.
+#[test]
+fn rendered_workload_admission_still_rejects_beside_stale_preflight() {
+    let fixture = Fixture::new("stale-preflight-workload", "absent", "");
+    let (output, elapsed) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(
+        !output.status.success(),
+        "a rendered workload FailedCreate must still reject cluster up\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the workload rejection must surface before the fake Helm deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
+    );
+    assert!(
+        shown.contains("admission rejected") && shown.contains("acme-worker-controller-7f68c9"),
+        "the rejection must name the rendered workload ReplicaSet:\n{shown}"
+    );
+    assert!(
+        !shown.contains("unexpected kubectl"),
+        "the rejection must come from admission, not a missing kubectl stub:\n{shown}"
+    );
 }
