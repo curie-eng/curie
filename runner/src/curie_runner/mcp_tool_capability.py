@@ -64,6 +64,7 @@ _CALLER_REFUSALS = {
     "invalid": "this sandbox's caller token is not valid",
     "expired": "this sandbox's caller token has expired",
     "not_admitted": "this agent is not in the connector's admits list",
+    "grant_required": "this sandbox presented no matching connector tool grant",
 }
 
 # Bounded retry for the boot capability probe (#2945). A failed dial is
@@ -370,14 +371,15 @@ async def _server_streams(
     command = config.get("command")
     if isinstance(command, str) and command:
         configured_env = config.get("env")
-        child_env = dict(interpolation_env)
+        from .subprocess_env import shell_and_hook_env
+
+        expanded_config_env: dict[str, str] = {}
         if isinstance(configured_env, Mapping):
-            child_env.update(
-                {
-                    str(key): _expand(str(value), interpolation_env)
-                    for key, value in configured_env.items()
-                }
-            )
+            expanded_config_env = {
+                str(key): _expand(str(value), interpolation_env)
+                for key, value in configured_env.items()
+            }
+        child_env = shell_and_hook_env(interpolation_env, extra=expanded_config_env)
         args = config.get("args")
         parameters = StdioServerParameters(
             command=_expand(command, interpolation_env),

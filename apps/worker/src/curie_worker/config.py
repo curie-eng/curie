@@ -19,6 +19,7 @@ import json
 import os
 import socket
 from typing import Annotated, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -37,14 +38,24 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
-from pydantic import AliasChoices, BeforeValidator, Field, model_validator
+from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
 
 from . import caller_token
+from .publication_validation import normalize_protected_publication_paths
 from .receipt import TurnReceiptMode
+
+
+def github_html_base(api_url: str) -> str:
+    """Derive the forge HTML base from its configured REST API base."""
+
+    parsed = urlsplit(api_url.rstrip("/"))
+    authority = "github.com" if parsed.netloc == "api.github.com" else parsed.netloc
+    path = parsed.path.removesuffix("/api/v3")
+    return urlunsplit((parsed.scheme, authority, path, "", ""))
 
 
 def _default_consumer_name() -> str:
@@ -130,6 +141,37 @@ def _parse_trusted_origins(value: object) -> object:
 # env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
 TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
+
+
+def _parse_publication_protected_paths(value: object) -> object:
+    """Parse ``CURIE_PUBLICATION_PROTECTED_PATHS`` as a JSON array of strings.
+
+    A comma-separated string is rejected. A path may itself contain a comma, and
+    splitting on that comma would protect different paths from the ones the
+    operator listed.
+    """
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings"
+            ) from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError("CURIE_PUBLICATION_PROTECTED_PATHS must be a JSON array of strings")
+        return tuple(parsed)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(part) for part in value)
+    return value
+
+
+PublicationProtectedPaths = Annotated[
+    tuple[str, ...], NoDecode, BeforeValidator(_parse_publication_protected_paths)
+]
 
 # Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
 # three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
@@ -422,6 +464,14 @@ class WorkerConfig(BaseSettings):
     # DO NOT CHANGE -- ADR-0039 stands, and weakening the cap is the #505 total
     # stall regression, not a simplification.
     max_delivery: int = Field(default=5, ge=2, validation_alias="CURIE_MAX_DELIVERY")
+    # Turns one worker runs at once on the runs lane (#760): the consumer's
+    # capacity semaphore, and so how many sandboxes one worker can hold busy.
+    # The chart renders it from worker.maxConcurrency; the fleet-wide figure is
+    # worker.replicas times this, which NOTES prints beside the sandbox quota
+    # ceiling. Floor 1, since 0 admits no turn; 256 matches the chart schema.
+    max_concurrency: int = Field(
+        default=16, ge=1, le=256, validation_alias="CURIE_WORKER_MAX_CONCURRENCY"
+    )
     # Empty means "derive ``<stream>:dead``" at the use site; a static Field
     # default cannot reference ``self.stream``. An explicit override equal to
     # ``stream`` is rejected outright -- see ``_reject_self_targeting_graveyard``.
@@ -1090,10 +1140,28 @@ class WorkerConfig(BaseSettings):
         gt=0,
         validation_alias="CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
     )
+    # Repository-relative paths publication refuses in addition to `.github/`.
+    # An entry matches that path and anything under it. The whole `.github/`
+    # tree is refused even when this list is empty.
+    publication_protected_paths: PublicationProtectedPaths = Field(
+        default=(),
+        validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
+    )
+
+    @field_validator("publication_protected_paths")
+    @classmethod
+    def _repository_relative_protected_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return normalize_protected_publication_paths(value)
+
     publication_github_api_url: str = Field(
         default="https://api.github.com",
         validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
     )
+
+    @property
+    def publication_github_html_base(self) -> str:
+        return github_html_base(self.publication_github_api_url)
+
     publication_reconcile_interval_seconds: float = Field(
         default=2.0,
         gt=0,
@@ -1199,6 +1267,19 @@ class WorkerConfig(BaseSettings):
     # How often the worker looks for WorkItem runs whose owner died (#3076).
     work_item_orphan_sweep_interval_s: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
+    )
+    # Settled stream entries are trimmed once they are older than this window
+    # (ADR 0184). The floor sits above the three-hour delivery budget ceiling;
+    # the ceiling is the one year shared by the other seconds knobs.
+    stream_retention_min_age_s: int = Field(
+        default=86400,
+        ge=3600,
+        le=31_536_000,
+        validation_alias="CURIE_STREAM_RETENTION_MIN_AGE_S",
+    )
+    # How often the retention pass runs over the consumed streams.
+    stream_retention_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_STREAM_RETENTION_INTERVAL_S"
     )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built

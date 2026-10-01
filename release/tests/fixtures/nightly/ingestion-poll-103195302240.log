@@ -1,0 +1,26 @@
+2026-09-11T08:26:27.8318467Z === exact ordinary product-observability seed ===
+2026-09-11T08:26:39.4589513Z waiting for worker reply: ok (9.9s)
+2026-09-11T08:26:39.4591454Z continue this conversation: curie local message --continue "..."
+2026-09-11T08:26:39.4848518Z local ordinary correlation: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-11T08:26:39.4849715Z local ordinary correlation: reply is not the fake sentinel (live negative control)
+2026-09-11T08:26:39.5429719Z local observability: curie-runner exporter endpoint/protocol verified
+2026-09-11T08:26:42.0000873Z {"approval_decision":null,"observation_count":18,"observation_type":["GENERATION","SPAN"],"operation":["agent.run","curie.queue.enqueue","curie.queue.process","curie.reply.update","curie.runner.rpc","curie.sandbox.claim","curie.turn.ingress","curie.turn.process"],"service":["curie-dispatcher","curie-runner","curie-worker"],"trace_id":"6cd67682fe31877b44c452dea2095826"}
+2026-09-11T08:26:42.0017801Z 6cd67682fe31877b44c452dea2095826
+2026-09-11T08:26:42.0018595Z === exact hosted MCP read product-observability seed ===
+2026-09-11T08:26:52.6826125Z waiting for worker reply: ok (8.8s)
+2026-09-11T08:26:52.6828416Z continue this conversation: curie local message --continue "..."
+2026-09-11T08:26:52.7156136Z local MCP correlation: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-11T08:26:52.7157707Z local MCP correlation: reply is not the fake sentinel (live negative control)
+2026-09-11T08:26:52.7621992Z MCP receipt call count delta=1
+2026-09-11T08:28:57.6531721Z exact trace failed the bounded ingestion poll: incomplete-membership (cli exit 0)
+2026-09-11T08:28:57.6544042Z {"approval_decision":null,"observation_count":17,"observation_type":["GENERATION","SPAN"],"operation":["agent.run","curie.queue.enqueue","curie.queue.process","curie.reply.update","curie.runner.rpc","curie.sandbox.claim","curie.turn.ingress","curie.turn.process"],"service":["curie-dispatcher","curie-runner","curie-worker"],"trace_id":"cf2ee5d0a3e03deec2613c3e03a5c5af"}
+2026-09-11T08:28:57.6558682Z 
+2026-09-11T08:28:57.6561534Z === teardown: curie local down ===
+2026-09-11T08:29:10.4313940Z stopping stack: ok (12.8s)
+2026-09-11T08:29:10.7731178Z removed 2 runner container(s)
+2026-09-11T08:29:10.7731678Z dev stack stopped
+2026-09-11T08:29:10.7732104Z volumes kept (fast restart with `curie local up`)
+2026-09-11T08:29:11.0623026Z ##[error]Process completed with exit code 1.
+2026-09-11T08:29:11.0738882Z Post job cleanup.
+2026-09-11T08:29:11.3248148Z ##[group]Generating build summary
+2026-09-11T08:29:11.3842779Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-qsk77U/export

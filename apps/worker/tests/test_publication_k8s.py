@@ -287,6 +287,7 @@ def test_built_job_is_bounded_secret_free_and_outside_sandbox_selectors(
         ("GIT_TIMEOUT_SECONDS", "60"),
         ("GITHUB_TIMEOUT_SECONDS", "30"),
         ("GITHUB_API_URL", "https://api.github.com"),
+        ("GITHUB_HTML_BASE", "https://github.com"),
     } <= set(env_by_name.items())
     assert container["resources"] == {
         "requests": {"cpu": "100m", "memory": "256Mi", "ephemeral-storage": "1Gi"},
@@ -539,7 +540,7 @@ def _run_github_guard(
     thread.start()
     try:
         completed = subprocess.run(
-            ["python", "-c", _embedded_github_script(resources)],
+            ["python3", "-c", _embedded_github_script(resources)],
             env={
                 **os.environ,
                 **_job_env(resources),
@@ -1589,9 +1590,13 @@ os.execv(real_git, [real_git, *args])
 def test_job_injects_a_non_default_github_api_base_without_baking_it_into_script(
     publication_k8s: Any,
 ) -> None:
-    api_base = "https://github.example.com/api/v3"
+    api_base = "https://github.example.com/forge/api/v3"
+    html_base = "https://github.example.com/forge"
     resources = publication_k8s.build_publication_resources(
-        _payload(publication_k8s),
+        replace(
+            _payload(publication_k8s),
+            clean_clone_url=f"{html_base}/acme-corp/acme-bot.git",
+        ),
         credential=WRITE_CREDENTIAL,
         settings=replace(_settings(publication_k8s), github_api_url=api_base),
     )
@@ -1600,9 +1605,80 @@ def test_job_injects_a_non_default_github_api_base_without_baking_it_into_script
     script = resources.config_map["data"]["publish.sh"]
 
     assert env_by_name["GITHUB_API_URL"] == api_base
+    assert env_by_name["GITHUB_HTML_BASE"] == html_base
     assert api_base not in script
     assert WRITE_CREDENTIAL not in script
     assert WRITE_CREDENTIAL not in json.dumps(resources.job)
+
+
+@pytest.mark.parametrize(
+    ("api_url", "html_base"),
+    [
+        ("https://api.github.com", "https://github.com"),
+        ("https://github.example.com/api/v3/", "https://github.example.com"),
+        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
+    ],
+)
+def test_job_settings_derive_the_publication_html_origin(
+    publication_k8s: Any, api_url: str, html_base: str
+) -> None:
+    settings = replace(_settings(publication_k8s), github_api_url=api_url)
+
+    assert settings.github_html_base == html_base
+
+
+@pytest.mark.parametrize("returned_base", ["https://github.example.com/forge", "https://github.com"])
+def test_enterprise_job_guard_validates_the_configured_pull_request_origin(
+    publication_k8s: Any, tmp_path: Path, returned_base: str
+) -> None:
+    # GitHub Enterprise REST uses the same pull request response fields:
+    # https://docs.github.com/en/enterprise-server@3.17/rest/pulls/pulls#get-a-pull-request
+    html_base = "https://github.example.com/forge"
+    payload = replace(
+        _payload(publication_k8s),
+        revision_number=2,
+        clean_clone_url=f"{html_base}/acme-corp/acme-bot.git",
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url=f"{html_base}/acme-corp/acme-bot/pull/123",
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload,
+        credential=WRITE_CREDENTIAL,
+        settings=replace(_settings(publication_k8s), github_api_url=f"{html_base}/api/v3"),
+    )
+    completed, requests = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="pre-push",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, _pull_response(url=f"{returned_base}/acme-corp/acme-bot/pull/123")),
+        ],
+    )
+
+    assert len(requests) == 2
+    if returned_base == html_base:
+        assert completed.returncode == 0, completed.stderr
+    else:
+        assert completed.returncode != 0
+        assert "CURIE_PR_URL=" not in completed.stdout
+
+
+def test_enterprise_job_refuses_a_public_github_clone_before_resource_creation(
+    publication_k8s: Any,
+) -> None:
+    with pytest.raises(publication_k8s.PublicationResourceError, match="clone URL"):
+        publication_k8s.build_publication_resources(
+            _payload(publication_k8s),
+            credential=WRITE_CREDENTIAL,
+            settings=replace(
+                _settings(publication_k8s),
+                github_api_url="https://github.example.com/forge/api/v3",
+            ),
+        )
 
 
 def _assert_script_redacts_authorization(script: str) -> None:
@@ -1901,8 +1977,18 @@ def _owned_pod(name: str, job_uid: str) -> Any:
     )
 
 
+@pytest.mark.parametrize(
+    "pr_url",
+    [
+        pytest.param("https://github.com/acme-corp/acme-bot/pull/123", id="public"),
+        pytest.param(
+            "https://github.example.com/forge/acme-corp/acme-bot/pull/123",
+            id="enterprise",
+        ),
+    ],
+)
 def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
-    publication_k8s: Any,
+    publication_k8s: Any, pr_url: str,
 ) -> None:
     cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
     cluster.namespace = "curie-publications"
@@ -1915,8 +2001,8 @@ def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
     )
     raw = (
         b"Cloning into 'repo'...\n"
-        b"CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123\n"
-        b"CURIE_PR_NUMBER=123\n"
+        + f"CURIE_PR_URL={pr_url}\n".encode()
+        + b"CURIE_PR_NUMBER=123\n"
         + f"CURIE_COMMIT_SHA={REVISION_HEAD}\n".encode()
     )
     cluster._core = SimpleNamespace(
@@ -1928,7 +2014,7 @@ def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
-    assert observed.pr_url == "https://github.com/acme-corp/acme-bot/pull/123"
+    assert observed.pr_url == pr_url
     assert observed.pr_number == 123
     assert observed.commit_sha == REVISION_HEAD
 

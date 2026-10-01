@@ -25,7 +25,9 @@ PROGRESS_SCOPE = "work_item.progress"
 REPORT_LIMIT = 200
 PHASE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 VERIFICATION_PREFLIGHT_PHASE = "verification_preflight"
-VERIFICATION_COMMAND = "uv run pytest runner/tests -q"
+VERIFICATION_CHECK_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
+VERIFICATION_CHECK_LIMIT = 4
+PYTHON_CHECK_ID = "python"
 
 
 class _Strict(BaseModel):
@@ -137,21 +139,28 @@ class ProgressReport(_Strict):
 
 
 class VerificationObservation(_Strict):
-    """Exact sandbox command result recorded before the model starts."""
+    """One declared check's sandbox result recorded before the model starts.
+
+    ``check`` is the declared check id and ``command`` the exact command the
+    runner ran for it. ``not_declared`` records that neither the bundle nor the
+    repository declared a check, so no command ran: its check, command and
+    exit_status are null and it carries no blockers.
+    """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    command: str = Field(min_length=1, max_length=180)
-    outcome: Literal["passed", "unavailable", "failed"]
+    check: str | None = Field(pattern=VERIFICATION_CHECK_PATTERN)
+    command: str | None = Field(min_length=1, max_length=180)
+    outcome: Literal["passed", "unavailable", "failed", "not_declared"]
     exit_status: int | None = Field(ge=-255, le=255)
     missing_binaries: list[str] = Field(max_length=8)
     blocked_services: list[str] = Field(max_length=8)
 
     @field_validator("command")
     @classmethod
-    def _command_not_blank(cls, value: str) -> str:
-        if value != VERIFICATION_COMMAND:
-            raise ValueError("command must be the documented factory verification check")
+    def _command_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("command must not be blank")
         return value
 
     @field_validator("missing_binaries", "blocked_services")
@@ -174,7 +183,19 @@ class VerificationObservation(_Strict):
     @model_validator(mode="after")
     def _consistent_result(self) -> VerificationObservation:
         has_blocker = bool(self.missing_binaries or self.blocked_services)
-        if self.outcome == "unavailable":
+        if self.outcome == "not_declared":
+            if (
+                self.check is not None
+                or self.command is not None
+                or self.exit_status is not None
+                or has_blocker
+            ):
+                raise ValueError(
+                    "not_declared requires a null check, command and exit_status and no blockers"
+                )
+        elif self.check is None or self.command is None:
+            raise ValueError(f"{self.outcome} requires a declared check and its command")
+        elif self.outcome == "unavailable":
             if self.exit_status is not None or not has_blocker:
                 raise ValueError("unavailable requires blockers and a null exit_status")
         elif self.outcome == "passed":
@@ -282,7 +303,13 @@ async def record_verification(
     token_request_id: uuid.UUID,
     body: VerificationObservation,
 ) -> RecordResult:
-    """Store the one immutable preflight observation on the token's active request."""
+    """Store one immutable preflight observation per declared check on the token's
+    active request.
+
+    A repeated check id, a second ``not_declared`` record, or mixing
+    ``not_declared`` with declared checks is ``verification_exists``; the first
+    stored rows stand.
+    """
 
     token_request: ExecutionRequest | None = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == token_request_id).with_for_update()
@@ -296,15 +323,20 @@ async def record_verification(
         return RecordResult("no_active_request")
     active_id = active.id
 
-    existing_id = await session.scalar(
-        select(ExecutionRequestPhaseReport.id)
-        .where(
-            ExecutionRequestPhaseReport.execution_request_id == active_id,
-            ExecutionRequestPhaseReport.phase == VERIFICATION_PREFLIGHT_PHASE,
+    try:
+        existing = await read_verification_observations(session, active_id)
+    except ValueError:
+        # Unreadable stored evidence is never extended; the gates fail closed on it.
+        await session.rollback()
+        return RecordResult("verification_exists", active_id)
+    if existing and (
+        body.outcome == "not_declared"
+        or len(existing) >= VERIFICATION_CHECK_LIMIT
+        or any(
+            observation.outcome == "not_declared" or observation.check == body.check
+            for observation in existing
         )
-        .limit(1)
-    )
-    if existing_id is not None:
+    ):
         await session.rollback()
         return RecordResult("verification_exists", active_id)
 
@@ -328,14 +360,16 @@ async def record_verification(
     return RecordResult("recorded", active_id)
 
 
-async def read_verification_observation(
+async def read_verification_observations(
     session: AsyncSession, request_id: uuid.UUID
-) -> VerificationObservation | None:
-    """Read and validate the stored preflight observation, if one exists.
+) -> list[VerificationObservation]:
+    """Read and validate the stored preflight observations in recorded order.
 
-    A missing row is distinct from an unreadable row. Malformed persisted data
-    raises ``ValueError`` so callers can fail closed instead of treating it as
-    a successful sandbox verification.
+    An empty list means no preflight was recorded, which is distinct from an
+    unreadable one. Malformed or noncanonical persisted data, a repeated check
+    id, more than the check limit, or ``not_declared`` mixed with checks raises
+    ``ValueError`` so callers can fail closed instead of treating it as a
+    successful sandbox verification.
     """
 
     notes = list(
@@ -345,24 +379,63 @@ async def read_verification_observation(
                 ExecutionRequestPhaseReport.execution_request_id == request_id,
                 ExecutionRequestPhaseReport.phase == VERIFICATION_PREFLIGHT_PHASE,
             )
-            .limit(2)
+            .order_by(ExecutionRequestPhaseReport.id)
+            .limit(VERIFICATION_CHECK_LIMIT + 1)
         )
     )
-    if not notes:
-        return None
-    if len(notes) != 1:
-        raise ValueError("multiple stored verification observations are unreadable")
-    note = notes[0]
-    if not isinstance(note, str):
-        raise ValueError("stored verification observation is unreadable")
-    try:
-        raw = json.loads(note)
-        observation = VerificationObservation.model_validate(raw)
-    except (TypeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError("stored verification observation is unreadable") from exc
-    if verification_observation_note(observation) != note:
-        raise ValueError("stored verification observation is not canonical")
-    return observation
+    if len(notes) > VERIFICATION_CHECK_LIMIT:
+        raise ValueError("too many stored verification observations are unreadable")
+    observations: list[VerificationObservation] = []
+    for note in notes:
+        if not isinstance(note, str):
+            raise ValueError("stored verification observation is unreadable")
+        try:
+            raw = json.loads(note)
+            observation = VerificationObservation.model_validate(raw)
+        except (TypeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("stored verification observation is unreadable") from exc
+        if verification_observation_note(observation) != note:
+            raise ValueError("stored verification observation is not canonical")
+        observations.append(observation)
+    checks = [observation.check for observation in observations]
+    if len(observations) > 1 and None in checks:
+        raise ValueError("not_declared mixed with other stored observations is unreadable")
+    if len(set(checks)) != len(checks):
+        raise ValueError("duplicate stored verification check ids are unreadable")
+    return observations
+
+
+def python_verification(
+    observations: Sequence[VerificationObservation],
+) -> VerificationObservation | None:
+    """The observation of the declared ``python`` check, if one was recorded.
+
+    Its absence stamps the not-declared publication pair when no check was
+    unavailable; failures and unavailability under any check id are judged
+    across every observation.
+    """
+
+    return next(
+        (observation for observation in observations if observation.check == PYTHON_CHECK_ID),
+        None,
+    )
+
+
+def failed_verification(
+    observations: Sequence[VerificationObservation],
+) -> VerificationObservation | None:
+    """The failed observation that refuses a Python change, if any failed.
+
+    A Python check can be declared under any id, so every failed check fails
+    closed: the ``python`` check's failure first, otherwise the first failure
+    in recorded order.
+    """
+
+    failed = [observation for observation in observations if observation.outcome == "failed"]
+    return next(
+        (observation for observation in failed if observation.check == PYTHON_CHECK_ID),
+        failed[0] if failed else None,
+    )
 
 
 WAIT_CI_PHASE = "wait_ci"

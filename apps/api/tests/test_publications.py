@@ -75,6 +75,9 @@ SECOND_REVISION_SHA = "2123456789abcdef0123456789abcdef01234567"
 EXTERNAL_REVISION_SHA = "3123456789abcdef0123456789abcdef01234567"
 PR_NUMBER = 123
 PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
+ENTERPRISE_HTML_BASE = "https://github.example.com/forge"
+ENTERPRISE_API_URL = f"{ENTERPRISE_HTML_BASE}/api/v3"
+ENTERPRISE_PR_URL = f"{ENTERPRISE_HTML_BASE}/{REPO}/pull/{PR_NUMBER}"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 _PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
 _REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
@@ -83,8 +86,12 @@ FACTORY_WORKER_HEADERS = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 
 @pytest.fixture
 def publication_stack(
-    _disposable_db: Any, monkeypatch: pytest.MonkeyPatch
+    _disposable_db: Any, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Iterator[tuple[TestClient, str]]:
+    forge = getattr(request, "param", None)
+    if forge is not None:
+        monkeypatch.setenv("GITHUB_API_URL", forge["api_url"])
+        monkeypatch.setenv("GITHUB_CLONE_BASE", forge["html_base"])
     runs_stream = f"test:curie:publication-runs:{uuid.uuid4().hex}"
     monkeypatch.setenv("RUNS_STREAM", runs_stream)
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
@@ -190,6 +197,19 @@ def test_publication_schema_refuses_github_workflow_changes() -> None:
 
     with pytest.raises(ValidationError, match="workflow changes cannot be published"):
         PublicationCreate.model_validate(payload)
+
+
+def test_publication_schema_refuses_github_metadata_changes() -> None:
+    for path in (
+        ".github/actions/build/action.yml",
+        ".github/CODEOWNERS",
+        ".GITHUB/CODEOWNERS",
+    ):
+        payload = _publication_payload(str(uuid.uuid4()))
+        payload["changed_paths"] = [path]
+
+        with pytest.raises(ValidationError, match="GitHub metadata changes cannot be published"):
+            PublicationCreate.model_validate(payload)
 
 
 def test_publication_schema_accepts_the_builtin_reply_adapter_without_an_endpoint() -> None:
@@ -487,6 +507,7 @@ def _open_lineage(
     auth_headers: dict[str, str],
     *,
     conversation_id: str,
+    pr_url: str = PR_URL,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
@@ -505,6 +526,7 @@ def _open_lineage(
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=pr_url,
     )
     assert advanced.status_code == 200, advanced.text
     _mark_outcome_history_ready(publication["id"])
@@ -1904,6 +1926,122 @@ def test_claimed_card_then_expired_waits_for_adoption_without_status_overwrite(
     ) == [{"status": "expired"}]
 
 
+def test_publication_resolved_before_card_registration_settles_the_card_once(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#3637 on the publication card outbox: the result waits for registration.
+
+    The outbox also posts its card and only then registers it. A verdict that
+    lands while Slack holds the post cannot strand a live card here, because the
+    card is settled by the result delivery, and the result is not claimable until
+    the card is reported, which follows registration. The real store, API and
+    card memory are exercised; only the Slack transport is a barrier.
+
+    THE MUTATION THIS CATCHES: letting a terminal result claim while its card is
+    still being delivered settles nothing and leaves the card live.
+    """
+
+    from channel_protocol.reply import ReplyAck, ReplyPost, ReplyUpdate
+    from curie_worker.approval_cards import ApprovalCardStore
+    from curie_worker.config import WorkerConfig
+    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="resolve-before-card")
+    )
+    approval_id = publication["approval_id"]
+    card_ts = "1700000000.000900"
+
+    class HeldCardSink:
+        """Slack, with the card post's acknowledgement held until released."""
+
+        def __init__(self) -> None:
+            self.posting = asyncio.Event()
+            self.release = asyncio.Event()
+            self.events: list[Any] = []
+
+        async def emit(
+            self, event: Any, *, route: Any, best_effort_unreachable: bool = False
+        ) -> ReplyAck:
+            if isinstance(event, ReplyPost):
+                self.posting.set()
+                await self.release.wait()
+                self.events.append(event)
+                return ReplyAck(ref=card_ts)
+            self.events.append(event)
+            return ReplyAck(ref=event.target.reply_ref)
+
+    class Transcript:
+        async def record_result(self, *_args: Any) -> None:
+            return None
+
+    async def exercise() -> tuple[list[Any], Any, list[bool]]:
+        engine = create_async_engine(get_settings().database_url)
+        valkey = aioredis.from_url(get_settings().valkey_dsn())
+        sink = HeldCardSink()
+        cards = ApprovalCardStore(valkey, WorkerConfig())
+        reconciler = PublicationReconciler(
+            store=PostgresPublicationStore(
+                engine,
+                schema="curie",
+                lease_owner="resolve-before-card",
+                result_max_attempts=2,
+            ),
+            credentials=None,
+            cluster=None,
+            github=None,
+            lineage=None,
+            replies=sink,
+            job_settings=None,  # type: ignore[arg-type]
+            card_store=cards,
+            transcript=Transcript(),
+        )
+        try:
+            delivering = asyncio.create_task(reconciler.deliver_pending_card())
+            await asyncio.wait_for(sink.posting.wait(), timeout=5.0)
+            rejected = _resolve(
+                client, auth_headers, approval_id, decision="rejected", note="not now"
+            )
+            assert rejected.status_code == 200, rejected.text
+            # The verdict is durable, but the card is not yet registered.
+            waited = [await reconciler.deliver_pending_result()]
+            assert await cards.read(approval_id) is None
+
+            sink.release.set()
+            assert await asyncio.wait_for(delivering, timeout=5.0) is True
+            waited.append(await reconciler.deliver_pending_result())
+            waited.append(await reconciler.deliver_pending_result())
+            return sink.events, await cards.read(approval_id), waited
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    events, remaining, waited = asyncio.run(exercise())
+    assert waited == [False, True, False]
+    settled = [
+        event
+        for event in events
+        if isinstance(event, ReplyUpdate) and event.settled is not None
+    ]
+    assert len(settled) == 1
+    assert settled[0].target.reply_ref == card_ts
+    assert settled[0].settled.decision == "rejected"
+    assert settled[0].settled.resolver == "U0REQUEST1"
+    assert settled[0].settled.note == "not now"
+    assert remaining is None
+    assert _rows(
+        "SELECT status, approval_card_reported_at IS NOT NULL AS card_reported, "
+        "result_reported_at IS NOT NULL AS result_reported "
+        "FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    ) == [{"status": "denied", "card_reported": True, "result_reported": True}]
+
+
 def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -2350,6 +2488,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: model,
         ceiling=10_000,
         tracer=RunTracer(None),
@@ -2565,6 +2704,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 "status": "idle-awaiting-input",
                 "turn_epoch": None,
                 "capacity_admission": True,
+                # RUNNER-TOOL-ACCESS-5: this test's runner session is built
+                # without tool access enforcement, so it advertises none.
+                "tool_access": [],
             }
         ]
         if late_handoff
@@ -5276,12 +5418,18 @@ def review_lineage_app(
         "status": 200,
         "state": "open",
         "merged": False,
+        "pr_url": PR_URL,
+        "title": "Existing publication title",
+        "body": "Existing publication body.\n",
+        "requests": [],
         "calls": [],
+        "authorization": "Bearer fixture-publication-app-token",
     }
     real_client = httpx.Client
 
     def handle(request: httpx.Request) -> httpx.Response:
         truth["calls"].append((request.method, request.url.path))
+        truth["requests"].append(request)
         if request.url.path.endswith("/installation"):
             return httpx.Response(200, json={"id": truth["installation_id"]})
         if request.url.path.endswith("/access_tokens"):
@@ -5292,20 +5440,22 @@ def review_lineage_app(
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["authorization"] == "Bearer fixture-publication-app-token"
+        assert request.headers["authorization"] == truth["authorization"]
         if truth["status"] != 200:
             return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
         repo = {"id": truth["repository_id"], "full_name": REPO}
-        if request.url.path == f"/repos/{REPO}":
+        if request.url.path.endswith(f"/repos/{REPO}"):
             return httpx.Response(200, json=repo)
         return httpx.Response(
             200,
             json={
                 "number": PR_NUMBER,
-                "html_url": PR_URL,
+                "html_url": truth["pr_url"],
                 "node_id": truth["node_id"],
                 "state": truth["state"],
                 "merged": truth["merged"],
+                "title": truth["title"],
+                "body": truth["body"],
                 "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
                 "base": {"repo": repo, "ref": "main"},
             },
@@ -5379,6 +5529,7 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=truth["pr_url"],
     )
     assert advanced.status_code == 200, advanced.text
     assert _rows(
@@ -5418,10 +5569,153 @@ def _verified_lineage(
         expected_version=1,
         expected_head_sha=None,
         head_sha=FIRST_REVISION_SHA,
+        pr_url=truth["pr_url"],
     )
     assert advanced.status_code == 200, advanced.text
     _mark_outcome_history_ready(publication["id"])
     return deployment, publication, advanced.json()
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    # Enterprise REST retains the documented repository and pull request fields:
+    # https://docs.github.com/en/enterprise-server@3.17/rest/pulls/pulls#get-a-pull-request
+    client, truth, _ = review_lineage_app
+    truth["pr_url"] = ENTERPRISE_PR_URL
+    conversation = "enterprise-publication-lineage"
+    deployment, first, lineage = _verified_lineage(
+        client, truth, auth_headers, conversation=conversation
+    )
+    assert lineage["pr_url"] == ENTERPRISE_PR_URL
+    assert _lineage_identity(first["lineage_id"]) == {
+        "status": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": ENTERPRISE_PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "version": 2,
+        "github_repository_id": 9001,
+        "github_installation_id": 41,
+        "github_pr_node_id": "PR_example_123",
+        "base_ref": "main",
+    }
+
+    truth["authorization"] = "Basic " + base64.b64encode(
+        b"x-access-token:fixture-publication-app-token"
+    ).decode()
+
+    refreshed = _get_lineage(
+        client, deployment_id=deployment["id"], conversation_id=conversation
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["pr_url"] == ENTERPRISE_PR_URL
+    assert refreshed.json()["version"] == 2
+    assert truth["requests"]
+    assert all(
+        request.url.host == "github.example.com"
+        and request.url.path.startswith("/forge/api/v3/")
+        for request in truth["requests"]
+    )
+    assert any(
+        request.url.path == f"/forge/api/v3/repos/{REPO}/pulls/{PR_NUMBER}"
+        for request in truth["requests"]
+    )
+    assert all(request.method in {"GET", "POST"} for request in truth["requests"])
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+@pytest.mark.parametrize("wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"])
+def test_enterprise_publication_refuses_wrong_host_outcomes_before_provider_access(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    wrong_url: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="enterprise-refused-outcome",
+        dedupe_key="enterprise-refused-outcome",
+    )
+    truth["branch"] = publication["branch"]
+    truth["pr_url"] = ENTERPRISE_PR_URL
+    before = _lineage_identity(publication["lineage_id"])
+
+    refused = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        pr_url=wrong_url,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.lineage_stale"
+    assert _lineage_identity(publication["lineage_id"]) == before
+    assert truth["calls"] == []
+
+
+@pytest.mark.parametrize(
+    "publication_stack",
+    [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
+    indirect=True,
+)
+@pytest.mark.parametrize("stage", ["advance", "refresh"])
+def test_enterprise_publication_refuses_public_github_provider_truth(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    stage: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    if stage == "refresh":
+        truth["pr_url"] = ENTERPRISE_PR_URL
+        deployment, publication, _ = _verified_lineage(
+            client, truth, auth_headers, conversation="enterprise-refused-refresh"
+        )
+        truth["pr_url"] = PR_URL
+        truth["authorization"] = "Basic " + base64.b64encode(
+            b"x-access-token:fixture-publication-app-token"
+        ).decode()
+        before = _lineage_identity(publication["lineage_id"])
+        refused = _get_lineage(
+            client,
+            deployment_id=deployment["id"],
+            conversation_id="enterprise-refused-refresh",
+        )
+        assert refused.status_code == 502, refused.text
+        assert refused.json()["detail"]["code"] == "publication.github_invalid_response"
+    else:
+        _, publication = _approved_revision(
+            client,
+            auth_headers,
+            conversation_id="enterprise-refused-provider",
+            dedupe_key="enterprise-refused-provider",
+        )
+        truth["branch"] = publication["branch"]
+        before = _lineage_identity(publication["lineage_id"])
+        refused = _advance_lineage(
+            client,
+            publication["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+            pr_url=ENTERPRISE_PR_URL,
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "publication.lineage_stale"
+
+    assert _lineage_identity(publication["lineage_id"]) == before
 
 
 def test_review_reservation_captures_verified_identity_and_exact_replay(
@@ -6464,19 +6758,68 @@ def _factory_publication_case(
     yield client, request_id, payload
 
 
+CURIE_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+CURIE_PYTHON_CI_POLICY = {
+    "check": CURIE_PYTHON_CI_CHECK,
+    "paths": [
+        "apps",
+        "runner",
+        "cli",
+        "adapters",
+        "packages",
+        "examples/tests",
+        "tools",
+        "release",
+    ],
+    "pendingCheckPrefix": "Python pytest (shard ",
+}
+
+
+def _configure_python_ci(
+    monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]
+) -> None:
+    """Set GITHUB_FACTORY_PYTHON_CI as an operator would (#3617)."""
+
+    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", json.dumps(dict(policies)))
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def _curie_python_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Configure Curie's own Python CI layout for the factory repository."""
+
+    _configure_python_ci(monkeypatch, {FACTORY_REPO: CURIE_PYTHON_CI_POLICY})
+    yield
+    get_settings.cache_clear()
+
+
 def _record_factory_verification(
     client: TestClient,
     request_id: uuid.UUID,
     *,
     outcome: str = "unavailable",
+    check: str = "python",
+    command: str = "uv run pytest runner/tests -q",
 ) -> Any:
-    observation: dict[str, Any] = {
-        "command": "uv run pytest runner/tests -q",
-        "outcome": outcome,
-        "exit_status": None if outcome == "unavailable" else 1,
-        "missing_binaries": ["uv"] if outcome == "unavailable" else [],
-        "blocked_services": [],
-    }
+    observation: dict[str, Any]
+    if outcome == "not_declared":
+        observation = {
+            "check": None,
+            "command": None,
+            "outcome": "not_declared",
+            "exit_status": None,
+            "missing_binaries": [],
+            "blocked_services": [],
+        }
+    else:
+        observation = {
+            "check": check,
+            "command": command,
+            "outcome": outcome,
+            "exit_status": {"unavailable": None, "passed": 0}.get(outcome, 1),
+            "missing_binaries": ["uv"] if outcome == "unavailable" else [],
+            "blocked_services": [],
+        }
     token = sandbox_token.mint(
         get_settings().api_key,
         agent=str(request_id),
@@ -6511,6 +6854,7 @@ def _post_factory_publication(
 
 
 def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_body(
+    _curie_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6529,6 +6873,166 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
     assert "In-sandbox verification was unavailable." in body
     assert "Python (ruff + mypy + pytest) is pending proof." in body
     assert "verification passed" not in body.casefold()
+
+
+_NOT_DECLARED_STAMP = "No in-sandbox Python verification check was declared."
+_PENDING_PROOF_STAMP = "Python (ruff + mypy + pytest) is pending proof."
+
+
+def _factory_publication_body(publication_id: str) -> str:
+    return str(
+        _factory_rows(
+            "SELECT body FROM curie.publications WHERE id = :id",
+            {"id": publication_id},
+        )[0]["body"]
+    )
+
+
+def test_factory_python_publication_with_no_declared_check_states_it_was_not_declared(
+    _curie_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="not_declared")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert payload["body"] in body
+    assert _NOT_DECLARED_STAMP in body
+    assert _PENDING_PROOF_STAMP in body
+    assert "In-sandbox verification was unavailable." not in body
+    assert "verification passed" not in body.casefold()
+
+
+def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_python(
+    _curie_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert _NOT_DECLARED_STAMP in body
+    assert _PENDING_PROOF_STAMP in body
+    assert "In-sandbox verification was unavailable." not in body
+
+
+def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["body"] == payload["body"]
+
+
+def test_factory_python_publication_uses_the_python_check_among_several(
+    _curie_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    rust = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert rust.status_code == 201, rust.text
+    python = _record_factory_verification(client, request_id)
+    assert python.status_code == 201, python.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "In-sandbox verification was unavailable." in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
+
+
+def test_factory_python_publication_refuses_a_failed_python_check_beside_a_passed_one(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    rust = _record_factory_verification(
+        client,
+        request_id,
+        outcome="passed",
+        check="rust",
+        command="cargo test --locked",
+    )
+    assert rust.status_code == 201, rust.text
+    python = _record_factory_verification(client, request_id, outcome="failed")
+    assert python.status_code == 201, python.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
+
+
+def test_factory_python_publication_refuses_any_failed_declared_check(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    failed = _record_factory_verification(
+        client,
+        request_id,
+        outcome="failed",
+        check="api",
+        command="uv run pytest apps/api/tests -q",
+    )
+    assert failed.status_code == 201, failed.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
+
+
+def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
+    _curie_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="api",
+        command="uv run pytest apps/api/tests -q",
+    )
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "In-sandbox verification was unavailable." in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(
@@ -6566,6 +7070,7 @@ def test_factory_python_publication_refuses_a_failed_preflight_observation(
 
 
 def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
+    _curie_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6595,6 +7100,7 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(
+    _curie_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6618,3 +7124,101 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
     assert created.status_code == 201, created.text
     assert "In-sandbox verification was unavailable." in created.json()["body"]
     assert "Python (ruff + mypy + pytest) is pending proof." in created.json()["body"]
+
+
+# --- per-repository Python CI policy (#3617) ------------------------------------------
+
+_REPOSITORY_PENDING_PROOF = "Repository CI is pending proof."
+
+
+def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_pending(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    """An outside repository (root package, plain unittest) is not refused by path."""
+
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["unitconv/convert.py"]
+    recorded = _record_factory_verification(client, request_id, outcome="not_declared")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert _NOT_DECLARED_STAMP in body
+    assert _REPOSITORY_PENDING_PROOF in body
+    assert CURIE_PYTHON_CI_CHECK not in body
+
+
+def test_outside_python_layout_without_a_policy_accepts_any_python_path(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "In-sandbox verification was unavailable." in body
+    assert _REPOSITORY_PENDING_PROOF in body
+
+
+def test_policy_for_another_repository_does_not_apply(
+    monkeypatch: pytest.MonkeyPatch,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    _configure_python_ci(monkeypatch, {"curie-eng/curie": CURIE_PYTHON_CI_POLICY})
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["unitconv/convert.py"]
+    recorded = _record_factory_verification(client, request_id, outcome="not_declared")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    assert _REPOSITORY_PENDING_PROOF in _factory_publication_body(created.json()["id"])
+
+
+def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    _configure_python_ci(
+        monkeypatch,
+        {FACTORY_REPO.upper(): {"check": "Unit tests", "paths": ["src"]}},
+    )
+    client, request_id, payload = _factory_publication_case
+    payload["changed_paths"] = ["src/widget.py"]
+    recorded = _record_factory_verification(client, request_id, outcome="not_declared")
+    assert recorded.status_code == 201, recorded.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert "Unit tests is pending proof." in body
+    assert CURIE_PYTHON_CI_CHECK not in body
+    assert _REPOSITORY_PENDING_PROOF not in body
+
+
+def test_custom_policy_refuses_a_path_outside_its_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    _configure_python_ci(
+        monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}}
+    )
+    client, request_id, payload = _factory_publication_case
+    # Selected by Curie's layout, not by this repository's.
+    payload["changed_paths"] = ["apps/api/src/example.py"]
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
+    assert "apps/api/src/example.py" in refused.json()["detail"]["message"]

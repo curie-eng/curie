@@ -244,7 +244,12 @@ import sys
 from pathlib import Path
 
 from plugin_format.connectors import ConnectorSpec
-from plugin_format.connector_render import render
+from plugin_format.connector_render import (
+    render_deployment,
+    render_ingress_networkpolicy,
+    render_networkpolicy,
+    render_service,
+)
 
 out_dir = Path(sys.argv[1])
 args = json.loads(sys.argv[2])
@@ -266,17 +271,21 @@ if args[:2] != ["sh", "-c"]:
     )
 
 spec = ConnectorSpec(image=image, args=args, port=port)
-objects = render(
-    release=release,
-    agent=agent,
-    namespace=namespace,
-    app_name=app_name,
-    connector=connector,
-    spec=spec,
-    # No secrets are declared, so nothing reads this name; it is still
-    # required (keyword-only) and stays in the shape the API renders.
-    secret_name=f"{release}-{agent}-connector-secrets",
-)
+# render() refuses a hosted connector with no caller key. This fixture pins
+# the server container's readiness probe, and this cluster step does not load
+# the worker image the proxy runs from, so it renders that server through the
+# same helpers render() calls, without a proxy sidecar.
+secret_name = f"{release}-{agent}-connector-secrets"
+objects = [
+    render_service(release, agent, connector, spec, None),
+    render_deployment(
+        release, agent, namespace, connector, spec, secret_name, None
+    ),
+    render_networkpolicy(release, agent, app_name, connector, spec, None),
+    render_ingress_networkpolicy(
+        release, agent, app_name, connector, spec, None
+    ),
+]
 
 deployment = next(o for o in objects if o["kind"] == "Deployment")
 if deployment["metadata"]["name"] != expected_name:
@@ -667,6 +676,7 @@ metadata:
     app.kubernetes.io/name: $APP_NAME
     app.kubernetes.io/instance: $RELEASE
     app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: $AGENT
 spec:
   restartPolicy: Never
   securityContext:
@@ -696,9 +706,9 @@ kc wait --for=condition=Ready -n "$NAMESPACE" \
 # strips them would silently widen nothing and narrow the allowed leg into a
 # second copy of the deny leg.
 SANDBOX_LABELS="$(kc get pod "$SANDBOX_POD" -n "$NAMESPACE" \
-  -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name} {.metadata.labels.app\.kubernetes\.io/instance} {.metadata.labels.app\.kubernetes\.io/component}' 2>/dev/null || true)"
-[[ "$SANDBOX_LABELS" == "$APP_NAME $RELEASE runner-sandbox" ]] \
-  || fail "the sandbox-labelled probe is not wearing the runner-sandbox labels (read back: '$SANDBOX_LABELS')"
+  -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name} {.metadata.labels.app\.kubernetes\.io/instance} {.metadata.labels.app\.kubernetes\.io/component} {.metadata.labels.curietech\.ai/agent}' 2>/dev/null || true)"
+[[ "$SANDBOX_LABELS" == "$APP_NAME $RELEASE runner-sandbox $AGENT" ]] \
+  || fail "the sandbox-labelled probe is not wearing the owning-agent sandbox labels (read back: '$SANDBOX_LABELS')"
 
 CONTROL_IP="$(kc get pod "$CONTROL_POD" -n "$NAMESPACE" \
   -o jsonpath='{.status.podIP}' 2>/dev/null || true)"

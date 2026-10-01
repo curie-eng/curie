@@ -9,7 +9,6 @@ The platform API is another service to the dispatcher, reached over HTTP, so
 uses. Its caller lists are plain sets: the dispatcher decides nothing about who
 is listed, it only relays the API's answer, so the fake need only answer
 consistently."""
-
 import json
 import logging
 import socket
@@ -40,6 +39,7 @@ from curie_test_support.valkey import (
     connect_or_skip,
 )
 from slack_bolt.authorization import AuthorizeResult
+from slack_sdk.socket_mode.builtin import client as builtin_socket_mode_client
 
 
 def _authorize(**_kwargs: Any) -> AuthorizeResult:
@@ -64,6 +64,22 @@ def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
     )
+
+
+def person_rooted_thread(**kwargs: Any) -> dict[str, Any]:
+    """Slack's ``conversations.replies`` answer for a thread a person started.
+
+    A threaded mention may look up its thread's root (spec
+    slack-alert-followup-context), so a harness built on a real ``WebClient``
+    answers that call here instead of reaching Slack. The parent message comes
+    first (https://docs.slack.dev/reference/methods/conversations.replies/),
+    and a person's root never belongs to the bot, so the turn is unchanged.
+    """
+    return {
+        "ok": True,
+        "messages": [{"ts": kwargs["ts"], "user": "U0PERSON", "text": "A person's root."}],
+        "has_more": False,
+    }
 
 
 class _TestTelemetry:
@@ -267,10 +283,15 @@ def config(
         approval_chat_attester_secret="dispatcher-attester-test-secret",
         api_base_url=admission_api.url,
         admission_cache_prefix=f"test:curie:admission:{token}:",
+        # Every threaded mention may consult the root-context cache, so every
+        # test gets its own prefix: tests reuse the same example channel, bot
+        # and timestamps, and must never read each other's cached roots.
+        thread_context_cache_prefix=f"test:curie:thread-context:{token}:",
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))
     keys.extend(redis_client.scan_iter(f"test:curie:admission:{token}:*"))
+    keys.extend(redis_client.scan_iter(f"test:curie:thread-context:{token}:*"))
     keys.append(cfg.stream)
     if keys:
         redis_client.delete(*keys)
@@ -315,3 +336,74 @@ class ScriptedResolver:
             self.outcome.status_code == 404
             and self.outcome.detail.strip().casefold() == "approval not found"
         )
+
+
+class SlackSocketStandIn:
+    """slack_sdk's builtin websocket ``Connection``, without the network.
+
+    It opens at once and stays open until the SDK closes it or a test drops
+    it, so ``SocketModeClient``'s own connect, refresh and reconnect code runs
+    unchanged around it. The constructor takes the SDK's keyword arguments and
+    ignores them.
+    """
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.session_id = uuid.uuid4().hex
+        self._open = False
+
+    def connect(self) -> None:
+        self._open = True
+
+    def is_active(self) -> bool:
+        return self._open
+
+    def close(self) -> None:
+        self._open = False
+
+    def disconnect(self) -> None:
+        self._open = False
+
+    def check_state(self) -> None:
+        return None
+
+    def send(self, payload: str) -> None:
+        del payload
+
+    def run_until_completion(self, state: Any) -> None:
+        while self._open and not state.terminated:
+            time.sleep(0.01)
+
+
+@pytest.fixture
+def offline_socket_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake only the Socket Mode transport: the websocket, and the
+    ``apps.connections.open`` call that issues its URL."""
+    monkeypatch.setattr(builtin_socket_mode_client, "Connection", SlackSocketStandIn)
+    monkeypatch.setattr(
+        builtin_socket_mode_client.SocketModeClient,
+        "issue_new_wss_url",
+        lambda _self: "wss://wss.example.invalid/link",
+    )
+
+
+def deliver_frames(client: Any, *frames: dict[str, Any], timeout: float = 5.0) -> None:
+    """Hand Slack frames to the SDK's own message queue, in order, and return
+    once every message listener has run for the last one.
+
+    A ``disconnect`` frame never reaches the listeners (the SDK reconnects on
+    it instead), so the last frame must be one that does.
+    """
+    last = frames[-1]
+    done = threading.Event()
+
+    def _after_the_others(_client: Any, message: dict[str, Any], _raw: Any) -> None:
+        if message == last:
+            done.set()
+
+    client.message_listeners.append(_after_the_others)
+    try:
+        for frame in frames:
+            client.enqueue_message(json.dumps(frame))
+        assert done.wait(timeout), f"the SDK did not deliver {last!r} within {timeout}s"
+    finally:
+        client.message_listeners.remove(_after_the_others)

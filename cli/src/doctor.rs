@@ -1446,6 +1446,44 @@ pub fn resolve_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1130 AC5: widening URL discovery to the api Service's NodePort must not
+    /// widen where an auto-discovered release key goes. The same classifier
+    /// `cluster deploy` refuses on decides it here.
+    #[test]
+    fn a_discovered_key_never_pairs_with_a_cleartext_non_loopback_url() {
+        let url = |u: &str| Some(u.to_string());
+        let key = || Some("release-key".to_string());
+        assert_eq!(
+            pair_api_connection(url("http://10.0.0.5:30799"), key(), true),
+            None,
+            "a discovered key must not travel over cleartext to a node address"
+        );
+        assert_eq!(
+            pair_api_connection(url("http://10.0.0.5:31234/api"), key(), true),
+            None
+        );
+        for allowed in ["http://127.0.0.1:30799", "https://api.example.com"] {
+            assert_eq!(
+                pair_api_connection(url(allowed), key(), true),
+                Some((allowed.to_string(), "release-key".to_string())),
+                "{allowed}"
+            );
+        }
+        // An operator-supplied key is their call, exactly as in `cluster deploy`.
+        assert_eq!(
+            pair_api_connection(url("http://10.0.0.5:30799"), key(), false),
+            Some((
+                "http://10.0.0.5:30799".to_string(),
+                "release-key".to_string()
+            ))
+        );
+        assert_eq!(pair_api_connection(None, key(), true), None);
+        assert_eq!(
+            pair_api_connection(url("https://api.example.com"), None, true),
+            None
+        );
+    }
     use crate::ui::CliOutput;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -5482,7 +5520,30 @@ pub async fn resolve_api(
             }
         },
     );
-    Some((url?, key?))
+    let key_discovered = nonempty(api_key).is_none();
+    if key_discovered
+        && key.is_some()
+        && url.as_deref().is_some_and(crate::api::is_insecure_endpoint)
+    {
+        crate::ui::ui().warn(&format!(
+            "not sending the auto-discovered release key over cleartext HTTP to {}; pass \
+             --api-key explicitly to acknowledge, or --api-url with an https:// or loopback URL",
+            url.as_deref().unwrap_or_default()
+        ));
+    }
+    pair_api_connection(url, key, key_discovered)
+}
+
+/// Pair a platform API URL with the key doctor would send it. An auto-discovered
+/// release key never travels over cleartext HTTP to a non-loopback host, the
+/// rule `cluster deploy` enforces with the same classifier.
+fn pair_api_connection(
+    url: Option<String>,
+    key: Option<String>,
+    key_discovered: bool,
+) -> Option<(String, String)> {
+    let (url, key) = (url?, key?);
+    (!key_discovered || !crate::api::is_insecure_endpoint(&url)).then_some((url, key))
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {

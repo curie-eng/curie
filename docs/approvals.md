@@ -164,7 +164,7 @@ the channel the card lands on:
 - **In Slack**, nothing changes: the channel's members, the route's user group, or its
   listed users, exactly as for any Slack card.
 - **In an email thread**, only an address on the route's approver list may answer
-  ([ADR-0183](adr/0183-an-email-approval-is-answered-only-by-a-listed-address.md)). The list
+  ([ADR-0177 amendment](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists)). The list
   is `approvers.emails`, separate from the binding's `allowed_callers`: being allowed to
   talk to the bot is not being allowed to approve what it does. A reply counts only when
   the mail adapter verified its sender (the same SPF, DKIM and DMARC check it applies to
@@ -177,7 +177,7 @@ the channel the card lands on:
   an approval that can only expire. So is a route that lists only Slack `users` or a
   `group`, since nobody on an email thread can prove to be one. Any other non-Slack channel
   has no approver list it can verify yet, so its approvals admit nobody.
-- **The requester adds approvers** (ADR-0183 decision 5). The request email names the route's listed addresses. If one of them is already on the thread (the person who asked, or the To or Cc of the asking message), it says they can answer. If none is, it asks the requester to reply all and add one or more of them, as many as they like. The first answer the platform accepts is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack. The request email and the outcome are sent reply all, the requester always gets the outcome, and the bot never emails an approver who is not on the thread. The worker passes the listed addresses to the adapter as the card's `Approver` fields, for wording only.
+- **The requester adds approvers** (ADR-0177 amendment A5). The request email names the route's listed addresses. If one of them is already on the thread (the person who asked, or the To or Cc of the asking message), it says they can answer. If none is, it asks the requester to reply all and add one or more of them, as many as they like. The first answer the platform accepts is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack. The request email and the outcome are sent reply all, the requester always gets the outcome, and the bot never emails an approver who is not on the thread. The worker passes the listed addresses to the adapter as the card's `Approver` fields, for wording only.
 
 `emails` is allowed only on a `requesting_surface` route, and may sit beside `users` or
 `group`: a card shown in Slack reads only the Slack entries, and a card shown in email
@@ -284,6 +284,9 @@ and the requester stay. An approved or rejected card names who decided and when,
 the note under it. The time is a Slack date token, so each reader sees it in their own
 time zone. An expired card states that the request expired without a decision time.
 A resolve from the CLI or the Console settles the card the same way a click does.
+That holds when the decision lands before the card has finished posting: once the
+worker registers the card it reads the approval back, and a decided or expired record
+settles the card there instead of on the resume.
 
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra

@@ -1,0 +1,25 @@
+2026-09-27T12:43:03.0744662Z === Resolve the bundle under test ===
+2026-09-27T12:43:03.0745069Z bundle: supplied by the caller (CURIE_E2E_BUNDLE), scaffold skipped: /tmp/tmp.i7oUKr2cdF/bundle
+2026-09-27T12:43:03.0745415Z 
+2026-09-27T12:43:03.0745565Z === curie skill up (fake model, offline) ===
+2026-09-27T12:43:10.9537810Z starting runner container 'curie-e2e-runner' from 'curie-runner'
+2026-09-27T12:43:10.9538283Z waiting for runner: ok (1.0s)
+2026-09-27T12:46:03.6511449Z 
+2026-09-27T12:46:03.6511517Z === curie local message --json ===
+2026-09-27T12:46:03.7463642Z local: no-turn control kept app turn counters at zero while Collector accepted=38.0 and exported=38.0 metric points
+2026-09-27T12:46:06.3879147Z waiting for worker reply: ok (1.3s)
+2026-09-27T12:46:06.3880287Z continue this conversation: curie local message --continue "..."
+2026-09-27T12:46:06.3893549Z {"finalized":true,"reply":"This agent cannot start: agent sre-bot declares connector secrets but SandboxWarmPool curie-agent-sre-bot-runner-pool was not rendered; set agentSandbox.connectorSecrets.sre-bot in the release values and upgrade. An operator has to make that change.","thread":"1790513163.801898"}
+2026-09-27T12:46:06.4071290Z local: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-27T12:47:40.4390706Z Traceback (most recent call last):
+2026-09-27T12:47:40.4390964Z   File "<stdin>", line 176, in <module>
+2026-09-27T12:47:40.4394629Z AssertionError: expected a new end-to-end trace after the before snapshot; span names=['GET /v1.48/info', 'GET /v1.48/version', 'HEAD /_ping', 'HTTP POST', 'bake', 'build', 'build .', 'containerd.services.content.v1.Content/Info', 'containerd.services.content.v1.Content/Read', 'curie.background.approval-sweeper', 'curie.background.graveyard-watcher', 'curie.background.resume-reconciler', 'curie.queue.enqueue', 'curie.queue.process', 'curie.reply.update', 'curie.sandbox.claim', 'curie.sandbox.cleanup', 'curie.thread.lock', 'curie.turn.ingress', 'curie.turn.process', 'http.server.request', 'load buildkit capabilities', 'load credentials for registry-1.docker.io', 'moby.buildkit.v1.Control/ListWorkers', 'moby.buildkit.v1.Control/ListenBuildHistory', 'moby.buildkit.v1.Control/Solve', 'moby.buildkit.v1.Control/Status', 'moby.buildkit.v1.frontend.LLBBridge/Ping', 'moby.buildkit.v1.frontend.LLBBridge/Return', 'moby.buildkit.v1.frontend.LLBBridge/Solve', 'moby.filesync.v1.Auth/FetchToken', 'moby.filesync.v1.Auth/GetTokenAuthority', 'moby.filesync.v1.Auth/VerifyTokenAuthority', 'moby.filesync.v1.FileSync/DiffCopy', 'remotes.docker.resolver.FetchTokenWithOAuth']; services=['buildx', 'curie-api', 'curie-dispatcher', 'curie-worker']
+2026-09-27T12:47:40.4540849Z 
+2026-09-27T12:47:40.4541059Z === teardown: curie local down ===
+2026-09-27T12:47:54.2869847Z stopping stack: ok (13.8s)
+2026-09-27T12:47:54.4595313Z volumes kept (fast restart with `curie local up`)
+2026-09-27T12:47:54.4596002Z dev stack stopped
+2026-09-27T12:47:54.8023053Z ##[error]Process completed with exit code 1.
+2026-09-27T12:47:54.8101292Z Post job cleanup.
+2026-09-27T12:47:55.1110732Z ##[group]Generating build summary
+2026-09-27T12:47:55.1568200Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-Ltp54J/export

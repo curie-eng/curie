@@ -157,12 +157,18 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # "workspace-error" (#2004): a managed-workspace preparation failure before
     # the turn was ever accepted, named apart from "runner-error" for the same
     # reason -- and, being retryable, subject to the same crash-on-omission.
+    # "sandbox-terminated": a retryable sandbox termination is a distinct
+    # cause; omitting it makes the retry metric reject the classification.
+    # "sandbox-capacity" (#3693): an approval resume refused by the sandbox
+    # ResourceQuota, retried under its own name.
     "retry_class": [
         "redelivery",
         "rate-limit",
         "runner-error",
         "runner-timeout",
         "workspace-error",
+        "sandbox-terminated",
+        "sandbox-capacity",
     ],
 }
 _THREAD_ATTRIBUTES = {
@@ -180,6 +186,7 @@ _SANDBOX_ATTRIBUTES = {
         "cleanup",
         "reclaim",
         "terminate",
+        "thread-reset",
     ],
     "outcome": [
         "claimed",
@@ -199,6 +206,7 @@ _SANDBOX_ATTRIBUTES = {
         "refused-no-budget",
         "refused-no-safe-route",
         "scan-incomplete",
+        "no-route",
         "timeout",
     ],
 }
@@ -241,6 +249,10 @@ _COMPLETION_OUTBOX_AGE_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["observe"],
     "outcome": ["retry"],
+}
+_SLACK_SOCKET_IDENTITY_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "state": ["configured", "connected"],
 }
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -397,6 +409,34 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+# One aggregate series: the count of agents the connector reconciler is
+# skipping right now (#1215). Which agents, and why, is in the log line each
+# skip transition emits; an agent label here would be a deployment identifier.
+_CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# Removals and rewrites of an agent's stored state (#3673). Namespaces are
+# caller-chosen, so every one the platform does not own shares ``other``; the
+# agent, scope and key are in the log line, never on the metric.
+_STATE_MUTATION_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "op": ["delete", "edit"],
+    "namespace": ["memory", "transcript", "other"],
+}
+_WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "step": [
+        "settle_publications",
+        "expire_waiting",
+        "request_deadline_cancellations",
+        "request_owner_lost_cancellations",
+        "publish_terminate_wakes",
+        "settle_overdue_cancellations",
+        "readmit_pending",
+        "reconcile_missed_labels",
+        "sync_status_comments",
+        "redispatch_lapsed_acquisitions",
+        "publish_execute_wakes",
+    ],
+}
 _EVAL_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["eval"],
@@ -414,6 +454,15 @@ _SUPERVISED_RESTART_ATTRIBUTES = {
         "other",
     ],
     "outcome": ["restart", "give_up"],
+}
+# One point per tool result the runner sees close a call (#3486). Neither the
+# connector nor the tool is an attribute: both are identifiers, so the runner's
+# WARNING line names them instead.
+_TOOL_RESULT_ATTRIBUTES = {
+    "service.name": ["curie-runner"],
+    "source": ["runner"],
+    "origin": ["connector", "platform", "builtin"],
+    "outcome": ["success", "error", "awaiting_approval", "cancelled", "refused", "unavailable"],
 }
 
 
@@ -564,6 +613,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _CAPACITY_WAIT_COUNT_ATTRIBUTES,
     ),
+    "curie.slack.socket.identities": _definition(
+        "gauge",
+        "{identity}",
+        "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+        False,
+        _SLACK_SOCKET_IDENTITY_ATTRIBUTES,
+    ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES
     ),
@@ -599,6 +655,34 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
     ),
+    "curie.connector.reconcile.skipped_agents": _definition(
+        "gauge",
+        "{agent}",
+        "Agents whose connector applies the reconciler is skipping.",
+        False,
+        _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
+    ),
+    "curie.state.mutation": _definition(
+        "counter",
+        "{mutation}",
+        "Agent state and memory entries removed or rewritten.",
+        True,
+        _STATE_MUTATION_ATTRIBUTES,
+    ),
+    "curie.work_item.reconciler.step.failure": _definition(
+        "counter",
+        "{failure}",
+        "Failed WorkItem reconciler steps.",
+        True,
+        _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES,
+    ),
+    "curie.work_item.reconciler.step.consecutive_failures": _definition(
+        "gauge",
+        "{pass}",
+        "Consecutive failed passes for each WorkItem reconciler step.",
+        False,
+        _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES,
+    ),
     "curie.eval.process": _definition(
         "counter", "{job}", "Eval processing outcomes.", True, _EVAL_ATTRIBUTES
     ),
@@ -608,6 +692,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "In-process supervised worker task restarts.",
         True,
         _SUPERVISED_RESTART_ATTRIBUTES,
+    ),
+    "curie.tool.result": _definition(
+        "counter",
+        "{call}",
+        "Tool call results by origin and outcome.",
+        True,
+        _TOOL_RESULT_ATTRIBUTES,
     ),
 }
 

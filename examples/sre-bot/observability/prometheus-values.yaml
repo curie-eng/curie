@@ -4,7 +4,10 @@ prometheus-pushgateway:
   enabled: false
 configmapReload:
   prometheus:
-    enabled: false
+    # Alert rules live in this chart-managed ConfigMap. Keep the reloader on so
+    # a Helm upgrade changes the rules Prometheus is actually serving without
+    # an undocumented manual pod restart (#2981).
+    enabled: true
 kube-state-metrics:
   enabled: true
   # CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these
@@ -145,12 +148,12 @@ serverFiles:
     groups:
       - name: curie-reliability
         # CurieTaskFailure, CurieWorkerSupervisedRestartLoop,
-        # CurieReplyDeliveryRefused and CurieChannelTokenRotationFailed each
-        # have a second term for a new series. The SDK exports a counter only
-        # after its first measurement, so a series arrives at its first value
-        # with no zero before it, and increase() cannot see a first sample.
-        # Each process exports under its own `instance`, so a restarted
-        # process's counters are new series too.
+        # CurieReplyDeliveryRefused, CurieChannelTokenRotationFailed and
+        # CurieConnectorToolErrors each have a second term for a new series.
+        # The SDK exports a counter only after its first measurement, so a
+        # series arrives at its first value with no zero before it, and
+        # increase() cannot see a first sample. Each process exports under its
+        # own `instance`, so a restarted process's counters are new series too.
         # `X unless last_over_time(X[1h] offset O)` is a series with no sample
         # in the hour ending O ago. O is the rule's window, so a new series'
         # value counts as its increase over the same window increase() uses.
@@ -167,6 +170,166 @@ serverFiles:
         # records no curie_approval_pending and should drop that term from
         # CurieApplicationMetricsAbsent.
         rules:
+          - alert: CurieAlloyNoActiveLogFiles
+            # up is scoped to the annotated Alloy DaemonSet pods by job,
+            # namespace, and pod. Prometheus-generated up has no curie_source
+            # stamp because metric relabeling runs before up is generated. The
+            # comparison on the right intentionally disappears for zero OR
+            # missing source gauges, so a healthy scrape still alerts.
+            expr: |
+              max by (namespace, pod, node) (
+                up{
+                  job="kubernetes-pods",
+                  namespace="observability",
+                  pod=~"alloy-.*"
+                } == 1
+              )
+              unless on (namespace, pod)
+              (
+                max by (namespace, pod) (
+                  loki_source_file_files_active_total{
+                    namespace="observability",
+                    curie_source="curie-sre-bot",
+                    component_id="loki.source.file.pod_logs"
+                  }
+                ) > 0
+              )
+            for: 10m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pod has no active log files
+              description: >-
+                Alloy is scrapeable but its file source has no active log files.
+                Check the container runtime parser and host log mounts.
+          - alert: CurieAlloyLogDeliveryStopped
+            # The read and sent metrics have different component/endpoint
+            # labels in the pinned Alloy image. Aggregate independently by
+            # pod, then compare; a second healthy pod must not mask one that
+            # reads without sending. A first positive counter sample counts as
+            # new activity, but an old flat counter does not.
+            expr: |
+              (
+                sum by (namespace, pod, node) (
+                  (
+                    increase(loki_source_file_read_lines_total{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      component_id="loki.source.file.pod_logs"
+                    }[15m]) > 0
+                  )
+                  or
+                  (
+                    (
+                      last_over_time(loki_source_file_read_lines_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.source.file.pod_logs"
+                      }[15m])
+                      unless
+                      last_over_time(loki_source_file_read_lines_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.source.file.pod_logs"
+                      }[1h] offset 15m)
+                    ) > 0
+                  )
+                ) > 0
+              )
+              unless on (namespace, pod)
+              (
+                sum by (namespace, pod) (
+                  (
+                    increase(loki_write_sent_entries_total{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      component_id="loki.write.default"
+                    }[15m]) > 0
+                  )
+                  or
+                  (
+                    (
+                      last_over_time(loki_write_sent_entries_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.write.default"
+                      }[15m])
+                      unless
+                      last_over_time(loki_write_sent_entries_total{
+                        namespace="observability",
+                        curie_source="curie-sre-bot",
+                        component_id="loki.write.default"
+                      }[1h] offset 15m)
+                    ) > 0
+                  )
+                ) > 0
+              )
+              and on (namespace, pod)
+              max by (namespace, pod) (
+                up{
+                  job="kubernetes-pods",
+                  namespace="observability",
+                  pod=~"alloy-.*"
+                } == 1
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pod read logs but sent none to Loki
+              description: >-
+                Alloy read log lines in 15 minutes but sent none to Loki.
+                Check loki.write, network egress, and the receiver.
+          - alert: CurieAlloyScrapeMissing
+            # Both rules above need up == 1, so an Alloy pod Prometheus cannot
+            # scrape (up 0, a blocked metrics port) or never sees (no scrape
+            # annotation) leaves them silent while it ships nothing.
+            # kube-state-metrics reports how many Alloy pods the DaemonSet
+            # wants; fewer scrapeable pods than that pages. The zero term
+            # stands in for the count when no Alloy pod is up at all. A
+            # kube-state-metrics outage removes the left side and is
+            # CurieKubeStateMetricsDown's page, not this one.
+            expr: |
+              max by (namespace) (
+                kube_daemonset_status_desired_number_scheduled{
+                  namespace="observability",
+                  curie_source="curie-sre-bot",
+                  daemonset="alloy"
+                }
+              )
+              >
+              (
+                count by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    namespace="observability",
+                    pod=~"alloy-.*"
+                  } == 1
+                )
+                or on (namespace)
+                (
+                  0 * max by (namespace) (
+                    kube_daemonset_status_desired_number_scheduled{
+                      namespace="observability",
+                      curie_source="curie-sre-bot",
+                      daemonset="alloy"
+                    }
+                  )
+                )
+              )
+            for: 10m
+            labels:
+              severity: page
+              component: curie-log-collection
+            annotations:
+              summary: Alloy pods are missing from the Prometheus scrape
+              description: >-
+                The Alloy DaemonSet wants more pods than Prometheus scrapes, so
+                the per-pod log alerts cannot see the missing ones. Check the
+                Alloy pods, their metrics port, and any network policy between
+                Prometheus and Alloy.
           - alert: CurieApplicationMetricsAbsent
             expr: |
               absent(curie_queue_depth{service_name="curie-worker"})
@@ -722,6 +885,155 @@ serverFiles:
               description: >-
                 The intake process restarted after a configuration, Slack,
                 file-download, hook, routing, or stale-placeholder failure.
+          - alert: CurieConnectorToolErrors
+            # A connector that is serving but answers its tool calls with
+            # errors is invisible to CurieConnectorNotReady: every turn still
+            # ends done, and the model tells the person it could not read the
+            # system. curie_tool_result_total is the runner's count of tool
+            # results by origin and outcome. Runner series are per sandbox
+            # process (`instance`), and a sandbox usually lives for one turn,
+            # so a series' first sample already carries that turn's errors.
+            # Every count therefore uses the new-series term above, reading
+            # last_over_time(X[15m]) for X as CurieTurnAcceptedStale does, so
+            # a sandbox that exported its errors and exited still counts for
+            # the whole window. Each count sums without (instance, outcome),
+            # so errors spread over several sandboxes add up and the alert
+            # names no process. It needs both three or more errors in 15
+            # minutes and errors at least half of the connector's success and
+            # error results, so an occasional model mistake, such as a
+            # connector refusing a wrong argument, does not page. A call the
+            # runner's approval gate held (awaiting_approval), the runner
+            # refused by policy or grant-argument check (refused), an operator
+            # stop cut off (cancelled), or the CLI rejected as an unavailable
+            # tool (unavailable) counts toward neither. An error is a
+            # connector's isError result or JSON-RPC error, or a call the turn
+            # deadline cut off, and rarely a runner-side deny outside the
+            # approval gate, as docs/interfaces/telemetry-otel/INTERFACE.md
+            # lists. A connector
+            # that reports failure inside a success-shaped payload counts as a
+            # success, and this rule cannot see it. The metric carries no
+            # connector name. The runner logs one WARNING per failed call
+            # naming the connector server and tool, and that line is how to
+            # find which connector is failing.
+            expr: |
+              sum without (instance, outcome) (
+                (
+                  increase(
+                    curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                  )
+                  unless
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                or
+                (
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                  )
+                  unless
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                    offset 15m
+                  )
+                )
+              ) >= 3
+              and
+              (
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="error"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                /
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error"
+                        }[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error"
+                        }[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error"
+                      }[1h]
+                      offset 15m
+                    )
+                  )
+                )
+              ) >= 0.5
+            for: 5m
+            labels:
+              severity: page
+              component: curie-connector
+            annotations:
+              summary: Connector tool calls are failing
+              description: >-
+                curie_tool_result_total with origin connector and outcome error
+                increased by three or more in 15 minutes and was at least half of
+                the connector success and error results, counting a series' first
+                sample as an increase from zero. The runner logs one WARNING per
+                failed call naming the connector server and tool.
           - alert: CurieDispatcherRestartLoop
             # Pod restarts, not CurieWorkerSupervisedRestartLoop's in-process
             # counter: a dispatcher that crashes takes its counter with it.

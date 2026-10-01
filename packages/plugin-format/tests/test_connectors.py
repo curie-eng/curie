@@ -792,11 +792,11 @@ def test_build_declaration_vectors(vector: dict) -> None:
 
 
 def test_connector_declaration_field_names_match_the_frozen_vector() -> None:
-    # The gap review finding r2-1 named: plugin-format.schema.json carries no
-    # Connector* $defs, so `curie dev field-parity` compares nothing for the
-    # Rust mirrors and a new Python field would land with every gate green.
-    # Adding one without editing the vector fails here; editing the vector to
-    # make this pass then fails the Rust half until the mirror gains the field.
+    # The gap review finding r2-1 named, from before the schema export carried
+    # these models (#1128). `curie dev field-parity` now compares the Rust
+    # mirrors against the exported $defs too; this vector pair predates that.
+    # Adding a field without editing the vector fails here; editing the vector
+    # to make this pass then fails the Rust half until the mirror gains it.
     from plugin_format.connectors import ConnectorBuild, ConnectorSpec
 
     fields = _vector_file("connector-fields.json")["models"]

@@ -263,7 +263,7 @@ def card_on_requesting_surface(approval: Approval, binding: Any) -> bool:
 
 
 def shown_off_slack(approval: Approval, binding: Any) -> bool:
-    """Whether this approval's card is in a non-Slack conversation (ADR-0177, ADR 0183).
+    """Whether this approval's card is in a non-Slack conversation (ADR-0177 and its amendment).
 
     None of Slack's approver sets can be proven there. An email card is
     answered only from the route's approver email list (``EmailApprovers``);
@@ -275,7 +275,7 @@ def shown_off_slack(approval: Approval, binding: Any) -> bool:
 
 
 class EmailApprovers:
-    """A literal list of approver email addresses (ADR 0183).
+    """A literal list of approver email addresses (ADR-0177 amendment).
 
     The set for a card shown in an email thread whose route lists ``emails``.
     A member is a sender the serving mail adapter verified at its inbound gate
@@ -297,7 +297,7 @@ class EmailApprovers:
     configuration the platform cannot evaluate, not a verdict on the sender.
     """
 
-    # NEW vocabulary added by ADR 0183; see the audit-vocabulary note above.
+    # NEW vocabulary added by the ADR-0177 amendment; see the audit-vocabulary note above.
     audit_name = "EmailApproverList"
     operator_eligible = False
     console_eligible = False
@@ -343,7 +343,7 @@ class EmailApprovers:
 class NoVerifiableApprovers:
     """A non-Slack card with no approver list that channel can verify: admits nobody.
 
-    ADR 0183 decision 3 retires the requester-only default: an email card is
+    ADR-0177 amendment A3 retires the requester-only default: an email card is
     answered only from the route's ``emails``, and no other non-Slack channel
     has a list yet. A routeless approval, a route declaring no ``emails``, a
     route declaring only Slack approvers, and any non-email channel all land
@@ -356,7 +356,7 @@ class NoVerifiableApprovers:
     the authorizer denies without knowing this set exists.
     """
 
-    # NEW vocabulary added by ADR 0183; see the audit-vocabulary note above.
+    # NEW vocabulary added by the ADR-0177 amendment; see the audit-vocabulary note above.
     audit_name = "NoVerifiableApprovers"
     operator_eligible = True
     console_eligible = True

@@ -1,0 +1,11 @@
+2026-09-17T08:30:29.6241097Z ##[group]Run python3 release/nightly.py file-issues \
+2026-09-17T08:30:29.6242704Z python3 release/nightly.py file-issues \
+2026-09-17T08:30:29.6244109Z   --repo "$GITHUB_REPOSITORY" \
+2026-09-17T08:30:29.6245648Z   --run-id "$GITHUB_RUN_ID" \
+2026-09-17T08:30:29.6247366Z   --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+2026-09-17T08:30:29.6301121Z ##[endgroup]
+2026-09-17T08:30:33.1929265Z ERROR: could not file nightly-ladder issues (CalledProcessError: the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway)
+2026-09-17T08:30:33.2020575Z ##[error]Process completed with exit code 1.
+2026-09-17T08:30:33.2165986Z Post job cleanup.
+2026-09-17T08:30:33.2989665Z [command]/usr/bin/git version
+2026-09-17T08:30:33.3026806Z git version 2.55.0

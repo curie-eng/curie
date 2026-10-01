@@ -38,7 +38,7 @@ def _approval(*, author: str = "U_AE", channel: str = "C_MGRS") -> Approval:
         author=author,
         summary="Discount for ACME",
         # NOT NULL in the table; every real row names its asking kind, and a
-        # non-Slack one selects an email or no-approver set instead (ADR 0183).
+        # non-Slack one selects an email or no-approver set instead (ADR-0177 amendment).
         reply_kind="slack",
         reply_channel=channel,
         reply_placeholder="p-1",
@@ -748,7 +748,7 @@ def test_authorizer_fails_closed_when_the_slack_lookup_errors() -> None:
     assert decision.evidence["error"]
 
 
-# --- ADR 0183: approver emails for a card shown in an email thread -------------
+# --- ADR-0177 amendment: approver emails for a card shown in an email thread ---
 
 _INBOX = "bot@example.com"
 _EMAIL_APPROVER = "approver@example.com"
@@ -823,7 +823,7 @@ def test_an_empty_email_list_is_undetermined_not_a_verdict() -> None:
 
 
 def test_no_list_on_email_admits_nobody_not_the_requester() -> None:
-    """ADR 0183 decision 3: routeless, a route without approvers, and a route
+    """ADR-0177 amendment A3: routeless, a route without approvers, and a route
     with only Slack approvers all admit nobody on an email card."""
 
     for route, binding in (

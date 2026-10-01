@@ -365,6 +365,14 @@ class SandboxView:
     port: int | None = None
 
 
+@dataclass(frozen=True)
+class SandboxTermination:
+    """Confirmed termination of the runner pod, with safe diagnostic text."""
+
+    reason: str
+    detail: str | None = None
+
+
 OperatingMode = Literal["Running", "Suspended"]
 
 
@@ -420,6 +428,13 @@ class SandboxClient(Protocol):
         """The scheduler's message when pod ``name`` is ``PodScheduled=False``
         with reason ``Unschedulable``; None when it is scheduled, missing, or
         unreadable."""
+
+        ...
+
+    def pod_termination(
+        self, name: str, *, since: datetime, request_timeout_seconds: float
+    ) -> SandboxTermination | None:
+        """Confirmed pod termination, or None when the evidence is absent."""
 
         ...
 

@@ -128,7 +128,8 @@ curl -X POST "$CURIE_API_URL/channels/turns" \
     "conversation_id": "thr_01H...",
     "author": "someone@example.com",
     "text": "Subject line\n\nBody text",
-    "reply_ref": "msg_01H..."
+    "reply_ref": "msg_01H...",
+    "attachments": [{"id": "msg_01H.../att_1", "name": "report.pdf"}]
   }'
 ```
 
@@ -144,6 +145,18 @@ curl -X POST "$CURIE_API_URL/channels/turns" \
   per (an email thread id, a ticket id).
 - **`reply_ref`** is opaque and adapter-minted. The platform never parses it and
   hands it back on every reply event. Email uses the upstream message id.
+- **`attachments`** is optional and defaults to `[]`. Each entry is a file
+  reference, never the bytes: a required `id` and `name`, plus optional
+  `mime_type` and `size_bytes`. The `id` is yours and opaque. A reference with
+  no `id` or `name` is a 422. To give the agent the file, the worker calls
+  `GET {endpoint}/attachments/{id}` on your binding's endpoint, with the same
+  `X-Curie-Adapter-Secret` your reply endpoint verifies (ADR-0153). The `id` is
+  percent-encoded with `/` kept. Answer 200 with the bytes. Any other status,
+  including a 404 for an id you no longer hold or a redirect, refuses the
+  turn's whole set, and the person is told the file could not be made
+  available. The worker only fetches when the operator has turned the
+  attachment lane on (`worker.attachments.enabled`), and the per-file cap
+  applies.
 - **`kind` and `address` ride in the body, not the path**, because an address
   may contain `@`, `.`, `/`, `?` or `#`.
 - Unknown fields are ignored, not rejected. In particular the body cannot name

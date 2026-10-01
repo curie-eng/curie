@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token, transcripts
+from .. import crud, sandbox_token, state_mutation, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
@@ -751,14 +751,31 @@ async def _delete_state(
     key: str,
     expected_version: int | None,
     session: AsyncSession,
+    caller: StateCaller,
 ) -> Response:
     # expected_version opts into compare-and-delete (#2820), so an operator
     # that exported a transcript never deletes turns appended after the export.
     # The version is a predicate of the DELETE itself, so an append that
     # commits between the read and the delete cannot be removed with it.
-    if namespace == TRANSCRIPT_NAMESPACE:
-        await transcripts.remove(session, agent_id, scope, key, expected_version)
+    #
+    # Each completed delete is recorded, including one that found nothing
+    # (#3673). A 409 raises before the record: nothing was touched.
+    def recorded(removed: bool) -> Response:
+        state_mutation.record(
+            op="delete",
+            agent_id=agent_id,
+            scope=scope,
+            namespace=namespace,
+            key=key,
+            removed=removed,
+            principal=caller.value,
+        )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    if namespace == TRANSCRIPT_NAMESPACE:
+        return recorded(
+            await transcripts.remove(session, agent_id, scope, key, expected_version)
+        )
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if expected_version is None:
         if entry is not None:
@@ -788,7 +805,8 @@ async def _delete_state(
                 status.HTTP_409_CONFLICT,
                 f"version mismatch: expected {expected_version}, {found}",
             )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Past the compare-and-delete, a versioned delete always removed its row.
+    return recorded(entry is not None)
 
 
 @router.delete(
@@ -801,9 +819,12 @@ async def delete_state(
     namespace: str,
     key: str,
     session: SessionDep,
+    caller: Annotated[StateCaller, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
-    return await _delete_state(agent_id, None, namespace, key, expected_version, session)
+    return await _delete_state(
+        agent_id, None, namespace, key, expected_version, session, caller
+    )
 
 
 @router.delete(
@@ -818,7 +839,10 @@ async def delete_state_for_binding(
     namespace: str,
     key: str,
     session: SessionDep,
+    caller: Annotated[StateCaller, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _delete_state(agent_id, scope, namespace, key, expected_version, session)
+    return await _delete_state(
+        agent_id, scope, namespace, key, expected_version, session, caller
+    )

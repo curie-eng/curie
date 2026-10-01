@@ -10,7 +10,7 @@ conftest uses for DATABASE_URL).
 from typing import Any
 
 import pytest
-from curie_api.config import get_settings
+from curie_api.config import Settings, get_settings
 
 
 def test_config_is_open(client: Any) -> None:
@@ -44,3 +44,22 @@ def test_config_reflects_the_configured_org_name(
         assert client.get("/config").json()["org_name"] == "Globex Corporation"
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("api_url", "html_base"),
+    [
+        ("https://api.github.com", "https://github.com"),
+        ("https://api.github.com/", "https://github.com"),
+        ("https://github.example.com/api/v3", "https://github.example.com"),
+        ("https://github.example.com/api/v3/", "https://github.example.com"),
+        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
+        ("https://github.example.com:8443/forge/api/v3/", "https://github.example.com:8443/forge"),
+    ],
+)
+def test_github_html_base_is_derived_from_the_configured_api_url(
+    monkeypatch: pytest.MonkeyPatch, api_url: str, html_base: str
+) -> None:
+    monkeypatch.setenv("GITHUB_API_URL", api_url)
+
+    assert Settings().github_html_base == html_base

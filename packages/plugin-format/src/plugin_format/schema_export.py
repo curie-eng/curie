@@ -10,6 +10,15 @@ from typing import Any
 
 from pydantic.json_schema import models_json_schema
 
+from .connector_lock import ConnectorLockEntry, ConnectorLockFile, RunnerLockEntry
+from .connectors import (
+    ConnectorBuild,
+    ConnectorsFile,
+    ConnectorSpec,
+    RunnerSpec,
+    SecretRef,
+)
+from .deploy_targets import DeployTarget, DeployTargetsFile
 from .models import (
     ApprovalGate,
     ApprovalPolicy,
@@ -36,6 +45,19 @@ _MODELS = (
     ApprovalPolicy,
     ApprovalGate,
     ToolPolicy,
+    # The Curie-only root files (connectors.yaml, connectors.lock.yaml,
+    # deploy.yaml). They are frozen bundle shapes like the manifest, so they
+    # ride the same drift gate (#1128).
+    ConnectorsFile,
+    ConnectorSpec,
+    ConnectorBuild,
+    SecretRef,
+    RunnerSpec,
+    ConnectorLockFile,
+    ConnectorLockEntry,
+    RunnerLockEntry,
+    DeployTargetsFile,
+    DeployTarget,
 )
 
 SCHEMA_ID = "https://curietech.ai/schemas/plugin-format.schema.json"

@@ -218,7 +218,7 @@ class SlackApproverSetSelector:
     Before any of that, a card shown in a non-Slack conversation (routeless, or
     a route in ``requesting_surface`` mode) takes a provider-neutral set, since
     no Slack set can be proven there (ADR-0177): the route's approver
-    ``emails`` on an email card, and nobody otherwise (ADR 0183).
+    ``emails`` on an email card, and nobody otherwise (ADR-0177 amendment).
     """
 
     def __init__(
@@ -251,7 +251,7 @@ class SlackApproverSetSelector:
             return InvalidApprovers(spec_error)
         if shown_off_slack(approval, binding):
             # ADR-0177: the card is in a non-Slack conversation, so none of
-            # Slack's sets below can be proven there. ADR 0183: an email card is
+            # Slack's sets below can be proven there. ADR-0177 amendment: an email card is
             # answered only from the route's approver emails, and there is no
             # requester-only fallback. A routeless approval has no binding, so
             # no list, and admits nobody; the worker escalates it when raised.
@@ -290,8 +290,8 @@ class SlackApproverSetSelector:
             return ExplicitUsers(approvers.users)
         group = approvers.group
         if group is None:
-            # A Slack card whose route lists only approver ``emails`` (ADR 0183
-            # decision 4): an address is never proof on Slack, and falling back
+            # A Slack card whose route lists only approver ``emails`` (ADR-0177 amendment
+            # A4): an address is never proof on Slack, and falling back
             # to channel membership would widen the set the operator narrowed.
             # Also the refusal for a block declaring nothing, which the schema
             # rejects. Written as a branch rather than an assert so it stays a

@@ -4,10 +4,12 @@ The dispatcher records file *references* on the wire and nothing else:
 ``aci_protocol.Attachment`` carries ``id``/``name`` and deliberately no url and
 no bytes, because a carried channel URL would invite a sandbox-side fetch that
 ADR-0032's default-deny egress forbids.  This module is the other half.  The
-worker holds the bot token and can reach the channel, so it downloads each
-referenced file, parks the bytes in the private object store under its OWN
-prefix, and mints a short-lived one-object read capability that the sandbox's
-attachment init container redeems.  The bot token never leaves the worker, which
+worker holds the channel credential and can reach the channel (the bot token
+for Slack, the adapter's egress secret for a channel-port binding, ADR-0153),
+so it downloads each referenced file, parks the bytes in the private object
+store under its OWN prefix, and mints a short-lived one-object read capability
+that the sandbox's attachment init container redeems.  The credential (the bot
+token, or an adapter's secret) never leaves the worker, which
 is what keeps ADR-0075's boundary intact while the Agent Proxy is unbuilt.
 
 Three properties are load-bearing and each has a reason it is not merely style:
@@ -48,15 +50,17 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from aci_protocol import Attachment
+from aci_protocol import Attachment, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY
 
+from .reply_sink import ADAPTER_SECRET_HEADER, SLACK_KIND
 from .workspace import WorkspaceObjectPort
 
 # The attachment lane's own object namespace. Never the workspace archives':
@@ -89,9 +93,8 @@ ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 #: exists to close.
 ATTACHMENTS_MOUNT_PATH = "/attachments"
 
-# Where the channel's file metadata is looked up. Only Slack today; the id in
-# ``Attachment`` is the channel's own file id, so resolving it is the port's
-# job, not this module's.
+# Where Slack's file metadata is looked up. The id in ``Attachment`` is the
+# channel's own file id, so resolving it is the port's job, not this module's.
 _SLACK_API_URL = "https://slack.com/api"
 
 # A files.info envelope is metadata; nothing legitimate is large. Bounded so a
@@ -470,6 +473,88 @@ def _slack_transport(
     )
 
 
+class ChannelPortFileError(RuntimeError):
+    """The adapter behind a channel-port binding would not serve a file."""
+
+
+class ChannelPortFileClient:
+    """Fetch a channel-port turn's files from the adapter that sent them (ADR-0153).
+
+    Every adapter behind the channel port serves one shape, ``GET
+    {endpoint}/attachments/{id}`` behind its adapter secret, so one client
+    serves them all. The endpoint is the binding's reply endpoint, and the
+    secret and its header are the ones the reply sink already sends there
+    (``CURIE_ADAPTER_CREDENTIALS``), so this adds no credential and no new
+    destination. Slack is the one kind whose files are not behind an adapter.
+    Redirects are refused by the shared transport: following one would send the
+    secret to a host the adapter named.
+
+    ``id`` is opaque and the adapter's own. It is percent-encoded so a ``?``,
+    ``#`` or space cannot end the path early, and ``/`` is kept so an id the
+    adapter minted with path segments reaches it as minted.
+    """
+
+    def __init__(
+        self,
+        *,
+        credentials: Mapping[str, str],
+        transport: Callable[..., SlackFileResponse] = _slack_transport,
+        read_chunk_bytes: int = 1024 * 1024,
+    ) -> None:
+        if read_chunk_bytes <= 0:
+            raise ValueError("read_chunk_bytes must be positive")
+        self._credentials = dict(credentials)
+        self._transport = transport
+        self._read_chunk_bytes = read_chunk_bytes
+
+    def bind(self, handle: ReplyHandle) -> AttachmentFilePort:
+        """The file port for one binding, refused before any request when the
+        worker has nowhere to ask or nothing to authenticate with."""
+
+        endpoint = (handle.endpoint or "").rstrip("/")
+        if not endpoint:
+            raise AttachmentResolutionError(
+                "wiring",
+                f"the {handle.kind} binding declares no endpoint to fetch its attachments from",
+            )
+        secret = self._credentials.get(handle.adapter or "")
+        if not secret:
+            raise AttachmentResolutionError(
+                "credential",
+                f"no adapter credential is configured on this worker for adapter "
+                f"{handle.adapter!r}, so its attachments cannot be fetched",
+            )
+        return _BoundChannelPortFiles(
+            endpoint=endpoint,
+            secret=secret,
+            transport=self._transport,
+            read_chunk_bytes=self._read_chunk_bytes,
+        )
+
+
+@dataclass(frozen=True)
+class _BoundChannelPortFiles:
+    """One binding's ``AttachmentFilePort``."""
+
+    endpoint: str
+    secret: str = field(repr=False)
+    transport: Callable[..., SlackFileResponse]
+    read_chunk_bytes: int
+
+    def fetch(self, file_id: str) -> Iterator[bytes]:
+        response = self.transport(
+            method="GET",
+            url=f"{self.endpoint}/attachments/{urllib.parse.quote(file_id, safe='/')}",
+            headers={ADAPTER_SECRET_HEADER: self.secret},
+            chunk_bytes=self.read_chunk_bytes,
+        )
+        if response.status != 200:
+            raise ChannelPortFileError(
+                f"adapter attachment download failed: HTTP {response.status}"
+            )
+        return response.chunks
+
+
 class SlackFileClient:
     """Download one Slack file's bytes with the bot token, and only here.
 
@@ -590,7 +675,9 @@ class AttachmentCoordinator:
     ``clock`` is the wall clock the two independent expiry windows are measured
     against. ``identity_files`` holds each named Slack identity's own download
     (ADR-0168 decision 5); ``files`` is ``default``'s, or None on a worker that
-    holds no bot token for it.
+    holds no bot token for it. ``channel_files`` fetches a channel-port
+    binding's files from its adapter (ADR-0153), or is None on a worker that
+    holds no adapter credential.
     """
 
     def __init__(
@@ -601,6 +688,7 @@ class AttachmentCoordinator:
         limits: AttachmentLimits | None = None,
         clock: Callable[[], float] = time.time,
         identity_files: Mapping[str, AttachmentFilePort] | None = None,
+        channel_files: ChannelPortFileClient | None = None,
     ) -> None:
         # None when this worker holds no bot token for `default` (ADR-0168
         # decision 5): `_files_for` refuses that identity the same way it
@@ -612,6 +700,7 @@ class AttachmentCoordinator:
         self._clock = clock
         self._lock = threading.Lock()
         self._identity_files: dict[str, AttachmentFilePort] = dict(identity_files or {})
+        self.channel_files = channel_files
 
     # -- resolve ------------------------------------------------------------
 
@@ -623,11 +712,16 @@ class AttachmentCoordinator:
         attachments: Sequence[Attachment],
         generation: str | None = None,
         identity: str = DEFAULT_IDENTITY,
+        handle: ReplyHandle | None = None,
     ) -> PreparedAttachments:
         """Download, park and mint the whole set, or refuse it and leave nothing.
 
         The refusal is loud and total by design (see the module docstring): a
         partial set reads to an agent exactly like a complete one.
+
+        ``handle`` is the turn's server-minted reply handle. A non-Slack kind
+        selects its adapter's transport; Slack, or no handle, selects the bot
+        token for ``identity``.
         """
 
         refs = tuple(attachments)
@@ -646,7 +740,7 @@ class AttachmentCoordinator:
             raise AttachmentResolutionError(
                 "wiring", "attachment resolution requires a bound agent"
             )
-        files = self._files_for(identity)
+        files = self._files_for(identity, handle)
 
         mint = generation or uuid.uuid4().hex
         written: list[str] = []
@@ -685,9 +779,19 @@ class AttachmentCoordinator:
         self._record(thread_key, prepared)
         return prepared
 
-    def _files_for(self, identity: str) -> AttachmentFilePort:
-        """The download for ``identity``, refused before any fetch when absent."""
+    def _files_for(self, identity: str, handle: ReplyHandle | None = None) -> AttachmentFilePort:
+        """The download for this turn's binding, refused before any fetch when absent."""
 
+        if handle is not None and handle.kind != SLACK_KIND:
+            if self.channel_files is None:
+                # Never fall through to Slack: the id is the adapter's, and
+                # Slack would answer for a different file or none.
+                raise AttachmentResolutionError(
+                    "credential",
+                    f"no adapter credential is configured on this worker, so the "
+                    f"{handle.kind} binding's attachments cannot be fetched",
+                )
+            return self.channel_files.bind(handle)
         files = self.files if identity == DEFAULT_IDENTITY else self._identity_files.get(identity)
         if files is None:
             raise AttachmentResolutionError(

@@ -376,8 +376,8 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
         return None
     if not callers:
         raise ValueError(
-            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
-            "to one operator and \"no limit\" to the next. Send null to let "
+            'allowed_callers must not be empty: an empty list reads as "nobody" '
+            'to one operator and "no limit" to the next. Send null to let '
             "everyone talk to the bot through this binding, or list at least one "
             "caller id."
         )
@@ -395,7 +395,7 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
                     "binding's callers are exact ids starting with U, W or B "
                     "(e.g. U0123ABCD), never a @handle, a display name or an "
                     "email. Find a person's id in their profile, under "
-                    "\"Copy member ID\"."
+                    '"Copy member ID".'
                 )
         elif kind == EMAIL_KIND:
             if not _EMAIL_CALLER.match(caller):
@@ -686,7 +686,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
     keeps the zero-setup default in Slack: the resolution-card channel's members
     are the approvers. Notification recipients never enter this policy.
 
-    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR 0183).
+    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR-0177 amendment).
     Each surface reads only its own: a Slack card never reads ``emails``, and an
     email card never reads ``users`` or ``group``.
     """
@@ -704,7 +704,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
     # (issue #420 settles the precedence rather than refusing the combination),
     # and needs no Slack lookup at all.
     users: list[str] | None = None
-    # An explicit list of approver email addresses (ADR 0183), read only for a
+    # An explicit list of approver email addresses (ADR-0177 amendment), read only for a
     # card shown in an email thread. Separate from the binding's
     # ``allowed_callers``: being allowed to talk to a bot is not being allowed to
     # approve what it does. Stored lowercase, the form the mail adapter reports a
@@ -1263,7 +1263,7 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     approval's card already does. Who may answer then follows the channel the
     card lands on: Slack keeps its approver sets, and any other channel admits
     only an address on the route's approver ``emails`` (``approvers.EmailApprovers``,
-    ADR 0183).
+    ADR-0177 amendment).
 
     Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
     ``address`` beside it is a mix of the two forms, which the ADR refuses
@@ -1322,7 +1322,7 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
-        # ADR 0183 decision 1: only a requesting_surface route shows its card in
+        # ADR-0177 amendment A1: only a requesting_surface route shows its card in
         # an email thread. A fixed target is a Slack channel, where an address
         # can never be verified, so an email list there could only admit nobody.
         if (
@@ -1967,11 +1967,11 @@ class PublicationCreate(BaseModel):
     def _safe_changed_paths(cls, value: list[str]) -> list[str]:
         for path in value:
             parts = path.split("/")
-            if tuple(part.casefold() for part in parts[:2]) == (
-                ".github",
-                "workflows",
-            ):
+            folded = tuple(part.casefold() for part in parts)
+            if folded[:2] == (".github", "workflows"):
                 raise ValueError("GitHub workflow changes cannot be published by this capability")
+            if folded[:1] == (".github",):
+                raise ValueError("GitHub metadata changes cannot be published by this capability")
             if (
                 not path
                 or path.startswith("/")
@@ -2515,6 +2515,12 @@ class ApprovalOut(BaseModel):
     resolved_at: datetime | None
 
 
+class ApprovalCreateOut(ApprovalOut):
+    """Display attribution for creation, separate from the durable turn author."""
+
+    requested_by: str | None = None
+
+
 class ActionRecord(BaseModel):
     """The opening frame of a side-effecting call, as the worker forwards it.
 
@@ -2932,9 +2938,17 @@ class KillState(BaseModel):
 
 
 class ThreadResetState(BaseModel):
-    """Whether a thread has a pending forced-sandbox-release request (#713)."""
+    """Whether a thread has a pending forced-sandbox-release request (#713).
+
+    ``route_existed`` is what the worker found when it drained the reset
+    (#3699). None while the reset is pending, and when no outcome is recorded
+    (the record expired, or the worker predates this field). False when the
+    drained reset matched no route, so nothing was released -- usually a key
+    built by hand that left out a named bot's identity segment. True when a
+    route existed and was released."""
 
     requested: bool
+    route_existed: bool | None = None
 
 
 class CostReport(BaseModel):

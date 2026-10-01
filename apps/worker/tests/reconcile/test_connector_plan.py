@@ -199,6 +199,10 @@ def test_a_built_connectors_desired_object_carries_the_locked_digest() -> None:
         connector="k8s-write",
         spec=resolved.connectors["k8s-write"],
         secret_name="conn-secrets",
+        proxy=connector_render.ConnectorProxy(
+            image="ghcr.io/curie-eng/curie-worker:0.0.0",
+            public_keys=("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",),
+        ),
     )
     desired = [own(o, "acme-bot") for o in rendered]
 

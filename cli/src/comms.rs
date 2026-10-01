@@ -68,6 +68,11 @@ pub struct LocalCommsOpts {
     /// verb silently reverts five services from a `--build` stack's tag to
     /// `:latest`.
     pub stack_image_env: Vec<(String, String)>,
+    /// The install's API key and Postgres password as compose secret env
+    /// (#3557, `local_stack_keys::compose_secret_env`). Same parity obligation
+    /// again: the `up` below recreates the api through `depends_on`, and an api
+    /// recreated without them falls back to compose's well-known dev key.
+    pub stack_secret_env: Vec<(String, String)>,
 }
 
 pub fn connect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
@@ -138,23 +143,24 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     env.extend(otel_endpoint_env_override(o.minimal));
     env.push(("COMPOSE_PROJECT_NAME".into(), o.project.clone()));
     env.extend(o.stack_image_env.iter().cloned());
-    vec![OpsCommand::new(
-        "docker",
-        comms_compose_args(
-            o,
-            &["core", "slack"],
-            &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
-        ),
-    )
-    .with_env(env)
-    .with_secret_env({
-        let mut secret_env = vec![
-            ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
-            ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
-        ];
-        secret_env.extend(o.model_credentials.clone());
-        secret_env
-    })]
+    let mut model_credentials = vec![
+        ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
+        ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
+    ];
+    model_credentials.extend(o.model_credentials.iter().cloned());
+    vec![crate::local::with_stack_secret_env(
+        OpsCommand::new(
+            "docker",
+            comms_compose_args(
+                o,
+                &["core", "slack"],
+                &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+            ),
+        )
+        .with_env(env),
+        model_credentials,
+        o.stack_secret_env.clone(),
+    )]
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
@@ -175,12 +181,15 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
             "docker",
             comms_compose_args(o, &["core", "slack"], &["stop", "curie-dispatcher"]),
         ),
-        OpsCommand::new(
-            "docker",
-            comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
-        )
-        .with_env(worker_env)
-        .with_secret_env(o.model_credentials.clone()),
+        crate::local::with_stack_secret_env(
+            OpsCommand::new(
+                "docker",
+                comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
+            )
+            .with_env(worker_env),
+            o.model_credentials.clone(),
+            o.stack_secret_env.clone(),
+        ),
     ]
 }
 
@@ -775,6 +784,7 @@ mod tests {
             model: None,
             minimal,
             stack_image_env: Vec::new(),
+            stack_secret_env: Vec::new(),
         }
     }
 
@@ -793,6 +803,7 @@ mod tests {
             model: None,
             minimal: false,
             stack_image_env: Vec::new(),
+            stack_secret_env: Vec::new(),
         });
         assert_eq!(cmds.len(), 1);
         let line = cmds[0].display();
@@ -804,6 +815,41 @@ mod tests {
              curie-worker curie-dispatcher"
         );
         assert!(!line.contains("secretsecret"), "secret leaked: {line}");
+    }
+
+    // #3557: both directions recreate the api through `depends_on`, so both
+    // carry the install credentials, masked, next to the model credentials.
+    #[test]
+    fn local_comms_commands_carry_the_install_credentials_masked() {
+        for disconnect in [false, true] {
+            let mut o = local_comms_opts(disconnect, ModelMode::DefaultFake);
+            o.model_credentials = vec![("ANTHROPIC_API_KEY".into(), "sk-PLACEHOLDER-model".into())];
+            o.stack_secret_env = vec![
+                ("CURIE_LOCAL_API_KEY".into(), "PLACEHOLDERapikey".into()),
+                (
+                    "CURIE_LOCAL_POSTGRES_PASSWORD".into(),
+                    "PLACEHOLDERpgpass".into(),
+                ),
+            ];
+            let cmds = if disconnect {
+                local_disconnect_commands(&o)
+            } else {
+                local_connect_commands(&o)
+            };
+            let up = cmds.last().expect("an up command");
+            let line = up.display();
+            for expected in [
+                "CURIE_LOCAL_API_KEY=PLACEHOL***",
+                "CURIE_LOCAL_POSTGRES_PASSWORD=PLACEHOL***",
+                "ANTHROPIC_API_KEY=sk-PLACE***",
+            ] {
+                assert!(line.contains(expected), "missing {expected}: {line}");
+            }
+            assert!(
+                !line.contains("apikey") && !line.contains("pgpass"),
+                "{line}"
+            );
+        }
     }
 
     #[test]

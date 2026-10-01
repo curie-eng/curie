@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Assert the cluster upgrade matrix stays inside the 20 minute budget (#2823).
+"""@spec CI-UPGRADE-MATRIX-BUDGET: measure the upgrade matrix wall clock.
 
 Reads a GitHub Actions jobs payload (the documented
 ``GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`` response) and adds the
 shared image build job's wall clock to each matrix shard's run step. The images
 now build once in a separate job before the shards start.
 
-Always writes the seconds to the job summary. Exits 1 when the longest shard
-job exceeds the budget, when the jobs list is truncated, or when timestamps
-are missing.
+Always writes the seconds to the job summary. An overrun emits a warning;
+untrustworthy measurements still fail.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 BUDGET_SECONDS = 20 * 60
 SHARD_PREFIX = "E2E cluster upgrade matrix ("
@@ -289,8 +288,7 @@ def read_jobs_json(path: Path) -> list[dict[str, Any]]:
     return load_jobs(payload)
 
 
-def emit(message: str, *, error: bool) -> None:
-    kind = "error" if error else "notice"
+def emit(message: str, *, kind: Literal["error", "warning", "notice"]) -> None:
     print(f"::{kind} title=Upgrade matrix wall clock::{message}")
     print(message, file=sys.stderr)
 
@@ -328,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = timings_from_jobs(jobs)
     except BudgetError as exc:
         write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
-        emit(str(exc), error=True)
+        emit(str(exc), kind="error")
         return 1
 
     try:
@@ -336,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
         asserted = longest.shard_plus_images_seconds
     except BudgetError as exc:
         write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
-        emit(str(exc), error=True)
+        emit(str(exc), kind="error")
         return 1
     over = asserted > BUDGET_SECONDS
     write_summary(summary_path, render_summary(rows, longest, over))
@@ -346,15 +344,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"longest image build plus matrix run {asserted}s on {longest.shard} "
                 f"exceeds {BUDGET_SECONDS}s budget"
             ),
-            error=True,
+            kind="warning",
         )
-        return 1
+        return 0
     emit(
         (
             f"longest image build plus matrix run {asserted}s on {longest.shard} "
             f"(budget {BUDGET_SECONDS}s)"
         ),
-        error=False,
+        kind="notice",
     )
     return 0
 

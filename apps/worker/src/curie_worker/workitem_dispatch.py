@@ -1,7 +1,7 @@
 """Work-item dispatch client, event-id parsing, and termination observation.
 
-The kernel recognizes ``work-item-{uuid}-execute-{generation}`` and
-``work-item-{uuid}-terminate`` on the runs stream. SQL in the API owns wait
+The kernel recognizes the work-item event ids on the runs stream (grammar in
+``channel_protocol.work_item_events``). SQL in the API owns wait
 and ownership; this module is the worker-side HTTP seam and the in-process
 run record keyed by request id.
 """
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -18,16 +17,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
+from channel_protocol.work_item_events import (
+    parse_work_item_event_id as _parse_shared_event_id,
+)
 
 logger = logging.getLogger(__name__)
-
-_UUID = (
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-)
-WORK_ITEM_EXECUTE_RE = re.compile(rf"^work-item-({_UUID})-execute-([1-9][0-9]*)$")
-WORK_ITEM_TERMINATE_RE = re.compile(rf"^work-item-({_UUID})-terminate$")
-WORK_ITEM_CI_RE = re.compile(rf"^work-item-({_UUID})-ci-([23])$")
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
 _MIN_HEARTBEAT_INTERVAL_S = 1.0
@@ -138,30 +132,17 @@ def parse_work_item_event_id(event_id: str) -> WorkItemEvent | None:
     """Parse execute, CI-continuation, or terminate work-item event ids.
 
     Returns None for any other namespace. A ``ci`` id is a continuation turn of
-    the same running request; ``generation`` carries its fix round (2 or 3).
+    the same running request; ``generation`` carries its fix round, which lies
+    in the shared CI round range. The grammar lives in
+    ``channel_protocol.work_item_events``.
     """
 
-    matched = WORK_ITEM_EXECUTE_RE.fullmatch(event_id)
-    if matched is not None:
-        return WorkItemEvent(
-            request_id=uuid.UUID(matched.group(1)),
-            kind="execute",
-            generation=int(matched.group(2)),
-        )
-    matched = WORK_ITEM_CI_RE.fullmatch(event_id)
-    if matched is not None:
-        return WorkItemEvent(
-            request_id=uuid.UUID(matched.group(1)),
-            kind="ci",
-            generation=int(matched.group(2)),
-        )
-    matched = WORK_ITEM_TERMINATE_RE.fullmatch(event_id)
-    if matched is not None:
-        return WorkItemEvent(
-            request_id=uuid.UUID(matched.group(1)),
-            kind="terminate",
-        )
-    return None
+    parsed = _parse_shared_event_id(event_id)
+    if parsed is None:
+        return None
+    return WorkItemEvent(
+        request_id=parsed.request_id, kind=parsed.kind, generation=parsed.number
+    )
 
 
 def _conflict_code(response: httpx.Response) -> str:
@@ -538,6 +519,9 @@ class WorkItemRun:
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
         self.execution_deadline: datetime | None = None
+        # The agent the run's turn belongs to, recorded when the turn registers,
+        # so a kill can drop the run if it is parked for approval (#3564).
+        self.agent_id: uuid.UUID | None = None
         self._client = client
         self._on_stop = on_stop
         self._on_stale = on_stale

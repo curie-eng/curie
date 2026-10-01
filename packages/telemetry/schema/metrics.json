@@ -323,10 +323,12 @@
           "rate-limit",
           "runner-error",
           "runner-timeout",
-          "workspace-error"
+          "workspace-error",
+          "sandbox-terminated",
+          "sandbox-capacity"
         ]
       },
-      "cardinality_bound": 10
+      "cardinality_bound": 14
     },
     "curie.queue.dead_letter": {
       "type": "counter",
@@ -626,7 +628,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -646,10 +649,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.claim.duration": {
       "type": "histogram",
@@ -667,7 +671,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -687,10 +692,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.resume.duration": {
       "type": "histogram",
@@ -708,7 +714,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -728,10 +735,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.release.duration": {
       "type": "histogram",
@@ -749,7 +757,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -769,10 +778,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.active": {
       "type": "gauge",
@@ -826,7 +836,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -846,10 +857,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",
@@ -1035,6 +1047,22 @@
         ]
       },
       "cardinality_bound": 3
+    },
+    "curie.slack.socket.identities": {
+      "type": "gauge",
+      "unit": "{identity}",
+      "description": "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "state": [
+          "configured",
+          "connected"
+        ]
+      },
+      "cardinality_bound": 2
     },
     "curie.reply.delivery": {
       "type": "counter",
@@ -1626,6 +1654,89 @@
       },
       "cardinality_bound": 10
     },
+    "curie.connector.reconcile.skipped_agents": {
+      "type": "gauge",
+      "unit": "{agent}",
+      "description": "Agents whose connector applies the reconciler is skipping.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1
+    },
+    "curie.state.mutation": {
+      "type": "counter",
+      "unit": "{mutation}",
+      "description": "Agent state and memory entries removed or rewritten.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "op": [
+          "delete",
+          "edit"
+        ],
+        "namespace": [
+          "memory",
+          "transcript",
+          "other"
+        ]
+      },
+      "cardinality_bound": 6
+    },
+    "curie.work_item.reconciler.step.failure": {
+      "type": "counter",
+      "unit": "{failure}",
+      "description": "Failed WorkItem reconciler steps.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "step": [
+          "settle_publications",
+          "expire_waiting",
+          "request_deadline_cancellations",
+          "request_owner_lost_cancellations",
+          "publish_terminate_wakes",
+          "settle_overdue_cancellations",
+          "readmit_pending",
+          "reconcile_missed_labels",
+          "sync_status_comments",
+          "redispatch_lapsed_acquisitions",
+          "publish_execute_wakes"
+        ]
+      },
+      "cardinality_bound": 11
+    },
+    "curie.work_item.reconciler.step.consecutive_failures": {
+      "type": "gauge",
+      "unit": "{pass}",
+      "description": "Consecutive failed passes for each WorkItem reconciler step.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "step": [
+          "settle_publications",
+          "expire_waiting",
+          "request_deadline_cancellations",
+          "request_owner_lost_cancellations",
+          "publish_terminate_wakes",
+          "settle_overdue_cancellations",
+          "readmit_pending",
+          "reconcile_missed_labels",
+          "sync_status_comments",
+          "redispatch_lapsed_acquisitions",
+          "publish_execute_wakes"
+        ]
+      },
+      "cardinality_bound": 11
+    },
     "curie.eval.process": {
       "type": "counter",
       "unit": "{job}",
@@ -1670,6 +1781,34 @@
         ]
       },
       "cardinality_bound": 14
+    },
+    "curie.tool.result": {
+      "type": "counter",
+      "unit": "{call}",
+      "description": "Tool call results by origin and outcome.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
+        ],
+        "origin": [
+          "connector",
+          "platform",
+          "builtin"
+        ],
+        "outcome": [
+          "success",
+          "error",
+          "awaiting_approval",
+          "cancelled",
+          "refused",
+          "unavailable"
+        ]
+      },
+      "cardinality_bound": 18
     }
   }
 }

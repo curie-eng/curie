@@ -10,7 +10,7 @@ Postgres and Valkey:
    own bindings: the conversation that asked, routeless or in the new mode.
 3. A card shown in an email thread is answered only by a sender the serving
    adapter verified whose address is on the route's approver ``emails``
-   (ADR 0183), after the binding's ``allowed_callers`` admit that sender
+   (ADR-0177 amendment), after the binding's ``allowed_callers`` admit that sender
    (ADR 0175). The requester is not admitted by default, a routeless email
    approval and an empty list admit nobody, and no operator, console session or
    Slack principal can answer it.
@@ -395,7 +395,7 @@ def test_a_route_repointed_after_the_ask_leaves_the_card_where_it_was_shown(
     assert closed.status_code == 403, closed.text
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
-    # Re-pointed without approvers, nobody is listed either (ADR 0183: no
+    # Re-pointed without approvers, nobody is listed either (ADR-0177 amendment: no
     # requester-only default), so the email card still admits nobody.
     _repoint(
         surface_client,
@@ -550,7 +550,7 @@ def test_a_slack_shaped_asking_address_is_never_read_as_the_asking_card(
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
 
-# --- 3. the approver email list (ADR 0183) -----------------------------------
+# --- 3. the approver email list (ADR-0177 amendment) -------------------------
 
 
 def _set_callers(
@@ -637,7 +637,7 @@ def test_a_listed_requester_may_approve_their_own_request(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """ADR 0183 decision 5, as Slack under ADR-0106: being the person who asked
+    """ADR-0177 amendment A5, as Slack under ADR-0106: being the person who asked
     neither grants nor blocks. A requester whose own address is listed answers
     their own request, and the audit row says the list admitted them."""
 
@@ -672,7 +672,7 @@ def test_several_listed_approvers_on_the_thread_the_first_answer_wins(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """ADR 0183 decision 5: several listed approvers may be copied in. The first
+    """ADR-0177 amendment A5: several listed approvers may be copied in. The first
     answer the platform accepts settles the approval for good: a second listed
     approver, answering the other way, is refused and changes nothing."""
 
@@ -737,7 +737,7 @@ def test_a_sender_outside_allowed_callers_is_refused_before_the_approver_list(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """ADR 0183 decision 2: the inbound allowlist comes first. A listed approver
+    """ADR-0177 amendment A2: the inbound allowlist comes first. A listed approver
     the binding does not admit is refused with the channel port's own refusal,
     before any approval logic, so no audit row is written. Admitting them then
     lets the list decide."""
@@ -763,7 +763,7 @@ def test_a_routeless_email_approval_admits_nobody(
     surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """A routeless approval has no binding, so no approver list. The person who
-    asked is no longer admitted by default (ADR 0183 decision 3)."""
+    asked is no longer admitted by default (ADR-0177 amendment A3)."""
 
     agent = _email_agent(surface_client, auth_headers)
     approval = _email_approval(surface_client, auth_headers, agent)
@@ -1049,7 +1049,7 @@ def _chat_click(approval_id: str, subject: str, from_channel: str) -> dict[str, 
 def test_a_slack_card_whose_route_lists_only_emails_admits_nobody(
     surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """ADR 0183 decision 4: an address is never proof on Slack, and a route that
+    """ADR-0177 amendment A4: an address is never proof on Slack, and a route that
     narrowed its approvers to emails must not widen back to channel membership
     when it is asked in Slack."""
 

@@ -9,8 +9,11 @@ adapter does not run an agent bundle.
 
 Create a Discord application with a bot, enable the Message Content intent,
 and invite it with permission to view channels, send messages, create public
-threads, send messages in threads, read message history, and manage its own
-messages. Keep the bot token in this adapter only.
+threads, send messages in threads, read message history, manage its own
+messages, and manage threads. Manage Threads lets the adapter delete the
+thread it opened for a caller the binding's caller list refuses (ADR 0175);
+without it, only the placeholder is removed and the empty thread stays.
+Keep the bot token in this adapter only.
 
 ## Configuration
 

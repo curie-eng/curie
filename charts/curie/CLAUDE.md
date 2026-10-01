@@ -210,17 +210,18 @@ component and rail detail in `charts/curie/README.md`.
   mechanism (another controller, an operator, a second chart) that could select
   `component: runner-sandbox` pods without checking it does not reintroduce
   this exact union-defeats-default-deny failure mode.
-- **The preflights are mandatory Helm hooks, not advisory scripts.** The
-  CPU-AVX/ClickHouse-pin check (`preflights.avxCheck`), the
-  NetworkPolicy-enforcement probe (`preflights.networkPolicyProbe`), and the
-  controller-ready gate (`preflights.controllerReady`, which fails the install
-  if the vendored agent-sandbox controller cannot sync its cluster-scope
-  NetworkPolicy informer -- issue #350) block a broken install. Do not make
-  any of them skippable by default, and do not add a new cluster-dependent
-  assumption (a CNI feature, a kernel feature, an RBAC grant the controller
-  needs to start) without a matching preflight -- an assumption that silently
-  fails on a customer cluster is exactly the failure mode these exist to
-  prevent.
+- **Preflights must fail loud on their real execution surface.** The CPU-AVX /
+  ClickHouse-pin check (`preflights.avxCheck`) and controller-ready gate
+  (`preflights.controllerReady`) are mandatory Helm hooks that block a broken
+  install. The NetworkPolicy-enforcement probe
+  (`preflights.networkPolicyProbe`) is necessarily a post-install `helm test`:
+  its before/after control needs the release to exist, so install success alone
+  cannot prove enforcement. The default-on NOTES warning must say that plainly
+  and name the exact `helm test` command (#1066). Do not make any preflight
+  skippable by default, and do not add a new cluster-dependent assumption (a
+  CNI feature, a kernel feature, an RBAC grant the controller needs to start)
+  without a matching preflight -- an assumption that silently fails on a
+  customer cluster is exactly the failure mode these exist to prevent.
 - **gVisor needs `runsc` on the node; the chart cannot install it.** On a
   cluster without it, use the ready-made overlay
   `-f charts/curie/values-e2e-nogvisor.yaml` (sets `runtimeClassName=""` and
@@ -258,7 +259,10 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`), plus the new
+  nonblank contract (`api.approvalChatAttesterSecret`), plus
+  `worker.streamRetention.minAgeSeconds` (a new key, so no existing values
+  file can disagree with it; the template reads it through `dig` for a
+  retained release without the block) and the new
   `e2eConnectorIdentity` block, whose prefix and label patterns keep its
   values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing

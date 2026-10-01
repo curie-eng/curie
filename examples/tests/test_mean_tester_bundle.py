@@ -296,7 +296,26 @@ def test_follow_ups_stay_in_the_testers_own_threads():
     # A follow-up the target's installation does not admit is not the agent's
     # failure: the root probe in the same thread was answered.
     verdicts = _section("Verdicts")
-    assert "not admitted" in verdicts and "UNCLEAR" in verdicts
+    text = " ".join(verdicts.split())
+    assert "not admitted" in text and "UNCLEAR" in text
+    assert "takes precedence over the timeout rule" in text
+    assert "first probe in the thread was answered promptly" in text
+    assert "follow-up has no reply or placeholder at all" in text
+
+
+def test_recorded_exchange_report_has_a_machine_readable_first_line():
+    recorded = _section("Judging a recorded exchange")
+    text = " ".join(recorded.split())
+    assert "no preamble or analysis before it" in text
+    assert (
+        "<target> @ recorded — round 1/1: <n> PASS · <n> FAIL · <n> UNCLEAR"
+        in recorded
+    )
+    assert (
+        "<target> @ recorded (no spec) — round 1/1: "
+        "<n> PASS · <n> FAIL · <n> UNCLEAR"
+        in recorded
+    )
 
 
 def test_every_probe_carries_the_campaign_id():

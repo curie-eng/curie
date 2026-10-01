@@ -1,0 +1,23 @@
+2026-09-24T15:11:06.8459251Z === #1087 AC1: edit the source after boot, confirm the running container keeps the ORIGINAL snapshot ===
+2026-09-24T15:11:06.9004391Z confirmed: the running container's /plugin mount does not see the post-boot host edit (skills/weather/SKILL.md)
+2026-09-24T15:11:06.9289483Z confirmed: bundle_digest is unchanged by the post-boot host edit (efd804aed94bfdf52359598c6bd5b86cf0943dc7d07b41103bdfee252b2a1436)
+2026-09-24T15:11:06.9290703Z 
+2026-09-24T15:11:06.9291093Z === curie skill message (synthetic event, streamed NDJSON reply) ===
+2026-09-24T15:11:06.9332559Z ⚠ warn  editable bundle differs from the running snapshot. Run `curie skill up` to load the changes.
+2026-09-24T15:11:14.6458082Z   -> [Bash] running tool Bash
+2026-09-24T15:11:14.6458897Z   !  side effect via Bash: non-idempotent tool executed
+2026-09-24T15:11:14.7446775Z   !  side effect via Bash: non-idempotent tool completed
+2026-09-24T15:11:20.9179866Z I can't approve this, and I don't have enough information to give you a recommendation either.
+2026-09-24T15:11:20.9180656Z 
+2026-09-24T15:11:20.9182460Z - **I can't find the deal.** None of the tools I have connect to a CRM or deal desk. What I can reach is Grafana monitoring and a local workspace, and neither has anything on Meridian or your discount rules. The only matches for "discount" were in the code that runs me, not in any sales data.
+2026-09-24T15:11:20.9184972Z - **Approving isn't my call.** Signing off on a discount has to come from whoever holds that authority, usually a sales manager, finance or the deal desk, depending on your approval tiers.
+2026-09-24T15:11:20.9185810Z 
+2026-09-24T15:11:20.9358021Z -- final (done)
+2026-09-24T15:11:20.9361778Z If you paste in the details, I can help you put together the approval request or check it against your policy. Useful details would be the deal size, the discount limits for each approval level, margin, contract length and any similar past deals. Otherwise, send it to your deal desk or whoever normally approves discounts at 18%.
+2026-09-24T15:11:20.9367700Z 
+2026-09-24T15:11:20.9368224Z === curie skill eval --json (the bundle's own evals/cases.json) ===
+2026-09-24T15:11:40.9560658Z cleanup: restored /tmp/tmp.9AR3vo12Fv/bundle/skills/weather/SKILL.md from the pre-mutation backup (content and mtime)
+2026-09-24T15:11:41.1255430Z ##[error]Process completed with exit code 1.
+2026-09-24T15:11:41.1370262Z Post job cleanup.
+2026-09-24T15:11:41.3904713Z ##[group]Generating build summary
+2026-09-24T15:11:41.4574736Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-bmdfKm/export
