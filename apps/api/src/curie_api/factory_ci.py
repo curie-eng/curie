@@ -1137,9 +1137,10 @@ async def _github_send(
         request = client.build_request(method, url, headers=headers, timeout=timeout)
         return await client.send(request, auth=None, follow_redirects=False)
     except httpx.TimeoutException:
-        return _ActionsRerun("retry", "timeout")
+        # The server may already have accepted the request.
+        return _ActionsRerun("unconfirmed", "timeout")
     except httpx.HTTPError:
-        return _ActionsRerun("retry", "github_error")
+        return _ActionsRerun("unconfirmed", "github_error")
 
 
 def _status_rerun(status_code: int, *, ok: int) -> _ActionsRerun | None:
@@ -1287,10 +1288,20 @@ async def _post_missing_runs(
             posted = await _post_failed_run(
                 client, base, headers, settings.github_app_timeout_seconds, run_id
             )
-            if posted.outcome == "retry":
+            if posted.outcome in {"retry", "unconfirmed"}:
+                if posted.outcome == "unconfirmed":
+                    # A dropped response is not proof of rejection. Do not POST
+                    # this run again; wait to see whether the attempt appears.
+                    accepted.add(run_id)
+                    record = {
+                        **record,
+                        "outcome": "claimed",
+                        "accepted_runs": sorted(accepted),
+                        "refused_runs": sorted(refused_runs),
+                    }
                 if not await _store_rerun(valkey, lock_key, record_key, token, record, ttl):
                     return _ActionsRerun("retry", "rerun_lock_lost")
-                return posted
+                return _ActionsRerun("retry", posted.reason)
             if posted.outcome != "requested":
                 refused_runs.add(run_id)
                 last_refusal = posted

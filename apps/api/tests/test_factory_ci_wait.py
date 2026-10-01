@@ -1791,3 +1791,21 @@ def test_a_mixed_rerun_records_both_the_request_and_the_refusal(admitted: Any) -
     notes = [note for note in _phase_notes(published["id"]) if note]
     assert "Reran failed Actions jobs once at this head." in notes
     assert "CI rerun refused: github_forbidden." in notes
+
+
+def test_a_dropped_rerun_response_is_not_posted_again(admitted: Any) -> None:
+    """A lost response may already have been accepted, so the run is not resent."""
+
+    _client, _github, sink = admitted
+    number = 9816
+    job_id = 88161
+    sink.ci_script = [ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))]
+    sink.rerun_status = 201
+    sink.lost_response_paths.add(f"/repos/{REPO}/actions/runs/{job_id}/rerun-failed-jobs")
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert _ci_turns(published["id"]) == []

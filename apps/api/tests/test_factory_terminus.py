@@ -426,7 +426,13 @@ class _GitHubComments(BaseHTTPRequestHandler):
             run_id = int(rerun.group(1))
             server.reruns.append(run_id)
             server.requests.append(("POST", path, None))
-            status = server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
+            if path in server.lost_response_paths:
+                server.lost_response_paths.discard(path)
+                self.close_connection = True
+                return
+            status = (
+                server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
+            )
             self._send(status, {} if status == 201 else {"message": "refused"})
             return
         server.requests.append(("POST", path, payload.get("body", "")))
