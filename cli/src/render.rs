@@ -242,17 +242,43 @@ mod tests {
         assert!(matches!(printer.part_for(&note), Some(TurnPart::Note(_))));
         assert_eq!(
             part_text(printer.part_for(&note)),
-            "  -> [Bash] running echo hi"
+            "  -> [shell request] running echo hi"
         );
         assert_eq!(
             part_text(printer.part_for(&flag)),
-            "  !  side effect via Bash"
+            "  !  possible change via shell request"
         );
         // Error events route to Fail (red stderr).
         assert!(matches!(
             printer.part_for(&error),
             Some(TurnPart::Fail(f)) if f == "error [budget]: boom"
         ));
+    }
+
+    #[test]
+    fn action_labels_are_bounded_and_fail_closed_for_malformed_names() {
+        for (name, expected) in [
+            ("mcp__files__fileAttachment", "file attachment"),
+            ("mcp__one__two__HTTPDownload", "http download"),
+            ("mcp__store__save-item", "save item"),
+            ("mcp__store__", "action"), ("mcp__", "action"),
+            ("mcp__a__bad.name", "action"), ("", "action"),
+            ("Skill", "instruction request"), ("Bash", "shell request"),
+            ("Read", "read file"),
+        ] { assert_eq!(action_label(name), expected, "{name}"); }
+        assert_eq!(action_label(&format!("mcp__a__{}", "x".repeat(81))), "action");
+        assert_eq!(action_text("mcp__a__save_item failed; retry?"), "save item failed; retry?");
+        assert_eq!(action_text("User requested Bash examples"), "User requested Bash examples");
+    }
+
+    #[test]
+    fn missing_tool_and_failed_side_effect_keep_warning_information() {
+        let mut printer = TurnPrinter::default();
+        let event = OutboundEvent::SideEffectFlag {
+            version: v(), tool: None, detail: Some("check before retry".into()),
+            call_id: None, arguments: None, result: None, failed: Some(true), redacted: None,
+        };
+        assert_eq!(part_text(printer.part_for(&event)), "  !  possible change via action: check before retry");
     }
 
     #[test]
