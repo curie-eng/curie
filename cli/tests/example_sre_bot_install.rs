@@ -3199,6 +3199,36 @@ fn normal_provisioning_event_needs_the_claims_own_uid() {
     }
 }
 
+#[test]
+fn a_matching_warning_outranks_a_normal_provisioning_event() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[
+            {"type":"Normal","reason":"ExternalProvisioning","message":"waiting for a volume to be created, either by external provisioner \"csi.example.com\" or manually created by system administrator","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}},
+            {"type":"Warning","reason":"ProvisioningFailed","message":"volume quota exceeded","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}
+        ]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("ProvisioningFailed") && text.contains("volume quota exceeded"),
+        "{text}"
+    );
+    assert!(!text.contains("ExternalProvisioning"), "{text}");
+}
+
 /// `helm status` runs a credential plugin the same way kubectl does; a plugin
 /// that forks must not outlive the bounded pending-upgrade read.
 #[test]
