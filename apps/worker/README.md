@@ -826,8 +826,9 @@ the same stream when its retry is due. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume is
 refused under `sandbox-capacity` instead (#3693): it retries, and its terminal
-notice tells the person the agent was at capacity and the approved request did
-not run, with the quota detail left to the worker's warning. Other turn sources
+notice tells the person the agent was at capacity and could not continue after
+the approval decision, with the quota detail left to the worker's warning. An
+earlier attempt's confirmed pod termination is carried onto that notice. Other turn sources
 retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
