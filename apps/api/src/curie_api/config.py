@@ -169,9 +169,11 @@ class Settings(BaseSettings):
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
-    # in flight lands first. 0 disables the listing.
-    github_factory_reconcile_interval_s: float = 300.0
-    github_factory_reconcile_grace_s: float = 300.0
+    # in flight lands first. 0 disables the listing. Both are bounded the way
+    # GITHUB_FACTORY_CI_WAIT_S is: a negative or non finite value is refused at
+    # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
+    github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
