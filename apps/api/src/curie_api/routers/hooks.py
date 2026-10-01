@@ -29,11 +29,12 @@ makes an identical payload undeliverable forever, because a delivery receipt
 deliberately never expires. Refusing names the header and is fixed in the
 upstream's configuration.
 
-**The delivery id and a timestamp are signed with the body (#3554).** The
-signature covers ``X-Curie-Timestamp``, ``X-Curie-Delivery-Id`` and the raw body
-(see ``hook_signing``), so a captured body cannot be resent under a fresh id to
-dodge deduplication, and a timestamp outside ``hook_signing.TOLERANCE_S`` is
-refused with the same 401 as a bad signature. The two defenses meet cleanly:
+**The delivery context is signed with the body (#3554).** The signature covers
+``X-Curie-Timestamp``, ``X-Curie-Delivery-Id``, the decoded hook name, the parsed
+``tool_access`` policy and the raw body (see ``hook_signing``). A captured
+request cannot change its receipt namespace or add or remove a policy
+restriction. A timestamp outside ``hook_signing.TOLERANCE_S`` is refused with
+the same 401 as a bad signature. These defenses meet cleanly:
 inside the window a retry that reuses its id is deduplicated, because a delivery
 receipt is written without an expiry once enqueued (``delivery._ENQUEUE_SCRIPT``)
 and so outlives every window; outside it, the request is refused before the
@@ -369,10 +370,10 @@ async def ingest_hook(
        refused without the server ever HMAC-ing it;
     3. the agent row, which unavoidably precedes authentication here (see the
        module docstring);
-    4. the SIGNATURE over the timestamp, delivery id and raw body, with the
-       timestamp required and inside ``hook_signing.TOLERANCE_S``; a missing
-       delivery id is verified as the empty string, so an absent id is only
-       reported to a caller who could sign;
+    4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed
+       requested policy and raw body, with the timestamp required and inside
+       ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the
+       empty string, so an absent id is only reported to a caller who could sign;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
     6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
@@ -402,6 +403,8 @@ async def ingest_hook(
         secret,
         timestamp=x_curie_timestamp,
         delivery_id=x_curie_delivery_id or "",
+        hook=hook,
+        tool_access=tool_access.value if tool_access is not None else None,
         body=raw,
         header=x_curie_signature_256,
     ):

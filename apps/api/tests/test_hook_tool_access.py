@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 
 import pytest
@@ -38,6 +39,29 @@ def hook_agent(hooks_client: TestClient, auth_headers: dict[str, str], clean_db:
     return str(created.json()["id"])
 
 
+def _signed_headers(
+    agent_id: str,
+    *,
+    hook: str,
+    tool_access: str | None,
+    body: bytes,
+) -> dict[str, str]:
+    secret = derive(get_settings().api_key, agent_id=agent_id, generation=0)
+    timestamp = str(int(time.time()))
+    # Match the accepted replay-bound hook wire contract independently of sign().
+    context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    material = f"{timestamp}.policy-delivery.{len(context)}:".encode() + context + body
+    signed = "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-Curie-Timestamp": timestamp,
+        "X-Curie-Signature-256": signed,
+        "X-Curie-Delivery-Id": "policy-delivery",
+    }
+
+
 def _post(
     client: TestClient,
     agent_id: str,
@@ -46,21 +70,14 @@ def _post(
     body: bytes = b"{}",
     signature: str | None = None,
 ) -> Response:
-    secret = derive(get_settings().api_key, agent_id=agent_id, generation=0)
-    timestamp = str(int(time.time()))
-    # Match the accepted replay-bound hook wire contract independently of sign().
-    material = f"{timestamp}.policy-delivery.".encode() + body
-    signed = "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
+    headers = _signed_headers(agent_id, hook="issues", tool_access=access, body=body)
+    if signature is not None:
+        headers["X-Curie-Signature-256"] = signature
     return client.post(
         f"/hooks/{agent_id}/issues",
         params={} if access is None else {"tool_access": access},
         content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Curie-Timestamp": timestamp,
-            "X-Curie-Signature-256": signed if signature is None else signature,
-            "X-Curie-Delivery-Id": "policy-delivery",
-        },
+        headers=headers,
     )
 
 
@@ -131,6 +148,91 @@ def test_read_only_query_does_not_bypass_signature_authentication(
     assert valkey.xlen(runs_stream) == 0
     assert not valkey.exists(_claim(hook_agent))
     assert _backlog(valkey, hook_agent) == {}
+
+
+@pytest.mark.parametrize(
+    "original,replay_hook,replay_access",
+    [
+        (None, "other-hook", None),
+        ("read-only", "other-hook", "read-only"),
+        ("read-only", "issues", None),
+        (None, "issues", "read-only"),
+        ("read-only", "other-hook", None),
+    ],
+    ids=[
+        "ordinary-hook",
+        "restricted-hook",
+        "policy-removed",
+        "policy-added",
+        "hook-and-policy-removed",
+    ],
+)
+@pytest.mark.parametrize("accepted_first", [True, False], ids=["accepted-first", "prearrival"])
+def test_captured_signature_cannot_change_hook_or_policy(
+    hooks_client: TestClient,
+    hook_agent: str,
+    valkey: redis.Redis,
+    runs_stream: str,
+    original: str | None,
+    replay_hook: str,
+    replay_access: str | None,
+    accepted_first: bool,
+) -> None:
+    body = b"{}"
+    headers = _signed_headers(hook_agent, hook="issues", tool_access=original, body=body)
+    original_params = {} if original is None else {"tool_access": original}
+    if accepted_first:
+        accepted = hooks_client.post(
+            f"/hooks/{hook_agent}/issues",
+            params=original_params,
+            content=body,
+            headers=headers,
+        )
+        assert accepted.status_code == 200, accepted.text
+    entries = valkey.xrange(runs_stream)
+    backlog = _backlog(valkey, hook_agent)
+    claim_pattern = f"curie:hook:delivery:{hook_agent}:*"
+    claims = {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)}
+    assert len(entries) == len(claims) == int(accepted_first)
+    assert bool(backlog) == accepted_first
+
+    # An intercepted request retains its exact timestamp, delivery id, body and
+    # signature. Its altered copy can arrive before the legitimate request.
+    refused = hooks_client.post(
+        f"/hooks/{hook_agent}/{replay_hook}",
+        params={} if replay_access is None else {"tool_access": replay_access},
+        content=body,
+        headers=headers,
+    )
+    assert refused.status_code == 401, refused.text
+    assert valkey.xrange(runs_stream) == entries
+    assert _backlog(valkey, hook_agent) == backlog
+    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)} == claims
+
+    if not accepted_first:
+        accepted = hooks_client.post(
+            f"/hooks/{hook_agent}/issues",
+            params=original_params,
+            content=body,
+            headers=headers,
+        )
+        assert accepted.status_code == 200, accepted.text
+    entries = valkey.xrange(runs_stream)
+    backlog = _backlog(valkey, hook_agent)
+    claims = {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)}
+    assert len(entries) == len(claims) == 1
+    assert backlog
+    duplicate = hooks_client.post(
+        f"/hooks/{hook_agent}/issues",
+        params=original_params,
+        content=body,
+        headers=headers,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() == {**accepted.json(), "duplicate": True}
+    assert valkey.xrange(runs_stream) == entries
+    assert _backlog(valkey, hook_agent) == backlog
+    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)} == claims
 
 
 @pytest.mark.parametrize("access", [None, "read-only"])

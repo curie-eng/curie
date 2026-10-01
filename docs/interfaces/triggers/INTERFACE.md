@@ -75,11 +75,16 @@ another handler that mints a `QueuedTurn` with the right `source`. The five that
   one at all -- outbound always works (#1239).
 - **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
   `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over
-  `X-Curie-Timestamp`, `X-Curie-Delivery-Id` and the raw body (signed as
-  `{timestamp}.{delivery_id}.` followed by the body; the delivery id may not
-  contain `.`, which would make that boundary ambiguous), refuses a timestamp
-  more than 5 minutes from the server clock with the same 401 as a bad signature,
-  claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
+  `X-Curie-Timestamp`, `X-Curie-Delivery-Id`, the decoded hook name, the parsed
+  requested `tool_access` policy and the raw body. The context is compact ASCII
+  JSON for `[hook, tool_access]`, with `null` for an omitted policy. The signed
+  bytes are `{timestamp}.{delivery_id}.{len(context)}:` followed by the context
+  and raw body. The context byte length fixes its boundary; the delivery id may
+  not contain `.`, which would make the earlier boundary ambiguous. A captured
+  signature cannot change the hook's receipt namespace or add or remove a
+  policy restriction. A timestamp more than 5 minutes from the server clock is
+  refused with the same 401 as a bad signature. The route claims the delivery
+  id and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
   identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
@@ -96,6 +101,12 @@ another handler that mints a `QueuedTurn` with the right `source`. The five that
   installation blocker (#3603); this is neither automatic fleet admission nor
   mandatory source policy. This is a hardcoded platform ingress, not consumption
   of a bundle-declared `webhook` path.
+
+  **Signing upgrade:** every custom signer must migrate to the context format
+  above; the API refuses signatures made with the previous format. Update the
+  API and the example's copied `alert-signer-code` ConfigMap together, then
+  restart its signer. The [Alert source installation](../../../examples/sre-bot/README.md#alert-source-opt-in)
+  documents the existing ConfigMap update steps.
 
 The five share no abstraction: a Slack Bolt event listener, two paths through a FastAPI
 GitHub HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push

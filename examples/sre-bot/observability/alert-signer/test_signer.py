@@ -1,7 +1,7 @@
 """Alertmanager signer injects a legal partition and HMAC-signs each delivery.
 
-The signature covers the timestamp, the delivery id and the forwarded body, the
-scheme ``curie_api.hook_signing`` verifies (#3554).
+The signature covers timestamp, delivery id, decoded hook, requested policy and
+forwarded body, the scheme ``curie_api.hook_signing`` verifies (#3554).
 """
 
 from __future__ import annotations
@@ -29,10 +29,27 @@ signer = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(signer)
 
 
+def _expected_signature(
+    secret: str,
+    timestamp: str,
+    delivery: str,
+    body: bytes,
+    *,
+    hook: str,
+    tool_access: str | None,
+) -> str:
+    context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    material = f"{timestamp}.{delivery}.{len(context)}:".encode() + context + body
+    return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
+
+
 def test_prepare_injects_partition_and_stable_delivery_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+    monkeypatch.setenv("CURIE_HOOK_URL", "http://api.example.com/hooks/acme-agent/alertmanager")
     payload = {
         "groupKey": '{}:{alertname="Example"}',
         "status": "firing",
@@ -49,12 +66,15 @@ def test_prepare_injects_partition_and_stable_delivery_id(
     )
     assert len(forwarded["curie_partition"]) == 32
     assert timestamp.isascii() and timestamp.isdigit()
-    material = f"{timestamp}.{delivery}.".encode() + body
-    expected = "sha256=" + hmac.new(b"hook-secret", material, hashlib.sha256).hexdigest()
+    expected = _expected_signature(
+        "hook-secret", timestamp, delivery, body, hook="alertmanager", tool_access=None
+    )
     assert signature == expected
-    # A body-only signature is exactly what the ingress no longer accepts.
     body_only = "sha256=" + hmac.new(b"hook-secret", body, hashlib.sha256).hexdigest()
     assert signature != body_only
+    old_material = f"{timestamp}.{delivery}.".encode() + body
+    old_signature = "sha256=" + hmac.new(b"hook-secret", old_material, hashlib.sha256).hexdigest()
+    assert signature != old_signature
     again = signer.prepare(payload)
     assert again[2] == delivery
     payload["alerts"][0]["startsAt"] = "2026-09-16T00:00:00Z"
@@ -66,10 +86,73 @@ def test_unsigned_curie_body_is_not_what_the_signer_forwards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+    monkeypatch.setenv("CURIE_HOOK_URL", "http://api.example.com/hooks/acme-agent/alertmanager")
     original = {"groupKey": "g", "status": "firing", "alerts": []}
     body, _signature, _delivery, _timestamp = signer.prepare(original)
     assert json.loads(body)["curie_partition"]
     assert b"curie_partition" in body
+
+
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
+def test_prepare_signs_decoded_dotted_hook_and_requested_policy(
+    monkeypatch: pytest.MonkeyPatch, tool_access: str | None
+) -> None:
+    query = "?kind=email&address=ops%40example.com"
+    if tool_access is not None:
+        query += "&tool_access=read%2Donly"
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+    monkeypatch.setenv(
+        "CURIE_HOOK_URL", f"http://api.example.com/hooks/acme-agent/alertmanager%2Erelease{query}"
+    )
+    payload = {"groupKey": "g", "status": "firing", "alerts": []}
+    body, signature, delivery, timestamp = signer.prepare(payload)
+    assert signature == _expected_signature(
+        "hook-secret",
+        timestamp,
+        delivery,
+        body,
+        hook="alertmanager.release",
+        tool_access=tool_access,
+    )
+    assert signature != _expected_signature(
+        "hook-secret",
+        timestamp,
+        delivery,
+        body,
+        hook="alertmanager%2Erelease",
+        tool_access=tool_access,
+    )
+    assert signature != _expected_signature(
+        "hook-secret",
+        timestamp,
+        delivery,
+        body,
+        hook="alertmanager.release",
+        tool_access="read-only" if tool_access is None else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "tool_access=read-write",
+        "tool_access=READ_ONLY",
+        "tool_access=",
+        "tool_access=null",
+        "tool_access=read-only&tool_access=read-only",
+        "tool_access=read-only&tool_access=read-write",
+        "tool_access=&tool_access=read-only",
+    ],
+)
+def test_prepare_refuses_invalid_or_duplicate_policy(
+    monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+    monkeypatch.setenv(
+        "CURIE_HOOK_URL", f"http://api.example.com/hooks/acme-agent/alertmanager?{query}"
+    )
+    with pytest.raises(ValueError):
+        signer.prepare({"groupKey": "g", "status": "firing", "alerts": []})
 
 
 @contextmanager
@@ -85,8 +168,10 @@ def _http_server(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
 def test_signer_http_authentication_and_forwarding(
     monkeypatch: pytest.MonkeyPatch,
+    tool_access: str | None,
 ) -> None:
     received: list[tuple[bytes, dict[str, str]]] = []
 
@@ -125,7 +210,10 @@ def test_signer_http_authentication_and_forwarding(
     monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
     monkeypatch.setenv("CURIE_SIGNER_TOKEN", "signer-token")
     with _http_server(Ingress) as ingress_url:
-        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/agent/alertmanager")
+        query = "" if tool_access is None else "?tool_access=read-only"
+        monkeypatch.setenv(
+            "CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager.release{query}"
+        )
         with _http_server(signer.Handler) as signer_url:
             assert post(signer_url, raw, "wrong-token") == 401
             assert post(signer_url, b"[]", "signer-token") == 400
@@ -148,6 +236,11 @@ def test_signer_http_authentication_and_forwarding(
     for body, headers in received:
         timestamp = headers["X-Curie-Timestamp"]
         assert timestamp.isascii() and timestamp.isdigit()
-        assert headers["X-Curie-Signature-256"] == signer.sign(
-            "hook-secret", timestamp, delivery, body
+        assert headers["X-Curie-Signature-256"] == _expected_signature(
+            "hook-secret",
+            timestamp,
+            delivery,
+            body,
+            hook="alertmanager.release",
+            tool_access=tool_access,
         )
