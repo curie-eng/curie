@@ -252,6 +252,15 @@ and report the locked installs as unavailable. The proxy narrows network access
 but does not hide the token from code in the runner. Verify the rendered policy
 selects the `dark-factory` runner pods.
 
+If runs fetch a registry on some attempts and fail with `Failed to connect` on
+others, the `registryEgress` list covers only part of that host's addresses.
+`index.crates.io` resolves through Fastly to several rotating IPv4 addresses
+and IPv6 addresses in `2a04:4e42::/32`, and each fetch picks one. A CIDR that
+covers one of those addresses passes the runs that pick it and fails the rest.
+The factory reports this as `registry_egress_unreachable` with the addresses
+that connected and the ones that did not. Point `registryEgress` at the
+proxy's fixed address instead of the CDN.
+
 The platform runner already supplies Python 3.13 and Node 22. This bundle
 adds pinned uv, Rust and pnpm 9 for repositories with committed lockfiles. It
 does not bake repository dependencies into the image. After changing the
