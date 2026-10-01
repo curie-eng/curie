@@ -705,9 +705,18 @@ class WorkerConfig(BaseSettings):
     # stays safely under this 120s TTL; if you raise claim_timeout keep it below
     # this. A force-killed holder cannot renew (#2500); replacement steal uses
     # the consumer alive lease rather than waiting this TTL out.
-    lock_ttl_ms: int = 120000
-    lock_acquire_timeout_s: float = 45.0
-    lock_poll_interval_s: float = 0.02
+    #
+    # All three are strictly positive and finite (#3730): ``lock_ttl_ms`` goes
+    # straight into ``SET key token NX PX <ttl>``, which Valkey rejects for
+    # every non-positive value, so an unbounded field boots fine and then fails
+    # every per-thread lock acquire -- every turn -- instead of refusing the
+    # configuration at boot. A non-positive poll interval turns a contended
+    # acquire into a hot loop against Valkey, a non-positive acquire timeout
+    # gives up on every contended acquire immediately, and inf/nan breaks the
+    # timeout arithmetic the same way.
+    lock_ttl_ms: int = Field(default=120000, gt=0)
+    lock_acquire_timeout_s: float = Field(default=45.0, gt=0, allow_inf_nan=False)
+    lock_poll_interval_s: float = Field(default=0.02, gt=0, allow_inf_nan=False)
 
     # Retry (flag-clean failures only; see the no-retry-after-side-effects rule)
     max_attempts: int = Field(default=3, validation_alias="CURIE_MAX_ATTEMPTS")
