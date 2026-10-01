@@ -1,4 +1,4 @@
-"""The worker's email approval card, through the real mail adapter (ADR 0183 decision 5).
+"""The worker's email approval card, through the real mail adapter (ADR-0177 amendment A5).
 
 The kernel raises an approval on an email turn and posts its card over the
 real HTTP reply sink to the real mail adapter's egress server. The adapter

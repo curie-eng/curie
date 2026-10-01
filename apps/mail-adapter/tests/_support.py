@@ -668,8 +668,8 @@ def approval_card(
     The shape `_pause_for_approval` in `apps/worker/src/curie_worker/kernel.py`
     emits: the approval id on the intent and both actions, a note allowed, and
     `requested_by` the turn's author. `approvers` are the route's listed
-    addresses, as the `Approver` fields that kernel attaches (ADR 0183
-    decision 5); None leaves them off, as a worker before that sends.
+    addresses, as the `Approver` fields that kernel attaches (ADR-0177 amendment
+    A5); None leaves them off, as a worker before that sends.
     """
     event = reply_post(text, conversation_id)
     event["requested_by"] = requested_by

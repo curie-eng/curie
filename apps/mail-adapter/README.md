@@ -136,7 +136,7 @@ silent.
 ## Approvals by email
 
 With `CURIE_ADAPTER_PRINCIPAL` set, a listed approver can answer an approval
-raised in an email thread by replying to it (ADR-0177, ADR-0183). Without it,
+raised in an email thread by replying to it (ADR-0177 and its amendment). Without it,
 nothing below happens: the card's text is mailed as before and the approval can
 only expire.
 
@@ -146,7 +146,7 @@ reference with the approval id and the thread. The card's ack carries a ref, so
 the worker can settle this card later. The reference links a reply to its
 approval. It proves nothing about who sent the reply: every reply quotes it.
 
-The instructions say who can approve (ADR-0183 decision 5). The worker sends the route's listed approver addresses with the card, as `Approver` fields, and the adapter reads the asking message's To and Cc from the provider. If a listed address is already on the thread (the requester counts), the email names the list and says who on the thread can answer. If none is, it says so, names the list, and asks the requester to reply all and add one or more of them, as many as they like. If the asking message cannot be read, it is worded to hold either way. The adapter uses the list only for wording; the platform still decides who may answer. A card from a worker that sends no `Approver` fields gets the generic instructions ("reply with APPROVE or REJECT on the first line; anything after it is your note; only an approver listed for this request can answer").
+The instructions say who can approve (ADR-0177 amendment A5). The worker sends the route's listed approver addresses with the card, as `Approver` fields, and the adapter reads the asking message's To and Cc from the provider. If a listed address is already on the thread (the requester counts), the email names the list and says who on the thread can answer. If none is, it says so, names the list, and asks the requester to reply all and add one or more of them, as many as they like. If the asking message cannot be read, it is worded to hold either way. The adapter uses the list only for wording; the platform still decides who may answer. A card from a worker that sends no `Approver` fields gets the generic instructions ("reply with APPROVE or REJECT on the first line; anything after it is your note; only an approver listed for this request can answer").
 
 **Who receives what.** The request email is sent reply all to the asking message, so a listed approver copied there receives it. Every other reply goes to its sender only, as before, including the resumed answer, which therefore reaches the requester. The adapter never mails an address that is not already on the thread: bringing an approver in is the requester's choice, made by copying them. A reply from someone not listed that copies a listed approver in and carries no decision is the requester doing what was asked, and gets nothing back.
 
@@ -169,7 +169,7 @@ The adapter then calls `POST /approvals/{id}/resolve` with its credential and
 the sender's bare address (lowercased, never the display name) as
 `X-Curie-Approval-Actor`, and the platform decides: the binding's
 `allowed_callers` must admit the sender, and the address must be on the route's
-approver `emails` (ADR-0183). The person who asked is not admitted by default. A
+approver `emails` (ADR-0177 amendment). The person who asked is not admitted by default. A
 reply that is not an answer gets the instructions back; a sender the platform
 does not list is told they are not an approver, and who is; a sender the binding's
 `allowed_callers` refuse gets nothing back; a reply to a spent reference is told

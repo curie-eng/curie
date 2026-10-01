@@ -192,11 +192,11 @@ class MailState:
             # ADR-0177: one random single-use reference per approval card this
             # adapter rendered. It links a reply to its approval; it proves
             # nothing about who sent the reply, which the platform decides from
-            # the verified sender (ADR 0183). ``requester`` and ``approvers``
+            # the verified sender (ADR-0177 amendment). ``requester`` and ``approvers``
             # (a JSON list) word the emails; ``answer_message_id`` and
             # ``answer_participants`` (a JSON list) say where the outcome goes;
             # ``follow_ups_sent`` counts the follow-up sends already made, so a
-            # retried settlement never sends one twice (ADR 0183 decision 5).
+            # retried settlement never sends one twice (ADR-0177 amendment A5).
             self.connection.executescript(
                 """
                 BEGIN IMMEDIATE;
@@ -691,7 +691,7 @@ class MailState:
         """Whether this reply carries a card whose approval is still open.
 
         That reply is the request email, which goes to everyone on the asking
-        message so listed approvers copied there see it (ADR 0183 decision 5).
+        message so listed approvers copied there see it (ADR-0177 amendment A5).
         """
         with self.lock:
             row = self.connection.execute(

@@ -250,7 +250,7 @@ class AgentMailClient:
         Reply To Message takes "reply_all (boolean, optional): Reply to all
         recipients of the original message"; without it the reply goes to the
         sender alone, which is every reply this adapter sends except the
-        approval request and its outcome (ADR 0183 decision 5).
+        approval request and its outcome (ADR-0177 amendment A5).
         https://docs.agentmail.to/api-reference/inboxes/messages/reply
         """
         body: dict[str, Any] = {"text": text}

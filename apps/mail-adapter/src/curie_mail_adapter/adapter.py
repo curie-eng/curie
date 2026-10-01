@@ -69,7 +69,7 @@ def _is_caller_refusal(status: int, body: Any) -> bool:
 #
 # A random single-use reference links a reply to the approval it answers. It is
 # not proof of identity: every reply quotes it, and anyone copied can see it.
-# Who may answer is the platform's decision (ADR 0183): the adapter carries the
+# Who may answer is the platform's decision (ADR-0177 amendment): the adapter carries the
 # sender its inbound gate verified, and the platform admits it only when the
 # binding's allowed_callers admit it and it is on the route's approver emails.
 APPROVAL_REF_PATTERN = re.compile(r"curie-approval-[A-Za-z0-9_-]{24}")
@@ -81,7 +81,7 @@ APPROVAL_INSTRUCTIONS = (
 )
 APPROVAL_REF_LABEL = "Approval reference:"
 # The card field the worker names each of the route's listed approver addresses
-# with (ADR 0183 decision 5; ``APPROVER_FIELD_LABEL`` in
+# with (ADR-0177 amendment A5; ``APPROVER_FIELD_LABEL`` in
 # ``curie_worker.approvals``). Read only to word the emails: who may answer is
 # still the platform's decision.
 APPROVER_FIELD_LABEL = "Approver"
@@ -664,7 +664,7 @@ class MailAdapter:
         decision 5). The first two are established before this runs, in
         ``handle_inbound``: the provider's SPF, DKIM and DMARC verdict with the
         ``labels`` gate, then ``CURIE_MAIL_ALLOWED_SENDERS``, so a sender the
-        mailbox does not admit never reaches this (ADR 0183 decision 2). Then:
+        mailbox does not admit never reaches this (ADR-0177 amendment A2). Then:
         it names a reference issued in this thread, that reference is still
         live, the message was not sent automatically, and the first line of its
         new text is one decision word. Who may answer is not decided here: the
@@ -695,7 +695,7 @@ class MailAdapter:
         decision, note = _parse_decision(full) if matched else (None, None)
         copies_in = decision is None and _brings_in_an_approver(ref, sender, full)
         if ref["state"] == "live" and copies_in:
-            # ADR 0183 decision 5: the requester did what the request email
+            # ADR-0177 amendment A5: the requester did what the request email
             # asked, replying all with a listed approver copied in. That
             # approver now has the request; answering the requester back with
             # the instructions would only suggest they got it wrong.
@@ -735,7 +735,7 @@ class MailAdapter:
         The platform decides. A win reopens the asking message's reply owner so
         the resumed turn can answer on it, and remembers this message and who is
         on it: the follow-up, sent when the card is settled whatever ended the
-        approval, goes to everyone on the winning answer (ADR 0183 decision 5).
+        approval, goes to everyone on the winning answer (ADR-0177 amendment A5).
         """
         url = (
             f"{self.config.api_base_url.rstrip('/')}/approvals/"
@@ -817,7 +817,7 @@ class MailAdapter:
     ) -> tuple[int, str | None]:
         """Render an approval card into the pending reply, with a fresh reference.
 
-        The request says who can approve (ADR 0183 decision 5): the route's
+        The request says who can approve (ADR-0177 amendment A5): the route's
         listed addresses, and whether any of them is on the thread already (the
         requester, or the To or Cc of the asking message). When none is, it asks
         the requester to reply all and copy one or more of them in. The request
@@ -1112,7 +1112,7 @@ class MailAdapter:
                 )
                 return 502
             # The request email goes to everyone on the asking message, so a
-            # listed approver copied there receives it (ADR 0183 decision 5).
+            # listed approver copied there receives it (ADR-0177 amendment A5).
             # Every other reply, the resumed answer included, goes to the
             # sender, which on that message is the requester.
             reply_all = self.state.live_approval_on(conversation_id, reply_ref)
@@ -1179,7 +1179,7 @@ def _who_can_approve(listed: list[str]) -> str:
 
 
 def _request_instructions(listed: list[str], on_thread: list[str] | None) -> str:
-    """How to answer, worded for who is on the thread (ADR 0183 decision 5).
+    """How to answer, worded for who is on the thread (ADR-0177 amendment A5).
 
     Args:
         listed: the route's listed approver addresses, never empty.
@@ -1230,7 +1230,7 @@ def _follow_up_sends(ref: dict[str, Any]) -> list[tuple[str, bool]]:
     an answer this adapter did not carry), reply all to the asking message. If
     the requester is not on the winning message, because the approver replied
     to the bot alone, they also get the outcome as a direct reply to the asking
-    message, whose sender they are (ADR 0183 decision 5).
+    message, whose sender they are (ADR-0177 amendment A5).
     """
     asking = str(ref["reply_ref"])
     answer = ref.get("answer_message_id")

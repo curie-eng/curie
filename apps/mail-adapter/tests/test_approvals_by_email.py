@@ -9,7 +9,7 @@ Each rule the ADR sets for accepting a reply is pinned by a refusal: a sender
 the inbound gate did not verify, a sender the mailbox does not admit, an
 auto-reply, a reply without headers, a decision only in the quote, a spent
 reference, and a reply naming no reference. None of them resolves, and none of
-them starts a turn. Who may answer is the platform's decision (ADR 0183): the
+them starts a turn. Who may answer is the platform's decision (ADR-0177 amendment): the
 adapter carries the verified sender's bare address, and the fake platform's
 refusals pin what the adapter then tells the sender.
 """
@@ -220,7 +220,7 @@ def test_a_listed_address_the_inbound_gate_did_not_verify_is_never_carried(
     url: str,
     label: str,
 ) -> None:
-    """ADR 0183 decision 2, step 1: the provider's SPF, DKIM and DMARC verdict
+    """ADR-0177 amendment A2, step 1: the provider's SPF, DKIM and DMARC verdict
     comes first. A forged message from an address the route lists never reaches
     the approval logic, gets nothing back, and is never a turn. The fake serves
     the labeled message, as a provider whose default filtering widened would, so
@@ -248,7 +248,7 @@ def test_a_listed_address_the_inbound_gate_did_not_verify_is_never_carried(
 def test_a_sender_the_mailbox_does_not_admit_is_refused_before_any_approval_logic(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """ADR 0183 decision 2, step 2: the inbound allowlist comes before the
+    """ADR-0177 amendment A2, step 2: the inbound allowlist comes before the
     reference, the reply rules and the approver list."""
 
     reference = _ask(mail, approvals_adapter, url)
@@ -570,7 +570,7 @@ def test_a_failed_follow_up_is_retried_by_the_next_settlement(
     assert mail.replies_to("msg-1")[-1] == "This approval expired before anyone answered it."
 
 
-# --- who can approve, and who hears the outcome (ADR 0183 decision 5) ---------
+# --- who can approve, and who hears the outcome (ADR-0177 amendment A5) ------
 #
 # The fake provider addresses each reply as AgentMail documents: to the sender
 # of the message replied to, or with reply_all to everyone on it but this inbox.

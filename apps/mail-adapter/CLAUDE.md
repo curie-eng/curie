@@ -54,13 +54,13 @@ the enforceable-rule summary.
   count as automatic), and the decision word on the first line of
   `extracted_text` only, never the full body. The reference links a reply to
   its approval; it is not proof of identity, and nothing here authenticates a
-  mailbox. **Who may answer is the platform's decision** (ADR 0183): the actor
+  mailbox. **Who may answer is the platform's decision** (ADR-0177 amendment): the actor
   is the sender's bare lowercased address, never a display name, and the
   platform checks the binding's `allowed_callers` and the route's approver
   `emails`. Do not add a local approver or requester filter. A
   `caller_not_allowed` refusal gets nothing back. Never respond to an automatic
   message. A settled card spends its reference.
-- **Reply all only for the approval request and its outcome** (ADR 0183 decision 5). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
+- **Reply all only for the approval request and its outcome** (ADR-0177 amendment A5). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's
