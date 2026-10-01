@@ -104,6 +104,11 @@ Write the bundle out first. No clone of this repository is needed:
 curie example dark-factory render --out ./dark-factory
 ```
 
+A release CLI records the runner layer its release published (the repository
+toolchains, for linux/amd64 and linux/arm64) in `connectors.lock.yaml`, so the
+deploy below builds nothing. A CLI built from source has no published layer,
+says so, and names the `curie build` that builds one instead.
+
 Then enable the model and intake. The skill plans for a 3 hour run. The chart
 worker budget and runner ceiling already default to 10800. The execution
 deadline still defaults to 1800, so it needs an override.
@@ -146,15 +151,6 @@ curie cluster factory \
   --app-id <app-id> --private-key-file ./app.pem \
   --webhook-secret-file ./webhook-secret
 
-# Build the runner layer that carries the repository toolchains only. It
-# records the layer digest in connectors.lock.yaml for deployment.
-# --platform builds only the named declared platform. The default Docker
-# driver can push one platform. A multi-platform push needs
-# `docker buildx create --driver docker-container --use`. Deploy checks that
-# the registry covers every node architecture.
-curie build --plugin-dir ./dark-factory --registry <registry-ref> \
-  --platform linux/amd64
-
 curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot
 # Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
@@ -171,11 +167,8 @@ gate requires.
 
 ### On a laptop (kind)
 
-A kind cluster works for a single operator. Create it with a local registry
-by following kind's upstream recipe at
-<https://kind.sigs.k8s.io/docs/user/local-registry/>, and pass that registry
-as `--registry`. Set `--platform` to the architecture of the kind nodes
-(`linux/arm64` on Apple silicon, `linux/amd64` otherwise).
+A kind cluster works for a single operator. It pulls the published runner
+layer from GHCR, so it needs no local registry.
 
 GitHub must reach the API to deliver webhooks. Start a port-forward and a
 cloudflared quick tunnel to it:
@@ -244,8 +237,11 @@ proxy's fixed address instead of the CDN.
 
 The platform runner already supplies Python 3.13 and Node 22. This bundle
 adds pinned uv, Rust and pnpm 9 for repositories with committed lockfiles. It
-does not bake repository dependencies into the image. After changing the
-toolchain layer or upgrading the platform runner, rebuild and redeploy:
+does not bake repository dependencies into the image. The published layer is
+built on the platform runner of the same release, so after upgrading Curie,
+render the bundle again with the upgraded CLI. After changing the toolchain
+layer, build it yourself into a registry your nodes can pull from; the build
+replaces the published entry in the lock:
 
 ```bash
 curie build --plugin-dir ./dark-factory --registry <registry-ref> \

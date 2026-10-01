@@ -4383,9 +4383,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     action: DarkFactoryAction::Render { out },
                 },
             ..
-        }) => emit(curie::examples::render_dark_factory(
-            curie::examples::DarkFactoryRenderOpts { out },
-        )?),
+        }) => emit(
+            curie::examples::render_dark_factory(curie::examples::DarkFactoryRenderOpts { out })
+                .await?,
+        ),
         Some(Command::Example {
             action: ExampleAction::SreBot { action },
             context,

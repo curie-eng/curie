@@ -94,7 +94,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 - **`cli/src/message.rs`**: `MessageDryRunOutput` and `MessageOutcomeOutput`, the
   multi-variant outcome whose covered variant set the enum-variant walk derives (see
   Known leakage).
-- **`cli/src/examples.rs`**: `ObservabilityProvisionOutput`, the receipt that Secret `curie-grafana-connector` holds a token (never the token value); `ObservabilityOnlyOutput`, which reports the stack namespace without claiming the Curie release changed; `SreBotRenderOutput`, which reports the new bundle directory; and `DarkFactoryRenderOutput`, which reports the rendered dark-factory bundle directory.
+- **`cli/src/examples.rs`**: `ObservabilityProvisionOutput`, the receipt that Secret `curie-grafana-connector` holds a token (never the token value); `ObservabilityOnlyOutput`, which reports the stack namespace without claiming the Curie release changed; `SreBotRenderOutput`, which reports the new bundle directory; and `DarkFactoryRenderOutput`, which reports the rendered dark-factory bundle directory, the published runner layer `runner_image` its lock records (or `null`), and a `runner_note` naming the `curie build` to run when no layer is published for the CLI's version.
 - **`cli/src/installation.rs`**: `ApplyOutput`, `DiffOutput`.
 - **`cli/src/observability.rs`**: `ObservabilityOutput`, `ObservabilityRunsOutput`,
   `ObservabilityRunOutput`, `ObservabilityMetricsOutput` — the tier-aware

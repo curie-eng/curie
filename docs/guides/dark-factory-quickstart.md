@@ -2,7 +2,7 @@
 
 This guide takes you from nothing to a pull request that Curie's dark factory
 opened on a GitHub repository you just created. Everything runs on your laptop:
-a local [kind](https://kind.sigs.k8s.io/) cluster, a local image registry, and a
+a local [kind](https://kind.sigs.k8s.io/) cluster and a
 cloudflared quick tunnel so GitHub can reach the cluster.
 
 You label an issue `curie-factory`. Curie reads it, plans, writes a test,
@@ -33,11 +33,11 @@ separate trusted job with your GitHub App's identity.
 
 | Tool | Used for |
 |---|---|
-| Docker | kind nodes, the local registry, the runner layer build |
+| Docker | kind nodes |
 | `kind` v0.24 or later, `kubectl`, `helm` | the local cluster. kind's network plugin enforces NetworkPolicy from v0.24, which the sandbox lockdown relies on. |
 | `cloudflared` | a public URL for the GitHub webhook |
 | `gh` | creating the repository, label and issue (the web UI works too) |
-| `curie` v0.11.2 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
+| `curie` v0.11.3 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
 | An [OpenRouter](https://openrouter.ai/) API key | the factory model, `z-ai/glm-5.3-flash` by default |
 | A GitHub account | your own GitHub App and the trial repository |
 
@@ -81,33 +81,14 @@ openssl rand -hex 32 > ~/.curie-factory-webhook-secret
 
 **You should now see** a 64 character line in that file.
 
-## Step 3: Start a kind cluster with a local registry
+## Step 3: Start a kind cluster
 
-The factory agent runs on a runner image layer you build in Step 6, and Curie
-only deploys a layer by registry digest, so kind needs a registry it can pull
-from ([#3619](https://github.com/curie-eng/curie/issues/3619) tracks removing
-this wiring).
+The factory agent runs on a runner layer each Curie release publishes, so the
+cluster pulls it from GHCR like the platform images. No local registry is
+needed.
 
 ```bash
-cat > kind-curie-factory.yaml <<'EOF'
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: curie-factory
-containerdConfigPatches:
-- |-
-  [plugins."io.containerd.grpc.v1.cri".registry]
-    config_path = "/etc/containerd/certs.d"
-EOF
-
-docker run -d --restart=always -p 127.0.0.1:5001:5000 \
-  --name curie-factory-registry registry:2
-kind create cluster --config kind-curie-factory.yaml
-docker network connect kind curie-factory-registry
-docker exec curie-factory-control-plane \
-  mkdir -p /etc/containerd/certs.d/localhost:5001
-printf '[host."http://curie-factory-registry:5000"]\n' | docker exec -i \
-  curie-factory-control-plane cp /dev/stdin \
-  /etc/containerd/certs.d/localhost:5001/hosts.toml
+kind create cluster --name curie-factory
 ```
 
 kind's two CoreDNS replicas hit a conntrack race that stalls name lookups from
@@ -257,28 +238,22 @@ repository, **Issues > Labels** lists `curie-factory`. The App appears under
 **Settings > Applications > Installed GitHub Apps** with access to the trial
 repository.
 
-## Step 6: Build and deploy the factory agent
+## Step 6: Deploy the factory agent
 
 The agent is the [`examples/dark-factory`](../../examples/dark-factory/README.md)
-bundle. Fetch it from the release source archive, no clone needed:
+bundle, embedded in the CLI. Render it:
 
 ```bash
-curl -fsSL https://github.com/curie-eng/curie/archive/refs/tags/v0.11.2.tar.gz \
-  | tar xz --strip-components=2 curie-0.11.2/examples/dark-factory
+curie example dark-factory render --out dark-factory
 ```
 
-The bundle builds its runner layer for two architectures, which Docker's
-default driver refuses (`Multi-platform build is not supported for the docker
-driver`). Build only your kind node's architecture
-([#3619](https://github.com/curie-eng/curie/issues/3619)):
-
-```bash
-# Use linux/arm64 instead on an Apple silicon Mac. -i.bak works with GNU and BSD sed.
-sed -i.bak 's|platforms: \[linux/amd64, linux/arm64\]|platforms: [linux/amd64]|' \
-  dark-factory/connectors.yaml
-grep platforms dark-factory/connectors.yaml
-curie build --plugin-dir dark-factory --registry localhost:5001/curie
-```
+**You should now see** `runner layer locked to the published
+ghcr.io/curie-eng/curie-dark-factory-runner@sha256:...` and a lock file,
+`connectors.lock.yaml`, in that directory. A release CLI records the runner
+layer its release published, so there is nothing to build. A CLI built from
+source has no published layer and says so; build the layer yourself with
+`curie build --plugin-dir dark-factory --registry <ref>` and a registry your
+nodes can pull from.
 
 The bundle needs no GitHub token: the platform reads the issue for it with
 your App.
@@ -423,7 +398,7 @@ label.
 | `curie cluster factory` refuses a key or Secret | The key does not authenticate as `--app-id`, or Secret `curie-github-app` holds another App's key | Pass the matching ID and key, or delete the Secret if it is stale |
 | `curie-api` crash loops after `cluster factory` | Intake is on but a required value is missing | `kubectl -n curie logs deploy/curie-api` names it; set it and rerun `curie cluster factory` |
 | `cluster up` fails on `Job/curie-preflight-gvisor` | A stale preflight Job on kind ([#3618](https://github.com/curie-eng/curie/issues/3618)) | `kubectl -n curie delete job curie-preflight-gvisor`, then rerun |
-| `curie build` fails with `Multi-platform build is not supported` | Docker's default driver builds one platform | Edit `platforms` in `connectors.yaml` (Step 6) |
+| `render` says no runner layer is published | The CLI is a source build, or its version has no published layer | Install a released `curie`, or build the layer with `curie build --plugin-dir dark-factory --registry <ref>` |
 | Work item stays `waiting for sandbox capacity` | Another run holds the sandbox, or the runner pod cannot start | `kubectl -n curie get pods`; the run starts when capacity frees |
 | Status comment ends with `Could not complete:` | The run stopped; the comment's `Cause:` and `Details:` lines say why | Fix the cause, then relabel |
 | Run ends `ci_unverified` | The App cannot read Checks or Commit statuses | Grant both, accept the new permissions on the installation, relabel |
@@ -436,8 +411,10 @@ label.
 
 The factory pieces stay the same. What changes:
 
-1. The registry is one your nodes can pull from, and `curie build` builds every
-   platform your nodes run (keep both platforms in `connectors.yaml`).
+1. The published runner layer covers linux/amd64 and linux/arm64. If you edit
+   the bundle's `runner.Dockerfile`, rebuild the layer with `curie build
+   --plugin-dir dark-factory --registry <ref>` into a registry your nodes can
+   pull from; that replaces the published entry in `connectors.lock.yaml`.
 2. The webhook URL is a stable ingress for the `curie-api` Service instead of a
    tunnel, and `--card-base-url` is that origin.
 3. gVisor stays on where the cluster has the `gvisor` RuntimeClass.
@@ -452,7 +429,6 @@ The factory pieces stay the same. What changes:
 
 ```bash
 kind delete cluster --name curie-factory
-docker rm -f curie-factory-registry
 ```
 
 Stop the tunnel and port-forward. Delete the App or its webhook URL when you
