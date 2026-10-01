@@ -608,7 +608,7 @@ def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub])
     rows = _requests(number)
     assert len(rows) == 2
     assert rows[1]["id"] == _mention_request_id(comment_id)
-    assert rows[1]["status"] == "waiting"
+    assert rows[1]["status"] == "queued"
     assert _delivery_ids() == before
 
     _run_once(github)

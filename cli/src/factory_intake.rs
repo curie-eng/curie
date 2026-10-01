@@ -348,10 +348,9 @@ pub fn intake_gate_offenders(
     {
         bad.push("GITHUB_APP_PRIVATE_KEY");
     }
-    // The webhook secret stays required until polling intake ships a chart
-    // value; ADR 0187 is where this requirement drops for poll mode.
+    let intake = api_str(&api, "githubFactoryIntake");
     let secret = api_str(&api, "githubWebhookSecret");
-    if secret.is_empty() || secret == "dev-webhook-secret" {
+    if intake == "webhook" && (secret.is_empty() || secret == "dev-webhook-secret") {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
     let label = api_str(&api, "githubFactoryLabel");

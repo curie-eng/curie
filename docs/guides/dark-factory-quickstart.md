@@ -146,6 +146,8 @@ delivery that failed that way can be redelivered from the App's delivery log. If
 
 Install Curie with no factory settings first. Factory intake is turned on in a
 second command, `curie cluster factory`, which needs a release to apply to.
+Polling is the default and does not need a webhook secret. Webhook mode is
+optional.
 
 ```bash
 curie cluster up --context kind-curie-factory --model z-ai/glm-5.3-flash

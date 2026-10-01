@@ -36,7 +36,17 @@
         },
         "githubFactoryIngressEnabled": {
           "type": "boolean",
-          "description": "Opt-in gate for signed GitHub issue admission. The API validates the App credentials, label, mention login, allowlist, and non-default webhook secret at boot."
+          "description": "Opt-in gate for GitHub issue admission. Poll mode does not require a webhook secret. Webhook mode requires a non-default webhook secret. The API also validates the App credentials, label, mention login, and allowlist at boot."
+        },
+        "githubFactoryIntake": {
+          "type": "string",
+          "enum": ["poll", "webhook"],
+          "description": "Factory intake mode. poll is the default and reads GitHub on an interval. webhook keeps signed deliveries and the missed-label backstop."
+        },
+        "githubFactoryPollIntervalSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Seconds between factory poll passes when intake is poll. Must be a positive finite number. Default 45."
         },
         "githubFactoryLabel": {
           "type": "string",
