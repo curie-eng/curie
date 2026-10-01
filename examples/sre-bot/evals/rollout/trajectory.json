@@ -1,0 +1,13 @@
+{
+  "specs": [
+    {
+      "case_id": "fetches-both-replica-sets-before-rollout-verdict",
+      "expected": [
+        "mcp__kubernetes__resources_get",
+        "mcp__kubernetes__resources_get"
+      ],
+      "mode": "in_order",
+      "threshold": 1.0
+    }
+  ]
+}

@@ -3697,6 +3697,153 @@ def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
     asyncio.run(go())
 
 
+def _capture_thread_reset_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Record every ``curie.sandbox.lifecycle`` attribute set the drain emits for
+    ``operation=thread-reset``."""
+    seen: list[dict[str, str]] = []
+    real_record_metric = consumer_module.record_metric
+
+    def record(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        real_record_metric(name, value, attributes=attributes)
+        if (
+            name == "curie.sandbox.lifecycle"
+            and attributes is not None
+            and attributes.get("operation") == "thread-reset"
+        ):
+            seen.append(dict(attributes))
+
+    monkeypatch.setattr(consumer_module, "record_metric", record)
+    return seen
+
+
+def _text(raw: object) -> str | None:
+    if raw is None:
+        return None
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
+    make_harness, caplog, monkeypatch
+) -> None:
+    """#3699: ``release_thread`` returns False when the key matched no route
+    (a hand-built key that left out a named bot's identity segment). Nothing was
+    released, so the drain records ``no-route`` where the API can read it, warns
+    instead of logging a success line, and counts the outcome."""
+    outcomes = _capture_thread_reset_outcomes(monkeypatch)
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            thread_key = "slack:C0EXAMPLE1:missing"
+            assert h.substrate.lookup(thread_key) is None
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+
+            with caplog.at_level(logging.INFO):
+                await consumer._drain_thread_reset_requests()
+
+            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
+            assert _text(await h.async_redis.get(result_key)) == "no-route"
+            ttl = await h.async_redis.ttl(result_key)
+            assert 0 < ttl <= 3600, ttl
+            # The in-flight marker is cleared only after the result is written,
+            # so a poll that reads "not pending" always finds the result.
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+
+            warnings = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and thread_key in r.getMessage()
+            ]
+            assert warnings, "a reset that matched no route must warn"
+            assert "nothing was released" in warnings[0].getMessage()
+            assert not any(
+                "released sandbox" in r.getMessage() and thread_key in r.getMessage()
+                for r in caplog.records
+            ), "a reset that released nothing must not log a release"
+
+    asyncio.run(go())
+    assert outcomes == [
+        {"service.name": "curie-worker", "operation": "thread-reset", "outcome": "no-route"}
+    ]
+
+
+def test_thread_reset_drain_records_released_when_a_route_existed(
+    make_harness, monkeypatch
+) -> None:
+    """#3699: a reset that matched a route behaves as before and records
+    ``released`` with the same one-hour lifetime."""
+    outcomes = _capture_thread_reset_outcomes(monkeypatch)
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            await h.kernel.process_event(_qevent("hi", thread="tResultReleased"))
+            thread_key = _thread_key("tResultReleased")
+            assert h.substrate.lookup(thread_key) is not None
+
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+
+            await consumer._drain_thread_reset_requests()
+
+            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
+            assert _text(await h.async_redis.get(result_key)) == "released"
+            ttl = await h.async_redis.ttl(result_key)
+            assert 0 < ttl <= 3600, ttl
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+
+    asyncio.run(go())
+    assert outcomes == [
+        {"service.name": "curie-worker", "operation": "thread-reset", "outcome": "released"}
+    ]
+
+
+def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises(
+    make_harness, monkeypatch
+) -> None:
+    """#3699: a release that raises writes no result (the request stays in
+    flight, as before) and counts as ``failed``."""
+    outcomes = _capture_thread_reset_outcomes(monkeypatch)
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            thread_key = "tResultFailed"
+            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.delete(result_key)
+
+            async def boom_release(key: str) -> bool:
+                raise RuntimeError("injected release failure")
+
+            h.kernel.release_thread = boom_release  # type: ignore[method-assign]
+
+            await consumer._drain_thread_reset_requests()
+
+            assert not await h.async_redis.exists(result_key)
+            assert await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+
+    asyncio.run(go())
+    assert outcomes == [
+        {"service.name": "curie-worker", "operation": "thread-reset", "outcome": "failed"}
+    ]
+
+
 def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
     make_harness, monkeypatch
 ) -> None:

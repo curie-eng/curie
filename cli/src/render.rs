@@ -231,6 +231,7 @@ mod tests {
             arguments: None,
             result: None,
             failed: None,
+            redacted: None,
         };
         let error = OutboundEvent::ErrorEvent {
             version: v(),

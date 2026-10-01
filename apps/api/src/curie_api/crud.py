@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from sqlalchemy import delete, func, literal, or_, select, text, tuple_, update
+from sqlalchemy import delete, func, literal, null, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1973,6 +1973,8 @@ def publication_lineage_outcome_conflict(
     publication: Publication,
     lineage: ThreadPublicationLineage,
     data: PublicationLineageAdvance,
+    *,
+    github_html_base: str,
 ) -> PublicationLineageConflict | None:
     """Preconditions one revision outcome must meet before it may claim a lineage.
 
@@ -1996,7 +1998,7 @@ def publication_lineage_outcome_conflict(
     # GitHub's own spelling of the repository and preserves it, so a repository
     # whose GitHub casing differs from `repo_full_name` publishes fine and must
     # not then take a stable refusal here.
-    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    canonical = f"{github_html_base}/{lineage.repo_full_name}/pull/{data.pr_number}"
     if data.pr_url.casefold() != canonical.casefold():
         return PublicationLineageConflict(
             "publication.lineage_stale",
@@ -2042,6 +2044,7 @@ async def advance_publication_lineage(
     publication_id: uuid.UUID,
     data: PublicationLineageAdvance,
     *,
+    github_html_base: str,
     identity: VerifiedPublicationIdentity | None = None,
 ) -> ThreadPublicationLineage:
     """Atomically advance one approved revision and its exact lineage head."""
@@ -2077,7 +2080,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    conflict = publication_lineage_outcome_conflict(
+        publication, lineage, data, github_html_base=github_html_base
+    )
     if conflict is not None:
         raise conflict
 
@@ -2318,16 +2323,28 @@ async def complete_action(
     state a restore is about to replay. Returned unchanged.
     """
 
-    if action.status != ActionStatus.pending:
-        return action
-    action.status = ActionStatus.failed if data.failed else ActionStatus.succeeded
-    action.result = data.result
-    action.prior_state = data.prior_state
-    action.post_state = data.post_state
-    action.target = data.target
+    # A Core UPDATE would bind Python None into these JSONB columns as the JSON
+    # value ``null``; an unreported field must stay SQL NULL, as it was when
+    # the record opened, so a SQL ``IS NULL`` test agrees with ``undoable``.
+    values: dict[str, Any] = {
+        "status": ActionStatus.failed if data.failed else ActionStatus.succeeded,
+        "result": null() if data.result is None else data.result,
+        "prior_state": null() if data.prior_state is None else data.prior_state,
+        "post_state": null() if data.post_state is None else data.post_state,
+        "target": null() if data.target is None else data.target,
+        "completed_at": datetime.now(UTC).replace(tzinfo=None),
+    }
     if data.detail is not None:
-        action.detail = data.detail
-    action.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        values["detail"] = data.detail
+    await session.execute(
+        update(AgentAction)
+        .where(AgentAction.id == action.id, AgentAction.status == ActionStatus.pending)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    # The row's current state wins even when this session loaded ``pending``
+    # before another completion committed. The SQL predicate, not the stale ORM
+    # object, decides which completion is first.
     await session.commit()
     await session.refresh(action)
     return action
@@ -2344,7 +2361,7 @@ async def list_action_audit(session: AsyncSession, action_id: uuid.UUID) -> list
 
 async def claim_action_undo(
     session: AsyncSession, action: AgentAction, *, actor: str
-) -> AgentAction:
+) -> AgentAction | None:
     """Mark the undo claimed so a second ruling cannot authorize a second restore.
 
     Claimed at ruling time rather than on completion, because nothing reports
@@ -2354,9 +2371,16 @@ async def claim_action_undo(
     one action is the worse failure of the two.
     """
 
-    action.undone_at = datetime.now(UTC).replace(tzinfo=None)
-    action.undone_by = actor
-    session.add(action)
+    result = await session.execute(
+        update(AgentAction)
+        .where(AgentAction.id == action.id, AgentAction.undone_at.is_(None))
+        .values(undone_at=datetime.now(UTC).replace(tzinfo=None), undone_by=actor)
+        .returning(AgentAction.id)
+        .execution_options(synchronize_session=False)
+    )
+    if result.scalar_one_or_none() is None:
+        return None
+    await session.refresh(action)
     return action
 
 
@@ -2459,6 +2483,54 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
 # turns. A chain is one approval per hop, so this is far past any real run; it
 # only bounds the walk against a corrupt row whose dedupe_key loops.
 _RERAISE_CHAIN_LIMIT = 64
+_DISPLAY_REQUESTER_CHAIN_LIMIT = 64
+
+
+async def approval_display_requester(session: AsyncSession, approval: Approval) -> str | None:
+    """Read the requester of a validated resume chain for display only.
+
+    The current row's author remains the actor of its own turn. No result from
+    this walk participates in resolution or grant authorization.
+    """
+
+    current = approval
+    seen = {approval.id}
+    reads = 0
+    while True:
+        prior_id = parse_resume_event_id(current.dedupe_key)
+        if prior_id is None:
+            # A malformed reserved resume id cannot prove a fresh human turn.
+            if current.dedupe_key.startswith("approval-") and current.dedupe_key.endswith(
+                "-resolved"
+            ):
+                return None
+            return current.author
+        if prior_id in seen or reads >= _DISPLAY_REQUESTER_CHAIN_LIMIT:
+            return None
+        seen.add(prior_id)
+        reads += 1
+        prior = await session.get(Approval, prior_id)
+        if prior is None or (
+            prior.agent_id != current.agent_id
+            or prior.conversation_id != current.conversation_id
+            or prior.reply_kind != current.reply_kind
+            or prior.reply_channel != current.reply_channel
+            or prior.reply_endpoint != current.reply_endpoint
+            or route_identity(prior.reply_kind, prior.reply_adapter)
+            != route_identity(current.reply_kind, current.reply_adapter)
+        ):
+            return None
+        if prior.status == ApprovalStatus.expired:
+            expected_actor = "system"
+        elif prior.status in {ApprovalStatus.approved, ApprovalStatus.rejected}:
+            if not prior.resolved_by:
+                return None
+            expected_actor = prior.resolved_by
+        else:
+            return None
+        if current.author != expected_actor:
+            return None
+        current = prior
 
 
 def _same_approval(prior: Approval, data: "ApprovalRequest") -> bool:

@@ -69,7 +69,14 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
-from aci_protocol.turn import SLACK_KIND, matching_routes
+from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
+from aci_protocol.turn import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DEFAULT_IDENTITY,
+    SLACK_KIND,
+    ReplyHandle,
+    matching_routes,
+)
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -173,6 +180,44 @@ SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
 # tests/vectors/eval-memory-isolation.json with the CLI copy. Kernel.py is
 # not in the loop: it already forwards conversation_id as thread_key.
 EVAL_ISOLATE_THREAD_PREFIX = "eval:"
+
+# @spec WORKER-CANARY-2: a declared Slack identity has a narrower shape than
+# the general binding adapter slug. Share its frozen name rule.
+_SLACK_IDENTITY = re.compile(IDENTITY_NAME_PATTERN)
+
+
+def _valid_slack_identity(identity: str) -> bool:
+    """@spec WORKER-CANARY-2: declared identity shape, excluding the relay name."""
+
+    return (
+        identity != CLUSTER_MESSAGE_ADAPTER
+        and len(identity) <= IDENTITY_NAME_MAX_LENGTH
+        and _SLACK_IDENTITY.fullmatch(identity) is not None
+    )
+
+
+def binding_adapter_for_handle(handle: ReplyHandle) -> str | None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-2: select the binding, not egress."""
+
+    if handle.kind != SLACK_KIND or handle.adapter != CLUSTER_MESSAGE_ADAPTER:
+        return handle.adapter
+    identity = handle.identity
+    if identity is None:
+        return DEFAULT_IDENTITY
+    if not _valid_slack_identity(identity):
+        raise ValueError("cluster-message identity must name a declared Slack identity")
+    return identity
+
+
+def _valid_slack_selector(kind: str, adapter: str | None) -> bool:
+    """@spec WORKER-CANARY-2: never treat an invalid selector as default."""
+
+    return (
+        kind != SLACK_KIND
+        or adapter is None
+        or adapter == CLUSTER_MESSAGE_ADAPTER
+        or _valid_slack_identity(adapter)
+    )
 
 
 def is_eval_isolate_thread(thread_key: str) -> bool:
@@ -542,6 +587,9 @@ class BindingResolver:
         route-less binding would otherwise leave the other agent's row as the
         only match, and the turn would run as that agent.
         """
+        # @spec WORKER-CANARY-2: direct resolver callers also fail closed.
+        if not _valid_slack_selector(kind, adapter):
+            return None
         params = {"kind": kind, "address": address}
         async with self._engine.connect() as conn:
             if adapter is None and kind != SLACK_KIND:
@@ -580,6 +628,9 @@ class BindingResolver:
         miss. Returning this record never grants a runner boot: a route remains
         runnable only through ``ResolvedDeployment`` above.
         """
+        # @spec WORKER-CANARY-2: the diagnostic cannot name default either.
+        if not _valid_slack_selector(kind, adapter):
+            return None
         async with self._engine.connect() as conn:
             result = await conn.execute(
                 self._undeployed_binding_sql, {"kind": kind, "address": address}

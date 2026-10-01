@@ -151,6 +151,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S",
         "CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES",
         "CURIE_WORKER_SUPERVISE_FAILURE_RESET_S",
+        # How many turns one worker runs at once (#760), read from the WORKER's
+        # env by WorkerConfig and consumed by the consumer's in-flight bound.
+        # It sizes the worker's own concurrency; nothing about it reaches a
+        # sandbox.
+        "CURIE_WORKER_MAX_CONCURRENCY",
         # Managed-workspace operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
         # and the internal credential client. They govern worker-side clone,
@@ -203,6 +208,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
         "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
         "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+        "CURIE_PUBLICATION_PROTECTED_PATHS",
         "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
@@ -280,6 +286,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_HOOK_CLAIM_LEASE_S",
         # WorkItem orphan sweep cadence (#3076), read by the worker process only.
         "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
+        # Settled stream retention window and cadence (ADR 0184), read by the
+        # worker process only.
+        "CURIE_STREAM_RETENTION_MIN_AGE_S",
+        "CURIE_STREAM_RETENTION_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
@@ -310,6 +320,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the ambient ones by name. Renaming a BootEnv key cannot move these.
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        # Same SDK-owned credential names. The runner's shell filter lists them
+        # so Bash drops them; they are not BootEnv keys.
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -338,6 +352,16 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # sandbox boot fact is instead frozen across both declaration sites by
         # tests/vectors/turn-progress-capability.json.
         "CURIE_TURN_PROGRESS_ENABLED",
+        # One-shot connector grant. The worker writes it beside BootEnv on an
+        # approved resume. The runner (connectors.py) reads it and adds the
+        # header only when it is set. It is not a BootEnv field: the caller
+        # token contract stays unchanged.
+        "CURIE_CONNECTOR_TOOL_GRANT",
+        # The connector proxy process, not the sandbox. The API render writes
+        # these onto the proxy container.
+        "CURIE_CALLER_PROXY_GATED_TOOLS",
+        "CURIE_CALLER_PROXY_CONNECTOR",
+        "CURIE_CALLER_PROXY_GRANT_STORE",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.

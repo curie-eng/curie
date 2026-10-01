@@ -523,9 +523,23 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- $eventsEnabled := (get (.Values.otelCollector.kubernetesEvents | default dict) "enabled") -}}
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
+{{- end -}}
+{{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper.
+     Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
+{{- $noHelper := .Values.otelCollector.exportersWithoutExporterHelper | default dict -}}
+{{- range $name, $reason := $noHelper -}}
+{{- if not (hasKey $.Values.otelCollector.extraExporters $name) -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] names no configured exporter. Remove it, or add the exporter under otelCollector.extraExporters." $name) -}}
+{{- end -}}
+{{- if ne (first (splitList "/" $name)) "awsemf" -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] is invalid: only awsemf exporters may bypass exporterhelper durability validation on Collector 0.119.0." $name) -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $reason) (trim $reason)) -}}
+{{- fail (printf "otelCollector.exportersWithoutExporterHelper[%q] must give a reason, naming the exporter and the Collector version its schema was checked against." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
@@ -549,6 +563,7 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if not (hasKey $noHelper $name) -}}
 {{- $retry := get $config "retry_on_failure" -}}
 {{- if not (kindIs "map" $retry) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must configure retry_on_failure with enabled: true and finite max_interval/max_elapsed_time." $name) -}}
@@ -578,6 +593,7 @@ http
 {{- $queueSize := int (get $queue "queue_size") -}}
 {{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1401,6 +1417,73 @@ true
 
 {{/* Keep the historical inline checksum byte-for-byte while also rolling the
      worker when an operator switches the BYO Secret source. */}}
+{{/* The connector caller key pair the release Secret carries (ADR-0168
+     decision 7): the operator's inline halves, or, with
+     security.allowDevDefaults exactly "true" and neither half set, the
+     published dev pair, as every other published dev credential ships (#195).
+     Without a pair the API refuses to render a hosted connector (#3552), so a
+     dev install could deploy no bundle that hosts one. Decided here from the
+     effective value and never written to the release values, so a later
+     sealed `cluster up` sees no recorded pair and mints a fresh one. The seed
+     is the 32 ASCII bytes `curie-dev-connector-caller-seed!`;
+     cli/tests/connector_caller_dev_pair.rs proves the public half is its
+     Ed25519 public key. */}}
+{{- define "curie.connectorCallerDevSigningKey" -}}Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE={{- end -}}
+
+{{- define "curie.connectorCallerDevVerifyKey" -}}tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c={{- end -}}
+
+{{/* Refuse to leave dev mode with no replacement pair while the release Secret
+     still holds the published one. The api and worker would roll onto no key,
+     but hosted connector proxies already rendered keep trusting the published
+     key, and #3552's refusal stops the reconciler from re-rendering them, so
+     published credentials would stay accepted. Supplying any pair, or naming
+     an existingSecret, lets the upgrade through and rolls the api and worker
+     onto it; a sealed `cluster up` supplies a generated one. A rendered proxy
+     moves to the new key when it is next rendered: the next `cluster deploy`
+     of its agent, or the next pass when worker.connectorReconciler is on. */}}
+{{- define "curie.connectorCallerRefuseKeylessDevExit" -}}
+{{- $caller := .root.Values.connectorCaller | default dict -}}
+{{- $live := "" -}}
+{{- if hasKey .existingData "connectorCallerVerifyKey" -}}
+{{- $live = index .existingData "connectorCallerVerifyKey" | b64dec -}}
+{{- end -}}
+{{- if and (eq $live (include "curie.connectorCallerDevVerifyKey" .root)) (eq (include "curie.connectorCallerVerifyKey" .root) "") (eq ((get $caller "existingSecret") | default "") "") -}}
+{{- fail "connectorCaller: leaving dev defaults would remove the published dev caller pair with no replacement, and hosted connector proxies already running would keep trusting it. Set connectorCaller.signingKey and connectorCaller.verifyKey (or connectorCaller.existingSecret), or run `curie cluster up`, which generates a pair, then redeploy each agent that hosts a connector so its proxy moves to the new key." -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.connectorCallerSigningKey" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- $signing := (get $caller "signingKey") | default "" -}}
+{{- $verify := (get $caller "verifyKey") | default "" -}}
+{{- if and (eq (toString .Values.security.allowDevDefaults) "true") (eq (toString $signing) "") (eq (toString $verify) "") -}}
+{{- $signing = include "curie.connectorCallerDevSigningKey" . -}}
+{{- end -}}
+{{- $signing -}}
+{{- end -}}
+
+{{- define "curie.connectorCallerVerifyKey" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- $signing := (get $caller "signingKey") | default "" -}}
+{{- $verify := (get $caller "verifyKey") | default "" -}}
+{{- if and (eq (toString .Values.security.allowDevDefaults) "true") (eq (toString $signing) "") (eq (toString $verify) "") -}}
+{{- $verify = include "curie.connectorCallerDevVerifyKey" . -}}
+{{- end -}}
+{{- $verify -}}
+{{- end -}}
+
+{{/* What rolls the api and worker when the caller pair they trust changes.
+     Both read it as env at boot, so leaving dev mode, supplying a first pair,
+     or replacing one would otherwise leave them on the old key, still trusting
+     the published dev pair after dev defaults are off. Public material and
+     references only: the effective public key, the previous one, and the BYO
+     Secret name and keys. A BYO Secret's content rotated in place under the
+     same name still needs a manual rollout, as every existingSecret here does. */}}
+{{- define "curie.connectorCallerChecksumSource" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- printf "%s|%s|%s|%s|%s" (include "curie.connectorCallerVerifyKey" .) ((get $caller "previousVerifyKey") | default "") ((get $caller "existingSecret") | default "") ((get $caller "signingKeyKey") | default "") ((get $caller "verifyKeyKey") | default "") -}}
+{{- end -}}
+
 {{- define "curie.adapterCredentialsChecksumSource" -}}
 {{- $creds := include "curie.adapterCredentials" . -}}
 {{- if not (empty .Values.worker.adapterCredentialsExistingSecret) -}}
@@ -1586,14 +1669,21 @@ livenessProbe:
      used by the enforcement preflight, the optional RuntimeClass object, and the
      probe's admission test.
 
+     curie.gvisor.requiredRuntimeClassName: the class a real install must stamp,
+     with no lookup. Empty for mode=off and for fake-model auto. The configured
+     runtimeClassName (default gvisor) for mode=require, and for mode=auto when a
+     real model is in effect (not fakeModel, OR inference.deploy). Real-model
+     auto therefore stamps the class even when lookup is empty (helm template,
+     Argo CD, Flux). Fake-model auto stays empty here even if lookup would hit.
+
      curie.gvisor.runtimeClassName: the EFFECTIVE runtimeClassName to stamp on a
-     runner pod. off -> empty; require -> className; auto -> className when the
-     chart itself creates the RuntimeClass (installRuntimeClass=true), otherwise
-     only if the class is found by `lookup`. The installRuntimeClass shortcut
-     exists because `lookup` cannot see the RuntimeClass the same install is about
-     to create (nor anything under `helm template`/--dry-run), which would leave
-     first-install runner pods with no runtimeClassName despite the chart
-     guaranteeing the object. */}}
+     runner pod. A non-empty requiredRuntimeClassName is returned immediately
+     (that covers require, and real-model auto). Otherwise today's order:
+     off -> empty; installRuntimeClass -> className; auto -> className only if
+     lookup finds the class. The installRuntimeClass shortcut exists because
+     lookup cannot see the RuntimeClass the same install is about to create (nor
+     anything under helm template/--dry-run). Fake-model auto still omits the
+     class when that lookup is empty. */}}
 {{- define "curie.gvisor.className" -}}
 {{- $g := .Values.security.gvisor -}}
 {{- if eq ($g.mode | default "auto") "off" -}}
@@ -1602,18 +1692,31 @@ livenessProbe:
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.gvisor.requiredRuntimeClassName" -}}
+{{- $g := .Values.security.gvisor -}}
+{{- $mode := $g.mode | default "auto" -}}
+{{- $realModel := or (not .Values.agentSandbox.runner.fakeModel) .Values.inference.deploy -}}
+{{- if eq $mode "off" -}}
+{{- else if or (eq $mode "require") (and (eq $mode "auto") $realModel) -}}
+{{- $g.runtimeClassName | default "gvisor" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.gvisor.runtimeClassName" -}}
+{{- $required := include "curie.gvisor.requiredRuntimeClassName" . | trim -}}
+{{- if $required -}}
+{{- $required -}}
+{{- else -}}
 {{- $g := .Values.security.gvisor -}}
 {{- $mode := $g.mode | default "auto" -}}
 {{- $name := $g.runtimeClassName | default "gvisor" -}}
 {{- if eq $mode "off" -}}
-{{- else if eq $mode "require" -}}
-{{- $name -}}
 {{- else if $g.installRuntimeClass -}}
 {{- $name -}}
 {{- else -}}
 {{- if lookup "node.k8s.io/v1" "RuntimeClass" "" $name -}}
 {{- $name -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1778,6 +1881,7 @@ securityContext:
   "CURIE_CLAIM_TIMEOUT_SECONDS" true
   "CURIE_ROUTE_TTL_SECONDS" true
   "CURIE_SUSPENDED_ROUTE_TTL_SECONDS" true
+  "CURIE_STREAM_RETENTION_MIN_AGE_S" true
   "CURIE_DELIVERY_BUDGET_S" true
   "CURIE_RUNNER_TOTAL_TIMEOUT_S" true
   "CURIE_DELIVERY_LEASE_TTL_S" true
@@ -2135,9 +2239,14 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173).
+every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523),
+and every string in agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) -}}
+{{- $extra := list -}}
+{{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
+{{- $extra = .Values.agentSandbox.poolAgents -}}
+{{- end -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}

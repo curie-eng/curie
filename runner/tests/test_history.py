@@ -332,7 +332,9 @@ def test_native_checkpoint_under_another_system_prompt_replays_the_portable_pref
         curie_session_id="curie-thread-attachment",
         cwd=str(tmp_path),
         harness_replay=checkpoint,
-        system_prompt="bundle prompt\n\nThe message you are answering carried file attachments.",
+        system_prompt=(
+            "bundle prompt\n\nFiles attached in this conversation are on disk in this sandbox."
+        ),
     )
 
     assert resume.resume == resume.session_id
@@ -347,7 +349,18 @@ def test_native_checkpoint_under_this_system_prompt_is_restored(tmp_path) -> Non
     checkpoint = HarnessReplayState(
         harness="claude",
         kind="checkpoint",
-        entries=(_PRIOR_NATIVE_USER, _prompt_snapshot("bundle prompt")),
+        # A valid optional cache must include the complete portable conversation;
+        # the previous fixture omitted its assistant row (#3628).
+        entries=(
+            _PRIOR_NATIVE_USER,
+            {
+                "type": "assistant",
+                "uuid": "entry-2",
+                "timestamp": "1970-01-01T00:00:00.000Z",
+                "message": {"role": "assistant", "content": _PRIOR_TURN[1].content},
+            },
+            _prompt_snapshot("bundle prompt"),
+        ),
     )
 
     resume = build_structured_resume(
@@ -442,6 +455,7 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
             runner = SessionRunner(
+                held_secrets=frozenset(),
                 session_factory=lambda: AdapterBackedFake(default_turn),
                 ceiling=0,
                 tracer=RunTracer(None),
@@ -887,6 +901,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             history_store = StateApiTranscriptStore(key_url, token=None)
             assert await history_store.load() == []
             runner = SessionRunner(
+                held_secrets=frozenset(),
                 session_factory=lambda: session,
                 ceiling=0,
                 tracer=RunTracer(None),
@@ -1129,6 +1144,7 @@ def _recording_runner(store: TranscriptStore, *, script=None, ceiling: int = 0):
     from curie_runner.session import SessionRunner
 
     return SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(script or default_turn),
         ceiling=ceiling,
         tracer=RunTracer(None),
@@ -1464,6 +1480,7 @@ def test_record_turn_swallows_store_failure() -> None:
             raise HistoryError("state API unavailable")
 
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: None,  # type: ignore[arg-type,return-value]
         ceiling=0,
         tracer=RunTracer(None),

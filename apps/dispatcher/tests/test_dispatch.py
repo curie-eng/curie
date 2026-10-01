@@ -134,6 +134,56 @@ def test_envelope_acked_placeholder_posted_and_enqueued(
     assert queued.reply_handle.placeholder == BOT_TS
 
 
+# @spec slack-alert-followup-context: Admission and identity checks
+# @spec slack-alert-followup-context: Files and ownership
+def test_threaded_mention_quotes_the_bot_rooted_thread_through_bolt(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """Bolt's own context supplies both identities the root is checked against.
+
+    The root carries only ``bot_id``, a shape Bolt's self-event filter itself
+    accepts for a bot's message, and the reply carries no ``parent_user_id``,
+    which Slack's ``AppMentionEvent`` type does not list. The context therefore
+    appears only if the listener hands the resolver Bolt's authorized
+    ``bot_id`` (the ``_authorize`` stub's ``B1``) as well as its bot user.
+    """
+    app, web_client = _build(config, redis_client)
+    web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "ok": True,
+            "messages": [
+                {"ts": "1700.0001", "bot_id": "B1", "text": "Should I roll back the example?"}
+            ],
+        }
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+    event = {
+        "type": "app_mention",
+        "channel": "C0EXAMPLE1",
+        "user": "U123",
+        "text": "<@U0BOT> yes please",
+        "ts": "1700.0002",
+        "thread_ts": "1700.0001",
+    }
+
+    handler.handle(sock, _events_api_request("env-ctx", "Ev-ctx", event))
+    _drain(app)
+
+    web_client.conversations_replies.assert_called_once_with(
+        channel="C0EXAMPLE1", ts="1700.0001", limit=1
+    )
+    web_client.chat_postMessage.assert_called_once_with(
+        channel="C0EXAMPLE1", thread_ts="1700.0001", text=config.placeholder_text
+    )
+    ((_, fields),) = redis_client.xrange(config.stream)
+    queued = from_stream_fields(fields)
+    assert queued.author == "U123"
+    assert queued.conversation_id == "1700.0001"
+    assert "Should I roll back the example?" in queued.text
+    assert queued.text.endswith("yes please")
+
+
 def test_enqueued_mention_log_includes_release_identity(
     redis_client: redis.Redis,
     config: DispatcherConfig,

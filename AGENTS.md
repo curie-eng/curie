@@ -44,6 +44,15 @@ before editing there, in addition to this file.
 The Python packages are one **uv workspace** (root `pyproject.toml`); ruff,
 mypy, and pytest are configured at the root and run across all members.
 
+## Parallel work
+
+At intake, identify independent tasks and their real dependencies. Start
+disjoint implementation, review, and verification concurrently in separate
+worktrees with isolated test resources; do not wait for one PR's CI or merge
+before starting work that is otherwise ready. Keep shared-file ownership and
+merge or deployment dependencies sequential. After a prerequisite merges,
+retarget its dependent PR promptly and rerun the required gates before merging.
+
 ## Verify commands (per package)
 
 Run these from the repo root unless noted. CI (`.github/workflows/ci.yaml`) runs
@@ -294,7 +303,8 @@ cargo test
 ```
 The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
 tests execute in CI. Contributors need a reachable Valkey, such as the compose
-Valkey, for equivalent local coverage.
+Valkey, for equivalent local coverage. The Python pytest shards likewise set
+`CI_REQUIRE_POSTGRES_TESTS`, so `pg_connect_or_skip` fails rather than skips there.
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
@@ -477,11 +487,18 @@ itself (`curie-eng/curie`, and `curie-eng/agentos`, its former name).
 `example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
 names no real host, so both are fine.
 
-This is enforced by `.gitleaks.toml`, which extends the default rules with
-identifier patterns and allowlists the placeholders above. If a check fires on
-something genuinely fake that the allowlist misses, add it to the allowlist with
-a reason -- do not annotate the line with `gitleaks:allow` to silence it, since
-that hides the next real one.
+`.gitleaks.toml` extends the default secret rules with patterns for Slack ids,
+AWS account ids, EC2 instance ids, internal hostnames, downstream repo slugs in
+this organization, and owner-qualified issue references. These patterns cover
+the shapes and allowlists defined in that file, not every possible identifier.
+
+**Agent and deployment names have no scanner rule.** Check them during review
+and use the `acme-*` placeholders above. A green scan does not prove that these
+names are absent. The examples-only rule still applies to them.
+
+If a check fires on something genuinely fake that the allowlist misses, add it
+to the allowlist with a reason -- do not annotate the line with `gitleaks:allow`
+to silence it, since that hides the next real one.
 
 **Redacting an identifier is a permitted edit to an Accepted ADR.**
 [ADR 0045](docs/adr/0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
@@ -495,19 +512,19 @@ meaning, change nothing else.
 **Why the rule exists:** an ADR and its tests were once written using a live
 workspace's Slack channel ids as the worked example, purely because those were
 the values in front of the author. It read as perfectly normal documentation.
-The agent-name and repo-slug rows have a sharper history, and it is the reason
-they now have a gate instead of only a paragraph. The morning of 2026-07-31 a
-commit swept real agent names out of nine files and added the `acme-*` row
+The agent-name and repo-slug rows have a sharper history, which led to a repo
+slug gate and an explicit review requirement for agent names. The morning of
+2026-07-31 a commit swept real agent names out of nine files and added the `acme-*` row
 above. **Five hours later** an ADR drafted that same afternoon cited the
 downstream repo by slug and issue number, and three hours after that a test
 fixture hard-coded the slug again. The rule was not stale or unknown -- it had
 just been applied, by the same hands, that day.
 
-Two things let that happen, and both are fixed above. The agent-name row was
-the only row in the table with no gitleaks rule behind it: Slack ids, AWS
-accounts, EC2 ids and hostnames were all gated, names were prose. And a repo
-slug was not in the table at all, so a pass that scrubbed *names* had no reason
-to look at `owner/repo`.
+Two gaps let that happen. Agent names had no gitleaks rule behind them, and
+still require review: Slack ids, AWS accounts, EC2 ids and hostnames were gated,
+but names were prose. Repo slugs were absent from the table, so a pass that
+scrubbed *names* had no reason to look at `owner/repo`. The table and repo-slug
+gate now address that second gap; they do not add a scanner rule for agent names.
 
 The deeper trap is that a slug in an ADR does not feel like a leaked value. It
 feels like **sourcing** -- "this decision is justified because that repo had to
@@ -532,8 +549,11 @@ change is safe.
 
 If your task needs a change to either package: **stop, do not work around it, and
 open a GitHub issue or raise it in your PR** -- a contract change must land as
-its own reviewed, backward-compatible change first, before dependent lanes
-proceed. This also applies whenever an adopted component (Langfuse, Agent
+its own reviewed, backward-compatible PR before dependent lanes merge or
+deploy. Once that contract PR is open with a pinned head, dependent lanes may
+develop and verify in parallel in separate worktrees and draft stacked PRs;
+they must retarget to the release branch and rerun required gates after the
+contract lands. This also applies whenever an adopted component (Langfuse, Agent
 Sandbox, Bolt) cannot do what a spec claims: stop and raise it with the evidence
 rather than silently diverging.
 

@@ -95,6 +95,7 @@ from .types import (
     OperatingMode,
     QuotaRejection,
     SandboxError,
+    SandboxTermination,
     SandboxView,
     filter_agent_child_env,
 )
@@ -619,6 +620,13 @@ class DockerSandboxClient:
     ) -> str | None:
         # A Docker runner has no scheduler; it starts or fails.
         del name, request_timeout_seconds
+        return None
+
+    def pod_termination(
+        self, name: str, *, since: datetime, request_timeout_seconds: float
+    ) -> SandboxTermination | None:
+        # Docker has no Kubernetes pod status or events.
+        del name, since, request_timeout_seconds
         return None
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:

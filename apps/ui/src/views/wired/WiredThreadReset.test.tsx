@@ -62,6 +62,37 @@ describe("WiredThreadReset (#871)", () => {
     expect(getThreadResetState).toHaveBeenCalledWith("a1", "1699.0012");
   });
 
+  it("reports that no route matched when the drained reset released nothing", async () => {
+    // #3699: the worker drained the reset but the key matched no route, so no
+    // sandbox was released. That must not read as a successful release.
+    vi.mocked(resetThread).mockResolvedValue({ requested: true, route_existed: null });
+    vi.mocked(getThreadResetState).mockResolvedValue({ requested: false, route_existed: false });
+
+    renderPanel();
+    await userEvent.type(screen.getByTestId("thread-reset-key"), "slack:C0EXAMPLE1:missing");
+    await userEvent.click(screen.getByTestId("thread-reset-start"));
+    await userEvent.click(screen.getByTestId("thread-reset-confirm"));
+
+    const noRoute = await screen.findByTestId("thread-reset-no-route");
+    expect(noRoute).toHaveTextContent(
+      "no route matched thread slack:C0EXAMPLE1:missing; nothing was released",
+    );
+    expect(screen.queryByTestId("thread-reset-released")).not.toBeInTheDocument();
+  });
+
+  it("still reports a release when the API names the route that was released", async () => {
+    vi.mocked(resetThread).mockResolvedValue({ requested: true, route_existed: null });
+    vi.mocked(getThreadResetState).mockResolvedValue({ requested: false, route_existed: true });
+
+    renderPanel();
+    await userEvent.type(screen.getByTestId("thread-reset-key"), "1699.0012");
+    await userEvent.click(screen.getByTestId("thread-reset-start"));
+    await userEvent.click(screen.getByTestId("thread-reset-confirm"));
+
+    expect(await screen.findByTestId("thread-reset-released")).toHaveTextContent("1699.0012");
+    expect(screen.queryByTestId("thread-reset-no-route")).not.toBeInTheDocument();
+  });
+
   it("reports the release as still pending when polling cannot confirm it", async () => {
     vi.mocked(resetThread).mockResolvedValue({ requested: true });
     // A poll failure degrades to "still pending", never fails the accepted reset.

@@ -221,6 +221,67 @@ the sandbox check was unavailable and that CI is pending proof. The factory
 does not report success until that job runs and passes. Other changes still
 need a runnable check before publication.
 
+### Declaring the factory verification checks
+
+A factory run does not guess which command checks a repository. Before the model
+starts, the runner reads a declaration and runs each declared check once in
+`/workspace`, recording the result for the work item.
+
+The declaration comes from the first of these that declares checks:
+
+1. the bundle file `verification/checks.json`; <!-- doclint:ignore-line -->
+2. the repository file `.curie/verification.json`. <!-- doclint:ignore-line -->
+
+When neither declares a check, no command runs, the factory records
+`not_declared`, and the agent is told that no check was declared. An unreadable
+repository file is treated the same way and named in the prompt; an unreadable
+bundle file stops the runner at startup.
+
+```json
+{
+  "lockfile_installs": true,
+  "checks": [
+    {
+      "id": "python",
+      "paths": ["**/*.py", "pyproject.toml", "uv.lock"],
+      "install": ["uv", "sync", "--frozen"],
+      "command": ["uv", "run", "pytest", "runner/tests", "-q"]
+    },
+    {
+      "id": "rust",
+      "paths": ["**/*.rs", "**/Cargo.toml", "Cargo.lock"],
+      "install": ["cargo", "fetch", "--locked"],
+      "command": ["cargo", "test", "--locked"]
+    }
+  ]
+}
+```
+
+- `checks` lists at most 4 checks. An `id` matches `^[a-z][a-z0-9_]{0,31}$`,
+  `paths` lists 1 to 8 globs, and `command` and `install` are argument lists run
+  without a shell. The joined command is at most 120 characters, and a check whose
+  recorded result could exceed the 280 byte stored note is rejected when loaded.
+- `lockfile_installs` is accepted only in the bundle file, so the operator and not
+  the repository decides whether an install may reach a package registry. Without
+  it a declared install is skipped.
+- An install must be a lockfile pinned form: `uv sync` with `--frozen` or
+  `--locked`, `cargo fetch --locked`, `pnpm install --frozen-lockfile`, or
+  `npm ci`, each with a fixed list of allowed options. Registry, index, upgrade
+  and no-lockfile options are rejected. The install runs before its check.
+- The check itself runs offline: `UV_OFFLINE`, `UV_NO_SYNC`, `UV_LOCKED`,
+  `CARGO_NET_OFFLINE` and `npm_config_offline` are set.
+
+The agent sees the declared checks as fenced JSON data and is told to run only the
+check whose paths match the files it changes. A change outside every declared
+check's paths is told that no check was declared for that area, so a Rust change
+is never pointed at a Python suite.
+
+For a factory Python change, any failed check refuses publication. Any check that
+could not run stamps the pull request with "In-sandbox verification was
+unavailable." and that CI is pending proof. With no check named `python`, the
+stamp says that no in-sandbox Python verification check was declared. The
+required CI check remains the only proof of success.
+
 ### Live registry dependencies
 
 ```sh
@@ -317,7 +378,13 @@ the coder to identify the repository's documented check command, run it from
 `/workspace`, and report the exact command and its exit status before requesting
 publication. The tool never publishes anything itself: the platform captures a
 patch, asks for human approval in the requesting thread, and publishes from a
-separate trusted job only after that approval. Human approval is the default.
+separate trusted job only after that approval. That job refuses any change
+under `.github/` (workflows, composite actions, `CODEOWNERS`, and the rest of
+that tree) and any path an operator lists in `worker.publication.protectedPaths`.
+It pushes the branch to the base repository, so a `push` or `pull_request`
+workflow there runs the changed files with the repository's Actions secrets
+before a person reviews the pull request. Keep those secrets in GitHub
+environments that require reviewers. Human approval is the default.
 An operator can opt one agent into automatic publication with
 `curie local publication-policy` or `curie cluster publication-policy` and
 `--policy auto`. That still records an approval, names the platform policy as

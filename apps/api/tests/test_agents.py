@@ -751,9 +751,10 @@ def test_the_published_agent_update_has_no_channel_property_at_all() -> None:
 
     read = schemas["AgentOut"]["properties"]["channels"]
     assert read.get("type") == "array", read
-    # Still the binding object, one element type: this cannot be satisfied by
-    # loosening the read surface to a bare list of anything.
-    assert json.dumps(read).count("#/components/schemas/ChannelBinding") == 1, read
+    # Still the binding READ object, one element type: this cannot be satisfied
+    # by loosening the read surface to a bare list of anything, nor by pointing
+    # it at the neutral pair or the write model, which share its name prefix.
+    assert read.get("items") == {"$ref": "#/components/schemas/ChannelBindingOut"}, read
 
 
 @pytest.fixture

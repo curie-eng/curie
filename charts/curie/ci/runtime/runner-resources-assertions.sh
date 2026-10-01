@@ -2,6 +2,9 @@
 #
 # Render assertions for the per-agent runner resource override (#3209).
 #
+# It needs no cluster, but it lives under ci/runtime, so CI runs it through
+# tools/runtime-assertion-gate/run.sh in e2e-cluster-chart-regressions (#3485).
+#
 # The API compares one override block to resourceQuota.hard because this chart's
 # sandbox pod has one regular container, every init container carries that same
 # resources block, and the RuntimeClass this chart renders has no overhead.

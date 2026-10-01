@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, EvalJob
 from curie_api.config import get_settings
 from curie_api.evalqueue import EvalQueue, from_stream_fields, now_iso
+from curie_worker.config import WorkerConfig
 
 SECRET = get_settings().github_webhook_secret
 REPO = "octo/k1-fanout"
@@ -71,6 +72,45 @@ def test_enqueue_lands_with_exact_shape() -> None:
     finally:
         sync.delete(stream)
         sync.close()
+
+
+def test_default_queue_enqueues_onto_the_worker_consumer_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One CURIE_EVAL_STREAM value moves the API producer (as main.py
+    constructs it) and the worker consumer together (#3565)."""
+    stream = f"curie:evals:test-{secrets.token_hex(4)}"
+    monkeypatch.setenv("CURIE_EVAL_STREAM", stream)
+    get_settings.cache_clear()
+    request = EvalJob(
+        agent_id=uuid.uuid4(),
+        version_id=uuid.uuid4(),
+        sha="deadbeef",
+        suite="default",
+        bundle_ref="bundles/x/y.tar.gz",
+        requested_at=now_iso(),
+    )
+    try:
+        dsn = get_settings().valkey_dsn()
+
+        async def _enqueue() -> None:
+            client = aioredis.from_url(dsn)
+            try:
+                await EvalQueue(client).enqueue(request)
+            finally:
+                await client.aclose()
+
+        asyncio.run(_enqueue())
+
+        sync = redis.from_url(dsn)
+        try:
+            assert sync.xlen(stream) == 1
+            assert stream == WorkerConfig().eval_stream
+        finally:
+            sync.delete(stream)
+            sync.close()
+    finally:
+        get_settings.cache_clear()
 
 
 def test_from_stream_fields_tolerates_an_unknown_field() -> None:

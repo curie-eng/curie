@@ -345,6 +345,39 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     assert sink.posts == 1
 
 
+def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9922
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    sink.requests.clear()
+
+    epoch = _start_running(request_id)
+    detail = 'Kubernetes reason: Evicted: EmptyDir volume "workspace" exceeded its limit'
+    _finish_failed(client, request_id, epoch, "sandbox_terminated", detail=detail)
+    _reconcile()
+
+    assert _posts(sink) == []
+    assert [path for path, _ in _patches(sink)] == [
+        f"/repos/{REPO}/issues/comments/{comment_id}"
+    ]
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert body.startswith("Could not complete: the sandbox terminated")
+    assert f"Details: {detail}" in body
+    assert "Provider message:" not in body
+    assert "Cause: sandbox_terminated" in body
+    assert "Failure class: sandbox-terminated" in body
+    assert "Status: FAILED" in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    token = _notices(request_id)[0]["card_token"]
+    card = client.get(f"/v1/factory/cards/{token}.svg")
+    assert card.status_code == 200, card.text
+    assert "NEEDS HUMAN" in card.text
+
+
 @pytest.mark.parametrize(
     ("number", "detail"),
     [

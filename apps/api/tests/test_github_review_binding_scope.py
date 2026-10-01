@@ -103,7 +103,12 @@ def test_concurrent_feedback_is_durable_for_same_and_independent_thread_lineages
         truth.comment = copy.deepcopy(truth.payload["comment"])
         truth.comment["issue_url"] = f"https://api.github.com/repos/{REPO}/issues/{number}"
         truth.comment["pull_request_url"] = f"https://api.github.com/repos/{REPO}/pulls/{number}"
-        second_id = parse_feedback("issue_comment", truth.payload, delivery).event_id
+        second_id = parse_feedback(
+            "issue_comment",
+            truth.payload,
+            delivery,
+            github_html_base="https://github.com",
+        ).event_id
         result = post_review(client, truth, delivery=delivery)
         assert result.status_code == 200, result.text
         assert result.json()["status"] == "feedback_queued", result.text

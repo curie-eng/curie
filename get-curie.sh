@@ -97,18 +97,19 @@ fi
 # DOWNLOAD MODE -- fetch, verify, and install the released binary.
 # ==========================================================================
 
-# Resolve the asset for this machine. The release ships exactly two binaries --
-# Linux x86_64 and macOS Apple silicon -- so this case statement is the whole
+# Resolve the asset for this machine. The release ships Linux binaries for
+# x86_64 and arm64, plus macOS Apple silicon, so this case statement is the whole
 # platform contract. Reset ASSET first so an unmatched platform is empty, not
 # stale, and name neither asset literally anywhere else (issues #746, #752).
 ASSET=
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64)                ASSET=curie-x86_64-unknown-linux-gnu ;;
+  Linux/arm64|Linux/aarch64)   ASSET=curie-aarch64-unknown-linux-gnu ;;
   Darwin/arm64|Darwin/aarch64) ASSET=curie-aarch64-apple-darwin ;;
 esac
 if [ -z "$ASSET" ]; then
   echo "error: no prebuilt curie binary for $(uname -s)/$(uname -m)." >&2
-  echo "Supported: Linux x86_64 and macOS Apple silicon (Darwin arm64)." >&2
+  echo "Supported: Linux x86_64/arm64 and macOS Apple silicon (Darwin arm64)." >&2
   echo "On anything else, build the CLI from source: clone the repo and run" >&2
   echo "./get-curie.sh from the checkout (see cli/ and docs/release-verification.md)." >&2
   exit 1

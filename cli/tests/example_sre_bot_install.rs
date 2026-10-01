@@ -44,6 +44,228 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn observability_only_plan_never_touches_the_curie_release_or_bot() {
+    let output = Command::new(bin())
+        .args([
+            "--json",
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run observability-only plan");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON plan");
+    let lines = value["plan"].as_array().expect("plan lines");
+    let plan = lines
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("grafana-community/grafana"));
+    assert!(plan.contains("tempo.yaml"));
+    for forbidden in [
+        "curie-values.yaml",
+        "cluster deploy",
+        "upgrade curie",
+        "kubernetes-access.yaml",
+    ] {
+        assert!(
+            !plan.contains(forbidden),
+            "unexpected platform step {forbidden}: {plan}"
+        );
+    }
+    let conflicting = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+            "--approvers",
+            DEFAULT_APPROVER,
+        ])
+        .output()
+        .expect("reject bot-only options on stack-only install");
+    assert!(!conflicting.status.success());
+}
+
+#[test]
+fn observability_only_installs_the_stack_without_curie_upgrade_or_api_calls() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &[
+            "--json",
+            "example",
+            "sre-bot",
+            "install",
+            "--observability-only",
+        ],
+        &repo_root(),
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let helm = fixture.helm_calls().join("\n");
+    assert!(helm.contains("upgrade --install grafana"));
+    assert!(helm.contains("upgrade --install prometheus"));
+    assert!(
+        !helm.contains("upgrade curie"),
+        "Curie release changed: {helm}"
+    );
+    let kubectl = fixture.kubectl_calls().join("\n");
+    assert!(kubectl.contains("tempo.yaml"));
+    assert!(!kubectl.contains("kubernetes-access.yaml"));
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "the bot must not be deployed"
+    );
+}
+
+#[test]
+fn render_writes_a_deployable_runtime_bundle_without_cluster_mutation() {
+    let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
+    let out = fixture._temp.path().join("nested/rendered-bot");
+    let output = Command::new(bin())
+        .args([
+            "--json",
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("render example bundle");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("JSON render receipt");
+    assert_eq!(receipt["bundle_dir"], out.to_str().unwrap());
+    assert_eq!(receipt["rendered"], true);
+    let connectors: Value =
+        serde_norway::from_slice(&fs::read(out.join("connectors.yaml")).unwrap()).unwrap();
+    assert!(connectors["connectors"].get("self-upgrade").is_none());
+    assert!(connectors["connectors"]["tempo"]["image"]
+        .as_str()
+        .unwrap()
+        .contains("@sha256:"));
+    assert!(connectors["connectors"]["tempo"].get("build").is_none());
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+    assert!(!manifest["toolPolicy"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.as_str().unwrap_or("").starts_with("self-upgrade/")));
+    assert!(fixture.helm_calls().is_empty() && fixture.kubectl_calls().is_empty());
+    let previous_connectors = fs::read(out.join("connectors.yaml")).unwrap();
+    let second = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("repeat render");
+    assert!(
+        !second.status.success(),
+        "render must not overwrite operator edits"
+    );
+    assert_eq!(
+        fs::read(out.join("connectors.yaml")).unwrap(),
+        previous_connectors
+    );
+}
+
+#[test]
+fn render_platform_upgrade_keeps_only_the_gated_upgrade_path_and_custom_namespaces() {
+    let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
+    let out = fixture._temp.path().join("rendered-upgrade-bot");
+    let output = Command::new(bin())
+        .args([
+            "example",
+            "sre-bot",
+            "render",
+            "--out",
+            out.to_str().unwrap(),
+            "--platform-upgrade",
+            "--namespace",
+            "soak",
+            "--release",
+            "soak-rel",
+            "--observability-namespace",
+            "signals",
+        ])
+        .env(
+            "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
+            &fixture.registry_endpoint,
+        )
+        .output()
+        .expect("render upgrade example bundle");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let connectors: Value =
+        serde_norway::from_slice(&fs::read(out.join("connectors.yaml")).unwrap()).unwrap();
+    assert!(connectors["connectors"]["self-upgrade"]["image"]
+        .as_str()
+        .unwrap()
+        .contains("@sha256:"));
+    assert_eq!(
+        connectors["connectors"]["self-upgrade"]["env"]["PLATFORM_UPGRADE_CRONJOB"],
+        "platform-upgrade"
+    );
+    assert_eq!(
+        connectors["connectors"]["self-upgrade"]["env"]["SELF_UPGRADE_CRONJOB"],
+        ""
+    );
+    assert!(fs::read_to_string(out.join("connectors.yaml"))
+        .unwrap()
+        .contains(".signals.svc.cluster.local"));
+    assert!(
+        fs::read_to_string(out.join("manifests/platform-upgrade-role.yaml"))
+            .unwrap()
+            .contains("namespace: soak")
+    );
+    assert!(
+        fs::read_to_string(out.join("manifests/platform-upgrade-cronjob.yaml"))
+            .unwrap()
+            .contains("soak-rel")
+    );
+    assert!(!out.join("manifests/self-upgrade-cronjob.yaml").exists());
+    assert!(fixture.helm_calls().is_empty() && fixture.kubectl_calls().is_empty());
+}
+
 fn install_example_stub(dir: &Path, name: &str, body: &str) {
     let reads = include_str!("data/converged-installation-read.sh");
     let body = if name == "helm" {
@@ -73,9 +295,14 @@ struct Fixture {
     helm_values_dir: PathBuf,
     nodes: String,
     pods: String,
+    pvcs: String,
+    events: String,
     nodes_mode: &'static str,
     pods_mode: &'static str,
     helm_mode: &'static str,
+    helm_status_mode: &'static str,
+    pvc_mode: &'static str,
+    tempo_rollout_mode: &'static str,
     grafana_secret_mode: &'static str,
     reader_token_mode: &'static str,
     helm_values: String,
@@ -139,6 +366,20 @@ case " $* " in
                 exit 1
                 ;;
         esac
+        exit 0
+        ;;
+    *" get pvc "*|*" get persistentvolumeclaims "*)
+        if [ "$CURIE_TEST_PVC_MODE" = "hang" ]; then
+            sleep 30 &
+            child_pid=$!
+            printf '%s\n' "$child_pid" > "$CURIE_TEST_PVC_CHILD_PID_PATH"
+            wait "$child_pid"
+        fi
+        printf '%s\n' "$CURIE_TEST_PVCS_JSON"
+        exit 0
+        ;;
+    *" get events "*)
+        printf '%s\n' "$CURIE_TEST_EVENTS_JSON"
         exit 0
         ;;
     *" get pods "*|*" get pod "*)
@@ -250,6 +491,13 @@ case " $* " in
     *" delete deployment,service,networkpolicy,secret "*)
         exit 0
         ;;
+    *" rollout status statefulset/tempo "*)
+        if [ "$CURIE_TEST_TEMPO_ROLLOUT_MODE" = "timeout" ]; then
+            printf '%s\n' 'error: timed out waiting for the condition' >&2
+            exit 1
+        fi
+        exit 0
+        ;;
     *" apply "*|*" rollout status "*)
         exit 0
         ;;
@@ -297,6 +545,26 @@ if [ "$1" = "get" ] && [ "$2" = "values" ]; then
 fi
 
 if [ "$1" = "status" ] && [ "$2" = "grafana" ]; then
+    if [ "$CURIE_TEST_HELM_STATUS_MODE" = "hang" ]; then
+        # A credential helper that forks and outlives its parent's timeout.
+        sleep 30 &
+        child_pid=$!
+        printf '%s\n' "$child_pid" > "$CURIE_TEST_HELM_STATUS_CHILD_PID_PATH"
+        wait "$child_pid"
+        exit 0
+    fi
+    if [ "$CURIE_TEST_HELM_STATUS_MODE" = "pending-upgrade" ]; then
+        status_namespace=observability
+        case " $* " in
+            *" -n soak-obs "*) status_namespace=soak-obs ;;
+        esac
+        printf '{"name":"grafana","namespace":"%s","info":{"status":"pending-upgrade"}}\n' "$status_namespace"
+        exit 0
+    fi
+    if [ "$CURIE_TEST_HELM_STATUS_MODE" = "wrong-release" ]; then
+        printf '%s\n' '{"name":"other","namespace":"observability","info":{"status":"pending-upgrade"}}'
+        exit 0
+    fi
     case "$CURIE_TEST_GRAFANA_SECRET_MODE" in
         migrate|migration-source-failure)
             printf '%s\n' '{"name":"grafana","namespace":"observability","info":{"status":"deployed"}}'
@@ -307,6 +575,11 @@ if [ "$1" = "status" ] && [ "$2" = "grafana" ]; then
             exit 1
             ;;
     esac
+fi
+
+if [ "$1" = "status" ] && [ "$2" = "curie" ] && [ "$CURIE_TEST_HELM_MODE" = "existing-release" ]; then
+    printf '%s\n' '{"name":"curie","namespace":"curie","info":{"status":"deployed"}}'
+    exit 0
 fi
 
 if [ "$1" = "repo" ]; then
@@ -327,7 +600,7 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
             printf '%s\n' 'intentional fixture stop after Helm mutation boundary' >&2
             exit 42
             ;;
-        success)
+        success|existing-release)
             exit 0
             ;;
     esac
@@ -363,6 +636,9 @@ exit 64
                     Some(agent) => Response::json(200, &json!([agent]).to_string()),
                     None => Response::json(200, "[]"),
                 },
+                ("GET", path) if path == format!("/deployments?agent_id={AGENT_ID}") => {
+                    Response::json(200, "[]")
+                }
                 ("POST", "/agents") => {
                     let agent = json!({
                         "id": AGENT_ID,
@@ -519,9 +795,14 @@ exit 64
             helm_values_dir,
             nodes: nodes.to_string(),
             pods: pods.to_string(),
+            pvcs: json!({"items":[]}).to_string(),
+            events: json!({"items":[]}).to_string(),
             nodes_mode,
             pods_mode,
             helm_mode,
+            helm_status_mode: "absent",
+            pvc_mode: "success",
+            tempo_rollout_mode: "success",
             grafana_secret_mode: "existing",
             reader_token_mode: "success",
             helm_values: "absent".to_string(),
@@ -566,6 +847,27 @@ exit 64
         self
     }
 
+    fn with_pvc_events(mut self, pvcs: Value, events: Value) -> Self {
+        self.pvcs = pvcs.to_string();
+        self.events = events.to_string();
+        self
+    }
+
+    fn with_tempo_rollout_mode(mut self, mode: &'static str) -> Self {
+        self.tempo_rollout_mode = mode;
+        self
+    }
+
+    fn with_helm_status_mode(mut self, mode: &'static str) -> Self {
+        self.helm_status_mode = mode;
+        self
+    }
+
+    fn with_pvc_mode(mut self, mode: &'static str) -> Self {
+        self.pvc_mode = mode;
+        self
+    }
+
     fn with_helm_values(mut self, values: Value) -> Self {
         self.helm_values = values.to_string();
         self
@@ -591,12 +893,6 @@ exit 64
         current_dir: &Path,
         release_cache: Option<&Path>,
     ) -> Output {
-        let mut paths = vec![self.bin_dir.clone()];
-        if let Some(current) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&current));
-        }
-        let path = std::env::join_paths(paths).expect("join PATH");
-
         let mut args = vec![
             "--color",
             "never",
@@ -606,6 +902,20 @@ exit 64
             "--observability",
         ];
         args.extend_from_slice(extra);
+        self.run_command_args(&args, current_dir, release_cache)
+    }
+
+    fn run_command_args(
+        &self,
+        args: &[&str],
+        current_dir: &Path,
+        release_cache: Option<&Path>,
+    ) -> Output {
+        let mut paths = vec![self.bin_dir.clone()];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        let path = std::env::join_paths(paths).expect("join PATH");
 
         let mut command = Command::new(bin());
         command
@@ -631,9 +941,22 @@ exit 64
             )
             .env("CURIE_TEST_NODES_JSON", &self.nodes)
             .env("CURIE_TEST_PODS_JSON", &self.pods)
+            .env("CURIE_TEST_PVCS_JSON", &self.pvcs)
+            .env("CURIE_TEST_EVENTS_JSON", &self.events)
             .env("CURIE_TEST_NODES_MODE", self.nodes_mode)
             .env("CURIE_TEST_PODS_MODE", self.pods_mode)
             .env("CURIE_TEST_HELM_MODE", self.helm_mode)
+            .env("CURIE_TEST_HELM_STATUS_MODE", self.helm_status_mode)
+            .env("CURIE_TEST_PVC_MODE", self.pvc_mode)
+            .env(
+                "CURIE_TEST_PVC_CHILD_PID_PATH",
+                self._temp.path().join("pvc-child.pid"),
+            )
+            .env(
+                "CURIE_TEST_HELM_STATUS_CHILD_PID_PATH",
+                self._temp.path().join("helm-status-child.pid"),
+            )
+            .env("CURIE_TEST_TEMPO_ROLLOUT_MODE", self.tempo_rollout_mode)
             .env("CURIE_TEST_HELM_VALUES", &self.helm_values)
             .env("CURIE_TEST_GRAFANA_SECRET_MODE", self.grafana_secret_mode)
             .env("CURIE_TEST_READER_TOKEN_MODE", self.reader_token_mode)
@@ -784,12 +1107,263 @@ fn node(name: &str, memory: &str, ready: bool) -> Value {
         "metadata": {"name": name},
         "status": {
             "allocatable": {"memory": memory},
+            // Kubernetes Node.status.nodeInfo.containerRuntimeVersion is
+            // runtime://version; DaemonSets can tolerate NotReady/cordoned nodes.
+            // https://kubernetes.io/docs/reference/kubernetes-api/core/node-v1/
+            // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+            "nodeInfo": {"containerRuntimeVersion": "containerd://1.7.0"},
             "conditions": [{
                 "type": "Ready",
                 "status": if ready { "True" } else { "False" }
             }]
         }
     })
+}
+
+fn node_with_runtime(name: &str, ready: bool, runtime: &str, cordoned: bool) -> Value {
+    let mut value = node(name, "4Gi", ready);
+    value["status"]["nodeInfo"]["containerRuntimeVersion"] = json!(runtime);
+    value["spec"]["unschedulable"] = json!(cordoned);
+    value
+}
+
+#[test]
+fn mixed_runtime_on_cordoned_node_refuses_before_cluster_mutation() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-a", true, "containerd://1.7.0", false),
+            node_with_runtime("node-b", true, "docker://24.0.0", true),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("node-a") && stderr.contains("node-b"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty(), "Helm was mutated");
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|call| call.contains("apply -f -")),
+        "Grafana Secret was mutated"
+    );
+}
+
+#[test]
+fn docker_runtime_selects_docker_alloy_values() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-a",
+            true,
+            "docker://24.0.0",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let values = fixture.helm_values_file("alloy-values.yaml");
+    assert!(values.contains("dockercontainers: true"), "{values}");
+    assert!(values.contains("stage.docker {"), "{values}");
+    assert!(!values.contains("stage.cri {"), "{values}");
+}
+
+#[test]
+fn unknown_node_runtime_refuses_before_secret_or_helm() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-unknown",
+            true,
+            "mystery://1",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("node-unknown") && stderr.contains("mystery://1"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty());
+    assert!(fixture.kubectl_stdin().is_empty());
+}
+
+#[test]
+fn not_ready_docker_node_prevents_cri_alloy_install() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-ready", true, "containerd://1.7.0", false),
+            node_with_runtime("node-not-ready", false, "docker://24.0.0", false),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("node-not-ready"));
+    assert!(fixture.helm_calls().is_empty());
+}
+
+#[test]
+fn not_ready_docker_node_with_its_condition_taints_prevents_cri_alloy_install() {
+    // A real NotReady node carries node.kubernetes.io/not-ready as both
+    // NoSchedule (taint by condition) and NoExecute (taint based eviction).
+    // A DaemonSet tolerates only the NoExecute half, so Alloy is not placed
+    // there now, but the taints lift when the node recovers and Alloy then
+    // runs on it with whatever parser this install rendered.
+    // https://kubernetes.io/docs/reference/labels-annotations-taints/#node-kubernetes-io-not-ready
+    // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/#taints-and-tolerations
+    let mut not_ready = node_with_runtime("node-not-ready", false, "docker://24.0.0", false);
+    not_ready["spec"]["taints"] = json!([
+        {"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
+        {"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"}
+    ]);
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-ready", true, "containerd://1.7.0", false),
+            not_ready,
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("node-ready") && stderr.contains("node-not-ready"),
+        "{stderr}"
+    );
+    assert!(fixture.helm_calls().is_empty(), "Helm was mutated");
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|call| call.contains("apply -f -")),
+        "Grafana Secret was mutated"
+    );
+}
+
+#[test]
+fn provision_observability_refuses_mixed_runtime_before_mutation() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![
+            node_with_runtime("node-cri", true, "containerd://1.7.0", false),
+            node_with_runtime("node-docker", false, "docker://24.0.0", false),
+        ]),
+        pods(vec![]),
+        "success",
+        "success",
+        "existing-release",
+    );
+    let output = fixture.run_command_args(
+        &[
+            "example",
+            "sre-bot",
+            "provision-observability",
+            "--chart",
+            "charts/curie",
+        ],
+        &repo_root(),
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node-cri") && stderr.contains("node-docker"),
+        "{stderr}"
+    );
+    assert!(fixture
+        .helm_calls()
+        .iter()
+        .all(|call| call.starts_with("status ")));
+    assert!(fixture.kubectl_stdin().is_empty());
+}
+
+#[test]
+fn full_install_dry_run_never_reads_cluster_nodes() {
+    let fixture = Fixture::with_modes(nodes(vec![]), pods(vec![]), "failure", "failure", "success");
+    let output = fixture.run(&["--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture
+            .kubectl_calls()
+            .iter()
+            .all(|call| !call.contains("get nodes")
+                && !call.contains("apply")
+                && !call.contains("delete")),
+        "{:?}",
+        fixture.kubectl_calls()
+    );
+    assert!(fixture.helm_calls().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("node runtimes"));
+}
+
+#[test]
+fn full_install_passes_docker_values_to_alloy_chart() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node_with_runtime(
+            "node-a",
+            true,
+            "docker://24.0.0",
+            false,
+        )]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&[]);
+    assert_reached_helm_upgrade(&fixture, &output);
+    let values = fixture.helm_values_file("alloy-values.yaml");
+    assert!(values.contains("dockercontainers: true"), "{values}");
+    assert!(values.contains("stage.docker {"), "{values}");
 }
 
 fn nodes(items: Vec<Value>) -> Value {
@@ -920,7 +1494,7 @@ fn assert_refused_before_helm(fixture: &Fixture, output: &Output) -> String {
 }
 
 #[test]
-fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credential_flags() {
+fn clap_routes_install_and_exposes_no_operator_configuration_or_credential_flags() {
     let output = Command::new(bin())
         .args(["example", "sre-bot", "install", "--help"])
         .output()
@@ -929,7 +1503,11 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
     assert!(output.status.success(), "new command must parse: {text}");
     assert!(
         text.contains("--observability"),
-        "the install surface must expose the one observability flag: {text}"
+        "the install surface must expose the full observability flag: {text}"
+    );
+    assert!(
+        text.contains("--observability-only"),
+        "the install surface must expose the stack-only flag: {text}"
     );
     assert!(
         text.contains("--slack-channel"),
@@ -949,11 +1527,8 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
         text.contains("--approvers"),
         "the install surface must expose --approvers as its single approval input: {text}"
     );
-    let usage = text.split("Options:").next().unwrap_or(&text);
-    assert!(
-        usage.contains("--approvers <USER_IDS>"),
-        "the usage line must mark --approvers as required: {text}"
-    );
+    // `--approvers` is required for the full install, but deliberately absent
+    // from the stack-only form. The missing-approvers test drives that refusal.
     for forbidden in [
         "--route-approvers",
         "--routes-from",
@@ -1296,7 +1871,9 @@ fn existing_grafana_release_migrates_its_live_admin_credential_without_exposure(
         fixture.kubectl_calls(),
         fixture.helm_calls()
     );
-    for secret in ["migrated-admin", "pw"] {
+    // Both forms, like the reader-token check: the realistic leak is the
+    // Secret manifest itself reaching argv or output, and its `data` is base64.
+    for secret in ["migrated-admin", "pw", "bWlncmF0ZWQtYWRtaW4=", "cHc="] {
         assert!(
             !observable.contains(secret),
             "migrated credentials must not reach argv, logs, stdout, or stderr"
@@ -2218,7 +2795,8 @@ fn helm_wait_is_bounded_and_timeout_names_safe_pending_upgrade_recovery() {
         "success",
         "success",
         "timeout",
-    );
+    )
+    .with_helm_status_mode("pending-upgrade");
     let output = fixture.run(&[]);
     let text = shown(&output);
     assert_eq!(
@@ -2252,6 +2830,459 @@ fn helm_wait_is_bounded_and_timeout_names_safe_pending_upgrade_recovery() {
             && normalized.contains(&recovery),
         "timeout must name the release and exact pending upgrade recovery command `{recovery}`: {text}"
     );
+}
+
+#[test]
+fn helm_timeout_names_matching_pending_pvc_warning_without_claiming_secret_deletion_fixes_it() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"ProvisioningFailed","message":"no storage class can provision this claim","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("loki-data") && text.contains("ProvisioningFailed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("no storage class can provision this claim"),
+        "{text}"
+    );
+    assert!(!text.contains("Recover the pending upgrade with"), "{text}");
+    assert!(fixture
+        .kubectl_calls()
+        .iter()
+        .any(|call| call.contains("get pvc")));
+    assert!(fixture
+        .kubectl_calls()
+        .iter()
+        .any(|call| call.contains("get events")));
+}
+
+#[test]
+fn tempo_timeout_names_failed_scheduling_for_pod_using_pending_pvc() {
+    let pending_pod = json!({
+        "metadata":{"name":"tempo-0","namespace":"observability","uid":"pod-current"},
+        "spec":{"containers":[],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"tempo-data"}}]},
+        "status":{"phase":"Pending"}
+    });
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![pending_pod]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_tempo_rollout_mode("timeout")
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"tempo-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"FailedScheduling","message":"pod has unbound immediate PersistentVolumeClaims","involvedObject":{"kind":"Pod","name":"tempo-0","namespace":"observability","uid":"pod-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("tempo-data") && text.contains("FailedScheduling"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unbound immediate PersistentVolumeClaims"),
+        "{text}"
+    );
+    assert!(
+        text.contains("timed out waiting for the condition"),
+        "{text}"
+    );
+}
+
+#[test]
+fn stale_pvc_warning_does_not_explain_a_new_pending_claim() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"new-uid"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"ProvisioningFailed","message":"old volume failure","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"old-uid"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("old volume failure"), "{text}");
+    assert!(
+        text.contains("kubectl describe pvc -n observability"),
+        "{text}"
+    );
+    assert!(!text.contains("kubectl delete secret"), "{text}");
+}
+
+#[test]
+fn uidless_old_pod_warning_does_not_explain_a_new_pending_claim() {
+    let pending_pod = json!({
+        "metadata":{"name":"tempo-0","namespace":"observability","uid":"pod-current"},
+        "spec":{"containers":[],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"tempo-data"}}]},
+        "status":{"phase":"Pending"}
+    });
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![pending_pod]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_tempo_rollout_mode("timeout")
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"tempo-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"FailedScheduling","message":"old unbound immediate PersistentVolumeClaims","involvedObject":{"kind":"Pod","name":"tempo-0","namespace":"observability"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("old unbound"), "{text}");
+    assert!(
+        text.contains("kubectl describe pvc -n observability"),
+        "{text}"
+    );
+}
+
+#[test]
+fn unrelated_pod_warning_does_not_explain_pending_pvc() {
+    let pending_pod = json!({
+        "metadata":{"name":"tempo-0","namespace":"observability","uid":"pod-current"},
+        "spec":{"containers":[],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"tempo-data"}}]},
+        "status":{"phase":"Pending"}
+    });
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![pending_pod]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_tempo_rollout_mode("timeout")
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"tempo-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Warning","reason":"FailedScheduling","message":"node lacked CPU","involvedObject":{"kind":"Pod","name":"tempo-0","namespace":"observability","uid":"pod-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("node lacked CPU"), "{text}");
+    assert!(text.contains("kubectl get pvc -n observability"), "{text}");
+}
+
+#[test]
+fn hanging_pvc_diagnostic_keeps_the_original_helm_timeout_bounded() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_mode("hang");
+    let started = std::time::Instant::now();
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "{text}"
+    );
+    assert!(text.contains("context deadline exceeded"), "{text}");
+    assert!(text.contains("kubectl get pvc -n observability"), "{text}");
+    #[cfg(unix)]
+    {
+        let pid = fs::read_to_string(fixture._temp.path().join("pvc-child.pid"))
+            .expect("diagnostic child PID");
+        let pid = pid.trim();
+        let process = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("inspect owned diagnostic child");
+        let state = String::from_utf8_lossy(&process.stdout);
+        let still_running = process.status.success() && !state.trim_start().starts_with('Z');
+        if still_running {
+            let _ = Command::new("kill").arg(pid).status();
+        }
+        assert!(
+            !still_running,
+            "owned diagnostic child survived timeout: {pid}"
+        );
+    }
+}
+
+#[test]
+fn unrelated_malformed_event_does_not_hide_matching_pvc_warning() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[
+            {"type":"Warning","reason":"Unrelated"},
+            {"type":"Warning","reason":"ProvisioningFailed","note":"no matching provisioner","regarding":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}
+        ]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("no matching provisioner"), "{text}");
+}
+
+#[test]
+fn pending_upgrade_recovery_requires_status_for_the_same_release() {
+    // Helm status -o json exposes release name, namespace, and info.status.
+    // https://helm.sh/docs/helm/helm_status/
+    // https://github.com/helm/helm/blob/v3.18.2/pkg/release/release.go
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_helm_status_mode("wrong-release");
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("kubectl delete secret"), "{text}");
+}
+
+/// A Pending claim on a StorageClass whose CSI driver is not installed only
+/// ever gets Normal events: the persistent volume controller hands it to the
+/// external provisioner and waits.
+/// https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/volume/persistentvolume/pv_controller.go
+#[test]
+fn pending_pvc_external_provisioning_names_the_provisioner() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Normal","reason":"ExternalProvisioning","message":"Waiting for a volume to be created either by the external provisioner 'csi.example.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Pending PVC loki-data")
+            && text.contains("ExternalProvisioning")
+            && text.contains("external provisioner \"csi.example.com\""),
+        "the diagnosis must name the claim and the provisioner it waits for: {text}"
+    );
+    assert!(
+        !text.contains("If a PVC is Pending, inspect it with"),
+        "a named cause replaces the generic hint: {text}"
+    );
+}
+
+#[test]
+fn pending_pvc_wait_for_first_consumer_is_named() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Normal","reason":"WaitForFirstConsumer","note":"waiting for first consumer to be created before binding","regarding":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Pending PVC loki-data")
+            && text.contains("WaitForFirstConsumer")
+            && text.contains("waiting for first consumer to be created before binding"),
+        "{text}"
+    );
+}
+
+#[test]
+fn normal_provisioning_event_needs_the_claims_own_uid() {
+    for (event_uid, reason) in [
+        (Some("old-uid"), "ExternalProvisioning"),
+        (None, "ExternalProvisioning"),
+        (Some("pvc-current"), "Provisioning"),
+    ] {
+        let mut object =
+            json!({"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability"});
+        if let Some(uid) = event_uid {
+            object["uid"] = json!(uid);
+        }
+        let fixture = Fixture::with_modes(
+            nodes(vec![node("node-a", "8Gi", true)]),
+            pods(vec![]),
+            "success",
+            "success",
+            "timeout",
+        )
+        .with_pvc_events(
+            json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+            json!({"items":[{"type":"Normal","reason":reason,"message":"external provisioner \"stale.example.com\" is provisioning","involvedObject":object}]}),
+        );
+        let output = fixture.run_command_args(
+            &["example", "sre-bot", "install", "--observability-only"],
+            &repo_root(),
+            None,
+        );
+        let text = shown(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            !text.contains("stale.example.com"),
+            "{reason} with uid {event_uid:?} must not explain the current claim: {text}"
+        );
+        assert!(
+            text.contains("If a PVC is Pending, inspect it with"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_matching_warning_outranks_a_normal_provisioning_event() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[
+            {"type":"Normal","reason":"ExternalProvisioning","message":"waiting for a volume to be created, either by external provisioner \"csi.example.com\" or manually created by system administrator","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}},
+            {"type":"Warning","reason":"ProvisioningFailed","message":"volume quota exceeded","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}
+        ]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("ProvisioningFailed") && text.contains("volume quota exceeded"),
+        "{text}"
+    );
+    assert!(!text.contains("ExternalProvisioning"), "{text}");
+}
+
+/// `helm status` runs a credential plugin the same way kubectl does; a plugin
+/// that forks must not outlive the bounded pending-upgrade read.
+#[test]
+fn helm_status_timeout_kills_forked_credential_helper() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_helm_status_mode("hang");
+    let started = std::time::Instant::now();
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{text}"
+    );
+    assert!(text.contains("context deadline exceeded"), "{text}");
+    assert!(!text.contains("kubectl delete secret"), "{text}");
+    #[cfg(unix)]
+    {
+        let pid = fs::read_to_string(fixture._temp.path().join("helm-status-child.pid"))
+            .expect("helm status child PID");
+        let pid = pid.trim().to_string();
+        let mut still_running = true;
+        for _ in 0..20 {
+            let process = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .expect("inspect forked helm status child");
+            let state = String::from_utf8_lossy(&process.stdout);
+            still_running = process.status.success() && !state.trim_start().starts_with('Z');
+            if !still_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if still_running {
+            let _ = Command::new("kill").arg(&pid).status();
+        }
+        assert!(
+            !still_running,
+            "forked helm status child survived the timeout: {pid}"
+        );
+    }
 }
 
 #[test]
@@ -2694,6 +3725,22 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
         "Alloy values must not retain observability DNS: {alloy_values}"
     );
 
+    let prometheus_values = fixture.helm_values_file("prometheus-values.yaml");
+    assert!(
+        prometheus_values.contains("alert: CurieAlloyNoActiveLogFiles")
+            && prometheus_values.contains("alert: CurieAlloyLogDeliveryStopped"),
+        "rendered Prometheus values must carry both Alloy alerts: {prometheus_values}"
+    );
+    assert_eq!(
+        prometheus_values.matches("namespace=\"soak-obs\"").count(),
+        12,
+        "all Alloy alert matchers must use the selected namespace: {prometheus_values}"
+    );
+    assert!(
+        !prometheus_values.contains("namespace=\"observability\""),
+        "Alloy alerts must not retain default namespace: {prometheus_values}"
+    );
+
     let curie_values = fixture.helm_values_file("curie-values.yaml");
     assert!(
         curie_values.contains("tempo.soak-obs.svc.cluster.local")
@@ -2865,7 +3912,8 @@ fn helm_timeout_recovery_names_the_selected_observability_namespace() {
         "success",
         "success",
         "timeout",
-    );
+    )
+    .with_helm_status_mode("pending-upgrade");
     let output = fixture.run(&custom_target_args());
     let text = shown(&output);
     assert_eq!(

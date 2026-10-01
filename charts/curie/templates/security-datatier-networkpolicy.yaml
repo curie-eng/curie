@@ -75,6 +75,18 @@ spec:
         {{- range $p := $s.ports }}
         - { protocol: TCP, port: {{ $p }} }
         {{- end }}
+    {{ if eq $s.component "valkey" }}
+    # Connector proxies spend one-shot grants in Valkey. Their pods are not
+    # chart app pods: the name is the connector object, and the component is
+    # mcp-connector. This peer is that pair only, and only on the Valkey port.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: {{ $.Release.Name }}
+              app.kubernetes.io/component: mcp-connector
+      ports:
+        - { protocol: TCP, port: 6379 }
+    {{ end }}
 {{- end }}
 {{- end }}
 {{- end }}

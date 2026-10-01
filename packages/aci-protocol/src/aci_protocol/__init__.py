@@ -15,6 +15,7 @@ from .conformance import ConformanceReport, Producer, run_conformance
 from .events import (
     OUTBOUND_EVENT_TYPES,
     READER_CONTEXT,
+    TOOL_ACCESS_STATUS_FIELD,
     ErrorEvent,
     Event,
     Final,
@@ -25,6 +26,7 @@ from .events import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
 )
 from .ndjson import (
@@ -93,6 +95,9 @@ __all__ = [
     # inbound
     "Event",
     "PublicationContext",
+    # per-turn tool access (TOOL-ACCESS)
+    "ToolAccess",
+    "TOOL_ACCESS_STATUS_FIELD",
     "Interrupt",
     "InboundMessage",
     # outbound

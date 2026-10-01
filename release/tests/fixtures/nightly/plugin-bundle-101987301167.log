@@ -1,0 +1,44 @@
+2026-09-08T08:15:53.7917941Z === curie try --keep (refuse an existing graduated project) ===
+2026-09-08T08:15:53.7991974Z Error: refusing to overwrite existing files: curie-demo/.claude-plugin/plugin.json, curie-demo/skills/curie-demo/SKILL.md, curie-demo/.mcp.json, curie-demo/connectors.yaml, curie-demo/deploy.yaml, curie-demo/evals/cases.json, curie-demo/.gitignore, curie-demo/AGENTS.md, curie-demo/.claude/skills/using-curie/SKILL.md
+2026-09-08T08:15:53.8019545Z confirmed: a second --keep refuses and preserves the graduated plugin manifest
+2026-09-08T08:15:53.8019989Z 
+2026-09-08T08:15:53.8020181Z === Resolve the bundle under test ===
+2026-09-08T08:15:53.8021013Z bundle: supplied by the caller (CURIE_E2E_BUNDLE), scaffold skipped: /tmp/tmp.q400SBKqjJ/bundle
+2026-09-08T08:15:53.8021481Z 
+2026-09-08T08:15:53.8021590Z === curie skill up (live model) ===
+2026-09-08T08:16:58.3101164Z starting runner container 'curie-e2e-runner' from 'curie-runner'
+2026-09-08T08:16:58.3102164Z waiting for runner: failed (unhealthy) (60s)
+2026-09-08T08:16:58.3103743Z {"logger":"curie_runner","message":"runner starting fake_model=False","service.name":"curie-runner","severity":"INFO","span_id":null,"timestamp":"2026-09-08T08:15:59.126687+00:00","trace_id":null}
+2026-09-08T08:16:58.3106545Z {"logger":"curie_runner","message":"runner configured session=local-1788855353 model=None port=8080 harness=claude","service.name":"curie-runner","severity":"INFO","span_id":null,"timestamp":"2026-09-08T08:15:59.127935+00:00","trace_id":null}
+2026-09-08T08:16:58.3108533Z {"logger":"curie_runner","message":"memory loaded session=local-1788855353 records=0","service.name":"curie-runner","severity":"INFO","span_id":null,"timestamp":"2026-09-08T08:15:59.131938+00:00","trace_id":null}
+2026-09-08T08:16:58.3110065Z {"logger":"curie_runner","message":"history loaded session=local-1788855353 turns=0","service.name":"curie-runner","severity":"INFO","span_id":null,"timestamp":"2026-09-08T08:15:59.132478+00:00","trace_id":null}
+2026-09-08T08:16:58.3110998Z Traceback (most recent call last):
+2026-09-08T08:16:58.3111349Z   File "<frozen runpy>", line 203, in _run_module_as_main
+2026-09-08T08:16:58.3111734Z   File "<frozen runpy>", line 88, in _run_code
+2026-09-08T08:16:58.3112260Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/__main__.py", line 584, in <module>
+2026-09-08T08:16:58.3112781Z     main()
+2026-09-08T08:16:58.3112983Z     ~~~~^^
+2026-09-08T08:16:58.3113378Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/__main__.py", line 578, in main
+2026-09-08T08:16:58.3113862Z     _serve()
+2026-09-08T08:16:58.3114071Z     ~~~~~~^^
+2026-09-08T08:16:58.3114474Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/__main__.py", line 529, in _serve
+2026-09-08T08:16:58.3114981Z     runner = build_runner(
+2026-09-08T08:16:58.3115233Z         config,
+2026-09-08T08:16:58.3115445Z     ...<7 lines>...
+2026-09-08T08:16:58.3115690Z         workspace_path=workspace_path,
+2026-09-08T08:16:58.3116173Z     )
+2026-09-08T08:16:58.3116567Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/__main__.py", line 183, in build_runner
+2026-09-08T08:16:58.3117119Z     compiled = harness.compile_bundle(config.session.plugin_dir)
+2026-09-08T08:16:58.3117690Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/harness/claude.py", line 20, in _compile_bundle
+2026-09-08T08:16:58.3118524Z     plugins=load_plugins(plugin_dir),
+2026-09-08T08:16:58.3118798Z             ~~~~~~~~~~~~^^^^^^^^^^^^
+2026-09-08T08:16:58.3119234Z   File "/app/.venv/lib/python3.13/site-packages/curie_runner/plugin.py", line 63, in load_plugins
+2026-09-08T08:16:58.3119804Z     raise PluginBundleError(f"invalid plugin bundle at {root}: {detail}")
+2026-09-08T08:16:58.3122500Z curie_runner.plugin.PluginBundleError: invalid plugin bundle at /plugin: [connectors.ambiguous_name] connectors.yaml: connectors.mcp-receipt: `mcp-receipt` would forge a second `-mcp-` in the object name Curie derives for this connector (`<release>-<agent>-mcp-<connector>`), so it is no longer recoverable where the agent ends and the connector begins -- a DIFFERENT agent/connector pair would render the same Service, Deployment, both NetworkPolicies and the same `app.kubernetes.io/name` pod selector, handing one agent's sandbox the other's connector and the credential bound to it (the connector is deliberately unauthenticated, ADR-0086) -- rename the connector so it does not start with `mcp-` or contain `-mcp-`
+2026-09-08T08:16:58.3124934Z 
+2026-09-08T08:16:58.3125529Z ✗ runner failed to become healthy: runner at http://localhost:7245 did not become healthy within 60s
+2026-09-08T08:16:58.3126216Z Error: runner failed to become healthy: runner at http://localhost:7245 did not become healthy within 60s
+2026-09-08T08:16:58.3307721Z ##[error]Process completed with exit code 1.
+2026-09-08T08:16:58.3414911Z Post job cleanup.
+2026-09-08T08:16:58.5856409Z ##[group]Generating build summary
+2026-09-08T08:16:58.6506154Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-TVuYpa/export

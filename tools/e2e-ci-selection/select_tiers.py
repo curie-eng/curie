@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,16 @@ OUTPUT_KEYS = {
 # Jobs behind these tiers each boot a kind cluster. Callers omit them when
 # the run should not pay for that.
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
+UPGRADE_WORKFLOW_JOBS = frozenset(
+    {
+        "e2e-released-upgrade",
+        "e2e-released-upgrade-negative",
+        "e2e-cluster-upgrade-matrix-shards",
+        "e2e-cluster-upgrade-matrix",
+    }
+)
+WORKFLOW_PATH = ".github/workflows/ci.yaml"
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 class RegistryError(ValueError):
@@ -63,6 +74,7 @@ class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
     prefixes: dict[str, tuple[str, ...]]
+    ignored_exact: tuple[str, ...]
     ignored_prefixes: tuple[str, ...]
 
 
@@ -103,7 +115,7 @@ def _matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
 
-# Fail-closed pytest set. ignored_prefixes may skip compose+pytest, but never
+# Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
 # for these Python or runtime paths even when a more-specific ignore exists
 # (packages/test-support, apps/dispatcher, apps/ui).
 MUST_RUN_PYTEST_EXACT = frozenset(
@@ -139,7 +151,7 @@ def _needs_pytest(registry: Registry, paths: list[str]) -> bool:
     for path in paths:
         if _is_must_run_pytest(path):
             return True
-        if not any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
+        if not _is_ignored(registry, path):
             return True
     return False
 
@@ -182,10 +194,23 @@ def _load_registry(path: Path) -> Registry:
         raise RegistryError("fallback must contain every base tier in canonical order")
 
     rules = _mapping(root.get("rules"), "rules")
-    if set(rules) != {"exact", "prefixes", "ignored_prefixes"}:
-        raise RegistryError("rules must define exact, prefixes, and ignored_prefixes")
+    if set(rules) != {"exact", "prefixes", "ignored_exact", "ignored_prefixes"}:
+        raise RegistryError(
+            "rules must define exact, prefixes, ignored_exact, and ignored_prefixes"
+        )
     exact = _tier_rules(rules["exact"], "rules.exact")
     prefixes = _tier_rules(rules["prefixes"], "rules.prefixes")
+    ignored_exact_rules = _mapping(rules["ignored_exact"], "rules.ignored_exact")
+    ignored_exact: list[str] = []
+    for ignored, value in ignored_exact_rules.items():
+        if not ignored or ignored.startswith("/") or ignored.endswith("/"):
+            raise RegistryError("rules.ignored_exact contains an invalid path")
+        if value != []:
+            raise RegistryError("ignored exact values must be empty lists")
+        if ignored in exact or ignored in prefixes:
+            raise RegistryError(f"ignored exact path overlaps a selected rule: {ignored}")
+        ignored_exact.append(ignored)
+
     ignored_rules = _mapping(rules["ignored_prefixes"], "rules.ignored_prefixes")
 
     ignored_prefixes: list[str] = []
@@ -204,11 +229,17 @@ def _load_registry(path: Path) -> Registry:
         if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
-    return Registry(fallback, exact, prefixes, tuple(ignored_prefixes))
+    return Registry(fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes))
+
+
+def _is_ignored(registry: Registry, path: str) -> bool:
+    return path in registry.ignored_exact or any(
+        _matches_prefix(path, prefix) for prefix in registry.ignored_prefixes
+    )
 
 
 def _select_path(registry: Registry, path: str) -> set[str]:
-    if any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
+    if _is_ignored(registry, path):
         return set()
 
     selected: set[str] = set()
@@ -231,6 +262,126 @@ def _changed_paths(base: str, head: str) -> list[str]:
         check=True,
     )
     return [line for line in completed.stdout.splitlines() if line]
+
+
+def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
+    try:
+        root = yaml.compose(content)
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
+    if not isinstance(root, yaml.nodes.MappingNode):
+        raise RegistryError("workflow root must be a mapping")
+
+    root_keys: set[str] = set()
+    jobs_node: yaml.nodes.MappingNode | None = None
+    for key, value in root.value:
+        if not isinstance(key, yaml.nodes.ScalarNode):
+            raise RegistryError("workflow root keys must be strings")
+        if key.value in root_keys:
+            raise RegistryError(f"duplicate workflow root key: {key.value}")
+        root_keys.add(key.value)
+        if key.value == "jobs":
+            if not isinstance(value, yaml.nodes.MappingNode):
+                raise RegistryError("workflow jobs must be a mapping")
+            jobs_node = value
+        elif isinstance(value, yaml.nodes.MappingNode):
+            if any(
+                isinstance(nested_key, yaml.nodes.ScalarNode)
+                and nested_key.value in UPGRADE_WORKFLOW_JOBS
+                for nested_key, _ in value.value
+            ):
+                raise RegistryError("upgrade job moved outside workflow jobs")
+    if jobs_node is None:
+        raise RegistryError("workflow jobs mapping is missing")
+
+    spans: dict[str, tuple[int, int]] = {}
+    seen_jobs: set[str] = set()
+    for index, (key, value) in enumerate(jobs_node.value):
+        if not isinstance(key, yaml.nodes.ScalarNode):
+            raise RegistryError("workflow job keys must be strings")
+        if key.value in seen_jobs:
+            raise RegistryError(f"duplicate workflow job: {key.value}")
+        seen_jobs.add(key.value)
+        if key.value in UPGRADE_WORKFLOW_JOBS:
+            if not isinstance(value, yaml.nodes.MappingNode):
+                raise RegistryError(f"workflow job {key.value} must be a mapping")
+            beginning = key.start_mark.line + 1
+            if index + 1 < len(jobs_node.value):
+                next_key, _ = jobs_node.value[index + 1]
+                end = next_key.start_mark.line + 1
+            else:
+                end = len(content.splitlines()) + 1
+            # Two flow-style job keys can share a physical line. Both own it.
+            spans[key.value] = (beginning, max(beginning + 1, end))
+
+    # PyYAML resolves aliases to the anchor's source node and keeps the anchor's
+    # marks. Until we track anchor dependencies, refuse an aliased target job
+    # instead of silently treating its external definition as unrelated.
+    try:
+        alias_lines = (
+            event.start_mark.line + 1
+            for event in yaml.parse(content)
+            if isinstance(event, yaml.events.AliasEvent)
+        )
+        if any(
+            beginning <= line < end
+            for line in alias_lines
+            for beginning, end in spans.values()
+        ):
+            raise RegistryError("released-upgrade job uses a YAML alias")
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
+    return spans
+
+
+def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
+    merge_base = subprocess.run(
+        ["git", "merge-base", base, head],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    old_content = subprocess.run(
+        ["git", "show", f"{merge_base}:{WORKFLOW_PATH}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    new_content = subprocess.run(
+        ["git", "show", f"{head}:{WORKFLOW_PATH}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_spans = _workflow_job_spans(old_content)
+    new_spans = _workflow_job_spans(new_content)
+    if not (old_spans or new_spans):
+        raise RegistryError("workflow has no released-upgrade job anchors")
+
+    diff = subprocess.run(
+        ["git", "diff", "--no-renames", "--unified=0", merge_base, head, "--", WORKFLOW_PATH],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    hunk_lines = [line for line in diff.splitlines() if line.startswith("@@")]
+    if not hunk_lines:
+        raise RegistryError("changed workflow has no text hunks")
+    for line in hunk_lines:
+        match = HUNK_HEADER.match(line)
+        if match is None:
+            raise RegistryError(f"malformed workflow diff hunk: {line}")
+        old_start, old_count, new_start, new_count = match.groups()
+        for start, count, spans in (
+            (int(old_start), int(old_count or "1"), old_spans),
+            (int(new_start), int(new_count or "1"), new_spans),
+        ):
+            if count and any(
+                start < end and start + count > beginning
+                for beginning, end in spans.values()
+            ):
+                return True
+    return False
 
 
 def _render(
@@ -272,6 +423,7 @@ def _run() -> None:
     registry = _load_registry(args.registry)
 
     paths: list[str] = []
+    workflow_upgrade_changed = False
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -286,6 +438,10 @@ def _run() -> None:
             paths = args.path
         elif args.base and args.head:
             paths = _changed_paths(args.base, args.head)
+            if WORKFLOW_PATH in paths:
+                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(
+                    args.base, args.head
+                )
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
@@ -300,11 +456,15 @@ def _run() -> None:
         # never drops the tier that proves it.
         if any(_is_runtime_assertion(path) for path in paths):
             selected.add("cluster")
+    if workflow_upgrade_changed:
+        selected.add("released-upgrade")
 
-    # A pull request that selects released-upgrade runs one upgrade matrix
-    # smoke shard. The full matrix and the released chart upgrade jobs run only
-    # on pushes and dispatches (the nightly), which are the --push runs.
-    released_upgrade_full = args.push and "released-upgrade" in selected
+    # Ordinary pull requests run one upgrade matrix smoke shard. A change to
+    # the upgrade jobs themselves runs the full matrix and released chart jobs
+    # before merge, as do pushes and dispatches (the nightly).
+    released_upgrade_full = (
+        args.push or workflow_upgrade_changed
+    ) and "released-upgrade" in selected
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:

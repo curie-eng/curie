@@ -25,6 +25,7 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkPluginConfig
@@ -204,3 +205,76 @@ def load_plugins(
         raise PluginBundleError(f"invalid plugin bundle at {root}: {detail}")
 
     return [SdkPluginConfig(type="local", path=str(root))]
+
+
+# The CLI's own name for a plugin-loaded MCP server, ``plugin:<bundle>:<server>``.
+# The SDK normalizes it to the live prefix ``mcp__plugin_<bundle>_<server>__``,
+# which is ``plugin_format.approval_policy.effective_tool_prefix`` -- so a server
+# mounted under this key publishes exactly the tool names toolPolicy, the approval
+# gates and the capability probe already expect (verified on CLI 2.1.281).
+_PLUGIN_ROOT_PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}"
+
+
+def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
+    """The bundle's own declared MCP servers, keyed as the CLI keys plugin servers.
+
+    The runner sets ``strict_mcp_config`` (#2899) so ambient project ``.mcp.json``,
+    user and plugin-marketplace servers never load beside the ones Curie mounts.
+    The CLI applies that to ``--plugin-dir`` servers too: under strict mode a
+    bundle's plugin servers silently stop registering. So the runner mounts them
+    itself on ``--mcp-config``, under the same ``plugin:<bundle>:<server>`` name
+    the plugin loader would have used, reading the same two declaration surfaces
+    (the manifest's inline ``mcpServers`` and the root ``.mcp.json``) that
+    ``plugin_format.approval_policy.declared_mcp_server_names`` reads.
+
+    ``${CLAUDE_PLUGIN_ROOT}`` is the one variable the plugin loader supplies that
+    the ``--mcp-config`` path does not, so it is substituted here and exported to
+    a stdio server's env. Every other ``${VAR}`` is left for the CLI, which
+    expands ``--mcp-config`` entries from the session env exactly as it expands a
+    plugin's. Call only after ``load_plugins`` has validated the bundle; a
+    malformed declaration was already refused there.
+    """
+
+    if not plugin_dir:
+        return {}
+    root = Path(plugin_dir)
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return {}
+    manifest = PluginManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+    declarations: list[object] = []
+    if isinstance(manifest.mcpServers, dict):
+        declarations.append(manifest.mcpServers)
+    root_mcp = root / ".mcp.json"
+    if root_mcp.is_file():
+        declarations.append(json.loads(root_mcp.read_text(encoding="utf-8")))
+
+    plugin_root = str(root)
+    servers: dict[str, Any] = {}
+    for payload in declarations:
+        if not isinstance(payload, dict):
+            continue
+        declared = payload.get("mcpServers", payload)
+        if not isinstance(declared, dict):
+            continue
+        for name, config in declared.items():
+            if not isinstance(config, dict):
+                continue
+            entry = cast("dict[str, object]", _substitute_plugin_root(config, plugin_root))
+            if isinstance(entry.get("command"), str):
+                raw_env = entry.get("env")
+                env = dict(raw_env) if isinstance(raw_env, dict) else {}
+                env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
+                entry["env"] = env
+            servers[f"plugin:{manifest.name}:{name}"] = entry
+    return servers
+
+
+def _substitute_plugin_root(value: object, plugin_root: str) -> object:
+    if isinstance(value, str):
+        return value.replace(_PLUGIN_ROOT_PLACEHOLDER, plugin_root)
+    if isinstance(value, list):
+        return [_substitute_plugin_root(item, plugin_root) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute_plugin_root(item, plugin_root) for key, item in value.items()}
+    return value

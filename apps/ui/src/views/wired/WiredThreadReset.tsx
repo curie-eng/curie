@@ -11,7 +11,14 @@ import { resetThread, getThreadResetState, ApiError } from "../../api/client";
 const RELEASE_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 1_000;
 
-type Phase = "idle" | "confirm" | "requesting" | "waiting" | "released" | "pending";
+type Phase =
+  | "idle"
+  | "confirm"
+  | "requesting"
+  | "waiting"
+  | "released"
+  | "no-route"
+  | "pending";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -26,7 +33,9 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 // The POST only queues the release (the worker drains it on its next
 // maintenance tick, up to ~30s later), so after the request we poll the reset
 // state to completion, exactly as the CLI does, and report "released" vs. "still
-// pending" honestly. Does not delete conversation history.
+// pending" honestly. When the worker drained the reset but the key matched no
+// route (#3699), nothing was released: that is its own outcome, never "released".
+// Does not delete conversation history.
 export function WiredThreadReset({ agentId, agentName }: { agentId: string; agentName: string }) {
   const { state, dispatch } = useStore();
   const [threadKey, setThreadKey] = useState("");
@@ -68,11 +77,13 @@ export function WiredThreadReset({ agentId, agentName }: { agentId: string; agen
     // pending", same as the CLI.
     const deadline = Date.now() + RELEASE_TIMEOUT_MS;
     let released = false;
+    let routeExisted: boolean | null | undefined;
     for (;;) {
       try {
         const st = await getThreadResetState(agentId, key);
         if (!st.requested) {
           released = true;
+          routeExisted = st.route_existed;
           break;
         }
       } catch {
@@ -83,12 +94,15 @@ export function WiredThreadReset({ agentId, agentName }: { agentId: string; agen
       if (!mounted.current) return;
     }
     if (!mounted.current) return;
-    setPhase(released ? "released" : "pending");
+    const noRoute = released && routeExisted === false;
+    setPhase(noRoute ? "no-route" : released ? "released" : "pending");
     dispatch({
       type: "toast",
-      message: released
-        ? `Thread ${key} reset: sandbox released`
-        : `Thread ${key} reset queued; release still pending`,
+      message: noRoute
+        ? `no route matched thread ${key}; nothing was released`
+        : released
+          ? `Thread ${key} reset: sandbox released`
+          : `Thread ${key} reset queued; release still pending`,
     });
   };
 
@@ -189,6 +203,14 @@ export function WiredThreadReset({ agentId, agentName }: { agentId: string; agen
             style={{ color: C.brand, fontSize: 12.5, marginTop: 10, fontFamily: C.mono }}
           >
             ✓ Thread {resetKey} reset — sandbox released.
+          </div>
+        ) : phase === "no-route" ? (
+          <div
+            data-testid="thread-reset-no-route"
+            style={{ color: C.warn, fontSize: 12.5, marginTop: 10, fontFamily: C.mono }}
+          >
+            ✗ no route matched thread {resetKey}; nothing was released. Check the key — a named
+            bot's key carries its identity as its own segment (kind:identity:channel:conversation).
           </div>
         ) : phase === "pending" ? (
           <div

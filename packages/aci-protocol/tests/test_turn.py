@@ -84,6 +84,51 @@ def test_nested_reply_handle_is_strict_without_reader_context() -> None:
         QueuedTurn.model_validate(_turn_payload_with_unknown_fields())
 
 
+def test_named_relay_identity_constructs_and_survives_worker_wire_decode() -> None:
+    # @spec INGRESS-CANARY-1
+    payload = {
+        "event_id": "EvSIM-named",
+        "conversation_id": "1720000000.000100",
+        "author": "U0EXAMPLE1",
+        "text": "canary probe",
+        "received_at": "2026-01-01T00:00:00Z",
+        "reply_handle": {
+            "kind": "slack",
+            "channel": "C0EXAMPLE1",
+            "placeholder": None,
+            "adapter": CLUSTER_MESSAGE_ADAPTER,
+            "identity": "second",
+        },
+    }
+
+    produced = QueuedTurn.model_validate(payload)
+    assert produced.reply_handle.identity == "second"
+    wire = produced.model_dump_json()
+    assert json.loads(wire)["reply_handle"]["identity"] == "second"
+    consumed = parse_queued_turn(wire)
+    assert consumed.reply_handle.identity == "second"
+
+
+def test_legacy_relay_turn_has_no_named_identity() -> None:
+    # @spec INGRESS-CANARY-1
+    payload = {
+        "event_id": "EvSIM-default",
+        "conversation_id": "1720000000.000100",
+        "author": "U0EXAMPLE1",
+        "text": "default probe",
+        "received_at": "2026-01-01T00:00:00Z",
+        "reply_handle": {
+            "kind": "slack",
+            "channel": "C0EXAMPLE1",
+            "placeholder": None,
+            "adapter": CLUSTER_MESSAGE_ADAPTER,
+        },
+    }
+
+    produced = QueuedTurn.model_validate(payload)
+    assert produced.reply_handle.identity is None
+
+
 def test_parse_queued_turn_tolerates_unknown_top_level_and_nested_fields() -> None:
     # The sanctioned consumer decode threads the reader context, so an unknown
     # field on the TOP-LEVEL turn and an unknown field on the NESTED reply handle
@@ -290,7 +335,7 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
 
 
 def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
-    assert PROTOCOL_VERSION == "0.5.7"
+    assert PROTOCOL_VERSION == "0.5.10"
     assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
     assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
 

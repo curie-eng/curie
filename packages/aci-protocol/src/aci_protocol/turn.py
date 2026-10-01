@@ -34,7 +34,7 @@ from typing import Protocol
 
 from pydantic import model_validator
 
-from .events import _AciModel
+from .events import ToolAccess, _AciModel
 
 
 class TurnSource(StrEnum):
@@ -211,6 +211,11 @@ class ReplyHandle(_AciModel):
     ``adapter`` is optional at the schema so a third-party or pre-upgrade
     producer is not rejected outright, but every first-party mint site sets it
     explicitly.
+
+    ``identity`` is an optional Slack binding selector for a disconnected
+    cluster message whose reserved ``adapter`` selects reply delivery. An absent
+    value retains the default identity. Ordinary Slack turns continue to name
+    their identity in ``adapter`` (INGRESS-CANARY-1).
     """
 
     kind: str
@@ -218,6 +223,7 @@ class ReplyHandle(_AciModel):
     placeholder: str | None
     endpoint: str | None = None
     adapter: str | None = None
+    identity: str | None = None  # @spec INGRESS-CANARY-1
 
 
 class Attachment(_AciModel):
@@ -308,6 +314,12 @@ class QueuedTurn(_AciModel):
     carry a complete, nonblank ``hook_run`` so the worker has explicit agent and
     scheduled run identity without inventing a reply route. Every targeted turn,
     including cron, keeps the existing reply handle contract unchanged.
+
+    ``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);
+    a worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,
+    and one that does not drops it. It defaults to ``None``, today's
+    unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
+    first-party ingress sets it.
     """
 
     event_id: str
@@ -319,6 +331,7 @@ class QueuedTurn(_AciModel):
     source: TurnSource = TurnSource.SLACK
     attachments: list[Attachment] = []
     hook_run: HookRunRef | None = None
+    tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
 
     @model_validator(mode="after")
     def _validate_targetless_cron_identity(self) -> "QueuedTurn":

@@ -1,4 +1,8 @@
-"""Alertmanager signer injects a legal partition and HMAC-signs the body."""
+"""Alertmanager signer injects a legal partition and HMAC-signs each delivery.
+
+The signature covers the timestamp, the delivery id and the forwarded body, the
+scheme ``curie_api.hook_signing`` verifies (#3554).
+"""
 
 from __future__ import annotations
 
@@ -37,15 +41,20 @@ def test_prepare_injects_partition_and_stable_delivery_id(
             {"fingerprint": "fp-a", "labels": {"curie_workload": "api"}},
         ],
     }
-    body, signature, delivery = signer.prepare(payload)
+    body, signature, delivery, timestamp = signer.prepare(payload)
     forwarded = json.loads(body)
     assert (
         forwarded["curie_partition"]
         == hashlib.sha256(payload["groupKey"].encode()).hexdigest()[:32]
     )
     assert len(forwarded["curie_partition"]) == 32
-    expected = "sha256=" + hmac.new(b"hook-secret", body, hashlib.sha256).hexdigest()
+    assert timestamp.isascii() and timestamp.isdigit()
+    material = f"{timestamp}.{delivery}.".encode() + body
+    expected = "sha256=" + hmac.new(b"hook-secret", material, hashlib.sha256).hexdigest()
     assert signature == expected
+    # A body-only signature is exactly what the ingress no longer accepts.
+    body_only = "sha256=" + hmac.new(b"hook-secret", body, hashlib.sha256).hexdigest()
+    assert signature != body_only
     again = signer.prepare(payload)
     assert again[2] == delivery
     payload["alerts"][0]["startsAt"] = "2026-09-16T00:00:00Z"
@@ -58,7 +67,7 @@ def test_unsigned_curie_body_is_not_what_the_signer_forwards(
 ) -> None:
     monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
     original = {"groupKey": "g", "status": "firing", "alerts": []}
-    body, _signature, _delivery = signer.prepare(original)
+    body, _signature, _delivery, _timestamp = signer.prepare(original)
     assert json.loads(body)["curie_partition"]
     assert b"curie_partition" in body
 
@@ -130,9 +139,15 @@ def test_signer_http_authentication_and_forwarding(
     assert first_body == second_body
     forwarded = json.loads(first_body)
     assert forwarded["curie_partition"] == signer.partition_value(payload["groupKey"])
-    signature = first_headers["X-Curie-Signature-256"]
     delivery = first_headers["X-Curie-Delivery-Id"]
-    assert signature == signer.sign("hook-secret", first_body)
-    assert second_headers["X-Curie-Signature-256"] == signature
+    assert delivery
+    # A retry keeps the delivery id and body, so Curie deduplicates it. Each
+    # forward is stamped when it is prepared, so the two signatures may differ;
+    # each must verify against its own timestamp header.
     assert second_headers["X-Curie-Delivery-Id"] == delivery
-    assert first_headers["X-Curie-Delivery-Id"]
+    for body, headers in received:
+        timestamp = headers["X-Curie-Timestamp"]
+        assert timestamp.isascii() and timestamp.isdigit()
+        assert headers["X-Curie-Signature-256"] == signer.sign(
+            "hook-secret", timestamp, delivery, body
+        )

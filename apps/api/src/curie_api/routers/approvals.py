@@ -54,6 +54,7 @@ from ..schemas import (
     AdapterPrincipalOut,
     AdapterPrincipalRotate,
     ApprovalAuditOut,
+    ApprovalCreateOut,
     ApprovalOut,
     ApprovalPrincipalMint,
     ApprovalPrincipalOut,
@@ -204,7 +205,7 @@ def _expired(approval: Approval) -> bool:
 
 @router.post(
     "",
-    response_model=ApprovalOut,
+    response_model=ApprovalCreateOut,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_api_key)],
 )
@@ -213,7 +214,7 @@ async def create_approval(
     request: Request,
     session: SessionDep,
     response: Response,
-) -> ApprovalOut:
+) -> ApprovalCreateOut:
     """Create a pending approval; idempotent on ``dedupe_key``.
 
     A redelivered worker turn that re-requests the same approval gets the
@@ -246,8 +247,10 @@ async def create_approval(
                 status.HTTP_409_CONFLICT, "approval violates a uniqueness constraint"
             ) from exc
         response.status_code = status.HTTP_200_OK
-        return ApprovalOut.model_validate(existing)
-    return ApprovalOut.model_validate(approval)
+        approval = existing
+    result = ApprovalCreateOut.model_validate(approval)
+    result.requested_by = await crud.approval_display_requester(session, approval)
+    return result
 
 
 async def _refuse_rejected_reraise(

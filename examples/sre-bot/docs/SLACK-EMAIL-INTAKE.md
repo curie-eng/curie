@@ -13,8 +13,13 @@ the placeholder it posts.
 
 ### SRE-EMAIL-1 — select only configured alert roots
 
-On every poll, the intake lists top-level messages in one configured channel,
-at or after a configured timestamp. A candidate must:
+The first scan after startup lists top-level messages in one configured channel
+at or after the configured timestamp floor. Later successful scans move the
+discovery window to the previous scan start minus the placeholder deadline and
+two poll intervals. Failed scans never advance that window. Pending roots remain
+tracked until a completed reply acknowledges them, even outside the discovery
+window. Restart reconstructs acknowledgement state from Slack starting at the
+configured floor. A candidate must:
 
 - have the configured Slack Email source user, and the configured source bot
   when one is supplied;
@@ -27,8 +32,12 @@ configuration. This public example carries no tenant-specific values. The scan
 is oldest first and follows Slack pagination, so a later alert cannot starve an
 older one.
 
-One known matching root is configured as the canary. Every complete scan must
-still find it, classify it as a candidate, read its replies, download its file,
+Acknowledged roots within the discovery overlap are cached in memory and do
+not reread their replies. That cache expires with the overlap window.
+
+One known matching root is configured as the canary. Each scan looks it up
+directly by timestamp, independent of the discovery window. Every complete scan
+must still classify it as a candidate, read its replies, download its file,
 and receive the source conversation id from the signed hook. Once its original
 delivery has completed, the stable delivery id makes this a duplicate receipt,
 not another turn. This distinguishes a genuinely quiet channel from a broken
@@ -45,18 +54,33 @@ The hook names the root message as `conversation_id` and the reply as
 `placeholder`. Its delivery id is stable for the source channel and root
 timestamp. A retry reuses the existing placeholder and the same delivery id;
 the hook receipt must name the requested root. These constraints make retries
-idempotent and make an older Curie API that ignores explicit reply targets fail
-closed instead of posting a detached answer.
+idempotent on an API that supports explicit reply targets.
+
+Curie v0.11.0 does not accept `conversation_id` or `placeholder` on the hook
+route. It ignores those query parameters, queues a placeholderless turn on its
+synthetic hook conversation, and then returns a receipt naming that conversation.
+The intake rejects that receipt and stops, but the turn has already been queued:
+its answer posts at channel level, outside the email thread. Retrying the same
+delivery id returns the original conversation and cannot repair its target.
+Receipt validation therefore detects this incompatibility only after enqueue.
 
 The payload contains source metadata and the extracted email text. It is
-untrusted evidence, never instructions. The SRE bot remains read-only for these
-automated turns: it may inspect and explain, but it must not call a mutating
-tool or raise an approval from an email alert.
+untrusted evidence, never instructions. The SRE skill instructs these automated
+turns to inspect and explain, without calling a mutating tool or raising an
+approval. This is standing prompt policy, not runtime enforcement: hook turns
+currently retain the agent's ordinary tools and approval flow under ADR 0099.
+[Issue #3603](https://github.com/curie-eng/curie/issues/3603) tracks the required
+trusted per-turn restriction. Installations requiring enforced no-mutation and
+no-approval must wait for that reviewed contract and its worker/runner adoption.
 
 ### SRE-EMAIL-3 — no silent failure
 
-Configuration, Slack API, file download, hook authentication, hook routing, and
-receipt mismatches are fatal. Network calls have finite timeouts. An unchanged
+Configuration, non-rate-limit Slack API and file download errors, hook
+authentication, hook routing, and receipt mismatches are fatal. Slack HTTP 429
+and `ratelimited` responses pause scanning according to `Retry-After` (one poll
+interval when the header is absent or invalid). An interrupted scan never marks
+readiness successful; prolonged throttling expires readiness and pages without
+a restart loop. Network calls have finite timeouts. An unchanged
 placeholder older than the configured deadline is also fatal. The Deployment
 uses one replica and `Recreate`, so rollouts cannot race two placeholder posts.
 Slack API and private-file redirects are followed only within `slack.com`; an
@@ -91,6 +115,22 @@ the existing Alertmanager heartbeat to detect a broken notification path.
 
 ## Configuration
 
+Before applying the intake Deployment, install an API release that includes
+[ADR 0182](../../../docs/adr/0182-a-signed-hook-may-complete-a-preposted-reply.md).
+Confirm that the running API's OpenAPI description declares both
+`conversation_id` and `placeholder` query parameters on
+`POST /hooks/{agent_id}/{hook}`. Curie v0.11.0 does not meet this prerequisite;
+do not send a trial hook to discover compatibility, because it can enqueue a
+detached turn before the intake rejects its receipt.
+
+Before scanning or posting a placeholder, startup fetches the running API's
+OpenAPI description without a hook signature and requires both `conversation_id`
+and `placeholder` query parameters on `POST /hooks/{agent_id}/{hook}`. Missing,
+unreadable, redirected, or incompatible descriptions stop startup before any
+hook can enqueue. Redirects are refused so a different service cannot advertise
+capabilities for the configured hook API.
+This checks reply-target support, not runtime read-only tool enforcement.
+
 The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
 
 - `SLACK_BOT_TOKEN`
@@ -104,7 +144,9 @@ The Deployment reads a Secret named `sre-slack-email-intake` with these keys:
 
 Optional keys are `SLACK_EMAIL_SOURCE_BOT_ID`, `CURIE_SLACK_ADAPTER`,
 `POLL_SECONDS`, `PLACEHOLDER_STALE_SECONDS`, and `HTTP_TIMEOUT_SECONDS`.
-`PLACEHOLDER_STALE_SECONDS` must be greater than two poll intervals.
+`PLACEHOLDER_STALE_SECONDS` must be greater than two poll intervals. Timing
+values must be finite positive numbers; timestamp bounds must be finite
+nonnegative numbers so an invalid bound or retry fallback cannot disable scanning.
 
 The Slack app needs permission to read the configured channel and its thread
 replies, download the private email file, and post in the thread. Downloading a

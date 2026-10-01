@@ -1628,11 +1628,16 @@ class AgentAction(Base):
         platform would then offer an undo it cannot honor. Deny-by-default falls
         out of this: a third-party tool that reports neither a prior state nor a
         target lands on ``False`` without anyone declaring anything.
+
+        ``post_state`` is required too: the undo route compares the live resource
+        against it and refuses without it, so a row lacking it is not one an undo
+        can be granted on.
         """
 
         return (
             self.status == ActionStatus.succeeded
             and self.prior_state is not None
+            and self.post_state is not None
             and self.target is not None
             and self.undone_at is None
         )

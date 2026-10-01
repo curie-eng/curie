@@ -31,10 +31,10 @@ from typing import Any
 import pytest
 from curie_api.resumequeue import resume_event_id
 from curie_runner.approval import summarize_tool_call
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.binding import BindingResolver
 from curie_worker.config import WorkerConfig
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _DB_URL = os.environ.get(
@@ -164,14 +164,6 @@ async def _cleanup_agents(engine: AsyncEngine, ids: list[uuid.UUID]) -> None:
             await conn.execute(
                 text(f"DELETE FROM {_SCHEMA}.agents WHERE id = :id"), {"id": agent_id}
             )
-
-
-async def _skip_if_unreachable(engine: AsyncEngine) -> None:
-    try:
-        async with engine.connect():
-            pass
-    except SQLAlchemyError as exc:
-        pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
 
 
 _PERMISSION_BASH = summarize_tool_call("Bash", {"command": "deploy"})
@@ -331,7 +323,7 @@ def test_approval_lookup(method: str, seed: dict[str, Any], expected: Any) -> No
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            await _skip_if_unreachable(engine)
+            await pg_connect_or_skip(engine)
             agent_id = uuid.uuid4()
             approval_id = uuid.uuid4()
             await _seed_agent(engine, agent_id)
@@ -364,7 +356,7 @@ def test_lookup_is_bound_to_the_approvals_agent(method: str, owner_result: str) 
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            await _skip_if_unreachable(engine)
+            await pg_connect_or_skip(engine)
             owner_id = uuid.uuid4()
             other_id = uuid.uuid4()
             approval_id = uuid.uuid4()
@@ -399,7 +391,7 @@ def test_grant_none_when_approval_agent_id_is_null() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            await _skip_if_unreachable(engine)
+            await pg_connect_or_skip(engine)
             approval_id = uuid.uuid4()
             summary = summarize_tool_call("mcp__github__create_issue", {"n": 1})
             await _seed_approval(
@@ -451,7 +443,7 @@ def test_approved_permission_gate_returns_stored_arguments_not_summary() -> None
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            await _skip_if_unreachable(engine)
+            await pg_connect_or_skip(engine)
             agent_id = uuid.uuid4()
             approval_id = uuid.uuid4()
             stored = {"command": "printf ok", "options": {"flags": ["a"]}}

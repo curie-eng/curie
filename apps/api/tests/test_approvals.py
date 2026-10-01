@@ -752,9 +752,13 @@ def test_create_get_list_round_trip(
     assert body["status"] == "pending"
     assert body["summary"] == payload["summary"]
     assert body["resolved_by"] is None
+    # Display derivation belongs to creation only; durable record views retain
+    # their author semantics and exact field shape.
+    assert body.pop("requested_by") == payload["author"]
 
     got = approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers)
     assert got.status_code == 200
+    assert "requested_by" not in got.json()
     assert got.json() == body
 
     listed = approvals_client.get(
@@ -764,6 +768,8 @@ def test_create_get_list_round_trip(
     )
     assert [a["id"] for a in listed.json()] == [body["id"]]
     assert listed.json()[0]["reply_placeholder"] == payload["reply_placeholder"]
+    assert "requested_by" not in listed.json()[0]
+    assert listed.json()[0] == body
 
 
 def test_create_tolerates_unknown_field_from_a_newer_worker(
@@ -3448,3 +3454,345 @@ def test_reraise_refusal_follows_the_resume_chain_back_to_the_last_person(
     )
     assert again.status_code == 409, again.text
     assert again.json()["detail"]["approval_id"] == rejected["id"]
+
+
+# WORKER-REQUESTER-1..5: display lineage is persisted independently of resolver
+# authority. These HTTP cases use real Postgres; resolution also uses Valkey.
+def _requester_create(client: TestClient, auth: dict[str, str], payload: dict[str, Any]) -> dict:
+    response = client.post("/approvals", json=payload, headers=auth)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _requester_edit(approval_id: str, **changes: Any) -> None:
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                row = await session.get(Approval, uuid.UUID(approval_id))
+                assert row is not None
+                for field, value in changes.items():
+                    setattr(row, field, value)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_requester_three_gate_chain_preserves_resume_actor_and_fresh_human_reset(
+    approvals_client, auth_headers, clean_db, valkey, runs_stream
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1", reply_channel="C0EXAMPLE1")
+    first = _requester_create(approvals_client, auth_headers, payload)
+    assert first["requested_by"] == "U0EXAMPLE1"
+    for index, actor in enumerate(("U0EXAMPLE2", "U0EXAMPLE3"), 1):
+        resolved = approvals_client.post(
+            f"/approvals/{first['id']}/resolve",
+            json={"decision": "approved", "note": "U0EXAMPLE4 asked"},
+            headers=_chat_resolve_headers(first["id"], actor, "C0EXAMPLE1", base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+        turn = QueuedTurn.model_validate(json.loads(valkey.xrange(runs_stream)[-1][1]["payload"]))
+        assert turn.author == actor
+        assert turn.event_id == resume_event_id(first["id"])
+        child = _requester_create(
+            approvals_client,
+            auth_headers,
+            {
+                **payload,
+                "author": turn.author,
+                "dedupe_key": turn.event_id,
+                "summary": f"Next bounded action {index}",
+                "reply_placeholder": f"card-{index}",
+                "card_channel": None,
+            },
+        )
+        assert child["requested_by"] == "U0EXAMPLE1"
+        assert child["author"] == actor
+        first = child
+    fresh = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": "U0EXAMPLE4",
+            "dedupe_key": "fresh-human-event",
+        },
+    )
+    assert fresh["requested_by"] == "U0EXAMPLE4"
+    record = approvals_client.get(f"/approvals/{first['id']}", headers=auth_headers).json()
+    assert record["author"] == "U0EXAMPLE3"
+    assert "requested_by" not in record  # Ordinary read record contract remains unchanged.
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("conversation_id", "another-thread"),
+        ("reply_kind", "email"),
+        ("reply_channel", "C0EXAMPLE2"),
+        ("reply_adapter", "acme-other-adapter"),
+        ("reply_endpoint", "https://adapter.example.com/other"),
+        ("author", "U0EXAMPLE4"),
+    ],
+)
+def test_requester_mismatched_requesting_surface_or_resume_actor_is_unavailable(
+    approvals_client, auth_headers, clean_db, field, value
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1", reply_channel="C0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": "U0EXAMPLE2",
+            "dedupe_key": resume_event_id(parent["id"]),
+            field: value,
+        },
+    )
+    assert "requested_by" in child and child["requested_by"] is None
+    assert child["status"] == "pending"  # Display failure does not disable the gate.
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_requester_pending_or_missing_predecessor_is_unavailable(
+    approvals_client, auth_headers, clean_db, missing
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    parent_id = (
+        str(uuid.uuid4())
+        if missing
+        else _requester_create(approvals_client, auth_headers, payload)["id"]
+    )
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": "U0EXAMPLE2",
+            "dedupe_key": resume_event_id(parent_id),
+        },
+    )
+    assert "requested_by" in child and child["requested_by"] is None
+
+
+@pytest.mark.parametrize("terminal,actor", [("rejected", "U0EXAMPLE2"), ("expired", "system")])
+def test_requester_terminal_continuation_keeps_display_without_granting_approval(
+    approvals_client, auth_headers, clean_db, terminal, actor
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(
+        parent["id"], status=terminal, resolved_by=None if terminal == "expired" else actor
+    )
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": actor,
+            "dedupe_key": resume_event_id(parent["id"]),
+            "route": "different-action",
+        },
+    )
+    assert child["requested_by"] == "U0EXAMPLE1"
+    assert child["author"] == actor and child["status"] == "pending"
+    assert child["resolved_by"] is None
+
+
+def test_requester_cross_agent_link_is_unavailable(
+    approvals_client, auth_headers, clean_db
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    ids = []
+    for index in range(2):
+        response = approvals_client.post(
+            "/agents",
+            json={
+                "name": f"acme-{uuid.uuid4().hex[:8]}",
+                "channel": {"kind": "slack", "address": f"C0EXAMPLE{index + 1}"},
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 201, response.text
+        ids.append(response.json()["id"])
+    payload = _payload(author="U0EXAMPLE1", agent_id=ids[0])
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "agent_id": ids[1],
+            "author": "U0EXAMPLE2",
+            "dedupe_key": resume_event_id(parent["id"]),
+        },
+    )
+    assert "requested_by" in child and child["requested_by"] is None
+
+
+def test_requester_creation_replay_uses_persisted_lineage(
+    approvals_client, auth_headers, clean_db
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
+    continuation = {**payload, "author": "U0EXAMPLE2", "dedupe_key": resume_event_id(parent["id"])}
+    child = _requester_create(approvals_client, auth_headers, continuation)
+    response = approvals_client.post(
+        "/approvals",
+        json={
+            **continuation,
+            "author": "U0EXAMPLE5",
+            "conversation_id": "forged-thread",
+            "reply_channel": "C0EXAMPLE2",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == child["id"]
+    assert response.json()["author"] == "U0EXAMPLE2"
+    assert response.json()["requested_by"] == "U0EXAMPLE1"
+
+
+def test_requester_cycle_is_unavailable(approvals_client, auth_headers, clean_db) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    first = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(first["id"], status="approved", resolved_by="U0EXAMPLE2")
+    second = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": "U0EXAMPLE2",
+            "dedupe_key": resume_event_id(first["id"]),
+        },
+    )
+    _requester_edit(second["id"], status="approved", resolved_by="U0EXAMPLE1")
+    _requester_edit(first["id"], dedupe_key=resume_event_id(second["id"]))
+    # Replay the persisted cyclic second row; body must not short-circuit it.
+    response = approvals_client.post(
+        "/approvals",
+        json={
+            **payload,
+            "dedupe_key": resume_event_id(first["id"]),
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert "requested_by" in response.json() and response.json()["requested_by"] is None
+
+
+@pytest.mark.parametrize("predecessors,expected", [(64, "U0EXAMPLE1"), (65, None)])
+def test_requester_lineage_has_a_fixed_read_bound(
+    approvals_client, auth_headers, clean_db, predecessors, expected
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    for index in range(predecessors):
+        _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
+        parent = _requester_create(
+            approvals_client,
+            auth_headers,
+            {
+                **payload,
+                "author": "U0EXAMPLE2",
+                "dedupe_key": resume_event_id(parent["id"]),
+                "summary": f"Bounded action {index}",
+            },
+        )
+    assert "requested_by" in parent and parent["requested_by"] == expected
+
+
+def test_requester_malformed_resume_does_not_become_a_fresh_human(
+    approvals_client, auth_headers, clean_db
+) -> None:
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        _payload(
+            author="U0EXAMPLE2",
+            dedupe_key="approval-not-a-uuid-resolved",
+        ),
+    )
+    assert "requested_by" in child and child["requested_by"] is None
+
+
+def test_requester_gate_route_and_card_placement_do_not_identify_origin(
+    approvals_client, auth_headers, clean_db
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1", route="first-gate", card_channel="C0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
+    child = _requester_create(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "author": "U0EXAMPLE2",
+            "dedupe_key": resume_event_id(parent["id"]),
+            "route": "next-gate",
+            "card_channel": "C0EXAMPLE2",
+            "reply_placeholder": "next-card",
+        },
+    )
+    assert child["requested_by"] == "U0EXAMPLE1"
+
+
+@pytest.mark.parametrize("status,resolver,actor", [
+    ("approved", None, "approver"), ("rejected", None, "approver"),
+    ("expired", None, "U0EXAMPLE2"),
+])
+def test_requester_terminal_record_must_prove_the_expected_resume_actor(
+    approvals_client, auth_headers, clean_db, status, resolver, actor
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    parent = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(parent["id"], status=status, resolved_by=resolver)
+    child = _requester_create(approvals_client, auth_headers, {
+        **payload, "author": actor, "dedupe_key": resume_event_id(parent["id"]),
+        "route": "different-action",
+    })
+    assert "requested_by" in child and child["requested_by"] is None
+
+
+def test_requester_valid_immediate_link_does_not_hide_an_invalid_older_link(
+    approvals_client, auth_headers, clean_db
+) -> None:
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _payload(author="U0EXAMPLE1")
+    first = _requester_create(approvals_client, auth_headers, payload)
+    _requester_edit(first["id"], status="approved", resolved_by="U0EXAMPLE2")
+    second = _requester_create(approvals_client, auth_headers, {
+        **payload, "author": "U0EXAMPLE2", "dedupe_key": resume_event_id(first["id"]),
+    })
+    _requester_edit(second["id"], status="approved", resolved_by="U0EXAMPLE3")
+    _requester_edit(first["id"], reply_endpoint="https://adapter.example.com/other")
+    third = _requester_create(approvals_client, auth_headers, {
+        **payload, "author": "U0EXAMPLE3", "dedupe_key": resume_event_id(second["id"]),
+    })
+    assert "requested_by" in third and third["requested_by"] is None

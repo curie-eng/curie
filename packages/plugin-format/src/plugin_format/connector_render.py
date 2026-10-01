@@ -472,6 +472,8 @@ def render_deployment(
     spec: ConnectorSpec,
     secret_name: str,
     proxy: ConnectorProxy | None = None,
+    gated_tools: tuple[str, ...] = (),
+    grant_store_url: str = "",
 ) -> dict[str, Any]:
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
@@ -601,7 +603,20 @@ def render_deployment(
                                 "limits": {"cpu": "500m", "memory": "256Mi"},
                             },
                         },
-                        *([_proxy_container(agent, spec, proxy)] if proxy is not None else []),
+                        *(
+                            [
+                                _proxy_container(
+                                    agent,
+                                    connector,
+                                    spec,
+                                    proxy,
+                                    gated_tools=gated_tools,
+                                    grant_store_url=grant_store_url,
+                                )
+                            ]
+                            if proxy is not None
+                            else []
+                        ),
                     ],
                     **({"volumes": volumes} if volumes else {}),
                     **(
@@ -615,7 +630,15 @@ def render_deployment(
     }
 
 
-def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> dict[str, Any]:
+def _proxy_container(
+    agent: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy,
+    *,
+    gated_tools: tuple[str, ...] = (),
+    grant_store_url: str = "",
+) -> dict[str, Any]:
     """The caller proxy: it checks each request's token and forwards to the server.
 
     Every value is a literal. The public keys are public, and the proxy holds no
@@ -624,20 +647,31 @@ def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> 
     """
 
     port = caller_proxy_port(spec)
+    env: list[dict[str, str]] = [
+        {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
+        {"name": "CURIE_CALLER_PROXY_UPSTREAM_PORT", "value": str(spec.port)},
+        {"name": "CURIE_CALLER_PROXY_PUBLIC_KEYS", "value": ",".join(proxy.public_keys)},
+        {
+            "name": "CURIE_CALLER_PROXY_ADMITS",
+            "value": json.dumps(resolved_admits(spec, agent), separators=(",", ":")),
+        },
+        {"name": "CURIE_CALLER_PROXY_CONNECTOR", "value": connector},
+    ]
+    if gated_tools:
+        env.append(
+            {
+                "name": "CURIE_CALLER_PROXY_GATED_TOOLS",
+                "value": json.dumps(list(gated_tools), separators=(",", ":")),
+            }
+        )
+    if grant_store_url:
+        env.append({"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": grant_store_url})
     return {
         "name": CALLER_PROXY_CONTAINER,
         "image": proxy.image,
         **({"imagePullPolicy": proxy.pull_policy} if proxy.pull_policy is not None else {}),
         "command": ["python", "-m", "curie_connector_proxy"],
-        "env": [
-            {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
-            {"name": "CURIE_CALLER_PROXY_UPSTREAM_PORT", "value": str(spec.port)},
-            {"name": "CURIE_CALLER_PROXY_PUBLIC_KEYS", "value": ",".join(proxy.public_keys)},
-            {
-                "name": "CURIE_CALLER_PROXY_ADMITS",
-                "value": json.dumps(resolved_admits(spec, agent), separators=(",", ":")),
-            },
-        ],
+        "env": env,
         "ports": [{"name": _CALLER_PORT_NAME, "containerPort": port}],
         "readinessProbe": _readiness_probe(_CALLER_PORT_NAME),
         "securityContext": {
@@ -693,6 +727,12 @@ def render_networkpolicy(
     }
 
 
+def _ingress_from_labels(release: str, app_name: str, agent: str) -> dict[str, str]:
+    """Release sandbox labels plus the owning agent. Not ``sandbox_selector``."""
+
+    return {**sandbox_selector(release, app_name), "curietech.ai/agent": agent}
+
+
 def render_ingress_networkpolicy(
     release: str,
     agent: str,
@@ -701,15 +741,16 @@ def render_ingress_networkpolicy(
     spec: ConnectorSpec,
     proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
-    """Ingress to this connector: any sandbox in this release, and nothing else.
+    """Ingress to this connector from one agent's sandboxes, and nothing else.
 
-    The egress policy above says where the sandbox may GO. It says nothing
-    about who may ARRIVE, and those are not the same question. Without this,
-    every pod in the namespace can call the connector. With a caller proxy
-    (ADR-0168 decision 7) this policy decides who may ask at all and the proxy
-    decides which agent is asking; on an install with no caller key there is no
-    proxy, and this policy is the whole of the access control. With a proxy it
-    opens only the proxy's port (``_policy_port``).
+    The peer is only pods labeled ``curietech.ai/agent`` with this agent, plus
+    the release sandbox labels from ``sandbox_selector``. A pod wearing another
+    agent's label does not match. The egress policy above stays release-wide:
+    it says where a sandbox may GO, and this policy says who may ARRIVE.
+    Without this, every pod in the namespace can call the connector. With a
+    caller proxy (ADR-0168 decision 7) this policy decides who may ask at all
+    and the proxy decides which agent is asking. With a proxy it opens only
+    the proxy's port (``_policy_port``).
 
     What that is worth is concrete: a connector holds a production credential
     and answers anyone who asks. In a namespace that also runs Postgres,
@@ -753,7 +794,13 @@ def render_ingress_networkpolicy(
             "policyTypes": ["Ingress"],
             "ingress": [
                 {
-                    "from": [{"podSelector": {"matchLabels": sandbox_selector(release, app_name)}}],
+                    "from": [
+                        {
+                            "podSelector": {
+                                "matchLabels": _ingress_from_labels(release, app_name, agent)
+                            }
+                        }
+                    ],
                     "ports": [{"protocol": "TCP", "port": _policy_port(spec, proxy)}],
                 }
             ],
@@ -771,6 +818,8 @@ def render(
     spec: ConnectorSpec,
     secret_name: str,
     proxy: ConnectorProxy | None = None,
+    gated_tools: tuple[str, ...] = (),
+    grant_store_url: str = "",
 ) -> list[dict[str, Any]]:
     """Every object needed to run one hosted connector. Empty for a remote one.
 
@@ -802,10 +851,26 @@ def render(
             "--plugin-dir <dir>` writes, and connector_lock.apply_lock applies "
             "before anything renders."
         )
+    # Only a render that would publish objects. A remote connector already
+    # returned [], and a build: connector with no image already raised.
+    if proxy is None:
+        raise ValueError(
+            "hosted_connector_requires_caller_key: a hosted connector needs a caller public key"
+        )
     return [
         render_service(release, agent, connector, spec, proxy),
         *([render_direct_service(release, agent, connector, spec)] if proxy is not None else []),
-        render_deployment(release, agent, namespace, connector, spec, secret_name, proxy),
+        render_deployment(
+            release,
+            agent,
+            namespace,
+            connector,
+            spec,
+            secret_name,
+            proxy,
+            gated_tools=gated_tools,
+            grant_store_url=grant_store_url,
+        ),
         render_networkpolicy(release, agent, app_name, connector, spec, proxy),
         render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),
     ]
@@ -895,4 +960,7 @@ def _labels(release: str, agent: str, connector: str) -> dict[str, str]:
     return {
         "app.kubernetes.io/name": object_name(release, agent, connector),
         "app.kubernetes.io/part-of": release,
+        # Valkey's data-tier allow selects this. It is on the pod and the
+        # selector together so a policy that names the connector still matches.
+        "app.kubernetes.io/component": "mcp-connector",
     }

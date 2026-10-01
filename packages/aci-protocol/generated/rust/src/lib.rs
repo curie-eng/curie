@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.7";
+pub const PROTOCOL_VERSION: &str = "0.5.10";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -111,6 +111,12 @@ pub enum TurnSource {
     Webhook,
     #[serde(rename = "cron")]
     Cron,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolAccess {
+    #[serde(rename = "read-only")]
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -274,6 +280,8 @@ pub struct ReplyHandle {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -308,6 +316,8 @@ pub struct QueuedTurn {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub hook_run: Option<HookRunRef>,
+    #[serde(default)]
+    pub tool_access: Option<ToolAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -399,6 +409,8 @@ pub enum InboundMessage {
         history_ref: Option<String>,
         #[serde(default)]
         publication_context: Option<PublicationContext>,
+        #[serde(default)]
+        tool_access: Option<ToolAccess>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -471,6 +483,8 @@ pub enum OutboundEvent {
         result: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default)]
         failed: Option<bool>,
+        #[serde(default)]
+        redacted: Option<bool>,
     },
 }
 
@@ -528,8 +542,14 @@ mod tests {
             session_id: None,
             history_ref: None,
             publication_context: None,
+            // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
+            tool_access: Some(ToolAccess::ReadOnly),
         };
         let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(r#""tool_access":"read-only""#));
+        // TOOL-ACCESS-2: an unknown value is refused, never read as None.
+        let unknown = encoded.replace(r#""read-only""#, r#""read-mostly""#);
+        assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
     }
@@ -566,13 +586,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.8","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.11","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.7","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.10","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

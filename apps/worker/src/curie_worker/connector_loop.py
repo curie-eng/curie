@@ -24,7 +24,10 @@ anything else down with it.
 **Quiet when converged.** The steady state is "nothing changed", which is most
 passes forever. Only work and failures are logged at INFO; a converged pass
 logs at DEBUG. A loop that narrates every pass trains people to ignore it, and
-then the one pass that mattered scrolls by unread.
+then the one pass that mattered scrolls by unread. A skipped agent is part of
+that steady state (#1215): its WARNING is logged when it enters the skip or
+its reason changes, one INFO when it leaves, and the
+`curie.connector.reconcile.skipped_agents` gauge carries it between.
 
 The cluster-shaped work is synchronous -- the Kubernetes client is, and so is
 the render fetch -- so a pass runs in a worker thread rather than blocking the
@@ -167,7 +170,9 @@ class PassSummary:
 
     @property
     def did_work(self) -> bool:
-        return bool(self.applied or self.deleted or self.skipped or self.failed)
+        # `skipped` is deliberately absent (#1215): a skip persists every pass
+        # until someone acts, and its transitions carry their own log lines.
+        return bool(self.applied or self.deleted or self.failed)
 
 
 class ConnectorReconcileLoop:
@@ -189,6 +194,9 @@ class ConnectorReconcileLoop:
         self._namespace = namespace
         self._interval = interval_seconds
         self._platform_5xx_streaks: dict[uuid.UUID, int] = {}
+        # The reason each currently-skipped agent was last logged with. Kept
+        # in process only: a restarted worker logs each standing skip once.
+        self._skip_reasons: dict[uuid.UUID, str] = {}
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_TARGETS_SQL.format(schema=db_schema))
 
@@ -234,6 +242,11 @@ class ConnectorReconcileLoop:
 
         summary = PassSummary()
         targets = await self.targets()
+        deployed = {target.agent_id for target in targets}
+        for agent_id in [known for known in self._skip_reasons if known not in deployed]:
+            # No longer deployed, so no longer skipped. Dropped without a line:
+            # the undeploy is the event, and this loop did not cause it.
+            del self._skip_reasons[agent_id]
         for target in targets:
             summary.reconciled += 1
             try:
@@ -271,6 +284,7 @@ class ConnectorReconcileLoop:
                 continue
 
             self._platform_5xx_streaks.pop(target.agent_id, None)
+            self._note_skip(target, outcome.skipped)
             if outcome.skipped:
                 summary.skipped += 1
                 # A skip means "no operator-supplied Secret", not "nothing
@@ -297,6 +311,25 @@ class ConnectorReconcileLoop:
         )
         return summary
 
+    def _note_skip(self, target: AgentTarget, reason: str | None) -> None:
+        """Log a skip only when it starts, changes or ends.
+
+        An agent whose reconcile raised is not seen here, so its skip state
+        stands until a pass completes for it.
+        """
+
+        previous = self._skip_reasons.get(target.agent_id)
+        if reason is not None:
+            if reason != previous:
+                self._skip_reasons[target.agent_id] = reason
+                logger.warning(
+                    "connector reconcile skipped agent=%s: %s", target.agent_name, reason
+                )
+            return
+        if previous is not None:
+            del self._skip_reasons[target.agent_id]
+            logger.info("connector reconcile agent=%s is no longer skipped", target.agent_name)
+
     def _record_pass_metrics(self, *, outcome: str) -> None:
         now = _monotonic()
         last_success = getattr(self, "_last_success_monotonic", None)
@@ -310,6 +343,11 @@ class ConnectorReconcileLoop:
             "outcome": outcome,
         }
         record_metric("curie.background.loop", attributes=attributes)
+        record_metric(
+            "curie.connector.reconcile.skipped_agents",
+            len(self._skip_reasons),
+            attributes={"service.name": "curie-worker"},
+        )
         if last_success is not None:
             record_metric(
                 "curie.background.last_success.age",

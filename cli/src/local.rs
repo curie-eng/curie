@@ -1436,6 +1436,33 @@ impl crate::ui::CliOutput for LocalUpOutput {
     }
 }
 
+/// Attach every masked secret a stack-starting compose child needs: the model
+/// credentials from [`apply_credential_plan`] and the install's own API key and
+/// Postgres password (#3557), as `local_stack_keys` env pairs. `up` and
+/// `rebuild` both go through here so a recreated service never starts on
+/// different credentials than the rest of the stack (#853). `with_secret_env`
+/// replaces, so this is the one place the list is assembled.
+pub fn with_stack_secret_env(
+    cmd: OpsCommand,
+    model_credentials: Vec<(String, String)>,
+    stack_env: Vec<(String, String)>,
+) -> OpsCommand {
+    let mut secret_env = model_credentials;
+    secret_env.extend(stack_env);
+    cmd.with_secret_env(secret_env)
+}
+
+/// The `local up` note naming where the install's API key lives. The key itself
+/// is never printed; the console needs it as `?api_key=`.
+fn stack_key_note(path: &Path) -> String {
+    format!(
+        "This install's API key is the `api_key` field of {} (mode 0600). `curie local` \
+         verbs send it to localhost automatically; for the console, append \
+         `&api_key=<that key>` to its URL (`?api_key=<that key>` if it has no query).",
+        path.display()
+    )
+}
+
 /// Resolve model credentials for a worker starting local verb. Private storage
 /// follows the shell and precedes the optional bundle `.env` file. Values are
 /// returned as masked `secret_env`, and every source contributes to the model
@@ -1514,6 +1541,23 @@ pub fn apply_credential_plan(
 /// [`ensure_build_reaches_the_stack`] at the resolve site, rather than as an
 /// assumption made here: it is what decides whether the success line may claim
 /// the stack below runs what was just built.
+/// The `docker build` lines a `--build --dry-run` plan lists ahead of the
+/// compose line (#1929). It walks [`source_images`] with the tag
+/// [`build_source_images`] builds, so the plan names exactly the builds the
+/// real run performs, each rendered as `build_image` announces it.
+fn source_build_plan(o: &LocalOpts) -> Vec<String> {
+    let tag = o.resources.image_tag.as_str();
+    source_images(o)
+        .iter()
+        .map(|image| {
+            crate::commands::build_image_command_line(
+                image.dockerfile,
+                &source_image_ref(image.image, tag),
+            )
+        })
+        .collect()
+}
+
 async fn build_source_images(o: &LocalOpts, reach: BuildReach) -> Result<()> {
     let ui = crate::ui::ui();
     // Same checkout sentinel `curie build` uses: a release binary has nothing
@@ -1555,14 +1599,23 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
     // is on, so a plain `up` after an `up --build` does not silently re-resolve
     // every image back to `:latest`. A no-op under `--build` itself.
     resolve_stack_image_env(&mut o).await;
-    let mut cmd = up_command_with_model(&o, model.as_deref());
-    if !env_creds.is_empty() {
-        cmd = cmd.with_secret_env(env_creds);
-    }
+    // #3557: the install's own API key and Postgres password, generated on the
+    // first `up` and reused after. `--dry-run` resolves them without writing.
+    let stack = crate::local_stack_keys::resolve_for_up(o.project(), !o.dry_run).await?;
+    let cmd = with_stack_secret_env(
+        up_command_with_model(&o, model.as_deref()),
+        env_creds,
+        crate::local_stack_keys::compose_secret_env(&stack.credentials),
+    );
     if o.dry_run {
-        return Ok(LocalUpOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![cmd.display()],
-        }));
+        // The builds run before compose starts anything, so they lead the plan.
+        let mut lines = if o.build.is_some() {
+            source_build_plan(&o)
+        } else {
+            Vec::new()
+        };
+        lines.push(cmd.display());
+        return Ok(LocalUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     require_on_path("docker")?;
     // #1915: build before compose starts anything, so a failed build never
@@ -1601,6 +1654,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
             ),
         }
     }
+    ui.note(&stack_key_note(&stack.path));
     let endpoints = advertised_endpoints(&o.resources, o.minimal);
     Ok(LocalUpOutput::Up {
         endpoints,
@@ -1680,10 +1734,16 @@ pub async fn rebuild(mut o: LocalRebuildOpts) -> Result<LocalRebuildOutput> {
     // the stack already running, so the tag that service comes back on must be
     // the stack's, not whatever this shell resolves.
     resolve_stack_image_env(&mut o.common).await;
-    let mut cmd = rebuild_command(&o.common, &o.service, o.model.as_deref());
-    if !env_creds.is_empty() {
-        cmd = cmd.with_secret_env(env_creds);
-    }
+    // #3557 under #853's rule: the recreated service must start on the same
+    // install credentials the running stack uses. Those are the stored ones, or
+    // none when the stack predates the store. Only `up` adopts CURIE_API_KEY or
+    // generates, so a rebuild never changes what the stack runs on.
+    let stack_env = crate::local_stack_keys::running_stack_secret_env(o.common.project())?;
+    let cmd = with_stack_secret_env(
+        rebuild_command(&o.common, &o.service, o.model.as_deref()),
+        env_creds,
+        stack_env,
+    );
     if o.common.dry_run {
         return Ok(LocalRebuildOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![cmd.display()],
@@ -2348,6 +2408,7 @@ mod tests {
             model: None,
             minimal: false,
             stack_image_env: derived.clone(),
+            stack_secret_env: Vec::new(),
         };
 
         // Each entry is one verb and the compose child it emits that RECREATES
@@ -3341,10 +3402,97 @@ mod tests {
     /// The endpoint constants are hardcoded; this asserts they still match the
     /// port mappings in the committed compose file (the "verify against the
     /// file" the task asks for, kept mechanical).
+    fn placeholder_stack() -> crate::local_stack_keys::LocalStackCredentials {
+        crate::local_stack_keys::LocalStackCredentials {
+            api_key: "PLACEHOLDERapikey".into(),
+            postgres_password: "PLACEHOLDERpgpass".into(),
+        }
+    }
+
+    /// The masked plan names both install credentials and never the values.
+    fn assert_carries_stack_secrets(cmd: &OpsCommand) {
+        let line = cmd.display();
+        for expected in [
+            "CURIE_LOCAL_API_KEY=PLACEHOL***",
+            "CURIE_LOCAL_POSTGRES_PASSWORD=PLACEHOL***",
+        ] {
+            assert!(line.contains(expected), "missing {expected}: {line}");
+        }
+        assert!(!line.contains("apikey"), "api key leaked: {line}");
+        assert!(!line.contains("pgpass"), "postgres password leaked: {line}");
+    }
+
+    // #3557 + #853: `up` and `rebuild` attach the install credentials through
+    // the one shared assembler, alongside (not instead of) the model credentials.
+    #[test]
+    fn up_and_rebuild_carry_the_install_credentials_masked() {
+        let o = opts("compose.dev.yaml");
+        let model = vec![(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-PLACEHOLDER-model".to_string(),
+        )];
+        let up = with_stack_secret_env(
+            up_command(&o),
+            model.clone(),
+            crate::local_stack_keys::compose_secret_env(&placeholder_stack()),
+        );
+        let rebuild = with_stack_secret_env(
+            rebuild_command(&o, "curie-api", None),
+            model,
+            crate::local_stack_keys::compose_secret_env(&placeholder_stack()),
+        );
+        for cmd in [&up, &rebuild] {
+            assert_carries_stack_secrets(cmd);
+            let names: Vec<&str> = cmd.secret_env.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "ANTHROPIC_API_KEY",
+                    "CURIE_LOCAL_API_KEY",
+                    "CURIE_LOCAL_POSTGRES_PASSWORD"
+                ],
+                "model credentials must survive next to the install credentials"
+            );
+            assert!(
+                !cmd.argv().iter().any(|a| a.contains("PLACEHOLDER")),
+                "install credentials must never ride argv"
+            );
+        }
+    }
+
+    // #3557: a rebuild of a stack that predates the store passes no install
+    // credential, so compose's fallbacks keep matching what that stack runs.
+    #[test]
+    fn rebuild_with_no_store_passes_no_stack_secret_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = opts("compose.dev.yaml");
+        let stack_env =
+            crate::local_stack_keys::running_stack_secret_env_in(dir.path(), "curie").unwrap();
+        let rebuild = with_stack_secret_env(
+            rebuild_command(&o, "curie-api", None),
+            vec![("ANTHROPIC_API_KEY".into(), "sk-PLACEHOLDER-model".into())],
+            stack_env,
+        );
+        let names: Vec<&str> = rebuild.secret_env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["ANTHROPIC_API_KEY"]);
+        assert!(
+            !dir.path().join("local").exists(),
+            "rebuild must not write the store"
+        );
+    }
+
+    #[test]
+    fn stack_key_note_names_the_path_not_the_key() {
+        let note = stack_key_note(Path::new("/cfg/local/curie.json"));
+        assert!(note.contains("/cfg/local/curie.json"), "{note}");
+        assert!(note.contains("?api_key="), "{note}");
+    }
+
     #[test]
     fn endpoints_match_compose_file() {
         let compose = read_compose("compose.dev.yaml");
-        // Each printed host port must appear as a `"<host>:<container>"` mapping.
+        // Each printed host port must appear as a loopback-only
+        // `"127.0.0.1:<host>:<container>"` mapping (#3557).
         for (label, host_port) in [
             ("Curie API", "28000"),
             ("Curie Console", "28080"),
@@ -3358,8 +3506,8 @@ mod tests {
             ("OTel HTTP", "24318"),
         ] {
             assert!(
-                compose.contains(&format!("\"{host_port}:")),
-                "compose.dev.yaml no longer maps host port {host_port} for {label}"
+                compose.contains(&format!("\"127.0.0.1:{host_port}:")),
+                "compose.dev.yaml no longer maps host port {host_port} on loopback for {label}"
             );
             assert!(
                 ENDPOINTS.iter().any(|(_, url, _)| url.contains(host_port)),
