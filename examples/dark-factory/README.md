@@ -3,6 +3,11 @@
 This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
 One pull request, or one stated reason, comes out.
 
+Trying it for the first time? The
+[dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
+you from nothing to a pull request this agent opened on a new repository, on a
+laptop kind cluster.
+
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
 reviewer subagents check it on a stronger model. The skill walks nine phases:
@@ -96,6 +101,11 @@ which GitHub MCP tools the agent can call; it does not hide the credential
 from other tools. The token scope is the real bound.
 
 ## Deploy it as the factory agent
+
+For a laptop trial on a small repository, follow the
+[quickstart](../../docs/guides/dark-factory-quickstart.md) instead; it needs
+none of the long run sizing below. This section is the production recipe for a
+repository the size of Curie itself.
 
 Enable factory intake first (see "Admitting a labelled GitHub issue" in
 [`docs/operations.md`](../../docs/operations.md)). Then:
