@@ -3960,6 +3960,14 @@ async fn admission_objects(namespace: &str, resources: &str) -> Option<Vec<serde
         .cloned()
 }
 
+// A hook Job the current render omits is not an admission rejection of this install.
+fn omitted_gvisor_preflight_job(event: &serde_json::Value, gvisor_job: Option<&str>) -> bool {
+    let name = admission_text(event, "/involvedObject/name");
+    admission_text(event, "/involvedObject/kind") == "Job"
+        && name.ends_with("-preflight-gvisor")
+        && gvisor_job != Some(name)
+}
+
 fn admission_rejection_excerpt(message: &str) -> String {
     let printable: String = message
         .chars()
@@ -4003,6 +4011,7 @@ async fn observe_admission_rejection(
                     admission_text(event, "/reason") == "FailedCreate"
                         && message.to_ascii_lowercase().contains("is forbidden:")
                         && fresh_admission_event(event, &baseline)
+                        && !omitted_gvisor_preflight_job(event, gvisor_job)
                         // The existing gVisor observer owns its inference and retry.
                         && !(namespace == common.namespace && gvisor_job.is_some_and(|job| {
                             admission_text(event, "/involvedObject/kind") == "Job"
