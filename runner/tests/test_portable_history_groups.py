@@ -447,6 +447,7 @@ def test_actual_session_capture_keeps_results_but_clears_user_and_new_turn(monke
         plugins=[], model=None, system_prompt=None, resume=None, max_turns=2, max_budget_usd=1
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
@@ -531,6 +532,7 @@ def test_accepted_steer_clears_capture_group(monkeypatch):
         plugins=[], model=None, system_prompt=None, resume=None, max_turns=2, max_budget_usd=1
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,

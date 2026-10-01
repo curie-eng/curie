@@ -202,6 +202,7 @@ def _decision(output: dict[str, Any]) -> dict[str, Any]:
 def _runner_over(script: list[Any], *, gate: ApprovalGate, ceiling: int = 10_000, **kw):
     session = FakeModelSession(lambda: script, **kw)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=ceiling,

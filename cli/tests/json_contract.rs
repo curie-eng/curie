@@ -2218,13 +2218,23 @@ fn budget_output_validates_all_variants() {
     let some = BudgetOutput::Done {
         agent: "d".to_string(),
         max_usd_per_day: Some(5.0),
+        max_output_tokens_per_run: Some(64000),
     };
     assert_valid("budget.schema.json", &some.to_json());
     let none = BudgetOutput::Done {
         agent: "d".to_string(),
         max_usd_per_day: None,
+        max_output_tokens_per_run: None,
     };
     assert_valid("budget.schema.json", &none.to_json());
+    for (usd, tokens) in [(Some(5.0), None), (None, Some(64000))] {
+        let mixed = BudgetOutput::Done {
+            agent: "d".to_string(),
+            max_usd_per_day: usd,
+            max_output_tokens_per_run: tokens,
+        };
+        assert_valid("budget.schema.json", &mixed.to_json());
+    }
     let dry = BudgetOutput::DryRun(DryRunPlan {
         lines: vec!["PUT /budget".to_string()],
     });
