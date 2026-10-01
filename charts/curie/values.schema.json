@@ -1,6 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "definitions": {
+    "computePodDisruptionBudget": {
+      "type": "object",
+      "description": "Optional PodDisruptionBudget for a compute-plane Deployment (issue #1574). minAvailable, when set, replaces maxUnavailable. A budget allowing zero voluntary disruptions at the configured replica count needs allowBlockingDrain: true; the template refuses it otherwise.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxUnavailable": {"type": "integer", "minimum": 0},
+        "minAvailable": {"type": "integer", "minimum": 0},
+        "allowBlockingDrain": {"type": "boolean"}
+      }
+    }
+  },
   "properties": {
     "config": {
       "type": "object",
@@ -19,6 +31,7 @@
     "api": {
       "type": "object",
       "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "approvalChatAttesterSecret": {
           "type": "string",
           "minLength": 1,
@@ -69,6 +82,7 @@
     "worker": {
       "type": "object",
       "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "claimTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -191,6 +205,18 @@
             }
             }
           }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
+      }
+    },
+    "dispatcher": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
       }
     },
     "agentSandbox": {

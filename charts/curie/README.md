@@ -1118,6 +1118,25 @@ this toward production HA:
   to handle drains deliberately (scale up first, or delete the PDB for planned
   maintenance). Enable it only once you run multiple replicas or explicitly want
   drains gated.
+- **Optional compute-plane PodDisruptionBudgets (#1574).** The api, worker, ui
+  and dispatcher Deployments each carry a `<component>.podDisruptionBudget`
+  block, also OFF by default because every one ships at `replicas: 1`:
+
+  | Values key | Default | When enabled |
+  |---|---|---|
+  | `api.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many API pods a drain evicts at once. Raise `api.replicas` for it to protect anything. |
+  | `worker.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many workers a drain evicts at once. Each evicted worker still drains its in-flight turns inside its termination grace (ADR-0131). |
+  | `ui.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many UI pods a drain evicts at once. Raise `ui.replicas` for it to protect anything. |
+  | `dispatcher.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Accepted only as `minAvailable: 1` with `allowBlockingDrain: true`. The dispatcher is one replica with strategy `Recreate` by design (#2944), so a budget that permits a disruption protects nothing and is refused. |
+
+  Setting `minAvailable` replaces `maxUnavailable`, since a `policy/v1` budget
+  carries exactly one of the two. A budget that allows zero voluntary
+  disruptions at the configured replica count (`minAvailable` at or above
+  `replicas`, or `maxUnavailable: 0`) blocks every drain of the node running
+  that pod, so the render refuses it unless `allowBlockingDrain: true` says
+  that is intended. Each budget selects exactly its own Deployment's pods,
+  which `ci/compute-pdb-assertions.sh` checks against every rendered pod
+  template.
 
 Production sizing (raise every `resources` block and persistence size, supply
 real secrets) is covered in **Production sizing** above; PDBs and BYO stores are
