@@ -97,6 +97,7 @@ from .approvals import (
     PublicationCreator,
     PublicationLineage,
     ReviewAuthorityUnavailable,
+    SettledApproval,
     VerifiedReviewFeedback,
     decided_field,
 )
@@ -1091,6 +1092,28 @@ def _parse_approval_targets(
     ):
         return None
     return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
+
+
+def _settled_outcome(
+    record: SettledApproval,
+) -> tuple[SettledOutcome, datetime | None] | None:
+    """A resolved record's outcome to stamp and its decision time (#1084).
+
+    None for any record that is not approved or rejected: a pending one has no
+    verdict, and an expiry names no decision, so its caller settles it apart.
+    """
+
+    if record.status not in ("approved", "rejected"):
+        return None
+    return (
+        SettledOutcome(
+            requested_by="",
+            decision=record.status,
+            resolver=record.resolved_by,
+            note=record.resolution_note,
+        ),
+        record.resolved_at,
+    )
 
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
@@ -7028,73 +7051,149 @@ class Kernel:
                         thread_key,
                     )
                     return
-            entry = await self._card_store.read(approval_id)
-            if entry is None:
-                return
-            ref, raw_ref = entry
-            if is_expiry:
-                # The branch above left the outcome unread, on purpose: an expiry
-                # says only that nobody decided.
-                settled = SettledOutcome(requested_by=ref.requested_by)
-            else:
-                # The resolve branch returned above unless it read an outcome.
-                assert outcome is not None
-                settled = SettledOutcome(
-                    requested_by=ref.requested_by,
-                    decision=outcome.decision,
-                    resolver=outcome.resolver,
-                    note=outcome.note,
-                )
-            # Emit the channel-neutral summary (ADR-0020) plus the semantic
-            # outcome; the adapter renders the buttonless settled card below the
-            # seam.
-            # The card's own address and ref, over the transport it was posted
-            # through. ``settled`` carries the whole difference between an
-            # expired card and a resolved one; the adapter renders the form.
-            await self._sink.emit(
-                ReplyUpdate(
-                    version=REPLY_WIRE_VERSION,
-                    event="reply.update",
-                    target=ReplyTarget(
-                        # The card's OWN destination, remembered at post time. A
-                        # policy-routed card lives in a channel this resume turn
-                        # may not share a kind or a transport with, so rebuilding
-                        # either from the turn addresses the wrong place; ``kind``
-                        # empty is the pre-upgrade entry, which falls back to the
-                        # turn's kind but NOT its identity: the historical card
-                        # was posted by the default transport.
-                        kind=ref.kind or handle.kind,
-                        address=ref.channel,
-                        conversation_id=qevent.conversation_id,
-                        reply_ref=ref.ts,
-                    ),
-                    message=OutboundMessage(
-                        version=MESSAGE_VERSION,
-                        text=ref.summary,
-                        # When it was decided, as data (ADR-0179); the adapter
-                        # chooses how to show it.
-                        fields=[decided_field(decided)] if decided is not None else [],
-                    ),
-                    settled=settled,
-                ),
-                route=TargetRoute(
-                    endpoint=ref.endpoint,
-                    adapter=ref.adapter if ref.kind else None,
-                ),
+            await self._settle_remembered_card(
+                approval_id,
+                is_expiry=is_expiry,
+                outcome=outcome,
+                decided=decided,
+                conversation_id=qevent.conversation_id,
+                handle=handle,
             )
-            consumed = await self._card_store.consume(approval_id, raw_ref)
-            if consumed:
-                logger.info("settled approval card for thread %s", qevent.conversation_id)
-            else:
-                logger.info(
-                    "approval card ref changed or vanished before cleanup for approval %s",
-                    approval_id,
-                )
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
             logger.warning(
                 "approval card teardown failed for thread %s: %s",
                 thread_key,
                 exc,
+            )
+
+    async def _settle_remembered_card(
+        self,
+        approval_id: str,
+        *,
+        is_expiry: bool,
+        outcome: SettledOutcome | None,
+        decided: datetime | None,
+        conversation_id: str,
+        handle: ReplyHandle,
+    ) -> None:
+        """Edit the remembered card into its settled form, then consume its ref.
+
+        Shared by the resume (``_finalize_settled_card``) and by the pause once
+        it registers a card whose record is already settled
+        (``_settle_if_decided_before_registration``, #3637). Either may run
+        first, or both at once: each emits the same edit, and the atomic
+        ``consume`` of the exact value read lets only one of them remove it.
+        Raises on failure; each caller owns its own best-effort handling.
+        """
+
+        assert self._card_store is not None
+        entry = await self._card_store.read(approval_id)
+        if entry is None:
+            return
+        ref, raw_ref = entry
+        if is_expiry:
+            # An expiry says only that nobody decided, so no outcome is stamped.
+            settled = SettledOutcome(requested_by=ref.requested_by)
+        else:
+            # A caller settles a resolve only once it has read an outcome.
+            assert outcome is not None
+            settled = SettledOutcome(
+                requested_by=ref.requested_by,
+                decision=outcome.decision,
+                resolver=outcome.resolver,
+                note=outcome.note,
+            )
+        # Emit the channel-neutral summary (ADR-0020) plus the semantic
+        # outcome; the adapter renders the buttonless settled card below the
+        # seam.
+        # The card's own address and ref, over the transport it was posted
+        # through. ``settled`` carries the whole difference between an
+        # expired card and a resolved one; the adapter renders the form.
+        await self._sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=ReplyTarget(
+                    # The card's OWN destination, remembered at post time. A
+                    # policy-routed card lives in a channel this resume turn
+                    # may not share a kind or a transport with, so rebuilding
+                    # either from the turn addresses the wrong place; ``kind``
+                    # empty is the pre-upgrade entry, which falls back to the
+                    # turn's kind but NOT its identity: the historical card
+                    # was posted by the default transport.
+                    kind=ref.kind or handle.kind,
+                    address=ref.channel,
+                    conversation_id=conversation_id,
+                    reply_ref=ref.ts,
+                ),
+                message=OutboundMessage(
+                    version=MESSAGE_VERSION,
+                    text=ref.summary,
+                    # When it was decided, as data (ADR-0179); the adapter
+                    # chooses how to show it.
+                    fields=[decided_field(decided)] if decided is not None else [],
+                ),
+                settled=settled,
+            ),
+            route=TargetRoute(
+                endpoint=ref.endpoint,
+                adapter=ref.adapter if ref.kind else None,
+            ),
+        )
+        consumed = await self._card_store.consume(approval_id, raw_ref)
+        if consumed:
+            logger.info("settled approval card for thread %s", conversation_id)
+        else:
+            logger.info(
+                "approval card ref changed or vanished before cleanup for approval %s",
+                approval_id,
+            )
+
+    async def _settle_if_decided_before_registration(
+        self, approval_id: str, qevent: QueuedTurn
+    ) -> None:
+        """Settle a card whose approval was decided before it was registered (#3637).
+
+        The record precedes every delivery, so an operator can resolve it, or
+        the sweeper expire it, while the card post is still in flight. Its
+        resume then finds no card ref and finishes, and nothing else would
+        settle the card this pause registers afterwards. So once the card is
+        registered, the pause reads its record back: a decided record settles
+        the card now, and a pending one leaves it to the resume.
+
+        Neither order is lost. A verdict recorded before this read is seen
+        here, and one recorded after it reaches a resume that runs after the
+        card was registered and settles it there. Best-effort, like the
+        resume's settle: an unreadable record leaves the card as it is.
+        """
+
+        if self._approval_reader is None or self._card_store is None:
+            return
+        try:
+            record = await self._approval_reader.get(approval_id)
+            if record is None:
+                return
+            if record.status == "expired":
+                # ``_settled_outcome`` answers only a resolve. An expiry names
+                # no decision and stamps none, exactly as its resume would.
+                is_expiry, outcome, decided = True, None, None
+            else:
+                read = _settled_outcome(record)
+                if read is None:
+                    return
+                is_expiry = False
+                outcome, decided = read
+            await self._settle_remembered_card(
+                approval_id,
+                is_expiry=is_expiry,
+                outcome=outcome,
+                decided=decided,
+                conversation_id=qevent.conversation_id,
+                handle=_reply_handle_for(qevent),
+            )
+        except Exception as exc:  # noqa: BLE001 - the pause stands without the settle
+            logger.warning(
+                "settling approval card %s after registration failed: %s", approval_id, exc
             )
 
     async def _settled_from_record(
@@ -7115,17 +7214,9 @@ class Kernel:
         if self._approval_reader is None:
             return None
         record = await self._approval_reader.get(approval_id)
-        if record is None or record.status not in ("approved", "rejected"):
+        if record is None:
             return None
-        return (
-            SettledOutcome(
-                requested_by="",
-                decision=record.status,
-                resolver=record.resolved_by,
-                note=record.resolution_note,
-            ),
-            record.resolved_at,
-        )
+        return _settled_outcome(record)
 
     async def _place_the_resumed_reply(self, qevent: QueuedTurn) -> QueuedTurn:
         """Choose where a resumed approval turn answers (ADR-0179 decision 3).
@@ -7754,6 +7845,7 @@ class Kernel:
             # later (#419). Best-effort: a lost memory only means the card is not
             # auto-disabled, and the resolve-click path still heals it.
             if card_ts and self._card_store is not None:
+                registered = False
                 try:
                     await self._card_store.remember(
                         str(created.id),
@@ -7773,8 +7865,11 @@ class Kernel:
                         # is the worker's only copy of it (#1084).
                         requested_by=requested_by,
                     )
+                    registered = True
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+                if registered:
+                    await self._settle_if_decided_before_registration(str(created.id), qevent)
             # ADR-0179 decision 3: the card is now a message of its own below the
             # notice, so the resume answers below it. Remembered apart from the
             # card ref because settling consumes that ref, and a redelivered
