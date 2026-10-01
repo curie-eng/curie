@@ -408,6 +408,8 @@ def test_a_failing_commit_status_is_a_failure_even_with_green_check_runs(
     turns = _ci_turns(published["id"])
     assert [t["event_id"] for t in turns] == [f"work-item-{published['id']}-ci-2"]
     assert "ci/jenkins" in turns[0]["text"]
+    # A commit status is not an Actions job, so nothing is rerun (#3741).
+    assert sink.reruns == []
 
 
 def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) -> None:
@@ -1547,3 +1549,170 @@ def test_pending_ci_shows_publish_done_and_wait_for_ci_in_progress(admitted: Any
     assert _phases(request_id)[-1] == ("wait_ci", None)
     assert "- [ ] **Wait for CI** (in progress)" in _body(sink, request_id)
     assert _terminal(number) == ("running", None)
+
+
+# --- #3741: rerun a failed Actions job once before wait_ci -------------------------
+
+
+def _actions_failure(
+    name: str,
+    run_id: int,
+    started_at: str,
+    *,
+    conclusion: str = "failure",
+) -> dict[str, Any]:
+    run = check_run(name, conclusion=conclusion, run_id=run_id, started_at=started_at)
+    run["app"] = {"slug": "github-actions"}
+    return run
+
+
+def _phase_notes(request_id: uuid.UUID) -> list[str | None]:
+    return [
+        row["note"]
+        for row in _rows(
+            "SELECT note FROM curie.execution_request_phase_reports "
+            "WHERE execution_request_id = :id ORDER BY id",
+            {"id": request_id},
+        )
+    ]
+
+
+def test_a_transient_actions_failure_passes_on_rerun_without_an_implementer_round(
+    admitted: Any,
+) -> None:
+    """A flake is rerun once at the same head and never reaches the implementer.
+
+    GitHub re-runs one job with POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun
+    and answers 201 Created.
+    https://docs.github.com/en/rest/actions/workflow-jobs#re-run-a-job-from-a-workflow-run
+    """
+
+    _client, _github, sink = admitted
+    number = 9810
+    job_id = 88101
+    failed = _actions_failure("Chart render assertions", job_id, "2026-10-01T00:00:00Z")
+    passed = _actions_failure(
+        "Chart render assertions",
+        job_id,
+        "2026-10-01T00:05:00Z",
+        conclusion="success",
+    )
+    sink.ci_scripts = {HEAD_A: [ci_entry(failed), ci_entry(passed)]}
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(request_id) == []
+    assert sink.reruns == [job_id]
+    assert factory_ci_note(request_id) == "Reran failed Actions jobs once at this head."
+    assert _phases(request_id) == [("wait_ci", None)]
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert _ci_turns(request_id) == []
+    assert _terminal(number) == ("completed", "completed")
+
+
+def factory_ci_note(request_id: uuid.UUID) -> str | None:
+    notes = [note for note in _phase_notes(request_id) if note]
+    return notes[-1] if notes else None
+
+
+def test_a_persistent_actions_failure_reaches_the_implementer_after_one_rerun(
+    admitted: Any,
+) -> None:
+    """The same head is rerun once. A new failure after that is round 2 of 3."""
+
+    _client, _github, sink = admitted
+    number = 9811
+    first_job = 88111
+    next_job = 88112
+    started = "2026-10-01T00:00:00Z"
+    rerun_started = "2026-10-01T00:06:00Z"
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(_actions_failure("unit-tests", first_job, started)),
+            ci_entry(_actions_failure("unit-tests", first_job, started)),
+            ci_entry(_actions_failure("unit-tests", first_job, rerun_started)),
+        ],
+        HEAD_B: [
+            ci_entry(_actions_failure("unit-tests", next_job, "2026-10-01T01:00:00Z")),
+            ci_entry(_actions_failure("unit-tests", next_job, "2026-10-01T01:06:00Z")),
+        ],
+    }
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+    assert sink.reruns == [first_job]
+    assert _ci_turns(request_id) == []
+
+    # The pre-rerun failure is still what GitHub is showing. Do not ask again.
+    _reconcile()
+    assert sink.reruns == [first_job]
+    assert _ci_turns(request_id) == []
+    assert _terminal(number) == ("running", None)
+
+    _reconcile()
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [f"work-item-{request_id}-ci-2"]
+    assert "Curie wait_ci round 2 of 3:" in turns[0]["text"]
+    assert sink.reruns == [first_job]
+
+    _attach_fix(
+        published["work_item_id"],
+        request_id,
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the widget parser off-by-one",
+        paths=["src/widget.txt"],
+    )
+    _reconcile()
+    assert sink.reruns == [first_job, next_job]
+    assert len(_ci_turns(request_id)) == 1
+
+    _reconcile()
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [
+        f"work-item-{request_id}-ci-2",
+        f"work-item-{request_id}-ci-3",
+    ]
+    assert "Curie wait_ci round 3 of 3:" in turns[1]["text"]
+    assert sink.reruns == [first_job, next_job]
+
+
+def test_a_refused_actions_rerun_falls_back_to_the_implementer_round(
+    admitted: Any,
+) -> None:
+    """A 403 from the rerun endpoint keeps today's continuation and records why.
+
+    https://docs.github.com/en/rest/actions/workflow-jobs#re-run-a-job-from-a-workflow-run
+    """
+
+    _client, _github, sink = admitted
+    number = 9812
+    job_id = 88121
+    sink.ci_script = [
+        ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))
+    ]
+    sink.rerun_status = 403
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [f"work-item-{request_id}-ci-2"]
+    assert "Curie wait_ci round 2 of 3:" in turns[0]["text"]
+    assert factory_ci_note(request_id) == "CI rerun refused: github_forbidden."
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert len(_ci_turns(request_id)) == 1

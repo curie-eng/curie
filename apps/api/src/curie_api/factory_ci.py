@@ -10,6 +10,10 @@ decides with the pure ``decide``:
 - Python changes require valid preflight evidence; when the repository has a
   required Python CI policy (``GITHUB_FACTORY_PYTHON_CI``, #3617), they must
   also fall under its paths and pass its GitHub Actions check;
+- a failure of GitHub Actions jobs is rerun once at that same head before
+  anyone is asked to fix it (#3741). The rerun does not consume a round. Only
+  a failure that is still present after the rerun, or a rerun GitHub refuses,
+  continues below;
 - a failure below the round cap enqueues ONE continuation turn for the same
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
@@ -87,6 +91,94 @@ _ANNOTATIONS_MAX = 10
 _TITLE_MAX = 100
 _CHECKS_LINE_MAX = 400
 _NO_CI_NOTE = f"No CI checks appeared within {CI_GRACE_SECONDS} s."
+_RERUN_INFLIGHT = b"inflight"
+RERUN_REQUESTED_NOTE = "Reran failed Actions jobs once at this head."
+
+
+def rerun_refused_note(reason: str) -> str:
+    """Fixed phase-report text for a rerun GitHub would not accept."""
+
+    return f"CI rerun refused: {reason}."
+
+
+def ci_rerun_key(request_id: uuid.UUID, head_sha: str) -> str:
+    """One flake rerun per request head. A later head gets its own key."""
+
+    return f"curie:work-item:ci-rerun:{request_id}:{head_sha}"
+
+
+def failing_actions_jobs(detail: CiDetail) -> list[dict[str, Any]]:
+    """Failed GitHub Actions jobs on this observation, in check-run order.
+
+    The check run id is the Actions job id. Other apps cannot be rerun through
+    the Actions API, so they are omitted and the gate keeps today's path.
+    """
+
+    jobs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for run in detail.check_runs:
+        job_id = run.get("id")
+        if (
+            run.get("status") != "completed"
+            or run.get("conclusion") not in _FAILING_CONCLUSIONS
+            or not isinstance(job_id, int)
+            or isinstance(job_id, bool)
+            or job_id < 1
+            or job_id in seen
+            or not isinstance(run.get("app"), dict)
+            or run["app"].get("slug") != "github-actions"
+        ):
+            continue
+        seen.add(job_id)
+        started = run.get("started_at")
+        name = run.get("name")
+        jobs.append(
+            {
+                "id": job_id,
+                "name": name if isinstance(name, str) else "",
+                "started_at": started if isinstance(started, str) else None,
+            }
+        )
+    return jobs
+
+
+def rerun_still_outstanding(detail: CiDetail, jobs: Sequence[dict[str, Any]]) -> bool:
+    """True while a requested rerun has not produced a new completed attempt.
+
+    The same completed failure GitHub was already showing is not a post-rerun
+    result. A pending replacement, a missing job, or that same ``started_at``
+    keeps the gate waiting. A completed attempt with a new ``started_at``, or
+    a different conclusion, has landed.
+    """
+
+    by_id: dict[int, dict[str, Any]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for run in detail.check_runs:
+        run_id = run.get("id")
+        if isinstance(run_id, int) and not isinstance(run_id, bool):
+            by_id[run_id] = run
+        name = run.get("name")
+        if isinstance(name, str):
+            by_name.setdefault(name, []).append(run)
+    for job in jobs:
+        job_id = job.get("id")
+        started = job.get("started_at")
+        raw_name = job.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        current = by_id.get(job_id) if isinstance(job_id, int) else None
+        if current is None:
+            replacements = [item for item in by_name.get(name, []) if item.get("id") != job_id]
+            if not replacements:
+                return True
+            current = replacements[-1]
+        if current.get("status") != "completed":
+            return True
+        if (
+            current.get("started_at") == started
+            and current.get("conclusion") in _FAILING_CONCLUSIONS
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -772,6 +864,28 @@ async def gate(
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
+    if (
+        verdict.kind == "failing"
+        and detail is not None
+        and detail.state == "observed"
+        and head_sha
+    ):
+        decision = await _consider_flake_rerun(
+            sessionmaker,
+            valkey,
+            settings,
+            client,
+            request=request,
+            work_item=work_item,
+            lineage=lineage,
+            detail=detail,
+            head_sha=head_sha,
+            published_at=facts.published_at,
+            now=now,
+        )
+        if decision == "wait":
+            next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
+            return "waiting"
     next_poll.pop(request.id, None)
     pr_url = lineage.pr_url
     if verdict.kind == "failing" and round_ < CI_MAX_ROUNDS:
@@ -822,6 +936,95 @@ async def gate(
             detail=text,
         )
     return "settled" if isinstance(result, workitems.WorkItemOutcome) else "waiting"
+
+
+def _ci_deadline(
+    published_at: datetime, request: ExecutionRequest, settings: Settings
+) -> datetime:
+    assert request.execution_deadline is not None
+    return min(
+        published_at + timedelta(seconds=settings.github_factory_ci_wait_s),
+        request.execution_deadline,
+    )
+
+
+async def _consider_flake_rerun(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    valkey: redis.Redis,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    *,
+    request: ExecutionRequest,
+    work_item: WorkItem,
+    lineage: ThreadPublicationLineage,
+    detail: CiDetail,
+    head_sha: str,
+    published_at: datetime,
+    now: datetime,
+) -> Literal["wait", "proceed"]:
+    """Rerun failed Actions jobs once, or proceed when that cannot help.
+
+    A successful request waits until the same head shows a new completed
+    attempt. A refusal is recorded and the caller keeps today's failure path.
+    A transport failure is not the one allowed attempt: the next pass retries
+    until the CI deadline.
+    """
+
+    key = ci_rerun_key(request.id, head_sha)
+    deadline = _ci_deadline(published_at, request, settings)
+    raw = await valkey.get(key)
+    if raw in (_RERUN_INFLIGHT, "inflight"):
+        return "proceed" if now >= deadline else "wait"
+    record: dict[str, Any] | None = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            record = parsed
+    if record is not None and record.get("outcome") == "requested":
+        jobs = record.get("jobs")
+        if isinstance(jobs, list) and rerun_still_outstanding(detail, jobs) and now < deadline:
+            return "wait"
+        return "proceed"
+    if record is not None and record.get("outcome") == "refused":
+        return "proceed"
+    jobs = failing_actions_jobs(detail)
+    if not jobs:
+        return "proceed"
+    if not await valkey.set(key, _RERUN_INFLIGHT, nx=True, ex=CI_CLAIM_SECONDS):
+        return "proceed" if now >= deadline else "wait"
+    try:
+        result = await workitem_outcomes.rerun_actions_jobs(
+            lineage,
+            work_item,
+            settings,
+            client,
+            [int(job["id"]) for job in jobs],
+        )
+    except Exception:
+        await valkey.delete(key)
+        raise
+    if result.outcome == "retry":
+        await valkey.delete(key)
+        return "proceed" if now >= deadline else "wait"
+    ttl = round_ttl(request, now)
+    if result.outcome == "requested":
+        body = json.dumps({"outcome": "requested", "jobs": jobs}, separators=(",", ":"))
+        note = RERUN_REQUESTED_NOTE
+        decision: Literal["wait", "proceed"] = "wait"
+    else:
+        reason = result.reason or "rerun_rejected"
+        body = json.dumps(
+            {"outcome": "refused", "reason": reason}, separators=(",", ":")
+        )
+        note = rerun_refused_note(reason)
+        decision = "proceed"
+    await valkey.set(key, body, ex=ttl)
+    async with sessionmaker() as session:
+        await factory_progress.record_ci_rerun(session, request.id, note)
+    return decision
 
 
 def _issue_url(settings: Settings, work_item: WorkItem) -> str:

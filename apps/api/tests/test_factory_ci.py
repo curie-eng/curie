@@ -999,6 +999,77 @@ def test_continuation_text_preserves_check_details_when_logs_fill_the_report() -
     assert checks[-1]["job_log"] == "Job log unavailable."
 
 
+# --- #3741: one Actions rerun per head --------------------------------------------------
+
+
+def _actions_run(
+    name: str,
+    *,
+    run_id: int,
+    started_at: str | None,
+    conclusion: str = "failure",
+    status: str = "completed",
+) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion if status == "completed" else None,
+        "started_at": started_at,
+        "app": {"slug": "github-actions"},
+    }
+
+
+def test_failing_actions_jobs_skip_other_apps_and_incomplete_runs() -> None:
+    other = _actions_run("unit", run_id=4, started_at="2026-10-01T00:00:00Z")
+    other["app"] = {"slug": "some-app"}
+    detail = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=HEAD,
+        check_runs=[
+            _actions_run("chart", run_id=7, started_at="2026-10-01T00:00:00Z"),
+            _actions_run("lint", run_id=8, started_at="2026-10-01T00:00:00Z", conclusion="success"),
+            _actions_run(
+                "build", run_id=9, started_at="2026-10-01T00:00:00Z", status="in_progress"
+            ),
+            other,
+        ],
+    )
+
+    assert factory_ci.failing_actions_jobs(detail) == [
+        {"id": 7, "name": "chart", "started_at": "2026-10-01T00:00:00Z"}
+    ]
+
+
+def test_rerun_stays_outstanding_until_the_attempt_changes() -> None:
+    jobs = [{"id": 7, "name": "chart", "started_at": "2026-10-01T00:00:00Z"}]
+    same = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=HEAD,
+        check_runs=[_actions_run("chart", run_id=7, started_at="2026-10-01T00:00:00Z")],
+    )
+    pending = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=HEAD,
+        check_runs=[
+            _actions_run("chart", run_id=7, started_at="2026-10-01T00:05:00Z", status="in_progress")
+        ],
+    )
+    failed_again = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=HEAD,
+        check_runs=[_actions_run("chart", run_id=7, started_at="2026-10-01T00:05:00Z")],
+    )
+
+    assert factory_ci.rerun_still_outstanding(same, jobs) is True
+    assert factory_ci.rerun_still_outstanding(pending, jobs) is True
+    assert factory_ci.rerun_still_outstanding(failed_again, jobs) is False
+
+
 # --- what was tried ---------------------------------------------------------------------
 
 
