@@ -1046,7 +1046,7 @@ def _valid_notification_endpoint(endpoint: Any) -> bool:
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
-# ADR 0183: the channels whose approvals are answered from a route's approver
+# ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
 # ``schemas.EMAIL_KIND``. A set rather than a comparison, because the question
 # the raise path asks is "does this channel read an email list", not "which
@@ -1055,7 +1055,7 @@ _APPROVER_EMAIL_KINDS = frozenset({"email"})
 
 
 def _approver_emails(binding: Any) -> list[str]:
-    """The approver email addresses a route binding lists (ADR 0183).
+    """The approver email addresses a route binding lists (ADR-0177 amendment).
 
     Without them, nobody can answer an approval shown in an email thread: the
     requester is no longer admitted by default. The API validates the list's
@@ -7504,8 +7504,8 @@ class Kernel:
         card_kind = handle.kind
         card_channel = handle.channel
         notification_target: tuple[str, str, TargetRoute] | None = None
-        # The listed approver addresses an email card names (ADR 0183 decision
-        # 5), so the mail adapter can tell the requester who can approve. Set
+        # The listed approver addresses an email card names (ADR-0177 amendment
+        # A5), so the mail adapter can tell the requester who can approve. Set
         # only on the email branch below, where the list was just required.
         card_approver_emails: list[str] = []
         if route_name:
@@ -7564,7 +7564,7 @@ class Kernel:
                 )
                 return _ApprovalPause(created=False)
         elif handle.kind in _APPROVER_EMAIL_KINDS:
-            # ADR 0183 decision 3: a routeless approval has no binding, so no
+            # ADR-0177 amendment A3: a routeless approval has no binding, so no
             # approver emails, and on email nobody else may answer it.
             await self._escalate_unanswerable_email_approval(qevent, route, agent_id, None)
             return _ApprovalPause(created=False)
@@ -7959,7 +7959,7 @@ class Kernel:
             card_message = OutboundMessage(
                 version=MESSAGE_VERSION,
                 text=display_summary,
-                # ADR 0183 decision 5: an email card in the asking thread names
+                # ADR-0177 amendment A5: an email card in the asking thread names
                 # who can approve. Display only; the platform decides who may.
                 fields=approver_fields(card_approver_emails),
                 interaction=ConfirmIntent(
@@ -8577,7 +8577,7 @@ class Kernel:
     ) -> None:
         """Escalate an approval raised in an email thread that nobody may answer.
 
-        ADR 0183 decision 3: on email, only an address on the route's approver
+        ADR-0177 amendment A3: on email, only an address on the route's approver
         list may answer, and there is no requester-only default. Creating the
         approval would leave a card that can only expire, so the turn is
         flagged for a human with the reason, as ADR-0177 decision 3 already does

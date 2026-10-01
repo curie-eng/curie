@@ -686,7 +686,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
     keeps the zero-setup default in Slack: the resolution-card channel's members
     are the approvers. Notification recipients never enter this policy.
 
-    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR 0183).
+    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR-0177 amendment).
     Each surface reads only its own: a Slack card never reads ``emails``, and an
     email card never reads ``users`` or ``group``.
     """
@@ -704,7 +704,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
     # (issue #420 settles the precedence rather than refusing the combination),
     # and needs no Slack lookup at all.
     users: list[str] | None = None
-    # An explicit list of approver email addresses (ADR 0183), read only for a
+    # An explicit list of approver email addresses (ADR-0177 amendment), read only for a
     # card shown in an email thread. Separate from the binding's
     # ``allowed_callers``: being allowed to talk to a bot is not being allowed to
     # approve what it does. Stored lowercase, the form the mail adapter reports a
@@ -1263,7 +1263,7 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     approval's card already does. Who may answer then follows the channel the
     card lands on: Slack keeps its approver sets, and any other channel admits
     only an address on the route's approver ``emails`` (``approvers.EmailApprovers``,
-    ADR 0183).
+    ADR-0177 amendment).
 
     Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
     ``address`` beside it is a mix of the two forms, which the ADR refuses
@@ -1322,7 +1322,7 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
-        # ADR 0183 decision 1: only a requesting_surface route shows its card in
+        # ADR-0177 amendment A1: only a requesting_surface route shows its card in
         # an email thread. A fixed target is a Slack channel, where an address
         # can never be verified, so an email list there could only admit nobody.
         if (

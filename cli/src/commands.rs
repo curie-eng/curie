@@ -7226,7 +7226,7 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
 /// One bare email address, mirroring the API's `_EMAIL_CALLER`: no display name,
-/// list, or wildcard (ADR 0183 approver emails, ADR 0175 callers).
+/// list, or wildcard (ADR-0177 amendment approver emails, ADR 0175 callers).
 static BARE_EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r#"^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$"#).expect("bare email re")
 });
@@ -7446,7 +7446,7 @@ fn build_route_bindings(
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
-            // ADR 0183, mirroring the API: only a requesting_surface route shows
+            // ADR-0177 amendment, mirroring the API: only a requesting_surface route shows
             // its card in an email thread. On a fixed Slack target an address
             // can never be verified, so the list could only admit nobody.
             if approvers.emails.is_some()

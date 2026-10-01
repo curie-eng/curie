@@ -328,7 +328,7 @@ def decided_field(resolved_at: datetime) -> MessageField:
     return MessageField(label=DECIDED_FIELD_LABEL, value=instant.astimezone(UTC).isoformat())
 
 
-# The addresses that may answer an email card (ADR 0183 decision 5), one field
+# The addresses that may answer an email card (ADR-0177 amendment A5), one field
 # per address, riding the card's ``fields`` for the same reason as
 # ``DECIDED_FIELD_LABEL``: the card's models are decoded strictly out of
 # process. The mail adapter reads them only to word the request email (who can

@@ -2364,7 +2364,7 @@ def test_the_created_record_carries_the_turns_kind_and_adapter(make_harness) -> 
     async def go() -> None:
         approvals = RecordingApprovals()
         # An email approval is created only for a route that lists approver
-        # emails (ADR 0183); a routeless one escalates.
+        # emails (ADR-0177 amendment); a routeless one escalates.
         binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote to ACME", "approve")
@@ -5520,7 +5520,7 @@ def test_tool_approval_card_reaches_the_cluster_message_caller(
 # --- ADR-0177: a route may show its card where the request was asked ----------
 
 _REQUESTING_SURFACE = {"resolution": {"mode": "requesting_surface"}}
-# ADR 0183: an email card needs a route that lists approver emails, or the
+# ADR-0177 amendment: an email card needs a route that lists approver emails, or the
 # approval escalates when raised.
 _LISTED_EMAIL_ROUTE = {**_REQUESTING_SURFACE, "approvers": {"emails": ["approver@example.com"]}}
 _MAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
@@ -5545,7 +5545,7 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
 ) -> None:
     """ADR-0177 decision 1: the card joins the conversation that asked, over
     that conversation's own transport, and the record says so, which is what
-    the API's served check and approver email list read back (ADR 0183)."""
+    the API's served check and approver email list read back (ADR-0177 amendment)."""
 
     async def go() -> None:
         approvals = RecordingApprovals()
@@ -5599,7 +5599,7 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
 def test_an_email_card_names_every_listed_approver_and_a_slack_card_names_none(
     make_harness,
 ) -> None:
-    """ADR 0183 decision 5: the email card carries the route's listed addresses,
+    """ADR-0177 amendment A5: the email card carries the route's listed addresses,
     so the mail adapter can tell the requester who can approve. Every address,
     lowercased, once, in list order. A Slack card on a route that also lists
     emails carries none: an address means nothing on Slack."""
@@ -5706,7 +5706,7 @@ def test_a_requesting_surface_route_asked_in_slack_joins_the_slack_thread(
 @pytest.mark.parametrize(
     ("route", "routes"),
     [
-        # Routeless: no binding, so no list (ADR 0183 decision 3).
+        # Routeless: no binding, so no list (ADR-0177 amendment A3).
         (None, None),
         # The mode alone lists nobody; the requester is not a default.
         ("confirm", {"confirm": _REQUESTING_SURFACE}),
@@ -5720,7 +5720,7 @@ def test_a_requesting_surface_route_asked_in_slack_joins_the_slack_thread(
 def test_an_email_approval_nobody_is_listed_for_escalates_at_raise_time(
     make_harness, route: str | None, routes: dict | None
 ) -> None:
-    """ADR 0183 decision 3: on email only an address on the route's approver
+    """ADR-0177 amendment A3: on email only an address on the route's approver
     list may answer. Rather than create an approval nobody there can answer,
     the turn escalates and says why."""
 

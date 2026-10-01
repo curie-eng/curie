@@ -25,7 +25,7 @@ but neither kind may manufacture Slack channel evidence. An ``adapter``
 Slack set, the explicit user list included, names Slack IDs that only the Slack
 dispatcher vouches for (ADR-0106), so no Slack set admits an adapter at all
 (ADR-0177, "A separate finding"). The reverse holds for a card shown in an
-email thread (ADR 0183): its approver email list admits only the adapter that
+email thread (ADR-0177 amendment): its approver email list admits only the adapter that
 serves that channel, so no ``chat``, ``console`` or ``operator`` principal is
 eligible there.
 

@@ -215,7 +215,7 @@ service is material:
 - **Fixed ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)): an approval is answered where it was asked.** An adapter
   is served the approvals whose card went to one of its own bindings. A card
   shown in an email thread is answered only by a verified sender on the route's
-  approver `emails` ([ADR-0183](../../adr/0183-an-email-approval-is-answered-only-by-a-listed-address.md),
+  approver `emails` ([ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists),
   `apps/api/src/curie_api/approvers.py::EmailApprovers`), after the binding's
   `allowed_callers` admit that sender; no other channel has a list yet, so its
   cards admit nobody. The platform half

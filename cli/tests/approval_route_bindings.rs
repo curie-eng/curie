@@ -1280,7 +1280,7 @@ async fn a_requesting_surface_route_refuses_a_notification_an_unknown_mode_and_a
     }
 }
 
-// --- ADR 0183: an email approval is answered only by a listed address --------
+// --- ADR-0177 amendment: an email approval is answered only by a listed address ---
 
 #[tokio::test]
 async fn routes_from_forwards_approver_emails_beside_slack_users() {

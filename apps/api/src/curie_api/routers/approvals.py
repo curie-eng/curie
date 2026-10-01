@@ -394,7 +394,7 @@ CALLER_NOT_ALLOWED_DETAIL = "caller_not_allowed"
 async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sender: str) -> None:
     """Refuse an adapter's answer from a sender the asking binding does not admit.
 
-    ADR 0183 decision 2: the inbound allowlist comes before any approval logic.
+    ADR-0177 amendment A2: the inbound allowlist comes before any approval logic.
     An answer carried by an adapter comes from the conversation that asked, so
     the binding that took that conversation's turns decides, through the one
     admission check (``admission.admit``, ADR 0175), whether its sender may use

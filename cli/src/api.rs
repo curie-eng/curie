@@ -437,7 +437,7 @@ pub struct ApprovalNotificationTargetResponse {
 /// `ApprovalApprovers`. The API settles the precedence (`users` wins over
 /// `group`); the CLI never reorders or merges them, it forwards what was asked
 /// for and lets the one authoritative validator answer. `emails` is read only
-/// for a card shown in an email thread (ADR 0183), never for a Slack card.
+/// for a card shown in an email thread (ADR-0177 amendment), never for a Slack card.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalApprovers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
