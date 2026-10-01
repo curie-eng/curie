@@ -360,3 +360,11 @@ explicitly selected with `CURIE_E2E_LIVE=1`, including the provider-side web
 search proof, may instead use an already-authenticated local Claude SDK. Without
 either authentication path they fail honestly rather than fabricating a live
 result.
+
+## Approval display wording
+
+Permission approval records retain the exact tool identifier and arguments.
+The card and waiting notice describe the requested action in plain language,
+including when a bundle has no summary template or its template cannot render.
+Do not present MCP identifiers or argument field names as prose. Preserve the
+requested values and do not imply that the pending action has run.
