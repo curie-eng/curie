@@ -843,6 +843,28 @@ def test_block_breaks_scrub_a_long_turn_in_linear_work(monkeypatch: pytest.Monke
     assert sum(scanned) <= 6 * total, sum(scanned)
 
 
+def test_block_breaks_stay_linear_inside_a_long_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#3694 review: a match that appears only after a held value is replaced
+    can cover many joins. Rejected breaks must not rescan the run each time,
+    and no break may trail the placeholder that swallowed the rest."""
+
+    scanned: list[int] = []
+    real = redact_module.redact_text
+
+    def counting(text: str) -> str:
+        scanned.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(redact_module, "redact_text", counting)
+    blocks = ["see ?token=Ax y", *(f"blk{index}" for index in range(500))]
+    total = sum(len(block) for block in blocks)
+
+    _, final = _redacted_turn(frozenset({"x y"}), blocks, "".join(blocks))
+
+    assert final == "see [REDACTED:url_secret_param]"
+    assert sum(scanned) <= 12 * total, sum(scanned)
+
+
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
 def test_http_reply_applies_every_shared_redaction_rule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, vector: str
