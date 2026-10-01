@@ -64,6 +64,7 @@ from channel_protocol import (
     Action,
     ConfirmIntent,
     OutboundMessage,
+    parse_scoped_conversation_id,
     scoped_conversation_id,
 )
 from channel_protocol.reply import (
@@ -117,6 +118,7 @@ from .behaviorpacks import (
 from .binding import (
     CONNECTOR_CALLER_TOKEN_ENV,
     DECISION_ENV,
+    EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
     MAX_TURNS_ENV,
@@ -375,7 +377,9 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     is a segment after the kind unless it is none or ``default``
     (ADR-0168 decision 4), built by ``channel_protocol.scoped_conversation_id``
     itself, so a pre-ADR key is unchanged and a named one has one more
-    segment. The worker only compares the key; it never parses it back.
+    segment. The worker only compares the key; the one place it reads a key
+    back is quota-pressure ordering (``_is_eval_thread_key``), through the
+    canonical inverse.
     """
     if qevent.reply_handle is None and qevent.hook_run is not None:
         # A targetless cron turn (#2963) has no channel pair; its thread belongs
@@ -391,6 +395,18 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         qevent.conversation_id,
         identity=route_identity(handle.kind, binding_adapter_for_handle(handle)),
     )
+
+
+def _is_eval_thread_key(thread_key: str) -> bool:
+    """True when ``thread_key`` was built from an eval conversation id.
+
+    The eval paths stamp ``EVAL_ISOLATE_THREAD_PREFIX`` onto the conversation id
+    (#1909), and ``_thread_key_for`` scopes it, so the prefix is only visible
+    after the canonical inverse. A key that does not parse is not an eval key:
+    quota-pressure ordering then falls back to plain expiry order.
+    """
+    parsed = parse_scoped_conversation_id(thread_key)
+    return parsed is not None and parsed.conversation_id.startswith(EVAL_ISOLATE_THREAD_PREFIX)
 
 
 def _route_from_handle(qevent: QueuedTurn) -> TargetRoute:
@@ -6557,10 +6573,18 @@ class Kernel:
             return _PressureResult(False, inventory.outcome)
 
         saw_race = False
+        # Idle eval routes go first, so a liveness probe's sandboxes are freed
+        # before a person's. The sort is stable: each group keeps the
+        # inventory's (expiry, thread key) order.
         candidates = tuple(
-            candidate
-            for candidate in inventory.candidates
-            if candidate.thread_key != requesting_thread_key
+            sorted(
+                (
+                    candidate
+                    for candidate in inventory.candidates
+                    if candidate.thread_key != requesting_thread_key
+                ),
+                key=lambda candidate: not _is_eval_thread_key(candidate.thread_key),
+            )
         )[:_PRESSURE_CANDIDATES]
         for candidate in candidates:
             if time.monotonic() >= pressure_deadline:
