@@ -5257,6 +5257,46 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
     asyncio.run(go())
 
 
+def test_an_email_card_names_every_listed_approver_and_a_slack_card_names_none(
+    make_harness,
+) -> None:
+    """ADR 0183 decision 5: the email card carries the route's listed addresses,
+    so the mail adapter can tell the requester who can approve. Every address,
+    lowercased, once, in list order. A Slack card on a route that also lists
+    emails carries none: an address means nothing on Slack."""
+
+    async def go() -> None:
+        route = {
+            **_REQUESTING_SURFACE,
+            "approvers": {
+                "emails": [
+                    "approver@example.com",
+                    "Second.Approver@Example.com",
+                    "approver@example.com",
+                ],
+                "users": ["U0EXAMPLE1"],
+            },
+        }
+        binding = RoutedBinding({"confirm": route})
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_email_qevent("send it", thread="th-mail-names"))
+            (_address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert [(f.label, f.value) for f in message.fields] == [
+                ("Approver", "approver@example.com"),
+                ("Approver", "second.approver@example.com"),
+            ]
+
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_qevent("send it", thread="th-slack-names"))
+            (address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert address == "C1"
+            assert message.fields == []
+
+    asyncio.run(go())
+
+
 def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harness) -> None:
     """ADR-0177 decision 6: whatever ends the approval, the resume settles the
     one card. For email the adapter turns the settled update into a follow-up,

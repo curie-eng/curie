@@ -630,6 +630,75 @@ def test_a_listed_verified_sender_answers_and_the_session_resumes(
     assert again.status_code == 409, again.text
 
 
+def test_a_listed_requester_may_approve_their_own_request(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR 0183 decision 5, as Slack under ADR-0106: being the person who asked
+    neither grants nor blocks. A requester whose own address is listed answers
+    their own request, and the audit row says the list admitted them."""
+
+    agent = _email_agent(
+        surface_client,
+        auth_headers,
+        routes={
+            LISTED_ROUTE: {
+                "resolution": REQUESTING_SURFACE,
+                "approvers": {"emails": [REQUESTER, APPROVER]},
+            }
+        },
+    )
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    assert approval["author"] == REQUESTER
+    token = _adapter_token([agent["binding_id"]])
+
+    accepted = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "approved"
+    assert accepted.json()["resolved_by"] == REQUESTER
+    (row,) = _audit(surface_client, auth_headers, approval["id"])
+    assert (row["action"], row["authorizer"]) == ("resolved", "EmailApproverList")
+    assert row["evidence"]["actor_listed"] is True
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
+def test_several_listed_approvers_on_the_thread_the_first_answer_wins(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR 0183 decision 5: several listed approvers may be copied in. The first
+    answer the platform accepts settles the approval for good: a second listed
+    approver, answering the other way, is refused and changes nothing."""
+
+    agent = _email_agent(
+        surface_client,
+        auth_headers,
+        routes={
+            LISTED_ROUTE: {
+                "resolution": REQUESTING_SURFACE,
+                "approvers": {"emails": [APPROVER, COPIED]},
+            }
+        },
+    )
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    token = _adapter_token([agent["binding_id"]])
+
+    first = _resolve(surface_client, approval["id"], _adp(token, COPIED), "rejected")
+    assert first.status_code == 200, first.text
+    second = _resolve(surface_client, approval["id"], _adp(token, APPROVER), "approved")
+    assert second.status_code == 409, second.text
+
+    record = surface_client.get(f"/approvals/{approval['id']}", headers=auth_headers).json()
+    assert (record["status"], record["resolved_by"]) == ("rejected", COPIED)
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
 @pytest.mark.parametrize("actor", [COPIED, REQUESTER, f"{APPROVER}.example.net"])
 def test_an_unlisted_sender_the_inbox_admits_cannot_answer(
     surface_client: TestClient,
