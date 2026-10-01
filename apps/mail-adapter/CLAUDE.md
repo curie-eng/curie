@@ -60,6 +60,7 @@ the enforceable-rule summary.
   `emails`. Do not add a local approver or requester filter. A
   `caller_not_allowed` refusal gets nothing back. Never respond to an automatic
   message. A settled card spends its reference.
+- **Reply all only for the approval request and its outcome** (ADR 0183 decision 5). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's

@@ -712,7 +712,7 @@ class _RaiseOnceClient(AgentMailClient):
         super().__init__(config)
         self.calls = 0
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("injected")

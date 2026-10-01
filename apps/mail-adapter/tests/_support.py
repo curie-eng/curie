@@ -21,6 +21,7 @@ about production. See `MailState.visible` for the behavior and its sources.
 from __future__ import annotations
 
 import base64
+import email.utils
 import http.client
 import json
 import os
@@ -82,6 +83,10 @@ class MailState:
         self.threads: dict[str, list[dict[str, Any]]] = {}
         self.deleted_threads: set[str] = set()
         self.replies: list[tuple[str, str]] = []  # (in_reply_to_message_id, text)
+        # Who each reply reached, as the provider addresses it: the sender of
+        # the message replied to, or with `reply_all` everyone on it (From, To,
+        # Cc) but this inbox. (in_reply_to_message_id, recipients, text).
+        self.deliveries: list[tuple[str, frozenset[str], str]] = []
         self.list_calls = 0
         # time.monotonic() per list call, so the retry CADENCE is observable at
         # the real external seam rather than inferred from the adapter's logs.
@@ -99,6 +104,9 @@ class MailState:
         # failure). One-shot rather than sticky because the failures these model
         # are transient, and the recovery is half of what each test pins.
         self.fail_next_reply: int | None = None
+        # One-shot: answer the next reply to this one message id with a 503,
+        # so a test can fail one send of several and watch the rest.
+        self.fail_next_reply_to: str | None = None
         self.fail_next_list: int | None = None
         self.fail_next_body: int | None = None
         self.fail_next_thread: int | None = None
@@ -157,8 +165,14 @@ class MailState:
         labels: list[str] | None = None,
         full_text: str | None = None,
         headers: dict[str, str] | None = None,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
     ) -> dict[str, Any]:
         """Seed one inbound message.
+
+        ``to`` defaults to this inbox alone and ``cc`` to nobody; Get Message
+        serves both as "Addresses of recipients. In format `username@domain.com`
+        or `Display Name <username@domain.com>`".
 
         ``full_text`` is the whole plain-text body, quoted history included,
         where the provider serves one beside ``extracted_text`` (the new text
@@ -186,6 +200,9 @@ class MailState:
             body["text"] = full_text
         if headers is not None:
             body["headers"] = dict(headers)
+        body["to"] = list(to if to is not None else [INBOX])
+        if cc is not None:
+            body["cc"] = list(cc)
         self.bodies[message_id] = body
         self.threads.setdefault(thread_id, []).append(self.bodies[message_id])
         return summary
@@ -248,6 +265,28 @@ class MailState:
 
     def replies_to(self, message_id: str) -> list[str]:
         return [text for mid, text in self.replies if mid == message_id]
+
+    def received_by(self, address: str) -> list[str]:
+        """Every reply that reached ``address``, oldest first."""
+        return [text for _mid, recipients, text in self.deliveries if address in recipients]
+
+    def recipients(self, message_id: str, reply_all: bool) -> frozenset[str]:
+        """Who a reply to ``message_id`` reaches, as Reply To Message documents.
+
+        "reply_all (boolean, optional): Reply to all recipients of the original
+        message"; without it, the original's sender.
+        https://docs.agentmail.to/api-reference/inboxes/messages/reply
+        """
+        original = self.bodies[message_id]
+        fields = ("from", "to", "cc") if reply_all else ("from",)
+        found: set[str] = set()
+        for field in fields:
+            value = original.get(field) or []
+            for entry in value if isinstance(value, list) else [value]:
+                found.add(email.utils.parseaddr(str(entry))[1].lower())
+        found.discard(INBOX)
+        found.discard("")
+        return frozenset(found)
 
 
 class IngressState:
@@ -379,10 +418,14 @@ class MailHandler(_JsonHandler):
         # /v0/inboxes/{inbox}/messages/{message_id}/reply
         if len(parts) == 6 and parts[3] == "messages" and parts[5] == "reply":
             message_id = parts[4]
-            text = self._read_body().get("text", "")
+            request_body = self._read_body()
+            text = request_body.get("text", "")
             state.reply_entered.set()
             state.reply_gate.wait(30)
             failure = state.fail_next_reply
+            if failure is None and state.fail_next_reply_to == message_id:
+                state.fail_next_reply_to = None
+                failure = 503
             if failure is not None:
                 state.fail_next_reply = None
                 if failure == 0:
@@ -390,6 +433,8 @@ class MailHandler(_JsonHandler):
                     return
                 return self._send(failure, {"detail": "injected provider failure"})
             state.replies.append((message_id, text))
+            reply_all = request_body.get("reply_all") is True
+            state.deliveries.append((message_id, state.recipients(message_id, reply_all), text))
             thread_id = state.bodies[message_id]["thread_id"]
             reply_id = f"{message_id}-reply-{len(state.replies)}"
             state.threads.setdefault(thread_id, []).append(
@@ -616,15 +661,22 @@ def approval_card(
     text: str = "Send the quote",
     conversation_id: str = "thr-1",
     requested_by: str = "human@example.com",
+    approvers: list[str] | None = None,
 ) -> dict[str, Any]:
     """The worker's approval card: a `reply.post` carrying a Confirm intent.
 
     The shape `_pause_for_approval` in `apps/worker/src/curie_worker/kernel.py`
     emits: the approval id on the intent and both actions, a note allowed, and
-    `requested_by` the turn's author.
+    `requested_by` the turn's author. `approvers` are the route's listed
+    addresses, as the `Approver` fields that kernel attaches (ADR 0183
+    decision 5); None leaves them off, as a worker before that sends.
     """
     event = reply_post(text, conversation_id)
     event["requested_by"] = requested_by
+    if approvers is not None:
+        event["message"]["fields"] = [
+            {"label": "Approver", "value": address} for address in approvers
+        ]
     event["message"]["interaction"] = {
         "kind": "confirm",
         "id": approval_id,

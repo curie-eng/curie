@@ -13,7 +13,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -192,7 +192,11 @@ class MailState:
             # ADR-0177: one random single-use reference per approval card this
             # adapter rendered. It links a reply to its approval; it proves
             # nothing about who sent the reply, which the platform decides from
-            # the verified sender (ADR 0183).
+            # the verified sender (ADR 0183). ``requester`` and ``approvers``
+            # (a JSON list) word the emails; ``answer_message_id`` and
+            # ``answer_participants`` (a JSON list) say where the outcome goes;
+            # ``follow_ups_sent`` counts the follow-up sends already made, so a
+            # retried settlement never sends one twice (ADR 0183 decision 5).
             self.connection.executescript(
                 """
                 BEGIN IMMEDIATE;
@@ -202,6 +206,11 @@ class MailState:
                     conversation_id TEXT NOT NULL,
                     reply_ref TEXT NOT NULL,
                     state TEXT NOT NULL,
+                    requester TEXT NOT NULL DEFAULT '',
+                    approvers TEXT NOT NULL DEFAULT '[]',
+                    answer_message_id TEXT,
+                    answer_participants TEXT,
+                    follow_ups_sent INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -595,11 +604,25 @@ class MailState:
         conversation_id: str,
         reply_ref: str,
         reference: str,
+        *,
+        requester: str = "",
+        approvers: Sequence[str] = (),
     ) -> str:
         """Keep ``reference`` for this approval, or return the one already kept.
 
         Idempotent on the approval id, so a redelivered card post renders the
         same reference rather than minting a second one for one approval.
+
+        Args:
+            approval_id: the platform's approval id.
+            conversation_id: the thread the card was rendered in.
+            reply_ref: the asking message, whose reply carries the card.
+            reference: the fresh reference to keep if none is kept yet.
+            requester: the bare address of the person who asked.
+            approvers: the route's listed approver addresses, for wording only.
+
+        Returns:
+            The reference kept for this approval.
         """
         now = time.time()
         with self.transaction() as connection:
@@ -610,46 +633,96 @@ class MailState:
                 return str(row[0])
             connection.execute(
                 "INSERT INTO approval_refs(reference, approval_id, conversation_id, "
-                "reply_ref, state, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, 'live', ?, ?)",
-                (reference, approval_id, conversation_id, reply_ref, now, now),
+                "reply_ref, state, requester, approvers, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, 'live', ?, ?, ?, ?)",
+                (
+                    reference,
+                    approval_id,
+                    conversation_id,
+                    reply_ref,
+                    requester,
+                    json.dumps(list(approvers)),
+                    now,
+                    now,
+                ),
             )
             return reference
 
-    def approval_refs_in(self, conversation_id: str) -> list[dict[str, str]]:
+    _REF_COLUMNS = (
+        "reference, approval_id, conversation_id, reply_ref, state, requester, approvers, "
+        "answer_message_id, answer_participants, follow_ups_sent"
+    )
+
+    @staticmethod
+    def _ref_row(row: Sequence[Any]) -> dict[str, Any]:
+        """One ``approval_refs`` row, in ``_REF_COLUMNS`` order, as a dict."""
+        return {
+            "reference": row[0],
+            "approval_id": row[1],
+            "conversation_id": row[2],
+            "reply_ref": row[3],
+            "state": row[4],
+            "requester": row[5],
+            "approvers": list(json.loads(row[6] or "[]")),
+            "answer_message_id": row[7],
+            "answer_participants": list(json.loads(row[8] or "[]")),
+            "follow_ups_sent": int(row[9]),
+        }
+
+    def approval_refs_in(self, conversation_id: str) -> list[dict[str, Any]]:
         """Every reference this adapter issued in one conversation, any state."""
         with self.lock:
             rows = self.connection.execute(
-                "SELECT reference, approval_id, reply_ref, state "
+                f"SELECT {self._REF_COLUMNS} "
                 "FROM approval_refs WHERE conversation_id=? ORDER BY created_at",
                 (conversation_id,),
             ).fetchall()
-        return [
-            {
-                "reference": row[0],
-                "approval_id": row[1],
-                "conversation_id": conversation_id,
-                "reply_ref": row[2],
-                "state": row[3],
-            }
-            for row in rows
-        ]
+        return [self._ref_row(row) for row in rows]
 
-    def approval_ref_for(self, approval_id: str) -> dict[str, str] | None:
+    def approval_ref_for(self, approval_id: str) -> dict[str, Any] | None:
         with self.lock:
             row = self.connection.execute(
-                "SELECT reference, conversation_id, reply_ref, state "
-                "FROM approval_refs WHERE approval_id=?",
+                f"SELECT {self._REF_COLUMNS} FROM approval_refs WHERE approval_id=?",
                 (approval_id,),
             ).fetchone()
-        if row is None:
-            return None
-        return {
-            "reference": row[0],
-            "conversation_id": row[1],
-            "reply_ref": row[2],
-            "state": row[3],
-        }
+        return None if row is None else self._ref_row(row)
+
+    def live_approval_on(self, conversation_id: str, reply_ref: str) -> bool:
+        """Whether this reply carries a card whose approval is still open.
+
+        That reply is the request email, which goes to everyone on the asking
+        message so listed approvers copied there see it (ADR 0183 decision 5).
+        """
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM approval_refs "
+                "WHERE conversation_id=? AND reply_ref=? AND state='live' LIMIT 1",
+                (conversation_id, reply_ref),
+            ).fetchone()
+        return row is not None
+
+    def record_approval_answer(
+        self, reference: str, message_id: str, participants: Sequence[str]
+    ) -> None:
+        """Remember the message that carried the winning answer, once.
+
+        The outcome is sent to everyone on that message. The first one recorded
+        stands: resolve is resolve-once, so a later message cannot have won.
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET answer_message_id=?, answer_participants=?, "
+                "updated_at=? WHERE reference=? AND answer_message_id IS NULL",
+                (message_id, json.dumps(list(participants)), time.time(), reference),
+            )
+
+    def record_follow_ups_sent(self, reference: str, count: int) -> None:
+        """Count the follow-up sends made so far for a settlement in progress."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET follow_ups_sent=?, updated_at=? WHERE reference=?",
+                (count, time.time(), reference),
+            )
 
     def set_approval_ref_state(self, reference: str, state: ApprovalRefState) -> None:
         """Move a reference forward; a spent reference never comes back."""

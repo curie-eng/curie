@@ -141,12 +141,14 @@ nothing below happens: the card's text is mailed as before and the approval can
 only expire.
 
 **The request.** When the worker posts the approval card into the thread, the
-adapter adds the instructions ("reply with APPROVE or REJECT on the first line;
-anything after it is your note; only an approver listed for this request can
-answer") and a random single-use reference, and keeps that reference with the
-approval id and the thread. The card's ack carries a ref, so the worker can settle
-this card later. The reference links a reply to its approval. It proves nothing
-about who sent the reply: every reply quotes it.
+adapter adds the instructions and a random single-use reference, and keeps that
+reference with the approval id and the thread. The card's ack carries a ref, so
+the worker can settle this card later. The reference links a reply to its
+approval. It proves nothing about who sent the reply: every reply quotes it.
+
+The instructions say who can approve (ADR-0183 decision 5). The worker sends the route's listed approver addresses with the card, as `Approver` fields, and the adapter reads the asking message's To and Cc from the provider. If a listed address is already on the thread (the requester counts), the email names the list and says who on the thread can answer. If none is, it says so, names the list, and asks the requester to reply all and add one or more of them, as many as they like. If the asking message cannot be read, it is worded to hold either way. The adapter uses the list only for wording; the platform still decides who may answer. A card from a worker that sends no `Approver` fields gets the generic instructions ("reply with APPROVE or REJECT on the first line; anything after it is your note; only an approver listed for this request can answer").
+
+**Who receives what.** The request email is sent reply all to the asking message, so a listed approver copied there receives it. Every other reply goes to its sender only, as before, including the resumed answer, which therefore reaches the requester. The adapter never mails an address that is not already on the thread: bringing an approver in is the requester's choice, made by copying them. A reply from someone not listed that copies a listed approver in and carries no decision is the requester doing what was asked, and gets nothing back.
 
 **The reply.** A message in a thread with an approval pending is never a turn.
 It is an answer only when all of these hold:
@@ -169,7 +171,7 @@ the sender's bare address (lowercased, never the display name) as
 `allowed_callers` must admit the sender, and the address must be on the route's
 approver `emails` (ADR-0183). The person who asked is not admitted by default. A
 reply that is not an answer gets the instructions back; a sender the platform
-does not list is told they are not an approver; a sender the binding's
+does not list is told they are not an approver, and who is; a sender the binding's
 `allowed_callers` refuse gets nothing back; a reply to a spent reference is told
 it was already answered. An automatic message gets no
 response at all, so nothing loops. If the platform cannot be reached, or rejects
@@ -181,6 +183,8 @@ card the adapter sends one short follow-up in the thread (approved or rejected,
 by whom, with the note, or expired) and spends the reference. It also reopens
 the asking message's reply, so the resumed turn's answer is mailed in the same
 thread.
+
+The follow-up is sent reply all to the message that carried the winning answer, so the approver, the requester and everyone copied on it see who decided. If the requester is not on that message, because the approver replied to the bot alone, the requester also gets it as a direct reply to the asking message. With no email answer (an expiry), it is sent reply all to the asking message. Each of these sends is counted, so a settlement that failed part way is retried without sending a part twice. The first answer the platform accepts is final: any later answer is told the approval was already answered.
 
 **What this does not authenticate.** Read the inbound security section above:
 nothing here authenticates an individual mailbox. DMARC binds the sending

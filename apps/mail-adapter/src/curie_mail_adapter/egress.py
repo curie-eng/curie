@@ -22,7 +22,7 @@ from channel_protocol import (
 )
 from pydantic import TypeAdapter, ValidationError
 
-from .adapter import APPROVAL_CARD_REF_PREFIX, CHANNEL_KIND, MailAdapter
+from .adapter import APPROVAL_CARD_REF_PREFIX, APPROVER_FIELD_LABEL, CHANNEL_KIND, MailAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +259,12 @@ class EgressHandler(BaseHTTPRequestHandler):
                     conversation_id,
                     interaction.id,
                     event.message.text,
+                    requester=event.requested_by,
+                    approvers=[
+                        item.value
+                        for item in event.message.fields
+                        if item.label == APPROVER_FIELD_LABEL
+                    ],
                 )
             status, recorded_at = self.adapter.record_text_at(
                 conversation_id,

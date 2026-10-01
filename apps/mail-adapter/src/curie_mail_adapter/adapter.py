@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -80,6 +80,12 @@ APPROVAL_INSTRUCTIONS = (
     "Anything after it is your note. Only an approver listed for this request can answer."
 )
 APPROVAL_REF_LABEL = "Approval reference:"
+# The card field the worker names each of the route's listed approver addresses
+# with (ADR 0183 decision 5; ``APPROVER_FIELD_LABEL`` in
+# ``curie_worker.approvals``). Read only to word the emails: who may answer is
+# still the platform's decision.
+APPROVER_FIELD_LABEL = "Approver"
+NOT_AN_APPROVER = "You are not an approver for this request."
 APPROVAL_NOTE_MAX_CHARS = 4000
 DECISIONS = {"APPROVE": "approved", "REJECT": "rejected"}
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
@@ -686,20 +692,28 @@ class MailAdapter:
             self.state.settle_without_turn(message_id, "answered")
             return True
         ref = matched[-1] if matched else live[-1]
-        if not matched:
+        decision, note = _parse_decision(full) if matched else (None, None)
+        copies_in = decision is None and _brings_in_an_approver(ref, sender, full)
+        if ref["state"] == "live" and copies_in:
+            # ADR 0183 decision 5: the requester did what the request email
+            # asked, replying all with a listed approver copied in. That
+            # approver now has the request; answering the requester back with
+            # the instructions would only suggest they got it wrong.
+            logger.info("approval reply correlation=%s copied in an approver", correlation)
+        elif not matched:
             self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
         elif ref["state"] != "live":
             self._notify(message_id, "This approval has already been answered.", correlation)
+        elif decision is None:
+            self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
         else:
-            decision, note = _parse_decision(full)
-            if decision is None:
-                self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
             # The bare address the inbound gate verified, lowercased, never the
             # display name from the From header: that is the only part of it
             # anyone vouched for, and the form the platform's lists are in.
-            elif self._carry_answer(ref, _bare_address(sender), decision, note, message_id) == (
-                "retry"
-            ):
+            outcome = self._carry_answer(
+                ref, _bare_address(sender), decision, note, message_id, full
+            )
+            if outcome == "retry":
                 # The platform could not be asked. Keep the message pending so
                 # the next pass carries the same answer again; resolve is
                 # resolve-once, so a repeat cannot decide twice.
@@ -709,17 +723,19 @@ class MailAdapter:
 
     def _carry_answer(
         self,
-        ref: dict[str, str],
+        ref: dict[str, Any],
         actor: str,
         decision: str,
         note: str | None,
         message_id: str,
+        full: dict[str, Any],
     ) -> AnswerOutcome:
         """Resolve the approval with the adapter's credential and the sender as actor.
 
         The platform decides. A win reopens the asking message's reply owner so
-        the resumed turn can answer on it; the follow-up is sent when the card
-        is settled, whatever ended the approval.
+        the resumed turn can answer on it, and remembers this message and who is
+        on it: the follow-up, sent when the card is settled whatever ended the
+        approval, goes to everyone on the winning answer (ADR 0183 decision 5).
         """
         url = (
             f"{self.config.api_base_url.rstrip('/')}/approvals/"
@@ -738,6 +754,9 @@ class MailAdapter:
         correlation = _correlation(message_id)
         logger.info("approval answer correlation=%s status=%s", correlation, result.status)
         if result.status == 200:
+            self.state.record_approval_answer(
+                ref["reference"], message_id, sorted(self._participants(full))
+            )
             self.state.set_approval_ref_state(ref["reference"], "answered")
             self.state.reopen_reply(ref["conversation_id"], ref["reply_ref"])
             return "resolved"
@@ -748,7 +767,12 @@ class MailAdapter:
         if result.status in (409, 410):
             # Over, but not spent: the card's settlement still owes the one
             # follow-up and must reopen the asking reply for the resumed turn.
-            # A lost 200 retried into a 409 lands here too.
+            # A lost 200 retried into a 409 lands here too, so a 409 records
+            # this message as the answer when none is recorded yet.
+            if result.status == 409:
+                self.state.record_approval_answer(
+                    ref["reference"], message_id, sorted(self._participants(full))
+                )
             self.state.set_approval_ref_state(ref["reference"], "answered")
             text = (
                 "This approval has already been answered."
@@ -762,7 +786,9 @@ class MailAdapter:
             logger.info("approval answer correlation=%s refused: caller not allowed", correlation)
             return "not_an_answer"
         elif result.status == 403:
-            text = "You are not an approver for this request."
+            text = NOT_AN_APPROVER
+            if ref["approvers"]:
+                text += " " + _who_can_approve(ref["approvers"])
         else:
             text = "Your answer could not be accepted for this approval."
         self._notify(message_id, text, correlation)
@@ -785,13 +811,32 @@ class MailAdapter:
         conversation_id: str,
         approval_id: str,
         text: str,
+        *,
+        requester: str = "",
+        approvers: Sequence[str] = (),
     ) -> tuple[int, str | None]:
         """Render an approval card into the pending reply, with a fresh reference.
 
-        Returns the ack status and the card ref the worker keeps to settle this
-        card. Without an adapter principal the card is recorded as plain text,
-        exactly as before, and no ref is returned: nothing here could carry an
-        answer, so nothing invites one.
+        The request says who can approve (ADR 0183 decision 5): the route's
+        listed addresses, and whether any of them is on the thread already (the
+        requester, or the To or Cc of the asking message). When none is, it asks
+        the requester to reply all and copy one or more of them in. The request
+        is mailed reply all, so a listed approver copied on the asking message
+        receives it. Nobody off the thread is mailed.
+
+        Args:
+            conversation_id: the thread the card belongs to.
+            approval_id: the platform's approval id.
+            text: the card's text.
+            requester: the ``requested_by`` of the card, the asking sender.
+            approvers: the card's ``Approver`` fields; empty from a worker that
+                sends none, which keeps the generic instructions.
+
+        Returns:
+            The ack status and the card ref the worker keeps to settle this
+            card. Without an adapter principal the card is recorded as plain
+            text, exactly as before, and no ref is returned: nothing here could
+            carry an answer, so nothing invites one.
         """
         if not self.config.adapter_principal:
             return self.record_text(conversation_id, None, text, append=True), None
@@ -804,13 +849,21 @@ class MailAdapter:
             )
             return 503, None
         reply_ref = refs[0]
+        listed = _listed_addresses(approvers)
+        requester = _bare_address(requester)
         reference = self.state.issue_approval_ref(
             approval_id,
             conversation_id,
             reply_ref,
             f"curie-approval-{secrets.token_urlsafe(18)}",
+            requester=requester,
+            approvers=listed,
         )
-        card = f"{text}\n\n{APPROVAL_INSTRUCTIONS}\n{APPROVAL_REF_LABEL} {reference}"
+        instructions = APPROVAL_INSTRUCTIONS
+        if listed:
+            on_thread = self._on_thread(reply_ref, requester, listed)
+            instructions = _request_instructions(listed, on_thread)
+        card = f"{text}\n\n{instructions}\n{APPROVAL_REF_LABEL} {reference}"
         status = self.record_text(conversation_id, reply_ref, card, append=True)
         if status != 200:
             return status, None
@@ -829,6 +882,9 @@ class MailAdapter:
             # Unknown, already spent, or another delivery holds the send.
             return 200
         self.state.reopen_reply(ref["conversation_id"], ref["reply_ref"])
+        # Read again under the claim: a send counted by an earlier settlement
+        # that failed part way is not made twice.
+        ref = self.state.approval_ref_for(approval_id) or ref
         if settled.decision is None:
             text = "This approval expired before anyone answered it."
         else:
@@ -838,17 +894,50 @@ class MailAdapter:
             text += "."
             if settled.note:
                 text += f"\n\nNote: {settled.note}"
-        status, _body = self.client.reply(ref["reply_ref"], text)
-        if not 200 <= status < 300:
-            logger.warning(
-                "approval follow-up correlation=%s failed: status=%s",
-                _correlation(approval_id),
-                status,
-            )
-            self.state.release_approval_settlement(ref["reference"])
-            return 502
+        sends = _follow_up_sends(ref)
+        for index, (message_id, reply_all) in enumerate(sends):
+            if index < ref["follow_ups_sent"]:
+                continue
+            status, _body = self.client.reply(message_id, text, reply_all=reply_all)
+            if not 200 <= status < 300:
+                logger.warning(
+                    "approval follow-up correlation=%s failed: status=%s",
+                    _correlation(approval_id),
+                    status,
+                )
+                self.state.release_approval_settlement(ref["reference"])
+                return 502
+            self.state.record_follow_ups_sent(ref["reference"], index + 1)
         self.state.set_approval_ref_state(ref["reference"], "spent")
         return 200
+
+    def _participants(self, full: dict[str, Any]) -> set[str]:
+        """The bare addresses on one message, From, To and Cc, without this inbox."""
+        found: set[str] = set()
+        for field in ("from", "to", "cc"):
+            value = full.get(field)
+            for entry in value if isinstance(value, list) else [value]:
+                address = _bare_address(str(entry or ""))
+                if address:
+                    found.add(address)
+        found.discard(self.config.agentmail_inbox.strip().lower())
+        return found
+
+    def _on_thread(self, reply_ref: str, requester: str, listed: list[str]) -> list[str] | None:
+        """The listed approvers already on the asking message, or None if unknown.
+
+        The requester is on the thread by definition. The rest comes from the
+        asking message's To and Cc, read from the provider; when it cannot be
+        read and the requester is not listed, the answer is unknown, and the
+        request is worded so it holds either way.
+        """
+        status, full = self.client.get_message(reply_ref)
+        if status == 200 and isinstance(full, dict):
+            present = self._participants(full) | {requester}
+            return [address for address in listed if address in present]
+        if requester in listed:
+            return [requester]
+        return None
 
     # -- egress -------------------------------------------------------------
 
@@ -1022,7 +1111,12 @@ class MailAdapter:
                     _correlation(event_id),
                 )
                 return 502
-            status, response = self.client.reply(reply_ref, body)
+            # The request email goes to everyone on the asking message, so a
+            # listed approver copied there receives it (ADR 0183 decision 5).
+            # Every other reply, the resumed answer included, goes to the
+            # sender, which on that message is the requester.
+            reply_all = self.state.live_approval_on(conversation_id, reply_ref)
+            status, response = self.client.reply(reply_ref, body, reply_all=reply_all)
             if (
                 status == 0
                 and isinstance(response, dict)
@@ -1062,6 +1156,91 @@ class MailAdapter:
 
 def _labels(message: dict[str, Any]) -> list[str]:
     return [str(label).strip().lower() for label in (message.get("labels") or [])]
+
+
+def _listed_addresses(approvers: Iterable[str]) -> list[str]:
+    """The card's approver addresses: bare, lowercased, once each, in order."""
+    seen: dict[str, None] = {}
+    for entry in approvers:
+        address = _bare_address(entry)
+        if "@" in address:
+            seen.setdefault(address, None)
+    return list(seen)
+
+
+def _who_can_approve(listed: list[str]) -> str:
+    """One sentence naming who can approve and how to bring them in."""
+    if len(listed) == 1:
+        return f"Only {listed[0]} can approve it. Reply all to this email and add {listed[0]}."
+    return (
+        f"Only these addresses can approve it: {', '.join(listed)}. Reply all to this email "
+        "and add one or more of them, as many as you like."
+    )
+
+
+def _request_instructions(listed: list[str], on_thread: list[str] | None) -> str:
+    """How to answer, worded for who is on the thread (ADR 0183 decision 5).
+
+    Args:
+        listed: the route's listed approver addresses, never empty.
+        on_thread: the listed addresses already on the thread, or None when
+            the asking message could not be read.
+
+    Returns:
+        The instructions placed above the reference in the request email.
+    """
+    answer = (
+        "with APPROVE or REJECT on the first line. Anything after it is the note. "
+        "The first answer decides, and it is final."
+    )
+    if on_thread:
+        return (
+            f"Who can approve: {', '.join(listed)}.\n"
+            f"Already on this thread and able to answer: {', '.join(on_thread)}.\n"
+            f"To answer, reply all to this email {answer}"
+        )
+    if on_thread is None:
+        lead = "If none of the people who can approve is on this thread yet:"
+    else:
+        lead = "Nobody on this thread can approve this request yet."
+    return (
+        f"{lead} {_who_can_approve(listed)}\n"
+        f"Anyone listed who is on the thread can then answer by replying all {answer}"
+    )
+
+
+def _brings_in_an_approver(ref: dict[str, Any], sender: str, full: dict[str, Any]) -> bool:
+    """Whether a non-answer from someone not listed copies a listed approver in."""
+    listed = set(ref.get("approvers") or [])
+    if not listed or _bare_address(sender) in listed:
+        return False
+    copied = set()
+    for field in ("to", "cc"):
+        value = full.get(field)
+        for entry in value if isinstance(value, list) else [value]:
+            copied.add(_bare_address(str(entry or "")))
+    return bool(listed & copied)
+
+
+def _follow_up_sends(ref: dict[str, Any]) -> list[tuple[str, bool]]:
+    """Where a settled card's outcome goes: (message to reply to, reply all).
+
+    Reply all to the message that carried the winning answer, so the approver
+    and everyone on it see who decided. When no email answered it (expiry, or
+    an answer this adapter did not carry), reply all to the asking message. If
+    the requester is not on the winning message, because the approver replied
+    to the bot alone, they also get the outcome as a direct reply to the asking
+    message, whose sender they are (ADR 0183 decision 5).
+    """
+    asking = str(ref["reply_ref"])
+    answer = ref.get("answer_message_id")
+    if not answer or answer == asking:
+        return [(asking, True)]
+    sends = [(str(answer), True)]
+    requester = ref.get("requester") or ""
+    if not requester or requester not in set(ref.get("answer_participants") or []):
+        sends.append((asking, False))
+    return sends
 
 
 def _sent_automatically(full: dict[str, Any], sender: str) -> bool:
