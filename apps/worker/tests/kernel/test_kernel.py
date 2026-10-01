@@ -4773,9 +4773,12 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3693: a quota refusal on an approval resume is not a runner failure.
+    """#3693, #3700: a resume that reclamation cannot help is not a runner failure.
 
-    It still retries, but under its own class, and the person is told the
+    The reclamation pass runs for the resume as for any turn, finds no idle
+    route to free, and the resume keeps its retries. Each of the three
+    attempts records the pass, and the failure is a ``sandbox-capacity``
+    escalation, not the fresh-turn capacity reply. The person is told the
     agent was at capacity, with no quota detail (#2434). The same event id
     resumes an approved, a rejected and an expired approval, so the sentence
     names the decision, not an approval.
@@ -4796,27 +4799,14 @@ def test_approval_resume_capacity_retries_then_escalates(
             max_attempts=3,
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
         ) as h:
             thread = "t-approval-capacity"
-            candidate = await _safe_pressure_candidate(h, "tApprovalSafeCandidate")
             await asyncio.to_thread(h.substrate.claim, thread)
             await asyncio.to_thread(h.substrate.suspend, thread, history_ref="history-1")
 
-            def scan_must_not_run(**_kwargs: object) -> object:
-                raise AssertionError("approval resume reached pressure inventory")
-
-            monkeypatch.setattr(
-                h.substrate._affinity,  # noqa: SLF001
-                "pressure_candidates",
-                scan_must_not_run,
-            )
             h.fake_k8s.claim_envs.clear()
-            h.fake_k8s.quota_rejection = QuotaRejection(
-                quota_name="curie-sandbox-quota",
-                requested={"limits.cpu": "NaN"},
-                used={"limits.cpu": "8"},
-                hard={"limits.cpu": "8"},
-            )
+            h.fake_k8s.quota_rejection = _quota_rejection()
             endpoint = "http://127.0.0.1:43199"
             ev = qevent(
                 "approved continuation",
@@ -4824,8 +4814,9 @@ def test_approval_resume_capacity_retries_then_escalates(
                 event_id="approval-example-resolved",
                 endpoint=endpoint,
             )
+            lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev)
+            await h.kernel.process_event(ev, lease=lease)
 
             assert len(h.fake_k8s.claim_envs) == 3
             assert h.runner.opened == []
@@ -4855,9 +4846,108 @@ def test_approval_resume_capacity_retries_then_escalates(
                 "sandbox-capacity",
                 "sandbox-capacity",
             ]
+            reclaims = [
+                attrs["outcome"]
+                for name, attrs in recorded
+                if name == "curie.sandbox.lifecycle" and attrs.get("operation") == "reclaim"
+            ]
+            assert reclaims == ["refused-no-safe-route"] * 3
             assert h.sink.update_endpoints == [endpoint]
-            assert h.substrate.lookup(_thread_key("tApprovalSafeCandidate")) == candidate
             assert h.kernel._order_locks == {}
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_capacity_reclaims_an_idle_route_and_runs(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3700: an approved continuation frees an idle route like any other turn.
+
+    The resume is refused for quota once while a proven-safe idle route holds
+    the capacity. The same bounded pass a fresh turn gets deletes that route,
+    confirms headroom, and the one retry runs the continuation instead of
+    failing it.
+    """
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim = await _safe_pressure_candidate(h, "tApprovalIdleVictim")
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            h.runner.default_script = [Final(text="continued after reclaim", status=DONE)]
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-reclaims",
+                event_id="approval-reclaims-resolved",
+            )
+            lease = await _pressure_lease(h, ev.event_id)
+
+            await h.kernel.process_event(ev, lease=lease)
+
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(victim.thread_key) is None
+            assert h.runner.opened == ["approved continuation"]
+            assert h.sink.last_text == "continued after reclaim"
+            assert not any("curie-turn-failure" in update[2] for update in h.sink.updates)
+            assert outcomes == ["reclaimed"]
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3700: the retry after a reclamation is refused again.
+
+    The resume records ``reclaimed-retry-refused`` and fails as
+    ``sandbox-capacity``. It neither sends the fresh turn's capacity reply nor
+    asks to wait for capacity (#2711), which would drop the approved
+    continuation.
+    """
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            max_attempts=1,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim = await _safe_pressure_candidate(h, "tApprovalRefusedVictim")
+            # Headroom is confirmed after the reclamation, then the retry is
+            # refused again: nothing releases capacity to the claim table.
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-refused-again",
+                event_id="approval-refused-again-resolved",
+            )
+            lease = await _pressure_lease(h, ev.event_id)
+
+            await h.kernel.process_event(ev, lease=lease)
+
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            # "reclaimed" is recorded only when the retry succeeds.
+            assert outcomes == ["reclaimed-retry-refused"]
+            assert h.runner.opened == []
+            reply = h.sink.updates[-1][2]
+            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
+            assert "queued" not in reply.lower()
+            assert "limits.cpu" not in reply
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
