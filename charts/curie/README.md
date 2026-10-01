@@ -1934,10 +1934,24 @@ which selects the same pods on the server's own port. No rendered policy opens
 that port, so the caller also needs an ingress policy of your own naming it.
 
 `curie cluster up` generates the pair on a release that records none and
-re-supplies it on every upgrade, as it does the sealing keypair. `--dev`
-generates none, and neither does a plain `helm install` that sets no
-`connectorCaller` value: with no key the worker mints no token, the API renders
-no proxy, and each connector's NetworkPolicy is its only access check.
+re-supplies it on every upgrade, as it does the sealing keypair. `--dev` mints
+none. With `security.allowDevDefaults` exactly `true` (as `--dev` and
+`values-dev.yaml` set it) and neither half of the pair set, the chart ships the
+published dev pair (the 32-byte seed `curie-dev-connector-caller-seed!`),
+which, like every other published dev credential, is not production material.
+It is never written to the release values, so a later sealed `cluster up` sees
+no recorded pair and generates a fresh one. A plain `helm install` or `helm
+upgrade` that sets no `connectorCaller` value generates nothing. With no key
+the API refuses to render a hosted connector (`hosted_connector_requires_caller_key`,
+issue #3552), so `cluster deploy` of a bundle that hosts one fails until the
+release has a pair. The api and worker carry a `checksum/connector-caller`
+annotation of the effective public key and the Secret reference, so an upgrade
+that supplies or replaces the pair rolls them onto it. A hosted connector's
+proxy moves to a new key only when it is next rendered: the next `cluster
+deploy` of its agent, or the next pass when `worker.connectorReconciler` is on.
+Leaving dev mode with no replacement pair while the published one is live is
+refused, since running proxies would keep trusting it; supply a pair (or run
+`curie cluster up`), then redeploy each agent that hosts a connector.
 
 To bring your own pair, name a Secret holding both halves as standard base64:
 the 32-byte seed under `connectorCaller.signingKeyKey` (default `signingKey`)
@@ -1956,9 +1970,11 @@ connectorCaller:
 Only the worker receives the signing key, and only the API the public key.
 `cluster up` carries `existingSecret` forward as well.
 
-To rotate, set `connectorCaller.previousVerifyKey` to the current public key,
-set the new pair, and `kubectl rollout restart` the api and worker Deployments:
-neither pod template carries a checksum of this Secret. Tokens live 24 hours,
+To rotate, set `connectorCaller.previousVerifyKey` to the current public key
+and set the new pair; the upgrade rolls the api and worker. A pair kept in your
+own `existingSecret` and rotated in place under the same name and keys still
+needs a `kubectl rollout restart` of both Deployments, since the chart cannot
+read that Secret's content. Tokens live 24 hours,
 so clear `previousVerifyKey` a day later.
 
 The worker that signs the token, the runner that presents it in
@@ -1969,8 +1985,8 @@ one. Keep any agent-specific runner image on this release too.
 The first upgrade that gives the release a caller key rolls every hosted
 connector pod once, because its rendered Deployment gains the proxy. That is
 the `curie cluster up` upgrade of a release recording none. `curie cluster
-upgrade` generates no key, so it renders no proxy until a later `cluster up`
-or a key of your own. Upgrade note: a keep-alive Job that dialled the
+upgrade` generates no key, so a release it upgrades without one cannot deploy
+a hosted connector until a later `cluster up` or a key of your own. Upgrade note: a keep-alive Job that dialled the
 connector Service now dials `<name>-direct`, keeping its port, because the
 connector Service lands on the proxy, which refuses a caller without a token.
 Its peer-ingress policy keeps naming the server's port.
