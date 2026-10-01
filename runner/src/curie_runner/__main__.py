@@ -96,6 +96,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .usage_report import USAGE_PATH, UsageReporter
 from .verification import KNOWN_BLOCKER_NAMES, preflight_workspace_verification
@@ -1266,6 +1267,7 @@ def _serve() -> None:
 
 
 def main() -> None:
+    lock_process_environ()
     install_stdout_redaction()
     telemetry = bootstrap_service_telemetry(
         "curie-runner",

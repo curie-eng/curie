@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from collections.abc import Collection, Iterable, Mapping
@@ -165,6 +166,30 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
 _BLOCK_BREAK = "\n\n"
 # Consecutive refused breaks after which the rest of a text gets none.
 _MAX_REJECTED_BREAKS = 4
+# Shorter values are too small for an encoded form to be distinctive.
+_HELD_ENCODING_MIN_LENGTH = 16
+
+
+def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
+    """Exact held values plus standard and URL-safe base64 of the longer ones."""
+
+    literals: set[str] = set()
+    for value in held_secrets:
+        if not value:
+            continue
+        literals.add(value)
+        if len(value) < _HELD_ENCODING_MIN_LENGTH:
+            continue
+        encoded = value.encode()
+        for raw in (
+            base64.standard_b64encode(encoded),
+            base64.urlsafe_b64encode(encoded),
+        ):
+            text = raw.decode()
+            for form in (text, text.rstrip("=")):
+                if form and form != value:
+                    literals.add(form)
+    return tuple(sorted(literals, key=lambda item: (-len(item), item)))
 
 
 class OutboundRedactor:
@@ -176,9 +201,7 @@ class OutboundRedactor:
     """
 
     def __init__(self, held_secrets: frozenset[str]) -> None:
-        self._secrets = tuple(
-            sorted(filter(None, held_secrets), key=lambda item: (-len(item), item))
-        )
+        self._secrets = _held_literals(held_secrets)
         self._pending = ""
         self._pending_record: dict[str, object] | None = None
         # Offsets into _pending where a later text block began.
