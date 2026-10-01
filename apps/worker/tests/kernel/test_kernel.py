@@ -3540,6 +3540,107 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     asyncio.run(go())
 
 
+def test_quota_pressure_reclaims_an_idle_eval_route_before_an_older_person_route(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from channel_protocol import scoped_conversation_id
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.sandbox.k8s import _claim_view
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            person_key = _thread_key("tPersonIdle")
+            eval_key = scoped_conversation_id("slack", "C1", "eval:1720000000.000100")
+            trigger_thread = "tEvalFirstTrigger"
+
+            for thread_key in (person_key, eval_key):
+                await asyncio.to_thread(
+                    h.substrate.claim,
+                    thread_key,
+                    env={
+                        "CURIE_HISTORY_REF": (
+                            f"https://api.example.com/state/transcript/{thread_key}"
+                        ),
+                        "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+                    },
+                )
+
+            person = h.substrate.lookup(person_key)
+            eval_route = h.substrate.lookup(eval_key)
+            assert person is not None
+            assert eval_route is not None
+            # The person's route expires first, so expiry order alone probes it
+            # ahead of the eval route.
+            assert h.substrate._affinity.touch(person_key, 30)  # noqa: SLF001
+
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_headroom_results = [True]
+            quota_view = _claim_view(
+                {
+                    "metadata": {"name": "acme-trigger-claim"},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "ReconcilerError",
+                                "message": (
+                                    'Error seen: pods "acme-trigger-claim" is '
+                                    "forbidden: exceeded quota: curie-sandbox-quota, "
+                                    "requested: limits.cpu=1, used: limits.cpu=2, "
+                                    "limited: limits.cpu=2"
+                                ),
+                            }
+                        ]
+                    },
+                }
+            )
+            assert quota_view.quota_rejection is not None
+            h.fake_k8s.quota_rejection = quota_view.quota_rejection
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            await h.async_redis.xgroup_create(
+                h.config.stream, h.config.consumer_group, id="0", mkstream=True
+            )
+            event_id = "eval-first-capacity-trigger"
+            lease = await _leased_entry(h, store, event_id=event_id, generation=1)
+            h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
+
+            await h.kernel.process_event(
+                qevent("start a new turn", thread=trigger_thread, event_id=event_id),
+                lease=lease,
+            )
+
+            assert eval_route.claim_name in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(eval_key) is None
+            assert person.claim_name not in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(person_key) == person
+            assert h.runner.opened == ["start a new turn"]
+            assert h.sink.last_text == "started after reclaim"
+
+    asyncio.run(go())
+
+
+def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> None:
+    from channel_protocol import scoped_conversation_id
+
+    is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
+
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
+    assert is_eval(
+        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
+    )
+    assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
+    assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
+    assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
+    assert not is_eval("eval:1720000000.000100")
+    assert not is_eval("")
+
+
 def test_quota_capacity_waits_for_external_headroom_before_retry(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
