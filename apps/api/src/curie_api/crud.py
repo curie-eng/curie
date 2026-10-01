@@ -18,6 +18,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from .approvers import card_on_requesting_surface
 from .config import get_settings
 from .models import (
+    DEFAULT_TENANT_ID,
     ActionAuditEntry,
     ActionStatus,
     Agent,
@@ -252,9 +253,20 @@ async def attach_bundle(
     return version
 
 
+def _agent_tenant(agent_id: uuid.UUID) -> Any:
+    """The agent's tenant as a scalar subquery, for a child row's ``tenant_id``.
+
+    Evaluated inside the INSERT, so the child takes whatever tenant the agent
+    row holds at write time with no read-then-write window.
+    """
+
+    return select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery()
+
+
 async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
     agent = Agent(
         name=data.name,
+        tenant_id=DEFAULT_TENANT_ID,
         # Attached through the relationship rather than inserted separately, so
         # the agent row and its binding are one transaction: a unique-constraint
         # collision on either rolls BOTH back, and no agent is ever left behind
@@ -268,6 +280,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # singular); the rest arrive through `add_channel_binding`.
         channels=[
             AgentChannel(
+                tenant_id=DEFAULT_TENANT_ID,
                 kind=data.channel.kind,
                 address=data.channel.address,
                 endpoint=data.channel.endpoint,
@@ -643,6 +656,7 @@ async def add_channel_binding(
 
     binding = AgentChannel(
         agent_id=agent_id,
+        tenant_id=_agent_tenant(agent_id),
         kind=channel.kind,
         address=channel.address,
         endpoint=channel.endpoint,
@@ -954,6 +968,7 @@ async def create_version_row(
 ) -> AgentVersion:
     version = AgentVersion(
         agent_id=agent_id,
+        tenant_id=_agent_tenant(agent_id),
         version_label=version_label,
         created_by=created_by,
         commit_sha=commit_sha,
@@ -1018,6 +1033,7 @@ async def create_deployment_row(
         resolved_workspace_enabled = workspace_enabled
     deployment = Deployment(
         agent_id=agent_id,
+        tenant_id=_agent_tenant(agent_id),
         version_id=version_id,
         environment=environment,
         commit_sha=commit_sha,

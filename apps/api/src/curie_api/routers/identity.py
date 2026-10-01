@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends
 from ..auth import require_api_key
 from ..deps import SessionDep
 from ..identity import find_provider_installation, resolve_principal
-from ..provider_installations import DEFAULT_TENANT_ID
+from ..models import DEFAULT_TENANT_ID
 from ..schemas import PrincipalResolutionOut, PrincipalResolveIn
 
 router = APIRouter(
