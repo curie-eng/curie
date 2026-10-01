@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,14 @@ from claude_agent_sdk import (
 )
 from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner import __main__ as boot
+from curie_runner import redact as redact_module
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.redact import (
     REDACTION_BOUNDARIES,
     REDACTION_RULES,
+    OutboundRedactor,
     install_stdout_redaction,
     redact_span_attribute,
     redact_text,
@@ -644,6 +647,222 @@ def test_http_redacts_held_secret_split_at_every_offset(
     assert frames[-1]["text"] == _assistant_text(frames)
     if with_tool_note:
         assert any(frame["type"] == "tool_note" for frame in frames)
+
+
+def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3694: two progress sentences around a tool call must not be glued.
+
+    Covers the stream and the empty-result final, which falls back to the
+    streamed text (#107).
+    """
+
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="Staging the files.")], model="fake"),
+        AssistantMessage(content=[ToolUseBlock(id="read", name="Read", input={})], model="fake"),
+        AssistantMessage(content=[TextBlock(text="All three files staged.")], model="fake"),
+        _result(""),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "Staging the files.\n\nAll three files staged."
+    assert frames[-1]["text"] == _assistant_text(frames)
+    assert frames[-1]["status"] == "done"
+
+
+def test_http_reply_does_not_pad_text_blocks_the_model_already_separated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="One.\n")], model="fake"),
+        AssistantMessage(content=[TextBlock(text="Two.")], model="fake"),
+        AssistantMessage(content=[TextBlock(text=" Three.")], model="fake"),
+        _result(""),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "One.\nTwo. Three."
+    assert frames[-1]["text"] == _assistant_text(frames)
+
+
+def test_http_reply_keeps_the_authoritative_result_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="Looking.")], model="fake"),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="fake"),
+        _result("Done."),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "Looking.\n\nDone."
+    assert frames[-1]["text"] == "Done."
+
+
+def _redacted_turn(
+    held: frozenset[str], blocks: list[str], final_text: str
+) -> tuple[str, str]:
+    """The streamed text and the final text one turn's redactor emits."""
+
+    redactor = OutboundRedactor(held)
+    lines: list[str] = []
+    for block in blocks:
+        lines.extend(redactor.push(json.dumps({"type": "text_delta", "text": block})))
+    lines.extend(
+        redactor.push(json.dumps({"type": "final", "status": "done", "text": final_text}))
+    )
+    frames = [json.loads(line) for line in lines]
+    return _assistant_text(frames), frames[-1]["text"]
+
+
+def test_block_break_final_scrubs_a_pattern_cut_by_a_held_prefix() -> None:
+    """#3694 review: the final is scrubbed whole, not as its streamed chunks.
+
+    The reply ends in characters that open a held value, so the stream holds
+    that tail back as its own chunk and the key pattern spans the cut.
+    """
+
+    block = "Your key: sk-proj-1234567890abcd"
+    _, final = _redacted_turn(frozenset({"abcdHELDVALUE0000"}), [block], block)
+
+    assert "sk-proj" not in final
+    assert "[REDACTED:" in final
+
+
+def test_block_break_never_splits_a_pattern_secret() -> None:
+    """#3694 review: a break inside a pattern match would let both halves out."""
+
+    blocks = ["The key is sk-", "proj0123456789abcdefXYZ"]
+    stream, final = _redacted_turn(
+        frozenset({"sk-ant-oat01-HELDVALUE0000"}), blocks, "".join(blocks)
+    )
+
+    assert "proj0123456789abcdefXYZ" not in stream
+    assert "proj0123456789abcdefXYZ" not in final
+
+
+def test_block_break_reaches_a_final_led_by_a_connector_notice() -> None:
+    """The DONE final may carry the connector notice ahead of the streamed text."""
+
+    stream, final = _redacted_turn(
+        frozenset(), ["First.", "Second."], "Connector notice.\n\nFirst.Second."
+    )
+
+    assert stream == "First.\n\nSecond."
+    assert final == "Connector notice.\n\nFirst.\n\nSecond."
+
+
+@pytest.mark.parametrize(
+    ("held", "blocks"),
+    [
+        pytest.param(
+            frozenset({"conn_HELD"}),
+            ["conn_HELDpostgres://app:hunter2", "pass@db/prod"],
+            id="match_appears_after_the_held_value_is_replaced",
+        ),
+        pytest.param(
+            frozenset(),
+            ['eyJhbGc.eyJzdWI.sigvalue"password', '": "hunter2pass"'],
+            id="match_appears_after_an_earlier_rule_runs",
+        ),
+    ],
+)
+def test_block_break_never_splits_a_match_made_while_scrubbing(
+    held: frozenset[str], blocks: list[str]
+) -> None:
+    """#3694 review: a rule can match only after an earlier replacement, so the
+    raw text alone cannot say where a break is safe."""
+
+    _, final = _redacted_turn(held, blocks, "".join(blocks))
+
+    assert "hunter2" not in final
+
+
+def test_block_breaks_add_nothing_but_breaks_to_the_final() -> None:
+    """With its breaks removed, the final is exactly what one unbroken block scrubs to."""
+
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    rng = random.Random(3694)
+
+    def body(size: int) -> str:
+        return "".join(rng.choice(alphabet) for _ in range(size))
+
+    fillers = ["Done.", "Here", " is ", "the", "value", ":", " ", "x", "ok", "-", ".", "_"]
+    for _ in range(400):
+        secrets = [
+            "sk-ant-api03-" + body(24),
+            "ghp_" + body(30),
+            "eyJ" + body(10) + "." + body(10) + "." + body(12),
+            "Bearer " + body(20),
+            "token=" + body(14),
+            "Authorization: Basic " + body(16),
+            "postgres://u:" + body(10) + "@h/db",
+            '"password": "' + body(10) + '"',
+        ]
+        held = frozenset(
+            {rng.choice(secrets) for _ in range(rng.randint(0, 2))}
+            | {rng.choice(secrets)[: rng.randint(1, 6)] + body(8) for _ in range(rng.randint(0, 2))}
+        )
+        text = "".join(
+            rng.choice(fillers) + rng.choice(secrets) + rng.choice(fillers)
+            for _ in range(rng.randint(1, 3))
+        )
+        cuts = sorted(rng.sample(range(1, len(text)), k=rng.randint(1, 4)))
+        blocks = [text[a:b] for a, b in zip([0, *cuts], [*cuts, len(text)], strict=True)]
+        lead = rng.choice(["", "Connector notice.\n\n"])
+
+        _, broken = _redacted_turn(held, blocks, lead + text)
+        _, unbroken = _redacted_turn(held, [lead + text], lead + text)
+
+        assert broken.replace("\n\n", "") == unbroken.replace("\n\n", ""), (held, blocks)
+
+
+def test_block_breaks_scrub_a_long_turn_in_linear_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Placing breaks must not rescan the rest of the turn once per block.
+
+    Counted in characters handed to the rule pass, not seconds, so the bound
+    holds on any machine.
+    """
+
+    scanned: list[int] = []
+    real = redact_module.redact_text
+
+    def counting(text: str) -> str:
+        scanned.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(redact_module, "redact_text", counting)
+    blocks = [f"Progress sentence number {index} with some words." for index in range(300)]
+    total = sum(len(block) for block in blocks)
+
+    held = frozenset({"sk-ant-oat01-HELDVALUE0000"})
+    stream, final = _redacted_turn(held, blocks, "".join(blocks))
+
+    assert final == stream == "\n\n".join(blocks)
+    assert sum(scanned) <= 6 * total, sum(scanned)
+
+
+def test_block_breaks_stay_linear_inside_a_long_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#3694 review: a match that appears only after a held value is replaced
+    can cover many joins. Rejected breaks must not rescan the run each time,
+    and no break may trail the placeholder that swallowed the rest."""
+
+    scanned: list[int] = []
+    real = redact_module.redact_text
+
+    def counting(text: str) -> str:
+        scanned.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(redact_module, "redact_text", counting)
+    blocks = ["see ?token=Ax y", *(f"blk{index}" for index in range(500))]
+    total = sum(len(block) for block in blocks)
+
+    _, final = _redacted_turn(frozenset({"x y"}), blocks, "".join(blocks))
+
+    assert final == "see [REDACTED:url_secret_param]"
+    assert sum(scanned) <= 12 * total, sum(scanned)
 
 
 @pytest.mark.parametrize(("name", "vector"), VECTORS)

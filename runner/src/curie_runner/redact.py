@@ -157,8 +157,23 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
             values.add(parts[1])
 
 
+# The break between two text blocks of one turn (#3694). Each text_delta the
+# runner emits is one whole TextBlock, and consumers join deltas with "", so the
+# boundary is known only here. It is added here rather than in translation so a
+# secret split across two blocks is still matched whole: the unbroken text is
+# scrubbed, and breaks are placed into that result.
+_BLOCK_BREAK = "\n\n"
+# Consecutive refused breaks after which the rest of a text gets none.
+_MAX_REJECTED_BREAKS = 4
+
+
 class OutboundRedactor:
-    """Scrub content while retaining possible held secret prefixes between deltas."""
+    """Scrub content while retaining possible held secret prefixes between deltas.
+
+    One instance serves one turn. It also separates the turn's text blocks
+    with ``_BLOCK_BREAK``, except inside a secret or where the model already
+    put whitespace.
+    """
 
     def __init__(self, held_secrets: frozenset[str]) -> None:
         self._secrets = tuple(
@@ -166,6 +181,12 @@ class OutboundRedactor:
         )
         self._pending = ""
         self._pending_record: dict[str, object] | None = None
+        # Offsets into _pending where a later text block began.
+        self._pending_breaks: list[int] = []
+        # Raw text of every delta this turn, and where each later block began.
+        self._streamed = ""
+        self._streamed_breaks: list[int] = []
+        self._last_raw = ""
 
     def _literal_intervals(self, text: str) -> list[tuple[int, int]]:
         occurrences: list[tuple[int, int]] = []
@@ -192,6 +213,58 @@ class OutboundRedactor:
             cursor = end
         parts.append(text[cursor:])
         return redact_text("".join(parts))
+
+    def _scrub_with_breaks(self, text: str, breaks: list[int], before: str) -> str:
+        """Scrub ``text``, with a block break at each break that may take one.
+
+        The whole text is scrubbed once, and a break goes into that result only
+        where the text before it scrubs to exactly the result's next stretch.
+        With its breaks removed the result is ``_text(text)`` by construction,
+        whatever the held values and rules match, so a break can move no secret
+        out of a placeholder. Skipping joins inside a held value or a rule match
+        on the raw text only keeps a break from landing beside a placeholder
+        that covers both blocks. ``before`` is the raw character ahead of
+        ``text``.
+        """
+
+        scrubbed = self._text(text)
+        spans = self._literal_intervals(text) + [
+            match.span() for rule in REDACTION_RULES for match in rule.pattern.finditer(text)
+        ]
+        parts: list[str] = []
+        cursor = 0
+        offset = 0
+        rejected = 0
+        for at in breaks:
+            prior = text[at - 1] if at else before
+            if (
+                not prior
+                or prior.isspace()
+                or text[at].isspace()
+                or any(start < at < stop for start, stop in spans)
+            ):
+                continue
+            head = self._text(text[cursor:at])
+            # Past the end of the scrub means a placeholder took the rest.
+            if offset + len(head) >= len(scrubbed) or not scrubbed.startswith(head, offset):
+                # Each rejection rescans a longer head, so a run of them inside
+                # one long match stops placing breaks rather than going quadratic.
+                rejected += 1
+                if rejected >= _MAX_REJECTED_BREAKS:
+                    break
+                continue
+            rejected = 0
+            parts.extend((head, _BLOCK_BREAK))
+            cursor = at
+            offset += len(head)
+        parts.append(scrubbed[offset:])
+        return "".join(parts)
+
+    def _stream_text(self, text: str, breaks: list[int]) -> str:
+        clean = self._scrub_with_breaks(text, breaks, self._last_raw)
+        if text:
+            self._last_raw = text[-1]
+        return clean
 
     def _content(self, value: object) -> object:
         if isinstance(value, str):
@@ -237,19 +310,41 @@ class OutboundRedactor:
     def push(self, line: str) -> tuple[str, ...]:
         record = cast("dict[str, object]", json.loads(line))
         if record.get("type") == "text_delta" and isinstance(record.get("text"), str):
-            text = self._pending + cast("str", record["text"])
+            incoming = cast("str", record["text"])
+            breaks = list(self._pending_breaks)
+            if incoming and self._streamed:
+                breaks.append(len(self._pending))
+                self._streamed_breaks.append(len(self._streamed))
+            self._streamed += incoming
+            text = self._pending + incoming
             end = self._safe_end(text)
             template = self._pending_record or record
             self._pending = text[end:]
+            self._pending_breaks = [at - end for at in breaks if at >= end]
             self._pending_record = record if self._pending else None
             if not end and text:
                 return ()
-            return (self._encode({**template, "text": self._text(text[:end])}),)
+            clean = self._stream_text(text[:end], [at for at in breaks if at < end])
+            return (self._encode({**template, "text": clean}),)
         emitted: list[str] = []
+        streamed_final: str | None = None
         if record.get("type") == "final":
             pending = self.finish()
             if pending is not None:
                 emitted.append(pending)
+            # A final that falls back to the streamed text (#107, an approval
+            # pause), perhaps behind the connector notice, gets the stream's
+            # block breaks. It is scrubbed whole, never as its streamed chunks.
+            final_text = record.get("text")
+            if (
+                self._streamed
+                and isinstance(final_text, str)
+                and final_text.endswith(self._streamed)
+            ):
+                lead = len(final_text) - len(self._streamed)
+                streamed_final = self._scrub_with_breaks(
+                    final_text, [lead + at for at in self._streamed_breaks], ""
+                )
         for name in _CONTENT_FIELDS & record.keys():
             scrubbed = self._content(record[name])
             if (
@@ -261,6 +356,8 @@ class OutboundRedactor:
                 # a placeholder in it is not a state anything can put back (#1873).
                 record["redacted"] = True
             record[name] = scrubbed
+        if streamed_final is not None:
+            record["text"] = streamed_final
         emitted.append(self._encode(record))
         return tuple(emitted)
 
@@ -269,8 +366,12 @@ class OutboundRedactor:
 
         if not self._pending or self._pending_record is None:
             return None
-        record = {**self._pending_record, "text": self._text(self._pending)}
+        record = {
+            **self._pending_record,
+            "text": self._stream_text(self._pending, self._pending_breaks),
+        }
         self._pending = ""
+        self._pending_breaks = []
         self._pending_record = None
         return self._encode(record)
 
