@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import time
 import uuid
 from collections.abc import Iterator
@@ -84,15 +85,31 @@ def _now() -> str:
     return str(int(time.time()))
 
 
-def _sign(secret: str, body: bytes, *, timestamp: str, delivery_id: str = "dlv-1") -> str:
+def _sign(
+    secret: str,
+    body: bytes,
+    *,
+    timestamp: str,
+    hook: str,
+    tool_access: str | None,
+    delivery_id: str = "dlv-1",
+) -> str:
     """Hand-rolled on purpose rather than calling `hook_signing.sign`.
 
-    This pins the wire format an upstream implements, ``{timestamp}.{delivery}.``
-    followed by the raw body, independently of the production signer, so a drift
-    in `hook_signing` fails these tests instead of moving both sides together.
+    This pins the scheme label, timestamp and delivery framing, then a length
+    framed compact JSON context containing hook and policy, followed by the
+    unchanged raw body. It stays independent of production so a drift fails.
     """
 
-    material = f"{timestamp}.{delivery_id}.".encode() + body
+    context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    material = (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery_id}.{len(context)}:".encode()
+        + context
+        + body
+    )
     return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
 
 
@@ -124,7 +141,12 @@ def _post(
         headers["X-Curie-Signature-256"] = signature
     elif secret is not None:
         headers["X-Curie-Signature-256"] = _sign(
-            secret, body, timestamp=stamp, delivery_id=delivery_id or ""
+            secret,
+            body,
+            timestamp=stamp,
+            delivery_id=delivery_id or "",
+            hook=hook,
+            tool_access=None,
         )
     if delivery_id is not None:
         headers["X-Curie-Delivery-Id"] = delivery_id
@@ -457,7 +479,7 @@ def test_a_forged_signature_is_refused(
         agent_id,
         "issues",
         body,
-        signature=_sign("not-the-secret", body, timestamp=ts),
+        signature=_sign("not-the-secret", body, timestamp=ts, hook="issues", tool_access=None),
         timestamp=ts,
     )
 
@@ -478,7 +500,7 @@ def test_a_signature_over_different_bytes_is_refused(
     agent_id = _bind(hooks_client, auth_headers, name="swapagent")
     secret = _secret_for(agent_id)
     ts = _now()
-    stolen = _sign(secret, b'{"amount": 1}', timestamp=ts)
+    stolen = _sign(secret, b'{"amount": 1}', timestamp=ts, hook="issues", tool_access=None)
 
     refused = _post(
         hooks_client,
@@ -513,7 +535,9 @@ def test_another_agents_secret_cannot_sign_for_this_one(
         victim,
         "issues",
         body,
-        signature=_sign(_secret_for(attacker), body, timestamp=ts),
+        signature=_sign(
+            _secret_for(attacker), body, timestamp=ts, hook="issues", tool_access=None
+        ),
         timestamp=ts,
     )
 
@@ -549,7 +573,7 @@ def test_rotating_the_generation_invalidates_the_old_secret(
         agent_id,
         "issues",
         body,
-        signature=_sign(old, body, timestamp=ts),
+        signature=_sign(old, body, timestamp=ts, hook="issues", tool_access=None),
         timestamp=ts,
     )
     assert refused.status_code == 401
@@ -560,7 +584,7 @@ def test_rotating_the_generation_invalidates_the_old_secret(
         agent_id,
         "issues",
         body,
-        signature=_sign(new, body, timestamp=ts),
+        signature=_sign(new, body, timestamp=ts, hook="issues", tool_access=None),
         timestamp=ts,
     )
     assert accepted.status_code == 200
@@ -755,7 +779,12 @@ def test_a_multi_surface_hook_requires_and_honors_an_explicit_reply_surface(
     ts = _now()
     headers = {
         "X-Curie-Signature-256": _sign(
-            _secret_for(agent_id), body, timestamp=ts, delivery_id="multi-hook-1"
+            _secret_for(agent_id),
+            body,
+            timestamp=ts,
+            delivery_id="multi-hook-1",
+            hook="issues",
+            tool_access=None,
         ),
         "X-Curie-Delivery-Id": "multi-hook-1",
         "X-Curie-Timestamp": ts,
@@ -853,7 +882,7 @@ def test_two_agents_do_not_swallow_each_others_deliveries(
 
 # --- replay: the signed timestamp and delivery id (#3554) ---------------------
 #
-# The signature covers the timestamp, the delivery id and the body. The delivery
+# The signature covers timestamp, delivery id, hook, policy and raw body. The delivery
 # id is the dedupe key, so leaving it outside the signature let a captured body be
 # resent under a fresh id and run the agent again. The timestamp bounds how long
 # any captured request stays usable. A delivery receipt is written without an
@@ -875,7 +904,14 @@ def test_a_captured_delivery_resent_under_a_new_delivery_id_is_refused(
     agent_id = _bind(hooks_client, auth_headers, name="replayagent")
     body = b'{"do": "something"}'
     ts = _now()
-    signature = _sign(_secret_for(agent_id), body, timestamp=ts, delivery_id="orig-a")
+    signature = _sign(
+        _secret_for(agent_id),
+        body,
+        timestamp=ts,
+        delivery_id="orig-a",
+        hook="issues",
+        tool_access=None,
+    )
 
     original = _post(
         hooks_client,
@@ -993,7 +1029,12 @@ def test_a_missing_or_malformed_timestamp_is_refused(
     headers = {
         "Content-Type": "application/json",
         "X-Curie-Signature-256": _sign(
-            _secret_for(agent_id), body, timestamp=presented, delivery_id="stamp-1"
+            _secret_for(agent_id),
+            body,
+            timestamp=presented,
+            delivery_id="stamp-1",
+            hook="issues",
+            tool_access=None,
         ),
         "X-Curie-Delivery-Id": "stamp-1",
     }
@@ -1014,13 +1055,19 @@ def test_a_signature_cannot_be_moved_across_the_id_and_body_boundary(
     runs_stream: str,
     clean_db: None,
 ) -> None:
-    """Id `d` with body `hello.world` and id `d.hello` with body `world` sign the
-    same bytes. The first is an honest delivery; the second reuses its signature
-    to carry a different body under a fresh dedupe key, and must be refused."""
+    """Moving a body prefix into the delivery id must fail authentication, even
+    though the old dot delimited scheme admitted that ambiguous spelling."""
 
     agent_id = _bind(hooks_client, auth_headers, name="boundaryagent")
     ts = _now()
-    signature = _sign(_secret_for(agent_id), b"hello.world", timestamp=ts, delivery_id="d")
+    signature = _sign(
+        _secret_for(agent_id),
+        b"hello.world",
+        timestamp=ts,
+        delivery_id="d",
+        hook="issues",
+        tool_access=None,
+    )
 
     original = _post(
         hooks_client,
@@ -1047,6 +1094,149 @@ def test_a_signature_cannot_be_moved_across_the_id_and_body_boundary(
     assert shifted.status_code == 401, shifted.text
     assert shifted.json()["detail"] == "missing or invalid signature"
     assert len(_queued(valkey, runs_stream)) == 1
+
+
+@pytest.mark.parametrize(
+    "original_hook,original_body,replay_hook,replay_body",
+    [
+        ("issues", b"release.world", "issues.release", b"world"),
+        ("issues.release", b"world", "issues", b"release.world"),
+    ],
+)
+def test_a_signature_cannot_be_moved_between_hook_and_body(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    original_hook: str,
+    original_body: bytes,
+    replay_hook: str,
+    replay_body: bytes,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="acme-hook-boundary")
+    timestamp = _now()
+    signature = _sign(
+        _secret_for(agent_id),
+        original_body,
+        timestamp=timestamp,
+        delivery_id="boundary-1",
+        hook=original_hook,
+        tool_access=None,
+    )
+    accepted = _post(
+        hooks_client,
+        agent_id,
+        original_hook,
+        original_body,
+        timestamp=timestamp,
+        delivery_id="boundary-1",
+        signature=signature,
+    )
+    assert accepted.status_code == 200, accepted.text
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.author == f"hook:{original_hook}"
+    assert original_body.decode() in turn.text
+    entries = valkey.xrange(runs_stream)
+    state = {key: valkey.get(key) for key in valkey.scan_iter(match=f"curie:hook:*:{agent_id}:*")}
+
+    refused = _post(
+        hooks_client,
+        agent_id,
+        replay_hook,
+        replay_body,
+        timestamp=timestamp,
+        delivery_id="boundary-1",
+        signature=signature,
+    )
+    assert refused.status_code == 401, refused.text
+    assert valkey.xrange(runs_stream) == entries
+    assert {
+        key: valkey.get(key) for key in valkey.scan_iter(match=f"curie:hook:*:{agent_id}:*")
+    } == state
+
+
+@pytest.mark.parametrize("scheme", ["body-only", "timestamp-delivery"])
+def test_a_previous_signature_scheme_is_refused_before_claim_or_quota(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    scheme: str,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="acme-old-signature")
+    body = b"{}"
+    timestamp = _now()
+    material = body if scheme == "body-only" else f"{timestamp}.old-scheme-1.".encode() + body
+    signature = "sha256=" + hmac.new(
+        _secret_for(agent_id).encode(), material, hashlib.sha256
+    ).hexdigest()
+
+    refused = _post(
+        hooks_client,
+        agent_id,
+        "issues",
+        body,
+        timestamp=timestamp,
+        delivery_id="old-scheme-1",
+        signature=signature,
+    )
+    assert refused.status_code == 401, refused.text
+    assert valkey.xlen(runs_stream) == 0
+    assert list(valkey.scan_iter(match=f"curie:hook:*:{agent_id}:*")) == []
+
+    accepted = _post(
+        hooks_client,
+        agent_id,
+        "issues",
+        body,
+        timestamp=timestamp,
+        delivery_id="old-scheme-1",
+        secret=_secret_for(agent_id),
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert valkey.xlen(runs_stream) == 1
+
+
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
+def test_a_retired_signature_cannot_reinterpret_body_as_authenticated_context(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    tool_access: str | None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="acme-retired-context")
+    body = b'{"run":"new-body"}'
+    timestamp = _now()
+    delivery_id = "retired-context-1"
+    context = json.dumps(
+        ["issues", tool_access], ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    # The retired signer treated this context frame as ordinary body bytes.
+    # Reusing its signature must not turn those bytes into authenticated fields.
+    old_body = f"{len(context)}:".encode() + context + body
+    old_material = f"{timestamp}.{delivery_id}.".encode() + old_body
+    signature = "sha256=" + hmac.new(
+        _secret_for(agent_id).encode(), old_material, hashlib.sha256
+    ).hexdigest()
+
+    refused = hooks_client.post(
+        f"/hooks/{agent_id}/issues",
+        params={} if tool_access is None else {"tool_access": tool_access},
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Curie-Timestamp": timestamp,
+            "X-Curie-Delivery-Id": delivery_id,
+            "X-Curie-Signature-256": signature,
+        },
+    )
+    assert refused.status_code == 401, refused.text
+    assert valkey.xlen(runs_stream) == 0
+    assert list(valkey.scan_iter(match=f"curie:hook:*:{agent_id}:*")) == []
 
 
 def test_a_retry_re_signed_with_a_fresh_timestamp_is_a_duplicate(
@@ -1106,8 +1296,17 @@ def test_verify_accepts_the_window_edge_and_refuses_one_second_past_it() -> None
             secret,
             timestamp=stamp,
             delivery_id="edge-1",
+            hook="issues",
+            tool_access=None,
             body=body,
-            header=_sign(secret, body, timestamp=stamp, delivery_id="edge-1"),
+            header=_sign(
+                secret,
+                body,
+                timestamp=stamp,
+                delivery_id="edge-1",
+                hook="issues",
+                tool_access=None,
+            ),
             now=float(now),
         )
 
@@ -1120,8 +1319,17 @@ def test_verify_accepts_the_window_edge_and_refuses_one_second_past_it() -> None
         secret,
         timestamp=arabic_indic,
         delivery_id="edge-1",
+        hook="issues",
+        tool_access=None,
         body=body,
-        header=_sign(secret, body, timestamp=arabic_indic, delivery_id="edge-1"),
+        header=_sign(
+            secret,
+            body,
+            timestamp=arabic_indic,
+            delivery_id="edge-1",
+            hook="issues",
+            tool_access=None,
+        ),
         now=float(ts),
     )
     assert verify_at(ts + tolerance) is True
@@ -1130,13 +1338,39 @@ def test_verify_accepts_the_window_edge_and_refuses_one_second_past_it() -> None
     assert verify_at(ts - tolerance - 1) is False
 
 
-def test_the_production_signer_matches_the_pinned_wire_format() -> None:
-    """`hook_signing.sign` is what every in-repo test and fixture signs with, so
-    it must produce exactly the bytes the hand-rolled `_sign` pins."""
+@pytest.mark.parametrize("hook", ["issues", "issues.release"])
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
+def test_the_production_signer_matches_the_pinned_wire_format(
+    hook: str, tool_access: str | None
+) -> None:
+    """Production must emit the bytes the independent upstream signer pins."""
 
     body = b'{"a": 1}'
-    assert hook_signing.sign("s", timestamp="1800000000", delivery_id="d-1", body=body) == _sign(
-        "s", body, timestamp="1800000000", delivery_id="d-1"
+    expected = _sign(
+        "s",
+        body,
+        timestamp="1800000000",
+        delivery_id="d-1",
+        hook=hook,
+        tool_access=tool_access,
+    )
+    assert hook_signing.sign(
+        "s",
+        timestamp="1800000000",
+        delivery_id="d-1",
+        hook=hook,
+        tool_access=tool_access,
+        body=body,
+    ) == expected
+    assert hook_signing.verify(
+        "s",
+        timestamp="1800000000",
+        delivery_id="d-1",
+        hook=hook,
+        tool_access=tool_access,
+        body=body,
+        header=expected,
+        now=1_800_000_000.0,
     )
 
 
@@ -1152,9 +1386,25 @@ def test_verify_refuses_a_dotted_delivery_id_and_sign_will_not_produce_one() -> 
         secret,
         timestamp=stamp,
         delivery_id="d.hello",
+        hook="issues",
+        tool_access=None,
         body=body,
-        header=_sign(secret, body, timestamp=stamp, delivery_id="d.hello"),
+        header=_sign(
+            secret,
+            body,
+            timestamp=stamp,
+            delivery_id="d.hello",
+            hook="issues",
+            tool_access=None,
+        ),
         now=1_800_000_000.0,
     )
     with pytest.raises(ValueError):
-        hook_signing.sign(secret, timestamp=stamp, delivery_id="d.hello", body=body)
+        hook_signing.sign(
+            secret,
+            timestamp=stamp,
+            delivery_id="d.hello",
+            hook="issues",
+            tool_access=None,
+            body=body,
+        )

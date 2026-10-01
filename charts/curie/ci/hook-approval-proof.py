@@ -641,15 +641,23 @@ class Proof:
             raise ProofError("could not load the Alertmanager signer fixture")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        previous = os.environ.get("CURIE_HOOK_SECRET")
-        os.environ["CURIE_HOOK_SECRET"] = secret
+        environment = {
+            "CURIE_HOOK_SECRET": secret,
+            "CURIE_HOOK_URL": (
+                f"{self.api_url}/hooks/{self.agent_id}/{HOOK}?"
+                + urllib.parse.urlencode({"kind": "slack", "address": CHANNEL})
+            ),
+        }
+        previous = {name: os.environ.get(name) for name in environment}
+        os.environ.update(environment)
         try:
             body, signature, delivery, timestamp = module.prepare(payload)
         finally:
-            if previous is None:
-                os.environ.pop("CURIE_HOOK_SECRET", None)
-            else:
-                os.environ["CURIE_HOOK_SECRET"] = previous
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
         return body, signature, delivery, timestamp
 
     def post_hook(

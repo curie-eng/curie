@@ -25,20 +25,22 @@ This is HMAC used as a key-derivation step, which is what ``sandbox_token`` and
 the first of them rather than copied.
 
 **What a delivery signature covers (#3554).** The signed material is the
-upstream's timestamp, its delivery id and the raw body, in that order:
-``f"{timestamp}.{delivery_id}.".encode() + body``. A signature over the body
-alone left the delivery id, which is the deduplication key, outside the
-authenticated bytes, so a captured signed body resent under a fresh delivery id
-was indistinguishable from a new delivery and ran the agent again. Binding the id
-into the signature ties one signature to one dedupe key; binding a timestamp and
-refusing any outside ``TOLERANCE_S`` bounds how long a captured request is worth
-anything at all. There is one scheme and no body-only fallback: a verifier that
-still accepted the old shape would reopen exactly what this closes.
+upstream's timestamp, its delivery id, the decoded hook name, the requested tool
+policy and the raw body. The context is compact ASCII JSON for
+``[hook, tool_access]``, with ``null`` for an omitted policy. Its byte length
+frames the boundary before the body. A fixed version prefix separates this
+format from every previous delivery signature:
+``b"curie.hook.delivery.v2\\n" +
+f"{timestamp}.{delivery_id}.{len(context)}:".encode() + context + body``.
+The delivery id and hook together select the receipt namespace, so both are
+authenticated. Signing the requested policy prevents a captured request from
+adding or removing a restriction. Binding the timestamp and refusing any outside
+``TOLERANCE_S`` bounds the replay window. There is one signing scheme.
 
 The ``.`` is the delimiter, so both boundaries must be fixed for the material to
 parse one way only. A digits-only timestamp fixes the first. A delivery id that
 may contain ``.`` would leave the second movable, letting bytes shift between the
-id and the body under one signature. A delivery id therefore may not contain
+id and the context under one signature. A delivery id therefore may not contain
 ``.``; ``sign`` refuses one and ``verify`` rejects one.
 """
 
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 
 from .sandbox_token import _signature
@@ -96,29 +99,55 @@ def derive(api_key: str, *, agent_id: str, generation: int) -> str:
     return _signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
 
 
-def _material(timestamp: str, delivery_id: str, body: bytes) -> bytes:
+def _material(
+    timestamp: str,
+    delivery_id: str,
+    body: bytes,
+    *,
+    hook: str,
+    tool_access: str | None,
+) -> bytes:
     """The exact bytes a delivery signature is computed over."""
 
-    return f"{timestamp}.{delivery_id}.".encode() + body
+    context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery_id}.{len(context)}:".encode()
+        + context
+        + body
+    )
 
 
-def sign(secret: str, *, timestamp: str, delivery_id: str, body: bytes) -> str:
+def sign(
+    secret: str,
+    *,
+    timestamp: str,
+    delivery_id: str,
+    hook: str,
+    tool_access: str | None,
+    body: bytes,
+) -> str:
     """The ``sha256=`` header value for one delivery under ``secret``.
 
     Args:
         secret: The derived per-agent secret.
         timestamp: The integer unix-seconds time sent in ``TIMESTAMP_HEADER``.
         delivery_id: The id sent in ``DELIVERY_HEADER``.
+        hook: The decoded hook name from the request path.
+        tool_access: The parsed requested policy, or None when omitted.
         body: The exact request body bytes.
 
     Raises:
         ValueError: ``delivery_id`` contains ``.``, the material delimiter, which
-            would let bytes shift between the id and the body.
+            would let bytes shift between the id and the context.
     """
 
     if "." in delivery_id:
         raise ValueError("a hook delivery id may not contain '.'")
-    digest = hmac.new(secret.encode(), _material(timestamp, delivery_id, body), hashlib.sha256)
+    material = _material(timestamp, delivery_id, body, hook=hook, tool_access=tool_access)
+    digest = hmac.new(secret.encode(), material, hashlib.sha256)
     return "sha256=" + digest.hexdigest()
 
 
@@ -127,20 +156,21 @@ def verify(
     *,
     timestamp: str | None,
     delivery_id: str,
+    hook: str,
+    tool_access: str | None,
     body: bytes,
     header: str | None,
     now: float | None = None,
 ) -> bool:
     """Constant-time check of the upstream's signature over one delivery.
 
-    The signature covers the timestamp, the delivery id and the RAW body. The
-    delivery id is signed because it is the deduplication key: left unsigned, a
-    captured body could be resent under a new id and accepted as a new delivery.
-    The timestamp is signed, and refused outside ``TOLERANCE_S`` of ``now``, so a
-    captured request stops being usable at all once the window passes. A
-    delivery id containing ``.`` is refused before any HMAC is computed: the dot
-    is the material delimiter, so such an id would make the id and body boundary
-    ambiguous.
+    The signature covers the timestamp, delivery id, decoded hook name, parsed
+    requested policy and RAW body. The hook and delivery id select the receipt
+    namespace, and authenticating the policy prevents a captured request from
+    adding or removing a restriction. The timestamp is refused outside
+    ``TOLERANCE_S`` of ``now``. A delivery id containing ``.`` is refused before
+    any HMAC is computed because the dot delimits the timestamp and id. The
+    context byte length fixes the boundary between its JSON and the raw body.
 
     The raw bytes are signed, never a re-serialization: any parse-then-dump round
     trip can change whitespace or key order, and a signature checked against
@@ -156,6 +186,8 @@ def verify(
         timestamp: The presented ``TIMESTAMP_HEADER``, or None when absent.
         delivery_id: The presented delivery id, or ``""`` when absent; the
             caller still refuses a missing id after this check passes.
+        hook: The decoded hook name from the request path.
+        tool_access: The parsed requested policy, or None when omitted.
         body: The exact request body bytes.
         header: The presented signature header, or None when absent.
         now: The current unix time; injectable for tests, defaults to the clock.
@@ -177,5 +209,12 @@ def verify(
     current = time.time() if now is None else now
     if abs(current - int(timestamp)) > TOLERANCE_S:
         return False
-    expected = sign(secret, timestamp=timestamp, delivery_id=delivery_id, body=body)
+    expected = sign(
+        secret,
+        timestamp=timestamp,
+        delivery_id=delivery_id,
+        hook=hook,
+        tool_access=tool_access,
+        body=body,
+    )
     return hmac.compare_digest(expected, header)
