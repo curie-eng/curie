@@ -106,7 +106,8 @@ turn whose `Event.tool_access` is `read-only`:
   classifier and this check. The MCP half is each connector's own annotation:
   a server that marks a tool `readOnlyHint: true` has classified it
   read-only. Curie's platform tools are not read-only, including
-  `mcp__curie__request_approval` and `mcp__curie__report_progress`, which the
+  `mcp__curie__request_approval`, `mcp__curie__report_progress` and
+  `mcp__curie__get_issue`, which the
   classifier treats as idempotent.
 - **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
   The runner registers a PreToolUse callback for every tool and wraps every

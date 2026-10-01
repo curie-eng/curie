@@ -32,15 +32,8 @@ One script handles every hook event the bundle registers:
     Allowed only after the diff reviewer approved, and never after a failed or
     capped review.
 
-``PreToolUse`` / ``PostToolUse`` on ``add_issue_comment``
-    Allowed only after a failed or capped review, only on the run's own issue,
-    and only until one comment succeeds (at most ``MAX_COMMENT_ATTEMPTS``
-    tries), so the unresolved findings reach the issue. Any other comment is
-    refused.
-
 ``UserPromptSubmit``
-    A new message starts a new run: the state resets, and the first GitHub
-    issue or pull request link in the message becomes the run's issue.
+    A new message starts a new run: the state resets.
 """
 
 from __future__ import annotations
@@ -55,14 +48,12 @@ from pathlib import Path
 from typing import Any
 
 MAX_ROUNDS = 3
-MAX_COMMENT_ATTEMPTS = 2
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PHASE = {PLAN: "plan_review", DIFF: "review_diff"}
 LOOP = {PLAN: "plan", DIFF: "diff"}
 BACK_TO = {PLAN: "plan", DIFF: "implement"}
 AGENT_TOOLS = {"Agent", "Task"}
 
-_ISSUE_LINK = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)")
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
 _CI_ROUND = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 
@@ -76,7 +67,6 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
     fix round starts with the plan already approved (plan review already
     happened) and the diff loop at round 0.
     """
-    link = _ISSUE_LINK.search(prompt)
     lines = prompt.split("\n")
     ci_match = _CI_ROUND.match(lines[1]) if len(lines) > 1 else None
     ci_round = int(ci_match.group(1)) if ci_match else None
@@ -85,11 +75,6 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         "plan": plan,
         "diff": {"round": 0, "verdict": None},
         "stopped": None,
-        "issue": [link.group(1).lower(), link.group(2).lower(), int(link.group(3))]
-        if link
-        else None,
-        "comment_attempts": 0,
-        "commented": False,
         "ci_round": ci_round,
     }
 
@@ -208,9 +193,9 @@ def _context(event: str, text: str) -> dict[str, Any]:
 
 def _stop_text(reason: str) -> str:
     return (
-        f"STOP. {reason} Do not publish. Post the reviewer's unresolved findings "
-        "and open questions on the issue with add_issue_comment, then end your "
-        "reply with `Could not complete:` and the same list."
+        f"STOP. {reason} Do not publish. End your reply with `Could not complete:` "
+        "and the reviewer's unresolved findings and open questions as a list; "
+        "the platform posts that reply on the issue."
     )
 
 
@@ -300,36 +285,6 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
     return _allow("diff review approved")
 
 
-def _comment_target(tool_input: dict[str, Any]) -> list[Any] | None:
-    try:
-        return [
-            str(tool_input["owner"]).lower(),
-            str(tool_input["repo"]).lower(),
-            int(tool_input["issue_number"]),
-        ]
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def pre_comment(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
-    if not state["stopped"]:
-        return _deny(
-            "Issue comments are only for posting unresolved review findings after a "
-            "failed or capped review."
-        )
-    if state["commented"]:
-        return _deny("The findings are already posted; end with `Could not complete:`.")
-    if state["issue"] is None or _comment_target(tool_input) != state["issue"]:
-        return _deny(
-            "The findings comment may only go on this run's issue "
-            f"({state['issue'] or 'unknown'}); end with `Could not complete:` instead."
-        )
-    if state["comment_attempts"] >= MAX_COMMENT_ATTEMPTS:
-        return _deny("The findings comment failed twice; end with `Could not complete:`.")
-    state["comment_attempts"] += 1
-    return _allow("posting unresolved review findings")
-
-
 def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     event = data.get("hook_event_name", "")
     path = state_path(str(data.get("session_id") or ""))
@@ -361,12 +316,6 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
         out = pre_bash(tool_input)
     elif event == "PreToolUse" and tool.endswith("publish_changes"):
         out = pre_publish(state)
-    elif tool.endswith("add_issue_comment"):
-        if event == "PreToolUse":
-            out = pre_comment(state, tool_input)
-        elif event == "PostToolUse" and "#issuecomment-" in _text(data.get("tool_response")):
-            # A posted comment comes back with its html_url; an error does not.
-            state["commented"] = True
     save(path, state)
     return out
 

@@ -3,7 +3,7 @@
 Drives ``examples/dark-factory/hooks/review_gate.py`` the way Claude Code does:
 one subprocess per hook event, JSON on stdin, JSON decision on stdout, state
 carried between calls on disk. Covers the Agent tool input rewrite, the round
-cap, a failed reviewer call, and the publication and comment gates.
+cap, a failed reviewer call, and the publication gate.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ BUNDLE = REPO_ROOT / "examples" / "dark-factory"
 HOOK = BUNDLE / "hooks" / "review_gate.py"
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PUBLISH = "mcp__curie__publish_changes"
-COMMENT = "mcp__github__add_issue_comment"
 
 
 class Session:
@@ -234,57 +233,14 @@ def test_third_rejection_caps_the_loop(session: Session, kind: str) -> None:
     assert [p for p in session.phases() if p[0] == loop] == [(loop, 1), (loop, 2), (loop, 3)]
 
 
-ON_ISSUE = {"owner": "acme", "repo": "Bot", "issue_number": 7, "body": "- finding"}
-POSTED = {
-    "content": [
-        {
-            "type": "text",
-            "text": '{"html_url": "https://github.com/acme/bot/issues/7#issuecomment-1"}',
-        }
-    ]
-}
-
-
-def _cap_plan_loop(session: Session) -> None:
+def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None:
+    # ADR 0187: the bundle has no GitHub write tool. The platform posts the
+    # final reply on the issue, so the stop text asks for the findings there.
     for _ in range(3):
-        session.review(PLAN, reply(PLAN, "CHANGES"))
-
-
-def test_capped_run_may_post_its_findings_once(session: Session) -> None:
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "deny"
-    _cap_plan_loop(session)
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "allow"
-    session.fire("PostToolUse", tool_name=COMMENT, tool_input=ON_ISSUE, tool_response=POSTED)
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "deny"
-
-
-def test_a_failed_findings_comment_may_be_retried_once(session: Session) -> None:
-    _cap_plan_loop(session)
-    for _ in range(2):
-        assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "allow"
-        session.fire(
-            "PostToolUse",
-            tool_name=COMMENT,
-            tool_input=ON_ISSUE,
-            tool_response={"content": [{"type": "text", "text": "502 Bad Gateway"}]},
-        )
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "deny"
-
-
-@pytest.mark.parametrize(
-    "target",
-    [
-        {**ON_ISSUE, "issue_number": 8},
-        {**ON_ISSUE, "repo": "other"},
-        {**ON_ISSUE, "owner": "evil"},
-        {"body": "- finding"},
-    ],
-)
-def test_findings_comment_only_on_the_runs_issue(session: Session, target: dict) -> None:
-    _cap_plan_loop(session)
-    assert session.pre(COMMENT, target)["permissionDecision"] == "deny"
-    # The refused call did not use up the real comment.
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "allow"
+        _, context = session.review(PLAN, reply(PLAN, "CHANGES"))
+    assert "Could not complete:" in context
+    assert "add_issue_comment" not in context
+    assert "platform posts that reply on the issue" in context
 
 
 # --- A failed reviewer call stops the run ---------------------------------------
@@ -336,7 +292,6 @@ def test_publish_only_after_the_diff_reviewer_approves(session: Session) -> None
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
-    assert session.pre(COMMENT, ON_ISSUE)["permissionDecision"] == "deny"
 
 
 def test_a_new_message_starts_a_fresh_run(session: Session) -> None:
@@ -355,7 +310,7 @@ def test_hooks_json_registers_every_event() -> None:
     hooks = json.loads((BUNDLE / "hooks" / "hooks.json").read_text())["hooks"]
     assert set(hooks) == {"UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure"}
     pre = re.compile(hooks["PreToolUse"][0]["matcher"])
-    for tool in ("Agent", "Task", PUBLISH, COMMENT):
+    for tool in ("Agent", "Task", PUBLISH):
         assert pre.fullmatch(tool), tool
     assert pre.fullmatch("Bash")
     for entries in hooks.values():

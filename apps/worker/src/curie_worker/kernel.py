@@ -121,6 +121,8 @@ from .binding import (
     EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
+    ISSUE_READ_TOKEN_ENV,
+    ISSUE_READ_URL_ENV,
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -2989,6 +2991,31 @@ class Kernel:
                         scope="work_item.progress",
                         exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
                     )
+                # The bundle reads its issue through the platform (ADR 0187):
+                # the API mints a capability naming this execution and its
+                # WorkItem's issue, and the runner mounts get_issue only when
+                # it is present. A refused or failed mint leaves the tool off
+                # and never stops the boot; the bundle states the gap.
+                if owned_work_item_id is not None and self._work_items is not None:
+                    try:
+                        issue, capability = await self._work_items.issue_read_context(
+                            owned_work_item_id
+                        )
+                    except (WorkItemConflict, WorkItemTransportError) as exc:
+                        logger.warning(
+                            "issue read capability unavailable for %s: %s",
+                            owned_work_item_id,
+                            type(exc).__name__,
+                        )
+                    else:
+                        base = self._config.runner_facing_api_base_url.rstrip("/")
+                        boot_env[ISSUE_READ_URL_ENV] = f"{base}/work-items/issue-read"
+                        boot_env[ISSUE_READ_TOKEN_ENV] = capability
+                        logger.info(
+                            "issue read capability bound for %s to %s",
+                            owned_work_item_id,
+                            issue,
+                        )
                 # Decision A2 marker (#544): an authority-free FACT carrying the
                 # resumed approval's gate kind (the actual gate_kind column value,
                 # e.g. 'policy' or 'permission'). After the approved-only gate in

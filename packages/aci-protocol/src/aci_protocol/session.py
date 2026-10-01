@@ -345,6 +345,15 @@ class BootEnv(_AciModel):
     progress_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_PROGRESS_TOKEN", "kernel")
     )
+    # The factory issue read (ADR 0187): the API route and the execution scoped
+    # capability naming one WorkItem issue. Kernel-minted per boot like the
+    # progress port; the runner mounts ``get_issue`` only when both are set.
+    issue_read_url: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_ISSUE_READ_URL", "kernel")
+    )
+    issue_read_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_ISSUE_READ_TOKEN", "kernel")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -691,6 +700,10 @@ class BootEnv(_AciModel):
             env[self.env_key("progress_url")] = self.progress_url
         if self.progress_token is not None:
             env[self.env_key("progress_token")] = self.progress_token
+        if self.issue_read_url is not None:
+            env[self.env_key("issue_read_url")] = self.issue_read_url
+        if self.issue_read_token is not None:
+            env[self.env_key("issue_read_token")] = self.issue_read_token
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -761,6 +774,8 @@ class BootEnv(_AciModel):
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
             progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),
             progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
+            issue_read_url=_str_or_none(env.get("CURIE_ISSUE_READ_URL")),
+            issue_read_token=_str_or_none(env.get("CURIE_ISSUE_READ_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_grant_arguments=(

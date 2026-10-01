@@ -134,6 +134,10 @@ class _WorkItems:
             heartbeat_interval_s=60.0,
         )
 
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        self.calls.append("issue_read_context")
+        return f"{WORK_ITEM_REPO}#7", f"wir.capability-for-{request_id}"
+
     async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
         self.finishes.append(kwargs)

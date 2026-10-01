@@ -1,10 +1,9 @@
 """The default dark-factory agent bundle validates and holds its discipline (#2576).
 
 Pins the parts of ``examples/dark-factory`` that must not drift: the bundle
-validates, its only MCP server is GitHub, its toolPolicy grants exactly
-``get_issue`` and ``add_issue_comment`` (the review gate hook narrows the
-comment to capped or failed reviews, #3092),
-the one skill states the factory discipline and its nine phases, the evals are
+validates, it declares no MCP server, secret or toolPolicy and reads its
+issue through the platform's ``mcp__curie__get_issue`` (ADR 0187), the one
+skill states the factory discipline and its nine phases, the evals are
 falsifiable, and no private identifier ships.
 """
 
@@ -61,30 +60,20 @@ def test_bundle_validates() -> None:
     assert _only_the_unbuilt_runner_layer(result.errors), result.errors
 
 
-def test_manifest_identity_secrets_and_policy() -> None:
+def test_manifest_declares_no_github_credential() -> None:
+    # ADR 0187: the platform reads the issue, so the bundle holds no PAT.
     manifest = _manifest()
     assert manifest["name"] == "dark-factory"
-    assert manifest["secrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
-    assert manifest["toolPolicy"]["enforcement"] == TOOL_POLICY_ENFORCEMENT
+    assert "secrets" not in manifest
+    assert "toolPolicy" not in manifest
 
 
-def test_mcp_declares_only_github() -> None:
-    mcp = json.loads((BUNDLE / ".mcp.json").read_text())
-    servers = mcp["mcpServers"]
-    assert list(servers) == ["github"]
-    github = servers["github"]
-    assert github["command"] == "mcp-server-github"
-    assert github["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}
-
-
-def test_tool_policy_entries_are_exact() -> None:
-    # Unlisted tools are denied by the classifier (plugin-format
-    # test_tool_policy.py); this pins the entries so a widened glob such as
-    # github/* fails here.
-    policy = _manifest()["toolPolicy"]
-    assert policy["allow"] == ["github/get_issue", "github/add_issue_comment"]
-    assert policy["approvalRequired"] == []
-    assert policy["deny"] == []
+def test_bundle_ships_no_mcp_server() -> None:
+    assert not (BUNDLE / ".mcp.json").exists()
+    assert "server-github" not in (BUNDLE / "runner.Dockerfile").read_text()
+    shipped = "\n".join(p.read_text(errors="ignore") for p in BUNDLE.rglob("*") if p.is_file())
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in shipped
+    assert "add_issue_comment" not in shipped
 
 
 def test_exactly_one_skill_without_allowed_tools() -> None:
@@ -357,7 +346,7 @@ def test_example_deploys_as_dark_factory_on_the_default_model() -> None:
     assert "--agent dark-factory " in readme
     assert "surfaces dark-factory " in readme
     assert "publication-policy dark-factory " in readme
-    assert "--github-api-egress dark-factory" in readme
+    assert "--github-api-egress" not in readme
     assert "--agent factory " not in readme
     assert "cluster up --model z-ai/glm-5.3-flash" in readme
     assert "agent `dark-factory`" in operations

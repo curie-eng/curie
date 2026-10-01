@@ -176,6 +176,8 @@ def _full_boot_env() -> BootEnv:
         state_token="st-state-token",
         progress_url="http://api:8000/v1/work-item-progress/wi-full",
         progress_token="sbx-progress-token",
+        issue_read_url="http://api:8000/work-items/issue-read",
+        issue_read_token="wir-issue-read-capability",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_grant_arguments={"command": "printf ok"},
@@ -572,6 +574,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
     ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
     request-bound progress URL/token the resume overlay mints per work item.
+    ADR 0187 added the issue read URL/capability the API mints at boot.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
@@ -580,6 +583,8 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
         "CURIE_APPROVAL_DECISION",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
     }
 
 
@@ -792,6 +797,8 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_STATE_TOKEN",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_GRANT_ARGUMENTS",
