@@ -70,7 +70,12 @@ from .history import (
     build_conversation_replay,
     resolve_history,
 )
-from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
+from .hooks import (
+    RefusalLedger,
+    build_factory_foreground_hooks,
+    build_gated_pre_tool_use_hooks,
+    load_bundle_hooks,
+)
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -536,9 +541,13 @@ def build_runner(
         workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
     )
+    # Every runner-side PreToolUse deny outside the approval gate records its
+    # call ID here, and the SessionRunner reads it to count that call's result
+    # as a refusal or an unavailable connector, not a tool error (#3580).
+    refusal_ledger = RefusalLedger()
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
-    bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
+    bundle_hooks = load_bundle_hooks(config.session.plugin_dir, ledger=refusal_ledger)
     # The permission gate (#245/#247): approval-required tools come from the
     # union of the bundle manifest's approvalPolicy gates (versioned with the
     # agent, each carrying its route name) and the CURIE_APPROVAL_REQUIRED_TOOLS
@@ -737,9 +746,14 @@ def build_runner(
                 build_gated_pre_tool_use_hooks(
                     build_approval_hook(approval_gate) if approval_gate is not None else None,
                     connector_availability,
+                    refusal_ledger,
                 ),
                 bundle_hooks,
-                build_factory_foreground_hooks() if progress_url and progress_token else None,
+                (
+                    build_factory_foreground_hooks(refusal_ledger)
+                    if progress_url and progress_token
+                    else None
+                ),
             ),
             tool_access,
         )
@@ -927,6 +941,7 @@ def build_runner(
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
             tool_access=tool_access,
+            refusal_ledger=refusal_ledger,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,

@@ -84,6 +84,50 @@ def _load_manifest_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcherCo
         return None
 
 
+class RefusalLedger:
+    """Call IDs a runner-side PreToolUse callback denied since the last prompt.
+
+    The approval gate records its own decisions and the per-turn tool access
+    its own refusals. This ledger holds the rest of the runner's PreToolUse
+    denials, so ``SessionRunner`` can count their error results as a refusal or
+    an unavailable connector and not as the tool failing (#3580). One instance
+    is shared by every callback that records into it and by the session, which
+    clears it immediately before each prompt, as it does ``TurnToolAccess``.
+    """
+
+    def __init__(self) -> None:
+        # Denied by the bundle's own PreToolUse command or the factory guard.
+        self.refused_call_ids: set[str] = set()
+        # Denied because the call's connector is in the exclusion set.
+        self.unavailable_call_ids: set[str] = set()
+
+    def begin(self) -> None:
+        """Start the record for the prompt about to be sent."""
+
+        self.refused_call_ids.clear()
+        self.unavailable_call_ids.clear()
+
+
+def _record_deny(
+    ids: set[str] | None, result: dict[str, Any], tool_use_id: str | None
+) -> dict[str, Any]:
+    """``result``, remembering ``tool_use_id`` in ``ids`` when it denies the call.
+
+    Only a deny is a refusal. ``ask`` asks the permission layer, which may
+    still allow the call, and a stop without a deny ends the turn rather than
+    refusing this call.
+    """
+
+    if (
+        ids is not None
+        and tool_use_id
+        and isinstance(result.get("hookSpecificOutput"), Mapping)
+        and result["hookSpecificOutput"].get("permissionDecision") == "deny"
+    ):
+        ids.add(tool_use_id)
+    return result
+
+
 def _decision(decision: str, reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -94,29 +138,42 @@ def _decision(decision: str, reason: str) -> dict[str, Any]:
     }
 
 
-def build_factory_foreground_hooks() -> dict[str, list[HookMatcher]]:
-    """Keep factory commands and reviewer calls inside the active turn."""
+def build_factory_foreground_hooks(
+    ledger: RefusalLedger | None = None,
+) -> dict[str, list[HookMatcher]]:
+    """Keep factory commands and reviewer calls inside the active turn.
 
-    async def guard(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> Any:
-        if not isinstance(hook_input, dict):
-            return {}
-        tool = hook_input.get("tool_name")
-        tool_input = hook_input.get("tool_input")
-        if not isinstance(tool_input, dict):
-            return {}
-        if tool == "Bash" and tool_input.get("run_in_background") is True:
-            return _decision(
-                "deny", "Run Bash in the foreground and wait for it before you end your turn."
-            )
-        if tool in ("Agent", "Task") and tool_input.get("run_in_background") is not False:
-            return _decision(
-                "deny",
-                "Run the agent in the foreground with run_in_background false. "
-                "Wait for it before you end your turn.",
-            )
-        return {}
+    A deny is recorded in ``ledger`` as a refusal (#3580).
+    """
+
+    refused = ledger.refused_call_ids if ledger is not None else None
+
+    async def guard(hook_input: Any, tool_use_id: str | None, _ctx: Any) -> Any:
+        return _record_deny(refused, _foreground_decision(hook_input), tool_use_id)
 
     return {"PreToolUse": [HookMatcher(matcher="Bash|Agent|Task", hooks=[guard])]}
+
+
+def _foreground_decision(hook_input: Any) -> dict[str, Any]:
+    """The foreground guard's decision for one call; ``{}`` abstains."""
+
+    if not isinstance(hook_input, dict):
+        return {}
+    tool = hook_input.get("tool_name")
+    tool_input = hook_input.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return {}
+    if tool == "Bash" and tool_input.get("run_in_background") is True:
+        return _decision(
+            "deny", "Run Bash in the foreground and wait for it before you end your turn."
+        )
+    if tool in ("Agent", "Task") and tool_input.get("run_in_background") is not False:
+        return _decision(
+            "deny",
+            "Run the agent in the foreground with run_in_background false. "
+            "Wait for it before you end your turn.",
+        )
+    return {}
 
 
 def _stdout_decision(out: bytes) -> dict[str, Any]:
@@ -233,31 +290,39 @@ async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) ->
     }
 
 
-def _make_callback(commands: list[str], plugin_root: Path) -> Any:
+def _make_callback(
+    commands: list[str], plugin_root: Path, ledger: RefusalLedger | None = None
+) -> Any:
     """Build one SDK hook callback that runs each command hook in order.
 
     The first command to deny, ask, or stop wins (short-circuits); otherwise the
-    tool proceeds.
+    tool proceeds. A deny is recorded in ``ledger`` as a refusal (#3580): the
+    bundle's own guardrail refused the call, and its connector never saw it.
     """
 
-    async def _callback(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> dict[str, Any]:
+    refused = ledger.refused_call_ids if ledger is not None else None
+
+    async def _callback(hook_input: Any, tool_use_id: str | None, _ctx: Any) -> dict[str, Any]:
         for command in commands:
             result = await _run_command_hook(command, hook_input, plugin_root)
             decision = result.get("hookSpecificOutput", {}).get("permissionDecision")
             if decision in ("deny", "ask") or result.get("continue_") is False:
-                return result
+                return _record_deny(refused, result, tool_use_id)
         return {}
 
     return _callback
 
 
-def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | None:
+def load_bundle_hooks(
+    plugin_dir: str | None, *, ledger: RefusalLedger | None = None
+) -> dict[str, list[HookMatcher]] | None:
     """Translate the bundle's PreToolUse hooks into SDK ``HookMatcher`` config.
 
     Returns a ``{"PreToolUse": [HookMatcher, ...]}`` mapping for
     ``ClaudeAgentOptions.hooks``, or ``None`` when the bundle declares no usable
     PreToolUse command hooks. Non-command hook actions are skipped (only
     ``type: "command"`` is executable here); other events are ignored for now.
+    Every deny is recorded in ``ledger`` when one is given.
     """
 
     parsed = _load_manifest_hooks(plugin_dir)
@@ -278,7 +343,10 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
         if not commands:
             continue
         matchers.append(
-            HookMatcher(matcher=entry.matcher, hooks=[_make_callback(commands, Path(plugin_dir))])
+            HookMatcher(
+                matcher=entry.matcher,
+                hooks=[_make_callback(commands, Path(plugin_dir), ledger)],
+            )
         )
 
     if not matchers:
@@ -289,6 +357,7 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
 def build_gated_pre_tool_use_hooks(
     approval_hooks: dict[str, list[HookMatcher]] | None,
     availability: ConnectorAvailability | None,
+    ledger: RefusalLedger | None = None,
 ) -> dict[str, list[HookMatcher]] | None:
     """Compose the connector exclusion (#2634) in FRONT of the approval hook.
 
@@ -306,6 +375,10 @@ def build_gated_pre_tool_use_hooks(
     ``caller_message()`` (names only) and no ``continue_: False``: the turn
     should carry on and answer with the tools it still has.
 
+    The exclusion deny is recorded in ``ledger`` as unavailable (#3580): the
+    call's connector failed its startup probe, so the call never reached it.
+    The delegated approval callbacks record their own decisions on the gate.
+
     ``availability`` None returns ``approval_hooks`` as-is, so an agent with no
     failed connector keeps its wiring byte-identical. The approval hooks must
     be ``matcher=None`` (every tool), which is what ``build_approval_hook``
@@ -319,6 +392,7 @@ def build_gated_pre_tool_use_hooks(
         if matcher.matcher is not None:
             raise ValueError("connector exclusion can only front a matcher=None hook")
         delegates.extend(matcher.hooks)
+    unavailable = ledger.unavailable_call_ids if ledger is not None else None
 
     async def connector_exclusion_hook(
         hook_input: Any,
@@ -336,13 +410,17 @@ def build_gated_pre_tool_use_hooks(
             else None
         )
         if failure is not None:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": failure.caller_message(),
-                }
-            }
+            return _record_deny(
+                unavailable,
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": failure.caller_message(),
+                    }
+                },
+                tool_use_id,
+            )
         for delegate in delegates:
             result: dict[str, Any] = await delegate(hook_input, tool_use_id, context)
             if result:

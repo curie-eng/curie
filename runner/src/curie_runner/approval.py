@@ -822,6 +822,12 @@ class ApprovalGate:
         if self.publication_precheck is None:
             return None
         refusal = await self.publication_precheck.decide(tool_use_id, tool_input)
+        if refusal is not None and tool_use_id is not None:
+            # Whichever observation refuses the call, it is not awaiting an
+            # approval, including one the hook held before this observation
+            # invalidated it (#3580).
+            self.held_call_ids.discard(tool_use_id)
+            self.refused_call_ids.add(tool_use_id)
         if (
             refusal is not None
             and self.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
@@ -1149,7 +1155,9 @@ async def _decide_gate(
     else is blocked (``gate.block`` records it, deny). The caller still owns
     rendering the outcome into its own return shape and any outcome-specific
     side effects (the hook's grant-spend log line, the SDK deny's ``interrupt``
-    flag) -- this function decides, it does not render.
+    flag) -- this function decides, it does not render. Each caller records the
+    call ID from the decision it renders (``_record_decision``), so a branch
+    added here is counted without recording anything itself (#3580).
     """
 
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
@@ -1160,8 +1168,6 @@ async def _decide_gate(
             )
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
-        if tool_use_id is not None:
-            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
@@ -1175,8 +1181,6 @@ async def _decide_gate(
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
         if gate.grant_argument_mismatch(tool_name, tool_input):
-            if tool_use_id is not None:
-                gate.refused_call_ids.add(tool_use_id)
             return _GateDecision(
                 blocked=False,
                 ungated=False,
@@ -1186,8 +1190,6 @@ async def _decide_gate(
         if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False)
         gate.block(tool_name, tool_input)
-        if tool_use_id is not None:
-            gate.held_call_ids.add(tool_use_id)
         return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
@@ -1196,8 +1198,6 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
         tool_name, tool_input
     ):
-        if tool_use_id is not None:
-            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
@@ -1207,8 +1207,6 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
-    if tool_use_id is not None:
-        gate.held_call_ids.add(tool_use_id)
     if (
         tool_name == PLATFORM_PUBLISH_TOOL_NAME
         and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
@@ -1216,6 +1214,22 @@ async def _decide_gate(
     ):
         gate._publication_pending_id = tool_use_id
     return _GateDecision(blocked=True, ungated=False)
+
+
+def _record_decision(gate: ApprovalGate, decision: _GateDecision, tool_use_id: str | None) -> None:
+    """Remember the call ID a rendered gate decision denies (#3580).
+
+    A refusal is ``refused`` and a block is ``awaiting_approval`` on
+    ``curie.tool.result``. Called by both interception points on the decision
+    they render, so every refusing branch of ``_decide_gate`` is recorded.
+    """
+
+    if tool_use_id is None:
+        return
+    if decision.refusal is not None:
+        gate.refused_call_ids.add(tool_use_id)
+    elif decision.blocked:
+        gate.held_call_ids.add(tool_use_id)
 
 
 def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
@@ -1256,6 +1270,7 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
                 interrupt=True,
             )
+        _record_decision(gate, decision, _context.tool_use_id)
         if decision.refusal is not None:
             return PermissionResultDeny(
                 message=decision.refusal, interrupt=not decision.continue_turn
@@ -1398,6 +1413,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "continue_": False,
                 "stopReason": reason,
             }
+        _record_decision(gate, decision, _tool_use_id)
         if decision.refusal is not None:
             if decision.continue_turn:
                 return {
