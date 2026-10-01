@@ -438,8 +438,10 @@ def test_skill_gives_service_backed_tests_a_ci_verification_path() -> None:
     flat = _flat(body)
     failing_test = flat.split("(phase `failing_test`)", 1)[1].split("(phase `implement`", 1)[0]
     assert "service-backed test" in failing_test
-    assert "red-on-base evidence comes from CI" in failing_test
-    assert "against the base commit" in failing_test
+    # Red-on-base keeps the new test and restores only the base source.
+    assert "keep the new test file" in failing_test
+    assert "git checkout <base-sha> -- <changed source files>" in failing_test
+    assert "must fail on the bug, not at import" in failing_test
     implement = flat.split("(phase `implement`", 1)[1].split("(phase `review_diff`", 1)[0]
     assert re.search(r"service-backed counts as verified for publication", implement)
     assert re.search(r"`wait_ci` returns any failure to `implement`", implement)
@@ -447,6 +449,7 @@ def test_skill_gives_service_backed_tests_a_ci_verification_path() -> None:
     assert "each service-backed test with its command and missing service" in review
     publish = flat.split("(phase `publish`)", 1)[1].split("(phase `wait_ci`)", 1)[0]
     assert re.search(r"red-on-base was not observed in the sandbox", publish)
+    assert "red-on-base procedure from step 5" in publish
 
 
 def test_diff_reviewer_does_not_block_on_unobtainable_service_evidence() -> None:
