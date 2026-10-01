@@ -324,10 +324,11 @@
           "runner-error",
           "runner-timeout",
           "workspace-error",
-          "sandbox-terminated"
+          "sandbox-terminated",
+          "sandbox-capacity"
         ]
       },
-      "cardinality_bound": 12
+      "cardinality_bound": 14
     },
     "curie.queue.dead_letter": {
       "type": "counter",

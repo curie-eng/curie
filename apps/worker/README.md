@@ -249,8 +249,9 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
   a non-idempotent action. For noncron turns, flag-clean failures retry by
   classification:
-  `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-terminated` and
-  `workspace-error` are transient (bounded exponential backoff);
+  `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-capacity`,
+  `sandbox-terminated` and `workspace-error` are transient (bounded exponential
+  backoff);
   `budget-exceeded` and everything else escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error`, which is a plain transport failure without
@@ -827,8 +828,11 @@ fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
 the same stream when its retry is due. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
-receives an expiry message if the deadline passes. Other turn sources retain
-their capacity response. Operators can inspect the persisted wait state and
+receives an expiry message if the deadline passes. An approval resume is
+refused under `sandbox-capacity` instead (#3693): it retries, and its terminal
+notice tells the person the agent was at capacity and the approved request did
+not run, with the quota detail left to the worker's warning. Other turn sources
+retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
 The rejection retains every exceeded resource and its requested, used, and
