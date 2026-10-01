@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from . import factory_progress, workitem_outcomes, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
+from .repo_full_name import repo_url_path
 from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
@@ -938,6 +939,100 @@ async def gate(
     return "settled" if isinstance(result, workitems.WorkItemOutcome) else "waiting"
 
 
+@dataclass(frozen=True)
+class _ActionsRerun:
+    """One attempt to rerun failed Actions jobs.
+
+    ``retry`` is a transport or rate-limit failure and is not the one allowed
+    attempt. ``refused`` is a definitive client response. The response body is
+    never copied.
+    """
+
+    outcome: str
+    reason: str | None = None
+
+
+_RERUN_REFUSED = {
+    401: "github_unauthorized",
+    403: "github_forbidden",
+    404: "github_not_found",
+    422: "rerun_rejected",
+}
+
+
+async def _rerun_actions_jobs(
+    lineage: ThreadPublicationLineage,
+    work_item: WorkItem,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    job_ids: Sequence[int],
+) -> _ActionsRerun:
+    """POST each failed Actions job's rerun endpoint once.
+
+    GitHub re-runs a job and its dependent jobs at the same workflow run with
+    ``POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`` and answers
+    201 Created. A missing Actions permission is 403.
+    https://docs.github.com/en/rest/actions/workflow-jobs#re-run-a-job-from-a-workflow-run
+    """
+
+    if not job_ids or any(
+        not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 1 for job_id in job_ids
+    ):
+        return _ActionsRerun("refused", "rerun_rejected")
+    head_sha = lineage.head_sha
+    if not isinstance(head_sha, str) or not workitem_outcomes._SHA_RE.fullmatch(head_sha):
+        return _ActionsRerun("refused", "no_head_sha")
+    token, refused = await workitem_outcomes._mint_ci_token(
+        lineage, work_item, settings, head_sha
+    )
+    if refused is not None:
+        reason = refused.reason or "github_error"
+        if reason in {"timeout", "observation_busy", "github_rate_limited", "github_error"}:
+            return _ActionsRerun("retry", reason)
+        return _ActionsRerun("refused", reason)
+    assert token is not None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        try:
+            base = (
+                f"{settings.github_api_url.rstrip('/')}/repos/"
+                f"{repo_url_path(lineage.repo_full_name or '')}"
+            )
+        except ValueError:
+            return _ActionsRerun("refused", "github_error")
+        for job_id in job_ids:
+            try:
+                # build_request inherits client auth. send(..., auth=None) strips
+                # it so the installation token is the only credential on the wire.
+                request = client.build_request(
+                    "POST",
+                    f"{base}/actions/jobs/{job_id}/rerun",
+                    headers=headers,
+                    timeout=settings.github_app_timeout_seconds,
+                )
+                response = await client.send(request, auth=None, follow_redirects=False)
+            except httpx.TimeoutException:
+                return _ActionsRerun("retry", "timeout")
+            except httpx.HTTPError:
+                return _ActionsRerun("retry", "github_error")
+            if response.status_code == 201:
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                reason = "github_rate_limited" if response.status_code == 429 else "github_error"
+                return _ActionsRerun("retry", reason)
+            return _ActionsRerun(
+                "refused", _RERUN_REFUSED.get(response.status_code, "rerun_rejected")
+            )
+    finally:
+        del token
+        headers.clear()
+    return _ActionsRerun("requested")
+
+
 def _ci_deadline(
     published_at: datetime, request: ExecutionRequest, settings: Settings
 ) -> datetime:
@@ -996,7 +1091,7 @@ async def _consider_flake_rerun(
     if not await valkey.set(key, _RERUN_INFLIGHT, nx=True, ex=CI_CLAIM_SECONDS):
         return "proceed" if now >= deadline else "wait"
     try:
-        result = await workitem_outcomes.rerun_actions_jobs(
+        result = await _rerun_actions_jobs(
             lineage,
             work_item,
             settings,
