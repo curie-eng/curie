@@ -545,6 +545,14 @@ if [ "$1" = "get" ] && [ "$2" = "values" ]; then
 fi
 
 if [ "$1" = "status" ] && [ "$2" = "grafana" ]; then
+    if [ "$CURIE_TEST_HELM_STATUS_MODE" = "hang" ]; then
+        # A credential helper that forks and outlives its parent's timeout.
+        sleep 30 &
+        child_pid=$!
+        printf '%s\n' "$child_pid" > "$CURIE_TEST_HELM_STATUS_CHILD_PID_PATH"
+        wait "$child_pid"
+        exit 0
+    fi
     if [ "$CURIE_TEST_HELM_STATUS_MODE" = "pending-upgrade" ]; then
         status_namespace=observability
         case " $* " in
@@ -943,6 +951,10 @@ exit 64
             .env(
                 "CURIE_TEST_PVC_CHILD_PID_PATH",
                 self._temp.path().join("pvc-child.pid"),
+            )
+            .env(
+                "CURIE_TEST_HELM_STATUS_CHILD_PID_PATH",
+                self._temp.path().join("helm-status-child.pid"),
             )
             .env("CURIE_TEST_TEMPO_ROLLOUT_MODE", self.tempo_rollout_mode)
             .env("CURIE_TEST_HELM_VALUES", &self.helm_values)
@@ -3080,6 +3092,195 @@ fn pending_upgrade_recovery_requires_status_for_the_same_release() {
     let text = shown(&output);
     assert!(!output.status.success(), "{text}");
     assert!(!text.contains("kubectl delete secret"), "{text}");
+}
+
+/// A Pending claim on a StorageClass whose CSI driver is not installed only
+/// ever gets Normal events: the persistent volume controller hands it to the
+/// external provisioner and waits.
+/// https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/volume/persistentvolume/pv_controller.go
+#[test]
+fn pending_pvc_external_provisioning_names_the_provisioner() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Normal","reason":"ExternalProvisioning","message":"Waiting for a volume to be created either by the external provisioner 'csi.example.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Pending PVC loki-data")
+            && text.contains("ExternalProvisioning")
+            && text.contains("external provisioner \"csi.example.com\""),
+        "the diagnosis must name the claim and the provisioner it waits for: {text}"
+    );
+    assert!(
+        !text.contains("If a PVC is Pending, inspect it with"),
+        "a named cause replaces the generic hint: {text}"
+    );
+}
+
+#[test]
+fn pending_pvc_wait_for_first_consumer_is_named() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[{"type":"Normal","reason":"WaitForFirstConsumer","note":"waiting for first consumer to be created before binding","regarding":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Pending PVC loki-data")
+            && text.contains("WaitForFirstConsumer")
+            && text.contains("waiting for first consumer to be created before binding"),
+        "{text}"
+    );
+}
+
+#[test]
+fn normal_provisioning_event_needs_the_claims_own_uid() {
+    for (event_uid, reason) in [
+        (Some("old-uid"), "ExternalProvisioning"),
+        (None, "ExternalProvisioning"),
+        (Some("pvc-current"), "Provisioning"),
+    ] {
+        let mut object =
+            json!({"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability"});
+        if let Some(uid) = event_uid {
+            object["uid"] = json!(uid);
+        }
+        let fixture = Fixture::with_modes(
+            nodes(vec![node("node-a", "8Gi", true)]),
+            pods(vec![]),
+            "success",
+            "success",
+            "timeout",
+        )
+        .with_pvc_events(
+            json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+            json!({"items":[{"type":"Normal","reason":reason,"message":"external provisioner \"stale.example.com\" is provisioning","involvedObject":object}]}),
+        );
+        let output = fixture.run_command_args(
+            &["example", "sre-bot", "install", "--observability-only"],
+            &repo_root(),
+            None,
+        );
+        let text = shown(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            !text.contains("stale.example.com"),
+            "{reason} with uid {event_uid:?} must not explain the current claim: {text}"
+        );
+        assert!(
+            text.contains("If a PVC is Pending, inspect it with"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_matching_warning_outranks_a_normal_provisioning_event() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_pvc_events(
+        json!({"items":[{"metadata":{"name":"loki-data","namespace":"observability","uid":"pvc-current"},"status":{"phase":"Pending"}}]}),
+        json!({"items":[
+            {"type":"Normal","reason":"ExternalProvisioning","message":"waiting for a volume to be created, either by external provisioner \"csi.example.com\" or manually created by system administrator","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}},
+            {"type":"Warning","reason":"ProvisioningFailed","message":"volume quota exceeded","involvedObject":{"kind":"PersistentVolumeClaim","name":"loki-data","namespace":"observability","uid":"pvc-current"}}
+        ]}),
+    );
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("ProvisioningFailed") && text.contains("volume quota exceeded"),
+        "{text}"
+    );
+    assert!(!text.contains("ExternalProvisioning"), "{text}");
+}
+
+/// `helm status` runs a credential plugin the same way kubectl does; a plugin
+/// that forks must not outlive the bounded pending-upgrade read.
+#[test]
+fn helm_status_timeout_kills_forked_credential_helper() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    )
+    .with_helm_status_mode("hang");
+    let started = std::time::Instant::now();
+    let output = fixture.run_command_args(
+        &["example", "sre-bot", "install", "--observability-only"],
+        &repo_root(),
+        None,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{text}"
+    );
+    assert!(text.contains("context deadline exceeded"), "{text}");
+    assert!(!text.contains("kubectl delete secret"), "{text}");
+    #[cfg(unix)]
+    {
+        let pid = fs::read_to_string(fixture._temp.path().join("helm-status-child.pid"))
+            .expect("helm status child PID");
+        let pid = pid.trim().to_string();
+        let mut still_running = true;
+        for _ in 0..20 {
+            let process = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .expect("inspect forked helm status child");
+            let state = String::from_utf8_lossy(&process.stdout);
+            still_running = process.status.success() && !state.trim_start().starts_with('Z');
+            if !still_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if still_running {
+            let _ = Command::new("kill").arg(&pid).status();
+        }
+        assert!(
+            !still_running,
+            "forked helm status child survived the timeout: {pid}"
+        );
+    }
 }
 
 #[test]

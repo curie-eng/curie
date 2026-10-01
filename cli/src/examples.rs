@@ -1839,15 +1839,14 @@ async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<S
             "json",
         ],
     );
-    let (ok, stdout, _stderr) =
-        tokio::time::timeout(Duration::from_secs(3), crate::ops::run_capture(&status))
-            .await
-            .ok()?
-            .ok()?;
-    if !ok {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let output = run_bounded_diagnostic(&status, deadline, "helm status")
+        .await
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     (value.get("name").and_then(serde_json::Value::as_str) == Some(target.release.as_str())
         && value.get("namespace").and_then(serde_json::Value::as_str)
             == Some(target.namespace.as_str())
@@ -1858,13 +1857,14 @@ async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<S
     .then(|| helm_pending_upgrade_recovery(target))
 }
 
-async fn diagnostic_kubectl_json(
-    namespace: &str,
-    resource: &str,
+/// Run one read-only timeout diagnostic, stopping it and everything it spawned
+/// at `deadline`.
+async fn run_bounded_diagnostic(
+    command: &crate::ops::OpsCommand,
     deadline: tokio::time::Instant,
-) -> Result<serde_json::Value> {
-    let mut command =
-        ops_command("kubectl", ["get", resource, "-n", namespace, "-o", "json"]).tokio_command();
+    what: &str,
+) -> Result<std::process::Output> {
+    let mut command = command.tokio_command();
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1873,19 +1873,18 @@ async fn diagnostic_kubectl_json(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // A kubectl exec-credential plugin may spawn descendants. Give this
-        // read-only diagnostic its own group so a timeout can stop all of it.
+        // kubectl and helm both run exec credential plugins, which may spawn
+        // descendants. Give the diagnostic its own group so a timeout can stop
+        // all of it.
         command.as_std_mut().process_group(0);
     }
     let child = command
         .spawn()
-        .with_context(|| format!("reading {resource} for timeout diagnosis"))?;
+        .with_context(|| format!("running {what} for timeout diagnosis"))?;
     let child_id = child.id();
     let mut wait = Box::pin(child.wait_with_output());
-    let output = match tokio::time::timeout_at(deadline, &mut wait).await {
-        Ok(result) => {
-            result.with_context(|| format!("reading {resource} for timeout diagnosis"))?
-        }
+    match tokio::time::timeout_at(deadline, &mut wait).await {
+        Ok(result) => result.with_context(|| format!("running {what} for timeout diagnosis")),
         Err(_) => {
             #[cfg(unix)]
             if let Some(pgid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
@@ -1896,9 +1895,19 @@ async fn diagnostic_kubectl_json(
             // Reap the direct child after killing the group. The bounded wait
             // also covers a credential plugin that kept an output pipe open.
             let _ = tokio::time::timeout(Duration::from_millis(250), &mut wait).await;
-            bail!("kubectl get {resource} timed out during diagnosis");
+            bail!("{what} timed out during diagnosis");
         }
-    };
+    }
+}
+
+async fn diagnostic_kubectl_json(
+    namespace: &str,
+    resource: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value> {
+    let command = ops_command("kubectl", ["get", resource, "-n", namespace, "-o", "json"]);
+    let output =
+        run_bounded_diagnostic(&command, deadline, &format!("kubectl get {resource}")).await?;
     if !output.status.success() {
         bail!("kubectl get {resource} failed");
     }
@@ -1933,6 +1942,9 @@ fn pending_pvc_warning(
     let claims = pvcs.get("items")?.as_array()?;
     let pod_items = pods.get("items")?.as_array()?;
     let event_items = events.get("items")?.as_array()?;
+    // A Warning names a failure; a Normal provisioning event only says what the
+    // claim is still waiting for, so any matching Warning wins.
+    let mut waiting = None;
     for claim in claims {
         if claim
             .pointer("/status/phase")
@@ -1958,7 +1970,12 @@ fn pending_pvc_warning(
             .pointer("/metadata/uid")
             .and_then(serde_json::Value::as_str);
         for event in event_items {
-            if event.get("type").and_then(serde_json::Value::as_str) != Some("Warning") {
+            let event_type = event.get("type").and_then(serde_json::Value::as_str);
+            if event_type == Some("Normal") && waiting.is_none() {
+                waiting = pending_pvc_waiting(event, name, uid, namespace);
+                continue;
+            }
+            if event_type != Some("Warning") {
                 continue;
             }
             let Some(object) = event
@@ -2027,7 +2044,65 @@ fn pending_pvc_warning(
             }
         }
     }
-    None
+    waiting
+}
+
+/// Name what a Pending claim is waiting for from one of its own Normal events.
+/// The claim's uid must match: a Normal event is ordinary progress, so one left
+/// over from a deleted claim of the same name would be a confident wrong cause.
+fn pending_pvc_waiting(
+    event: &serde_json::Value,
+    name: &str,
+    uid: Option<&str>,
+    namespace: &str,
+) -> Option<String> {
+    let object = event
+        .get("involvedObject")
+        .or_else(|| event.get("regarding"))?;
+    let field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+    if field("kind") != Some("PersistentVolumeClaim")
+        || field("name") != Some(name)
+        || field("namespace") != Some(namespace)
+        || uid.is_none()
+        || field("uid") != uid
+    {
+        return None;
+    }
+    let reason = event.get("reason").and_then(serde_json::Value::as_str)?;
+    let message = event
+        .get("message")
+        .or_else(|| event.get("note"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let inspect = format!("Inspect `kubectl describe pvc {name} -n {namespace}`.");
+    match reason {
+        "ExternalProvisioning" => {
+            let waits_for = external_provisioner_name(message)
+                .map(|provisioner| {
+                    format!(
+                        " It waits for external provisioner \"{provisioner}\"; check that this provisioner is installed and running."
+                    )
+                })
+                .unwrap_or_default();
+            Some(format!(
+                "Pending PVC {name} has Kubernetes Normal {reason}: {message}.{waits_for} {inspect}"
+            ))
+        }
+        "WaitForFirstConsumer" => Some(format!(
+            "Pending PVC {name} has Kubernetes Normal {reason}: {message}. Its StorageClass binds only after a Pod using the claim is scheduled, so check why that Pod is not. {inspect}"
+        )),
+        _ => None,
+    }
+}
+
+/// The provisioner quoted in an `ExternalProvisioning` event message. Kubernetes
+/// has quoted it both as `'name'` and as `"name"` across releases.
+fn external_provisioner_name(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("external provisioner ")?;
+    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let rest = &rest[quote.len_utf8()..];
+    let (provisioner, _) = rest.split_once(quote)?;
+    (!provisioner.is_empty()).then_some(provisioner)
 }
 
 async fn kubernetes_connector_kubeconfig(namespace: &str) -> Result<String> {
@@ -3479,6 +3554,66 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_provisioner_name_reads_both_quote_styles() {
+        assert_eq!(
+            external_provisioner_name(
+                "Waiting for a volume to be created either by the external provisioner 'csi.example.com' or manually by the system administrator."
+            ),
+            Some("csi.example.com")
+        );
+        assert_eq!(
+            external_provisioner_name(
+                "waiting for a volume to be created, either by external provisioner \"csi.example.com\" or manually created by system administrator"
+            ),
+            Some("csi.example.com")
+        );
+        for message in [
+            "waiting for first consumer to be created before binding",
+            "external provisioner csi.example.com",
+            "external provisioner ''",
+        ] {
+            assert_eq!(external_provisioner_name(message), None, "{message}");
+        }
+    }
+
+    /// The helm render gate templates the Docker variant of the Alloy values
+    /// from this file instead of re-implementing `render_alloy_values`.
+    /// Regenerate it with `CURIE_TEST_UPDATE_ALLOY_FIXTURE=1 cargo test
+    /// alloy_docker_variant_matches_ci_fixture` after changing the template.
+    #[test]
+    fn alloy_docker_variant_matches_ci_fixture() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../charts/curie/ci/fixtures/alloy-docker-values.yaml");
+        let template = OBSERVABILITY_FILES
+            .iter()
+            .find(|(name, _)| *name == "alloy-values.yaml")
+            .map(|(_, contents)| *contents)
+            .expect("embedded Alloy values");
+        // The same two steps `write_observability_files` takes for the
+        // default namespace the gate renders into.
+        let template = rewrite_observability_namespace(template, OBSERVABILITY_NAMESPACE);
+        let rendered = render_alloy_values(&template, LogRuntime::Docker).unwrap();
+        if std::env::var("CURIE_TEST_UPDATE_ALLOY_FIXTURE").as_deref() == Ok("1") {
+            std::fs::create_dir_all(fixture.parent().expect("fixture directory"))
+                .expect("create Alloy CI fixture directory");
+            std::fs::write(&fixture, &rendered).expect("write Alloy CI fixture");
+        }
+        let committed = std::fs::read(&fixture).unwrap_or_else(|error| {
+            panic!(
+                "{} is unreadable ({error}); regenerate it with \
+                 CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+                fixture.display()
+            )
+        });
+        assert!(
+            committed == rendered,
+            "{} drifted from render_alloy_values; regenerate it with \
+             CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+            fixture.display()
+        );
+    }
 
     #[test]
     fn log_runtime_classifies_supported_node_versions() {
