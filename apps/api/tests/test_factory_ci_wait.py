@@ -1768,3 +1768,26 @@ def test_an_outstanding_rerun_times_out_without_an_implementer_round(
     assert sink.reruns == [job_id]
     assert _terminal(number) == ("failed", "ci_timeout")
     assert "Reason: ci_rerun_outstanding" in _body(sink, request_id)
+
+
+def test_a_mixed_rerun_records_both_the_request_and_the_refusal(admitted: Any) -> None:
+    """One accepted run and one 403 both show up on the phase report."""
+
+    _client, _github, sink = admitted
+    number = 9815
+    sink.ci_script = [
+        ci_entry(
+            _actions_failure("unit-tests", 88151, "2026-10-01T00:00:00Z"),
+            _actions_failure("lint", 88152, "2026-10-01T00:00:00Z"),
+        )
+    ]
+    sink.rerun_statuses = [201, 403]
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+
+    assert sink.reruns == [88151, 88152]
+    assert _ci_turns(published["id"]) == []
+    notes = [note for note in _phase_notes(published["id"]) if note]
+    assert "Reran failed Actions jobs once at this head." in notes
+    assert "CI rerun refused: github_forbidden." in notes

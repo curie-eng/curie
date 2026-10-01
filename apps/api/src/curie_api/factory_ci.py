@@ -1077,6 +1077,45 @@ async def _note_rerun(
         await factory_progress.record_ci_rerun(session, request_id, note)
 
 
+def _refused_run_ids(record: dict[str, Any]) -> list[int]:
+    return _accepted_runs({"accepted_runs": record.get("refused_runs")})
+
+
+async def _ensure_record_notes(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    request_id: uuid.UUID,
+    record: dict[str, Any],
+) -> None:
+    """Write the rerun note and, when any run was refused, the refusal too."""
+
+    if record.get("outcome") == "requested" or _accepted_runs(record):
+        await _note_rerun(sessionmaker, request_id, RERUN_REQUESTED_NOTE)
+    if record.get("outcome") == "refused" or _refused_run_ids(record):
+        reason = record.get("reason")
+        await _note_rerun(
+            sessionmaker,
+            request_id,
+            rerun_refused_note(reason if isinstance(reason, str) else "rerun_rejected"),
+        )
+
+
+def _terminal_rerun_decision(
+    record: dict[str, Any], detail: CiDetail, now: datetime, deadline: datetime
+) -> Literal["wait", "proceed", "timeout"] | None:
+    if record.get("outcome") == "refused":
+        return "proceed"
+    if record.get("outcome") != "requested":
+        return None
+    jobs = record.get("jobs")
+    if (
+        isinstance(jobs, list)
+        and jobs
+        and rerun_still_outstanding(detail, jobs, _refused_run_ids(record))
+    ):
+        return "timeout" if now >= deadline else "wait"
+    return "proceed"
+
+
 def _rerun_headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -1317,22 +1356,11 @@ async def _consider_flake_rerun(
     lock_key = f"{key}:lock"
     deadline = _ci_deadline(published_at, request, settings)
     record = _rerun_record(await valkey.get(key))
-    if record is not None and record.get("outcome") == "requested":
-        await _note_rerun(sessionmaker, request.id, RERUN_REQUESTED_NOTE)
-        jobs = _stored_jobs(record, detail)
-        if jobs and rerun_still_outstanding(detail, jobs, _accepted_runs(
-            {"accepted_runs": record.get("refused_runs")}
-        )):
-            return "timeout" if now >= deadline else "wait"
-        return "proceed"
-    if record is not None and record.get("outcome") == "refused":
-        reason = record.get("reason")
-        await _note_rerun(
-            sessionmaker,
-            request.id,
-            rerun_refused_note(reason if isinstance(reason, str) else "rerun_rejected"),
-        )
-        return "proceed"
+    if record is not None and record.get("outcome") in {"requested", "refused"}:
+        await _ensure_record_notes(sessionmaker, request.id, record)
+        decision = _terminal_rerun_decision(record, detail, now, deadline)
+        if decision is not None:
+            return decision
 
     jobs = _stored_jobs(record, detail)
     if not jobs:
@@ -1346,6 +1374,16 @@ async def _consider_flake_rerun(
         return "wait"
     ttl = round_ttl(request, now)
     try:
+        # Another reconciler may have stored accepted runs between the first
+        # read and this lock. Post from the locked record, not the stale one.
+        fresh = _rerun_record(await valkey.get(key))
+        if fresh is not None:
+            record = fresh
+        if record is not None and record.get("outcome") in {"requested", "refused"}:
+            await _ensure_record_notes(sessionmaker, request.id, record)
+            decision = _terminal_rerun_decision(record, detail, now, deadline)
+            if decision is not None:
+                return decision
         if record is None:
             record = {"outcome": "claimed", "jobs": jobs, "accepted_runs": []}
             if not await valkey.set(key, _rerun_body(record), nx=True, ex=ttl):
@@ -1383,6 +1421,7 @@ async def _consider_flake_rerun(
                 # Some runs were already accepted. Wait for those results.
                 # The runs GitHub refused stay failed and reach the
                 # implementer only after the accepted reruns settle.
+                await _ensure_record_notes(sessionmaker, request.id, latest)
                 return "timeout" if now >= deadline else "wait"
             refused_record = {
                 "outcome": "refused",
@@ -1393,7 +1432,7 @@ async def _consider_flake_rerun(
             if await _store_rerun(valkey, lock_key, key, token, refused_record, ttl):
                 await _note_rerun(sessionmaker, request.id, rerun_refused_note(reason))
             return "proceed"
-        await _note_rerun(sessionmaker, request.id, RERUN_REQUESTED_NOTE)
+        await _ensure_record_notes(sessionmaker, request.id, posted)
         return "wait"
     finally:
         await valkey.eval(_RELEASE_CLAIM, 1, lock_key, token)
