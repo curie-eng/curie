@@ -177,6 +177,7 @@ the channel the card lands on:
   an approval that can only expire. So is a route that lists only Slack `users` or a
   `group`, since nobody on an email thread can prove to be one. Any other non-Slack channel
   has no approver list it can verify yet, so its approvals admit nobody.
+- **The requester adds approvers** (ADR-0183 decision 5). The request email names the route's listed addresses. If one of them is already on the thread (the person who asked, or the To or Cc of the asking message), it says they can answer. If none is, it asks the requester to reply all and add one or more of them, as many as they like. The first answer the platform accepts is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack. The request email and the outcome are sent reply all, the requester always gets the outcome, and the bot never emails an approver who is not on the thread. The worker passes the listed addresses to the adapter as the card's `Approver` fields, for wording only.
 
 `emails` is allowed only on a `requesting_surface` route, and may sit beside `users` or
 `group`: a card shown in Slack reads only the Slack entries, and a card shown in email
