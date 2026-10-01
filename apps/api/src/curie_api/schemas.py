@@ -2869,9 +2869,17 @@ class KillState(BaseModel):
 
 
 class ThreadResetState(BaseModel):
-    """Whether a thread has a pending forced-sandbox-release request (#713)."""
+    """Whether a thread has a pending forced-sandbox-release request (#713).
+
+    ``route_existed`` is what the worker found when it drained the reset
+    (#3699). None while the reset is pending, and when no outcome is recorded
+    (the record expired, or the worker predates this field). False when the
+    drained reset matched no route, so nothing was released -- usually a key
+    built by hand that left out a named bot's identity segment. True when a
+    route existed and was released."""
 
     requested: bool
+    route_existed: bool | None = None
 
 
 class CostReport(BaseModel):

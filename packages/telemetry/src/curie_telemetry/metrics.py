@@ -183,6 +183,7 @@ _SANDBOX_ATTRIBUTES = {
         "cleanup",
         "reclaim",
         "terminate",
+        "thread-reset",
     ],
     "outcome": [
         "claimed",
@@ -202,6 +203,7 @@ _SANDBOX_ATTRIBUTES = {
         "refused-no-budget",
         "refused-no-safe-route",
         "scan-incomplete",
+        "no-route",
         "timeout",
     ],
 }
