@@ -303,8 +303,14 @@ class SessionRunner:
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
         tool_access: TurnToolAccess | None = None,
+        attachment_notice: str | None = None,
     ) -> None:
         self._factory = session_factory
+        # The attachments this boot found, named on the first prompt sent
+        # (#3691): the worker boots a sandbox for every turn that carries a
+        # file, so that prompt is the message that carried them. Cleared once
+        # sent, so a later turn in this warm sandbox names none.
+        self._attachment_notice = attachment_notice
         self._held_secrets = held_secrets
         # The per-turn tool access every call decision reads (RUNNER-TOOL-ACCESS-2).
         # None means this session cannot enforce one, so it refuses a restricted
@@ -575,7 +581,7 @@ class SessionRunner:
         if state.final_text is None:
             return
         messages = (
-            ConversationMessage(role="user", content=event.text),
+            ConversationMessage(role="user", content=state.prompt_text or event.text),
             *state.history_messages,
         )
         if (
@@ -1412,7 +1418,12 @@ class SessionRunner:
         else:
             self._read_only_prompt_sent = True
         self._result_pending = True
-        await self._session.query(event.text)
+        prompt = event.text
+        if self._attachment_notice is not None:
+            prompt = f"{event.text}\n\n{self._attachment_notice}"
+            self._attachment_notice = None
+        state.prompt_text = prompt
+        await self._session.query(prompt)
         async for message in self._session.receive_turn():
             if isinstance(message, ResultMessage):
                 self._result_pending = False
@@ -1464,7 +1475,7 @@ class SessionRunner:
                 if not (
                     not state.history_messages
                     and history_message.role == "user"
-                    and history_message.content == event.text
+                    and history_message.content == prompt
                 ):
                     state.history_messages.append(history_message)
             usage = getattr(message, "usage", None)
