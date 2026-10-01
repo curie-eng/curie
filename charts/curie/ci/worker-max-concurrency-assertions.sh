@@ -26,6 +26,9 @@
 #      the shipped defaults print "1 x 16 = 16".
 #   7. NOTES, negative: worker.deploy=false prints no turn-slot line, and a
 #      plain render (lookup empty, as under helm template) prints none either.
+#   8. RETAINED: a chart copy whose own values.yaml lacks maxConcurrency
+#      renders the worker env as 16; an explicit override still renders as 4.
+#   9. NOTES, retained: the same missing key prints "1 x 16 = 16".
 #
 # Refusals in 4 come from helm's bundled JSON-Schema validator, whose wording
 # differs across helm versions, so only the exit status and the bare key name
@@ -199,6 +202,36 @@ if notes | grep -q "concurrent turns"; then
   fail "7 a render with no lookup data printed a worker turn-slot line"
 fi
 echo "  ok: no lookup data, no turn-slot line"
+
+echo "=== Assertion 8: retained values missing maxConcurrency use 16 and preserve overrides ==="
+# Removing the key from the copied chart's defaults reproduces the values
+# available to a release upgrade that retains values from before the key existed.
+RETAINED="$TMP/retained"
+cp -R "$CHART" "$RETAINED"
+python3 - "$RETAINED/values.yaml" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+line = "  maxConcurrency: 16\n"
+assert text.count(line) == 1, "worker.maxConcurrency default changed shape"
+path.write_text(text.replace(line, ""))
+PY
+render "$RETAINED" retained-default
+expect_env 16
+echo "  ok: missing worker.maxConcurrency renders CURIE_WORKER_MAX_CONCURRENCY=16"
+
+render "$RETAINED" retained-four --set worker.maxConcurrency=4
+expect_env 4
+echo "  ok: an explicit worker.maxConcurrency=4 still renders as 4"
+
+echo "=== Assertion 9: NOTES uses 16 when retained values lack maxConcurrency ==="
+cp "$RETAINED/values.yaml" "$STUB/values.yaml"
+render "$STUB" notes-retained
+notes | grep -qF "worker.replicas 1 x worker.maxConcurrency 16 = 16 concurrent turns; the sandbox quota admits 8" \
+  || fail "9 NOTES does not print the retained default 1 x 16 = 16: $(notes | grep -i 'turn' || true)"
+echo "  ok: retained defaults print 1 x 16 = 16"
 
 echo
 echo "PASS: worker.maxConcurrency reaches the worker env within its bounds, and NOTES prints replicas x maxConcurrency beside the sandbox quota ceiling."
