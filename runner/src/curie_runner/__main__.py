@@ -144,18 +144,36 @@ def format_attachment_preamble(paths: Sequence[Path]) -> str | None:
     The session's cwd is the managed checkout, so a bare filename would resolve
     to ``<workspace>/<name>`` and the read would fail. Naming a file without a
     resolvable path is the same bug as not naming it at all, one step later.
+
+    It stays in force for every turn this sandbox serves, so it says what is on
+    disk and leaves which message carried it to ``format_attachment_notice``.
     """
 
     if not paths:
         return None
     lines = [
-        "The message you are answering carried file attachments. They are "
-        "already on disk in this sandbox and you can open them with your "
-        "ordinary file-reading tools. Your working directory is NOT the "
+        "Files attached in this conversation are on disk in this sandbox, and "
+        "you can open them with your ordinary file-reading tools. The message "
+        "that carried a file names it. Your working directory is NOT the "
         "directory holding them, so use these absolute paths exactly as "
         "written:",
     ]
     lines.extend(f"- {path}" for path in paths)
+    return "\n".join(lines)
+
+
+def format_attachment_notice(paths: Sequence[Path]) -> str | None:
+    """Name this boot's files on the message that carried them (#3691).
+
+    A file re-attached under the same name leaves the system prompt unchanged,
+    so only the message itself can say that it brought one.
+    """
+
+    if not paths:
+        return None
+    lines = ["[This message carried file attachments, on disk at these absolute paths:"]
+    lines.extend(f"- {path}" for path in paths)
+    lines[-1] += "]"
     return "\n".join(lines)
 
 
@@ -927,6 +945,7 @@ def build_runner(
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
             tool_access=tool_access,
+            attachment_notice=format_attachment_notice(attachment_paths),
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
