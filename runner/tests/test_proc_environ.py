@@ -126,10 +126,50 @@ def test_runner_boot_proc_environ_is_unreadable_to_the_same_user() -> None:
         _kill(proc)
 
 
-def test_cli_parent_proc_environ_is_unreadable_to_the_same_user() -> None:
-    """A process started from the cli parent env is not readable after exec."""
+def _compile_library(tmp_path: Path) -> Path:
+    source = tmp_path / "proc_dumpable.c"
+    library = tmp_path / "libproc_dumpable.so"
+    source.write_text(
+        "#include <sys/prctl.h>\n"
+        "__attribute__((constructor)) static void lock_dumpable(void) {\n"
+        "    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    if shutil.which("gcc") is None:
+        raise RuntimeError("gcc is missing")
+    compiled = subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(source)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if compiled.returncode != 0:
+        raise RuntimeError(compiled.stderr.strip() or "gcc failed")
+    return library
 
-    env = cli_parent_env({**os.environ, "ANTHROPIC_API_KEY": _PARENT_SENTINEL})
+
+def test_cli_parent_proc_environ_is_unreadable_to_the_same_user(tmp_path: Path) -> None:
+    """A process started from the cli parent env is not readable after exec.
+
+    connect clears os.environ before building the parent env, so the library
+    path has to come from the saved snapshot.
+    """
+
+    library = _compile_library(tmp_path)
+    snapshot = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": _PARENT_SENTINEL,
+        "CURIE_PROC_DUMPABLE_PRELOAD": str(library),
+    }
+    saved = dict(os.environ)
+    os.environ.clear()
+    try:
+        env = cli_parent_env(snapshot)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert env["LD_PRELOAD"].split(":", 1)[0] == str(library)
     proc = subprocess.Popen(
         ["/bin/sleep", "30"],
         env=env,
@@ -142,6 +182,23 @@ def test_cli_parent_proc_environ_is_unreadable_to_the_same_user() -> None:
         _expect_environ_unreadable(proc.pid)
     finally:
         _kill(proc)
+
+
+def test_a_missing_preload_path_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured library path that is not a file does not fall back to a cache."""
+
+    def _refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("gcc should not run")
+
+    monkeypatch.setattr(subprocess, "run", _refuse)
+    snapshot = {
+        "PATH": "/usr/bin",
+        "CURIE_PROC_DUMPABLE_PRELOAD": str(tmp_path / "missing.so"),
+    }
+    with pytest.raises(FileNotFoundError):
+        cli_parent_env(snapshot)
 
 
 def test_unfiltered_sleep_environ_is_readable_and_contains_the_sentinel() -> None:

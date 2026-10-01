@@ -166,8 +166,9 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
 _BLOCK_BREAK = "\n\n"
 # Consecutive refused breaks after which the rest of a text gets none.
 _MAX_REJECTED_BREAKS = 4
-# Shorter values are too small for an encoded form to be distinctive.
-_HELD_ENCODING_MIN_LENGTH = 16
+# Encodings shorter than this match ordinary text. A 4 character value
+# encodes to 8 characters; shorter values stay exact matches only.
+_HELD_ENCODING_MIN_LENGTH = 8
 
 
 def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
@@ -178,8 +179,6 @@ def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
         if not value:
             continue
         literals.add(value)
-        if len(value) < _HELD_ENCODING_MIN_LENGTH:
-            continue
         encoded = value.encode()
         for raw in (
             base64.standard_b64encode(encoded),
@@ -187,7 +186,7 @@ def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
         ):
             text = raw.decode()
             for form in (text, text.rstrip("=")):
-                if form and form != value:
+                if form and form != value and len(form) >= _HELD_ENCODING_MIN_LENGTH:
                     literals.add(form)
     return tuple(sorted(literals, key=lambda item: (-len(item), item)))
 

@@ -17,8 +17,8 @@ Declared connector secrets are not platform credentials. ADR-0009 remote
 from __future__ import annotations
 
 import ctypes
-import os
 import subprocess
+import tempfile
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
@@ -113,23 +113,27 @@ def lock_process_environ() -> None:
         raise OSError(ctypes.get_errno())
 
 
-def proc_dumpable_library() -> str:
-    """Constructor library the CLI parent loads. exec clears the environ lock."""
+def proc_dumpable_library(source: Mapping[str, str]) -> str:
+    """Constructor library the CLI parent loads. exec clears the environ lock.
 
-    configured = os.environ.get("CURIE_PROC_DUMPABLE_PRELOAD", "").strip()
+    The path comes from ``source``. ``connect`` clears ``os.environ`` before
+    building the parent env, and the image path is root owned. A missing
+    configured path fails closed. Hosts without the image variable compile a
+    fresh library in a private temp directory, not a stable home cache.
+    """
+
+    configured = source.get("CURIE_PROC_DUMPABLE_PRELOAD", "").strip()
     if configured:
         if Path(configured).is_file():
             return configured
         raise FileNotFoundError(configured)
-    cache_home = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    library = Path(cache_home) / "curie" / "libproc_dumpable.so"
-    source = Path(__file__).with_name("proc_dumpable.c")
-    if not library.is_file() or library.stat().st_mtime < source.stat().st_mtime:
-        library.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(source)],
-            check=True,
-        )
+    library_dir = Path(tempfile.mkdtemp(prefix="curie-proc-dumpable-"))
+    library = library_dir / "libproc_dumpable.so"
+    c_source = Path(__file__).with_name("proc_dumpable.c")
+    subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(c_source)],
+        check=True,
+    )
     return str(library)
 
 
@@ -148,7 +152,7 @@ def cli_parent_env(source: Mapping[str, str]) -> dict[str, str]:
         if value:
             parent[key] = value
     parent["BASH_ENV"] = str(BASH_CREDENTIAL_PRELUDE)
-    library = proc_dumpable_library()
+    library = proc_dumpable_library(source)
     existing = source.get("LD_PRELOAD", "")
     kept = [entry for entry in existing.split(":") if entry and entry != library]
     parent["LD_PRELOAD"] = ":".join([library, *kept])

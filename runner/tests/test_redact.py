@@ -9,6 +9,7 @@ held credential inventory.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -1442,6 +1443,20 @@ def test_turn_close_drops_pending_secret_text_and_followup_is_independent(
             await runner.close()
 
     anyio.run(go)
+
+
+def test_outbound_redactor_scrubs_base64_of_a_short_held_token() -> None:
+    """Encoded forms of a 10 character held token are replaced."""
+
+    secret = "acme-token"
+    encoded = base64.standard_b64encode(secret.encode()).decode()
+    redactor = OutboundRedactor(frozenset({secret}))
+    raw = json.dumps({"type": "text_delta", "text": f"before {encoded} after"})
+    emitted = redactor.push(raw + "\n")
+    assert encoded not in "".join(emitted)
+    assert "[REDACTED:held_secret]" in "".join(emitted)
+    finished = redactor.finish()
+    assert finished is None or encoded not in finished
 
 
 def test_http_reply_scrubs_base64_of_a_held_secret(
