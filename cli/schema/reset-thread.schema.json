@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/reset-thread/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/reset-thread/v1.1.json",
   "title": "curie <tier> reset-thread --json",
-  "description": "The agent-facing payload of `curie <tier> reset-thread`: the dry-run plan, or the reset-request state (`requested` always true on success; `released` true only once the worker confirmed the sandbox drained within the wait window).",
+  "description": "The agent-facing payload of `curie <tier> reset-thread`: the dry-run plan, or the reset-request state (`requested` always true on success; `released` true only once the worker confirmed the sandbox drained within the wait window; `route_existed` is present, and true, only when the API reported that the drained reset found a route and released it -- a reset that matched no route is an error, not this payload).",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -42,6 +42,9 @@
           "type": "boolean"
         },
         "released": {
+          "type": "boolean"
+        },
+        "route_existed": {
           "type": "boolean"
         }
       },

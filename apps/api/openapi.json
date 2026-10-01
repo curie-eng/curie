@@ -7127,11 +7127,22 @@
         "type": "object"
       },
       "ThreadResetState": {
-        "description": "Whether a thread has a pending forced-sandbox-release request (#713).",
+        "description": "Whether a thread has a pending forced-sandbox-release request (#713).\n\n``route_existed`` is what the worker found when it drained the reset\n(#3699). None while the reset is pending, and when no outcome is recorded\n(the record expired, or the worker predates this field). False when the\ndrained reset matched no route, so nothing was released -- usually a key\nbuilt by hand that left out a named bot's identity segment. True when a\nroute existed and was released.",
         "properties": {
           "requested": {
             "title": "Requested",
             "type": "boolean"
+          },
+          "route_existed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Existed"
           }
         },
         "required": [
@@ -11556,7 +11567,7 @@
     },
     "/agents/{agent_id}/threads/{thread_key}/reset": {
       "get": {
-        "description": "Poll whether a forced reset (the POST above) is still outstanding for\nthis thread (#735). ``requested`` is True from the moment the POST enqueues\nthe request until the worker's maintenance tick drains it AND\n``release_thread`` actually completes, then False.\n\nWhy this exists: the POST returns as soon as the request is *queued*, but the\nrelease only happens on the worker's maintenance tick (up to\n``reclaim_interval_s`` -- 30s by default -- later). Without a way to observe\ncompletion, the natural operator workflow \"reset the thread, then send a\nmessage to confirm\" adopts the still-live pre-reset sandbox and reads a\nstale answer, indistinguishable from \"the reset did not work\" (#735). A\ncaller that must not adopt the pre-reset sandbox polls this until it reads\nFalse before sending the next message; the CLI ``reset-thread`` verb does\nexactly that on the operator's behalf. Mirrors ``GET .../kill``.\n\nThe signal flips only after the release LANDS, not at claim time (#812, was\n#806 incomplete). The worker SPOPs the request to claim it, then moves it\ninto an in-progress set that ``is_pending`` also reads, clearing it only once\n``release_thread`` succeeds. So this stays True across the whole release, and\na release that raises or times out leaves it True -- the CLI reports the\nreset as unconfirmed rather than a false \"released\". Reading only the request\nset would flip to done the instant the request was SPOPped, before -- and\nindependent of whether -- the sandbox was actually released.",
+        "description": "Poll whether a forced reset (the POST above) is still outstanding for\nthis thread (#735). ``requested`` is True from the moment the POST enqueues\nthe request until the worker's maintenance tick drains it AND\n``release_thread`` actually completes, then False.\n\nWhy this exists: the POST returns as soon as the request is *queued*, but the\nrelease only happens on the worker's maintenance tick (up to\n``reclaim_interval_s`` -- 30s by default -- later). Without a way to observe\ncompletion, the natural operator workflow \"reset the thread, then send a\nmessage to confirm\" adopts the still-live pre-reset sandbox and reads a\nstale answer, indistinguishable from \"the reset did not work\" (#735). A\ncaller that must not adopt the pre-reset sandbox polls this until it reads\nFalse before sending the next message; the CLI ``reset-thread`` verb does\nexactly that on the operator's behalf. Mirrors ``GET .../kill``.\n\nThe signal flips only after the release LANDS, not at claim time (#812, was\n#806 incomplete). The worker SPOPs the request to claim it, then moves it\ninto an in-progress set that ``is_pending`` also reads, clearing it only once\n``release_thread`` succeeds. So this stays True across the whole release, and\na release that raises or times out leaves it True -- the CLI reports the\nreset as unconfirmed rather than a false \"released\". Reading only the request\nset would flip to done the instant the request was SPOPped, before -- and\nindependent of whether -- the sandbox was actually released.\n\nOnce the reset is no longer pending, ``route_existed`` says what the drain\nfound (#3699): False when the key matched no route, so nothing was released\nand the sandbox the caller meant to free is still claimed; True when a route\nexisted and was released. It stays None while the reset is pending and when\nthe worker recorded no outcome (expired, or a worker that predates it), so a\ncaller treats None as unknown, not as success or failure.",
         "operationId": "get_thread_reset_state_agents__agent_id__threads__thread_key__reset_get",
         "parameters": [
           {

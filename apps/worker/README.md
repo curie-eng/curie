@@ -868,6 +868,17 @@ database outside either finite window fails closed. Alert on
 `outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
 `PEXPIRETIME`, so the pass returns `expiry-unsupported`.
 
+An operator thread reset (`reset-thread`, `POST /agents/{id}/threads/{key}/reset`)
+is drained on the maintenance tick. The drain records the outcome under
+`curie:thread-reset-result:<thread_key>` for an hour, as `released` when a route
+existed or `no-route` when the key matched none, before it clears the
+in-progress marker. The API reports it as `route_existed`, so a reset that freed
+nothing (typically a hand-built key that left out a named bot's identity
+segment) is visible to the caller. A release that raises records no result and
+leaves the request in progress. Each drained reset also increments
+`curie.sandbox.lifecycle` with `operation=thread-reset` and `outcome=released`,
+`no-route` or `failed`; alert on `no-route` to find resets that freed nothing.
+
 On a terminal pressure timeout, cancellation is delivered once and victim lock
 release can add one finite cold pressure Redis operation, at most four seconds.
 That tail consumes unused claim reserve and never authorizes requester retry.

@@ -628,7 +628,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -648,10 +649,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.claim.duration": {
       "type": "histogram",
@@ -669,7 +671,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -689,10 +692,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.resume.duration": {
       "type": "histogram",
@@ -710,7 +714,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -730,10 +735,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.release.duration": {
       "type": "histogram",
@@ -751,7 +757,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -771,10 +778,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.sandbox.active": {
       "type": "gauge",
@@ -828,7 +836,8 @@
           "suspend",
           "cleanup",
           "reclaim",
-          "terminate"
+          "terminate",
+          "thread-reset"
         ],
         "outcome": [
           "claimed",
@@ -848,10 +857,11 @@
           "refused-no-budget",
           "refused-no-safe-route",
           "scan-incomplete",
+          "no-route",
           "timeout"
         ]
       },
-      "cardinality_bound": 126
+      "cardinality_bound": 152
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",
