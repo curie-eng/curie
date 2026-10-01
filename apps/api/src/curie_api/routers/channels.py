@@ -40,7 +40,13 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import redis.asyncio as redis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol import (
+    STREAM_PAYLOAD_FIELD,
+    Attachment,
+    QueuedTurn,
+    ReplyHandle,
+    TurnSource,
+)
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -176,6 +182,12 @@ class TurnIn(ChannelBinding):
     `message_id`, a webhook's delivery id). The platform derives `event_id` from
     it deterministically, so an adapter that never saw the response converges by
     retrying rather than by enqueuing a second turn.
+
+    `attachments` are references, never bytes (ADR-0153 decision 1). Each `id`
+    is the adapter's own, and the worker asks that adapter for the file. The
+    empty default keeps a body from an adapter that predates the field valid.
+    The field has to be modelled: `extra="ignore"` would otherwise accept the
+    key and drop it.
     """
 
     model_config = ConfigDict(extra="ignore", from_attributes=True)
@@ -185,6 +197,7 @@ class TurnIn(ChannelBinding):
     author: str
     text: str
     reply_ref: str
+    attachments: list[Attachment] = []
 
 
 class AdmissionIn(ChannelBinding):
@@ -557,6 +570,9 @@ def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
         # field is about who caused the turn, and the answer here is a human.
         # ADR-0079's hook ingress is a separate route and will say `WEBHOOK`.
         source=TurnSource.SLACK,
+        # ADR-0153 decision 2: the field the Slack dispatcher fills, so both
+        # ingress paths reach the same resolver.
+        attachments=body.attachments,
         reply_handle=ReplyHandle(
             kind=row.kind,
             channel=row.address,
