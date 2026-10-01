@@ -336,6 +336,12 @@ _RETRY_MAX_DOUBLINGS = math.ceil(math.log2(_RETRY_MAX_DELAY_S / _RETRY_BASE_DELA
 # failure the deploy lane has stopped, and an operator needs to find it as that
 # rather than as one more per-pass INFO line (#1309).
 _RETRY_ERROR_ROUNDS = 3
+# The failure class of an exception that ESCAPED process_push rather than being
+# mapped to a rejection (#3736). A rejection's codes name the failure; an escape
+# has none, so the backoff record needs a stable stand-in for the same
+# "same sha AND same failure class continues the schedule" rule. Chosen to be
+# visibly not a rejection code, since no `process_push` result ever carries it.
+_PUSH_RAISED = "commitpoller.process_push_raised"
 
 
 @dataclass(frozen=True)
@@ -577,12 +583,48 @@ class CommitPoller:
                 unsettled.append(move)
         moves = unsettled
 
+        # A move whose deploy RAISES must not stop the moves behind it (#3736).
+        # `process_push` maps git, archive and bundle validation errors to a
+        # rejected result, but its later steps -- a stored bundle's object read,
+        # the bundle store write, the revalidation, database writes, the eval
+        # enqueue -- are unguarded. The first such failure is held here and
+        # re-raised AFTER the loop, so the remaining moves still deploy in this
+        # pass while `poll_once` still records the pass as a failure rather than
+        # letting a broken lane look like a clean one.
+        pass_failure: Exception | None = None
         for move in moves:
             key = (move.repo_full_name, move.branch)
             async with self._session_factory() as session:
-                result = await gitflow.process_push(
-                    session, self._store, self._settings, self._eval_queue, move.as_push_payload()
-                )
+                # No `except CancelledError: raise`, deliberately -- the same
+                # structural guarantee `run_forever` documents: CancelledError
+                # derives from BaseException, so `except Exception` below cannot
+                # catch it and cancellation propagates on its own.
+                try:
+                    result = await gitflow.process_push(
+                        session,
+                        self._store,
+                        self._settings,
+                        self._eval_queue,
+                        move.as_push_payload(),
+                    )
+                except Exception as exc:
+                    # The mirror clone lives inside process_push, so an escape
+                    # must earn the same capped backoff a retryable rejection
+                    # does (#1309) -- otherwise the next pass re clones it
+                    # first and blocks these same repositories again. The
+                    # record is a statement about the attempt, not the sha:
+                    # `_settled` is not written, so recovery stays possible.
+                    logger.exception(
+                        "commit poll deploy raised repo=%s branch=%s sha=%s: %s",
+                        move.repo_full_name,
+                        move.branch,
+                        move.sha[:8],
+                        exc,
+                    )
+                    self._record_retryable_failure(move, {_PUSH_RAISED}, deployed.get(key))
+                    if pass_failure is None:
+                        pass_failure = exc
+                    continue
             # Shared with the webhook lane, not copied (#1268). Reporting a
             # rejection as "deployed" at INFO is #1066 again, and this is the
             # lane with no GitHub delivery UI to fall back on.
@@ -620,6 +662,11 @@ class CommitPoller:
                     move.sha[:8],
                     result.status,
                 )
+        if pass_failure is not None:
+            # Only once every move has had its turn (#3736): the pass reports
+            # failure through poll_once's span and metric, and run_forever's
+            # existing handler keeps the loop alive.
+            raise pass_failure
         return moves
 
     def _record_retryable_failure(
