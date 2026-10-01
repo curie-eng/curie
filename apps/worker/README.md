@@ -824,10 +824,14 @@ fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
 the same stream when its retry is due. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
-receives an expiry message if the deadline passes. An approval resume is
-refused under `sandbox-capacity` instead (#3693): it retries, and its terminal
-notice tells the person the agent was at capacity and could not continue after
-the approval decision, with the quota detail left to the worker's warning. An
+receives an expiry message if the deadline passes. An approval resume does not
+wait. It runs the same reclamation pass after its own quota refusal, and when
+the pass frees nothing, or the one retry after it is refused again, the attempt
+fails under `sandbox-capacity` instead (#3693, #3700). The failure retries, and
+each retry that is refused again may run the pass once more, so a resume that
+stays refused can free up to one idle route per attempt. Its terminal notice
+tells the person the agent was at capacity and could not continue after the
+approval decision, with the quota detail left to the worker's warning. An
 earlier attempt's confirmed pod termination is carried onto that notice. Other turn sources
 retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
