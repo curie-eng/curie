@@ -28,6 +28,7 @@ pub mod eval_sampling;
 pub mod evals;
 pub mod examples;
 pub mod exit;
+pub mod factory_intake;
 pub mod github_app;
 pub mod guide;
 pub mod installation;

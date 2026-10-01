@@ -818,6 +818,118 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+/// Every tracked file of `examples/dark-factory`, embedded so a released
+/// binary can render the factory bundle without a source checkout (#3619).
+pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
+    (
+        "README.md",
+        include_bytes!("../../examples/dark-factory/README.md"),
+    ),
+    (
+        ".mcp.json",
+        include_bytes!("../../examples/dark-factory/.mcp.json"),
+    ),
+    (
+        ".gitignore",
+        include_bytes!("../../examples/dark-factory/.gitignore"),
+    ),
+    (
+        "connectors.yaml",
+        include_bytes!("../../examples/dark-factory/connectors.yaml"),
+    ),
+    (
+        "runner.Dockerfile",
+        include_bytes!("../../examples/dark-factory/runner.Dockerfile"),
+    ),
+    (
+        ".claude-plugin/plugin.json",
+        include_bytes!("../../examples/dark-factory/.claude-plugin/plugin.json"),
+    ),
+    (
+        "agents/diff-reviewer.md",
+        include_bytes!("../../examples/dark-factory/agents/diff-reviewer.md"),
+    ),
+    (
+        "agents/plan-reviewer.md",
+        include_bytes!("../../examples/dark-factory/agents/plan-reviewer.md"),
+    ),
+    (
+        "progress/phases.json",
+        include_bytes!("../../examples/dark-factory/progress/phases.json"),
+    ),
+    (
+        "hooks/hooks.json",
+        include_bytes!("../../examples/dark-factory/hooks/hooks.json"),
+    ),
+    (
+        "hooks/review_gate.py",
+        include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
+    ),
+    (
+        "evals/cases.json",
+        include_bytes!("../../examples/dark-factory/evals/cases.json"),
+    ),
+    (
+        "skills/implement-issue/SKILL.md",
+        include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
+    ),
+];
+
+/// Files rendered with the executable bit, matching their tracked mode.
+const DARK_FACTORY_EXECUTABLE_FILES: &[&str] = &["hooks/review_gate.py"];
+
+pub struct DarkFactoryRenderOpts {
+    pub out: PathBuf,
+}
+
+pub struct DarkFactoryRenderOutput {
+    pub path: PathBuf,
+}
+
+impl CliOutput for DarkFactoryRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"bundle_dir": self.path, "rendered": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("Dark factory bundle: {}", self.path.display()));
+    }
+}
+
+/// Write the embedded dark-factory bundle into `opts.out`. Touches no cluster.
+/// Refuses an existing non-empty directory before writing anything.
+pub fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
+    let out = opts.out;
+    if out.exists() {
+        let non_empty = !out.is_dir()
+            || std::fs::read_dir(&out)
+                .with_context(|| format!("reading render output {}", out.display()))?
+                .next()
+                .is_some();
+        if non_empty {
+            return Err(crate::exit::usage(format!(
+                "render output {} already exists and is not empty; pick an empty or new directory",
+                out.display()
+            )));
+        }
+    }
+    for (name, bytes) in DARK_FACTORY_BUNDLE_FILES {
+        let path = out.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        if DARK_FACTORY_EXECUTABLE_FILES.contains(name) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("marking {} executable", path.display()))?;
+        }
+    }
+    Ok(DarkFactoryRenderOutput { path: out })
+}
+
 pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
     if opts.out.exists() {
         return Err(crate::exit::usage(format!(
@@ -4560,5 +4672,126 @@ mod tests {
                 "unexpected error for {case}: {error:#}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dark_factory_render_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn source_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory")
+    }
+
+    /// Every file under the example, relative to its root, excluding the lock
+    /// a local build writes.
+    fn source_files() -> Vec<(String, PathBuf)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+            for entry in std::fs::read_dir(dir).expect("read example dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                        continue;
+                    }
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if rel == "connectors.lock.yaml" {
+                        continue;
+                    }
+                    out.push((rel, path));
+                }
+            }
+        }
+        let root = source_root();
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
+    // A1
+    #[test]
+    fn every_dark_factory_file_is_embedded_with_identical_bytes() {
+        let files = source_files();
+        assert!(
+            files.iter().any(|(rel, _)| rel == "hooks/review_gate.py"),
+            "fixture walk found no review gate: {files:?}"
+        );
+        for (rel, path) in &files {
+            let embedded = DARK_FACTORY_BUNDLE_FILES
+                .iter()
+                .find(|(name, _)| name == rel)
+                .unwrap_or_else(|| panic!("{rel} is in examples/dark-factory but not embedded"));
+            let on_disk = std::fs::read(path).unwrap();
+            assert_eq!(embedded.1, on_disk.as_slice(), "{rel} bytes differ");
+        }
+        for (name, _) in DARK_FACTORY_BUNDLE_FILES {
+            assert!(
+                files.iter().any(|(rel, _)| rel == name),
+                "{name} is embedded but not in examples/dark-factory"
+            );
+        }
+    }
+
+    // A2
+    #[test]
+    fn render_writes_every_file_and_keeps_the_review_gate_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("factory");
+        let rendered = render_dark_factory(DarkFactoryRenderOpts { out: out.clone() })
+            .expect("render into a new directory");
+        assert_eq!(rendered.path, out);
+        for (name, bytes) in DARK_FACTORY_BUNDLE_FILES {
+            let written = std::fs::read(out.join(name))
+                .unwrap_or_else(|e| panic!("{name} was not written: {e}"));
+            assert_eq!(written.as_slice(), *bytes, "{name} bytes differ");
+        }
+        let mode = std::fs::metadata(out.join("hooks/review_gate.py"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "review_gate.py mode {mode:o} is not executable"
+        );
+        let readme_mode = std::fs::metadata(out.join("README.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(readme_mode & 0o111, 0, "README.md should not be executable");
+        let json = rendered.to_json();
+        assert_eq!(json["rendered"], serde_json::json!(true));
+        assert_eq!(json["bundle_dir"], serde_json::json!(out));
+    }
+
+    // A3
+    #[test]
+    fn render_into_a_non_empty_directory_is_refused_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("busy");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("keep.txt"), b"mine").unwrap();
+        let error = match render_dark_factory(DarkFactoryRenderOpts { out: out.clone() }) {
+            Ok(_) => panic!("a non-empty out dir must be refused"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains(&out.display().to_string()),
+            "the refusal should name the directory: {error}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.txt")]);
+        assert_eq!(std::fs::read(out.join("keep.txt")).unwrap(), b"mine");
     }
 }

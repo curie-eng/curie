@@ -893,6 +893,10 @@ the development default, `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a
 single label name, `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one
 GitHub login, and `api.githubRepoAllowlist` is non-empty.
 
+`curie cluster factory` sets these values for you (see the dark-factory
+example README). It checks the merged config against this boot gate before
+applying anything, and `--disable` turns intake off.
+
 Bind the agent with a `github` channel whose address is the repository
 `owner/name`. No Slack binding is required. The configured label is only the
 initial admission convention. A later bounded execution requires a new issue

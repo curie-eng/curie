@@ -818,7 +818,8 @@ enum Command {
         /// Build the connectors this agent bundle declares.
         #[arg(long, value_name = "PATH")]
         plugin_dir: Option<PathBuf>,
-        /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
+        /// Push every declared platform (or the `--platform` subset) to this
+        /// registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
         /// The platform runner a declared runner layer builds on (default: the
@@ -828,6 +829,11 @@ enum Command {
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
+        /// Push only these declared platforms (repeatable; requires `--registry`), e.g. the one architecture a laptop cluster runs.
+        /// The default Docker driver can push a single platform; a multi-platform push needs a docker-container builder.
+        /// Without `--registry` the build is the host platform only, so `--platform` is refused there.
+        #[arg(long = "platform", value_name = "OS/ARCH", requires = "registry")]
+        platform: Vec<String>,
     },
     /// Bootstrap or update a dev checkout: install deps and build, start nothing (source checkout only).
     ///
@@ -1044,6 +1050,21 @@ enum ExampleAction {
     SreBot {
         #[command(subcommand)]
         action: SreBotAction,
+    },
+    /// Work with the dark-factory example bundle.
+    DarkFactory {
+        #[command(subcommand)]
+        action: DarkFactoryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DarkFactoryAction {
+    /// Write the dark-factory bundle into a new or empty directory. Touches no cluster.
+    Render {
+        /// Directory to write the bundle into. Must not exist or be empty.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
     },
 }
 
@@ -2944,6 +2965,56 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Turn on the GitHub factory intake (label or mention triggers, webhook
+    /// secret, repo allowlist, GitHub API egress) on an existing release.
+    Factory {
+        /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
+        /// Sets `api.githubRepoAllowlist`.
+        #[arg(long = "repo", value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+        /// Issue label that hands an issue to the factory. Required (here or
+        /// already recorded on the release); no whitespace, 50 chars max.
+        #[arg(long)]
+        label: Option<String>,
+        /// GitHub App login (the app slug, no '@', e.g. `my-app-slug`) whose
+        /// comment mention hands an issue to the factory. Required (here or
+        /// already recorded on the release).
+        #[arg(long)]
+        mention: Option<String>,
+        /// Public base URL the factory links its progress cards to.
+        #[arg(long, value_name = "URL")]
+        card_base_url: Option<String>,
+        /// File holding the GitHub webhook secret. Alternatively set
+        /// CURIE_GITHUB_WEBHOOK_SECRET; never both. The secret never enters argv.
+        #[arg(long, value_name = "PATH")]
+        webhook_secret_file: Option<PathBuf>,
+        /// Give this agent egress to the GitHub API ranges published at
+        /// <api>/meta (port 443). Repeatable.
+        #[arg(long = "github-api-egress", value_name = "AGENT")]
+        github_api_egress: Vec<String>,
+        /// Turn the factory intake off; changes nothing else.
+        #[arg(long)]
+        disable: bool,
+        /// Helm `--timeout` in seconds for the upgrade. Default: the release's
+        /// own drain contract, the `curie.ai/minimum-helm-timeout-seconds`
+        /// annotation on its pre-upgrade worker drain hook (worker
+        /// deliveryBudgetSeconds + reserve + Job and grace slack), never below
+        /// 900. A factory install with a 10800s budget needs about 21900s.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Drive the deployed Kubernetes release end to end with zero Slack contact.
     Message {
         /// The user message text.
@@ -3674,6 +3745,9 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::GithubApp {
             namespace, release, ..
         }
+        | ClusterAction::Factory {
+            namespace, release, ..
+        }
         | ClusterAction::Eval {
             namespace, release, ..
         }
@@ -3777,6 +3851,11 @@ fn retarget_cluster_action(
             ..
         }
         | ClusterAction::GithubApp {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Factory {
             namespace: current_namespace,
             release: current_release,
             ..
@@ -4285,6 +4364,15 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
+            action:
+                ExampleAction::DarkFactory {
+                    action: DarkFactoryAction::Render { out },
+                },
+            ..
+        }) => emit(curie::examples::render_dark_factory(
+            curie::examples::DarkFactoryRenderOpts { out },
+        )?),
+        Some(Command::Example {
             action: ExampleAction::SreBot { action },
             context,
         }) => {
@@ -4371,6 +4459,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             registry,
             runner_image,
             force,
+            platform,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
@@ -4378,6 +4467,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     registry,
                     runner_image,
                     force,
+                    platforms: platform,
                 })
                 .await?,
             ),
@@ -5666,6 +5756,53 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         &clone_base,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::Factory {
+                repos,
+                label,
+                mention,
+                card_base_url,
+                webhook_secret_file,
+                github_api_egress,
+                disable,
+                timeout,
+                namespace,
+                release,
+                chart,
+                dry_run,
+            } => {
+                let webhook_secret = if disable {
+                    None
+                } else {
+                    curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?
+                };
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                emit(
+                    curie::factory_intake::factory_intake(curie::factory_intake::FactoryIntakeOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        chart,
+                        repos,
+                        label,
+                        mention,
+                        card_base_url,
+                        webhook_secret,
+                        github_api_egress,
+                        disable,
+                        timeout_seconds: timeout,
+                    })
                     .await?,
                 )
             }
@@ -7077,6 +7214,38 @@ mod tests {
         }
     }
 
+    // #3619 C4: the webhook secret never reaches argv, so no value flag exists.
+    #[test]
+    fn cluster_factory_has_no_webhook_secret_value_flag() {
+        let error = match try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--webhook-secret",
+            "x",
+            "--dry-run",
+        ]) {
+            Ok(_) => panic!("--webhook-secret <value> must not parse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(error.to_string().contains("--webhook-secret"), "{error}");
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "factory",
+                "--webhook-secret-file",
+                "/tmp/s",
+                "--label",
+                "factory",
+                "--dry-run"
+            ])
+            .is_ok(),
+            "the file form is the supported path"
+        );
+    }
+
     /// clap's derived parser is deep enough that debug bin tests overflow the
     /// default thread stack once apply/diff/doctor grew `--context`. The
     /// released binary still parses on the process stack; only the test
@@ -7451,6 +7620,33 @@ mod tests {
             allow_only.is_ok(),
             "--allow-stateful-removal alone must parse"
         );
+    }
+
+    #[test]
+    fn build_platform_requires_registry() {
+        assert!(
+            try_parse_from([
+                "curie",
+                "build",
+                "--plugin-dir",
+                "x",
+                "--platform",
+                "linux/arm64"
+            ])
+            .is_err(),
+            "--platform without --registry must be refused"
+        );
+        assert!(try_parse_from([
+            "curie",
+            "build",
+            "--plugin-dir",
+            "x",
+            "--registry",
+            "r",
+            "--platform",
+            "linux/arm64"
+        ])
+        .is_ok());
     }
 
     #[test]
