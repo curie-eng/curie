@@ -605,9 +605,16 @@ class Settings(BaseSettings):
     # upstreams can create, and a per-hook counter would let a source multiply
     # its own allowance by inventing hook names.
     hook_backlog_limit: int = 64
-    hook_backlog_window_s: int = 60
+    # Both windows floor `take_backlog_slot`'s time bucket (delivery.py), so 0
+    # divides by zero -- a 500 on every new delivery AFTER the claim was taken,
+    # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
+    # a negative window makes the quota script's EXPIRE delete the counter
+    # immediately, silently disabling the quota. Bounded at construction the
+    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # rather than surfacing mid-delivery (#3720).
+    hook_backlog_window_s: int = Field(default=60, gt=0)
     channel_binding_backlog_limit: int = 64
-    channel_binding_backlog_window_s: int = 60
+    channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
     # the quota object renders, and leaves all four unset otherwise. A partial
     # set is a broken install: the agent write refuses rather than skipping the
