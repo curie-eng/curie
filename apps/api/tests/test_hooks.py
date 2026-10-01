@@ -96,15 +96,20 @@ def _sign(
 ) -> str:
     """Hand-rolled on purpose rather than calling `hook_signing.sign`.
 
-    This pins timestamp and delivery framing, then a length framed compact JSON
-    context containing hook and policy, followed by the unchanged raw body. It
-    stays independent of production so a drift fails the tests.
+    This pins the scheme label, timestamp and delivery framing, then a length
+    framed compact JSON context containing hook and policy, followed by the
+    unchanged raw body. It stays independent of production so a drift fails.
     """
 
     context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
         "ascii"
     )
-    material = f"{timestamp}.{delivery_id}.{len(context)}:".encode() + context + body
+    material = (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery_id}.{len(context)}:".encode()
+        + context
+        + body
+    )
     return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
 
 

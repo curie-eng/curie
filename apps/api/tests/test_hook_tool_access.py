@@ -52,7 +52,12 @@ def _signed_headers(
     context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
         "ascii"
     )
-    material = f"{timestamp}.policy-delivery.{len(context)}:".encode() + context + body
+    material = (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.policy-delivery.{len(context)}:".encode()
+        + context
+        + body
+    )
     signed = "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
     return {
         "Content-Type": "application/json",

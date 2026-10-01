@@ -261,6 +261,10 @@ derived Curie hook secret stays in the signer pod.
 
 For an existing installation, update the API and every custom signer together
 to the context format in the [trigger contract](../../docs/interfaces/triggers/INTERFACE.md).
+The signed bytes are `b"curie.hook.delivery.v2\n"` followed by
+`{timestamp}.{delivery_id}.{len(context)}:`, compact ASCII JSON for
+`[hook, tool_access]`, and the raw body. The omitted policy is `null` in the
+context, and `len(context)` is its byte length.
 The API refuses signatures made with the previous format. This example copies
 `server.py` into the `alert-signer-code` ConfigMap, so updating the checkout alone
 does not update the installed signer. Repeat the ConfigMap creation and apply

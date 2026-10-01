@@ -78,8 +78,10 @@ another handler that mints a `QueuedTurn` with the right `source`. The five that
   `X-Curie-Timestamp`, `X-Curie-Delivery-Id`, the decoded hook name, the parsed
   requested `tool_access` policy and the raw body. The context is compact ASCII
   JSON for `[hook, tool_access]`, with `null` for an omitted policy. The signed
-  bytes are `{timestamp}.{delivery_id}.{len(context)}:` followed by the context
-  and raw body. The context byte length fixes its boundary; the delivery id may
+  bytes are `b"curie.hook.delivery.v2\n"` followed by
+  `{timestamp}.{delivery_id}.{len(context)}:`, the context and raw body. The fixed
+  prefix separates this format from previous signatures. The context byte
+  length fixes its boundary; the delivery id may
   not contain `.`, which would make the earlier boundary ambiguous. A captured
   signature cannot change the hook's receipt namespace or add or remove a
   policy restriction. A timestamp more than 5 minutes from the server clock is

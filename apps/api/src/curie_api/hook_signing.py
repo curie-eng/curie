@@ -28,8 +28,10 @@ the first of them rather than copied.
 upstream's timestamp, its delivery id, the decoded hook name, the requested tool
 policy and the raw body. The context is compact ASCII JSON for
 ``[hook, tool_access]``, with ``null`` for an omitted policy. Its byte length
-frames the boundary before the body:
-``f"{timestamp}.{delivery_id}.{len(context)}:".encode() + context + body``.
+frames the boundary before the body. A fixed version prefix separates this
+format from every previous delivery signature:
+``b"curie.hook.delivery.v2\\n" +
+f"{timestamp}.{delivery_id}.{len(context)}:".encode() + context + body``.
 The delivery id and hook together select the receipt namespace, so both are
 authenticated. Signing the requested policy prevents a captured request from
 adding or removing a restriction. Binding the timestamp and refusing any outside
@@ -110,7 +112,12 @@ def _material(
     context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
         "ascii"
     )
-    return f"{timestamp}.{delivery_id}.{len(context)}:".encode() + context + body
+    return (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery_id}.{len(context)}:".encode()
+        + context
+        + body
+    )
 
 
 def sign(

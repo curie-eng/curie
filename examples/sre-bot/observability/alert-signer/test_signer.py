@@ -41,7 +41,12 @@ def _expected_signature(
     context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
         "ascii"
     )
-    material = f"{timestamp}.{delivery}.{len(context)}:".encode() + context + body
+    material = (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery}.{len(context)}:".encode()
+        + context
+        + body
+    )
     return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
 
 

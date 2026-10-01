@@ -5,8 +5,10 @@ binding: it injects a partition-safe ``curie_partition`` derived from groupKey,
 assigns a stable delivery id, stamps the current unix time, and signs the
 timestamp, delivery id, decoded hook name, requested tool policy and raw body.
 The context is compact ASCII JSON for ``[hook, tool_access]``, with ``null``
-when the policy is omitted. Its length frames the boundary before the body:
-``f"{timestamp}.{delivery}.{len(context)}:".encode() + context + body``.
+when the policy is omitted. Its length frames the boundary before the body.
+The signed bytes include a fixed version prefix:
+``b"curie.hook.delivery.v2\\n" +
+f"{timestamp}.{delivery}.{len(context)}:".encode() + context + body``.
 The hook and policy come from ``CURIE_HOOK_URL``, which is also the destination
 for the POST. Duplicate or invalid ``tool_access`` query values are refused.
 The request sends ``X-Curie-Timestamp`` and ``X-Curie-Delivery-Id`` alongside
@@ -56,7 +58,12 @@ def sign(
     context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
         "ascii"
     )
-    material = f"{timestamp}.{delivery}.{len(context)}:".encode() + context + body
+    material = (
+        b"curie.hook.delivery.v2\n"
+        + f"{timestamp}.{delivery}.{len(context)}:".encode()
+        + context
+        + body
+    )
     return "sha256=" + hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
 
 
