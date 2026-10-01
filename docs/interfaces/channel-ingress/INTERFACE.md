@@ -89,10 +89,13 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   set the optional `identity` on `ReplyHandle` to select a named Slack binding.
   The producer constructs `QueuedTurn` with ordinary strict validation. The
   identity survives serialization and worker decoding unchanged. An absent
-  identity selects `default`, preserving existing relay turns. The dependent
-  worker routing change must select the named binding and refuse unknown
-  identities instead of falling back to `default`; until that change lands,
-  named relay producers must not be enabled. For ordinary Slack turns,
+  identity selects `default`, preserving existing relay turns. The worker
+  selects the named binding and refuses unknown identities instead of falling
+  back to `default` (WORKER-CANARY-1 to 5 in `apps/worker/README.md`). The
+  first-party producer is `curie cluster message`'s disconnected relay lane and
+  `curie cluster eval`: each sets `identity` from the `--agent` binding it
+  selected, and leaves it absent for a `default` binding. The connected Slack
+  transport does not carry it. For ordinary Slack turns,
   `adapter` remains the identity and `identity` is absent. The two fields have
   separate purposes only when the relay adapter occupies `adapter`.
 
