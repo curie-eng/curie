@@ -8455,6 +8455,63 @@
         "title": "WorkItemUsageRole",
         "type": "object"
       },
+      "WorkspaceCredentialOut": {
+        "description": "The workspace clone credential, plus the base a factory WorkItem froze.\n\nThe worker clones ``base_branch`` and pins ``base_commit`` (ADR 0186). Both\nare None outside the factory and on legacy WorkItems.",
+        "properties": {
+          "authorization_header": {
+            "title": "Authorization Header",
+            "type": "string"
+          },
+          "base_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Branch"
+          },
+          "base_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Commit"
+          },
+          "clone_url": {
+            "title": "Clone Url",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "clone_url",
+          "authorization_header"
+        ],
+        "title": "WorkspaceCredentialOut",
+        "type": "object"
+      },
       "WorkspaceCredentialRequest": {
         "properties": {
           "conversation_id": {
@@ -17366,7 +17423,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                  "$ref": "#/components/schemas/WorkspaceCredentialOut"
                 }
               }
             },

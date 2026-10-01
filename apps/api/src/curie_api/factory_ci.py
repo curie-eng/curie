@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from . import factory_progress, workitem_outcomes, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
+from .repo_full_name import entry_for_repo
 from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
@@ -107,15 +108,14 @@ class PythonCiPolicy:
 def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy | None:
     """The configured policy for ``owner/name``, matched case-insensitively."""
 
-    wanted = repo_full_name.casefold()
-    for name, value in settings.github_factory_python_ci.items():
-        if name.casefold() == wanted:
-            return PythonCiPolicy(
-                check=value["check"],
-                paths=tuple(value["paths"]),
-                pending_check_prefix=value.get("pendingCheckPrefix"),
-            )
-    return None
+    value = entry_for_repo(settings.github_factory_python_ci, repo_full_name)
+    if value is None:
+        return None
+    return PythonCiPolicy(
+        check=value["check"],
+        paths=tuple(value["paths"]),
+        pending_check_prefix=value.get("pendingCheckPrefix"),
+    )
 
 VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]

@@ -18,6 +18,8 @@ from .github_review_events import (
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 
 _MAX_COMMENT_LENGTH = 65536
+# The label prefix a ticket declares its base with (ADR 0186).
+BASE_LABEL_PREFIX = "base:"
 
 
 class FactoryRefused(FeedbackIgnored):
@@ -134,13 +136,20 @@ def parse_factory_event(
         if action in {"labeled", "unlabeled"}:
             label_obj = payload_object(data.get("label"), "invalid_label")
             name = label_obj.get("name")
-            if not isinstance(name, str) or name != label:
+            if not isinstance(name, str):
+                raise FactoryRefused("unrelated_label")
+            if name == label:
+                disposition = "admit" if action == "labeled" else "cancel"
+            elif name.startswith(BASE_LABEL_PREFIX):
+                # A base label change only records disagreement (ADR 0186).
+                disposition = "base_label"
+            else:
                 raise FactoryRefused("unrelated_label")
             return FactoryNotice(
                 delivery,
                 event,
                 action,
-                "admit" if action == "labeled" else "cancel",
+                disposition,
                 installation_id,
                 repository_id,
                 repo,

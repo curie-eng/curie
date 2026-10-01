@@ -253,6 +253,8 @@ class WorkspaceCredential:
     clone_url: str
     authorization_header: str
     revision: str | None = None
+    base_branch: str | None = None
+    base_commit: str | None = None
 
     def __post_init__(self) -> None:
         if not self.repo_full_name or not self.clone_url or not self.authorization_header:
@@ -548,19 +550,40 @@ class WorkspaceCredentialClient:
             )
         try:
             payload = json.loads(response.body)
-            revision = payload.get("revision")
-            if revision is not None and not isinstance(revision, str):
-                raise TypeError("revision is not a string")
+            revision = _opt_str(payload, "revision")
+            base_branch = _opt_str(payload, "base_branch")
+            base_commit = _opt_str(payload, "base_commit")
             return WorkspaceCredential(
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
                 revision=revision,
+                base_branch=base_branch,
+                base_commit=base_commit,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
                 "credential-redemption", "API returned an invalid credential response"
             ) from exc
+
+
+
+def _opt_str(payload: dict[str, Any], key: str) -> str | None:
+    """An optional string field of an API payload; any other type is invalid."""
+
+    value = payload.get(key)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{key} is not a string")
+    return value
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _is_full_sha(value: str | None) -> bool:
+    """Whether ``value`` is a full lowercase 40-hex commit id."""
+
+    return value is not None and _FULL_SHA.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1142,8 @@ class WorkspacePreparer:
                     ]
                     if branch is not None:
                         clone_argv.extend(["--branch", branch])
+                    elif detached_head is None and credential.base_branch:
+                        clone_argv.extend(["--branch", credential.base_branch])
                     clone_argv.extend([credential.clone_url, str(checkout)])
                     self.commands.run(
                         clone_argv,
@@ -1129,9 +1154,9 @@ class WorkspacePreparer:
                         ),
                     )
                     pin = detached_head
-                    if pin is None and credential.revision and re.fullmatch(
-                        r"[0-9a-f]{40}", credential.revision
-                    ):
+                    if pin is None and branch is None and _is_full_sha(credential.base_commit):
+                        pin = credential.base_commit
+                    if pin is None and _is_full_sha(credential.revision):
                         pin = credential.revision
                     if pin is not None:
                         self.commands.run(

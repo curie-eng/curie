@@ -402,6 +402,7 @@ async def readmit(
         + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         objective=facts.objective,
         requester=facts.requester,
+        base=getattr(facts, "base", None),
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -426,6 +427,8 @@ async def _admit_new(
         agent_id=facts.agent_id,
         repo_full_name=facts.repo_full_name,
         conversation_id=_facts_conversation(facts, adapter),
+        # Factory admission resolves a base (ADR 0186); other callers do not.
+        base=getattr(facts, "base", None),
     )
     if isinstance(created, WorkItemConflict):
         return created
