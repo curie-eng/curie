@@ -1161,6 +1161,19 @@ api:
   #  - cidr: 192.0.2.11/32
   #    ports: [{ protocol: TCP, port: 443 }]
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once api.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   image:
     repository: ghcr.io/curie-eng/curie-api
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1467,6 +1480,18 @@ dispatcher:
   # For the same reason keep replicas at 1: each extra replica is another
   # client on the same tokens.
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. The dispatcher is
+  # one replica with strategy Recreate by design (see replicas above), so a
+  # budget that permits a disruption protects nothing and the render refuses
+  # it. The only accepted budget is a blocking one, acknowledged:
+  # minAvailable: 1 with allowBlockingDrain: true, which makes every drain of
+  # the node running the dispatcher wait for an operator. See README "High
+  # availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Platform API the dispatcher resolves Slack approval clicks against. Empty
   # (the default) derives the in-chart API Service,
   # http://<fullname>-api:<api.service.port>. Set it to a full base URL to point
@@ -1801,6 +1826,22 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once worker.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that. The worker
+  # already drains in-flight turns inside its termination grace (ADR-0131); a
+  # budget bounds how many workers a drain evicts at once, not how each one
+  # stops.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Floor for the worker's voluntary termination grace. The chart renders the
   # effective grace as max(this, deliveryBudgetSeconds +
   # deliveryShutdownReserveSeconds) (ADR-0131, #3071), so a raised budget
@@ -2229,6 +2270,19 @@ worker:
 ui:
   deploy: true
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once ui.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Platform API the UI's nginx reverse-proxies /api/ to. Empty (the default)
   # derives the in-chart API Service, http://<fullname>-api:<api.service.port>.
   # Set it to a full base URL to point at an API this chart did not deploy; that
