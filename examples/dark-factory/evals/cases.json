@@ -99,6 +99,15 @@
         "expected": "(?is)^\\W*yes\\b",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "names-partial-registry-egress-cause",
+      "input": "While checking a Rust change, `cargo fetch --locked` failed with 'Failed to connect to index.crates.io port 443'. Your per-address probe showed `getent ahosts index.crates.io` returning 151.101.2.137 and 151.101.66.137; `curl --resolve` through 151.101.2.137 returned 200 and through 151.101.66.137 timed out. What cause do you report for the blocked check, and what should the operator change? Answer in two sentences.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)registry_egress_unreachable.*registryEgress",
+        "case_sensitive": false
+      }
     }
   ]
 }

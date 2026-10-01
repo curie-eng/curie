@@ -241,6 +241,24 @@ Do not change a lockfile or run an ad hoc package install, an unpinned install,
 or another dependency download command. An unavailable registry is a blocked
 check, not permission to use a different source.
 
+When a locked fetch cannot connect to a registry host, name the cause instead
+of only deferring the check. Run, for that host:
+
+```sh
+getent ahosts <host>
+curl -sS -o /dev/null -m 10 -w '%{http_code} %{remote_ip}\n' --resolve <host>:443:<address> https://<host>/
+```
+
+running the `curl` once for each distinct address `getent` returned. Report
+the blocked check with the cause `registry_egress_unreachable`, the host, and
+which resolved addresses connected and which timed out or were refused. Add
+this operator guidance: NetworkPolicy matches addresses, not hostnames, and a
+CDN host such as `index.crates.io` rotates across many IPv4 and IPv6
+addresses, so a registry egress CIDR list that covers only some of them fails
+on some runs and passes on others. Point `agentSandbox.registryEgress` for
+this agent at a registry mirror or proxy with a fixed address, as the bundle
+README describes.
+
 Run every available check for the changed area. Record the exact command,
 exit status and result for each check you run. If Postgres or another required
 service is absent from the sandbox, record which check it blocks and the
