@@ -34,15 +34,17 @@ separate trusted job with your GitHub App's identity.
 | Tool | Used for |
 |---|---|
 | Docker | kind nodes, the local registry, the runner layer build |
-| `kind`, `kubectl`, `helm` | the local cluster |
+| `kind` v0.24 or later, `kubectl`, `helm` | the local cluster. kind's network plugin enforces NetworkPolicy from v0.24, which the sandbox lockdown relies on. |
+| `jq` | building the GitHub egress values in Step 6 |
 | `cloudflared` | a public URL for the GitHub webhook |
 | `gh` | creating the repository, label and issue (the web UI works too) |
 | `curie` v0.11.1 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
 | An [OpenRouter](https://openrouter.ai/) API key | the factory model, `z-ai/glm-5.3-flash` by default |
 | A GitHub account | your own GitHub App and the trial repository |
 
-Keep one terminal for the whole guide. The commands below use these variables;
-set them now:
+The guide uses three terminals: one for the commands, one for the tunnel and
+one for a port-forward. The commands below use these variables; set them in
+the first terminal now:
 
 ```bash
 export KUBECONFIG="$HOME/.kube/curie-factory"   # a kubeconfig just for this guide
@@ -241,10 +243,23 @@ kubectl -n curie delete job curie-preflight-gvisor
 **You should now see** `curie is up`, and `kubectl -n curie get pods` with
 `curie-api` and `curie-worker` Running.
 
-Now expose the API to the tunnel. Leave this running in a third terminal:
+Check that the sandbox network lockdown is really enforced:
 
 ```bash
-kubectl -n curie port-forward svc/curie-api 18000:8000
+helm test curie -n curie --kube-context kind-curie-factory
+kubectl -n curie logs job/curie-netpol-probe
+```
+
+The probe log must contain `enforcement=true`. If it says `enforcement=false`, your kind is older than
+v0.24 or uses a network plugin without NetworkPolicy; stop here, because the
+sandbox would have open network access.
+
+Now expose the API to the tunnel. Leave this running in a third terminal. A
+new terminal does not have the guide's `KUBECONFIG`, so name it:
+
+```bash
+kubectl --kubeconfig "$HOME/.kube/curie-factory" --context kind-curie-factory \
+  -n curie port-forward svc/curie-api 18000:8000
 ```
 
 Point the App at it: on the App's settings page set **Webhook URL** to
@@ -262,11 +277,13 @@ NetworkPolicy matches addresses, not names, so the list comes from
 this one step uses `helm` directly with the chart `cluster up` installed:
 
 ```bash
+set -o pipefail
 curl -fsSL https://api.github.com/meta \
   | jq -r '"agentSandbox:\n  connectorEgress:\n    dark-factory:",
            (.api[] | select(contains(":") | not)
              | "      - { cidr: \"\(.)\", ports: [{ protocol: TCP, port: 443 }] }")' \
   > factory-egress.yaml
+grep -c cidr factory-egress.yaml   # must be more than 0
 
 gh release download v0.11.1 -R curie-eng/curie -p 'curie-0.11.1.tgz'
 helm upgrade curie curie-0.11.1.tgz -n curie --kube-context kind-curie-factory \
@@ -293,8 +310,10 @@ driver`). Build only your kind node's architecture
 ([#3619](https://github.com/curie-eng/curie/issues/3619)):
 
 ```bash
-sed -i 's|platforms: \[linux/amd64, linux/arm64\]|platforms: [linux/amd64]|' \
-  dark-factory/connectors.yaml     # use linux/arm64 on an Apple silicon Mac
+# Use linux/arm64 instead on an Apple silicon Mac. -i.bak works with GNU and BSD sed.
+sed -i.bak 's|platforms: \[linux/amd64, linux/arm64\]|platforms: [linux/amd64]|' \
+  dark-factory/connectors.yaml
+grep platforms dark-factory/connectors.yaml
 curie build --plugin-dir dark-factory --registry localhost:5001/curie
 ```
 
@@ -418,21 +437,21 @@ label.
 
 ## What a repository with no CI sees
 
-- **Checks.** After publishing, Curie waits on the pull request's checks. With
-  no checks at all within 120 seconds of the push, and no required check
-  configured for the repository, the run completes, and the final status
-  comment says `Note: No CI checks appeared within 120 s.`
-  A Python change in your repository is judged on your repository's own checks.
-  Only a repository listed in `api.githubFactoryPythonCi` has a required check,
-  and none is listed by default.
-- **In-sandbox verification.** Before the model starts, the runner runs the
-  checks a repository declares in `.curie/verification.json`. With no <!-- doclint:ignore-line -->
-  declaration it runs nothing and records `not_declared`, and the agent runs
-  the repository's own tests itself where it can. See
-  [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md)
-  to declare checks.
-- **Background builds.** The run ends when the agent's turn ends. A command
-  the agent leaves running in the background does not keep the run alive.
+1. **Checks.** After publishing, Curie waits on the pull request's checks. With
+   no checks at all within 120 seconds of the push, and no required check
+   configured for the repository, the run completes, and the final status
+   comment says `Note: No CI checks appeared within 120 s.`
+   A Python change in your repository is judged on your repository's own checks.
+   Only a repository listed in `api.githubFactoryPythonCi` has a required check,
+   and none is listed by default.
+2. **In-sandbox verification.** Before the model starts, the runner runs the
+   checks a repository declares in `.curie/verification.json`. With no <!-- doclint:ignore-line -->
+   declaration it runs nothing and records `not_declared`, and the agent runs
+   the repository's own tests itself where it can. See
+   [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md)
+   to declare checks.
+3. **Background builds.** The run ends when the agent's turn ends. A command
+   the agent leaves running in the background does not keep the run alive.
 
 ## Troubleshooting
 
@@ -458,17 +477,17 @@ label.
 
 The factory pieces stay the same. What changes:
 
-- The registry is one your nodes can pull from, and `curie build` builds every
-  platform your nodes run (keep both platforms in `connectors.yaml`).
-- The webhook URL is a stable ingress for the `curie-api` Service instead of a
-  tunnel, and `api.githubFactoryCardBaseUrl` is that origin.
-- gVisor stays on where the cluster has the `gvisor` RuntimeClass.
-- A larger repository needs bigger workspace and runner limits, a longer
-  execution deadline, and package registry egress for dependency installs.
-  The [dark-factory README](../../examples/dark-factory/README.md) has the
-  sizing measured on Curie itself, and
-  [operations](../operations.md#admitting-a-labelled-github-issue) has every
-  intake and CI setting.
+1. The registry is one your nodes can pull from, and `curie build` builds every
+   platform your nodes run (keep both platforms in `connectors.yaml`).
+2. The webhook URL is a stable ingress for the `curie-api` Service instead of a
+   tunnel, and `api.githubFactoryCardBaseUrl` is that origin.
+3. gVisor stays on where the cluster has the `gvisor` RuntimeClass.
+4. A larger repository needs bigger workspace and runner limits, a longer
+   execution deadline, and package registry egress for dependency installs.
+   The [dark-factory README](../../examples/dark-factory/README.md) has the
+   sizing measured on Curie itself, and
+   [operations](../operations.md#admitting-a-labelled-github-issue) has every
+   intake and CI setting.
 
 ## Clean up
 
