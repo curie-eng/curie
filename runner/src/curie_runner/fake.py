@@ -361,7 +361,10 @@ class FakeModelSession:
                 await anyio.sleep(PROGRESS_DEMO_PAUSE_S)
                 continue
             if isinstance(message, _ProgressCall):
-                yield await self._answer_progress(message)
+                # A refused call already got its refusal from the gate; the
+                # handler's answer would be a second result for it.
+                if message.tool_use_id not in self._refused_ids:
+                    yield await self._answer_progress(message)
                 continue
             denied_messages = await self._apply_gate(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
