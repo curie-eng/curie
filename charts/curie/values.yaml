@@ -1845,6 +1845,8 @@ worker:
   # ask for at once. NOTES prints that product beside the sandbox quota
   # ceiling (resourceQuota.hard): a product below the ceiling leaves quota
   # unused, and one far above it turns the excess into capacity replies.
+  # When retained release values omit this key, the worker env and NOTES
+  # both use 16.
   maxConcurrency: 16
   # Optional PodDisruptionBudget (#1574), off by default. At the shipped
   # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;

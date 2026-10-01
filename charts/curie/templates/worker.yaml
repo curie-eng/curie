@@ -456,7 +456,7 @@ spec:
               value: {{ .Values.worker.workItemMaxTurns | quote }}
             # Turns this worker runs at once (#760); see worker.maxConcurrency.
             - name: CURIE_WORKER_MAX_CONCURRENCY
-              value: {{ .Values.worker.maxConcurrency | quote }}
+              value: {{ dig "maxConcurrency" 16 .Values.worker | quote }}
             # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
             # only: it both raises the caption and lowers it, so one value
             # governs the feature release-wide and the two halves cannot be
