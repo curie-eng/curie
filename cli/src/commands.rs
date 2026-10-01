@@ -9562,7 +9562,9 @@ impl crate::ui::CliOutput for HookFireOutput {
 }
 
 fn hook_fire_path(agent: &str, name: &str) -> String {
-    format!("/agents/{agent}/hooks/{name}/fire")
+    // Delegate to the same builder `fire_hook` encodes its request with, so the
+    // dry-run plan cannot drift from the path the real request uses (#3731).
+    crate::api::hook_fire_path(agent, name)
 }
 
 /// `<tier> hook fire`: run the hook now and print the record once it settles.
