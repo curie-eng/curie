@@ -159,6 +159,8 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # reason -- and, being retryable, subject to the same crash-on-omission.
     # "sandbox-terminated": a retryable sandbox termination is a distinct
     # cause; omitting it makes the retry metric reject the classification.
+    # "sandbox-capacity" (#3693): an approval resume refused by the sandbox
+    # ResourceQuota, retried under its own name.
     "retry_class": [
         "redelivery",
         "rate-limit",
@@ -166,6 +168,7 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "runner-timeout",
         "workspace-error",
         "sandbox-terminated",
+        "sandbox-capacity",
     ],
 }
 _THREAD_ATTRIBUTES = {

@@ -4672,6 +4672,24 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """#3693: a quota refusal on an approval resume is not a runner failure.
+
+    It still retries, but under its own class, and the person is told the
+    agent was at capacity, with no quota detail (#2434). The same event id
+    resumes an approved, a rejected and an expired approval, so the sentence
+    names the decision, not an approval.
+    """
+
+    real_record_metric = kernel_module.record_metric
+    recorded: list[tuple[str, dict[str, str]]] = []
+
+    def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        recorded.append((name, dict(attributes or {})))
+        # Delegate so the metric allowlist still validates the new class.
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(kernel_module, "record_metric", spy)
+
     async def go() -> None:
         async with make_harness(
             max_attempts=3,
@@ -4714,15 +4732,86 @@ def test_approval_resume_capacity_retries_then_escalates(
                 (
                     "C1",
                     "p-1",
-                    "curie-turn-failure: runner-error\n\n"
-                    "The run failed (runner-error) after 3 attempt(s). "
+                    "curie-turn-failure: sandbox-capacity\n\n"
+                    "The run failed (sandbox-capacity) after 3 attempt(s). "
+                    "The agent was at capacity, so it could not continue after the "
+                    "approval decision. Send the request again in a few minutes if it "
+                    "is still needed. "
                     "event_id=approval-example-resolved. Flagging for a human.",
                 )
+            ]
+            reply = h.sink.updates[0][2]
+            for leaked in (
+                "curie-sandbox-quota",
+                "limits.cpu",
+                "quota",
+                "runner-error",
+                "approved request",
+            ):
+                assert leaked not in reply
+            retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
+            assert [attrs["retry_class"] for attrs in retries] == [
+                "sandbox-capacity",
+                "sandbox-capacity",
             ]
             assert h.sink.update_endpoints == [endpoint]
             assert h.substrate.lookup(_thread_key("tApprovalSafeCandidate")) == candidate
             assert h.kernel._order_locks == {}
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3693: a resume whose pod was evicted, then refused for capacity on the
+    retries, still tells the operator about the eviction, as runner-error did."""
+
+    async def go() -> None:
+        async with make_harness(
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            real_termination = h.fake_k8s.pod_termination
+
+            def evicted_then_full(name: str, **kwargs: object) -> object:
+                # The evicted sandbox is gone and the quota fills behind it, so
+                # every retry needs a new claim and is refused for capacity.
+                h.fake_k8s.quota_rejection = QuotaRejection(
+                    quota_name="curie-sandbox-quota",
+                    requested={"limits.cpu": "1"},
+                    used={"limits.cpu": "8"},
+                    hard={"limits.cpu": "8"},
+                )
+                found = real_termination(name, **kwargs)
+                h.fake_k8s.termination = None
+                for claim in list(h.fake_k8s.claims):
+                    h.fake_k8s.claims.pop(claim)
+                h.fake_k8s.sandboxes.clear()
+                return found
+
+            h.fake_k8s.termination = SimpleNamespace(
+                reason="Evicted", detail="The node was low on memory."
+            )
+            monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-evicted-then-full",
+                event_id="approval-evicted-resolved",
+            )
+
+            await h.kernel.process_event(ev)
+
+            assert len(h.runner.opened) == 1
+            reply = h.sink.updates[-1][2]
+            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
+            assert "Earlier attempt: Kubernetes pod terminated: Evicted" in reply
+            assert "limits.cpu" not in reply
 
     asyncio.run(go())
 
