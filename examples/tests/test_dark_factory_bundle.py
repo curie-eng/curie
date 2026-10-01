@@ -421,3 +421,47 @@ def test_readme_describes_the_ci_wait_and_fix_loop() -> None:
     assert "does not act on the checks yet" not in readme
     assert re.search(r"`wait_ci`.{0,80}`implement`", readme, re.DOTALL)
     assert "unverified" in readme.lower()
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def test_skill_gives_service_backed_tests_a_ci_verification_path() -> None:
+    """A change whose tests need Postgres or Valkey reaches publication (#3755).
+
+    The sandbox has neither service, so the skill treats the pull request's
+    CI as those tests' run and names where their red-on-base evidence comes
+    from, instead of leaving it unobtainable.
+    """
+    _, body = _skill_parts()
+    flat = _flat(body)
+    failing_test = flat.split("(phase `failing_test`)", 1)[1].split("(phase `implement`", 1)[0]
+    assert "service-backed test" in failing_test
+    # Red-on-base keeps the new test and restores only the base source.
+    assert "keep the new test file" in failing_test
+    assert "git checkout <base-sha> -- <changed source files>" in failing_test
+    assert "must fail on the bug, not at import" in failing_test
+    implement = flat.split("(phase `implement`", 1)[1].split("(phase `review_diff`", 1)[0]
+    assert re.search(r"service-backed counts as verified for publication", implement)
+    assert re.search(r"`wait_ci` returns any failure to `implement`", implement)
+    review = flat.split("(phase `review_diff`", 1)[1].split("## Loop cap", 1)[0]
+    assert "each service-backed test with its command and missing service" in review
+    publish = flat.split("(phase `publish`)", 1)[1].split("(phase `wait_ci`)", 1)[0]
+    assert re.search(r"red-on-base was not observed in the sandbox", publish)
+    assert "red-on-base procedure from step 5" in publish
+
+
+def test_diff_reviewer_does_not_block_on_unobtainable_service_evidence() -> None:
+    """The diff reviewer stops asking for runs the sandbox cannot produce (#3755)."""
+    flat = _flat((BUNDLE / "agents" / "diff-reviewer.md").read_text())
+    assert re.search(
+        r"do not demand its run results, real-service evidence, or a red-on-base run", flat
+    )
+    assert re.search(r"criterion is verified for publication", flat)
+    assert "`wait_ci`" in flat
+    # The relaxation is bounded: a wrong test or a failed serviceless check still blocks.
+    assert re.search(
+        r"Block only when the test is wrong or misses the criterion, or a serviceless check failed",
+        flat,
+    )

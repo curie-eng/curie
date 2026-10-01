@@ -200,7 +200,18 @@ Call report_progress with phase `failing_test`.
 
 Where a test is feasible, write the test for the new behavior first and run
 it. Confirm it fails, and fails for the reason the issue describes, before
-you change the code. When a test is not feasible (documentation, pure
+you change the code. When the new test needs a service the sandbox lacks
+(Postgres, Valkey, or another server the repository's CI starts), it cannot
+run here, and a failure at import or connection is not the red you need. Write
+the test anyway and record it as a service-backed test: its exact command, the
+missing service, and the line in the base code it exercises that your change
+fixes. Its green run comes from the pull request's CI, which starts the
+services. Its red-on-base run is a defined procedure for a machine with those
+services, not this sandbox: keep the new test file, restore only the changed
+non-test files from the base with `git checkout <base-sha> -- <changed source
+files>`, start the services the repository documents, and run the recorded
+command; it must fail on the bug, not at import. Put that procedure in the
+pull request body. Do not stop for want of a red run you cannot obtain. When a test is not feasible (documentation, pure
 configuration, or a project with no test framework), say so and say how you
 will verify the change instead.
 
@@ -237,7 +248,12 @@ missing service. Name each blocked check and its cause in the pull request body;
 never claim it passed. A blocked service check can be left to the
 repository's independent pull request CI only when the functional acceptance
 criteria are verified by checks you did run. A real product check failure or
-an unmet criterion still requires a fix or a stated stop reason. Never fake a
+an unmet criterion still requires a fix or a stated stop reason.
+A criterion whose only test is service-backed counts as verified for
+publication when the test is written, the serviceless checks pass, and the
+diff reviewer approves the test as exercising that criterion. The pull
+request's required CI, which starts the services, is that test's run, and
+`wait_ci` returns any failure to `implement`. Never fake a
 missing package, service or file with a stub, a mock presented as real, or a
 fixed result.
 
@@ -248,7 +264,8 @@ Call report_progress with phase `review_diff` and round `<n>`.
 Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"dark-factory:diff-reviewer"` (required; never omit it), `description`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
-numbered acceptance criteria, each check you ran with its exit status, and,
+numbered acceptance criteria, each check you ran with its exit status, each
+service-backed test with its command and missing service, and,
 from round 2 on, the previous round's findings.
 The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
 `model`. Set `run_in_background` to `false`; wait for the foreground call to
@@ -286,7 +303,9 @@ Call report_progress with phase `publish`.
 available product check passes, and the diff reviewer's latest verdict is
 `VERDICT: APPROVE`. Checks blocked by an absent service must be named with
 their causes in the pull request body and left to the independent pull request
-CI. Never treat a failed check or an unmet criterion as a service gap. First
+CI. For each service-backed test, the body also states that red-on-base was
+not observed in the sandbox and gives the red-on-base procedure from step 5,
+with the base commit and the changed source files filled in. Never treat a failed check or an unmet criterion as a service gap. First
 read the repository's pull request conventions: `AGENTS.md` and `CONTRIBUTING.md`, the pull request
 template (often under `.github/`), and any CI job that checks pull request
 bodies. Follow them in the pull request's title and body, including required
