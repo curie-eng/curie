@@ -33,7 +33,8 @@ from curie_runner.history import ConversationMessage, HarnessReplayState
 _BODIES = web.AppKey("bodies", list[dict[str, Any]])
 _BUNDLE_PROMPT = "You file finished marketing assets."
 _ATTACHMENT_PREAMBLE = (
-    "The message you are answering carried file attachments.\n- /attachments/all-up-messaging-v1.md"
+    "Files attached in this conversation are on disk in this sandbox.\n"
+    "- /attachments/all-up-messaging-v1.md"
 )
 
 
