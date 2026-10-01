@@ -122,6 +122,29 @@ async fn reset_thread_posts_to_reset_endpoint_with_empty_body() {
 }
 
 #[tokio::test]
+async fn thread_reset_state_decodes_whether_the_reset_matched_a_route() {
+    // #3699: the API reports `route_existed` only once the reset is no longer
+    // pending. A worker or API that predates the field omits it.
+    for (body, expected) in [
+        (r#"{"requested":false,"route_existed":false}"#, Some(false)),
+        (r#"{"requested":false,"route_existed":true}"#, Some(true)),
+        (r#"{"requested":false,"route_existed":null}"#, None),
+        (r#"{"requested":false}"#, None),
+    ] {
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", p) if *p == format!("/agents/{AGENT_ID}/threads/t-1/reset") => {
+                Response::json(200, body)
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let client = ApiClient::new(&server.base_url, "k").unwrap();
+        let state = client.thread_reset_state(AGENT_ID, "t-1").await.unwrap();
+        assert!(!state.requested, "{body}");
+        assert_eq!(state.route_existed, expected, "{body}");
+    }
+}
+
+#[tokio::test]
 async fn delete_agent_issues_a_delete() {
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
         ("DELETE", p) if *p == format!("/agents/{AGENT_ID}") => Response {
@@ -264,6 +287,106 @@ async fn reset_thread_handler_resolves_then_resets_and_waits_for_release() {
                 format!("/agents/{AGENT_ID}/threads/t-1/reset")
             ),
         ]
+    );
+}
+
+#[tokio::test]
+async fn reset_thread_handler_fails_when_the_key_matched_no_route() {
+    // #3699: the worker drained the reset but the key matched no route, so
+    // nothing was released. The command must say so and exit non-zero instead of
+    // printing "released".
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("POST", p) if *p == format!("/agents/{AGENT_ID}/threads/slack:C0EXAMPLE1:t/reset") => {
+            Response::json(200, r#"{"requested":true,"route_existed":null}"#)
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/threads/slack:C0EXAMPLE1:t/reset") => {
+            Response::json(200, r#"{"requested":false,"route_existed":false}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let err = commands::reset_thread(
+        opts(&server.base_url, "deal-desk", false),
+        "slack:C0EXAMPLE1:t".to_string(),
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("no route matched this thread key; nothing was released"),
+        "{err}"
+    );
+    let (class, fix) = curie::exit::classify(&err);
+    assert_ne!(class, curie::exit::ExitClass::Success);
+    let fix = fix.expect("a no-route reset carries a fix hint");
+    assert!(
+        fix.contains("kind:identity:channel:conversation"),
+        "the hint must name the identity segment a named bot's key carries: {fix}"
+    );
+}
+
+#[tokio::test]
+async fn reset_thread_handler_reports_the_route_that_was_released() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("POST", p) if *p == format!("/agents/{AGENT_ID}/threads/t-1/reset") => {
+            Response::json(200, r#"{"requested":true,"route_existed":null}"#)
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/threads/t-1/reset") => {
+            Response::json(200, r#"{"requested":false,"route_existed":true}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let out = commands::reset_thread(
+        opts(&server.base_url, "deal-desk", false),
+        "t-1".to_string(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        curie::ui::CliOutput::to_json(&out),
+        serde_json::json!({
+            "agent": "deal-desk",
+            "thread_key": "t-1",
+            "requested": true,
+            "released": true,
+            "route_existed": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn reset_thread_handler_keeps_released_when_the_api_reports_no_outcome() {
+    // An API that predates `route_existed` (or an expired result) reads as
+    // unknown: today's "released" output, without the new key.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("POST", p) if *p == format!("/agents/{AGENT_ID}/threads/t-1/reset") => {
+            Response::json(200, r#"{"requested":true}"#)
+        }
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/threads/t-1/reset") => {
+            Response::json(200, r#"{"requested":false}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let out = commands::reset_thread(
+        opts(&server.base_url, "deal-desk", false),
+        "t-1".to_string(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        curie::ui::CliOutput::to_json(&out),
+        serde_json::json!({
+            "agent": "deal-desk",
+            "thread_key": "t-1",
+            "requested": true,
+            "released": true
+        })
     );
 }
 
