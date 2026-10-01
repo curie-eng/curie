@@ -117,9 +117,18 @@ pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
         .reply_handle
         .as_ref()
         .expect("thread keys require a targeted turn");
+    // @spec WORKER-CANARY-3. A relay turn's `adapter` selects delivery and its
+    // `identity` selects the binding, so the worker scopes the thread by the
+    // identity: read it here, or an eval reset releases a key nothing claimed.
+    let adapter = match reply_handle.adapter.as_deref() {
+        Some(CLUSTER_MESSAGE_RELAY_ADAPTER) if reply_handle.kind == "slack" => {
+            reply_handle.identity.as_deref()
+        }
+        other => other,
+    };
     thread_key_for(
         &reply_handle.kind,
-        reply_handle.adapter.as_deref(),
+        adapter,
         &reply_handle.channel,
         &turn.conversation_id,
     )
@@ -210,6 +219,17 @@ pub fn synthetic_turn(
 pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
     if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
         handle.adapter = Some(identity.to_string());
+    }
+    turn
+}
+
+/// Name the binding a cluster-message relay turn is for. The relay stays the
+/// turn's delivery adapter; the identity rides in `reply_handle.identity`, which
+/// the worker resolves the binding from. `None` (a default binding) sends none.
+/// @spec INGRESS-CANARY-1
+pub fn name_relay_identity(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
+    if let Some(handle) = turn.reply_handle.as_mut() {
+        handle.identity = identity.map(str::to_string);
     }
     turn
 }

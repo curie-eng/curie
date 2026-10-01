@@ -34,8 +34,8 @@ use crate::chat::{
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, speak_as, synthetic_turn,
-    thread_key_for_turn, xadd,
+    self, connect, diagnostics, eval_case_turn, name_relay_identity, queue_thread_reset, speak_as,
+    synthetic_turn, thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
@@ -724,9 +724,12 @@ fn cluster_relay_page_outcome(
 
 /// One disconnected cluster turn plus the opaque API bucket the worker will
 /// write. The normal Slack binding coordinates stay intact so agent resolution
-/// does not diverge; only reply delivery selects the reserved built-in adapter.
+/// does not diverge; only reply delivery selects the reserved built-in adapter,
+/// and a named binding's identity rides in `reply_handle.identity`
+/// (INGRESS-CANARY-1).
 fn cluster_relay_turn(
     channel: &str,
+    identity: Option<&str>,
     opts: &MessageOpts,
     conversation_id: &str,
 ) -> (QueuedTurn, uuid::Uuid) {
@@ -744,7 +747,7 @@ fn cluster_relay_turn(
         .as_mut()
         .expect("cluster relay turns are targeted")
         .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
-    (turn, reply_ref)
+    (name_relay_identity(turn, identity), reply_ref)
 }
 
 struct ClusterRelayObservation {
@@ -948,8 +951,7 @@ fn refuse_named_route(
          the installation's default bot, so it would reach a different binding"
     ))
     .with_fix(format!(
-        "drive this agent with `eval --agent {agent}`, which sends through the reply stub, or \
-         mention the `{identity}` bot in Slack"
+        "drive this agent with `eval --agent {agent}`, or mention the `{identity}` bot in Slack"
     ))
     .into())
 }
@@ -981,25 +983,6 @@ fn refuse_named_route_for_cluster_connected(
         agent.unwrap_or_default(),
         channel,
         "the connected Slack transport",
-    )
-}
-
-/// The named-route refusal for `message_cluster`'s disconnected relay lane
-/// (the missing-carrier compatibility control #1817 requires, which always
-/// speaks as the installation's default bot). Factored out so a test can reach
-/// it without a live cluster, and a mutant that drops the call site there goes
-/// red.
-/// @spec ADR-0168 d8.
-fn refuse_named_route_for_relay(
-    identity: Option<&str>,
-    agent: Option<&str>,
-    channel: &str,
-) -> Result<()> {
-    refuse_named_route(
-        identity,
-        agent.unwrap_or_default(),
-        channel,
-        "the disconnected cluster relay",
     )
 }
 
@@ -1126,8 +1109,8 @@ pub fn dry_run_lines(opts: &MessageOpts, _advertise_host: &str) -> Vec<String> {
     ));
     if opts.agent.is_some() {
         lines.push(
-            "a named identity's route is refused here: both the disconnected relay and the \
-             connected Slack transport speak as the installation's default bot"
+            "a named binding's identity rides the relay turn as reply_handle.identity; the \
+             connected Slack transport speaks as the installation's default bot and refuses it"
                 .to_string(),
         );
     }
@@ -3491,7 +3474,6 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // deployed agent via a short-lived API port-forward (#766). Shared with
     // the connected path.
     let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, &fullname).await?;
-    refuse_named_route_for_relay(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // The worker self-dials the in-cluster API; this distinct loopback tunnel is
@@ -3518,7 +3500,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     );
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
-    let (event, reply_ref) = cluster_relay_turn(&channel, &opts, &thread_ts);
+    let (event, reply_ref) = cluster_relay_turn(&channel, identity.as_deref(), &opts, &thread_ts);
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
@@ -3587,7 +3569,12 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             // The API resume queue preserves this turn's reply handle, so keep
             // polling the same opaque bucket through any approval resolution.
-            match approval_id {
+            // A named relay turn is the exception (#3683): its resume does not
+            // carry the identity yet, so it would resolve the channel's default
+            // binding, and the bucket would print that agent's answer. Park it
+            // the way an unparseable approval id is parked.
+            let follow_resume = identity.is_none();
+            match approval_id.filter(|_| follow_resume) {
                 Some(id) => {
                     let remaining = Duration::from_secs(opts.timeout_secs)
                         .saturating_sub(wait_started.elapsed());
@@ -4021,7 +4008,7 @@ async fn run_eval_turns(
                             .as_mut()
                             .expect("eval turns are targeted")
                             .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
-                        (event, Some(reply_ref))
+                        (name_relay_identity(event, identity), Some(reply_ref))
                     }
                 };
                 // The worker claims under quote(kind):quote(channel):quote(conversation_id),
@@ -5133,14 +5120,6 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             .await
             .context("listing agents through the api port-forward")?;
         let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
-        // Cluster eval replies come back through the message relay, which
-        // speaks only as the default identity (ADR-0168 d8).
-        refuse_named_route(
-            route.identity.as_deref(),
-            agent,
-            &route.channel,
-            "the cluster message relay",
-        )?;
         (route.channel, route.identity)
     } else {
         let channel = match opts.channel.as_deref() {
@@ -6628,18 +6607,31 @@ mod tests {
         assert!(refuse_named_route_for_cluster_connected(None, Some("ops"), "C0EXAMPLE1").is_ok());
     }
 
+    // @spec INGRESS-CANARY-1
     #[test]
-    fn message_clusters_disconnected_relay_refuses_a_named_route() {
-        // #1817's retained compatibility lane: it always speaks as the
-        // installation's default bot, so a named identity must refuse here too.
-        let err =
-            refuse_named_route_for_relay(Some("ops-bot"), Some("ops"), "C0EXAMPLE1").unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains("ops-bot") && text.contains("the disconnected cluster relay"),
-            "{text}"
+    fn message_clusters_relay_turn_names_a_named_binding_and_keeps_the_relay() {
+        let opts = MessageOpts::default();
+        let (named, _) =
+            cluster_relay_turn("C0EXAMPLE1", Some("ops-bot"), &opts, "1700000000.000100");
+        let handle = named
+            .reply_handle
+            .as_ref()
+            .expect("a relay turn is targeted");
+        assert_eq!(
+            handle.adapter.as_deref(),
+            Some(CLUSTER_MESSAGE_RELAY_ADAPTER)
         );
-        assert!(refuse_named_route_for_relay(None, Some("ops"), "C0EXAMPLE1").is_ok());
+        assert_eq!(handle.identity.as_deref(), Some("ops-bot"));
+        let (default, _) = cluster_relay_turn("C0EXAMPLE1", None, &opts, "1700000000.000100");
+        let handle = default
+            .reply_handle
+            .as_ref()
+            .expect("a relay turn is targeted");
+        assert_eq!(
+            handle.adapter.as_deref(),
+            Some(CLUSTER_MESSAGE_RELAY_ADAPTER)
+        );
+        assert_eq!(handle.identity, None, "a default binding sends no identity");
     }
 
     // @spec ADR-0168 d8
