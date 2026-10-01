@@ -306,7 +306,10 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
         ["0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071"]
     );
     let (last, earlier) = pending.split_last().expect("0071 is pending");
-    assert_eq!((last.revision.as_str(), last.kind.as_str()), ("0071", "expand"));
+    assert_eq!(
+        (last.revision.as_str(), last.kind.as_str()),
+        ("0071", "expand")
+    );
     let (contract, expansions) = earlier.split_last().expect("0070 is pending");
     assert!(expansions.iter().all(|step| step.kind == "expand"));
     assert_eq!(
