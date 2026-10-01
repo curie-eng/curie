@@ -442,6 +442,8 @@ struct AppPlan {
     mention: crate::factory_app::Chosen<String>,
     repos: crate::factory_app::Chosen<Vec<String>>,
     label: crate::factory_app::Chosen<String>,
+    /// Concrete repos (wildcards expanded) whose label is missing.
+    labels_missing: Vec<String>,
 }
 
 fn recorded_api_str(recorded: &serde_json::Value, key: &str) -> Option<String> {
@@ -513,7 +515,14 @@ async fn plan_app(
         &pem,
     )
     .await?;
+    let mut labels_missing = Vec::new();
+    for repo in crate::factory_app::label_targets(&repos, &app.repos) {
+        if !crate::factory_app::label_exists(&api, &app, &repo, &label).await? {
+            labels_missing.push(repo);
+        }
+    }
     Ok(AppPlan {
+        labels_missing,
         app,
         api,
         app_id: app_id.to_string(),
@@ -700,12 +709,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             step.done("stored");
             secret_written = true;
         }
-        for repo in plan.repos.value.iter().filter(|r| !r.ends_with("/*")) {
-            if crate::factory_app::ensure_label(&plan.api, &plan.app, repo, &plan.label.value)
-                .await?
-            {
-                labels_created.push(repo.clone());
-            }
+        for repo in &plan.labels_missing {
+            crate::factory_app::create_label(&plan.api, &plan.app, repo, &plan.label.value).await?;
+            labels_created.push(repo.clone());
         }
     }
     {

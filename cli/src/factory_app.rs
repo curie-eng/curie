@@ -273,21 +273,32 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
         .ok_or_else(|| CliError::failure("GitHub's GET /app response carries no slug"))?
         .to_string();
 
-    let (status, installations) = api
-        .call(
-            reqwest::Method::GET,
-            api.url(&["app", "installations"]),
-            &jwt,
-            None,
-        )
-        .await?;
-    if !(200..300).contains(&status) {
-        return Err(unexpected(status, "GET /app/installations"));
+    let mut ids: Vec<String> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let mut url = api.url(&["app", "installations"]);
+        url.query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let (status, installations) = api.call(reqwest::Method::GET, url, &jwt, None).await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET /app/installations"));
+        }
+        let listed: Vec<String> = installations
+            .as_array()
+            .map(|list| list.iter().filter_map(|i| json_id(i, "id")).collect())
+            .unwrap_or_default();
+        let count = listed.len();
+        for id in listed {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if count < 100 {
+            break;
+        }
+        page += 1;
     }
-    let ids: Vec<String> = installations
-        .as_array()
-        .map(|list| list.iter().filter_map(|i| json_id(i, "id")).collect())
-        .unwrap_or_default();
     if ids.is_empty() {
         return Err(not_installed(&slug));
     }
@@ -465,11 +476,7 @@ pub async fn plan_secret(
                 None, namespace, name, key, app_id, pem,
             )));
         }
-        return Err(CliError::failure(format!(
-            "reading Secret {name} in namespace {namespace} failed: {}; nothing was applied",
-            stderr.trim()
-        ))
-        .into());
+        return Err(secret_read_failure(namespace, name));
     }
     let existing: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|error| {
         CliError::failure(format!("Secret {name} is not readable JSON: {error}"))
@@ -500,16 +507,14 @@ pub async fn plan_secret(
         .and_then(|a| a.get(APP_ID_ANNOTATION))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let same_app = if annotated.as_deref() == Some(app_id) {
-        true
-    } else {
-        match crate::github_app::sign_app_jwt(app_id, &stored) {
-            Ok(jwt) => {
-                let (status, body) = api.get_app(&jwt).await?;
-                (200..300).contains(&status) && json_id(&body, "id").as_deref() == Some(app_id)
-            }
-            Err(_) => false,
+    // The annotation is metadata only; the stored key must itself
+    // authenticate as this App before it may be replaced.
+    let same_app = match crate::github_app::sign_app_jwt(app_id, &stored) {
+        Ok(jwt) => {
+            let (status, body) = api.get_app(&jwt).await?;
+            (200..300).contains(&status) && json_id(&body, "id").as_deref() == Some(app_id)
         }
+        Err(_) => false,
     };
     if !same_app {
         let owner = annotated.unwrap_or_else(|| "unknown".to_string());
@@ -549,31 +554,82 @@ pub fn secret_apply_command(namespace: &str) -> OpsCommand {
 
 pub async fn apply_secret(namespace: &str, manifest: &serde_json::Value) -> Result<()> {
     let body = serde_json::to_vec(manifest)?;
-    let (ok, _, stderr) =
+    let name = manifest
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_SECRET_NAME);
+    // kubectl's stderr is dropped on purpose: a failed apply can echo the
+    // patch, which carries the base64 private key.
+    let (ok, _, _stderr) =
         crate::ops::run_capture_with_stdin(&secret_apply_command(namespace), &body).await?;
     if !ok {
-        // kubectl echoes the object name, never the data, on failure.
-        return Err(CliError::failure(format!(
-            "writing the GitHub App key Secret failed: {}",
-            stderr.trim()
-        ))
-        .into());
+        return Err(secret_write_failure(namespace, name));
     }
     Ok(())
 }
 
-/// Ensure `label` exists on `repo`. Returns true when it was created.
-pub async fn ensure_label(
+/// Sanitized: never carries kubectl output.
+pub fn secret_read_failure(namespace: &str, name: &str) -> anyhow::Error {
+    CliError::failure(format!(
+        "reading Secret {name} in namespace {namespace} failed; nothing was applied"
+    ))
+    .with_fix(format!(
+        "check access with `kubectl -n {namespace} get secret {name}` and rerun"
+    ))
+    .into()
+}
+
+/// Sanitized: never carries kubectl output, which can echo the key.
+pub fn secret_write_failure(namespace: &str, name: &str) -> anyhow::Error {
+    CliError::failure(format!(
+        "writing the GitHub App key to Secret {name} in namespace {namespace} failed; \
+         kubectl output is withheld because it can contain the key"
+    ))
+    .with_fix(format!(
+        "check that you may apply Secrets in namespace {namespace} and rerun"
+    ))
+    .into()
+}
+
+/// Concrete repositories to label: exact entries as given, `owner/*`
+/// expanded against the installed repositories. Deduplicated case
+/// insensitively, order preserved.
+pub fn label_targets(allowlist: &[String], installed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |repo: &str| {
+        if !out.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+            out.push(repo.to_string());
+        }
+    };
+    for entry in allowlist {
+        if let Some(owner) = entry.trim().strip_suffix("/*") {
+            for repo in installed {
+                if repo
+                    .split_once('/')
+                    .is_some_and(|(o, _)| o.eq_ignore_ascii_case(owner))
+                {
+                    push(repo);
+                }
+            }
+        } else {
+            push(entry.trim());
+        }
+    }
+    out
+}
+
+/// Preflight read: does `label` exist on `repo`? Mutates nothing.
+pub async fn label_exists(
     api: &GithubApi,
     app: &InstalledApp,
     repo: &str,
     label: &str,
 ) -> Result<bool> {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return Ok(false);
-    };
-    let Some(token) = app.token_for(repo) else {
-        return Ok(false);
+    let (Some((owner, name)), Some(token)) = (repo.split_once('/'), app.token_for(repo)) else {
+        return Err(CliError::failure(format!(
+            "no installation token covers {repo}; nothing was applied"
+        ))
+        .into());
     };
     let (status, _) = api
         .call(
@@ -583,21 +639,44 @@ pub async fn ensure_label(
             None,
         )
         .await?;
-    if (200..300).contains(&status) {
-        return Ok(false);
-    }
-    if status != 404 {
-        return Err(unexpected(
+    match status {
+        200..=299 => Ok(true),
+        404 => Ok(false),
+        _ => Err(unexpected(
             status,
             &format!("GET /repos/{repo}/labels/{label}"),
-        ));
+        )),
     }
+}
+
+/// True only for GitHub's duplicate-label validation error.
+pub fn is_already_exists(body: &serde_json::Value) -> bool {
+    body.get("errors")
+        .and_then(|e| e.as_array())
+        .is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|e| e.get("code").and_then(|c| c.as_str()) == Some("already_exists"))
+        })
+}
+
+/// Create `label` on `repo`. Runs after the Secret write, so its errors do
+/// not claim nothing was applied.
+pub async fn create_label(
+    api: &GithubApi,
+    app: &InstalledApp,
+    repo: &str,
+    label: &str,
+) -> Result<()> {
+    let (Some((owner, name)), Some(token)) = (repo.split_once('/'), app.token_for(repo)) else {
+        return Err(CliError::failure(format!("no installation token covers {repo}")).into());
+    };
     let body = serde_json::json!({
         "name": label,
         "color": LABEL_COLOR,
         "description": LABEL_DESCRIPTION,
     });
-    let (status, _) = api
+    let (status, response) = api
         .call(
             reqwest::Method::POST,
             api.url(&["repos", owner, name, "labels"]),
@@ -605,15 +684,15 @@ pub async fn ensure_label(
             Some(&body),
         )
         .await?;
-    match status {
-        200..=299 => Ok(true),
-        // Already exists (a concurrent create): present is what we wanted.
-        422 => Ok(false),
-        _ => Err(CliError::failure(format!(
-            "GitHub returned HTTP {status} creating label {label} in {repo}"
-        ))
-        .into()),
+    if (200..300).contains(&status) || (status == 422 && is_already_exists(&response)) {
+        return Ok(());
     }
+    Err(CliError::failure(format!(
+        "GitHub returned HTTP {status} creating label {label} in {repo}; the App key Secret \
+         may already be written and earlier labels created"
+    ))
+    .with_fix("fix the cause and rerun; the command is safe to repeat")
+    .into())
 }
 
 /// `cluster factory` without an App: print the registration link and steps.
@@ -779,6 +858,51 @@ mod tests {
         assert!(suffix
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn only_a_duplicate_label_422_counts_as_present() {
+        let dup = serde_json::json!({"message": "Validation Failed",
+            "errors": [{"resource": "Label", "code": "already_exists", "field": "name"}]});
+        assert!(is_already_exists(&dup));
+        let invalid = serde_json::json!({"message": "Validation Failed",
+            "errors": [{"resource": "Label", "code": "invalid", "field": "color"}]});
+        assert!(!is_already_exists(&invalid));
+        assert!(!is_already_exists(
+            &serde_json::json!({"message": "spammed"})
+        ));
+        assert!(!is_already_exists(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn wildcards_expand_against_installed_repos_for_labels() {
+        let installed = vec![
+            "acme/bot".to_string(),
+            "Acme/Web".to_string(),
+            "other/x".to_string(),
+        ];
+        let allow = vec!["acme/*".to_string(), "ACME/BOT".to_string()];
+        assert_eq!(
+            label_targets(&allow, &installed),
+            vec!["acme/bot".to_string(), "Acme/Web".to_string()]
+        );
+        assert_eq!(
+            label_targets(&["other/x".to_string()], &installed),
+            vec!["other/x".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_errors_carry_no_kubectl_output() {
+        for error in [
+            secret_write_failure("curie", "curie-github-app"),
+            secret_read_failure("curie", "curie-github-app"),
+        ] {
+            let text = format!("{error:#}");
+            assert!(text.contains("curie-github-app"), "{text}");
+            assert!(!text.contains("BEGIN"), "{text}");
+            assert!(!text.contains("data"), "{text}");
+        }
     }
 
     #[test]
