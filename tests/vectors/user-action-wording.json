@@ -1,0 +1,89 @@
+{
+  "description": "Presentation labels only. Never change stored tool IDs or infer status from the label. MCP namespace uses the last suffix; native mapping applies only to exact native IDs.",
+  "vectors": [
+    {
+      "tool": null,
+      "label": "action"
+    },
+    {
+      "tool": "",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__acme__",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__only",
+      "label": "action"
+    },
+    {
+      "tool": "bad\nname",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__acme__file_attachment",
+      "label": "file attachment"
+    },
+    {
+      "tool": "mcp__acme__nested__createInvoice",
+      "label": "create invoice"
+    },
+    {
+      "tool": "mcp__acme__Skill",
+      "label": "skill"
+    },
+    {
+      "tool": "mcp__acme__Bash",
+      "label": "bash"
+    },
+    {
+      "tool": "mcp__acme__HTTPServer",
+      "label": "http server"
+    },
+    {
+      "tool": "restart-deployment",
+      "label": "restart deployment"
+    },
+    {
+      "tool": "Bash",
+      "label": "shell request"
+    },
+    {
+      "tool": "Skill",
+      "label": "instruction request"
+    },
+    {
+      "tool": "Read",
+      "label": "read file"
+    },
+    {
+      "tool": "Write",
+      "label": "write file"
+    },
+    {
+      "tool": "Edit",
+      "label": "edit file"
+    },
+    {
+      "tool": "MultiEdit",
+      "label": "edit files"
+    },
+    {
+      "tool": "Glob",
+      "label": "find files"
+    },
+    {
+      "tool": "Grep",
+      "label": "search files"
+    },
+    {
+      "tool": "WebFetch",
+      "label": "fetch web page"
+    },
+    {
+      "tool": "WebSearch",
+      "label": "search web"
+    }
+  ]
+}

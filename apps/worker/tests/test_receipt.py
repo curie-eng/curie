@@ -18,10 +18,13 @@ something for the control to do.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_worker.action_wording import action_label
 from curie_worker.receipt import render_receipt
 
 
@@ -478,8 +481,7 @@ def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: s
     )
 
     assert receipt == (
-        "_What I changed:_\n"
-        "• stage file — cannot be undone: nothing reported a prior state"
+        "_What I changed:_\n• stage file — cannot be undone: nothing reported a prior state"
     )
     assert detail not in receipt
 
@@ -575,7 +577,9 @@ def test_native_request_keeps_failure_undoability_custom_detail_and_summary(
     action = _action(tool=tool, result=None, undoable=False)
     action.update(overrides)
 
-    assert render_receipt([action]) == "_What I changed:_\n• " + line.format(label="shell request" if tool == "Bash" else "instruction request")
+    assert render_receipt([action]) == "_What I changed:_\n• " + line.format(
+        label="shell request" if tool == "Bash" else "instruction request"
+    )
 
 
 def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> None:
@@ -638,18 +642,26 @@ def test_unknown_action_with_prior_snapshot_does_not_claim_it_was_absent(
     assert "nothing reported a prior state" not in receipt
 
 
-@pytest.mark.parametrize("tool,label", [
-    ("mcp__acme__file_attachment", "file attachment"),
-    ("mcp__acme__nested__createInvoice", "create invoice"),
-    ("mcp__acme__", "action"),
-    ("mcp__only", "action"),
-    (None, "action"),
-    ("bad\nname", "action"),
-    ("Read", "read file"),
-    ("Edit", "edit file"),
-])
-@pytest.mark.parametrize("status,verdict", [("succeeded", "restore information recorded"), ("failed", "failed — check before retrying")])
-def test_every_receipt_fallback_is_plain_and_status_is_independent(tool: str | None, label: str, status: str, verdict: str) -> None:
+@pytest.mark.parametrize(
+    "tool,label",
+    [
+        ("mcp__acme__file_attachment", "file attachment"),
+        ("mcp__acme__nested__createInvoice", "create invoice"),
+        ("mcp__acme__", "action"),
+        ("mcp__only", "action"),
+        (None, "action"),
+        ("bad\nname", "action"),
+        ("Read", "read file"),
+        ("Edit", "edit file"),
+    ],
+)
+@pytest.mark.parametrize(
+    "status,verdict",
+    [("succeeded", "restore information recorded"), ("failed", "failed — check before retrying")],
+)
+def test_every_receipt_fallback_is_plain_and_status_is_independent(
+    tool: str | None, label: str, status: str, verdict: str
+) -> None:
     action = _action(tool=tool, result=None, status=status)
     original = deepcopy(action)
     assert render_receipt([action]) == f"_What I changed:_\n• {label} — {verdict}"
@@ -658,7 +670,12 @@ def test_every_receipt_fallback_is_plain_and_status_is_independent(tool: str | N
 
 def test_connector_metadata_replaces_identifier_references_and_keeps_content() -> None:
     tool = "mcp__acme__file_attachment"
-    action = _action(tool=tool, result={"summary": f"{tool} attached acme_invoice.pdf to public/api"}, undoable=False, detail=f"{tool}: manual restoration required")
+    action = _action(
+        tool=tool,
+        result={"summary": f"{tool} attached acme_invoice.pdf to public/api"},
+        undoable=False,
+        detail=f"{tool}: manual restoration required",
+    )
     original = deepcopy(action)
     assert render_receipt([action]) == (
         "_What I changed:_\n• file attachment attached acme_invoice.pdf to public/api — "
@@ -668,7 +685,12 @@ def test_connector_metadata_replaces_identifier_references_and_keeps_content() -
 
 
 def test_connector_metadata_does_not_rewrite_identifier_substrings_in_content() -> None:
-    action = _action(tool="stage_file", result={"summary": "saved acme_stage_file.txt"}, undoable=False, detail="restore acme_stage_file.txt manually")
+    action = _action(
+        tool="stage_file",
+        result={"summary": "saved acme_stage_file.txt"},
+        undoable=False,
+        detail="restore acme_stage_file.txt manually",
+    )
     assert render_receipt([action]) == (
         "_What I changed:_\n• saved acme_stage_file.txt — restore acme_stage_file.txt manually"
     )
@@ -676,4 +698,20 @@ def test_connector_metadata_does_not_rewrite_identifier_substrings_in_content() 
 
 def test_connector_metadata_normalizes_secondary_mcp_references() -> None:
     action = _action(result={"summary": "mcp__acme__file_attachment followed mcp__acme__readFile"})
-    assert render_receipt([action]) == "_What I changed:_\n• file attachment followed read file — restore information recorded"
+    assert (
+        render_receipt([action])
+        == "_What I changed:_\n• file attachment followed read file — restore information recorded"
+    )
+
+
+def test_action_labels_match_shared_presentation_vectors() -> None:
+    vector_path = Path(__file__).resolve().parents[3] / "tests/vectors/user-action-wording.json"
+    for vector in json.loads(vector_path.read_text())["vectors"]:
+        assert action_label(vector["tool"]) == vector["label"]
+
+
+def test_native_words_in_connector_content_are_not_tool_references() -> None:
+    action = _action(tool="Read", result={"summary": "Read permissions updated for acme.txt"})
+    assert render_receipt([action]) == (
+        "_What I changed:_\n• Read permissions updated for acme.txt — restore information recorded"
+    )
