@@ -852,6 +852,7 @@ mod tests {
         _comment: String,
         thread_reset_set: String,
         thread_reset_inflight_set: String,
+        thread_reset_result_prefix: String,
         thread_key_examples: Vec<ThreadKeyExample>,
     }
 
@@ -870,6 +871,12 @@ mod tests {
         assert_eq!(
             parsed.thread_reset_inflight_set,
             "curie:thread-reset-inflight"
+        );
+        // The CLI never reads a reset result itself (the API does); it only has
+        // to know the literal so the frozen name cannot drift unseen.
+        assert_eq!(
+            parsed.thread_reset_result_prefix,
+            "curie:thread-reset-result:"
         );
         assert!(
             !parsed.thread_key_examples.is_empty(),
