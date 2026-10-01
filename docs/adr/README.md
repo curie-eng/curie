@@ -209,4 +209,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
 | 0184 | [Settled stream entries are trimmed; receipts live in Postgres; backlog is counted, not rated](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md) | Draft |
 | 0186 | [A factory ticket declares its base branch and keeps it](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) | Draft |
+| 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
 <!-- END GENERATED: adr-index -->
