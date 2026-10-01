@@ -31,6 +31,7 @@ from claude_agent_sdk import (
 )
 from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner import __main__ as boot
+from curie_runner import redact as redact_module
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
@@ -815,6 +816,31 @@ def test_block_breaks_add_nothing_but_breaks_to_the_final() -> None:
         _, unbroken = _redacted_turn(held, [lead + text], lead + text)
 
         assert broken.replace("\n\n", "") == unbroken.replace("\n\n", ""), (held, blocks)
+
+
+def test_block_breaks_scrub_a_long_turn_in_linear_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Placing breaks must not rescan the rest of the turn once per block.
+
+    Counted in characters handed to the rule pass, not seconds, so the bound
+    holds on any machine.
+    """
+
+    scanned: list[int] = []
+    real = redact_module.redact_text
+
+    def counting(text: str) -> str:
+        scanned.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(redact_module, "redact_text", counting)
+    blocks = [f"Progress sentence number {index} with some words." for index in range(300)]
+    total = sum(len(block) for block in blocks)
+
+    held = frozenset({"sk-ant-oat01-HELDVALUE0000"})
+    stream, final = _redacted_turn(held, blocks, "".join(blocks))
+
+    assert final == stream == "\n\n".join(blocks)
+    assert sum(scanned) <= 6 * total, sum(scanned)
 
 
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
