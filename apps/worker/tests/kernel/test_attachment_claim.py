@@ -2178,9 +2178,56 @@ def test_the_lane_is_asked_for_the_identity_the_turn_arrived_on(make_harness) ->
             await h.kernel.process_event(turn("tNamedIdentity", "ops-bot"))
             await h.kernel.process_event(turn("tStockIdentity", None))
 
-            assert [call["extra"] for call in lane.resolve_calls] == [
-                {"identity": "ops-bot"},
-                {"identity": "default"},
+            assert [call["extra"]["identity"] for call in lane.resolve_calls] == [
+                "ops-bot",
+                "default",
+            ]
+
+    asyncio.run(go())
+
+
+def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harness) -> None:
+    """ADR-0153 decision 3: the lane picks its transport from the turn's binding.
+
+    The server-minted reply handle is the only place the worker learns which
+    adapter produced a channel-port turn and where that adapter listens, so the
+    kernel must hand it over. A Slack turn hands over its Slack handle, which
+    keeps the Slack client.
+    """
+
+    def turn(thread: str, handle: ReplyHandle) -> QueuedTurn:
+        return QueuedTurn(
+            event_id=f"ev-{thread}",
+            conversation_id=thread,
+            author="person@example.test",
+            text="what does this say?",
+            reply_handle=handle,
+            received_at="2026-07-05T00:00:00+00:00",
+            source=TurnSource.SLACK,
+            attachments=[Attachment(id="msg-1/att-1", name="report.pdf")],
+        )
+
+    email = ReplyHandle(
+        kind="email",
+        channel="inbox@example.test",
+        placeholder="msg-1",
+        endpoint="http://mail-adapter.example.test:8080/curie",
+        adapter="mail-adapter",
+    )
+    slack = ReplyHandle(kind="slack", channel="C1", placeholder="p-1")
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+
+            await h.kernel.process_event(turn("tEmailBinding", email))
+            await h.kernel.process_event(turn("tSlackBinding", slack))
+
+            assert [call["extra"].get("handle") for call in lane.resolve_calls] == [
+                email,
+                slack,
             ]
 
     asyncio.run(go())
