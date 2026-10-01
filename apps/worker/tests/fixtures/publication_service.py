@@ -17,7 +17,6 @@ REPO_FULL_NAME = "acme-corp/acme-bot"
 DEFAULT_BRANCH = "main"
 AUTHORIZATION = "Bearer fixture-token"
 PULL_NUMBER = 1
-PULL_URL = f"https://github.com/{REPO_FULL_NAME}/pull/{PULL_NUMBER}"
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -33,8 +32,9 @@ def _git(*args: str, cwd: Path | None = None) -> str:
 
 
 class FixtureState:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, html_base: str) -> None:
         self.root = root
+        self.pull_url = f"{html_base.rstrip('/')}/{REPO_FULL_NAME}/pull/{PULL_NUMBER}"
         self.bare_repo = root / "acme-bot.git"
         self.lock = threading.RLock()
         self.pull: dict[str, Any] | None = None
@@ -96,7 +96,7 @@ class FixtureState:
                 return None
             return {
                 "number": PULL_NUMBER,
-                "html_url": PULL_URL,
+                "html_url": self.pull_url,
                 "title": self.pull["title"],
                 "body": self.pull["body"],
                 "state": "open",
@@ -248,9 +248,10 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cert", type=Path, required=True)
     parser.add_argument("--key", type=Path, required=True)
+    parser.add_argument("--html-base", required=True)
     args = parser.parse_args()
 
-    state = FixtureState(args.root)
+    state = FixtureState(args.root, args.html_base)
     git_daemon = subprocess.Popen(
         [
             "git",

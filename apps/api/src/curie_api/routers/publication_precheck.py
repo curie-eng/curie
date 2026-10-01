@@ -105,6 +105,7 @@ async def compare_publication_metadata(
     claims: Annotated[PublicationPrecheckClaims, Depends(require_publication_precheck)],
 ) -> PublicationPrecheckResult:
     response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
     if (
         metadata_digest(data.observed_title) != claims.observed_title_sha256
         or data.observed_body_sha256 != claims.observed_body_sha256
@@ -115,6 +116,7 @@ async def compare_publication_metadata(
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
             authority = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=claims.deployment_id,
                 work_item_id=claims.work_item_id,
                 execution_request_id=claims.execution_request_id,
@@ -126,10 +128,11 @@ async def compare_publication_metadata(
             if authority.has_inflight_push:
                 raise PublicationPrecheckUnavailable
             metadata = await read_publication_metadata(
-                authority, settings=get_settings(), client=request.app.state.http_client
+                authority, settings=settings, client=request.app.state.http_client
             )
             current = await read_publication_authority(
                 session,
+                github_html_base=settings.github_html_base,
                 deployment_id=claims.deployment_id,
                 work_item_id=claims.work_item_id,
                 execution_request_id=claims.execution_request_id,

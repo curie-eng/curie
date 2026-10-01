@@ -1,0 +1,16 @@
+2026-09-07T08:17:33.4633428Z === graduated project: curie skill down ===
+2026-09-07T08:17:33.5982461Z ✓ stopped and removed container 'curie-runner-local'
+2026-09-07T08:17:33.6091795Z confirmed: normal skill up, status, message, and down operate on the retained project
+2026-09-07T08:17:33.6092103Z 
+2026-09-07T08:17:33.6092310Z === curie try --keep (refuse an existing graduated project) ===
+2026-09-07T08:17:33.6232164Z Error: refusing to overwrite existing files: curie-demo/.claude-plugin/plugin.json, curie-demo/skills/curie-demo/SKILL.md, curie-demo/.mcp.json, curie-demo/connectors.yaml, curie-demo/deploy.yaml, curie-demo/evals/cases.json, curie-demo/.gitignore, curie-demo/AGENTS.md, curie-demo/.claude/skills/using-curie/SKILL.md
+2026-09-07T08:17:33.6250833Z confirmed: a second --keep refuses and preserves the graduated plugin manifest
+2026-09-07T08:17:33.6251110Z 
+2026-09-07T08:17:33.6251203Z === Resolve the bundle under test ===
+2026-09-07T08:17:33.6251524Z bundle: supplied by the caller (CURIE_E2E_BUNDLE), scaffold skipped: /tmp/tmp.lCnZksdpJ9/bundle
+2026-09-07T08:17:33.6251818Z 
+2026-09-07T08:17:33.6251957Z === curie skill up (live model) ===
+2026-09-07T08:18:39.9283762Z ##[error]Process completed with exit code 1.
+2026-09-07T08:18:39.9366553Z Post job cleanup.
+2026-09-07T08:18:40.0995500Z ##[group]Generating build summary
+2026-09-07T08:18:40.1504830Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-f0bLbE/export

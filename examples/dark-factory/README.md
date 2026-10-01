@@ -68,7 +68,8 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
 
 - **The checkout.** Curie mounts the issue's repository at `/workspace` and
   gives every session the built-in file tools. The sandbox has no general
-  network access, and it holds no push or publication credential.
+  network access. The operator may allow package registry routes for locked
+  dependency fetches, and the sandbox holds no push or publication credential.
 - **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
   `runner.Dockerfile` installs it in a runner layer that `connectors.yaml`
   declares (ADR 0173). The platform runner does not carry it, so the layer
@@ -100,8 +101,11 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 [`docs/operations.md`](../../docs/operations.md)). Then:
 
 ```bash
-# The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
-# and the worker budget to 600 s, so raise all three. The chart raises the
+# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
+# already default to 10800. The execution deadline still defaults to 1800, so
+# the required override is:
+#   curie cluster overrides dark-factory --execution-deadline 10800
+# The helm sets below pin those worker values explicitly. The chart raises the
 # worker termination grace with the budget. At this budget, the drain Job
 # publishes a minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
@@ -125,9 +129,8 @@ helm upgrade curie <chart> -n curie --reuse-values \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
 
-# Build the runner layer that carries the GitHub MCP server. It records the
-# layer digest in connectors.lock.yaml, which the deploy requires. Rebuild and
-# redeploy after every platform upgrade.
+# Build the runner layer that carries the repository toolchains and GitHub MCP
+# server. It records the layer digest in connectors.lock.yaml for deployment.
 curie build --plugin-dir examples/dark-factory --registry <registry-ref>
 
 export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
@@ -141,6 +144,112 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+Before a production factory run resolves dependencies, provide an operator
+controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
+to use it, including package archive URLs
+and redirects recorded in their lockfiles. Restrict its upstream hosts to
+`pypi.org`, `files.pythonhosted.org`, `index.crates.io`, `static.crates.io`,
+`registry.npmjs.org` and any reviewed redirect destinations. Permit only the
+read methods `GET` and `HEAD`; reject uploads and arbitrary `CONNECT` tunnels,
+which cannot enforce HTTP methods inside TLS. Allow only exact reviewed package
+metadata and artifact paths needed by the committed lockfiles. Permit only
+reviewed query keys and values; reject unknown paths and queries. Never forward
+client supplied authentication headers, including `Authorization`,
+`Proxy-Authorization` and `Cookie`. The proxy must supply its own upstream
+authentication if needed. Allow the sandbox to reach only the proxy CIDR on
+TCP port 443:
+
+```yaml
+agentSandbox:
+  registryEgress:
+    dark-factory:
+      - cidr: "<operator registry proxy CIDR>"
+        ports: [{ protocol: TCP, port: 443 }]
+```
+
+Put this in an operator maintained Helm values file and apply it:
+
+```bash
+helm upgrade curie <chart> -n curie --reuse-values --timeout 21900s \
+  -f <factory-egress-values.yaml>
+```
+
+PyPI resolves package metadata through `pypi.org` and downloads artifacts from
+`files.pythonhosted.org`. Cargo uses `index.crates.io` for the sparse index and
+`static.crates.io` for archives. pnpm uses `registry.npmjs.org`. The proxy must
+check redirects against its allowed upstream hosts. The `registryEgress` CIDR
+above points only to that proxy. NetworkPolicy matches IP addresses, not
+hostnames, and a shared CDN CIDR can also serve unrelated hosts. Direct CDN
+CIDRs are unsafe for factory runs carrying a GitHub token because dependency
+build scripts or other runner code could send it to an unrelated host on the
+same address range. If the proxy is unavailable, leave registry egress closed
+and report the locked installs as unavailable. The proxy narrows network access
+but does not hide the token from code in the runner. Verify the rendered policy
+selects the `dark-factory` runner pods.
+
+The platform runner already supplies Python 3.13 and Node 22. This bundle
+adds pinned uv, Rust and pnpm 9 for repositories with committed lockfiles. It
+does not bake repository dependencies into the image. After changing the
+toolchain layer or upgrading the platform runner, rebuild and redeploy:
+
+```bash
+curie build --plugin-dir examples/dark-factory --registry <registry-ref>
+curie cluster deploy --plugin-dir examples/dark-factory \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot \
+  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+```
+
+The build updates the layer digest, and the deploy selects that digest.
+
+Measure writable disk use in a runner pod after the frozen installs:
+
+```bash
+du -sh /workspace/.venv /workspace/.cache/uv /workspace/.cargo \
+  /workspace/.cargo-target \
+  /workspace/apps/ui/node_modules "$HOME/.local/share/pnpm" 2>/dev/null
+```
+
+In a runner pod for this repository, the root uv environment used 538 MiB, the
+Cargo cache used 585 MiB, and UI modules used 223 MiB. After
+`cargo test --no-run` completed successfully, the Cargo target directory used
+8.7 GiB.
+These are measured values for this checkout; other repositories and build
+profiles can need different amounts. The chart's default 1 GiB workspace,
+512 MiB home scratch, and 4 GiB runner ephemeral storage limit cannot hold this
+workload. Give the factory agent its own workspace ceiling with
+`agentSandbox.workspaceSizeLimits`, which applies to that agent's sandboxes
+only. Merge these values into the same Helm values file as the registry routes:
+
+```yaml
+agentSandbox:
+  workspaceSizeLimits:
+    dark-factory: 24Gi
+  runner:
+    hardening:
+      writablePathSizeLimit: 2Gi
+```
+
+The kubelet counts the workspace against the pod's `ephemeral-storage` limit
+too, so raise the factory agent's runner resources to match. This override
+applies to the `dark-factory` agent only:
+
+```bash
+curie cluster overrides dark-factory --runner-resources \
+  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"16Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"28Gi"}}'
+```
+
+With these settings, a sandbox running this layer built every `cli/` test
+target (`cargo test --locked --manifest-path cli/Cargo.toml --no-run`) in about
+three minutes. The workspace peaked at 8.8 GiB and the build used the full 6 GiB
+of memory. With a 2 GiB memory limit, the same build was OOMKilled while
+linking.
+
+`writablePathSizeLimit` still applies to every sandbox runner in this Helm
+release. The larger home scratch holds the default uv, Cargo and pnpm caches;
+a run can instead put them under `/workspace`. Repeat the frozen installs and
+Rust build in a pod with these values, measure peak disk and memory use, and
+raise the limits if the completed build needs more room.
 
 The $100 cap is an example for this three hour recipe. Tune it to the model
 and expected workload. The SDK applies it to each session; it does not meter

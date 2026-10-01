@@ -20,6 +20,8 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from typing import Protocol
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
 from aiohttp.typedefs import Handler
@@ -33,14 +35,20 @@ LISTEN_PORT_ENV = "CURIE_CALLER_PROXY_PORT"
 UPSTREAM_PORT_ENV = "CURIE_CALLER_PROXY_UPSTREAM_PORT"
 PUBLIC_KEYS_ENV = "CURIE_CALLER_PROXY_PUBLIC_KEYS"
 ADMITS_ENV = "CURIE_CALLER_PROXY_ADMITS"
+GATED_TOOLS_ENV = "CURIE_CALLER_PROXY_GATED_TOOLS"
+CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
+GRANT_STORE_ENV = "CURIE_CALLER_PROXY_GRANT_STORE"
 
+GRANT_HEADER = "X-Curie-Connector-Grant"
 REFUSAL_STATUS = 403
 _REFUSAL_CODE = -32000
+_MAX_BODY_BYTES = 1024 * 1024
 _REFUSAL_MESSAGES = {
     caller.MISSING: "no caller token was presented",
     caller.INVALID: "the caller token is not valid",
     caller.EXPIRED: "the caller token has expired",
     caller.NOT_ADMITTED: "this agent is not admitted by the connector",
+    caller.GRANT_REQUIRED: "the connector tool call has no matching grant",
 }
 # RFC 9110 section 7.6.1, plus the caller header itself: the token stops here,
 # so the connector server never sees one.
@@ -55,6 +63,7 @@ _NOT_FORWARDED = frozenset(
         "transfer-encoding",
         "upgrade",
         caller.HEADER.lower(),
+        GRANT_HEADER.lower(),
     }
 )
 
@@ -63,7 +72,9 @@ logger = logging.getLogger("curie_connector_proxy")
 # A caller token, and any run of base64url long enough to be a piece of one:
 # aiohttp's parse-error log quotes the bytes it refused, which can be a token
 # cut anywhere.
-_TOKEN_TEXT = re.compile(rf"{caller.PREFIX}\.[A-Za-z0-9_.-]*|[A-Za-z0-9_-]{{32,}}")
+_TOKEN_TEXT = re.compile(
+    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX})\.[A-Za-z0-9_.-]*|[A-Za-z0-9_-]{{32,}}"
+)
 _REDACTED = "<redacted>"
 
 
@@ -105,12 +116,103 @@ _HANDLER_ARGS = {
 }
 
 
+class _GrantSpender(Protocol):
+    """Spend a grant id once. True only when this call stored it."""
+
+    def spend(self, jti: str, ttl: int) -> bool: ...
+
+
+def _resp(*parts: str) -> bytes:
+    encoded = [part.encode("utf-8") for part in parts]
+    head = f"*{len(encoded)}\r\n".encode("ascii")
+    body = b"".join(f"${len(part)}\r\n".encode("ascii") + part + b"\r\n" for part in encoded)
+    return head + body
+
+
+def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
+    """SET key 1 NX EX ttl over the Redis wire. True only when this call stored it.
+
+    The proxy package cannot import the redis client. A missing store, a TLS
+    failure, or any reply other than ``+OK`` is a failed spend.
+    """
+
+    import socket
+    import ssl
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host or parsed.scheme not in {"redis", "rediss"}:
+        return False
+    port = parsed.port or 6379
+    password = unquote(parsed.password) if parsed.password else ""
+    database = (parsed.path or "/0").lstrip("/") or "0"
+    raw = socket.create_connection((host, port), timeout=2)
+    try:
+        conn: socket.socket = raw
+        if parsed.scheme == "rediss":
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            conn = context.wrap_socket(raw, server_hostname=host)
+
+        def reply() -> bytes:
+            line = b""
+            while not line.endswith(b"\r\n"):
+                chunk = conn.recv(1)
+                if not chunk:
+                    raise OSError("the grant store closed the connection")
+                line += chunk
+            return line[:-2]
+
+        def command(*parts: str) -> bytes:
+            conn.sendall(_resp(*parts))
+            return reply()
+
+        if password and command("AUTH", password) != b"+OK":
+            return False
+        if database != "0" and command("SELECT", database) != b"+OK":
+            return False
+        return command("SET", key, "1", "NX", "EX", str(ttl)) == b"+OK"
+    finally:
+        raw.close()
+
+
+class _ValkeyGrantStore:
+    """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    def spend(self, jti: str, ttl: int) -> bool:
+        try:
+            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
+        except Exception:
+            logger.warning("connector grant spend failed")
+            return False
+
+
+def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
+    raw = env.get(GATED_TOOLS_ENV, "")
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise ValueError(f"{GATED_TOOLS_ENV} must be a JSON list of strings") from None
+    if not isinstance(parsed, list) or not all(isinstance(name, str) for name in parsed):
+        raise ValueError(f"{GATED_TOOLS_ENV} must be a JSON list of strings")
+    return tuple(parsed)
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     listen_port: int
     upstream_port: int
     public_keys: tuple[VerifyKey, ...]
     admits: frozenset[str]
+    gated_tools: tuple[str, ...] = ()
+    connector: str = ""
+    grant_store: _GrantSpender | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ProxyConfig:
@@ -141,11 +243,15 @@ class ProxyConfig:
             isinstance(name, str) and name for name in admits
         ):
             raise ValueError(f"{ADMITS_ENV} must be a JSON list of agent names")
+        store_url = env.get(GRANT_STORE_ENV, "").strip()
         return cls(
             listen_port=port(LISTEN_PORT_ENV),
             upstream_port=port(UPSTREAM_PORT_ENV),
             public_keys=keys,
             admits=frozenset(admits),
+            gated_tools=_gated_tools(env),
+            connector=env.get(CONNECTOR_ENV, ""),
+            grant_store=_ValkeyGrantStore(store_url) if store_url else None,
         )
 
 
@@ -182,6 +288,84 @@ _CLOCK: web.AppKey[Callable[[], float]] = web.AppKey("clock")
 _UPSTREAM = web.AppKey("upstream", ClientSession)
 
 
+@dataclass(frozen=True)
+class _ToolCall:
+    name: str
+    arguments: object
+
+
+def _tool_call(body: bytes) -> _ToolCall | None:
+    """A ``tools/call`` name and its arguments object, or None."""
+
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or parsed.get("method") != "tools/call":
+        return None
+    params = parsed.get("params")
+    if not isinstance(params, dict):
+        return None
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if "arguments" in params:
+        return _ToolCall(name=name, arguments=params["arguments"])
+    return _ToolCall(name=name, arguments={})
+
+
+def _is_gated(config: ProxyConfig, name: str) -> bool:
+    candidates = (f"{config.connector}/{name}", f"mcp__{config.connector}__{name}")
+    return any(
+        fnmatchcase(candidate, pattern)
+        for pattern in config.gated_tools
+        for candidate in candidates
+    )
+
+
+def _canonical_arguments(arguments: object) -> str | None:
+    if not isinstance(arguments, dict):
+        return None
+    try:
+        return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> bool:
+    """Spend a grant that already matches. A missing store never spends."""
+
+    store = config.grant_store
+    if store is None:
+        return False
+    try:
+        return bool(store.spend(grant.jti, max(grant.exp - now, 1)))
+    except Exception:
+        logger.warning("connector grant spend failed")
+        return False
+
+
+def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> bool:
+    """True when this admitted POST is a gated tools/call without a live grant."""
+
+    config = request.app[_CONFIG]
+    call = _tool_call(body)
+    if call is None or not _is_gated(config, call.name):
+        return False
+    presented = request.headers.getall(GRANT_HEADER, [])
+    if len(presented) != 1:
+        return True
+    grant = caller.verify(config.public_keys, presented[0])
+    if grant is None or grant.exp <= now:
+        return True
+    if grant.agent != agent or grant.connector != config.connector or grant.tool != call.name:
+        return True
+    canonical = _canonical_arguments(call.arguments)
+    if canonical is None or grant.args != canonical:
+        return True
+    return not _grant_spent(config, grant, now)
+
+
 def _decide(request: web.Request) -> caller.Decision:
     config = request.app[_CONFIG]
     tokens = request.headers.getall(caller.HEADER, [])
@@ -206,17 +390,37 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # routing's result either way, so every request, matched or not, is
     # decided and never silently let through to the router's default.
     decision = _decide(request)
+    refusal = decision.refusal
+    body: bytes | None = None
+    buffered = False
+    if refusal is None and request.method == "POST" and request.body_exists:
+        try:
+            body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            # A body over 1 MiB is refused rather than forwarded unread.
+            logger.info(
+                "caller=%s outcome=too_large method=%s path=%r",
+                decision.agent or "-",
+                request.method,
+                request.path,
+            )
+            return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
+        buffered = True
+        if len(body) > _MAX_BODY_BYTES or _grant_refused(
+            request, decision.agent or "", body, int(request.app[_CLOCK]())
+        ):
+            refusal = caller.GRANT_REQUIRED
     # The path is decoded, so it is quoted: an encoded newline in it stays
     # `\n` inside this line rather than starting a line of its own.
     logger.info(
         "caller=%s outcome=%s method=%s path=%r",
         decision.agent or "-",
-        decision.refusal or "admitted",
+        refusal or "admitted",
         request.method,
         request.path,
     )
-    if decision.refusal is not None:
-        return web.json_response(refusal_body(decision.refusal), status=REFUSAL_STATUS)
+    if refusal is not None:
+        return web.json_response(refusal_body(refusal), status=REFUSAL_STATUS)
     config = request.app[_CONFIG]
     target = URL.build(
         scheme="http",
@@ -231,7 +435,13 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
             request.method,
             target,
             headers=_forwardable(request.headers),
-            data=request.content if request.body_exists else None,
+            data=(
+                body
+                if buffered
+                else request.content
+                if request.body_exists
+                else None
+            ),
             allow_redirects=False,
         )
     except ClientError:

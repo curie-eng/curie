@@ -1313,6 +1313,68 @@ fn duplicate_selected_python_testcases_cannot_prove_a_pin() {
     );
 }
 
+fn assert_parametrized_python_pin(selector: &str, junit: &str, passes: bool) {
+    let path = "apps/api/tests/test_pin.py";
+    let fixture = Fixture::new(path, "def test_selected():\n    assert 1 == 1\n");
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            (path, "def test_selected():\n    assert 2 == 2\n"),
+        ],
+        "Change selected Python test",
+    );
+    test_executable::install_in(
+        &fixture.tools,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = run ] && [ "$2" = --python ] && [ "$4" = python ]; then
+    shift 4
+    exec python3 "$@"
+fi
+if grep -qx 'value=fixed' runner/Dockerfile; then
+    exit 0
+fi
+printf '%s\n' "$VERIFY_JUNIT" > "$7"
+exit 1
+"#,
+    );
+    let output = fixture
+        .command(&change, selector)
+        .env("VERIFY_JUNIT", junit)
+        .output()
+        .expect("run verify fix pin");
+    assert_eq!(output.status.success(), passes, "{}", output_text(&output));
+    assert_eq!(stdout_has_result(&output, "PINNED"), passes);
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
+fn bare_parametrized_python_pin_accepts_all_reversed_cases() {
+    assert_parametrized_python_pin(
+        "apps/api/tests/test_pin.py::test_selected",
+        r#"<testsuites><testsuite><testcase classname="apps.api.tests.test_pin" name="test_selected[first]"><failure/></testcase><testcase classname="apps.api.tests.test_pin" name="test_selected[second]"><failure/></testcase></testsuite></testsuites>"#,
+        true,
+    );
+}
+
+#[test]
+fn single_parametrized_python_case_pin_still_passes() {
+    assert_parametrized_python_pin(
+        "apps/api/tests/test_pin.py::test_selected[first]",
+        r#"<testsuites><testsuite><testcase classname="apps.api.tests.test_pin" name="test_selected[first]"><failure/></testcase></testsuite></testsuites>"#,
+        true,
+    );
+}
+
+#[test]
+fn bare_parametrized_python_pin_refuses_a_passing_case() {
+    assert_parametrized_python_pin(
+        "apps/api/tests/test_pin.py::test_selected",
+        r#"<testsuites><testsuite><testcase classname="apps.api.tests.test_pin" name="test_selected[first]"><failure/></testcase><testcase classname="apps.api.tests.test_pin" name="test_selected[second]"/></testsuite></testsuites>"#,
+        false,
+    );
+}
+
 #[test]
 fn unchanged_selected_python_test_cannot_use_collection_failure_as_a_pin() {
     let fixture = Fixture::new(

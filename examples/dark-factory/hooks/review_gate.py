@@ -10,6 +10,10 @@ phases and rounds. This hook takes all of that out of the model's hands.
 
 One script handles every hook event the bundle registers:
 
+``PreToolUse`` on ``Bash``
+    Refuses background shell commands. Run the command in the foreground and
+    wait for its result before continuing or ending the turn.
+
 ``PreToolUse`` on ``Agent``/``Task``
     Only ``plan-reviewer`` and ``diff-reviewer`` may run. The type is kept when
     it names a reviewer, otherwise inferred from the description and prompt.
@@ -247,6 +251,17 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
     return _allow(f"routed to {kind}, round {round_}", updated)
 
 
+def pre_bash(tool_input: dict[str, Any]) -> dict[str, Any] | None:
+    if tool_input.get("run_in_background") is True:
+        return _deny(
+            "Run Bash in the foreground. Do not set run_in_background to true. "
+            "Wait for the command to finish before you end your turn."
+        )
+    updated = dict(tool_input)
+    updated["run_in_background"] = False
+    return _allow("Bash runs in the foreground", updated)
+
+
 def post_agent(
     state: dict[str, Any], event: str, tool_input: dict[str, Any], response: Any
 ) -> dict[str, Any] | None:
@@ -342,6 +357,8 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
         elif event in ("PostToolUse", "PostToolUseFailure"):
             response = data.get("tool_response", data.get("error"))
             out = post_agent(state, event, tool_input, response)
+    elif event == "PreToolUse" and tool == "Bash":
+        out = pre_bash(tool_input)
     elif event == "PreToolUse" and tool.endswith("publish_changes"):
         out = pre_publish(state)
     elif tool.endswith("add_issue_comment"):

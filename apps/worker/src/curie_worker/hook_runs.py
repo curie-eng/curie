@@ -106,8 +106,10 @@ def _parse_ref(ref: HookRunRef) -> _HookRunKey:
 class HookRunRecorder:
     """Read and close hook run rows owned by the API schema."""
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, db_schema: str) -> None:
         self._engine = engine
+        # Table identifiers are not user input; the schema comes from config.
+        self._schema = db_schema
 
     @asynccontextmanager
     async def start_guard(self, ref: HookRunRef) -> AsyncIterator[bool]:
@@ -127,8 +129,8 @@ class HookRunRecorder:
                     await connection.execute(
                         text(
                             "SELECT r.outcome IS NULL AND c.paused_at IS NULL "
-                            "FROM curie.hook_runs r "
-                            "LEFT JOIN curie.schedule_controls c "
+                            f"FROM {self._schema}.hook_runs r "
+                            f"LEFT JOIN {self._schema}.schedule_controls c "
                             "ON c.agent_id = r.agent_id AND c.name = r.name "
                             "WHERE r.agent_id = :agent_id AND r.name = :name "
                             "AND r.slot_utc = :slot_utc"
@@ -154,7 +156,7 @@ class HookRunRecorder:
                 row = (
                     await connection.execute(
                         text(
-                            "SELECT outcome FROM curie.hook_runs "
+                            f"SELECT outcome FROM {self._schema}.hook_runs "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc"
                         ),
@@ -191,7 +193,7 @@ class HookRunRecorder:
                 renewed = (
                     await connection.execute(
                         text(
-                            "UPDATE curie.hook_runs SET lease_expires_at = GREATEST("
+                            f"UPDATE {self._schema}.hook_runs SET lease_expires_at = GREATEST("
                             "lease_expires_at, now() + make_interval(secs => :lease_s)) "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc "
@@ -221,7 +223,7 @@ class HookRunRecorder:
                 updated = (
                     await connection.execute(
                         text(
-                            "UPDATE curie.hook_runs "
+                            f"UPDATE {self._schema}.hook_runs "
                             "SET outcome = :outcome, ended_at = now() "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc "
@@ -241,7 +243,7 @@ class HookRunRecorder:
                     existing = (
                         await connection.execute(
                             text(
-                                "SELECT outcome FROM curie.hook_runs "
+                                f"SELECT outcome FROM {self._schema}.hook_runs "
                                 "WHERE agent_id = :agent_id "
                                 "AND name = :name AND slot_utc = :slot_utc"
                             ),

@@ -3,7 +3,6 @@
 import asyncio
 import uuid
 
-from aci_protocol import QueuedTurn
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,6 +15,7 @@ from ..github_review_store import (
     reserve_queued_feedback,
     verify_queued_feedback,
 )
+from ..wirebody import QueuedTurnBody
 
 _FINAL_RESERVE_CONTROL_PLANE_TIMEOUT_S = 2.0
 
@@ -28,7 +28,7 @@ router = APIRouter(
 
 class ReviewVerificationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    turn: QueuedTurn
+    turn: QueuedTurnBody
     deployment_id: uuid.UUID
 
 

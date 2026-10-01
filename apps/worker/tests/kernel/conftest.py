@@ -97,7 +97,7 @@ class HookRunSeed:
     def recorder(self) -> object:
         from curie_worker.hook_runs import HookRunRecorder
 
-        return HookRunRecorder(self.engine)
+        return HookRunRecorder(self.engine, "curie")
 
     async def state(self) -> tuple[str | None, datetime | None] | None:
         async with self.engine.connect() as conn:
@@ -447,6 +447,8 @@ class FakeK8s:
     ready_reason: str | None = None
     ready_message: str | None = None
     unschedulable_message: str | None = None
+    termination: Any | None = None
+    termination_queries: list[str] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -590,6 +592,14 @@ class FakeK8s:
         assert request_timeout_seconds > 0
         return self.unschedulable_message
 
+    def pod_termination(
+        self, name: str, *, request_timeout_seconds: float, since: datetime
+    ) -> Any | None:
+        assert request_timeout_seconds > 0
+        assert since.tzinfo is not None
+        self.termination_queries.append(name)
+        return self.termination
+
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
 
@@ -639,12 +649,18 @@ class FakeRunner:
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
         self.supports_capacity_admission = True
+        # The tool access values this runner advertises under ``tool_access``
+        # (TOOL-ACCESS-4). None models a runner that predates the key.
+        self.tool_access_enforced: list[str] | None = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
         self.turn_scripts: list[list[OutboundEvent]] = []
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
+        self.abort_after_frames = False
         self.opened: list[str] = []
+        # Every /v1/event body as received, for asserting what the worker sent.
+        self.event_bodies: list[dict[str, object]] = []
         self.request_epochs: list[tuple[str, str]] = []
         self.queried: list[str] = []
         self.admissions: list[tuple[str, bool]] = []
@@ -687,6 +703,8 @@ class FakeRunner:
             "turn_active": self.turn_active,
             "history_durable": self.history_durable,
         }
+        if self.tool_access_enforced is not None:
+            body["tool_access"] = list(self.tool_access_enforced)
         if request.path == "/v1/status":
             body["turn_epoch"] = self.turn_epoch
             if self.supports_capacity_admission:
@@ -702,6 +720,7 @@ class FakeRunner:
         self.event_headers.append(dict(request.headers))
         body = await request.json()
         self.opened.append(body["text"])
+        self.event_bodies.append(body)
         epoch = uuid.uuid4().hex
         self.request_epochs.append((body["text"], epoch))
         if self.event_fail_times > 0:
@@ -743,6 +762,11 @@ class FakeRunner:
                 self.queried.append(body["text"])
                 for frame in script:
                     await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+                if self.abort_after_frames:
+                    transport = request.transport
+                    assert transport is not None
+                    transport.close()
+                    return resp
                 if self.hold is not None:
                     await self.hold.wait()  # type: ignore[attr-defined]
                     for frame in self.tail:

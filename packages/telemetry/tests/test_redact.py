@@ -15,6 +15,9 @@ from curie_telemetry.redact import RedactingLogFilter, redact_text
 # (``apps/api/src/curie_api/channel_token.py``, prefix ``chn``). The issue's
 # ``chn-{channel_id}-{digest}`` shape is ``_event_id``, not a credential.
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
+# Shapes from curie_api.sandbox_token.mint and curie_worker.caller_token.mint.
+FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
+FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
 # Provider docs: "API keys start with `am_`"
 # https://docs.agentmail.to/knowledge-base/getting-api-key.md
 FAKE_AGENTMAIL_API_KEY = "am_" + "FAKEFAKEFAKEFAKEFAKE0000"
@@ -90,6 +93,55 @@ def _bot_token(first_len: int = 24, middle_len: int = 6, last_len: int = 27) -> 
 # Each case: input text, exact redacted output. Every output must also be a
 # fixed point of redaction (idempotence).
 REDACTED_CASES = [
+    *(
+        pytest.param(
+            f"before ({token}) after",
+            f"before ([REDACTED:{rule}]) after",
+            id=f"{rule}_bare_value_preserves_punctuation",
+        )
+        for rule, token in (
+            ("sandbox_token", FAKE_SANDBOX_TOKEN),
+            ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+        )
+    ),
+    *(
+        pytest.param(
+            repr({"credential": token, "status": "ok"}),
+            f"{{'credential': '[REDACTED:{rule}]', 'status': 'ok'}}",
+            id=f"{rule}_dictionary_value_keeps_harmless_fields",
+        )
+        for rule, token in (
+            ("sandbox_token", FAKE_SANDBOX_TOKEN),
+            ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+        )
+    ),
+    *(
+        pytest.param(
+            f"CURIE_RUNNER_TOKEN={token}",
+            f"CURIE_RUNNER_TOKEN=[REDACTED:{rule}]",
+            id=f"{rule}_assignment_uses_named_placeholder",
+        )
+        for rule, token in (
+            ("sandbox_token", FAKE_SANDBOX_TOKEN),
+            ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+        )
+    ),
+    *(
+        pytest.param(
+            f"{prefix}{token}/FAKE_SUFFIX",
+            f"{retained}[REDACTED:{context_rule}]",
+            id=f"{rule}_{context_rule}_overlap_consumes_the_entire_value",
+        )
+        for rule, token in (
+            ("sandbox_token", FAKE_SANDBOX_TOKEN),
+            ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+        )
+        for prefix, retained, context_rule in (
+            ("Authorization: Bearer ", "Authorization: ", "bearer_token"),
+            ("X-API-Key: ", "X-API-Key: ", "x_api_key"),
+            ("token=", "token=", "secret_assignment"),
+        )
+    ),
     pytest.param(
         f"Authorization: Basic {FAKE_BASIC_AUTH}",
         "Authorization: [REDACTED:basic_auth]",
@@ -340,6 +392,18 @@ def test_redaction(text: str, expected: str) -> None:
 
 # Each case: text that carries no credential and must pass through unchanged.
 PRESERVED_CASES = [
+    *(
+        pytest.param(text, id=f"curie_token_near_match_is_preserved_{index}")
+        for index, text in enumerate(
+            (
+                "sbx.payload",
+                "cct.payload",
+                "sbx..signature",
+                "cct.payload.",
+                "sandbox=sbx-acme-example caller=cct-acme-example",
+            )
+        )
+    ),
     pytest.param(
         f"inbound admitted event_id={BENIGN_EVENT_ID}",
         id="channel_event_id_is_not_treated_as_a_credential",

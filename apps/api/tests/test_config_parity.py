@@ -6,8 +6,8 @@ watcher reads a stream the worker never writes to and every dead-letter goes
 unobserved. This module is the parity contract: `Settings.dead_letter_stream_name()`
 (apps/api) and `WorkerConfig.dead_letter_stream_name()` (apps/worker) must
 resolve to the SAME value under every operator override, including
-`CURIE_STREAM` alone (today the API only reads `RUNS_STREAM` for its base
-stream, so overriding `CURIE_STREAM` diverges the two lanes).
+`CURIE_STREAM` alone. It also covers the runs and eval stream names (#3565):
+the API's producers and the worker's consumers must resolve the same names.
 
 Pure unit tests: no fixtures, no Postgres/Valkey/network. `get_settings()` is
 `lru_cache`d, so every case constructs `Settings()` directly for a fresh read
@@ -22,12 +22,14 @@ import pytest
 from curie_api.config import Settings
 from curie_dispatcher.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
+from pydantic import ValidationError
 
 
 def _clear_stream_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "RUNS_STREAM",
         "CURIE_STREAM",
+        "CURIE_EVAL_STREAM",
         "CURIE_DEAD_LETTER_STREAM",
         "RESUME_DEAD_LETTER_STREAM",
     ):
@@ -79,22 +81,57 @@ def test_curie_stream_override_alone_agrees_across_lanes(
     assert api_name == worker_name == "operations:dead"
 
 
-def test_runs_stream_takes_precedence_over_curie_stream(
+def test_conflicting_runs_stream_and_curie_stream_is_refused_at_boot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Historical RUNS_STREAM precedence is preserved once AliasChoices lands.
-
-    With both `RUNS_STREAM` and `CURIE_STREAM` set, the API's `runs_stream`
-    must resolve to the `RUNS_STREAM` value -- the narrower, historically
-    supported override wins over the newer shared alias. Today, with no
-    AliasChoices in place, `runs_stream` reads only `RUNS_STREAM`, so this
-    already passes; it guards the ordering once the alias is added.
-    """
+    """The worker and dispatcher read only CURIE_STREAM, so a RUNS_STREAM that
+    disagrees would split the lanes; boot refuses it (#3565)."""
     _clear_stream_env(monkeypatch)
     monkeypatch.setenv("RUNS_STREAM", "runs-legacy")
     monkeypatch.setenv("CURIE_STREAM", "operations")
 
+    with pytest.raises(ValidationError, match="CURIE_STREAM"):
+        Settings()
+
+
+def test_runs_stream_alone_is_still_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setenv("RUNS_STREAM", "runs-legacy")
+
     assert Settings().runs_stream == "runs-legacy"
+
+
+def test_agreeing_runs_stream_and_curie_stream_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setenv("RUNS_STREAM", "operations")
+    monkeypatch.setenv("CURIE_STREAM", "operations")
+    monkeypatch.setenv("CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "parity-attester-secret-3")
+
+    assert (
+        Settings().runs_stream
+        == WorkerConfig().stream
+        == DispatcherConfig().stream
+        == "operations"
+    )
+
+
+def test_eval_stream_default_agrees_across_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_stream_env(monkeypatch)
+
+    assert Settings().eval_stream == WorkerConfig().eval_stream == "curie:evals"
+
+
+def test_eval_stream_override_agrees_across_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_stream_env(monkeypatch)
+    monkeypatch.setenv("CURIE_EVAL_STREAM", "operations:evals")
+
+    assert Settings().eval_stream == WorkerConfig().eval_stream == "operations:evals"
 
 
 class TestResumeDeadLetterStreamCoherence:

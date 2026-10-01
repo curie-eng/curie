@@ -365,6 +365,7 @@ def test_the_default_identity_mints_its_name(
             "placeholder": "100.0001",
             "endpoint": None,
             "adapter": "default",
+            "identity": None,
         }
 
 

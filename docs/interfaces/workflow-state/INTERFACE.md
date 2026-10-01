@@ -92,6 +92,17 @@ for an app-scoped caller instead (#856). Which scope authenticated is carried
 through as `apps/api/src/curie_api/routers/state.py::StateCaller`, resolved by
 `apps/api/src/curie_api/routers/state.py::require_state_access`.
 
+Every completed state delete, shared or binding scoped and including a
+transcript, and every operator memory edit or delete, leaves one INFO line on
+the `curie_api.state_mutation` logger, plus one `curie.state.mutation` count
+when it changed stored state (#3673,
+`apps/api/src/curie_api/state_mutation.py::record`). The line names the
+operation, agent, scope, namespace, key or memory index, whether anything was
+removed, and the `StateCaller` kind that authenticated the call. It never
+carries the stored value or a memory entry's content. A compare-and-delete that
+conflicts is refused before anything is recorded, and a write that bypasses the
+API, such as a direct database statement, leaves no record here.
+
 The worker-side route store is separate. `AffinityStore` at
 `apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore` records the
 `thread_key -> sandbox route` binding, and its methods are the closest thing to a

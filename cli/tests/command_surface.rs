@@ -16,6 +16,29 @@ fn run_help(args: &[&str]) -> std::process::Output {
         .expect("run curie --help")
 }
 
+#[test]
+fn deploy_local_help_documents_only_accepted_environment_flags() {
+    let help = run_help(&["deploy-local"]);
+    assert!(help.status.success(), "deploy-local help must succeed");
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--env <ENV>"), "{text}");
+    assert!(
+        !text.contains("--target"),
+        "unsupported --target advertised\n{text}"
+    );
+
+    for env in ["dev", "prod"] {
+        let accepted = run_help(&["deploy-local", "acme-bot", "--env", env]);
+        assert!(
+            accepted.status.success(),
+            "documented --env {env} must parse"
+        );
+    }
+    let refused = run_help(&["deploy-local", "acme-bot", "--target", "prod"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--target"));
+}
+
 fn output_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }

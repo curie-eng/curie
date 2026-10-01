@@ -251,6 +251,54 @@ def test_no_bot_token_leaves_the_lane_unwired_rather_than_half_wired(built: Any)
     assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
 
 
+# --- ADR-0153: a channel-port adapter's credential is a lane credential too --
+
+
+def test_adapter_credentials_alone_wire_the_lane_for_channel_port_turns(built: Any) -> None:
+    # An install whose only channels sit behind the channel port holds no bot
+    # token, so a Slack-only condition never built the lane there and every
+    # file an adapter referenced was dropped (#3678). The adapter secrets the
+    # reply sink already holds are the credential that fetches those files.
+    lane = _lane(
+        built(
+            attachment_enabled=True,
+            slack_bot_token="",
+            adapter_credentials={"mail-adapter": "adapter-secret-placeholder"},
+        )
+    )
+    assert lane.channel_files is not None
+    assert lane.files is None
+
+    # A Slack turn on that worker is refused by name before anything is
+    # written, not fetched with an empty token.
+    objects = _RecordingObjects()
+    lane.objects = objects
+    with pytest.raises(AttachmentResolutionError) as excinfo:
+        lane.resolve(
+            thread_key="t1",
+            agent_id="agent-1",
+            attachments=[Attachment(id="F1", name="report.csv")],
+        )
+    assert excinfo.value.stage == "credential"
+    assert objects.put_stream_calls == []
+
+
+def test_a_slack_only_worker_wires_no_channel_port_client(built: Any) -> None:
+    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
+    assert lane.files is not None
+    assert lane.channel_files is None
+
+
+def test_adapter_credentials_do_not_switch_the_lane_on_by_themselves(built: Any) -> None:
+    # The off switch still governs: credentials alone build nothing.
+    assert (
+        built(adapter_credentials={"mail-adapter": "adapter-secret-placeholder"}).get(
+            "attachments"
+        )
+        is None
+    )
+
+
 # --- the configured envelope reaches the lane ------------------------------
 
 

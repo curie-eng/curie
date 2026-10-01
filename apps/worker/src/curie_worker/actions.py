@@ -78,6 +78,13 @@ def _snapshot(
     result = frame.result
     if not isinstance(result, dict):
         return None, None, None
+    if frame.redacted:
+        # The runner replaced something inside this reply, so ``prior`` may hold
+        # a placeholder where a value was, and a restore would write it (#1873).
+        # Recording neither state keeps the row not undoable; ``target`` names
+        # what was acted on and is never replayed, so it stays.
+        target = result.get(TARGET_KEY)
+        return None, None, target if isinstance(target, dict) else None
 
     def _obj(key: str) -> dict[str, Any] | None:
         value = result.get(key)

@@ -1225,6 +1225,12 @@ pub struct KillState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThreadResetState {
     pub requested: bool,
+    /// What the worker found when it drained the reset (#3699): `Some(false)`
+    /// when the key matched no route, so nothing was released; `Some(true)` when
+    /// a route existed and was released; `None` while the reset is pending, when
+    /// the outcome expired, or against an API that predates the field.
+    #[serde(default)]
+    pub route_existed: Option<bool>,
 }
 
 /// The enqueued eval job's identity (`EvalTriggerResult` in openapi.json): the
@@ -1393,6 +1399,48 @@ fn has_local_host(endpoint: &reqwest::Url) -> bool {
         Ok(address) => address.is_loopback() || address.is_unspecified(),
         Err(_) => host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost"),
     }
+}
+
+/// The key a client for `base_url` actually sends (#3557).
+///
+/// `curie local up` stores a per-install API key, and a verb whose `--api-key`
+/// fell back to the dev sentinel should send that key instead. This is the one
+/// seam where the destination is known, so the substitution happens here and
+/// only for a loopback destination: the stored key belongs to a stack on this
+/// machine and must never reach a remote host, even when `CURIE_API_URL` points
+/// somewhere else. An explicit key is always sent as given. `stored` runs only
+/// for a loopback destination with the sentinel key; `None` keeps the sentinel.
+fn api_key_for_destination(
+    base_url: &str,
+    api_key: &str,
+    stored: impl FnOnce() -> Option<String>,
+) -> String {
+    if api_key == crate::message::DEFAULT_API_KEY && is_loopback_destination(base_url) {
+        if let Some(key) = stored().filter(|key| !key.is_empty()) {
+            return key;
+        }
+    }
+    api_key.to_string()
+}
+
+/// Whether `base_url` names this machine's loopback: `localhost`, any address
+/// in 127.0.0.0/8, or `::1`. Deliberately narrower than [`has_local_host`]: no
+/// unspecified address and no `*.localhost` names, since this gates sending a
+/// private key.
+fn is_loopback_destination(base_url: &str) -> bool {
+    let Ok(endpoint) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    endpoint
+        .host_str()
+        .is_some_and(crate::oci_registry::is_loopback_host)
+}
+
+/// The stored per-install key for the local project this process targets, or
+/// `None` on any failure (no project, no store, unreadable store).
+fn stored_local_api_key() -> Option<String> {
+    let resources = crate::local::current_resources().ok()?;
+    crate::local_stack_keys::stored_api_key(&resources.project)
 }
 
 /// Build the one kind of HTTP client this CLI makes requests with.
@@ -1843,9 +1891,10 @@ impl ApiClient {
         warn_if_insecure(base_url);
         let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
             .context("building HTTP client")?;
+        let api_key = api_key_for_destination(base_url, api_key, stored_local_api_key);
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            api_key,
             http,
         })
     }
@@ -3833,9 +3882,10 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
-        mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
+        add_channel_body, agent_create_body, agent_update_body, api_key_for_destination,
+        is_insecure_endpoint, mint_channel_token_body, prevalidate_series_span,
+        validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
+        DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -4194,6 +4244,68 @@ mod tests {
     fn https_is_always_secure() {
         assert!(!is_insecure_endpoint("https://api.example.com"));
         assert!(!is_insecure_endpoint("HTTPS://API.EXAMPLE.COM"));
+    }
+
+    // #3557: the stored install key replaces the sentinel only on loopback.
+    #[test]
+    fn stored_key_replaces_the_sentinel_for_a_loopback_destination() {
+        use crate::message::DEFAULT_API_KEY;
+        for url in [
+            "http://localhost:28080",
+            "http://LOCALHOST",
+            "http://127.0.0.1:28080",
+            "http://127.9.8.7:28080",
+            "http://[::1]:28080",
+        ] {
+            assert_eq!(
+                api_key_for_destination(url, DEFAULT_API_KEY, || Some("stored-placeholder".into())),
+                "stored-placeholder",
+                "{url}"
+            );
+        }
+        // Nothing stored, or an empty store value, keeps the sentinel.
+        assert_eq!(
+            api_key_for_destination("http://localhost:28080", DEFAULT_API_KEY, || None),
+            DEFAULT_API_KEY
+        );
+        assert_eq!(
+            api_key_for_destination("http://localhost:28080", DEFAULT_API_KEY, || Some(
+                String::new()
+            )),
+            DEFAULT_API_KEY
+        );
+    }
+
+    #[test]
+    fn stored_key_never_reaches_a_remote_destination() {
+        use crate::message::DEFAULT_API_KEY;
+        for url in [
+            "http://api.example.com",
+            "https://api.example.com:8443",
+            "http://0.0.0.0:28080",
+            "http://api.localhost:28080",
+            "http://localhost.example.com",
+            "http://10.0.0.5:28080",
+            "not a url",
+        ] {
+            assert_eq!(
+                api_key_for_destination(url, DEFAULT_API_KEY, || panic!(
+                    "the store must not be read for {url}"
+                )),
+                DEFAULT_API_KEY,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_key_is_sent_as_given_even_on_loopback() {
+        assert_eq!(
+            api_key_for_destination("http://127.0.0.1:28080", "explicit-placeholder", || panic!(
+                "the store must not be read for an explicit key"
+            )),
+            "explicit-placeholder"
+        );
     }
 
     #[test]

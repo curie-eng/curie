@@ -24,9 +24,7 @@ sends as an `Authorization: Bearer` header on every ACI call to that sandbox
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
 > bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker. Per-channel
-> dev/prod bot-identity routing (the dispatcher carrying which bot was addressed)
-> is a git-flow/dispatcher refinement.
+> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
@@ -40,6 +38,66 @@ the resolver against the real compose Postgres (channel resolution, prod
 preference, unknown -> None, budget/env); the kill switch against real Valkey
 (flag gate, subscriber dispatch); and kernel-level behaviors (unmapped drop,
 boot-env on claim, killed-agent refusal, kill interrupts a live turn).
+
+### Named cluster-message canary routing
+
+The cluster-message relay delivers a Slack-kind turn whose reply handle uses
+`adapter=curie-cluster-message` for egress. Its optional `identity` selects the
+Slack binding independently of that delivery adapter (INGRESS-CANARY-1).
+
+- **WORKER-CANARY-1:** An absent identity selects the `default` Slack binding.
+  A declared named identity such as `sre-bot` selects only the binding with
+  that identity on the same channel. Ordinary Slack turns continue to select
+  their binding by `adapter`.
+- **WORKER-CANARY-2:** An unknown identity returns no binding. An empty or
+  malformed identity is refused before a sandbox claim. None of these cases
+  may fall back to `default`, including the bound-but-undeployed diagnostic.
+- **WORKER-CANARY-3:** A named relay turn's internal thread key includes its
+  selected identity. A default and named turn on one channel and conversation
+  cannot adopt each other's sandbox, history, lock, or approval state.
+- **WORKER-CANARY-4:** Resolved and bound-but-undeployed relay replies keep
+  `curie-cluster-message` as their egress adapter. The binding's Slack identity
+  never replaces the relay; ordinary Slack reply routing is unchanged.
+- **WORKER-CANARY-5:** Active deployment selection for the selected binding
+  retains prod-over-dev and most-recent ordering. A stale or undeployed named
+  route cannot run or answer as a different identity.
+
+### Per-turn tool access
+
+The worker's half of TOOL-ACCESS in
+[the ACI producer seam](../../docs/interfaces/aci-producer/INTERFACE.md), for a
+queued turn whose `tool_access` is set (a canary sets `read-only`):
+
+- **WORKER-TOOL-ACCESS-1:** The worker forwards `QueuedTurn.tool_access`
+  unchanged as `Event.tool_access` on the turn it opens. A turn without it opens
+  exactly as before, with no extra runner call.
+- **WORKER-TOOL-ACCESS-2:** Whichever path opens a restricted turn on a
+  runner (a fresh claim, a replacement, an attachment handoff, a work-item
+  continuation), the worker first reads the status of that runner, from that
+  sandbox's own address with its own token when it has one, and opens the
+  turn only when the value is listed under `tool_access`. A status that
+  answers without it means the runner would run the turn unrestricted, or
+  cannot enforce it on this session, so the model is never asked: the turn
+  fails once, escalated with the class `tool-access-unenforced` and the text
+  `This agent cannot start: its runner cannot enforce read-only tool access
+  for this turn, so the turn was not run.`, and is not retried. A status that
+  cannot be read, or is not a JSON object, opens nothing and is retried like
+  any turn the runner did not accept. The read is bounded to two seconds.
+- **WORKER-TOOL-ACCESS-3:** A restricted turn never steers a live turn: when
+  the thread has one, it is not started and the delivery stays pending for a
+  later redelivery, as a job's does (ADR-0079), and a capacity wake re-parks
+  it instead. It never takes a greeting or help pack's canned reply, which
+  would answer it without a runner.
+- **WORKER-TOOL-ACCESS-4:** The worker never creates an approval from a
+  `read-only` turn and never delivers an approval grant to its boot. A runner
+  final that nonetheless ends `awaiting-approval` records no approval and
+  posts no card; the turn is a failed turn, escalated with the reply `This
+  read-only turn asked for an approval, which it may not do. No approval was
+  created.`
+- **WORKER-TOOL-ACCESS-5:** The runner's own refusal classes for a restricted
+  turn, `tool-access-unenforced` and `tool-access-refused`, are platform error
+  classes: a turn the runner refuses escalates under its class, never as
+  `unclassified`.
 
 ## The eval lane (`curie_worker.eval`)
 
@@ -191,12 +249,16 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
   a non-idempotent action. For noncron turns, flag-clean failures retry by
   classification:
-  `rate-limit`, `runner-error`, `runner-timeout` and `workspace-error` are
-  transient (bounded exponential backoff); `budget-exceeded` and everything else
-  escalate.
+  `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-capacity`,
+  `sandbox-terminated` and `workspace-error` are transient (bounded exponential
+  backoff);
+  `budget-exceeded` and everything else escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
-  told apart from `runner-error` -- the sandbox or the transport dying -- so an
-  operator can see which one happened.
+  told apart from `runner-error`, which is a plain transport failure without
+  confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
+  terminated during the stream, the worker classifies the failure as
+  `sandbox-terminated`; the terminal notice includes the Kubernetes termination
+  reason so an operator can diagnose it before retrying.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
@@ -206,7 +268,11 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
   answers the user, and logs at INFO instead. A turn that names a repository
-  while the coordinator is off for the worker is such a refusal (#2659). Generic
+  by github.com URL while the coordinator is off for the worker is such a
+  refusal (#2659). A bare `owner/repo` token is only a guess (#2947) and with
+  the coordinator off there is no allowlist to confirm it, so it names no
+  repository and the turn stays generic, on a new thread and on a retained
+  route alike (#3671). Generic
   turns continue through the normal claim path while it is off. A retained live
   or suspended route that already has a repository workspace and verified review
   feedback are also terminal refusals, because both require repository authority.
@@ -394,6 +460,25 @@ beneath a reply shows: `all`, the default, `failures` or `off`; ADR-0180) and
 [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)),
 plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for the
 substrate. Run with `python -m curie_worker`.
+
+<!-- @spec WORKER-RECEIPT-1 -->
+A receipt must explain an irreversible action without exposing generic runner
+bookkeeping such as `non-idempotent tool completed`, `non-idempotent tool executed`
+or `tool result too large to record`. When a successful action has no prior state
+and only that generic detail, show that nothing reported a prior state. Keep the
+call visible; this does not classify the tool as read-only or change the action
+ledger, retry latch, receipt mode, or Bash grouping. A meaningful connector
+explanation, a failed-action warning, and an undoable-action verdict take
+precedence over this fallback.
+
+For successful native instruction or shell requests with no meaningful summary,
+no undo capability and only generic runner detail, use plain request-completion
+wording. State that changes were not summarized and undo information is
+incomplete; do not infer that no prior snapshot exists from undo capability
+alone. Preserve counts and every stored action. Do not suppress instruction
+requests or promote them to read-only: loading one can execute dynamic context.
+Custom descriptions, summaries, failed warnings and undoable verdicts retain
+their existing meaning.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
@@ -920,8 +1005,16 @@ fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
 the same stream when its retry is due. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
-receives an expiry message if the deadline passes. Other turn sources retain
-their capacity response. Operators can inspect the persisted wait state and
+receives an expiry message if the deadline passes. An approval resume does not
+wait. It runs the same reclamation pass after its own quota refusal, and when
+the pass frees nothing, or the one retry after it is refused again, the attempt
+fails under `sandbox-capacity` instead (#3693, #3700). The failure retries, and
+each retry that is refused again may run the pass once more, so a resume that
+stays refused can free up to one idle route per attempt. Its terminal notice
+tells the person the agent was at capacity and could not continue after the
+approval decision, with the quota detail left to the worker's warning. An
+earlier attempt's confirmed pod termination is carried onto that notice. Other turn sources
+retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
 The rejection retains every exceeded resource and its requested, used, and
@@ -944,11 +1037,24 @@ another victim or schedule work.
 The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
 roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
 separate limit counts at most 256 matching route keys before filtering, so
-suspended routes count toward it, and at most four candidates are probed. A
+suspended routes count toward it, and at most four candidates are probed.
+Candidates are probed idle eval routes first (conversation ids with the `eval:`
+isolate prefix), then every other route, each group in expiry order. A
 database outside either finite window fails closed. Alert on
 `curie.sandbox.lifecycle` with `operation=reclaim` and
 `outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
 `PEXPIRETIME`, so the pass returns `expiry-unsupported`.
+
+An operator thread reset (`reset-thread`, `POST /agents/{id}/threads/{key}/reset`)
+is drained on the maintenance tick. The drain records the outcome under
+`curie:thread-reset-result:<thread_key>` for an hour, as `released` when a route
+existed or `no-route` when the key matched none, before it clears the
+in-progress marker. The API reports it as `route_existed`, so a reset that freed
+nothing (typically a hand-built key that left out a named bot's identity
+segment) is visible to the caller. A release that raises records no result and
+leaves the request in progress. Each drained reset also increments
+`curie.sandbox.lifecycle` with `operation=thread-reset` and `outcome=released`,
+`no-route` or `failed`; alert on `no-route` to find resets that freed nothing.
 
 On a terminal pressure timeout, cancellation is delivered once and victim lock
 release can add one finite cold pressure Redis operation, at most four seconds.

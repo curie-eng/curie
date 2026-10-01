@@ -95,7 +95,9 @@ Preflights:
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-preflight-avx
 {{- end }}
 {{- if .Values.preflights.networkPolicyProbe.enabled }}
-  - NetworkPolicy-enforcement probe runs on demand:
+  - WARNING: a successful install does not prove NetworkPolicy enforcement.
+    Until this probe passes, treat sandbox network isolation as unverified.
+    Run the NetworkPolicy-enforcement probe now:
       helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-netpol-probe
 {{- end }}

@@ -17,6 +17,8 @@ use std::process::{Command, Output};
 const BASE_REF: &str = "ghcr.io/curie-eng/curie-runner:0.10.0";
 const REGISTRY: &str = "registry.example/acme";
 const BUNDLE: &str = "acme-bot";
+const OVERRIDE_IMAGE: &str = "registry.example/acme/override-runner:manual";
+const GREEN_CHECK_REPORT: &str = r#"{"check":"mcp-load","version":1,"plugin_dir":"/plugin","declared":[],"registered":[],"matches":[],"verdict":"green","reasons":[],"hints":[]}"#;
 
 fn base_digest() -> String {
     format!("sha256:{}", "b".repeat(64))
@@ -64,11 +66,18 @@ if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
   fi
   exit 0
 fi
+if [ "$1" = "run" ]; then
+  case "$*" in
+    *"curie_runner.check"*) printf '%s\n' '{check_report}'; exit 0 ;;
+    *) printf '%s\n' 'test stopped runner startup' >&2; exit 86 ;;
+  esac
+fi
 exit 0
 "#,
         log = log.display(),
         base = base_digest(),
         layer = layer_digest(),
+        check_report = GREEN_CHECK_REPORT,
     );
     write_executable(&tools.join("docker"), &script);
 }
@@ -149,6 +158,94 @@ fn build_lines(log: &str) -> Vec<&str> {
     log.lines()
         .filter(|line| line.starts_with("buildx build") || line.starts_with("build "))
         .collect()
+}
+
+fn run_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.starts_with("run "))
+        .collect()
+}
+
+fn run_skill(root: &Path, bundle: &Path, action: &str, image: Option<&str>) -> Run {
+    let tools = root.join("tools");
+    let home = root.join("home");
+    for dir in [&tools, &home] {
+        fs::create_dir_all(dir).expect("mkdir fixture dir");
+    }
+    let log = root.join("docker.log");
+    install_fake_docker(&tools, &log);
+    fs::write(&log, "").expect("clear prior Docker calls");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    command
+        .current_dir(root)
+        .args(["--color=never", "skill", action, "--plugin-dir"])
+        .arg(bundle);
+    if action == "up" {
+        command.args(["--fake-model", "--name", "acme-runner-test"]);
+    }
+    if let Some(image) = image {
+        command.args(["--image", image]);
+    }
+    let output = command
+        .env_clear()
+        .env("PATH", stub_path(&tools))
+        .env("HOME", &home)
+        .env("TMPDIR", root)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run curie skill command");
+    let log = fs::read_to_string(&log).unwrap_or_default();
+    Run { output, log }
+}
+
+fn write_eval_suite(bundle: &Path) {
+    let evals = bundle.join("evals");
+    fs::create_dir_all(&evals).expect("mkdir evals");
+    fs::write(
+        evals.join("cases.json"),
+        r#"{"name":"runner-layer","cases":[{"id":"reply","input":"ping","grader":{"kind":"contains","expected":"pong"}}]}"#,
+    )
+    .expect("write eval suite");
+}
+
+fn run_eval_model(root: &Path, bundle: &Path) -> Run {
+    let tools = root.join("tools");
+    let home = root.join("home");
+    for dir in [&tools, &home] {
+        fs::create_dir_all(dir).expect("mkdir fixture dir");
+    }
+    let log = root.join("docker.log");
+    install_fake_docker(&tools, &log);
+    fs::write(&log, "").expect("clear prior Docker calls");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .current_dir(bundle)
+        .args(["--color=never", "skill", "eval", "--model", "acme-model"])
+        .env_clear()
+        .env("PATH", stub_path(&tools))
+        .env("HOME", &home)
+        .env("TMPDIR", root)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run curie skill eval model sweep");
+    let log = fs::read_to_string(&log).unwrap_or_default();
+    Run { output, log }
+}
+
+fn assert_runner_image(run: &Run, image: &str) {
+    let runs = run_lines(&run.log);
+    assert_eq!(
+        runs.len(),
+        1,
+        "exactly one runner starts\n{}",
+        describe(run)
+    );
+    assert!(
+        runs[0].split_whitespace().any(|arg| arg == image),
+        "runner must use image {image}\n{}",
+        describe(run)
+    );
 }
 
 /// AC2 + AC3: the runner layer is built on the digest-pinned platform runner,
@@ -243,4 +340,148 @@ fn a_literal_base_in_the_runner_dockerfile_is_refused_before_building() {
         !bundle.join("connectors.lock.yaml").exists(),
         "a refused build writes no lock"
     );
+}
+
+/// #3441: skill up must start the layer image built from this very bundle.
+/// The fake Docker stops the long lived runner at `run`, after recording argv.
+#[test]
+fn skill_up_uses_the_bundles_locked_runner_layer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+    );
+    let built = run_build(temp.path(), &bundle);
+    assert!(built.output.status.success(), "{}", describe(&built));
+
+    let run = run_skill(temp.path(), &bundle, "up", None);
+    assert!(!run.output.status.success(), "{}", describe(&run));
+    let locked = format!("{REGISTRY}/{BUNDLE}-runner@{}", layer_digest());
+    assert_runner_image(&run, &locked);
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
+}
+
+/// #3441: the one shot MCP check must load the same layer as skill up.
+#[test]
+fn skill_check_uses_the_bundles_locked_runner_layer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+    );
+    let built = run_build(temp.path(), &bundle);
+    assert!(built.output.status.success(), "{}", describe(&built));
+
+    let run = run_skill(temp.path(), &bundle, "check", None);
+    assert!(run.output.status.success(), "{}", describe(&run));
+    let locked = format!("{REGISTRY}/{BUNDLE}-runner@{}", layer_digest());
+    assert_runner_image(&run, &locked);
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
+}
+
+/// The declaration alone cannot identify an image. Both skill commands must
+/// refuse before Docker starts anything and give the command that writes it.
+#[test]
+fn unbuilt_runner_layer_refuses_both_skill_commands_with_a_build_remedy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+    );
+
+    for action in ["up", "check"] {
+        let run = run_skill(temp.path(), &bundle, action, None);
+        assert_eq!(run.output.status.code(), Some(2), "{}", describe(&run));
+        assert!(
+            String::from_utf8_lossy(&run.output.stderr).contains("curie build --plugin-dir"),
+            "{action} must name the recovery command\n{}",
+            describe(&run)
+        );
+        assert!(run_lines(&run.log).is_empty(), "{}", describe(&run));
+        assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
+    }
+}
+
+/// An explicit image remains authoritative even when the declared layer is
+/// unbuilt. This lets an operator run a selected image without writing a lock.
+#[test]
+fn explicit_skill_image_overrides_an_unbuilt_runner_layer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+    );
+
+    for action in ["up", "check"] {
+        let run = run_skill(temp.path(), &bundle, action, Some(OVERRIDE_IMAGE));
+        assert_runner_image(&run, OVERRIDE_IMAGE);
+        if action == "check" {
+            assert!(run.output.status.success(), "{}", describe(&run));
+        }
+    }
+}
+
+/// A leftover lock cannot select a layer after the declaration is removed.
+#[test]
+fn skill_commands_use_the_platform_runner_without_a_runner_declaration() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+    );
+    let built = run_build(temp.path(), &bundle);
+    assert!(built.output.status.success(), "{}", describe(&built));
+    fs::remove_file(bundle.join("connectors.yaml")).expect("remove runner declaration");
+
+    let platform = curie::artifacts::resolve_image(
+        None,
+        curie::artifacts::Channel::current(),
+        curie::artifacts::version(),
+    );
+    for action in ["up", "check"] {
+        let run = run_skill(temp.path(), &bundle, action, None);
+        assert_runner_image(&run, &platform);
+    }
+}
+
+/// A model sweep starts its own runner, so it must select the same locked
+/// layer as the other skill commands before it enters Docker.
+#[test]
+fn skill_eval_model_sweep_uses_the_bundles_locked_runner_layer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n",
+    );
+    write_eval_suite(&bundle);
+    let built = run_build(temp.path(), &bundle);
+    assert!(built.output.status.success(), "{}", describe(&built));
+
+    let run = run_eval_model(temp.path(), &bundle);
+    assert!(!run.output.status.success(), "{}", describe(&run));
+    let locked = format!("{REGISTRY}/{BUNDLE}-runner@{}", layer_digest());
+    assert_runner_image(&run, &locked);
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
+}
+
+/// A declared but unbuilt runner must fail before an eval sweep can boot a
+/// transient platform runner that lacks the bundle's installed MCP servers.
+#[test]
+fn unbuilt_runner_layer_refuses_skill_eval_model_sweep() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = runner_bundle(
+        temp.path(),
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+    );
+    write_eval_suite(&bundle);
+
+    let run = run_eval_model(temp.path(), &bundle);
+    assert_eq!(run.output.status.code(), Some(2), "{}", describe(&run));
+    assert!(
+        String::from_utf8_lossy(&run.output.stderr).contains("curie build --plugin-dir"),
+        "model sweep must name the recovery command\n{}",
+        describe(&run)
+    );
+    assert!(run_lines(&run.log).is_empty(), "{}", describe(&run));
+    assert!(build_lines(&run.log).is_empty(), "{}", describe(&run));
 }

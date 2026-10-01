@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,7 +24,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
+from claude_agent_sdk.types import (
+    CanUseTool,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 
 from .adapter import PartialMessageBoundary
 from .approval import (
@@ -34,6 +38,7 @@ from .approval import (
     process_approval_request,
 )
 from .history import ConversationMessage
+from .tool_access import TurnToolAccess
 from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
 
@@ -47,6 +52,7 @@ def _result(
     is_error: bool = False,
     subtype: str = "success",
     usage: dict[str, Any] | None = None,
+    terminal_reason: str | None = None,
 ) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
@@ -57,6 +63,7 @@ def _result(
         session_id="fake-session",
         result=text,
         usage=usage,
+        terminal_reason=terminal_reason,
     )
 
 
@@ -250,7 +257,15 @@ class FakeModelSession:
     turn still surfaces the tool note it would in production. Defaults None, so
     a fake constructed without it behaves exactly as before. Bundle PreToolUse
     command hooks (#272) are NOT run here: they shell out and would break the
-    fake's offline no-op guarantee.
+    fake's offline no-op guarantee. Tests may inject Curie's in-process
+    ``pre_tool_use_hook`` callback explicitly to exercise the real hook decision
+    shape without running bundle code.
+
+    ``tool_access`` is the session's shared per-turn tool access
+    (RUNNER-TOOL-ACCESS-8). A call it refuses is decided first, before any
+    emulated tool (the approval request) runs, and is answered the way the real
+    CLI answers a PreToolUse deny: an error result carrying the refusal, in
+    place of whatever result the script had for that call. The turn continues.
     """
 
     def __init__(
@@ -259,18 +274,29 @@ class FakeModelSession:
         *,
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
+        pre_tool_use_hook: Callable[
+            [Any, str | None, Any], Awaitable[dict[str, Any]]
+        ]
+        | None = None,
         approval_gate: ApprovalGate | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
         turn_progress: TurnProgress | None = None,
+        tool_access: TurnToolAccess | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
         # The session's progress holder (ADR 0130); None when the tool is not
         # mounted, which the demo answers as "not shown", like no capability.
         self._turn_progress = turn_progress
+        self._tool_access = tool_access
+        # Per turn: the calls ``tool_access`` refused, whose scripted results are
+        # replaced, and the refusal results not yet delivered.
+        self._refused_ids: set[str] = set()
+        self._pending_refusals: list[UserMessage] = []
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
+        self._pre_tool_use_hook = pre_tool_use_hook
         self._emit_partial_boundaries = emit_partial_boundaries
         self._disallowed_tools = tuple(disallowed_tools or ())
         # The shared policy gate (#561): a scripted request_approval block must
@@ -316,15 +342,20 @@ class FakeModelSession:
         self.queries.append(text)
         self._interrupted = False
         self._halted = False
+        self._refused_ids = set()
+        self._pending_refusals = []
 
     async def interrupt(self) -> None:
         self.interrupts += 1
         self._interrupted = True
 
     async def receive_turn(self) -> AsyncIterator[Any]:
-        for message in self._script_factory():
+        for scripted in self._script_factory():
             if self._interrupted and self._truncate_on_interrupt:
                 return
+            message = self._without_refused_results(scripted)
+            if message is None:
+                continue
             if isinstance(message, _Pause):
                 # Read at call time, so a test can shorten the demo's waits.
                 await anyio.sleep(PROGRESS_DEMO_PAUSE_S)
@@ -332,10 +363,17 @@ class FakeModelSession:
             if isinstance(message, _ProgressCall):
                 yield await self._answer_progress(message)
                 continue
-            await self._apply_gate(message)
+            denied_messages = await self._apply_gate(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
                 yield PartialMessageBoundary(event_type="message_start")
             yield message
+            refusals, self._pending_refusals = self._pending_refusals, []
+            for refusal in refusals:
+                yield refusal
+            if denied_messages is not None:
+                for denied_message in denied_messages:
+                    yield denied_message
+                return
             if self._halted:
                 # The denied ToolUseBlock above IS delivered (the real SDK emits
                 # the tool_use even for a denied call), and nothing after it is:
@@ -350,15 +388,15 @@ class FakeModelSession:
 
         return _tool_result(call.tool_use_id, [{"type": "text", "text": NOT_SHOWN_TEXT}])
 
-    async def _apply_gate(self, message: Any) -> None:
+    async def _apply_gate(self, message: Any) -> tuple[UserMessage, ResultMessage] | None:
         """Run the permission gate over each ToolUseBlock and honor its decision.
 
         Mirrors the SDK: the gate decides a call before it executes, and a gated
         deny records the block on the shared ``ApprovalGate`` (flipping the turn to
         awaiting-approval). The block is delivered unchanged either way -- the real
         SDK emits the ``tool_use`` before the permission decision, so a denied call
-        still surfaces as a tool note. A no-op unless a gate is configured, keeping
-        the un-gated fake unchanged.
+        still surfaces as a tool note. A no-op unless a gate or a tool access is
+        configured, keeping the un-gated, unrestricted fake unchanged.
 
         The callback's return value is READ, not discarded (#1852): a
         ``PermissionResultDeny`` with ``interrupt=True`` is forwarded by the SDK
@@ -371,10 +409,24 @@ class FakeModelSession:
         """
 
         if not isinstance(message, AssistantMessage):
-            return
+            return None
         for block in message.content:
             if not isinstance(block, ToolUseBlock):
                 continue
+            if self._tool_access is not None:
+                # @spec RUNNER-TOOL-ACCESS-8: the read-only decision comes before
+                # anything this fake emulates, as the front does on the real path.
+                reason = self._tool_access.refuse(block.name, block.id)
+                if reason is not None:
+                    self._refused_ids.add(block.id)
+                    self._pending_refusals.append(
+                        _tool_result(
+                            block.id,
+                            f"PreToolUse:{block.name} hook error: {reason}",
+                            is_error=True,
+                        )
+                    )
+                    continue
             if block.name == APPROVAL_TOOL_NAME and self._approval_gate is not None:
                 # Run the real decision table so the container fake tier resolves
                 # the route (sole-route auto-bind, unknown-route refusal) and sets
@@ -390,12 +442,63 @@ class FakeModelSession:
                 # execute the write (#2429).
                 self._halted = True
                 continue
+            if self._pre_tool_use_hook is not None:
+                hook_output = await self._pre_tool_use_hook(
+                    {"tool_name": block.name, "tool_input": block.input},
+                    block.id,
+                    {"signal": None},
+                )
+                specific = hook_output.get("hookSpecificOutput", {})
+                if (
+                    specific.get("permissionDecision") == "deny"
+                    and hook_output.get("continue_") is False
+                ):
+                    reason = specific.get("permissionDecisionReason")
+                    if not isinstance(reason, str) or not reason:
+                        reason = hook_output.get("stopReason")
+                    if not isinstance(reason, str) or not reason:
+                        reason = "tool use denied"
+                    return (
+                        _tool_result(
+                            block.id,
+                            f"PreToolUse:{block.name} hook error: {reason}",
+                            is_error=True,
+                        ),
+                        _result(terminal_reason="hook_stopped"),
+                    )
+                if specific.get("permissionDecision") == "allow":
+                    continue
             if self._can_use_tool is not None:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
-                    self._halted = True
+                    return (
+                        _tool_result(
+                            block.id,
+                            "The user doesn't want to proceed with this tool use. "
+                            "The tool use was rejected.",
+                            is_error=True,
+                        ),
+                        _result(is_error=True, subtype="error_during_execution"),
+                    )
+        return None
+
+    def _without_refused_results(self, message: Any) -> Any:
+        """``message`` less any scripted result for a call this turn refused."""
+
+        if not self._refused_ids or not isinstance(message, UserMessage):
+            return message
+        if isinstance(message.content, str):
+            return message
+        kept = [
+            block
+            for block in message.content
+            if not (isinstance(block, ToolResultBlock) and block.tool_use_id in self._refused_ids)
+        ]
+        if not kept:
+            return None
+        return UserMessage(content=kept)
 
     async def close(self) -> None:
         self.connected = False

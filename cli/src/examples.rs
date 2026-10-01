@@ -7,14 +7,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use crate::commands::{self, DeployOpts, DeployTier};
 use crate::ui::{CliOutput, DryRunPlan, Ui};
@@ -227,6 +225,7 @@ const PLATFORM_UPGRADE_SCRIPT: &[u8] =
 
 pub struct SreBotInstallOpts {
     pub observability: bool,
+    pub observability_only: bool,
     pub dry_run: bool,
     pub slack_channel: Option<String>,
     /// Install the upgrade path: the self-upgrade connector, the platform
@@ -264,6 +263,46 @@ impl InstallIdentity {
 pub enum SreBotInstallResult {
     DryRun(DryRunPlan),
     Installed(Box<commands::DeployOutput>),
+    ObservabilityInstalled(ObservabilityOnlyOutput),
+}
+
+pub struct ObservabilityOnlyOutput {
+    pub namespace: String,
+}
+
+impl CliOutput for ObservabilityOnlyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"observability_namespace": self.namespace, "ready": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!(
+            "SRE observability stack ready in namespace {}",
+            self.namespace
+        ));
+    }
+}
+
+pub struct SreBotRenderOpts {
+    pub out: PathBuf,
+    pub platform_upgrade: bool,
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+}
+
+pub struct SreBotRenderOutput {
+    pub path: PathBuf,
+}
+
+impl CliOutput for SreBotRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"bundle_dir": self.path, "rendered": true})
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("SRE bot runtime bundle: {}", self.path.display()));
+    }
 }
 
 pub struct ObservabilityProvisionOpts {
@@ -347,6 +386,14 @@ struct InstallCommand {
 }
 
 impl InstallCommand {
+    /// The live command, with workspace and chart paths resolved, as spawned.
+    fn ops_command(&self, workspace: &EmbeddedWorkspace, chart: &Path) -> crate::ops::OpsCommand {
+        ops_command(
+            self.program,
+            self.args.iter().map(|arg| arg.live(workspace, chart)),
+        )
+    }
+
     fn display(&self, chart: &Path) -> String {
         std::iter::once(self.program.to_string())
             .chain(self.args.iter().map(|arg| arg.display(chart)))
@@ -359,6 +406,15 @@ impl InstallCommand {
 struct HelmTarget {
     release: String,
     namespace: String,
+}
+
+/// A `kubectl` or `helm` invocation with plain arguments, spawned through the
+/// ops runners so every child is built in one place (#3568).
+fn ops_command<S: Into<String>>(
+    program: &str,
+    args: impl IntoIterator<Item = S>,
+) -> crate::ops::OpsCommand {
+    crate::ops::OpsCommand::new(program, args.into_iter().map(crate::ops::plain).collect())
 }
 
 fn plain(value: impl Into<String>) -> CommandArg {
@@ -540,6 +596,40 @@ fn read_access_command() -> InstallCommand {
 }
 
 pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallResult> {
+    if opts.observability_only {
+        let stack_commands = stack_install_commands(&opts.observability_namespace);
+        if opts.dry_run {
+            let mut lines = vec![format!(
+                "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
+                opts.observability_namespace
+            )];
+            lines.push(
+                "select the Alloy log parser from the cluster node runtimes on live installation"
+                    .to_string(),
+            );
+            lines.extend(
+                stack_commands
+                    .iter()
+                    .map(|command| command.display(Path::new("charts/curie"))),
+            );
+            return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
+        }
+        preflight_capacity(&opts.observability_namespace).await?;
+        let log_runtime = preflight_log_runtime().await?;
+        // Render before the first mutation, so a values mismatch refuses
+        // with the cluster untouched.
+        let workspace =
+            EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
+        ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+        for command in &stack_commands {
+            run_install_command(command, &workspace, Path::new("charts/curie")).await?;
+        }
+        return Ok(SreBotInstallResult::ObservabilityInstalled(
+            ObservabilityOnlyOutput {
+                namespace: opts.observability_namespace,
+            },
+        ));
+    }
     if !opts.observability {
         return Err(crate::exit::usage(
             "the SRE bot example installer currently requires --observability",
@@ -553,8 +643,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
 
     let identity = InstallIdentity::from_opts(&opts);
     let mut model = ModelCredential::resolve()?;
-
-    preflight_capacity(&identity.observability_namespace).await?;
 
     let resolved_chart = crate::artifacts::resolve_chart(
         None,
@@ -572,6 +660,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         let mut lines = vec![format!(
             "resolve {TEMPO_TAGGED_IMAGE} to its immutable OCI image index digest before cluster mutation"
         )];
+        lines.push(
+            "select the Alloy log parser from the cluster node runtimes on live installation"
+                .to_string(),
+        );
         lines.push(format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {} without exposing its generated password",
             identity.observability_namespace
@@ -653,6 +745,8 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         return Ok(SreBotInstallResult::DryRun(DryRunPlan { lines }));
     }
 
+    preflight_capacity(&identity.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
     let tempo_digest = resolve_tempo_index_digest().await?;
     let chart = crate::artifacts::ensure_cached(&resolved_chart).await?;
     crate::ops::require_on_path("helm")?;
@@ -665,7 +759,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         false => None,
     };
-    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        log_runtime,
+    )?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
@@ -719,6 +818,80 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
+    if opts.out.exists() {
+        return Err(crate::exit::usage(format!(
+            "render output {} already exists; choose a new directory",
+            opts.out.display()
+        )));
+    }
+    let tempo_digest = resolve_tempo_index_digest().await?;
+    let upgrade_digest = if opts.platform_upgrade {
+        Some(resolve_index_digest(SELF_UPGRADE_IMAGE_REPOSITORY, SELF_UPGRADE_IMAGE_TAG).await?)
+    } else {
+        None
+    };
+    let identity = InstallIdentity {
+        namespace: opts.namespace,
+        release: opts.release,
+        observability_namespace: opts.observability_namespace,
+    };
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        &identity,
+        upgrade_digest.as_deref(),
+        LogRuntime::Cri,
+    )?;
+    if let Some(parent) = opts
+        .out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating SRE bot render parent {}", parent.display()))?;
+    }
+    std::fs::create_dir(&opts.out)
+        .with_context(|| format!("creating SRE bot render output {}", opts.out.display()))?;
+    let copy_result = (|| -> Result<()> {
+        for (name, _) in BUNDLE_FILES {
+            if upgrade_digest.is_none()
+                && matches!(
+                    *name,
+                    "manifests/upgrade-role.yaml" | "manifests/platform-upgrade-role.yaml"
+                )
+            {
+                continue;
+            }
+            copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+        }
+        if upgrade_digest.is_some() {
+            for name in [
+                "manifests/platform-upgrade-configmap.yaml",
+                "manifests/platform-upgrade-cronjob.yaml",
+            ] {
+                copy_rendered_file(&workspace.bundle_dir(), &opts.out, name)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = copy_result {
+        let _ = std::fs::remove_dir_all(&opts.out);
+        return Err(err);
+    }
+    Ok(SreBotRenderOutput { path: opts.out })
+}
+
+fn copy_rendered_file(source_root: &Path, out: &Path, name: &str) -> Result<()> {
+    let target = out.join(name);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(source_root.join(name), &target)
+        .with_context(|| format!("copying rendered SRE bot file {name}"))?;
+    Ok(())
+}
+
 pub fn observability_provision_plan(
     chart: &str,
     namespace: &str,
@@ -732,6 +905,8 @@ pub fn observability_provision_plan(
     };
     let chart = Path::new(chart);
     let mut lines = vec![
+        "select the Alloy log parser from the cluster node runtimes on live installation"
+            .to_string(),
         format!("create namespace {observability_namespace} when it is absent"),
         format!(
             "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
@@ -767,8 +942,12 @@ pub async fn provision_observability(
     require_existing_release(&opts.release, &opts.namespace).await?;
     let chart = provision_chart(opts.chart.as_deref()).await?;
     preflight_capacity(&opts.observability_namespace).await?;
+    let log_runtime = preflight_log_runtime().await?;
+    // Render before the first mutation, so a values mismatch refuses with the
+    // cluster untouched.
+    let workspace =
+        EmbeddedWorkspace::create_observability(&opts.observability_namespace, log_runtime)?;
     ensure_grafana_admin_secret(&opts.observability_namespace).await?;
-    let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
     let identity = InstallIdentity {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
@@ -791,17 +970,15 @@ pub async fn provision_observability(
 
 async fn require_existing_release(release: &str, namespace: &str) -> Result<()> {
     crate::ops::require_on_path("helm")?;
-    let output = tokio::process::Command::new("helm")
-        .args(["status", release, "--namespace", namespace])
-        .output()
-        .await
-        .with_context(|| {
-            format!("failed to run `helm status {release} --namespace {namespace}`")
-        })?;
-    if output.status.success() {
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "helm",
+        ["status", release, "--namespace", namespace],
+    ))
+    .await
+    .with_context(|| format!("failed to run `helm status {release} --namespace {namespace}`"))?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if crate::ops::failure_reason(&stderr) == "Error: release: not found" {
         return Err(crate::exit::usage(format!(
             "release {release} in namespace {namespace} does not exist; run `curie cluster up` before provisioning observability"
@@ -843,8 +1020,9 @@ async fn provision_chart(chart: Option<&str>) -> Result<PathBuf> {
 }
 
 async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
-    let output = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "secret",
             GRAFANA_CONNECTOR_SECRET,
@@ -852,14 +1030,14 @@ async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
             namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("reading the Grafana connector Secret")?;
-    let present = output.status.success()
-        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        ],
+    ))
+    .await
+    .context("reading the Grafana connector Secret")?;
+    let present = ok
+        && serde_json::from_str::<serde_json::Value>(&stdout)
             .is_ok_and(|secret| grafana_connector_token_present(&secret));
-    drop(output);
+    drop(stdout);
     if present {
         return Ok(());
     }
@@ -1284,8 +1462,9 @@ fn validate_sha256_digest(digest: &str) -> Result<()> {
 
 async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()> {
     ensure_observability_namespace(observability_namespace).await?;
-    let inspect = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "secret",
             GRAFANA_ADMIN_SECRET,
@@ -1293,14 +1472,13 @@ async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()
             observability_namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("inspecting the Grafana admin Secret")?;
-    if inspect.status.success() {
+        ],
+    ))
+    .await
+    .context("inspecting the Grafana admin Secret")?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&inspect.stderr);
     let lower = stderr.to_ascii_lowercase();
     if !lower.contains("notfound") && !lower.contains("not found") {
         bail!(
@@ -1331,22 +1509,22 @@ async fn ensure_grafana_admin_secret(observability_namespace: &str) -> Result<()
 }
 
 async fn grafana_release_exists(observability_namespace: &str) -> Result<bool> {
-    let output = tokio::process::Command::new("helm")
-        .args([
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "helm",
+        [
             "status",
             GRAFANA_RELEASE,
             "--namespace",
             observability_namespace,
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("inspecting the existing Grafana release")?;
-    if output.status.success() {
+        ],
+    ))
+    .await
+    .context("inspecting the existing Grafana release")?;
+    if ok {
         return Ok(true);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.trim() == "Error: release: not found" {
         return Ok(false);
     }
@@ -1362,8 +1540,9 @@ struct SecretKeyReference {
 }
 
 async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<()> {
-    let output = tokio::process::Command::new("kubectl")
-        .args([
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        [
             "get",
             "deployment,statefulset",
             "--namespace",
@@ -1372,14 +1551,14 @@ async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<(
             "app.kubernetes.io/instance=grafana",
             "-o",
             "json",
-        ])
-        .output()
-        .await
-        .context("discovering the existing Grafana admin credential")?;
-    if !output.status.success() {
+        ],
+    ))
+    .await
+    .context("discovering the existing Grafana admin credential")?;
+    if !ok {
         bail!("could not read the existing Grafana admin credential");
     }
-    let workloads: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let workloads: serde_json::Value = serde_json::from_str(&stdout)
         .context("the existing Grafana workload response was malformed")?;
     let user = find_grafana_secret_reference(&workloads, "GF_SECURITY_ADMIN_USER")?;
     let password = find_grafana_secret_reference(&workloads, "GF_SECURITY_ADMIN_PASSWORD")?;
@@ -1389,23 +1568,24 @@ async fn migrate_grafana_admin_secret(observability_namespace: &str) -> Result<(
         if source_secrets.contains_key(source_name) {
             continue;
         }
-        let source = tokio::process::Command::new("kubectl")
-            .args([
+        let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command(
+            "kubectl",
+            [
                 "get",
                 "secret",
-                source_name,
+                source_name.as_str(),
                 "--namespace",
                 observability_namespace,
                 "-o",
                 "json",
-            ])
-            .output()
-            .await
-            .context("reading the existing Grafana admin credential")?;
-        if !source.status.success() {
+            ],
+        ))
+        .await
+        .context("reading the existing Grafana admin credential")?;
+        if !ok {
             bail!("could not read the existing Grafana admin credential");
         }
-        let secret: serde_json::Value = serde_json::from_slice(&source.stdout)
+        let secret: serde_json::Value = serde_json::from_str(&stdout)
             .context("the existing Grafana admin Secret response was malformed")?;
         source_secrets.insert(source_name.clone(), secret);
     }
@@ -1504,15 +1684,15 @@ fn secret_data_value(
 }
 
 async fn ensure_observability_namespace(observability_namespace: &str) -> Result<()> {
-    let inspect = tokio::process::Command::new("kubectl")
-        .args(["get", "namespace", observability_namespace, "-o", "json"])
-        .output()
-        .await
-        .context("inspecting the observability namespace")?;
-    if inspect.status.success() {
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        ["get", "namespace", observability_namespace, "-o", "json"],
+    ))
+    .await
+    .context("inspecting the observability namespace")?;
+    if ok {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&inspect.stderr);
     let lower = stderr.to_ascii_lowercase();
     if !lower.contains("notfound") && !lower.contains("not found") {
         bail!(
@@ -1520,12 +1700,13 @@ async fn ensure_observability_namespace(observability_namespace: &str) -> Result
             stderr.trim()
         );
     }
-    let output = tokio::process::Command::new("kubectl")
-        .args(["create", "namespace", observability_namespace])
-        .output()
-        .await
-        .context("creating the observability namespace")?;
-    if !output.status.success() {
+    let (ok, _stdout, _stderr) = crate::ops::run_capture(&ops_command(
+        "kubectl",
+        ["create", "namespace", observability_namespace],
+    ))
+    .await
+    .context("creating the observability namespace")?;
+    if !ok {
         bail!(
             "could not create namespace {observability_namespace}; run `kubectl create namespace {observability_namespace}` and retry"
         );
@@ -1538,27 +1719,11 @@ async fn apply_private_manifest(
     description: &str,
     observability_namespace: &str,
 ) -> Result<()> {
-    let mut child = tokio::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting kubectl for {description}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("kubectl stdin was unavailable for {description}"))?;
-    stdin
-        .write_all(manifest)
-        .await
-        .with_context(|| format!("writing {description} to kubectl stdin"))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("waiting for kubectl to apply {description}"))?;
-    if !output.status.success() {
+    let (ok, _stdout, _stderr) =
+        crate::ops::run_capture_with_stdin(&ops_command("kubectl", ["apply", "-f", "-"]), manifest)
+            .await
+            .with_context(|| format!("running kubectl to apply {description}"))?;
+    if !ok {
         bail!(
             "could not apply {description} {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace}; inspect access with `kubectl auth can-i create secret -n {observability_namespace}`"
         );
@@ -1578,35 +1743,64 @@ async fn run_install_command(
     workspace: &EmbeddedWorkspace,
     chart: &Path,
 ) -> Result<()> {
-    let args = command
-        .args
-        .iter()
-        .map(|arg| arg.live(workspace, chart))
-        .collect::<Vec<_>>();
-    crate::ui::ui().plumbing(&format!("+ {} {}", command.program, args.join(" ")));
-    let output = tokio::process::Command::new(command.program)
-        .args(&args)
-        .output()
-        .await
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", command.program))?;
-    if output.status.success() {
+    let cmd = command.ops_command(workspace, chart);
+    crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&cmd).await?;
+    if ok {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = stderr.trim().to_string();
+    let args = cmd.argv();
     if let Some(target) = &command.helm_target {
         if is_helm_timeout(&stderr) {
-            let recovery = helm_pending_upgrade_recovery(target);
-            return Err(crate::exit::CliError::failure(format!(
-                "Helm timed out waiting for release {} in namespace {}: {}. Recover the pending upgrade with: {}",
+            let diagnostic = pending_pvc_diagnostic(&target.namespace).await;
+            let recovery = verified_helm_pending_upgrade_recovery(target).await;
+            let mut message = format!(
+                "Helm timed out waiting for release {} in namespace {}: {}. {}",
                 target.release,
                 target.namespace,
-                if stderr.is_empty() { "command timed out" } else { &stderr },
-                recovery,
-            ))
-            .with_fix(recovery)
-            .into());
+                if stderr.is_empty() {
+                    "command timed out"
+                } else {
+                    &stderr
+                },
+                diagnostic,
+            );
+            if let Some(recovery) = recovery {
+                message.push_str(&format!(
+                    " Helm reports pending-upgrade; after checking why it is pending, recover the release with: {recovery}"
+                ));
+                return Err(crate::exit::CliError::failure(message)
+                    .with_fix(recovery)
+                    .into());
+            }
+            return Err(crate::exit::CliError::failure(message).into());
         }
+    }
+    if command.program == "kubectl"
+        && is_helm_timeout(&stderr)
+        && args.iter().any(|arg| arg == "statefulset/tempo")
+        && args.iter().any(|arg| arg == "rollout")
+    {
+        let namespace = command
+            .helm_target
+            .as_ref()
+            .map(|target| target.namespace.as_str())
+            .or_else(|| {
+                args.iter()
+                    .position(|arg| arg == "--namespace")
+                    .and_then(|index| args.get(index + 1))
+                    .map(String::as_str)
+            })
+            .unwrap_or(OBSERVABILITY_NAMESPACE);
+        let diagnostic = pending_pvc_diagnostic(namespace).await;
+        bail!(
+            "`{}` failed: {}. {}",
+            command.display(chart),
+            stderr,
+            diagnostic
+        );
     }
     bail!(
         "`{}` failed: {}",
@@ -1633,6 +1827,284 @@ fn helm_pending_upgrade_recovery(target: &HelmTarget) -> String {
     )
 }
 
+async fn verified_helm_pending_upgrade_recovery(target: &HelmTarget) -> Option<String> {
+    let status = ops_command(
+        "helm",
+        [
+            "status",
+            target.release.as_str(),
+            "-n",
+            target.namespace.as_str(),
+            "-o",
+            "json",
+        ],
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let output = run_bounded_diagnostic(&status, deadline, "helm status")
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    (value.get("name").and_then(serde_json::Value::as_str) == Some(target.release.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str)
+            == Some(target.namespace.as_str())
+        && value
+            .pointer("/info/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pending-upgrade"))
+    .then(|| helm_pending_upgrade_recovery(target))
+}
+
+/// Run one read-only timeout diagnostic, stopping it and everything it spawned
+/// at `deadline`.
+async fn run_bounded_diagnostic(
+    command: &crate::ops::OpsCommand,
+    deadline: tokio::time::Instant,
+    what: &str,
+) -> Result<std::process::Output> {
+    let mut command = command.tokio_command();
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // kubectl and helm both run exec credential plugins, which may spawn
+        // descendants. Give the diagnostic its own group so a timeout can stop
+        // all of it.
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("running {what} for timeout diagnosis"))?;
+    let child_id = child.id();
+    let mut wait = Box::pin(child.wait_with_output());
+    match tokio::time::timeout_at(deadline, &mut wait).await {
+        Ok(result) => result.with_context(|| format!("running {what} for timeout diagnosis")),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pgid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: this is the fresh process group created for our
+                // diagnostic child, never the CLI's own process group.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            // Reap the direct child after killing the group. The bounded wait
+            // also covers a credential plugin that kept an output pipe open.
+            let _ = tokio::time::timeout(Duration::from_millis(250), &mut wait).await;
+            bail!("{what} timed out during diagnosis");
+        }
+    }
+}
+
+async fn diagnostic_kubectl_json(
+    namespace: &str,
+    resource: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value> {
+    let command = ops_command("kubectl", ["get", resource, "-n", namespace, "-o", "json"]);
+    let output =
+        run_bounded_diagnostic(&command, deadline, &format!("kubectl get {resource}")).await?;
+    if !output.status.success() {
+        bail!("kubectl get {resource} failed");
+    }
+    serde_json::from_slice(&output.stdout).context("invalid Kubernetes diagnosis JSON")
+}
+
+async fn pending_pvc_diagnostic(namespace: &str) -> String {
+    let hint = format!(
+        "If a PVC is Pending, inspect it with `kubectl get pvc -n {namespace}` and `kubectl describe pvc -n {namespace} <claim>`."
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let read = async {
+        let pvcs = diagnostic_kubectl_json(namespace, "pvc", deadline).await?;
+        let pods = diagnostic_kubectl_json(namespace, "pods", deadline).await?;
+        let events = diagnostic_kubectl_json(namespace, "events", deadline).await?;
+        Ok::<_, anyhow::Error>((pvcs, pods, events))
+    };
+    match read.await {
+        Ok((pvcs, pods, events)) => {
+            pending_pvc_warning(&pvcs, &pods, &events, namespace).unwrap_or(hint)
+        }
+        _ => hint,
+    }
+}
+
+fn pending_pvc_warning(
+    pvcs: &serde_json::Value,
+    pods: &serde_json::Value,
+    events: &serde_json::Value,
+    namespace: &str,
+) -> Option<String> {
+    let claims = pvcs.get("items")?.as_array()?;
+    let pod_items = pods.get("items")?.as_array()?;
+    let event_items = events.get("items")?.as_array()?;
+    // A Warning names a failure; a Normal provisioning event only says what the
+    // claim is still waiting for, so any matching Warning wins.
+    let mut waiting = None;
+    for claim in claims {
+        if claim
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str)
+            != Some("Pending")
+        {
+            continue;
+        }
+        let Some(name) = claim
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if claim
+            .pointer("/metadata/namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(namespace)
+        {
+            continue;
+        }
+        let uid = claim
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str);
+        for event in event_items {
+            let event_type = event.get("type").and_then(serde_json::Value::as_str);
+            if event_type == Some("Normal") && waiting.is_none() {
+                waiting = pending_pvc_waiting(event, name, uid, namespace);
+                continue;
+            }
+            if event_type != Some("Warning") {
+                continue;
+            }
+            let Some(object) = event
+                .get("involvedObject")
+                .or_else(|| event.get("regarding"))
+            else {
+                continue;
+            };
+            if object.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
+                continue;
+            }
+            let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(object_name) = object.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let object_uid = object.get("uid").and_then(serde_json::Value::as_str);
+            let direct = kind == "PersistentVolumeClaim"
+                && object_name == name
+                && (uid.is_none() || object_uid.is_none() || uid == object_uid);
+            let pod = kind == "Pod"
+                && pod_items.iter().any(|pod| {
+                    pod.pointer("/metadata/namespace")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(namespace)
+                        && pod
+                            .pointer("/metadata/name")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(object_name)
+                        && object_uid.is_some()
+                        && pod
+                            .pointer("/metadata/uid")
+                            .and_then(serde_json::Value::as_str)
+                            == object_uid
+                        && pod
+                            .pointer("/spec/volumes")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|volumes| {
+                                volumes.iter().any(|volume| {
+                                    volume
+                                        .pointer("/persistentVolumeClaim/claimName")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(name)
+                                })
+                            })
+                });
+            let reason = event
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Warning");
+            let message = event
+                .get("message")
+                .or_else(|| event.get("note"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if direct
+                || (pod
+                    && reason == "FailedScheduling"
+                    && message.to_ascii_lowercase().contains("unbound")
+                    && message
+                        .to_ascii_lowercase()
+                        .contains("persistentvolumeclaim"))
+            {
+                return Some(format!("Pending PVC {name} has Kubernetes Warning {reason}: {message}. Inspect `kubectl describe pvc {name} -n {namespace}`."));
+            }
+        }
+    }
+    waiting
+}
+
+/// Name what a Pending claim is waiting for from one of its own Normal events.
+/// The claim's uid must match: a Normal event is ordinary progress, so one left
+/// over from a deleted claim of the same name would be a confident wrong cause.
+fn pending_pvc_waiting(
+    event: &serde_json::Value,
+    name: &str,
+    uid: Option<&str>,
+    namespace: &str,
+) -> Option<String> {
+    let object = event
+        .get("involvedObject")
+        .or_else(|| event.get("regarding"))?;
+    let field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+    if field("kind") != Some("PersistentVolumeClaim")
+        || field("name") != Some(name)
+        || field("namespace") != Some(namespace)
+        || uid.is_none()
+        || field("uid") != uid
+    {
+        return None;
+    }
+    let reason = event.get("reason").and_then(serde_json::Value::as_str)?;
+    let message = event
+        .get("message")
+        .or_else(|| event.get("note"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let inspect = format!("Inspect `kubectl describe pvc {name} -n {namespace}`.");
+    match reason {
+        "ExternalProvisioning" => {
+            let waits_for = external_provisioner_name(message)
+                .map(|provisioner| {
+                    format!(
+                        " It waits for external provisioner \"{provisioner}\"; check that this provisioner is installed and running."
+                    )
+                })
+                .unwrap_or_default();
+            Some(format!(
+                "Pending PVC {name} has Kubernetes Normal {reason}: {message}.{waits_for} {inspect}"
+            ))
+        }
+        "WaitForFirstConsumer" => Some(format!(
+            "Pending PVC {name} has Kubernetes Normal {reason}: {message}. Its StorageClass binds only after a Pod using the claim is scheduled, so check why that Pod is not. {inspect}"
+        )),
+        _ => None,
+    }
+}
+
+/// The provisioner quoted in an `ExternalProvisioning` event message. Kubernetes
+/// has quoted it both as `'name'` and as `"name"` across releases.
+fn external_provisioner_name(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("external provisioner ")?;
+    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let rest = &rest[quote.len_utf8()..];
+    let (provisioner, _) = rest.split_once(quote)?;
+    (!provisioner.is_empty()).then_some(provisioner)
+}
+
 async fn kubernetes_connector_kubeconfig(namespace: &str) -> Result<String> {
     connector_kubeconfig(READER_IDENTITY, READER_TOKEN_SECRET, namespace).await
 }
@@ -1655,13 +2127,10 @@ async fn connector_kubeconfig(
         &format!("--timeout={READER_TOKEN_TIMEOUT}"),
     ];
     crate::ui::ui().plumbing(&format!("+ kubectl {}", wait_args.join(" ")));
-    let wait = tokio::process::Command::new("kubectl")
-        .args(wait_args)
-        .output()
+    let (ok, _stdout, stderr) = crate::ops::run_capture(&ops_command("kubectl", wait_args))
         .await
         .context("waiting for the SRE bot ServiceAccount token")?;
-    if !wait.status.success() {
-        let stderr = String::from_utf8_lossy(&wait.stderr);
+    if !ok {
         bail!(
             "the connector token {token_secret} was not populated within {READER_TOKEN_TIMEOUT}: {}. Inspect it with `kubectl get secret {token_secret} -n {namespace}` and retry",
             if stderr.trim().is_empty() {
@@ -1681,17 +2150,15 @@ async fn connector_kubeconfig(
         "-o",
         "json",
     ];
-    let output = tokio::process::Command::new("kubectl")
-        .args(get_args)
-        .output()
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&ops_command("kubectl", get_args))
         .await
         .context("reading the SRE bot ServiceAccount token")?;
-    if !output.status.success() {
+    if !ok {
         bail!(
             "could not read Secret {token_secret} in namespace {namespace}; inspect it with `kubectl get secret {token_secret} -n {namespace}` and retry"
         );
     }
-    let secret: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let secret: serde_json::Value = serde_json::from_str(&stdout)
         .context("the SRE bot token Secret returned malformed JSON")?;
     let data = secret
         .get("data")
@@ -1994,6 +2461,7 @@ impl EmbeddedWorkspace {
         tempo_digest: &str,
         identity: &InstallIdentity,
         upgrade_digest: Option<&str>,
+        log_runtime: LogRuntime,
     ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-install-{}-{}",
@@ -2003,7 +2471,7 @@ impl EmbeddedWorkspace {
         std::fs::create_dir(&root)
             .with_context(|| format!("creating embedded SRE bot workspace {}", root.display()))?;
         let workspace = Self { root };
-        workspace.write_observability_files(&identity.observability_namespace)?;
+        workspace.write_observability_files(&identity.observability_namespace, log_runtime)?;
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
                 let runtime = runtime_connector_declaration(
@@ -2060,7 +2528,10 @@ impl EmbeddedWorkspace {
         Ok(workspace)
     }
 
-    fn create_observability(observability_namespace: &str) -> Result<Self> {
+    fn create_observability(
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-observability-{}-{}",
             std::process::id(),
@@ -2073,7 +2544,7 @@ impl EmbeddedWorkspace {
             )
         })?;
         let workspace = Self { root };
-        workspace.write_observability_files(observability_namespace)?;
+        workspace.write_observability_files(observability_namespace, log_runtime)?;
         Ok(workspace)
     }
 
@@ -2094,9 +2565,18 @@ impl EmbeddedWorkspace {
         self.root.join("bundle")
     }
 
-    fn write_observability_files(&self, observability_namespace: &str) -> Result<()> {
+    fn write_observability_files(
+        &self,
+        observability_namespace: &str,
+        log_runtime: LogRuntime,
+    ) -> Result<()> {
         for (name, contents) in OBSERVABILITY_FILES {
             let rendered = rewrite_observability_namespace(contents, observability_namespace);
+            let rendered = if *name == "alloy-values.yaml" {
+                render_alloy_values(&rendered, log_runtime)?
+            } else {
+                rendered
+            };
             self.write(&Path::new("observability").join(name), &rendered)?;
         }
         Ok(())
@@ -2115,6 +2595,12 @@ fn rewrite_observability_namespace(contents: &[u8], observability_namespace: &st
     .replace(
         &format!("namespace: {OBSERVABILITY_NAMESPACE}"),
         &format!("namespace: {observability_namespace}"),
+    )
+    // PromQL string matchers in the shipped Alloy alerts are not YAML keys.
+    // They must follow --observability-namespace just like scrape targets do.
+    .replace(
+        &format!("namespace=\"{OBSERVABILITY_NAMESPACE}\""),
+        &format!("namespace=\"{observability_namespace}\""),
     )
     .replace(
         &format!("kubernetes.io/metadata.name: {OBSERVABILITY_NAMESPACE}"),
@@ -2677,12 +3163,136 @@ struct ObjectMeta {
 struct NodeSpec {
     #[serde(default)]
     unschedulable: bool,
+    #[serde(default)]
+    taints: Vec<NodeTaint>,
+}
+
+#[derive(Deserialize)]
+struct NodeTaint {
+    key: String,
+    effect: String,
 }
 
 #[derive(Deserialize)]
 struct NodeStatus {
     allocatable: BTreeMap<String, String>,
     conditions: Vec<NodeCondition>,
+    #[serde(rename = "nodeInfo", default)]
+    node_info: NodeInfo,
+}
+
+#[derive(Default, Deserialize)]
+struct NodeInfo {
+    #[serde(rename = "containerRuntimeVersion", default)]
+    container_runtime_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogRuntime {
+    Cri,
+    Docker,
+}
+
+fn alloy_can_schedule_on(node: &Node) -> bool {
+    // The checked-in Alloy values have no custom tolerations or hostNetwork.
+    // Kubernetes automatically adds only these DaemonSet tolerations.
+    // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+    // Condition taints are lifted by their controllers once the node is
+    // healthy or initialized, and the DaemonSet then places Alloy there, so a
+    // node behind one still decides the parser.
+    // https://kubernetes.io/docs/reference/labels-annotations-taints/
+    node.spec
+        .taints
+        .iter()
+        .filter(|taint| !is_transient_condition_taint(&taint.key))
+        .all(|taint| match taint.effect.as_str() {
+            "NoExecute" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/not-ready" | "node.kubernetes.io/unreachable"
+            ),
+            "NoSchedule" => matches!(
+                taint.key.as_str(),
+                "node.kubernetes.io/disk-pressure"
+                    | "node.kubernetes.io/memory-pressure"
+                    | "node.kubernetes.io/pid-pressure"
+                    | "node.kubernetes.io/unschedulable"
+            ),
+            _ => true,
+        })
+}
+
+fn is_transient_condition_taint(key: &str) -> bool {
+    matches!(
+        key,
+        "node.kubernetes.io/not-ready"
+            | "node.kubernetes.io/unreachable"
+            | "node.kubernetes.io/network-unavailable"
+            | "node.cloudprovider.kubernetes.io/uninitialized"
+    )
+}
+
+fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
+    if nodes.is_empty() {
+        bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
+    }
+    let mut selected = None;
+    let mut observed = Vec::new();
+    for node in nodes.iter().filter(|node| alloy_can_schedule_on(node)) {
+        let version = node.status.node_info.container_runtime_version.as_str();
+        let runtime = if version.starts_with("containerd://") || version.starts_with("cri-o://") {
+            Some(LogRuntime::Cri)
+        } else if version.starts_with("docker://") {
+            Some(LogRuntime::Docker)
+        } else {
+            None
+        };
+        observed.push(format!(
+            "{}={}",
+            node.metadata.name,
+            if version.is_empty() {
+                "<missing>"
+            } else {
+                version
+            }
+        ));
+        match (selected, runtime) {
+            (None, Some(runtime)) => selected = Some(runtime),
+            (Some(previous), Some(runtime)) if previous == runtime => {}
+            _ => bail!("Alloy needs one supported log format across every eligible node, including cordoned and NotReady nodes; found {}", observed.join(", ")),
+        }
+    }
+    selected.ok_or_else(|| {
+        anyhow!(
+            "no nodes eligible for the Alloy DaemonSet have a supported runtime; inspect node taints and runtimes"
+        )
+    })
+}
+
+async fn preflight_log_runtime() -> Result<LogRuntime> {
+    crate::ops::require_on_path("kubectl")?;
+    let nodes: KubeList<Node> = read_kubernetes_json(
+        &["get", "nodes", "-o", "json"],
+        "kubectl get nodes -o json",
+        "node container runtimes",
+    )
+    .await?;
+    select_log_runtime(&nodes.items)
+}
+
+fn render_alloy_values(contents: &[u8], runtime: LogRuntime) -> Result<Vec<u8>> {
+    if runtime == LogRuntime::Cri {
+        return Ok(contents.to_vec());
+    }
+    let text = std::str::from_utf8(contents).context("Alloy values are not UTF-8")?;
+    if text.matches("dockercontainers: false").count() != 1
+        || text.matches("stage.cri { }").count() != 1
+    {
+        bail!("embedded Alloy values no longer match the supported CRI template");
+    }
+    Ok(text
+        .replace("dockercontainers: false", "dockercontainers: true")
+        .replace("stage.cri { }", "stage.docker { }")
+        .into_bytes())
 }
 
 #[derive(Deserialize)]
@@ -2840,13 +3450,12 @@ async fn read_kubernetes_json<T: for<'de> Deserialize<'de>>(
     display: &str,
     purpose: &str,
 ) -> Result<T> {
-    let output = tokio::process::Command::new("kubectl")
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to invoke `{display}`"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let (ok, stdout, stderr) =
+        crate::ops::run_capture(&ops_command("kubectl", args.iter().copied()))
+            .await
+            .with_context(|| format!("failed to invoke `{display}`"))?;
+    if !ok {
+        let stderr = stderr.trim().to_string();
         bail!(
             "could not read {purpose} with `{display}`: {}",
             if stderr.is_empty() {
@@ -2856,7 +3465,7 @@ async fn read_kubernetes_json<T: for<'de> Deserialize<'de>>(
             }
         );
     }
-    serde_json::from_slice(&output.stdout)
+    serde_json::from_str(&stdout)
         .with_context(|| format!("malformed JSON from `{display}` while reading {purpose}"))
 }
 
@@ -2945,6 +3554,194 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_provisioner_name_reads_both_quote_styles() {
+        assert_eq!(
+            external_provisioner_name(
+                "Waiting for a volume to be created either by the external provisioner 'csi.example.com' or manually by the system administrator."
+            ),
+            Some("csi.example.com")
+        );
+        assert_eq!(
+            external_provisioner_name(
+                "waiting for a volume to be created, either by external provisioner \"csi.example.com\" or manually created by system administrator"
+            ),
+            Some("csi.example.com")
+        );
+        for message in [
+            "waiting for first consumer to be created before binding",
+            "external provisioner csi.example.com",
+            "external provisioner ''",
+        ] {
+            assert_eq!(external_provisioner_name(message), None, "{message}");
+        }
+    }
+
+    /// The helm render gate templates the Docker variant of the Alloy values
+    /// from this file instead of re-implementing `render_alloy_values`.
+    /// Regenerate it with `CURIE_TEST_UPDATE_ALLOY_FIXTURE=1 cargo test
+    /// alloy_docker_variant_matches_ci_fixture` after changing the template.
+    #[test]
+    fn alloy_docker_variant_matches_ci_fixture() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../charts/curie/ci/fixtures/alloy-docker-values.yaml");
+        let template = OBSERVABILITY_FILES
+            .iter()
+            .find(|(name, _)| *name == "alloy-values.yaml")
+            .map(|(_, contents)| *contents)
+            .expect("embedded Alloy values");
+        // The same two steps `write_observability_files` takes for the
+        // default namespace the gate renders into.
+        let template = rewrite_observability_namespace(template, OBSERVABILITY_NAMESPACE);
+        let rendered = render_alloy_values(&template, LogRuntime::Docker).unwrap();
+        if std::env::var("CURIE_TEST_UPDATE_ALLOY_FIXTURE").as_deref() == Ok("1") {
+            std::fs::create_dir_all(fixture.parent().expect("fixture directory"))
+                .expect("create Alloy CI fixture directory");
+            std::fs::write(&fixture, &rendered).expect("write Alloy CI fixture");
+        }
+        let committed = std::fs::read(&fixture).unwrap_or_else(|error| {
+            panic!(
+                "{} is unreadable ({error}); regenerate it with \
+                 CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+                fixture.display()
+            )
+        });
+        assert!(
+            committed == rendered,
+            "{} drifted from render_alloy_values; regenerate it with \
+             CURIE_TEST_UPDATE_ALLOY_FIXTURE=1",
+            fixture.display()
+        );
+    }
+
+    #[test]
+    fn log_runtime_classifies_supported_node_versions() {
+        // Node.status.nodeInfo.containerRuntimeVersion is a runtime://version
+        // string; DaemonSet pods can tolerate cordoned and NotReady nodes.
+        // https://kubernetes.io/docs/reference/kubernetes-api/core/node-v1/
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        for (version, expected) in [
+            ("containerd://1.7.0", LogRuntime::Cri),
+            ("cri-o://1.30.0", LogRuntime::Cri),
+            ("docker://24.0.0", LogRuntime::Docker),
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            assert_eq!(select_log_runtime(&nodes.items).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn log_runtime_refuses_missing_or_unknown_node_version() {
+        for version in ["", "mystery://1"] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [{
+                    "metadata": {"name": "node-a"},
+                    "status": {
+                        "allocatable": {"memory": "4Gi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "nodeInfo": {"containerRuntimeVersion": version}
+                    }
+                }]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("node-a"), "{error}");
+        }
+    }
+
+    #[test]
+    fn log_runtime_ignores_nodes_excluded_by_untolerated_taints() {
+        // The shipped Alloy DaemonSet has no custom tolerations. Kubernetes
+        // adds only the documented built-in DaemonSet tolerations.
+        // https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "worker"},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                },
+                {
+                    "metadata": {"name": "reserved-docker"},
+                    "spec": {"taints": [{"key": "dedicated", "effect": "NoSchedule", "value": "other"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                },
+                {
+                    "metadata": {"name": "cordoned-cri"},
+                    "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}]},
+                    "status": {"allocatable": {}, "conditions": [],
+                        "nodeInfo": {"containerRuntimeVersion": "cri-o://1.30"}}
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(select_log_runtime(&nodes.items).unwrap(), LogRuntime::Cri);
+    }
+
+    #[test]
+    fn log_runtime_counts_nodes_behind_transient_condition_taints() {
+        // The node lifecycle controller and the cloud controller add these
+        // taints while a node is unhealthy or starting, then remove them. A
+        // DaemonSet pod lands there afterwards, so the node's runtime counts.
+        // https://kubernetes.io/docs/reference/labels-annotations-taints/
+        for key in [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+            "node.kubernetes.io/network-unavailable",
+            "node.cloudprovider.kubernetes.io/uninitialized",
+        ] {
+            let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+                "items": [
+                    {
+                        "metadata": {"name": "worker"},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+                    },
+                    {
+                        "metadata": {"name": "recovering-docker"},
+                        "spec": {"taints": [
+                            {"key": key, "effect": "NoSchedule"},
+                            {"key": key, "effect": "NoExecute"}
+                        ]},
+                        "status": {"allocatable": {}, "conditions": [],
+                            "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+                    }
+                ]
+            }))
+            .unwrap();
+            let error = select_log_runtime(&nodes.items).unwrap_err().to_string();
+            assert!(error.contains("recovering-docker"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn log_runtime_refuses_when_no_nodes_are_eligible_for_alloy() {
+        let nodes: KubeList<Node> = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "metadata": {"name": "reserved"},
+                "spec": {"taints": [{"key": "dedicated", "effect": "NoExecute"}]},
+                "status": {"allocatable": {}, "conditions": [],
+                    "nodeInfo": {"containerRuntimeVersion": "docker://24"}}
+            }]
+        }))
+        .unwrap();
+        assert!(select_log_runtime(&nodes.items)
+            .unwrap_err()
+            .to_string()
+            .contains("no nodes eligible"));
+    }
 
     fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {
         serde_json::from_value(serde_json::json!({

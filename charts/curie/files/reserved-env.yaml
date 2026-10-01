@@ -44,6 +44,7 @@ worker:
   CURIE_PUBLICATION_OWNER_NAME: worker.publication.ownerName
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_PRIORITY_CLASS_NAME: priorityClasses.platform.name
+  CURIE_PUBLICATION_PROTECTED_PATHS: worker.publication.protectedPaths
   CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS: worker.publication.reconcileIntervalSeconds
   CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS: worker.publication.reconcileMaxAttempts
   CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS: worker.publication.resultMaxAttempts
@@ -126,6 +127,7 @@ api:
   GITHUB_CLONE_BASE: api.githubCloneBase
   GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
+  GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel
   GITHUB_FACTORY_MENTION: api.githubFactoryMention

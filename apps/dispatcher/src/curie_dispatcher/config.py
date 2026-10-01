@@ -31,6 +31,8 @@ Env mapping:
     CURIE_ADMISSION_CACHE_TTL_SECONDS -> admission_cache_ttl_s
     CURIE_ADMISSION_STALE_SECONDS     -> admission_stale_s
     CURIE_ADMISSION_CACHE_PREFIX      -> admission_cache_prefix
+    CURIE_THREAD_CONTEXT_CACHE_PREFIX -> thread_context_cache_prefix
+    CURIE_THREAD_CONTEXT_TTL_SECONDS  -> thread_context_ttl_seconds
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
 """
@@ -183,6 +185,20 @@ class DispatcherConfig(BaseSettings):
     # read each other's answers.
     admission_cache_prefix: str = Field(
         default="curie:admission:", validation_alias="CURIE_ADMISSION_CACHE_PREFIX"
+    )
+
+    # @spec slack-alert-followup-context: Context cache and restart behavior.
+    # Where a validated thread-root answer persists, so a restart keeps the
+    # context a later reply needs; a prefix so two installs sharing a Valkey
+    # never read each other's. The retention matches the idle transcript window.
+    thread_context_cache_prefix: str = Field(
+        default="curie:slack-root-context:",
+        validation_alias="CURIE_THREAD_CONTEXT_CACHE_PREFIX",
+    )
+    thread_context_ttl_seconds: int = Field(
+        default=30 * 24 * 60 * 60,
+        gt=0,
+        validation_alias="CURIE_THREAD_CONTEXT_TTL_SECONDS",
     )
 
     placeholder_text: str = Field(

@@ -127,6 +127,21 @@ pod_verbs = {
 }
 if pod_verbs - {"get"}:
     fail(f"main worker Role grants pods beyond get: {sorted(pod_verbs)}")
+event_rules = [
+    rule
+    for rule in worker_role.get("rules") or []
+    if "events" in (rule.get("resources") or [])
+]
+if len(event_rules) != 1:
+    fail(f"main worker Role needs one events rule, got {len(event_rules)}")
+event_rule = event_rules[0]
+if (
+    event_rule.get("apiGroups") != [""]
+    or event_rule.get("resources") != ["events"]
+    or event_rule.get("verbs") != ["list"]
+    or "resourceNames" in event_rule
+):
+    fail(f"main worker Role must grant namespaced events list only: {event_rule}")
 
 role = one("Role", component="publication-worker")
 rules = role.get("rules") or []

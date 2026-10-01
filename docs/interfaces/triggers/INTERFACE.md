@@ -21,18 +21,31 @@ order: 17
 ## The black line
 
 A "trigger" is the thing that wakes an agent: an inbound event that gets turned into a
-run. Today there are **five hardcoded triggers** wired directly into their respective
-ingress handlers, with **no shared `Trigger`/`EventSource` port** between them. There
-is no swappable line here yet — each trigger is bespoke code. The open architectural
-question (Epic #29) is whether "trigger" is even a real seam, or whether new triggers
-are just new *event types* handled inside the existing Slack-dispatcher and
-API-webhook ingresses. This file records the current state honestly; it does not
-assert a port that does not exist.
+run. **Trigger is not a swappable seam, and there is deliberately no shared
+`Trigger`/`EventSource` port** (decided on Epic #29). A trigger is a new event *kind* on the
+runs stream ([ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) decision 2):
+its ingress is bespoke code that verifies its own source's credential and shape, then
+enqueues a `QueuedTurn` (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`)
+whose `source` (`packages/aci-protocol/src/aci_protocol/turn.py::TurnSource`) names what
+caused it. The five ingresses below share that one stream contract, and **that contract
+is the seam.** A new trigger is a new producer of `QueuedTurn`, owned by whichever service
+already receives its source, not an implementation of a trigger interface. Downstream of
+the stream, the consumer, kernel, and claim path learn nothing about which ingress
+produced a turn beyond `TurnSource.is_job`.
+
+Why no port: the ingresses differ exactly where a port would sit. Slack arrives over
+Socket Mode under the app token, GitHub and the generic hook arrive as HMAC-signed HTTP,
+and the commit poll and the cron scheduler are timers with no inbound request at all. A
+port over those would either restate the `QueuedTurn` contract under another name or
+abstract away the authentication each receiver exists to perform. The `SOFT` kind above
+means exactly this: the line is a wire payload, not a code interface. The wire payload
+itself is owned by the [queue / stream seam](../queue-stream/INTERFACE.md) and the frozen
+ACI protocol; this file catalogs its trigger producers.
 
 ## Current contract
 
-There is no cross-trigger contract to satisfy — a new trigger today means adding
-another hardcoded handler. The five that exist:
+The cross-trigger contract is the queued turn, nothing more: a new trigger means adding
+another handler that mints a `QueuedTurn` with the right `source`. The five that exist:
 
 - **Slack mention** — `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
@@ -61,7 +74,11 @@ another hardcoded handler. The five that exist:
   an INBOUND request, and a self-hosted cluster behind a firewall cannot receive
   one at all -- outbound always works (#1239).
 - **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
-  `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over the raw body,
+  `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over
+  `X-Curie-Timestamp`, `X-Curie-Delivery-Id` and the raw body (signed as
+  `{timestamp}.{delivery_id}.` followed by the body; the delivery id may not
+  contain `.`, which would make that boundary ambiguous), refuses a timestamp
+  more than 5 minutes from the server clock with the same 401 as a bad signature,
   claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
@@ -70,8 +87,19 @@ another hardcoded handler. The five that exist:
   `conversation_id` and `placeholder` pair, so the ordinary worker completes
   that preposted reply in place. Message coordinates never replace the stored
   binding's endpoint or adapter route (ADR-0182).
-  This is a hardcoded platform ingress, not consumption of a bundle-declared
-  `webhook` path.
+  Optional `tool_access=read-only` narrows this turn under the existing
+  [TOOL-ACCESS contract](../aci-producer/INTERFACE.md). Omission retains ordinary
+  hooks and approvals; untrusted body text never selects the policy. The receipt's
+  `tool_access` proves only the queued value. Completed retries must match the
+  original value, and return 409 if it differs or the original queued turn is
+  unavailable. A pending restricted retry also returns 409; an ordinary pending
+  202 receipt proves no accepted turn. Before opting in, the operator must verify
+  homogeneous worker artifacts implementing TOOL-ACCESS-6 and compatible runners;
+  this API cannot discover or exclude old workers. Implementing workers verify the
+  exact runner's advertisement before dispatch. Old/mixed fleets remain an intake
+  installation blocker (#3603); this is neither automatic fleet admission nor
+  mandatory source policy. This is a hardcoded platform ingress, not consumption
+  of a bundle-declared `webhook` path.
 
 The five share no abstraction: a Slack Bolt event listener, two paths through a FastAPI
 GitHub HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push
@@ -114,9 +142,9 @@ types; webhook `{type, path}` is unchanged. Declared `cron` triggers are consume
 per-agent cron scheduler (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop`, ADR-0099,
 #268) fires each declared schedule as a CRON `QueuedTurn`. See
 [Cron triggers](../../guides/cron-triggers.md) for the operator guide. A generic HMAC hook ingress
-is shipped (`ingest_hook` above); mapping a declared `webhook` path onto that handler is still the
-open Epic #29 question and is not built, so a declared webhook validates its shape but does not yet
-wire a live wake-up.
+is shipped (`ingest_hook` above). Mapping a declared `webhook` path onto that handler at deploy is
+not built (#3666), so a declared webhook validates its shape but does not yet wire a live wake-up;
+`ingest_hook` serves any valid hook name whether or not the bundle declared it.
 
 ## Implementations today
 
@@ -150,13 +178,12 @@ enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
 
 ## Known leakage
 
-The whole seam is "leakage" in the sense that nothing is abstracted yet. Each trigger
-carries its source's shape end to end: Slack triggers are Bolt-event-shaped and
-authed by the Slack app token; the GitHub trigger is HMAC-signature-shaped and lives
-"outside the X-API-Key dependency" (`github.py` docstring). A future `Trigger` port —
-if Epic #29 concludes one is warranted — must reconcile these two auth models and
-payload shapes into a common event contract, and would live alongside the ingress
-handlers rather than replacing the transport-specific receivers.
+Each trigger carries its source's shape up to the stream and no further: Slack triggers
+are Bolt-event-shaped and authed by the Slack app token; the GitHub trigger is
+HMAC-signature-shaped and lives "outside the X-API-Key dependency" (`github.py`
+docstring). That is by design, not a gap awaiting a port: the common event contract these
+ingresses reconcile into is the `QueuedTurn` itself, and each transport-specific receiver
+stays where its source arrives.
 
 A second, narrower leak the CLI path exposes: **the dedupe id is minted by whoever enqueues**,
 under a different rule per producer, with nothing enforcing that the rules stay disjoint.
@@ -168,11 +195,12 @@ through `apps/api/src/curie_api/github_review_audit.py::claim_review_delivery`, 
 stable `github-feedback-<uuid5>` event id from repository id, event kind, and provider feedback
 id in `apps/api/src/curie_api/github_review_events.py::UnverifiedFeedback.event_id`; and the CLI generates a random uuid behind an `EvSIM-`
 prefix (`cli/src/queue.rs`), chosen expressly so it cannot collide with a real Slack `Ev...` id.
-Idempotency across producers therefore holds by convention, not by contract, and that is the
-first thing a real `Trigger` port would have to take ownership of.
+Idempotency across producers therefore holds by convention, not by contract. Because there is
+no trigger port, taking ownership of that rule would be a change to the shared turn contract,
+not to any trigger.
 
 ## Cross-links
 
-- **Epic(s):** #29 — triggers: decide whether "trigger" is a real seam (extract an `EventSource` port) or just new event types on the existing ingresses.
+- **Epic(s):** #29, closed with the decision above: trigger is not a seam, and new triggers are new event kinds on the runs stream. Remaining work is tracked by #2935 (per-hook model, prompt and env), #2936 (bind hooks from the control plane), #2938 (a cron hook targeting a thread), and #3666 (map a declared webhook onto its hook).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six swappable jobs; not separately graded.
 - **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Accepted) — hooks are bundle-declared turns the system starts.

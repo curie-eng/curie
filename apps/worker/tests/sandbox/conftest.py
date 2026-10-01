@@ -33,6 +33,7 @@ from curie_worker.sandbox import (
     SubstrateConfig,
 )
 from curie_worker.sandbox.docker import DockerSandboxClient
+from curie_worker.sandbox.types import SandboxTermination
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
@@ -196,6 +197,8 @@ class FakeSandboxClient:
     # None for a pod that is scheduled (or unknown).
     unschedulable_message: str | None = None
     pod_reads: list[str] = field(default_factory=list)
+    termination: SandboxTermination | None = None
+    termination_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
@@ -297,6 +300,14 @@ class FakeSandboxClient:
         assert request_timeout_seconds > 0
         self.pod_reads.append(name)
         return self.unschedulable_message
+
+    def pod_termination(
+        self, name: str, *, request_timeout_seconds: float, since: datetime
+    ) -> SandboxTermination | None:
+        assert request_timeout_seconds > 0
+        assert since.tzinfo is not None
+        self.termination_reads.append(name)
+        return self.termination
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

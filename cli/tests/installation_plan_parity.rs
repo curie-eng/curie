@@ -1820,6 +1820,21 @@ fn changing_mail_egress_source_requires_an_explicit_worker_pair_decision() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if key == "mailAdapter.egressSecret" && surface != "up" {
+                assert!(
+                    visible.contains("secret-bearing chart key"),
+                    "{surface}: committed inline secret must hit the file boundary: {visible}"
+                );
+                assert!(
+                    !visible.contains(value),
+                    "{surface}: committed inline secret leaked: {visible}"
+                );
+                assert!(
+                    fixture.calls().is_empty(),
+                    "{surface}: file validation must precede cluster reads"
+                );
+                continue;
+            }
             assert!(
                 visible.contains("paired worker"),
                 "actionable paired-source refusal: {visible}"
@@ -2366,65 +2381,73 @@ fn clearing_an_active_sealing_byo_without_an_inline_replacement_refuses_before_m
 }
 
 #[test]
-fn explicit_inline_sealing_replacement_allows_an_active_byo_clear_without_generation() {
+fn operator_inline_sealing_replacement_remains_compatible_but_the_file_refuses_it() {
     let existing = json!({
         "sealing": {
             "privateKeyExistingSecret": "acme-active-sealing-source",
             "privateKeyExistingSecretKey": "active-sealing-selector"
         }
     });
-    for surface in ["cluster up", "apply"] {
-        let config = if surface == "apply" {
-            format!(
-                "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n  \
-                 sealing.privateKey: {PRESERVED_SEALING_KEY:?}\n",
-                installation_for_the_stateful_guard()
-            )
-        } else {
-            installation_for_the_stateful_guard().to_string()
-        };
-        let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
-        let replacement = format!("sealing.privateKey={PRESERVED_SEALING_KEY}");
-        let output = if surface == "cluster up" {
-            fixture.cluster_up_with(
-                &[
-                    "--set",
-                    "sealing.privateKeyExistingSecret=",
-                    "--set",
-                    replacement.as_str(),
-                ],
-                &[],
-            )
-        } else {
-            fixture.apply(&[], &[])
-        };
-        let visible = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        json_output(
-            output,
-            &format!("{surface} with explicit sealing replacement"),
-        );
-        assert!(
-            !visible.contains("generated a sealing private key"),
-            "the supplied replacement must prevent a second generated key: {visible}"
-        );
-        assert!(
-            !visible.contains(PRESERVED_SEALING_KEY),
-            "the replacement private key leaked into CLI output: {visible}"
-        );
-        let calls = fixture.calls();
-        assert!(
-            calls.contains("sealing.privateKeyExistingSecret="),
-            "{surface} must clear the active external source: {calls}"
-        );
-        assert!(
-            calls.contains(&replacement),
-            "{surface} must consume the exact replacement private key: {calls}"
-        );
-    }
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(existing.clone()),
+    );
+    let replacement = format!("sealing.privateKey={PRESERVED_SEALING_KEY}");
+    let output = fixture.cluster_up_with(
+        &[
+            "--set",
+            "sealing.privateKeyExistingSecret=",
+            "--set",
+            replacement.as_str(),
+        ],
+        &[],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with explicit sealing replacement");
+    assert!(
+        !visible.contains("generated a sealing private key"),
+        "the supplied replacement must prevent a second generated key: {visible}"
+    );
+    assert!(
+        !visible.contains(PRESERVED_SEALING_KEY),
+        "the replacement private key leaked into CLI output: {visible}"
+    );
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("sealing.privateKeyExistingSecret="),
+        "cluster up must clear the active external source: {calls}"
+    );
+    assert!(
+        calls.contains(&replacement),
+        "cluster up must consume the exact replacement private key: {calls}"
+    );
+
+    let config = format!(
+        "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n  \
+         sealing.privateKey: {PRESERVED_SEALING_KEY:?}\n",
+        installation_for_the_stateful_guard()
+    );
+    let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing));
+    let output = fixture.apply(&[], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "curie.yaml must refuse an inline key"
+    );
+    assert!(visible.contains("secret-bearing chart key"), "{visible}");
+    assert!(!visible.contains(PRESERVED_SEALING_KEY), "{visible}");
+    assert!(
+        fixture.calls().is_empty(),
+        "refusal must precede cluster reads"
+    );
 }
 
 #[test]
@@ -3300,6 +3323,169 @@ fn apply_string_egress_does_not_warn_that_model_credential_is_sealed() {
         !calls.contains(MODEL_VALUE),
         "the model credential leaked into the command log: {calls}"
     );
+}
+
+#[test]
+fn secret_bearing_set_entries_fail_before_dry_run_output_or_apply_mutation() {
+    // #1300: the declared set lane must not turn a committed credential into
+    // plain Helm argv or expose it in either operator output stream. The first
+    // four keys are the regression paths named in the issue; the last case
+    // catches token-shaped values on otherwise ordinary chart keys.
+    for (key, value) in [
+        (
+            "agentSandbox.runner.credentials",
+            "opaque-runner-placeholder",
+        ),
+        ("api.githubToken", "opaque-github-placeholder"),
+        ("dispatcher.slack.appToken", "opaque-app-placeholder"),
+        ("dispatcher.slack.botToken", "opaque-bot-placeholder"),
+        (
+            "otelCollector.extraExporters.backend.headers.Authorization",
+            "opaque-authorization-placeholder",
+        ),
+        (
+            "otelCollector.extraExporters.backend.headers.Proxy-Authorization",
+            "opaque-proxy-authorization-placeholder",
+        ),
+        (
+            "otelCollector.extraExporters.backend.headers.X-API-Key",
+            "opaque-api-key-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "Authorization=Bearer opaque-header-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "X-API-Key=opaque-header-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "Proxy-Authorization=opaque-header-placeholder",
+        ),
+        (
+            "otelCollector.headers",
+            "X-Auth-Token=opaque-header-placeholder",
+        ),
+        ("example.label", "sk-ant-placeholder"),
+    ] {
+        let config = format!(
+            "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  {key}: {value}\n"
+        );
+        for dry_run in [true, false] {
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+            let output = if dry_run {
+                fixture.apply_dry_run(&[])
+            } else {
+                fixture.apply(&[], &[])
+            };
+            assert!(
+                !output.status.success(),
+                "{key} must fail before {}",
+                if dry_run { "dry run" } else { "apply" }
+            );
+            let visible = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !visible.contains(value),
+                "{key} credential leaked into operator output: {visible}"
+            );
+            assert!(
+                fixture.calls().is_empty(),
+                "{key} reached Helm or kubectl before rejection: {}",
+                fixture.calls()
+            );
+        }
+    }
+}
+
+#[test]
+fn documented_secret_name_references_reach_dry_run_and_apply() {
+    for key in [
+        "api.migrate.provenanceDeclarationsSecret",
+        "api.imagePullSecrets[0].name",
+        "agentSandbox.runner.imagePullSecrets[0].name",
+    ] {
+        let config = format!(
+            "{}set:\n  {key}: reference-name\n",
+            installation_for_the_stateful_guard()
+        );
+        for dry_run in [true, false] {
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+            let output = if dry_run {
+                fixture.apply_dry_run(&[])
+            } else {
+                fixture.apply(&[], &[])
+            };
+            assert!(
+                output.status.success(),
+                "{key} reference failed during {}:\n{}{}",
+                if dry_run { "dry run" } else { "apply" },
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let observed = if dry_run {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            } else {
+                fixture.calls()
+            };
+            let expected = if dry_run {
+                format!("{key}=")
+            } else {
+                format!("{key}=reference-name")
+            };
+            assert!(
+                observed.contains(&expected),
+                "{key} reference did not reach the Helm plan: {observed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn benign_otel_workload_headers_reach_dry_run_and_apply() {
+    let key = "otelCollector.headers";
+    let value = "tenant=acme;region=us-west";
+    let config = format!(
+        "{}set:\n  {key}: {value:?}\n",
+        installation_for_the_stateful_guard()
+    );
+    for dry_run in [true, false] {
+        let fixture = HelmFixture::new(&config, HelmValuesResponse::Absent);
+        let output = if dry_run {
+            fixture.apply_dry_run(&[])
+        } else {
+            fixture.apply(&[], &[])
+        };
+        assert!(
+            output.status.success(),
+            "benign headers failed during {}:\n{}{}",
+            if dry_run { "dry run" } else { "apply" },
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let observed = if dry_run {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        } else {
+            fixture.calls()
+        };
+        assert!(observed.contains(key), "benign headers missing: {observed}");
+        assert!(
+            observed.contains("tenant=acme") && observed.contains("region=us-west"),
+            "benign headers changed or disappeared: {observed}"
+        );
+    }
 }
 
 #[test]

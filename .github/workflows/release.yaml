@@ -26,7 +26,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   # Gates the ENTIRE tag-triggered publish pipeline (issue #628). A `v*` tag push
@@ -97,6 +96,9 @@ jobs:
             --commit "$GITHUB_SHA"
 
   build:
+    permissions:
+      contents: read
+      packages: write
     name: Build ${{ matrix.name }} image (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     needs: [authorize-release]
@@ -236,6 +238,9 @@ jobs:
           retention-days: 1
 
   merge:
+    permissions:
+      contents: read
+      packages: write
     name: Merge ${{ matrix.name }} manifest
     needs: [build]
     # A skip propagates through the WHOLE ancestor graph, not just the direct
@@ -327,6 +332,9 @@ jobs:
           docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}:${{ steps.meta.outputs.version }}
 
   worker-local-build:
+    permissions:
+      contents: read
+      packages: write
     name: Build worker-local overlay (${{ matrix.platform }})
     needs: [merge]
     # Same ancestor-graph skip as `merge` above, one level further down (#787):
@@ -435,6 +443,9 @@ jobs:
           retention-days: 1
 
   worker-local-merge:
+    permissions:
+      contents: read
+      packages: write
     name: Merge worker-local manifest
     needs: [worker-local-build]
     # Same ancestor-graph skip again (#787); both arch legs must have pushed

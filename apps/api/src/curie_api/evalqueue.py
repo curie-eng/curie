@@ -1,9 +1,11 @@
 """Eval-job fan-out seam (K1): the API enqueues, a worker consumer runs the Job.
 
 On a dev-branch push the git-flow deploy enqueues one eval job per new version
-onto the Valkey stream ``curie:evals``. Wire encoding mirrors the dispatcher's
-``curie:runs`` seam exactly: a single ``payload`` stream field holds the model
-as ``model_dump_json()``, so fields can evolve without reshaping the stream.
+onto the Valkey stream ``curie:evals`` (the shared default; override with
+``CURIE_EVAL_STREAM``, which the worker consumer reads too). Wire encoding
+mirrors the dispatcher's ``curie:runs`` seam exactly: a single ``payload``
+stream field holds the model as ``model_dump_json()``, so fields can evolve
+without reshaping the stream.
 
 This module is the PRODUCER only. The consumer reads the stream and runs
 ``python -m curie_worker.eval`` for the version, decoding the ``payload`` field
@@ -20,9 +22,9 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import redis.asyncio as redis
-from aci_protocol import EVAL_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, EvalJob, parse_eval_job
+from aci_protocol import STREAM_PAYLOAD_FIELD, EvalJob, parse_eval_job
 
-EVAL_STREAM = EVAL_STREAM_DEFAULT
+from .config import get_settings
 
 
 def to_stream_fields(job: EvalJob) -> dict[str, str]:
@@ -40,9 +42,12 @@ def now_iso() -> str:
 
 
 class EvalQueue:
-    def __init__(self, client: redis.Redis, stream: str = EVAL_STREAM) -> None:
+    def __init__(self, client: redis.Redis, stream: str | None = None) -> None:
+        # The eval stream is declared once, on the settings object (#3565), and
+        # resolved at construction so the CURIE_EVAL_STREAM override the worker
+        # consumer also reads is picked up when the queue is built.
         self._client = client
-        self._stream = stream
+        self._stream = stream if stream is not None else get_settings().eval_stream
 
     async def enqueue(self, request: EvalJob) -> str:
         # redis-py types the fields map as an invariant broad union; cast to

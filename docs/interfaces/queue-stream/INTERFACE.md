@@ -183,7 +183,10 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   `_THREAD_RESET_CLAIM_LUA`) plus `SREM` on it in
   `apps/worker/src/curie_worker/consumer.py::Consumer._drain_thread_reset_requests`.
   The API half is the same shape: `SADD`/`SISMEMBER` in
-  `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. A second broker that
+  `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. The worker also writes
+  each drained reset's outcome (`released` or `no-route`) to a one-hour string key
+  that the API reads back, so a reset whose key matched no route is reported to the
+  caller instead of reading as a release (#3699). A second broker that
   implements only the two stream Protocols would leave this feature unbacked; it is a
   Valkey dependency, not a stream-contract one, and no port names it today.
 - **Liveness string keys are another intentionally narrow adjacent dependency.**
@@ -209,7 +212,7 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   EVAL Lua) that bypasses the dispatcher's `StreamPublisher` port entirely. The hooks
   router also reads one exact `curie:runs` entry with `xrange` when a delivery claim
   already holds a stream id
-  (`apps/api/src/curie_api/routers/hooks.py::_landed_conversation_id`). The API also
+  (`apps/api/src/curie_api/routers/hooks.py::_landed_turn`). The API also
   *reads* the worker's `<stream>:dead` graveyard directly, with `xrevrange`/`xrange`
   on its own raw client:
   `apps/api/src/curie_api/graveyardwatcher.py::GraveyardWatcher` (`xrevrange` to seed the

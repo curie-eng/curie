@@ -20,7 +20,24 @@ import pytest
 from curie_api import bundles
 from curie_api.config import get_settings
 from curie_api.models import Agent, AgentChannel
+from plugin_format.connector_render import CALLER_PROXY_PORT, ConnectorProxy
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+def test_a_wildcard_approval_pattern_stays_on_the_matching_connector() -> None:
+    # `*/merge_pull_request` is how a bundle gates that tool on every server.
+    # Dropping it because it does not start with `github/` would leave the
+    # proxy forwarding the call with no grant.
+    patterns = ("*/merge_pull_request", "grafana/*", "mcp__github__merge_pull_request")
+    assert bundles.gated_tools_for_connector("github", patterns) == (
+        "*/merge_pull_request",
+        "mcp__github__merge_pull_request",
+    )
+    assert bundles.gated_tools_for_connector("grafana", patterns) == (
+        "*/merge_pull_request",
+        "grafana/*",
+    )
+    assert bundles.gated_tools_for_connector("other", ("grafana/*",)) == ()
 
 
 def _bundle(root: Path, connectors_yaml: str | None = None) -> Path:
@@ -60,9 +77,19 @@ AGENT = "acme-bot"
 NAMESPACE = "acme-ns"
 APP_NAME = "curie"
 SECRET_NAME = f"{RELEASE}-{AGENT}-connectors"
+# A public half frozen in tests/vectors/connector-caller-token.json.
+_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+_DEFAULT_PROXY = object()
 
 
-def _render(root: Path, agent: str = AGENT) -> list[dict]:
+def _api_proxy() -> ConnectorProxy:
+    return ConnectorProxy(image=_PROXY_IMAGE, public_keys=(_CALLER_PUBLIC,))
+
+
+def _render(root: Path, agent: str = AGENT, proxy: object = _DEFAULT_PROXY) -> list[dict]:
+    # Success paths pass a caller proxy. `proxy=None` is the empty-key refusal.
+    resolved = _api_proxy() if proxy is _DEFAULT_PROXY else proxy
     return bundles.render_connector_manifests(
         bundles.read_connectors(root),
         release=RELEASE,
@@ -70,6 +97,7 @@ def _render(root: Path, agent: str = AGENT) -> list[dict]:
         namespace=NAMESPACE,
         app_name=APP_NAME,
         secret_name=f"{RELEASE}-{agent}-connectors",
+        proxy=resolved,  # type: ignore[arg-type]
     )
 
 
@@ -86,7 +114,7 @@ def test_hosted_connector_renders_the_full_object_set(tmp_path: Path) -> None:
     # design -- the sandbox has no credential to authenticate with -- so
     # without the ingress half every pod in the namespace can reach something
     # holding a production credential.
-    assert kinds == ["Service", "Deployment", "NetworkPolicy", "NetworkPolicy"]
+    assert kinds == ["Service", "Service", "Deployment", "NetworkPolicy", "NetworkPolicy"]
     directions = sorted(p["spec"]["policyTypes"][0] for p in objs if p["kind"] == "NetworkPolicy")
     assert directions == ["Egress", "Ingress"]
 
@@ -147,12 +175,16 @@ def test_ingress_policy_admits_only_the_sandbox(tmp_path: Path) -> None:
     src = np["spec"]["ingress"][0]["from"]
     assert len(src) == 1
     assert "podSelector" in src[0] and "ipBlock" not in src[0]
+    labels = src[0]["podSelector"]["matchLabels"]
+    assert labels["curietech.ai/agent"] == AGENT
+    assert labels["app.kubernetes.io/name"] == APP_NAME
+    assert labels["app.kubernetes.io/instance"] == RELEASE
+    assert labels["app.kubernetes.io/component"] == "runner-sandbox"
     svc = next(o for o in objs if o["kind"] == "Service")
-    assert (
-        svc["spec"]["ports"][0]["port"]
-        == np["spec"]["ingress"][0]["ports"][0]["port"]
-        == 9876
-    )
+    # The Service keeps the declared port. The ingress rule matches the proxy
+    # port the Service DNATs onto.
+    assert svc["spec"]["ports"][0]["port"] == 9876
+    assert np["spec"]["ingress"][0]["ports"][0]["port"] == CALLER_PROXY_PORT
 
 
 def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
@@ -191,17 +223,25 @@ def test_each_of_the_four_names_lands_where_it_belongs(tmp_path: Path) -> None:
         "app.kubernetes.io/component": "runner-sandbox",
     }
 
-    # app_name and release: the sandbox selector, on both policies.
+    # app_name and release: the sandbox selector. Egress stays that selector.
+    # Ingress from adds the owning agent and nothing else.
     assert _policy(objs, "Egress")["spec"]["podSelector"]["matchLabels"] == sandbox
     ingress_from = _policy(objs, "Ingress")["spec"]["ingress"][0]["from"][0]
-    assert ingress_from["podSelector"]["matchLabels"] == sandbox
+    assert ingress_from["podSelector"]["matchLabels"] == {**sandbox, "curietech.ai/agent": AGENT}
+    assert "curietech.ai/agent" not in _policy(objs, "Egress")["spec"]["podSelector"]["matchLabels"]
 
     # release and agent: the object name, in that order, plus part-of.
     dep = next(o for o in objs if o["kind"] == "Deployment")
-    assert {o["metadata"]["name"] for o in objs} == {name, f"{name}-allow", f"{name}-allow-ingress"}
+    assert {o["metadata"]["name"] for o in objs} == {
+        name,
+        f"{name}-direct",
+        f"{name}-allow",
+        f"{name}-allow-ingress",
+    }
     assert dep["metadata"]["labels"] == {
         "app.kubernetes.io/name": name,
         "app.kubernetes.io/part-of": RELEASE,
+        "app.kubernetes.io/component": "mcp-connector",
     }
 
     # namespace: the only place it shows up is the Service DNS Curie derives.
@@ -371,6 +411,7 @@ def test_a_built_connector_renders_the_locked_digest_and_no_build(tmp_path: Path
             namespace=NAMESPACE,
             app_name=APP_NAME,
             secret_name=SECRET_NAME,
+            proxy=_api_proxy(),
         )
         if o["kind"] == "Deployment"
     )
@@ -384,7 +425,7 @@ def test_render_connector_manifests_stays_a_pure_function_of_its_arguments(tmp_p
     # UNRESOLVED build it must raise rather than quietly emit `image: null`.
     root = _built(tmp_path)
     _write_lock(root)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="connectors.lock.yaml"):
         bundles.render_connector_manifests(
             bundles.read_connectors(root),
             release=RELEASE,
@@ -392,6 +433,7 @@ def test_render_connector_manifests_stays_a_pure_function_of_its_arguments(tmp_p
             namespace=NAMESPACE,
             app_name=APP_NAME,
             secret_name=SECRET_NAME,
+            proxy=_api_proxy(),
         )
 
 
@@ -467,7 +509,11 @@ def _version_with_bundle(client: Any, headers: dict[str, str], archive: bytes) -
 
 
 def test_the_connectors_route_renders_the_locked_digest(
-    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
 ) -> None:
     root = _built(tmp_path)
     _write_lock(root)
@@ -663,7 +709,7 @@ def _read_connectors(client: Any, headers: dict[str, str], agent_id: str, versio
 
 
 def test_a_stored_forging_agent_name_is_a_422_not_a_500(
-    client: Any, auth_headers: dict[str, str], clean_db: None
+    client: Any, auth_headers: dict[str, str], clean_db: None, _caller_key: None
 ) -> None:
     agent_id = _agent_row("a-mcp-b")
     version_id = _collision_version_with_bundle(client, auth_headers, agent_id)
@@ -677,7 +723,7 @@ def test_a_stored_forging_agent_name_is_a_422_not_a_500(
 
 
 def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
-    client: Any, auth_headers: dict[str, str], clean_db: None
+    client: Any, auth_headers: dict[str, str], clean_db: None, _caller_key: None
 ) -> None:
     # The control, and it is not optional: without it the 422 test above passes
     # just as happily if the endpoint, the bundle fixture, or the upload broke
@@ -692,6 +738,7 @@ def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
     name = f"{ENDPOINT_RELEASE}-acme-dev-mcp-grafana"
     assert {o["metadata"]["name"] for o in body["manifests"]} == {
         name,
+        f"{name}-direct",
         f"{name}-allow",
         f"{name}-allow-ingress",
     }
@@ -759,7 +806,11 @@ def _connector_of(obj: dict[str, Any]) -> str:
 
 # @spec ADR-0168 d8
 def test_the_route_renders_only_the_connectors_the_agents_target_lists(
-    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
 ) -> None:
     root = _allowlisted_bundle(
         tmp_path,
@@ -786,7 +837,11 @@ def test_an_empty_allowlist_renders_nothing_so_the_appliers_prune_everything(
 
 # @spec ADR-0168 d8
 def test_an_agent_no_target_names_still_renders_every_connector(
-    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
 ) -> None:
     root = _allowlisted_bundle(
         tmp_path, "targets:\n  dev:\n    agent: acme-dev\n    connectors: []\n"
@@ -797,10 +852,7 @@ def test_an_agent_no_target_names_still_renders_every_connector(
 
 
 # ADR-0168 decision 7: the caller proxy rides every hosted connector render
-# once the API holds a caller public key. The key is a public half frozen in
-# tests/vectors/connector-caller-token.json.
-_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
-_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+# once the API holds a caller public key.
 
 
 def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
@@ -812,8 +864,6 @@ def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
 
 # @spec ADR-0168 d7
 def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None:
-    from plugin_format.connector_render import ConnectorProxy
-
     root = _bundle(tmp_path, HOSTED)
     manifests = bundles.render_connector_manifests(
         bundles.read_connectors(root),
@@ -826,7 +876,8 @@ def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None
     )
     # The stored agent name, the same name the worker signs into the token.
     assert _proxy_admits(manifests) == [AGENT]
-    assert "caller-proxy" not in json.dumps(_render(root))
+    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
+        _render(root, proxy=None)
 
 
 @pytest.fixture
@@ -837,6 +888,24 @@ def _caller_key(monkeypatch: pytest.MonkeyPatch) -> Any:
     yield
     monkeypatch.undo()
     get_settings.cache_clear()
+
+
+# @spec ADR-0168 d7
+def test_the_route_refuses_a_hosted_connector_when_the_api_has_no_caller_key(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # No CURIE_CONNECTOR_CALLER_PUBLIC_KEY: the route's proxy is None, and a
+    # hosted connector must come back as 422 naming the reason.
+    agent_id, version_id = _version_with_bundle(
+        client, auth_headers, _archive(_bundle(tmp_path, HOSTED))
+    )
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert "hosted_connector_requires_caller_key" in resp.text
 
 
 # @spec ADR-0168 d7

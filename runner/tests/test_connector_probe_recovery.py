@@ -61,6 +61,7 @@ def test_transient_probe_failure_recovers_on_a_later_turn(
 
     fake = FakeModelSession(default_turn)
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
         tracer=RunTracer(None),

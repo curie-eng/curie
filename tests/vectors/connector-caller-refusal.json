@@ -19,6 +19,10 @@
     {
       "refusal": "not_admitted",
       "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: this agent is not admitted by the connector", "data": {"curie_caller": "not_admitted"}}}
+    },
+    {
+      "refusal": "grant_required",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: the connector tool call has no matching grant", "data": {"curie_caller": "grant_required"}}}
     }
   ]
 }

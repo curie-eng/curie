@@ -10,11 +10,14 @@ Override any field via the matching environment variable for shared or
 production deployments.
 """
 
+import json
 from functools import lru_cache
-from urllib.parse import urlsplit
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
+    EVAL_STREAM_DEFAULT,
     RUNS_STREAM_DEFAULT,
     STREAM_ENV,
     WORKER_GROUP_DEFAULT,
@@ -22,10 +25,10 @@ from aci_protocol import (
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from plugin_format.connector_render import ConnectorProxy
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .workspace_policy import valid_allowlist_entry
+from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -182,6 +185,14 @@ class Settings(BaseSettings):
         le=10800,
         validation_alias="GITHUB_FACTORY_CI_WAIT_S",
     )
+    # Required Python CI per repository (#3617), a JSON object keyed by
+    # ``owner/name`` (matched case-insensitively): ``{"check": str, "paths":
+    # [str, ...], "pendingCheckPrefix": str | null}``. A repository without an
+    # entry is judged on its own checks with no path refusal. Empty by default.
+    github_factory_python_ci: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_PYTHON_CI",
+    )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
     # the estimate unset and the token counts are still stored. Empty disables.
@@ -193,6 +204,16 @@ class Settings(BaseSettings):
     # a private repository cannot deploy at all (#1058). Sent as a scoped
     # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
+
+    @property
+    def github_html_base(self) -> str:
+        """Derive the forge HTML base from its configured API endpoint."""
+
+        parts = urlsplit(self.github_api_url.rstrip("/"))
+        authority = "github.com" if parts.netloc == "api.github.com" else parts.netloc
+        path = parts.path.removesuffix("/api/v3")
+        return urlunsplit((parts.scheme, authority, path, "", ""))
+
     github_token: str = ""
     # GitHub App identity (ADR-0092). When both are set the platform mints a
     # one-hour token scoped to the single repository being cloned, instead of
@@ -271,14 +292,23 @@ class Settings(BaseSettings):
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
     # the default is the shared declaration both lanes import (#492) rather than
-    # a literal mirrored here. Overridable via RUNS_STREAM (the API's historical
-    # name, which still wins if both are set) OR CURIE_STREAM (the worker's
-    # name), so an operator who moves the base stream on the worker side moves it
-    # here too and the two lanes agree on the graveyard derived from it (#668).
+    # a literal mirrored here. RUNS_STREAM remains accepted as the API's
+    # historical name, CURIE_STREAM (the worker's name) also works, and a
+    # RUNS_STREAM that disagrees with CURIE_STREAM is refused at boot rather
+    # than silently winning (#3565). The graveyard derived from it stays in
+    # agreement with the worker's (#668).
     runs_stream: str = Field(
         default=RUNS_STREAM_DEFAULT,
         validation_alias=AliasChoices("RUNS_STREAM", STREAM_ENV),
     )
+    # CURIE_STREAM read on its own so the boot check can see a disagreement
+    # with RUNS_STREAM. Not used for anything else; consumers read runs_stream.
+    curie_stream: str = Field(default="", validation_alias=STREAM_ENV)
+
+    # The eval fan-out stream the API enqueues onto (K1). Must match the worker's
+    # CURIE_EVAL_STREAM (its consumer side); the default is the shared aci_protocol
+    # declaration both lanes import (#626), not a literal mirrored here.
+    eval_stream: str = Field(default=EVAL_STREAM_DEFAULT, validation_alias="CURIE_EVAL_STREAM")
 
     # Dead-letter graveyard watcher (#531). The worker moves a permanently-failing
     # entry to the graveyard (ADR-0039, #505) and acks it; this watcher is the
@@ -675,6 +705,51 @@ class Settings(BaseSettings):
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
 
+    @field_validator("github_factory_python_ci", mode="before")
+    @classmethod
+    def _validate_factory_python_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
+        policies: dict[str, dict[str, Any]] = {}
+        for repo, policy in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
+            if not isinstance(policy, dict) or set(policy) - {
+                "check",
+                "paths",
+                "pendingCheckPrefix",
+            }:
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}] has an invalid shape")
+            check = policy.get("check")
+            paths = policy.get("paths")
+            prefix = policy.get("pendingCheckPrefix")
+            if not isinstance(check, str) or not check.strip():
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].check must be non-empty")
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or not all(
+                    isinstance(path, str)
+                    and path.strip()
+                    and not path.startswith("/")
+                    and not path.endswith("/")
+                    for path in paths
+                )
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].paths must be non-empty relative"
+                    " prefixes without a leading or trailing slash"
+                )
+            if prefix is not None and (not isinstance(prefix, str) or not prefix):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].pendingCheckPrefix must be a"
+                    " non-empty string or null"
+                )
+            policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
+        return policies
+
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
         # At boot, not at the first render: a key the proxy cannot use would
@@ -691,6 +766,18 @@ class Settings(BaseSettings):
             self.connector_proxy()
         except ValueError as exc:
             raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _validate_runs_stream_agrees_with_curie_stream(self) -> "Settings":
+        # The worker and dispatcher read only CURIE_STREAM (#3565).
+        if self.curie_stream and self.curie_stream != self.runs_stream:
+            raise ValueError(
+                f"RUNS_STREAM ({self.runs_stream!r}) and CURIE_STREAM "
+                f"({self.curie_stream!r}) disagree: the worker and dispatcher read "
+                "only CURIE_STREAM, so the API would enqueue resumes onto a stream "
+                "no worker consumes; set one, or set both to the same value"
+            )
         return self
 
     @model_validator(mode="after")
@@ -793,9 +880,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":
-        """Production boot gate (#57): with ENVIRONMENT=prod, refuse to start if a
-        shared secret is unset or still the shipped dev default, so a prod deploy
-        can never silently run on well-known credentials."""
+        """Refuse blank API keys in every environment.
+
+        Production also refuses unset shared secrets and shipped dev defaults (#57).
+        """
+        if not self.api_key.strip():
+            raise ValueError("API_KEY must be nonblank")
         attester_secret = self.approval_chat_attester_secret
         if attester_secret and not attester_secret.strip():
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")

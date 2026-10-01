@@ -32,6 +32,7 @@ from plugin_format import HookMatcherConfig, PluginManifest, resolve_manifest
 from pydantic import TypeAdapter, ValidationError
 
 from .mcp_tool_capability import ConnectorAvailability
+from .subprocess_env import shell_and_hook_env
 
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 
@@ -91,6 +92,31 @@ def _decision(decision: str, reason: str) -> dict[str, Any]:
             "permissionDecisionReason": reason or "blocked by bundle PreToolUse hook",
         }
     }
+
+
+def build_factory_foreground_hooks() -> dict[str, list[HookMatcher]]:
+    """Keep factory commands and reviewer calls inside the active turn."""
+
+    async def guard(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> Any:
+        if not isinstance(hook_input, dict):
+            return {}
+        tool = hook_input.get("tool_name")
+        tool_input = hook_input.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return {}
+        if tool == "Bash" and tool_input.get("run_in_background") is True:
+            return _decision(
+                "deny", "Run Bash in the foreground and wait for it before you end your turn."
+            )
+        if tool in ("Agent", "Task") and tool_input.get("run_in_background") is not False:
+            return _decision(
+                "deny",
+                "Run the agent in the foreground with run_in_background false. "
+                "Wait for it before you end your turn.",
+            )
+        return {}
+
+    return {"PreToolUse": [HookMatcher(matcher="Bash|Agent|Task", hooks=[guard])]}
 
 
 def _stdout_decision(out: bytes) -> dict[str, Any]:
@@ -166,7 +192,7 @@ async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) ->
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=plugin_root,
-            env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+            env=shell_and_hook_env(os.environ, extra={"CLAUDE_PLUGIN_ROOT": str(plugin_root)}),
             start_new_session=True,
         )
         out, err = await asyncio.wait_for(
