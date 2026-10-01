@@ -360,16 +360,19 @@ incomplete adapter coverage and conformance.
   bind under the generic non-empty rule. There is still no multi-channel adapter
   framework (#27). The routing pair removes the binding ambiguity; it does not by
   itself give other kinds a registered address shape.
-- **Still leaks — attachment resolution.** The only `AttachmentFilePort`
-  implementation is `SlackFileClient`
-  (`apps/worker/src/curie_worker/attachments.py::SlackFileClient`): Slack
-  `files.info` / `url_private_download` with the bot token (`url_private` 302s
-  to `slack-files.com`, which the no-redirect transport refuses to follow), wired from
-  `apps/worker/src/curie_worker/run.py::build` regardless of the turn's channel
-  kind. The kernel (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`)
-  never checks `reply_handle.kind`. A missing `files:read` scope degrades
-  attachments only (4a71d99f). Discord and email simply do not emit attachments
-  today.
+- **Fixed (#3678, ADR-0153) — attachment resolution.** The kernel hands the
+  turn's reply handle to the lane
+  (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`), and the
+  lane picks the file port from its kind
+  (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
+  `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /
+  `url_private_download` with the bot token; a missing `files:read` scope degrades
+  attachments only, 4a71d99f). Every other kind goes to
+  `apps/worker/src/curie_worker/attachments.py::ChannelPortFileClient`, which fetches
+  `GET {endpoint}/attachments/{id}` from the binding's own adapter with that adapter's
+  egress secret. The channel-port ingress carries the references on `TurnIn.attachments`
+  (`apps/api/src/curie_api/routers/channels.py::TurnIn`). Discord and the first-party
+  mail adapter do not emit attachments yet.
 
 ## Cross-links
 
