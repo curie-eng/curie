@@ -9,7 +9,7 @@ bodies into the platform and it does not bind Slack.
 import hashlib
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -18,8 +18,10 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import crud, workitem_dispatch
+from . import crud, factory_base, workitem_dispatch
 from .config import Settings
+from .factory_base import BaseRefusal
+from .factory_notices import mark_status_comment_stale
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import (
     FactoryNotice,
@@ -34,7 +36,12 @@ from .github_review_truth import (
     repository_identity_matches,
     verify_sender_write_permission,
 )
-from .models import Agent, AgentChannel, WorkItem
+from .models import (
+    Agent,
+    AgentChannel,
+    ThreadPublicationLineage,
+    WorkItem,
+)
 from .repo_full_name import repo_url_path
 from .schemas import WebhookResult
 from .workitem_dispatch import DispatchConflict
@@ -68,6 +75,10 @@ _IGNORED = {
     "active_request",
     "work_item_cancelled",
     "comment_too_large",
+    "base_conflict",
+    "base_not_allowed",
+    "base_missing",
+    "base_label_recorded",
 }
 
 
@@ -84,6 +95,18 @@ class _Facts:
     objective: str
     requester: str
     request_id: uuid.UUID
+    # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
+    base: factory_base.ResolvedBase | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedIssue:
+    """What GitHub confirmed about the issue, reused for base resolution."""
+
+    labels: set[str]
+    default_branch: str | None
+    token: str
+    repo_path: str
 
 
 def _delivery_uuid(delivery_id: str) -> uuid.UUID:
@@ -117,7 +140,7 @@ async def verify_current(
     *,
     settings: Settings,
     client: httpx.AsyncClient,
-) -> None:
+) -> VerifiedIssue:
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
@@ -156,43 +179,48 @@ async def verify_current(
     if "pull_request" in issue:
         raise FactoryRefused("pull_request_issue")
     names = _label_names(issue)
-    if notice.disposition == "admit":
-        if issue.get("state") != "open" or notice.label not in names:
-            raise FactoryRefused(
-                "issue_not_open" if issue.get("state") != "open" else "label_absent"
+    # A ``base:`` label change is only recorded against an existing WorkItem;
+    # the labels are what matter, so none of the per-disposition checks apply.
+    if notice.disposition != "base_label":
+        if notice.disposition == "admit":
+            if issue.get("state") != "open" or notice.label not in names:
+                raise FactoryRefused(
+                    "issue_not_open" if issue.get("state") != "open" else "label_absent"
+                )
+        elif notice.action == "closed":
+            if issue.get("state") != "closed":
+                raise FactoryRefused("issue_still_open")
+        elif notice.action == "unlabeled":
+            if notice.label in names:
+                raise FactoryRefused("label_still_present")
+        else:
+            if issue.get("state") != "open":
+                raise FactoryRefused("issue_not_open")
+            comment = await get_github_json(
+                client,
+                api=api,
+                token=token,
+                path=f"{repo_path}/issues/comments/{notice.comment_id}",
+                refusal="comment_unavailable",
             )
-    elif notice.action == "closed":
-        if issue.get("state") != "closed":
-            raise FactoryRefused("issue_still_open")
-    elif notice.action == "unlabeled":
-        if notice.label in names:
-            raise FactoryRefused("label_still_present")
-    else:
-        if issue.get("state") != "open":
-            raise FactoryRefused("issue_not_open")
-        comment = await get_github_json(
-            client,
-            api=api,
-            token=token,
-            path=f"{repo_path}/issues/comments/{notice.comment_id}",
-            refusal="comment_unavailable",
-        )
-        if comment.get("issue_url") != f"{api}{repo_path}/issues/{notice.issue_number}":
-            raise FactoryRefused("comment_target_mismatch")
-        if comment.get("performed_via_github_app") is not None:
-            raise FactoryRefused("app_authored")
-        if comment.get("body") != notice.comment_body:
-            raise FactoryRefused("comment_changed")
-        user = comment.get("user")
-        if (
-            not isinstance(user, dict)
-            or type(user.get("id")) is not int
-            or user["id"] != notice.sender_id
-        ):
-            raise FactoryRefused("sender_mismatch")
-        body = comment.get("body")
-        if not isinstance(body, str) or not mentions_login(body, settings.github_factory_mention):
-            raise FactoryRefused("ordinary_comment")
+            if comment.get("issue_url") != f"{api}{repo_path}/issues/{notice.issue_number}":
+                raise FactoryRefused("comment_target_mismatch")
+            if comment.get("performed_via_github_app") is not None:
+                raise FactoryRefused("app_authored")
+            if comment.get("body") != notice.comment_body:
+                raise FactoryRefused("comment_changed")
+            user = comment.get("user")
+            if (
+                not isinstance(user, dict)
+                or type(user.get("id")) is not int
+                or user["id"] != notice.sender_id
+            ):
+                raise FactoryRefused("sender_mismatch")
+            body = comment.get("body")
+            if not isinstance(body, str) or not mentions_login(
+                body, settings.github_factory_mention
+            ):
+                raise FactoryRefused("ordinary_comment")
     await verify_sender_write_permission(
         client,
         api=api,
@@ -200,6 +228,13 @@ async def verify_current(
         repo_path=repo_path,
         sender_id=notice.sender_id,
         sender_login=notice.sender_login,
+    )
+    default_branch = repository.get("default_branch")
+    return VerifiedIssue(
+        labels=names,
+        default_branch=default_branch if isinstance(default_branch, str) else None,
+        token=token,
+        repo_path=repo_path,
     )
 
 
@@ -318,22 +353,115 @@ def _admission_result(
     return _ignored(code)
 
 
+async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
+    if item.publication_lineage_id is None:
+        return False
+    status = await session.scalar(
+        select(ThreadPublicationLineage.status).where(
+            ThreadPublicationLineage.id == item.publication_lineage_id
+        )
+    )
+    return status == "open"
+
+
+async def _record_label(
+    session: AsyncSession, item: WorkItem, verified: VerifiedIssue, settings: Settings
+) -> None:
+    """Note a ``base:`` label that disagrees with the frozen base. Never move it."""
+
+    if item.base_branch is None:
+        # A legacy WorkItem keeps the repository default branch and says nothing.
+        return
+    ignored = factory_base.label_disagreement(
+        verified.labels,
+        factory_base.bases_for(settings, item.repo_full_name),
+        verified.default_branch,
+        item.base_branch,
+    )
+    if ignored == item.base_label_ignored:
+        return
+    item.base_label_ignored = ignored
+    await mark_status_comment_stale(session, item.id)
+
+
+async def _fresh_base(
+    notice: FactoryNotice,
+    verified: VerifiedIssue,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> factory_base.ResolvedBase:
+    """Resolve the base for a fresh admission, or comment and refuse."""
+
+    resolved = await factory_base.resolve_base(
+        client,
+        settings=settings,
+        token=verified.token,
+        repo_full_name=notice.repo_full_name,
+        repo_path=verified.repo_path,
+        labels=verified.labels,
+        default_branch=verified.default_branch,
+    )
+    if isinstance(resolved, BaseRefusal):
+        await factory_base.comment_refusal(
+            client,
+            settings=settings,
+            token=verified.token,
+            repo_path=verified.repo_path,
+            issue_number=notice.issue_number,
+            refusal=resolved,
+        )
+        raise FactoryRefused(resolved.code)
+    return resolved
+
+
 async def admit_notice(
     session: AsyncSession,
     notice: FactoryNotice,
     settings: Settings,
+    verified: VerifiedIssue,
+    client: httpx.AsyncClient,
 ) -> WebhookResult:
     binding = await _binding(session, notice)
-    if notice.disposition == "mention":
-        existing = await work_item_for(session, notice.repository_id, notice.issue_number)
-        if existing is None:
-            raise FactoryRefused("not_admitted")
+    # Under the issue lock: the WorkItem decides whether the base is resolved
+    # again (a fresh admission) or kept (ADR 0186 decision 5).
+    existing = await work_item_for(session, notice.repository_id, notice.issue_number)
+    if notice.disposition == "mention" and existing is None:
+        raise FactoryRefused("not_admitted")
     facts = _facts(notice, binding, settings)
+    if existing is not None and (
+        notice.disposition == "mention" or await _has_open_pr(session, existing)
+    ):
+        # A revision, or work with an open PR, keeps its recorded base; no
+        # branch is read.
+        await _record_label(session, existing, verified, settings)
+    else:
+        # The fresh base travels with the admission facts. Dispatch validates
+        # ownership first, then writes it with the request that runs on it: at
+        # once for a fresh admission, or when a stopping run's replacement is
+        # admitted (ADR 0186 decision 5).
+        facts = replace(facts, base=await _fresh_base(notice, verified, settings, client))
     if notice.disposition == "mention":
         result = await workitem_dispatch.admit_revision(session, facts)
     else:
         result = await workitem_dispatch.readmit(session, facts)
     return _admission_result(result, facts.request_id)
+
+
+async def _record_base_label(
+    session: AsyncSession, notice: FactoryNotice, verified: VerifiedIssue, settings: Settings
+) -> WebhookResult:
+    """A ``base:`` label changed: record whether it now disagrees (ADR 0186)."""
+
+    item = await work_item_for(session, notice.repository_id, notice.issue_number)
+    if item is None:
+        raise FactoryRefused("work_item_absent")
+    if (
+        item.github_installation_id != notice.installation_id
+        or item.repo_full_name != notice.repo_full_name
+    ):
+        raise FactoryRefused("identity_mismatch")
+    await _record_label(session, item, verified, settings)
+    return _ignored("base_label_recorded")
 
 
 async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
@@ -407,11 +535,13 @@ async def handle_factory_delivery(
         if not repository_is_allowed(notice.repo_full_name, settings.github_repo_allowlist):
             raise FactoryRefused("repository_not_allowed")
         await _lock_issue(session, notice)
-        await verify_current(notice, settings=settings, client=client)
+        verified = await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "cancel":
             outcome = await _cancel(session, notice)
+        elif notice.disposition == "base_label":
+            outcome = await _record_base_label(session, notice, verified, settings)
         else:
-            outcome = await admit_notice(session, notice, settings)
+            outcome = await admit_notice(session, notice, settings, verified, client)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

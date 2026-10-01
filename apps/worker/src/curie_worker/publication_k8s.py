@@ -102,6 +102,7 @@ class PublicationPayload:
     github_pr_node_id: str | None
     open_as_draft: bool = False
     branch_prefix: str | None = None
+    base_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -413,7 +414,7 @@ if pr_number:
         raise SystemExit("stored pull request URL is missing")
     if phase in {"pre-push", "metadata-only"}:
         repository = request("GET", repo_api)
-        default_base = repository.get("default_branch")
+        default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
         if not isinstance(default_base, str) or not default_base:
             raise SystemExit("GitHub repository has no default branch")
         current_pull = request("GET", f"{api}/{pr_number}")
@@ -513,7 +514,7 @@ else:
     # Query the deterministic head before POST, and again after an ambiguous
     # REST failure. This is the idempotency boundary for a lost response.
     repository = request("GET", repo_api)
-    default_base = repository.get("default_branch")
+    default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
     if not isinstance(default_base, str) or not default_base:
         raise SystemExit("GitHub repository has no default branch")
     pull = existing(default_base)
@@ -752,6 +753,7 @@ def build_publication_resources(
         {"name": "REPO_FULL_NAME", "value": payload.repo_full_name},
         {"name": "CLEAN_CLONE_URL", "value": payload.clean_clone_url},
         {"name": "BASE_SHA", "value": payload.base_sha},
+        {"name": "BASE_REF", "value": payload.base_ref or ""},
         {"name": "BRANCH", "value": payload.branch},
         {"name": "REVISION_ID", "value": str(payload.revision_id)},
         {"name": "REVISION_NUMBER", "value": str(payload.revision_number)},

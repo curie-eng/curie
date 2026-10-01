@@ -431,6 +431,7 @@ class GitHubPublicationLookup:
         expected_head_sha: str,
         authorization_header: str,
         draft: bool = False,
+        base: str | None = None,
     ) -> PublicationPullState | None:
         """Adopt a PR, or create it only when its deterministic branch exists."""
 
@@ -442,7 +443,7 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub deterministic-head recovery expected commit is invalid"
             )
-        default_branch = await self._default_branch(
+        default_branch = base or await self._default_branch(
             repo_full_name,
             authorization_header=authorization_header,
         )

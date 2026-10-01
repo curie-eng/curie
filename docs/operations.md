@@ -965,6 +965,28 @@ api:
       pendingCheckPrefix: "Python pytest (shard "
 ```
 
+The branch a factory ticket starts from and targets is set per repository with
+`api.githubFactoryBases` (API env `GITHUB_FACTORY_BASES`, a JSON object, default
+`{}`, checked at boot). Each key is an `owner/name`, matched case-insensitively;
+each value is `{"bases": [...], "default_base": "..."}`. `bases` is a non-empty
+list of unique allowed branches. `default_base` must be one of them and defaults
+to the repository default branch. A repository without an entry may only use its
+default branch. A ticket picks a base with a `base:<branch>` issue label; with no
+label it uses the default. Two `base:` labels, a base outside `bases`, or a base
+that does not exist are refused with an issue comment, and no other branch is
+substituted. The base is frozen when the work item is created: a later label
+change is ignored. The status comment shows it on a `Base:` line, for example
+``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
+chose it.
+
+```yaml
+api:
+  githubFactoryBases:
+    curie-eng/curie:
+      bases: [main, next]
+      default_base: next
+```
+
 When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
 on its `Details:` line.

@@ -1258,6 +1258,13 @@ api:
   # repository without an entry is judged on its own checks. Rendered as JSON
   # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
   githubFactoryPythonCi: {}
+  # Bases a factory ticket may start from and target (#3095, ADR 0186), keyed
+  # by owner/name: {bases: [branch, ...], default_base: branch}. A ticket picks
+  # one with a `base:<branch>` label; with none it uses default_base, or the
+  # repository default branch when default_base is unset. A repository without
+  # an entry may only use its default branch. Rendered as JSON into
+  # GITHUB_FACTORY_BASES.
+  githubFactoryBases: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed

@@ -270,8 +270,12 @@ async def _admit(
             ):
                 await session.rollback()
                 return False
-            await github_factory.verify_current(notice, settings=settings, client=client)
-            outcome = await github_factory.admit_notice(session, notice, settings)
+            verified = await github_factory.verify_current(
+                notice, settings=settings, client=client
+            )
+            outcome = await github_factory.admit_notice(
+                session, notice, settings, verified, client
+            )
         except (FeedbackUnavailable, FeedbackIgnored) as exc:
             await session.rollback()
             logger.info(

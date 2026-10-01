@@ -666,6 +666,16 @@ class WorkItem(Base):
             "AND readmit_objective IS NOT NULL)",
             name="work_items_readmit_ck",
         ),
+        CheckConstraint(
+            "(base_branch IS NULL AND base_source IS NULL AND base_commit IS NULL) OR "
+            "(base_branch IS NOT NULL AND base_source IS NOT NULL "
+            "AND base_commit IS NOT NULL)",
+            name="work_items_base_ck",
+        ),
+        CheckConstraint(
+            "base_source IS NULL OR base_source IN ('label', 'default')",
+            name="work_items_base_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -696,6 +706,19 @@ class WorkItem(Base):
     )
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved for that deferred relabel (ADR 0186). It replaces the
+    # recorded base only when the replacement request is admitted.
+    readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved at admission and frozen for every later run (ADR
+    # 0186). All three are NULL on a legacy row, which uses the repository
+    # default branch. ``base_label_ignored`` is the branch a later ``base:``
+    # label names when it disagrees with the recorded one.
+    base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(

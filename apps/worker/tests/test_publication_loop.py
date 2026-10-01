@@ -430,8 +430,9 @@ class _GitHub:
         expected_head_sha: str,
         authorization_header: str,
         draft: bool = False,
+        base: str | None = None,
     ) -> Any | None:
-        del draft
+        del draft, base
         self.authorization_headers.append(authorization_header)
         self.recover_calls.append((repo_full_name, branch, expected_head_sha))
         if expected_head_sha != self.recovered_head_sha:

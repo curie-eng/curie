@@ -128,6 +128,7 @@ api:
   GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
   GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
+  GITHUB_FACTORY_BASES: api.githubFactoryBases
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel
   GITHUB_FACTORY_MENTION: api.githubFactoryMention

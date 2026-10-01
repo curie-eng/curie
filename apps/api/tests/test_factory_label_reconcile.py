@@ -76,7 +76,13 @@ class GitHubAPI:
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"id": REPO_ID, "full_name": REPO})
+            return httpx.Response(
+                200, json={"id": REPO_ID, "full_name": REPO, "default_branch": "main"}
+            )
+        if path.startswith(f"/repos/{REPO}/branches/"):
+            # Admission resolves the base and reads its commit (#3095).
+            name = path.removeprefix(f"/repos/{REPO}/branches/")
+            return httpx.Response(200, json={"name": name, "commit": {"sha": "0" * 39 + "1"}})
         if path == f"/repos/{REPO}/issues":
             assert request.url.params.get("labels") == LABEL
             assert request.url.params.get("state") == "open"

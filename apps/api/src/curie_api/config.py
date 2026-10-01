@@ -38,6 +38,18 @@ _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
 
 
+def valid_base_branch(name: Any) -> bool:
+    """A branch name a factory base may use: no whitespace, leading ``-`` or ``..``."""
+
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and not any(char.isspace() for char in name)
+        and not name.startswith("-")
+        and ".." not in name
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -192,6 +204,16 @@ class Settings(BaseSettings):
     github_factory_python_ci: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
         validation_alias="GITHUB_FACTORY_PYTHON_CI",
+    )
+    # Bases a factory ticket may start from and target, per repository
+    # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
+    # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
+    # A ``base:<branch>`` label picks one; no label picks ``default_base``, or
+    # the repository default branch when that is unset. A repository without
+    # an entry may only use its default branch. Empty by default.
+    github_factory_bases: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_BASES",
     )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
@@ -749,6 +771,38 @@ class Settings(BaseSettings):
                 )
             policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
         return policies
+
+    @field_validator("github_factory_bases", mode="before")
+    @classmethod
+    def _validate_factory_bases(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
+        entries: dict[str, dict[str, Any]] = {}
+        for repo, entry in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
+            if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
+                raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")
+            bases = entry.get("bases")
+            if (
+                not isinstance(bases, list)
+                or not bases
+                or not all(valid_base_branch(base) for base in bases)
+                or len(set(bases)) != len(bases)
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].bases must be a non-empty list of"
+                    " unique branch names"
+                )
+            default_base = entry.get("default_base")
+            if default_base is not None and default_base not in bases:
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].default_base must be one of its bases"
+                )
+            entries[repo] = {"bases": list(bases), "default_base": default_base}
+        return entries
 
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
