@@ -916,3 +916,13 @@ The one-command pre-release gate:
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 ```
+
+### Human turn progress
+
+Tool progress and possible-change warnings on stderr describe actions in plain
+language. MCP identifiers use the action suffix as a bounded label; missing or
+malformed identifiers use `action`. Generated identifiers in progress text and
+warning details receive the same treatment. Answer text, error diagnostics,
+wire events, JSON results and eval trajectories keep their original content.
+A possible-change warning does not claim that a call succeeded or that its
+result was committed. Quiet mode continues to suppress progress notes.
