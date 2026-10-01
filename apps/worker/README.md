@@ -856,7 +856,9 @@ another victim or schedule work.
 The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
 roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
 separate limit counts at most 256 matching route keys before filtering, so
-suspended routes count toward it, and at most four candidates are probed. A
+suspended routes count toward it, and at most four candidates are probed.
+Candidates are probed idle eval routes first (conversation ids with the `eval:`
+isolate prefix), then every other route, each group in expiry order. A
 database outside either finite window fails closed. Alert on
 `curie.sandbox.lifecycle` with `operation=reclaim` and
 `outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
