@@ -59,6 +59,26 @@ side-channel injections whose output surfaces on the open `/v1/event` stream (th
 proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
+### Caller feedback
+
+Connector availability notices describe unavailable connected services in plain
+language. Missing sign-in settings, rejected access, invalid connection settings,
+and unsuccessful connection attempts remain distinguishable; notices never show
+connector identifiers, credential environment-variable names, MCP terminology or
+sandbox details. Only observed causes are described. Retry counts may be shown,
+without promising that a retry will succeed.
+
+Technical diagnosis retains the connector name, credential names (never values),
+reason and refusal in logs. The shared connector diagnosis vector continues to
+verify this diagnostic representation. The final reply and tool exclusion hook
+use the caller representation. Recovery removes the notice as before.
+
+Policy refusals and changed approval details describe the action in ordinary
+words. MCP names use their last nonempty suffix, underscores and hyphens become
+spaces, and camel case becomes words; Bash and Skill are shell and instruction
+requests. Invalid labels fall back to “action”. Refusals still prevent execution,
+never mint an approval for a policy denial and never spend a mismatched grant.
+
 At boot, the runner snapshots held credential values before hosted connector
 environment cleanup. A common outbound boundary replaces those exact values,
 their standard and URL-safe base64 forms when that encoding is at least 8 characters, and recognized secret patterns
