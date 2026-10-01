@@ -1849,6 +1849,41 @@ pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
     }
 }
 
+/// The percent-encoded request path for firing a hook:
+/// `/agents/{agent}/hooks/{name}/fire`.
+///
+/// Segments are pushed through [`reqwest::Url::path_segments_mut`], the same
+/// encoding `control_schedule` uses, so an agent name holding `#` or `?`
+/// cannot truncate the path or leak into the query string (#3731). A name
+/// without reserved characters encodes to itself. `commands::hook_fire_path`
+/// renders the same string for `--dry-run`, so the plan shows the path the
+/// request really uses.
+pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
+    hook_agent_path(agent, name, &["fire"])
+}
+
+/// The percent-encoded request path for reading one hook run:
+/// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
+pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
+    hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// Percent-encode an agent hook path by pushing each segment through a
+/// throwaway URL, mirroring how `control_schedule` builds its request URL.
+fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments.push("agents").push(agent).push("hooks").push(name);
+        for segment in tail {
+            segments.push(segment);
+        }
+    }
+    url.path().to_string()
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -3210,14 +3245,11 @@ impl ApiClient {
 
     /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
     pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let url =
+            reqwest::Url::parse(&format!("{}{}", self.base_url, hook_fire_path(agent, name)))?;
         let resp = self
             .send_request(
-                self.http
-                    .post(format!(
-                        "{}/agents/{agent}/hooks/{name}/fire",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.post(url).header("X-API-Key", &self.api_key),
                 "POST /agents/{agent}/hooks/{name}/fire",
             )
             .await?;
@@ -3235,14 +3267,14 @@ impl ApiClient {
         name: &str,
         run_id: &str,
     ) -> Result<HookFireRecord> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_run_path(agent, name, run_id)
+        ))?;
         let resp = self
             .send_request(
-                self.http
-                    .get(format!(
-                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.get(url).header("X-API-Key", &self.api_key),
                 "GET /agents/{agent}/hooks/{name}/runs/{id}",
             )
             .await?;
