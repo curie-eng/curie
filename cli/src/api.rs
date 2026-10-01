@@ -1194,6 +1194,12 @@ pub struct KillState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThreadResetState {
     pub requested: bool,
+    /// What the worker found when it drained the reset (#3699): `Some(false)`
+    /// when the key matched no route, so nothing was released; `Some(true)` when
+    /// a route existed and was released; `None` while the reset is pending, when
+    /// the outcome expired, or against an API that predates the field.
+    #[serde(default)]
+    pub route_existed: Option<bool>,
 }
 
 /// The enqueued eval job's identity (`EvalTriggerResult` in openapi.json): the

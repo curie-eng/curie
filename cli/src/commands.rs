@@ -6541,6 +6541,11 @@ pub enum ResetThreadOutput {
         /// release the sandbox within the wait window (#735). False means the
         /// release is still pending -- queued, but not yet confirmed drained.
         released: bool,
+        /// The API reported that the drained reset found a route and released
+        /// it (#3699). `None` when it reported nothing (an older API, or the
+        /// outcome expired, or the release is still pending). A reset that
+        /// matched no route is an error, never a `Done`.
+        route_existed: Option<bool>,
     },
 }
 
@@ -6553,8 +6558,15 @@ impl crate::ui::CliOutput for ResetThreadOutput {
                 thread_key,
                 requested,
                 released,
+                route_existed,
             } => {
-                serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released})
+                let mut out = serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released});
+                // Present only when the API reported the outcome, so an older API
+                // leaves the payload exactly as it was.
+                if let Some(route_existed) = route_existed {
+                    out["route_existed"] = serde_json::json!(route_existed);
+                }
+                out
             }
         }
     }
@@ -6639,9 +6651,13 @@ pub async fn reset_thread(
     // unconfirmed, still pending".
     let wait = cl.step("waiting for the sandbox to be released");
     let deadline = Instant::now() + RESET_RELEASE_TIMEOUT;
+    let mut route_existed = None;
     let released = loop {
         match client.thread_reset_state(&agent.id, &thread_key).await {
-            Ok(state) if !state.requested => break true,
+            Ok(state) if !state.requested => {
+                route_existed = state.route_existed;
+                break true;
+            }
             Ok(_) => {}
             Err(_) => break false,
         }
@@ -6650,6 +6666,19 @@ pub async fn reset_thread(
         }
         tokio::time::sleep(RESET_RELEASE_POLL_INTERVAL).await;
     };
+    // The worker drained the reset but the key matched no route, so nothing was
+    // released and the sandbox the operator meant to free is still claimed
+    // (#3699). Say so rather than print "released".
+    if released && route_existed == Some(false) {
+        wait.fail("no route matched");
+        return Err(crate::exit::CliError::usage(
+            "no route matched this thread key; nothing was released",
+        )
+        .with_fix(
+            "check the thread key; a named bot's key carries its identity as its own segment (kind:identity:channel:conversation)",
+        )
+        .into());
+    }
     if released {
         wait.done("released");
     } else {
@@ -6661,6 +6690,7 @@ pub async fn reset_thread(
         thread_key,
         requested: true,
         released,
+        route_existed,
     })
 }
 
