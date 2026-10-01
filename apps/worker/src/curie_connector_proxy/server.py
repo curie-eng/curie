@@ -294,13 +294,9 @@ class _ToolCall:
     arguments: object
 
 
-def _tool_call(body: bytes) -> _ToolCall | None:
-    """A ``tools/call`` name and its arguments object, or None."""
+def _tool_call(parsed: object) -> _ToolCall | None:
+    """One ``tools/call`` name and its arguments object, or None."""
 
-    try:
-        parsed = json.loads(body)
-    except ValueError:
-        return None
     if not isinstance(parsed, dict) or parsed.get("method") != "tools/call":
         return None
     params = parsed.get("params")
@@ -312,6 +308,31 @@ def _tool_call(body: bytes) -> _ToolCall | None:
     if "arguments" in params:
         return _ToolCall(name=name, arguments=params["arguments"])
     return _ToolCall(name=name, arguments={})
+
+
+def _tool_calls(body: bytes) -> tuple[_ToolCall, ...]:
+    """Tool calls in one JSON object or a top-level JSON array.
+
+    Invalid JSON, and a value that is neither an object nor an array, yields
+    no calls, so the body stays on the forward path. Each array element uses
+    the same per-object rules as a single request.
+    """
+
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return ()
+    if isinstance(parsed, dict):
+        call = _tool_call(parsed)
+        return (call,) if call is not None else ()
+    if not isinstance(parsed, list):
+        return ()
+    found: list[_ToolCall] = []
+    for item in parsed:
+        call = _tool_call(item)
+        if call is not None:
+            found.append(call)
+    return tuple(found)
 
 
 def _is_gated(config: ProxyConfig, name: str) -> bool:
@@ -346,12 +367,18 @@ def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> bool:
 
 
 def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> bool:
-    """True when this admitted POST is a gated tools/call without a live grant."""
+    """True when a gated tools/call in this admitted POST lacks one live grant.
+
+    Two or more gated calls are refused before a grant is spent.
+    """
 
     config = request.app[_CONFIG]
-    call = _tool_call(body)
-    if call is None or not _is_gated(config, call.name):
+    gated = [call for call in _tool_calls(body) if _is_gated(config, call.name)]
+    if not gated:
         return False
+    if len(gated) > 1:
+        return True
+    call = gated[0]
     presented = request.headers.getall(GRANT_HEADER, [])
     if len(presented) != 1:
         return True
