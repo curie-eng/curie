@@ -116,7 +116,7 @@ def lock_process_environ() -> None:
 def proc_dumpable_library() -> str:
     """Constructor library the CLI parent loads. exec clears the environ lock."""
 
-    configured = os.environ.get("CURIE_PROC_DUMPABLE_PRELOAD", "")
+    configured = os.environ.get("CURIE_PROC_DUMPABLE_PRELOAD", "").strip()
     if configured:
         if Path(configured).is_file():
             return configured

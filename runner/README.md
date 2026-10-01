@@ -61,7 +61,7 @@ proven steering pattern). The finish race (a steer arriving as a turn ends,
 
 At boot, the runner snapshots held credential values before hosted connector
 environment cleanup. A common outbound boundary replaces those exact values,
-their standard and URL-safe base64 forms, and recognized secret patterns
+their standard and URL-safe base64 forms when the value is at least 16 characters, and recognized secret patterns
 with placeholders in assistant replies and structured tool results. Protocol
 keys, control metadata and approval argument carriers retain their original
 values. A buffer shared across `TextDelta` chunks protects held values split
