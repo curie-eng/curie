@@ -71,6 +71,7 @@ from .history import (
     resolve_history,
 )
 from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
+from .issue_read import build_issue_tool, resolve_issue_read
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -626,6 +627,9 @@ def build_runner(
     except ValueError as exc:
         logger.warning("report_progress not mounted: %s", exc)
         progress = None
+    # The GitHub factory's issue read (ADR 0187): present only for an execution
+    # with a WorkItem, whose worker injected the route and capability.
+    issue_read = resolve_issue_read(os.environ)
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
     # Per-model token usage for the run's cost line (#3223): reported whenever
@@ -794,6 +798,9 @@ def build_runner(
                     build_progress_tool(progress[1], progress[0], progress_activity)
                     if progress is not None
                     else None
+                ),
+                issue_tool=(
+                    build_issue_tool(*issue_read) if issue_read is not None else None
                 ),
             ),
             **(

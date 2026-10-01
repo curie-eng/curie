@@ -127,8 +127,10 @@ Call report_progress with phase `read_issue`.
 
 Your message is the issue link, for example
 `https://github.com/<owner>/<repo>/issues/<number>`. Read it with the
-`mcp__github__get_issue` tool (`owner`, `repo`, `issue_number`). That tool is
-the only GitHub tool this bundle grants; the repository itself is already
+`mcp__curie__get_issue` tool (`owner`, `repo`, `issue_number`). The platform
+reads the issue for you and returns its title, body and comments verbatim; it
+reads only this run's issue. That tool is the only GitHub tool this bundle has,
+and the sandbox holds no GitHub credential; the repository itself is already
 checked out at `/workspace`.
 
 If the issue cannot be read (the tool is missing, refused, or returns an
@@ -307,11 +309,11 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 (implement), never to the plan. When a reviewer still answers
 `VERDICT: CHANGES` on round 3, or a review fails, do not publish:
 
-1. Post the reviewer's unresolved findings and open questions on the issue
-   with `add_issue_comment`, once, as a short bulleted list a maintainer can
-   answer. This is the only comment you may post.
-2. End your final reply with `Could not complete:`, one sentence naming the
-   loop that did not converge (or the review that failed), and the same list.
+End your final reply with `Could not complete:`, one sentence naming the loop
+that did not converge (or the review that failed), and the reviewer's
+unresolved findings and open questions as a short bulleted list a maintainer
+can answer. The platform posts that reply on the issue; you post nothing
+there yourself.
 
 ## 8. Finish (phase `publish`)
 

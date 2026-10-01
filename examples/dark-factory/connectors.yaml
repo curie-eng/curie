@@ -1,4 +1,4 @@
-# This bundle's stdio MCP servers ship in its own runner layer (ADR 0173), not
+# This bundle's repository toolchains ship in its own runner layer (ADR 0173), not
 # in the platform runner. Build it before deploying:
 #   curie build --plugin-dir <this directory> --registry <ref>
 connectors: {}

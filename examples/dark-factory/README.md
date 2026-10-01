@@ -43,8 +43,9 @@ does not enforce it, and a different bundle can choose differently.
 
 Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
 `wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
-call fails, the run publishes nothing. It posts the reviewer's unresolved
-findings and open questions on the issue and ends with `Could not complete:`.
+call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
+reviewer's unresolved findings and open questions, and the platform's status
+comment on the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not
@@ -75,30 +76,20 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
   gives every session the built-in file tools. The sandbox has no general
   network access. The operator may allow package registry routes for locked
   dependency fetches, and the sandbox holds no push or publication credential.
-- **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
-  `runner.Dockerfile` installs it in a runner layer that `connectors.yaml`
-  declares (ADR 0173). The platform runner does not carry it, so the layer
-  must be built with `curie build` before the deploy (below). The server is
-  authenticated with the bundle's own `GITHUB_PERSONAL_ACCESS_TOKEN`
-  (ADR 0145: reading the ticket is the bundle's job). The manifest's
-  `toolPolicy` allows `github/get_issue` and `github/add_issue_comment`.
-  The review gate hook refuses the comment tool except for one comment on
-  the run's own issue, after a failed or capped review, to post the
-  unresolved findings. Every other GitHub tool, including every other
-  write tool, is denied by the runner, and so is any tool the server adds
-  later.
+- **The issue.** The platform tool `mcp__curie__get_issue` (arguments
+  `owner`, `repo`, `issue_number`), mounted for executions that have a
+  WorkItem. The tool presents an execution scoped capability the API minted
+  for that execution. The API checks that it names this execution and the
+  WorkItem's issue, reads the issue and its comments with the GitHub App
+  installation token (minted fresh per read, so runs longer than one hour
+  keep reading), and returns the title, body, state, author and comments
+  verbatim. It stores nothing. The sandbox holds no GitHub credential at all.
+  A failed or capped review ends the reply with `Could not complete:` and the
+  unresolved findings, and the platform's factory status comment on the issue
+  carries that result.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.
-
-Give the bundle a narrow token: a fine-grained token (or a GitHub App
-installation token) limited to the factory repositories with **Issues: Read
-and write** and nothing else. Write is for the findings comment. With a
-read-only token a capped run still stops and states its findings in its final
-reply, but they do not reach the issue. That token is in the sandbox's
-environment, so any tool in the session can read it. The tool policy limits
-which GitHub MCP tools the agent can call; it does not hide the credential
-from other tools. The token scope is the real bound.
 
 ## Deploy it as the factory agent
 
@@ -132,8 +123,7 @@ helm upgrade curie <chart> -n curie --reuse-values \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
-# Intake, plus runner egress to the GitHub API for the MCP server. On a
-# release with no GitHub App, the first run prints a prefilled App
+# Intake. On a release with no GitHub App, the first run prints a prefilled App
 # registration link (add --org <org> for an organization) and four manual
 # steps, and applies nothing. It never opens a browser. Click Create, copy the
 # App ID, generate a private key, install the App on the repositories, and in
@@ -149,17 +139,15 @@ curie cluster factory
 # curie-github-app (key privateKey) through kubectl stdin; a Secret that
 # holds another App's key is refused. The webhook secret comes from the file
 # (or CURIE_GITHUB_WEBHOOK_SECRET) and is still required until polling intake
-# ships. The egress flag fetches api.github.com/meta and opens the agent's
-# runner egress to the IPv4 api ranges. Before applying anything, the command
-# checks the merged config against the API boot gate and applies nothing if
-# one value is missing. The values survive a later `curie cluster up`.
+# ships. Before applying anything, the command checks the merged config
+# against the API boot gate and applies nothing if one value is missing. The
+# values survive a later `curie cluster up`.
 curie cluster factory \
   --app-id <app-id> --private-key-file ./app.pem \
-  --webhook-secret-file ./webhook-secret \
-  --github-api-egress dark-factory
+  --webhook-secret-file ./webhook-secret
 
-# Build the runner layer that carries the repository toolchains and GitHub MCP
-# server. It records the layer digest in connectors.lock.yaml for deployment.
+# Build the runner layer that carries the repository toolchains only. It
+# records the layer digest in connectors.lock.yaml for deployment.
 # --platform builds only the named declared platform. The default Docker
 # driver can push one platform. A multi-platform push needs
 # `docker buildx create --driver docker-container --use`. Deploy checks that
@@ -167,10 +155,8 @@ curie cluster factory \
 curie build --plugin-dir ./dark-factory --registry <registry-ref> \
   --platform linux/amd64
 
-export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
 curie cluster deploy --plugin-dir ./dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 # Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
 curie cluster budget dark-factory --limit 100
 curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
@@ -204,10 +190,6 @@ Set the App's webhook URL to `<tunnel>/github/webhook`, and pass
 comments resolve. The port-forward and the tunnel both die when the laptop
 sleeps or the api restarts. Restart them, and update the App webhook URL if
 the quick tunnel hostname changed.
-
-For a long-lived laptop install, make the bundle's
-`GITHUB_PERSONAL_ACCESS_TOKEN` a fine-grained PAT. An App installation token
-expires after an hour, which is too short for a run that can last 3 hours.
 
 Before a production factory run resolves dependencies, provide an operator
 controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
@@ -245,11 +227,10 @@ PyPI resolves package metadata through `pypi.org` and downloads artifacts from
 check redirects against its allowed upstream hosts. The `registryEgress` CIDR
 above points only to that proxy. NetworkPolicy matches IP addresses, not
 hostnames, and a shared CDN CIDR can also serve unrelated hosts. Direct CDN
-CIDRs are unsafe for factory runs carrying a GitHub token because dependency
-build scripts or other runner code could send it to an unrelated host on the
-same address range. If the proxy is unavailable, leave registry egress closed
-and report the locked installs as unavailable. The proxy narrows network access
-but does not hide the token from code in the runner. Verify the rendered policy
+CIDRs are unsafe for factory runs because dependency build scripts or other
+runner code could reach unrelated hosts on the same address range. If the
+proxy is unavailable, leave registry egress closed and report the locked
+installs as unavailable. Verify the rendered policy
 selects the `dark-factory` runner pods.
 
 If runs fetch a registry on some attempts and fail with `Failed to connect` on
@@ -270,8 +251,7 @@ toolchain layer or upgrading the platform runner, rebuild and redeploy:
 curie build --plugin-dir ./dark-factory --registry <registry-ref> \
   --platform linux/amd64
 curie cluster deploy --plugin-dir ./dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 ```
 
 The build updates the layer digest, and the deploy selects that digest.

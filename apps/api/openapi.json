@@ -4372,6 +4372,184 @@
         "title": "HookSecretOut",
         "type": "object"
       },
+      "IssueReadComment": {
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          }
+        },
+        "required": [
+          "author",
+          "created_at",
+          "body"
+        ],
+        "title": "IssueReadComment",
+        "type": "object"
+      },
+      "IssueReadContext": {
+        "description": "The execution scoped capability and the one issue it names.",
+        "properties": {
+          "capability": {
+            "title": "Capability",
+            "type": "string"
+          },
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          },
+          "issue_number": {
+            "title": "Issue Number",
+            "type": "integer"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "execution_request_id",
+          "repo_full_name",
+          "issue_number",
+          "capability"
+        ],
+        "title": "IssueReadContext",
+        "type": "object"
+      },
+      "IssueReadContextMint": {
+        "additionalProperties": false,
+        "description": "Trusted worker identity for one factory execution's issue read (ADR 0187).",
+        "properties": {
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_request_id"
+        ],
+        "title": "IssueReadContextMint",
+        "type": "object"
+      },
+      "IssueReadRequest": {
+        "additionalProperties": false,
+        "description": "The issue the sandbox asks for. Anything but the capability's is refused.",
+        "properties": {
+          "issue_number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Issue Number",
+            "type": "integer"
+          },
+          "repo_full_name": {
+            "maxLength": 512,
+            "minLength": 3,
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "issue_number"
+        ],
+        "title": "IssueReadRequest",
+        "type": "object"
+      },
+      "IssueReadResult": {
+        "description": "The issue verbatim. The platform parses and stores none of it.",
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "comments": {
+            "items": {
+              "$ref": "#/components/schemas/IssueReadComment"
+            },
+            "title": "Comments",
+            "type": "array"
+          },
+          "comments_truncated": {
+            "title": "Comments Truncated",
+            "type": "boolean"
+          },
+          "issue_number": {
+            "title": "Issue Number",
+            "type": "integer"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "issue_number",
+          "title",
+          "body",
+          "state",
+          "author",
+          "comments",
+          "comments_truncated"
+        ],
+        "title": "IssueReadResult",
+        "type": "object"
+      },
       "KillState": {
         "description": "Whether an agent is currently killed (kill switch, L1).",
         "properties": {
@@ -16045,6 +16223,65 @@
         ]
       }
     },
+    "/v1/internal/work-items/issue-read/context": {
+      "post": {
+        "operationId": "mint_issue_read_context_v1_internal_work_items_issue_read_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueReadContextMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueReadContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Issue Read Context",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
     "/v1/internal/work-items/requests/{request_id}": {
       "get": {
         "operationId": "get_work_item_request_v1_internal_work_items_requests__request_id__get",
@@ -17362,6 +17599,65 @@
           }
         },
         "summary": "List Work Items",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/issue-read": {
+      "post": {
+        "operationId": "read_work_item_issue_work_items_issue_read_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Issue-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Issue-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueReadResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Work Item Issue",
         "tags": [
           "work-items"
         ]

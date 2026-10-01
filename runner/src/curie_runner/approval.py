@@ -229,6 +229,9 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # The live-status-card progress tool (#3077), mounted on the same server only
 # when the worker injected a progress URL and token.
 PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
+# The GitHub factory's platform issue read (ADR 0187), mounted on the same
+# server only when the worker injected the issue read route and capability.
+ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -259,9 +262,10 @@ PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
 # exempting its name costs nothing, and making the exemption depend on the
 # pager decision would add a second way for the two to disagree. The same
 # reasoning covers ``report_progress`` (#3077), mounted only for a factory
-# execution: it reports a phase and never acts, so it is never gated.
+# execution: it reports a phase and never acts, so it is never gated. So does
+# ``get_issue`` (ADR 0187): it reads only the execution's own issue.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
-    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME, PROGRESS_TOOL_NAME}
+    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME, PROGRESS_TOOL_NAME, ISSUE_TOOL_NAME}
 )
 
 # Platform-owned remote-development publication gate.  This is deliberately
@@ -417,6 +421,7 @@ def build_approval_server(
     managed_workspace: bool = False,
     include_request_approval: bool = True,
     progress_tool: SdkMcpTool[Any] | None = None,
+    issue_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -440,6 +445,9 @@ def build_approval_server(
 
     ``progress_tool`` (#3077) is the ``report_progress`` tool, appended when the
     runner resolved a progress URL, token and phase declaration.
+
+    ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
+    execution with a WorkItem, when the worker injected its read capability.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -470,6 +478,8 @@ def build_approval_server(
     tools.append(publish_changes)
     if progress_tool is not None:
         tools.append(progress_tool)
+    if issue_tool is not None:
+        tools.append(issue_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,

@@ -141,6 +141,9 @@ class _WorkItems:
         if self.after_finish is not None:
             await self.after_finish()
 
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 7", f"wir.capability-for-{request_id}"
+
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
             self.calls.append(name)

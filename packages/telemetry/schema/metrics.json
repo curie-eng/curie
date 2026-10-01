@@ -1277,6 +1277,7 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -1285,6 +1286,7 @@
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
           "/work-items",
+          "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
           "unmatched"
@@ -1310,7 +1312,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4480
+      "cardinality_bound": 4560
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1423,6 +1425,7 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -1431,6 +1434,7 @@
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
           "/work-items",
+          "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
           "unmatched"
@@ -1456,7 +1460,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4480
+      "cardinality_bound": 4560
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1569,6 +1573,7 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -1577,6 +1582,7 @@
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
           "/work-items",
+          "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
           "unmatched"
@@ -1595,7 +1601,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 896
+      "cardinality_bound": 912
     },
     "curie.background.loop": {
       "type": "counter",

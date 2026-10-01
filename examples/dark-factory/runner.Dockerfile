@@ -1,4 +1,4 @@
-# Layers this bundle's repository tools and stdio MCP server onto the platform runner.
+# Layers this bundle's repository toolchains onto the platform runner.
 # The base is a build argument, never a tag written in this file. The platform
 # image already supplies Python 3.13 and Node 22. External images resolve for
 # the target platform, so their binaries match both amd64 and arm64 builds.
@@ -16,7 +16,6 @@ COPY --from=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake pkg-config \
     && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 RUN npm install -g --ignore-scripts pnpm@9.15.9
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=${HOME}/.cargo

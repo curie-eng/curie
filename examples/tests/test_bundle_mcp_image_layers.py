@@ -83,9 +83,8 @@ def _runner_layer_errors(text: str, commands: set[str], bundle_name: str) -> lis
 
 def test_bundle_mcp_servers_are_installed_by_bundle_runner_layers() -> None:
     declared = _declared_commands()
-    assert set(declared) == {"github-issues", "dark-factory", "mean-tester"}
+    assert set(declared) == {"github-issues", "mean-tester"}
     assert declared["github-issues"] == {"mcp-server-github"}
-    assert declared["dark-factory"] == {"mcp-server-github"}
     assert declared["mean-tester"] == {"slack-mcp", "mcp-server-github"}
     for name, commands in declared.items():
         text = (EXAMPLES / name / "runner.Dockerfile").read_text()
@@ -113,9 +112,10 @@ def test_bundle_mcp_servers_are_installed_by_bundle_runner_layers() -> None:
         unauthorized_pnpm, {"mcp-server-github"}, "github-issues"
     )
     dark_factory = (EXAMPLES / "dark-factory" / "runner.Dockerfile").read_text()
+    # The factory reads its issue through the platform (ADR 0187); its layer
+    # carries toolchains only.
+    assert _runner_layer_errors(dark_factory, set(), "dark-factory") == []
     unpinned_pnpm = dark_factory.replace(
         _DARK_FACTORY_PNPM_INSTALL, "RUN npm install -g --ignore-scripts pnpm"
     )
-    assert _runner_layer_errors(
-        unpinned_pnpm, {"mcp-server-github"}, "dark-factory"
-    )
+    assert _runner_layer_errors(unpinned_pnpm, set(), "dark-factory")

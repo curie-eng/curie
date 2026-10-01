@@ -543,6 +543,38 @@
           ],
           "title": "History Token"
         },
+        "issue_read_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ISSUE_READ_TOKEN",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Issue Read Token"
+        },
+        "issue_read_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ISSUE_READ_URL",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Issue Read Url"
+        },
         "max_turns": {
           "anyOf": [
             {
@@ -1788,6 +1820,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.9",
-  "title": "ACI Protocol v0.5.9"
+  "protocolVersion": "0.5.10",
+  "title": "ACI Protocol v0.5.10"
 }

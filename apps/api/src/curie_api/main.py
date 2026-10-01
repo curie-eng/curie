@@ -67,6 +67,7 @@ from .routers import (
     runs,
     schedules,
     state,
+    work_item_issue,
     work_item_outcomes,
     work_items,
     workspaces,
@@ -416,6 +417,8 @@ def create_app() -> FastAPI:
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(work_item_issue.router)
+    app.include_router(work_item_issue.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
     app.include_router(work_item_outcomes.router)
