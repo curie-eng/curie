@@ -163,6 +163,8 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
 # secret split across two blocks is still matched whole: the unbroken text is
 # scrubbed, and breaks are placed into that result.
 _BLOCK_BREAK = "\n\n"
+# Consecutive refused breaks after which the rest of a text gets none.
+_MAX_REJECTED_BREAKS = 4
 
 
 class OutboundRedactor:
@@ -232,6 +234,7 @@ class OutboundRedactor:
         parts: list[str] = []
         cursor = 0
         offset = 0
+        rejected = 0
         for at in breaks:
             prior = text[at - 1] if at else before
             if (
@@ -242,8 +245,15 @@ class OutboundRedactor:
             ):
                 continue
             head = self._text(text[cursor:at])
-            if not scrubbed.startswith(head, offset):
+            # Past the end of the scrub means a placeholder took the rest.
+            if offset + len(head) >= len(scrubbed) or not scrubbed.startswith(head, offset):
+                # Each rejection rescans a longer head, so a run of them inside
+                # one long match stops placing breaks rather than going quadratic.
+                rejected += 1
+                if rejected >= _MAX_REJECTED_BREAKS:
+                    break
                 continue
+            rejected = 0
             parts.extend((head, _BLOCK_BREAK))
             cursor = at
             offset += len(head)
