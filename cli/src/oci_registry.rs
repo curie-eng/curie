@@ -182,6 +182,56 @@ pub struct Manifest {
 /// bytes, and a by-digest fetch whose bytes do not hash to it fails.
 pub async fn fetch_manifest(image: &str) -> Result<Manifest> {
     let parsed = parse(image)?;
+    let response = registry_get(
+        image,
+        &parsed,
+        "manifests",
+        &parsed.reference,
+        MANIFEST_ACCEPT,
+    )
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("the registry could not serve the manifest of {image}: HTTP {status}");
+    }
+    let raw = read_capped(response, image).await?;
+    let digest = sha256_digest(&raw);
+    if parsed.is_digest() && digest != parsed.reference {
+        bail!(
+            "the registry served bytes for {image} that hash to {digest}, not the requested \
+             digest"
+        );
+    }
+    Ok(Manifest { digest, raw })
+}
+
+/// Fetch the blob `digest` from `image`'s repository under the same transport,
+/// redirect, and anonymous-bearer rules as [`fetch_manifest`], refusing bytes
+/// that do not hash to `digest`.
+pub async fn fetch_blob(image: &str, digest: &str) -> Result<Vec<u8>> {
+    let parsed = parse(image)?;
+    let response = registry_get(image, &parsed, "blobs", digest, "*/*").await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("the registry could not serve blob {digest} of {image}: HTTP {status}");
+    }
+    let raw = read_capped(response, image).await?;
+    let actual = sha256_digest(&raw);
+    if actual != digest {
+        bail!("the registry served blob bytes for {image} that hash to {actual}, not {digest}");
+    }
+    Ok(raw)
+}
+
+/// GET `/v2/<repo>/<kind>/<reference>`, answering an anonymous bearer
+/// challenge once if the registry sends one.
+async fn registry_get(
+    image: &str,
+    parsed: &ImageRef,
+    kind: &str,
+    reference: &str,
+    accept: &str,
+) -> Result<reqwest::Response> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -196,16 +246,13 @@ pub async fn fetch_manifest(image: &str) -> Result<Manifest> {
         .build()
         .context("building the registry client")?;
     let url = format!(
-        "{}://{}/v2/{}/manifests/{}",
+        "{}://{}/v2/{}/{kind}/{reference}",
         parsed.scheme(),
         parsed.api_host(),
         parsed.repository,
-        parsed.reference
     );
     let get = |token: Option<&str>| {
-        let mut request = client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT);
+        let mut request = client.get(&url).header(reqwest::header::ACCEPT, accept);
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
@@ -226,22 +273,10 @@ pub async fn fetch_manifest(image: &str) -> Result<Manifest> {
                      anonymous bearer token"
                 )
             })?;
-        let token = anonymous_token(&client, &challenge, &parsed, image).await?;
+        let token = anonymous_token(&client, &challenge, parsed, image).await?;
         response = get(Some(&token)).await.with_context(unreachable)?;
     }
-    let status = response.status();
-    if !status.is_success() {
-        bail!("the registry could not serve the manifest of {image}: HTTP {status}");
-    }
-    let raw = read_capped(response, image).await?;
-    let digest = sha256_digest(&raw);
-    if parsed.is_digest() && digest != parsed.reference {
-        bail!(
-            "the registry served bytes for {image} that hash to {digest}, not the requested \
-             digest"
-        );
-    }
-    Ok(Manifest { digest, raw })
+    Ok(response)
 }
 
 /// The parameters of a `WWW-Authenticate: Bearer ...` challenge.

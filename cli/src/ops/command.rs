@@ -396,6 +396,17 @@ impl SecretValuesFileGuard {
         Self::write_document(&nest_dotted_keys(pairs))
     }
 
+    /// Write a complete values document into a fresh private (0600) temp file
+    /// a caller passes to helm with `-f`. Removed on drop or signal.
+    pub(crate) fn private_document(doc: &serde_json::Value) -> Result<Self> {
+        Self::write_document(doc)
+    }
+
+    /// Where the private values file lives.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     fn write_document(doc: &serde_json::Value) -> Result<Self> {
         ensure_secret_signal_cleanup()?;
         let body = serde_json::to_vec(doc).context("serializing secret helm values")?;

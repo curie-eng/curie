@@ -46,6 +46,7 @@ use curie::commands::{
     WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
+use curie::factory_intake::FactoryIntakeOutput;
 use curie::github_app::GithubAppOutput;
 use curie::installation::ApplyOutput;
 use curie::local::{
@@ -630,6 +631,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => GithubAppOutput::DryRun(plan()),
             "Done" => GithubAppOutput::Done { configured: true },
+        ],
+    );
+    m.insert(
+        "FactoryIntakeOutput",
+        samples![
+            "DryRun" => FactoryIntakeOutput::DryRun(plan()),
+            "Done" => FactoryIntakeOutput::Done { enabled: true },
         ],
     );
     m.insert(

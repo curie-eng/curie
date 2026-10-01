@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/factory/v1.json",
+  "title": "curie cluster factory --json",
+  "description": "The agent-facing payload of `curie cluster factory`: the dry-run plan, or whether the GitHub factory intake is now enabled. Never carries the webhook secret.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "factory_intake_enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "factory_intake_enabled"
+      ]
+    }
+  ]
+}
