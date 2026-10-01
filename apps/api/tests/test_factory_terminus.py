@@ -416,6 +416,25 @@ class _GitHubComments(BaseHTTPRequestHandler):
             present.update(names)
             self._send(200, [{"name": value} for value in sorted(present)])
             return
+        rerun = re.fullmatch(
+            rf"/repos/{re.escape(REPO)}/actions/runs/([0-9]+)/rerun-failed-jobs", path
+        )
+        if rerun is not None:
+            # Re-run failed jobs in one workflow run. 201 Created on success.
+            # Default 403 so a suite that does not opt in keeps today's path.
+            # https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+            run_id = int(rerun.group(1))
+            server.reruns.append(run_id)
+            server.requests.append(("POST", path, None))
+            if path in server.lost_response_paths:
+                server.lost_response_paths.discard(path)
+                self.close_connection = True
+                return
+            status = (
+                server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
+            )
+            self._send(status, {} if status == 201 else {"message": "refused"})
+            return
         server.requests.append(("POST", path, payload.get("body", "")))
         if server.by_path:
             refused = server.refuse_paths.get(path)
@@ -468,6 +487,10 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
+        # #3741. 403 matches a token with no Actions write permission.
+        self.rerun_status = 403
+        self.rerun_statuses: list[int] = []
+        self.reruns: list[int] = []
 
         # Statuses the next PATCHes answer with instead of editing (#3077).
         self.patch_statuses: list[int] = []
