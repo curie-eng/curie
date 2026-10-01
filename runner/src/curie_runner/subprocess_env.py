@@ -130,9 +130,13 @@ def proc_dumpable_library(source: Mapping[str, str]) -> str:
     library_dir = Path(tempfile.mkdtemp(prefix="curie-proc-dumpable-"))
     library = library_dir / "libproc_dumpable.so"
     c_source = Path(__file__).with_name("proc_dumpable.c")
+    # connect has already cleared os.environ. gcc needs PATH to find cc1.
+    compile_env = dict(source)
+    compile_env.setdefault("PATH", "/usr/bin:/bin")
     subprocess.run(
         ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(c_source)],
         check=True,
+        env=compile_env,
     )
     return str(library)
 
