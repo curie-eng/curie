@@ -97,7 +97,11 @@ tags: at least `work_item`, `execution_request`, `repo`, `agent`, `role`,
 `phase` and `loop_round`. The contract defines no cost buckets. Grouping
 phases into buckets is plugin configuration, shipped with a default mapping to
 planning, plan review, implementation and implementation review, and changeable
-without a contract version. Adding a tag is a minor version; removing or
+without a contract version. The default mapping goes by phase, not by role:
+every token spent while a review phase is current counts as review, and when a
+review sends work back, the fixes made in the following implementation or
+planning round count as implementation or planning. Tokens with no phase are
+reported in an unattributed bucket. Adding a tag is a minor version; removing or
 retyping one is a major version.
 
 This needs one open source change below the port: usage must be attributed to
