@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -46,7 +46,7 @@ from .github_review_events import (
     parse_feedback,
 )
 from .github_review_truth import get_github_json, github_headers
-from .models import FactoryPollCursor, ThreadPublicationLineage, WorkItem
+from .models import ExecutionRequest, FactoryPollCursor, ThreadPublicationLineage, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
 from .workspace_policy import repository_is_allowed
 
@@ -133,12 +133,48 @@ def _label_names(issue: dict[str, Any]) -> set[str] | None:
     return names
 
 
-def _last_kind(events: list[Any], kind: str) -> dict[str, Any] | None:
+def _last_kind(
+    events: list[Any], kind: str, *, label: str | None = None
+) -> dict[str, Any] | None:
     found: dict[str, Any] | None = None
     for event in events:
-        if isinstance(event, dict) and event.get("event") == kind:
-            found = event
+        if not isinstance(event, dict) or event.get("event") != kind:
+            continue
+        if label is not None:
+            raw = event.get("label")
+            if not isinstance(raw, dict) or raw.get("name") != label:
+                continue
+        found = event
     return found
+
+
+async def _label_already_admitted(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    repository_id: int,
+    number: int,
+    event: dict[str, Any],
+) -> bool:
+    """True when this label event is not newer than the work item's latest request.
+
+    Requests admitted through a webhook use the delivery id, not the timeline
+    event id. Treating that same label as a new admission would cancel the
+    live run. A later label event still readmits.
+    """
+
+    event_at = _parse_time(event.get("created_at"))
+    if event_at is None:
+        return False
+    async with sessionmaker() as session:
+        item = await github_factory.work_item_for(session, repository_id, number)
+        if item is None or item.cancelled_at is not None:
+            return False
+        latest = await session.scalar(
+            select(ExecutionRequest.created_at)
+            .where(ExecutionRequest.work_item_id == item.id)
+            .order_by(desc(ExecutionRequest.sequence))
+            .limit(1)
+        )
+    return latest is not None and event_at <= latest
 
 
 async def poll_once(
@@ -390,6 +426,8 @@ async def _admit_labeled(
             label=label,
             label_event_id=event["id"],
         )
+        if await _label_already_admitted(sessionmaker, repository_id, number, event):
+            continue
         await _apply_notice(sessionmaker, settings, client, notice, admit=True)
     if etag:
         cursor.etags["issues"] = etag
@@ -439,7 +477,7 @@ async def _cancel_stale(
         else:
             continue
         events = await _events(client, api=api, token=token, repo_path=repo_path, number=number)
-        event = _last_kind(events, kind)
+        event = _last_kind(events, kind, label=label if kind == "unlabeled" else None)
         if event is None:
             continue
         sender = _human_actor(event)
@@ -504,6 +542,9 @@ async def _admit_mentions(
     if listed is None:
         return
     factory_issues = await _issue_numbers(sessionmaker, repository_id)
+    owned_pulls = set(
+        await _open_pulls(sessionmaker, repo, repository_id)
+    )
     for comment in listed:
         if not isinstance(comment, dict):
             continue
@@ -519,8 +560,34 @@ async def _admit_mentions(
             not isinstance(body, str)
             or type(comment_id) is not int
             or number is None
-            or number not in factory_issues
-            or not mentions_login(body, settings.github_factory_mention)
+            or not body.strip()
+        ):
+            continue
+        if number in owned_pulls:
+            pull = await _pull(
+                client, api=api, token=token, repo_path=repo_path, number=number
+            )
+            await _admit_one_feedback(
+                sessionmaker,
+                settings,
+                client,
+                event="issue_comment",
+                payload={
+                    "action": "created",
+                    "installation": {"id": installation_id},
+                    "repository": _repository_payload(repository_id, repo),
+                    "sender": comment.get("user"),
+                    "issue": {
+                        "number": number,
+                        "state": pull.get("state"),
+                        "pull_request": {},
+                    },
+                    "comment": comment,
+                },
+            )
+            continue
+        if number not in factory_issues or not mentions_login(
+            body, settings.github_factory_mention
         ):
             continue
         sender_id, sender_login = sender
@@ -598,12 +665,12 @@ async def _admit_one_feedback(
     async with sessionmaker() as session:
         try:
             await admit_parsed_feedback(session, feedback, settings=settings, client=client)
-        except FeedbackIgnored:
-            await session.rollback()
-            return
         except FeedbackUnavailable:
             await session.rollback()
             raise
+        except FeedbackIgnored:
+            await session.rollback()
+            return
         await session.commit()
 
 
@@ -743,12 +810,12 @@ async def _apply_notice(
                 await github_factory.admit_notice(session, notice, settings)
             else:
                 await github_factory.cancel_notice(session, notice)
-        except FeedbackIgnored:
-            await session.rollback()
-            return
         except FeedbackUnavailable:
             await session.rollback()
             raise
+        except FeedbackIgnored:
+            await session.rollback()
+            return
         await session.commit()
 
 
