@@ -1649,6 +1649,27 @@
       },
       "cardinality_bound": 1
     },
+    "curie.state.mutation": {
+      "type": "counter",
+      "unit": "{mutation}",
+      "description": "Agent state and memory entries removed or rewritten.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "op": [
+          "delete",
+          "edit"
+        ],
+        "namespace": [
+          "memory",
+          "transcript",
+          "other"
+        ]
+      },
+      "cardinality_bound": 6
+    },
     "curie.work_item.reconciler.step.failure": {
       "type": "counter",
       "unit": "{failure}",

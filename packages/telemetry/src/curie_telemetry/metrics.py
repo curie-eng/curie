@@ -405,6 +405,14 @@ _BACKGROUND_AGE_ATTRIBUTES = {
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
 _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# Removals and rewrites of an agent's stored state (#3673). Namespaces are
+# caller-chosen, so every one the platform does not own shares ``other``; the
+# agent, scope and key are in the log line, never on the metric.
+_STATE_MUTATION_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "op": ["delete", "edit"],
+    "namespace": ["memory", "transcript", "other"],
+}
 _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "step": [
@@ -645,6 +653,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Agents whose connector applies the reconciler is skipping.",
         False,
         _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
+    ),
+    "curie.state.mutation": _definition(
+        "counter",
+        "{mutation}",
+        "Agent state and memory entries removed or rewritten.",
+        True,
+        _STATE_MUTATION_ATTRIBUTES,
     ),
     "curie.work_item.reconciler.step.failure": _definition(
         "counter",

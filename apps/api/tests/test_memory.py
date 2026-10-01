@@ -797,3 +797,104 @@ def test_overlapping_operator_creates_both_persist(
         "operator",
         "operator",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Who removed what (#3673)
+# --------------------------------------------------------------------------- #
+_STATE_MUTATION_LOGGER = "curie_api.state_mutation"
+
+
+def _mutation_records(caplog: Any) -> list[Any]:
+    return [r for r in caplog.records if r.name == _STATE_MUTATION_LOGGER]
+
+
+def test_deleting_a_memory_entry_records_who_removed_which(
+    client: Any, auth_headers: dict[str, str], clean_db: None, caplog: Any
+) -> None:
+    aid = _agent(client, auth_headers)
+    for c in ("lesson-a", "lesson-b-secret", "lesson-c"):
+        _remember(client, auth_headers, aid, {"content": c})
+    listed = _memory(client, auth_headers, aid)
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        d = client.delete(
+            f"/agents/{aid}/memory/1",
+            params={"expected_version": listed[0]["version"]},
+            headers=auth_headers,
+        )
+    assert d.status_code == 204, d.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    assert records[0].state_mutation == {
+        "op": "delete",
+        "agent_id": aid,
+        "scope": "shared",
+        "namespace": "memory",
+        "key": "log",
+        "index": 1,
+        "removed": True,
+        "principal": "platform",
+    }
+    message = records[0].getMessage()
+    for part in ("op=delete", f"agent_id={aid}", "namespace=memory", "index=1", "removed=true"):
+        assert part in message, message
+    assert "lesson-b-secret" not in message
+
+
+def test_editing_a_memory_entry_records_which_entry_changed(
+    client: Any, auth_headers: dict[str, str], clean_db: None, caplog: Any
+) -> None:
+    aid = _agent(client, auth_headers)
+    _remember(client, auth_headers, aid, {"content": "old-secret-lesson"})
+    listed = _memory(client, auth_headers, aid)
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        r = client.put(
+            f"/agents/{aid}/memory/0",
+            json={"content": "new-secret-lesson", "expected_version": listed[0]["version"]},
+            headers=auth_headers,
+        )
+    assert r.status_code == 200, r.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    assert records[0].state_mutation == {
+        "op": "edit",
+        "agent_id": aid,
+        "scope": "shared",
+        "namespace": "memory",
+        "key": "log",
+        "index": 0,
+        "principal": "platform",
+    }
+    message = records[0].getMessage()
+    assert "op=edit" in message and "index=0" in message
+    assert "old-secret-lesson" not in message
+    assert "new-secret-lesson" not in message
+
+
+def test_a_refused_memory_delete_records_nothing(
+    client: Any, auth_headers: dict[str, str], clean_db: None, caplog: Any
+) -> None:
+    # A stale version or an out-of-range index is refused before anything is
+    # touched, so there is no mutation to attribute.
+    aid = _agent(client, auth_headers)
+    _remember(client, auth_headers, aid, {"content": "a"})
+    listed = _memory(client, auth_headers, aid)
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        missing = client.delete(
+            f"/agents/{aid}/memory/9",
+            params={"expected_version": listed[0]["version"]},
+            headers=auth_headers,
+        )
+        stale = client.delete(
+            f"/agents/{aid}/memory/0",
+            params={"expected_version": listed[0]["version"] + 5},
+            headers=auth_headers,
+        )
+    assert missing.status_code == 404
+    assert stale.status_code == 409
+    assert _mutation_records(caplog) == []
