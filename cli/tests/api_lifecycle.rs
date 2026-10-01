@@ -144,6 +144,131 @@ async fn thread_reset_state_decodes_whether_the_reset_matched_a_route() {
     }
 }
 
+/// Percent-decode a recorded wire path segment the way the platform API's
+/// router decodes it (Starlette unquotes path params), so a test can assert
+/// on what the API actually received.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// The thread-key segment of a recorded reset request path: whatever sits
+/// between `/threads/` and `/reset`. Panics if the key did not land in that
+/// position, or if it was sent as more than one path segment.
+fn recorded_thread_key_segment(path: &str, agent_id: &str) -> String {
+    let prefix = format!("/agents/{agent_id}/threads/");
+    let segment = path
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix("/reset"))
+        .unwrap_or_else(|| panic!("thread key must sit between /threads/ and /reset: {path}"));
+    assert!(
+        !segment.contains('/'),
+        "thread key must be one path segment, sent: {path}"
+    );
+    segment.to_string()
+}
+
+/// #3727: stored thread keys already carry `%XX` escapes
+/// (`scoped_conversation_id` percent-encodes every component), and the API
+/// decodes escapes when it reads `thread_key`. So the POST must re-escape
+/// the key (`%2F` on the wire as `%252F`) or a GitHub thread key is decoded
+/// into a slash and matches no route, and a mail key decodes into an `@`
+/// and names a thread other than the one the operator asked for.
+#[tokio::test]
+async fn reset_thread_encodes_the_thread_key_as_one_re_escaped_segment() {
+    for (key, wire) in [
+        (
+            "github:curie-eng%2Fcurie:3698",
+            "github:curie-eng%252Fcurie:3698",
+        ),
+        (
+            "email:ops%40example.com:abc",
+            "email:ops%2540example.com:abc",
+        ),
+    ] {
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("POST", _) => Response::json(200, r#"{"requested":true}"#),
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let client = ApiClient::new(&server.base_url, "k").unwrap();
+        let state = client.reset_thread(AGENT_ID, key).await.unwrap();
+        assert!(state.requested, "{key}");
+
+        let rec = server.recorded();
+        assert_eq!(rec.len(), 1, "{key}");
+        assert_eq!(rec[0].method, "POST", "{key}");
+        let segment = recorded_thread_key_segment(&rec[0].path, AGENT_ID);
+        assert_eq!(segment, wire, "{key}: raw wire path: {}", rec[0].path);
+        assert_eq!(percent_decode(&segment), key, "{key}");
+    }
+}
+
+/// The GET poll of the same route must re-escape the key exactly like the
+/// POST (#3727): both verbs target the same stored key, so both must send
+/// it as one percent-encoded path segment.
+#[tokio::test]
+async fn thread_reset_state_encodes_the_thread_key_as_one_re_escaped_segment() {
+    for (key, wire) in [
+        (
+            "github:curie-eng%2Fcurie:3698",
+            "github:curie-eng%252Fcurie:3698",
+        ),
+        (
+            "email:ops%40example.com:abc",
+            "email:ops%2540example.com:abc",
+        ),
+    ] {
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", _) => Response::json(200, r#"{"requested":false,"route_existed":true}"#),
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let client = ApiClient::new(&server.base_url, "k").unwrap();
+        let state = client.thread_reset_state(AGENT_ID, key).await.unwrap();
+        assert!(!state.requested, "{key}");
+
+        let rec = server.recorded();
+        assert_eq!(rec.len(), 1, "{key}");
+        assert_eq!(rec[0].method, "GET", "{key}");
+        let segment = recorded_thread_key_segment(&rec[0].path, AGENT_ID);
+        assert_eq!(segment, wire, "{key}: raw wire path: {}", rec[0].path);
+        assert_eq!(percent_decode(&segment), key, "{key}");
+    }
+}
+
+/// #3727: a plain Slack key keeps today's wire form byte-for-byte. Only
+/// characters that would decode into a different string or split the path
+/// get escaped, so `:`, `.` and the digits pass through untouched and the
+/// mock server sees the exact path the pre-fix `format!` produced.
+#[tokio::test]
+async fn reset_thread_sends_a_plain_slack_key_exactly_as_today() {
+    let key = "slack:C0EXAMPLE1:1700000000.000100";
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", p) if *p == format!("/agents/{AGENT_ID}/threads/{key}/reset") => {
+            Response::json(200, r#"{"requested":true}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let state = client.reset_thread(AGENT_ID, key).await.unwrap();
+    assert!(state.requested);
+}
+
 #[tokio::test]
 async fn delete_agent_issues_a_delete() {
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
