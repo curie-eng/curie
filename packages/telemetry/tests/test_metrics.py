@@ -342,9 +342,10 @@ def test_retry_metrics_separate_bounded_retry_causes(
             "runner-timeout",
             "workspace-error",
             "sandbox-terminated",
+            "sandbox-capacity",
         ],
     }
-    assert queue["cardinality_bound"] == 12
+    assert queue["cardinality_bound"] == 14
     record_metric(
         "curie.queue.retry",
         attributes={

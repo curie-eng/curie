@@ -4634,6 +4634,22 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """#3693: a quota refusal on an approval resume is not a runner failure.
+
+    It still retries, but under its own class, and the person is told the
+    agent was at capacity, with no quota detail (#2434).
+    """
+
+    real_record_metric = kernel_module.record_metric
+    recorded: list[tuple[str, dict[str, str]]] = []
+
+    def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        recorded.append((name, dict(attributes or {})))
+        # Delegate so the metric allowlist still validates the new class.
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(kernel_module, "record_metric", spy)
+
     async def go() -> None:
         async with make_harness(
             max_attempts=3,
@@ -4676,10 +4692,20 @@ def test_approval_resume_capacity_retries_then_escalates(
                 (
                     "C1",
                     "p-1",
-                    "curie-turn-failure: runner-error\n\n"
-                    "The run failed (runner-error) after 3 attempt(s). "
+                    "curie-turn-failure: sandbox-capacity\n\n"
+                    "The run failed (sandbox-capacity) after 3 attempt(s). "
+                    "The agent was at capacity, so the approved request did not run. "
+                    "Send it again in a few minutes. "
                     "event_id=approval-example-resolved. Flagging for a human.",
                 )
+            ]
+            reply = h.sink.updates[0][2]
+            for leaked in ("curie-sandbox-quota", "limits.cpu", "quota", "runner-error"):
+                assert leaked not in reply
+            retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
+            assert [attrs["retry_class"] for attrs in retries] == [
+                "sandbox-capacity",
+                "sandbox-capacity",
             ]
             assert h.sink.update_endpoints == [endpoint]
             assert h.substrate.lookup(_thread_key("tApprovalSafeCandidate")) == candidate
