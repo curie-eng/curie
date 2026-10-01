@@ -169,6 +169,22 @@ def _console_origin_rejected() -> HTTPException:
     )
 
 
+def reject_mismatched_console_origin(request: Request) -> None:
+    """Raise 403 unless a safe method or a matching browser origin.
+
+    Shared by ``require_approval_principal`` (only when the console cookie is
+    its sole credential) and ``POST /console/logout`` (the cookie is its only
+    possible credential). Both are unsafe, cookie-authenticated writes that
+    ``SameSite=Strict`` alone does not stop a same-site cross-origin form from
+    making.
+    """
+
+    if request.method.upper() in _SAFE_ORIGIN_METHODS:
+        return
+    if not _same_console_host(_claimed_console_origin(request), _expected_console_origin(request)):
+        raise _console_origin_rejected()
+
+
 async def require_approval_principal(
     approval_id: uuid.UUID,
     request: Request,
@@ -203,11 +219,8 @@ async def require_approval_principal(
     if presented == 0:
         raise _unauthorized()
 
-    if has_cookie and request.method.upper() not in _SAFE_ORIGIN_METHODS:
-        if not _same_console_host(
-            _claimed_console_origin(request), _expected_console_origin(request)
-        ):
-            raise _console_origin_rejected()
+    if has_cookie:
+        reject_mismatched_console_origin(request)
 
     if has_adapter:
         assert x_curie_adapter_principal is not None

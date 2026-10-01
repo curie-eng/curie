@@ -104,6 +104,17 @@ def _cookie(name: str, value: str) -> dict[str, str]:
     return {"Cookie": f"{name}={value}"}
 
 
+def _cookie_with_origin(name: str, value: str, origin: str = "http://testserver") -> dict[str, str]:
+    """A cookie-only credential with the Origin a same-origin browser sends.
+
+    POST /console/logout (#3000) rejects an unsafe, cookie-only write whose
+    Origin does not match this request's host, the same guard
+    require_approval_principal already applies.
+    """
+
+    return {**_cookie(name, value), "Origin": origin}
+
+
 @dataclass
 class Callback:
     """A callback request the IdP sent the browser back with, not yet replayed."""
@@ -968,6 +979,29 @@ def test_principal_endpoint_requires_a_live_session(
     assert oidc_client.get("/console/principal", headers=auth_headers).status_code == 401
 
 
+def test_principal_endpoint_rejects_the_pre_host_prefix_cookie_name(
+    oidc_client: TestClient,
+) -> None:
+    """#3000: a token presented under the retired ``curie_console_session``
+    name (no ``__Host-`` prefix) must not resolve a principal, even though the
+    token itself is live. FastAPI's cookie alias binds only the exact name, so
+    this proves the live token is actually unreachable under the old name
+    rather than merely untested.
+    """
+
+    token = _session_token(_login(oidc_client))
+    legacy_name = SESSION_COOKIE.removeprefix("__Host-")
+    assert legacy_name != SESSION_COOKIE
+
+    response = oidc_client.get("/console/principal", headers=_cookie(legacy_name, token))
+    assert response.status_code == 401, response.text
+
+    # The same live token under the correct name still resolves.
+    assert oidc_client.get(
+        "/console/principal", headers=_cookie(SESSION_COOKIE, token)
+    ).status_code == 200
+
+
 def test_oidc_session_cannot_resolve_an_approval(
     oidc_client: TestClient, idp: TestIdP, auth_headers: dict[str, str]
 ) -> None:
@@ -1523,7 +1557,7 @@ def test_logout_revokes_an_oidc_session(oidc_client: TestClient) -> None:
     headers = _cookie(SESSION_COOKIE, token)
     assert oidc_client.get("/console/principal", headers=headers).status_code == 200
 
-    _assert_logged_out(_logout(oidc_client, headers))
+    _assert_logged_out(_logout(oidc_client, _cookie_with_origin(SESSION_COOKIE, token)))
 
     (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
     assert row["revoked_at"] is not None
@@ -1541,7 +1575,7 @@ def test_logout_revokes_a_login_code_session_without_oidc(
     headers = _cookie(SESSION_COOKIE, token)
     assert plain_client.get("/console/session", headers=headers).status_code == 200
 
-    _assert_logged_out(_logout(plain_client, headers))
+    _assert_logged_out(_logout(plain_client, _cookie_with_origin(SESSION_COOKIE, token)))
 
     (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
     assert row["revoked_at"] is not None
@@ -1555,7 +1589,7 @@ def test_logout_revokes_only_the_presented_session(
     mine = _login_code_session(plain_client, auth_headers)
     theirs = _login_code_session(plain_client, auth_headers)
 
-    _assert_logged_out(_logout(plain_client, _cookie(SESSION_COOKIE, mine)))
+    _assert_logged_out(_logout(plain_client, _cookie_with_origin(SESSION_COOKIE, mine)))
 
     assert (
         plain_client.get("/console/session", headers=_cookie(SESSION_COOKIE, mine)).status_code
@@ -1569,7 +1603,7 @@ def test_logout_revokes_only_the_presented_session(
 
 @pytest.mark.parametrize(
     "headers",
-    [{}, {"Cookie": f"{SESSION_COOKIE}=not-a-session"}],
+    [{}, _cookie_with_origin(SESSION_COOKIE, "not-a-session")],
     ids=["no-cookie", "unknown-token"],
 )
 def test_logout_without_a_live_session_is_idempotent(
@@ -1595,13 +1629,39 @@ def test_logout_twice_with_the_same_token_is_idempotent(
     plain_client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     token = _login_code_session(plain_client, auth_headers)
-    headers = _cookie(SESSION_COOKIE, token)
+    headers = _cookie_with_origin(SESSION_COOKIE, token)
     _assert_logged_out(_logout(plain_client, headers))
     (first,) = _sql("SELECT revoked_at FROM curie.console_sessions")
 
     _assert_logged_out(_logout(plain_client, headers))
     (second,) = _sql("SELECT revoked_at FROM curie.console_sessions")
     assert second["revoked_at"] == first["revoked_at"]
+
+
+def test_logout_rejects_a_mismatched_origin_and_leaves_the_session_live(
+    plain_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """#3000: SameSite=Strict does not stop a same-site cross-origin form, so a
+    cookie-only logout also requires a matching Origin, exactly as
+    require_approval_principal already does.
+    """
+
+    token = _login_code_session(plain_client, auth_headers)
+    headers = _cookie(SESSION_COOKIE, token)
+    assert plain_client.get("/console/session", headers=headers).status_code == 200
+
+    rejected = plain_client.post(
+        "/console/logout", headers={**headers, "Origin": "https://sibling.example"}
+    )
+    assert rejected.status_code == 403, rejected.text
+    assert rejected.headers.get("cache-control") == "no-store"
+
+    # Not revoked: the mismatched-origin attempt never touched the session.
+    assert plain_client.get("/console/session", headers=headers).status_code == 200
+    assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
+
+    # The same request with a matching Origin still logs out.
+    _assert_logged_out(_logout(plain_client, _cookie_with_origin(SESSION_COOKIE, token)))
 
 
 def test_logout_does_not_accept_the_platform_key_as_a_session(
