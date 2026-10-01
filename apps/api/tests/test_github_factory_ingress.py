@@ -73,6 +73,12 @@ class GitHubAPI:
         self.issue_number = 0
         self.label_event_ids: dict[int, int] = {}
 
+    def advance_label_event(self, number: int) -> None:
+        """Record a newer labeled timeline event. A relabel webhook reads it."""
+
+        current = self.label_event_ids.get(number, 810000 + number)
+        self.label_event_ids[number] = current + 1
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == f"/repos/{REPO}":
@@ -93,10 +99,7 @@ class GitHubAPI:
             )
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
-            # Each read is a newer timeline event. A second labeled webhook is a
-            # relabel. One webhook reads the list once.
-            event_id = self.label_event_ids.get(number, 810000 + number) + 1
-            self.label_event_ids[number] = event_id
+            event_id = self.label_event_ids.get(number, 810000 + number)
             return httpx.Response(
                 200,
                 json=[

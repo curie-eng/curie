@@ -623,6 +623,7 @@ def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
 
 def _label(client: Any, github: GitHubAPI, number: int) -> None:
     github.issue_number = number
+    github.advance_label_event(number)
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted"
