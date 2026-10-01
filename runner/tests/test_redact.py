@@ -36,6 +36,7 @@ from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.redact import (
     REDACTION_BOUNDARIES,
     REDACTION_RULES,
+    OutboundRedactor,
     install_stdout_redaction,
     redact_span_attribute,
     redact_text,
@@ -695,6 +696,59 @@ def test_http_reply_keeps_the_authoritative_result_unchanged(
 
     assert _assistant_text(frames) == "Looking.\n\nDone."
     assert frames[-1]["text"] == "Done."
+
+
+def _redacted_turn(
+    held: frozenset[str], blocks: list[str], final_text: str
+) -> tuple[str, str]:
+    """The streamed text and the final text one turn's redactor emits."""
+
+    redactor = OutboundRedactor(held)
+    lines: list[str] = []
+    for block in blocks:
+        lines.extend(redactor.push(json.dumps({"type": "text_delta", "text": block})))
+    lines.extend(
+        redactor.push(json.dumps({"type": "final", "status": "done", "text": final_text}))
+    )
+    frames = [json.loads(line) for line in lines]
+    return _assistant_text(frames), frames[-1]["text"]
+
+
+def test_block_break_final_scrubs_a_pattern_cut_by_a_held_prefix() -> None:
+    """#3694 review: the final is scrubbed whole, not as its streamed chunks.
+
+    The reply ends in characters that open a held value, so the stream holds
+    that tail back as its own chunk and the key pattern spans the cut.
+    """
+
+    block = "Your key: sk-proj-1234567890abcd"
+    _, final = _redacted_turn(frozenset({"abcdHELDVALUE0000"}), [block], block)
+
+    assert "sk-proj" not in final
+    assert "[REDACTED:" in final
+
+
+def test_block_break_never_splits_a_pattern_secret() -> None:
+    """#3694 review: a break inside a pattern match would let both halves out."""
+
+    blocks = ["The key is sk-", "proj0123456789abcdefXYZ"]
+    stream, final = _redacted_turn(
+        frozenset({"sk-ant-oat01-HELDVALUE0000"}), blocks, "".join(blocks)
+    )
+
+    assert "proj0123456789abcdefXYZ" not in stream
+    assert "proj0123456789abcdefXYZ" not in final
+
+
+def test_block_break_reaches_a_final_led_by_a_connector_notice() -> None:
+    """The DONE final may carry the connector notice ahead of the streamed text."""
+
+    stream, final = _redacted_turn(
+        frozenset(), ["First.", "Second."], "Connector notice.\n\nFirst.Second."
+    )
+
+    assert stream == "First.\n\nSecond."
+    assert final == "Connector notice.\n\nFirst.\n\nSecond."
 
 
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
