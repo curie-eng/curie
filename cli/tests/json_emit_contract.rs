@@ -1039,9 +1039,28 @@ fn reset_thread_output_json_shape_is_pinned() {
             thread_key: "t-1".to_string(),
             requested: true,
             released: true,
+            route_existed: None,
         }
         .to_json(),
         json!({"agent": "weather", "thread_key": "t-1", "requested": true, "released": true})
+    );
+    // #3699: the key appears only when the API reported the outcome.
+    assert_eq!(
+        ResetThreadOutput::Done {
+            agent: "weather".to_string(),
+            thread_key: "t-1".to_string(),
+            requested: true,
+            released: true,
+            route_existed: Some(true),
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "thread_key": "t-1",
+            "requested": true,
+            "released": true,
+            "route_existed": true
+        })
     );
 }
 

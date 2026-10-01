@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 
 from curie_api.threadkeys import route_thread_key
-from curie_api.threadreset import THREAD_RESET_INFLIGHT_SET, THREAD_RESET_SET
+from curie_api.threadreset import (
+    THREAD_RESET_INFLIGHT_SET,
+    THREAD_RESET_RESULT_PREFIX,
+    THREAD_RESET_SET,
+)
 
 _VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
@@ -15,6 +19,7 @@ _EXPECTED_KEYS = {
     "comment",
     "thread_reset_set",
     "thread_reset_inflight_set",
+    "thread_reset_result_prefix",
     "thread_key_examples",
 }
 _EXAMPLE_KEYS = {"kind", "adapter", "channel", "conversation_id", "thread_key"}
@@ -35,6 +40,7 @@ def test_thread_reset_keys_match_the_frozen_vector() -> None:
     )
     assert parsed["thread_reset_set"] == THREAD_RESET_SET
     assert parsed["thread_reset_inflight_set"] == THREAD_RESET_INFLIGHT_SET
+    assert parsed["thread_reset_result_prefix"] == THREAD_RESET_RESULT_PREFIX
 
 
 def test_the_api_builds_every_frozen_thread_key() -> None:

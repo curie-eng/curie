@@ -8,7 +8,11 @@ from urllib.parse import quote
 
 from aci_protocol import QueuedTurn, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY, route_identity
-from curie_worker.consumer import THREAD_RESET_INFLIGHT_SET, THREAD_RESET_SET
+from curie_worker.consumer import (
+    THREAD_RESET_INFLIGHT_SET,
+    THREAD_RESET_RESULT_PREFIX,
+    THREAD_RESET_SET,
+)
 from curie_worker.kernel import _thread_key_for
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
@@ -16,6 +20,7 @@ _EXPECTED_KEYS = {
     "comment",
     "thread_reset_set",
     "thread_reset_inflight_set",
+    "thread_reset_result_prefix",
     "thread_key_examples",
 }
 _EXAMPLE_KEYS = {"kind", "adapter", "channel", "conversation_id", "thread_key"}
@@ -30,6 +35,7 @@ def test_thread_reset_keys_match_the_frozen_vector() -> None:
     )
     assert parsed["thread_reset_set"] == THREAD_RESET_SET
     assert parsed["thread_reset_inflight_set"] == THREAD_RESET_INFLIGHT_SET
+    assert parsed["thread_reset_result_prefix"] == THREAD_RESET_RESULT_PREFIX
     examples = parsed["thread_key_examples"]
     assert examples, "the vector must freeze at least one scoped thread-key example"
     for example in examples:
