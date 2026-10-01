@@ -38,6 +38,7 @@ from .approvals import ApprovalClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
+    ChannelPortFileClient,
     SlackFileClient,
 )
 from .binding import BindingResolver
@@ -422,11 +423,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # The credential condition is separate and unchanged: the lane's single job
-    # is to download a referenced file with the bot token, and the kernel treats a wired lane as
-    # authoritative, so a credential-less install (compose smoke, a mail-only
-    # deployment) must keep running every turn exactly as it does today rather
-    # than failing on the first message that carries a file.
+    # The credential condition is separate: the lane downloads a referenced
+    # file with a Slack bot token, or with a channel-port adapter's secret
+    # (ADR-0153), and the kernel treats a wired lane as authoritative. An
+    # install holding neither (compose smoke) keeps running every turn exactly
+    # as it does today rather than failing on the first message with a file.
+    # An install holding only one gets a lane whose other client is None, and
+    # a file on that other kind is refused by name.
     #
     # It parks bytes in the PRIVATE workspace store, never the public bundle
     # bucket -- under its own ``attachments/`` key prefix, with its retention
@@ -458,10 +461,19 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
                 for name, token in slack_tokens.items()
                 if name != DEFAULT_IDENTITY
             },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.adapter_credentials
+                else None
+            ),
             objects=workspace_objects,
             limits=_attachment_limits(config),
         )
-        if config.attachment_enabled and any(slack_tokens.values())
+        if config.attachment_enabled
+        and (any(slack_tokens.values()) or bool(config.adapter_credentials))
         else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
