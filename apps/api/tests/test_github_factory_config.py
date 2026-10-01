@@ -14,6 +14,8 @@ _FACTORY_ENV = (
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_WEBHOOK_SECRET",
     "GITHUB_REPO_ALLOWLIST",
+    "GITHUB_FACTORY_RECONCILE_INTERVAL_S",
+    "GITHUB_FACTORY_RECONCILE_GRACE_S",
 )
 
 
@@ -62,6 +64,55 @@ def test_enabled_factory_ingress_accepts_complete_configuration() -> None:
 
     assert settings.github_factory_label == "factory"
     assert settings.github_factory_mention == "curie"
+
+
+_RECONCILE_SETTINGS = (
+    "github_factory_reconcile_interval_s",
+    "github_factory_reconcile_grace_s",
+)
+_RECONCILE_ENV = {
+    "github_factory_reconcile_interval_s": "GITHUB_FACTORY_RECONCILE_INTERVAL_S",
+    "github_factory_reconcile_grace_s": "GITHUB_FACTORY_RECONCILE_GRACE_S",
+}
+
+
+def test_factory_reconcile_settings_default_to_300() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.github_factory_reconcile_interval_s == 300.0
+    assert settings.github_factory_reconcile_grace_s == 300.0
+
+
+@pytest.mark.parametrize("field", _RECONCILE_SETTINGS)
+def test_factory_reconcile_settings_accept_zero(field: str) -> None:
+    settings = Settings(_env_file=None, **{field: 0})
+
+    assert getattr(settings, field) == 0.0
+
+
+@pytest.mark.parametrize("field", _RECONCILE_SETTINGS)
+@pytest.mark.parametrize("value", [-5, -600])
+def test_factory_reconcile_settings_refuse_negative_values(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize("field", _RECONCILE_SETTINGS)
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_factory_reconcile_settings_refuse_non_finite_values(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize("field", _RECONCILE_SETTINGS)
+@pytest.mark.parametrize("value", ["-5", "nan", "inf"])
+def test_factory_reconcile_settings_refuse_the_same_via_the_environment(
+    field: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_RECONCILE_ENV[field], value)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize(
