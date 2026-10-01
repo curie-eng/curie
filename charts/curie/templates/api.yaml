@@ -43,10 +43,13 @@ spec:
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
       annotations:
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+        # Roll the API when the caller public key it renders into every hosted
+        # connector's proxy changes; see curie.connectorCallerChecksumSource.
+        checksum/connector-caller: {{ include "curie.connectorCallerChecksumSource" . | sha256sum }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}

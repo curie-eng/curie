@@ -164,6 +164,9 @@ spec:
         # existingSecret-sourced credential in this chart already has (a
         # secretKeyRef env resolves once at pod start).
         checksum/adapter-credentials: {{ include "curie.adapterCredentialsChecksumSource" . | sha256sum }}
+        # Roll the workers when the caller pair they sign with changes; see
+        # curie.connectorCallerChecksumSource.
+        checksum/connector-caller: {{ include "curie.connectorCallerChecksumSource" . | sha256sum }}
       labels:
         {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}

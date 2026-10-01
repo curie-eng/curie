@@ -1417,6 +1417,73 @@ true
 
 {{/* Keep the historical inline checksum byte-for-byte while also rolling the
      worker when an operator switches the BYO Secret source. */}}
+{{/* The connector caller key pair the release Secret carries (ADR-0168
+     decision 7): the operator's inline halves, or, with
+     security.allowDevDefaults exactly "true" and neither half set, the
+     published dev pair, as every other published dev credential ships (#195).
+     Without a pair the API refuses to render a hosted connector (#3552), so a
+     dev install could deploy no bundle that hosts one. Decided here from the
+     effective value and never written to the release values, so a later
+     sealed `cluster up` sees no recorded pair and mints a fresh one. The seed
+     is the 32 ASCII bytes `curie-dev-connector-caller-seed!`;
+     cli/tests/connector_caller_dev_pair.rs proves the public half is its
+     Ed25519 public key. */}}
+{{- define "curie.connectorCallerDevSigningKey" -}}Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE={{- end -}}
+
+{{- define "curie.connectorCallerDevVerifyKey" -}}tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c={{- end -}}
+
+{{/* Refuse to leave dev mode with no replacement pair while the release Secret
+     still holds the published one. The api and worker would roll onto no key,
+     but hosted connector proxies already rendered keep trusting the published
+     key, and #3552's refusal stops the reconciler from re-rendering them, so
+     published credentials would stay accepted. Supplying any pair, or naming
+     an existingSecret, lets the upgrade through and rolls the api and worker
+     onto it; a sealed `cluster up` supplies a generated one. A rendered proxy
+     moves to the new key when it is next rendered: the next `cluster deploy`
+     of its agent, or the next pass when worker.connectorReconciler is on. */}}
+{{- define "curie.connectorCallerRefuseKeylessDevExit" -}}
+{{- $caller := .root.Values.connectorCaller | default dict -}}
+{{- $live := "" -}}
+{{- if hasKey .existingData "connectorCallerVerifyKey" -}}
+{{- $live = index .existingData "connectorCallerVerifyKey" | b64dec -}}
+{{- end -}}
+{{- if and (eq $live (include "curie.connectorCallerDevVerifyKey" .root)) (eq (include "curie.connectorCallerVerifyKey" .root) "") (eq ((get $caller "existingSecret") | default "") "") -}}
+{{- fail "connectorCaller: leaving dev defaults would remove the published dev caller pair with no replacement, and hosted connector proxies already running would keep trusting it. Set connectorCaller.signingKey and connectorCaller.verifyKey (or connectorCaller.existingSecret), or run `curie cluster up`, which generates a pair, then redeploy each agent that hosts a connector so its proxy moves to the new key." -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.connectorCallerSigningKey" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- $signing := (get $caller "signingKey") | default "" -}}
+{{- $verify := (get $caller "verifyKey") | default "" -}}
+{{- if and (eq (toString .Values.security.allowDevDefaults) "true") (eq (toString $signing) "") (eq (toString $verify) "") -}}
+{{- $signing = include "curie.connectorCallerDevSigningKey" . -}}
+{{- end -}}
+{{- $signing -}}
+{{- end -}}
+
+{{- define "curie.connectorCallerVerifyKey" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- $signing := (get $caller "signingKey") | default "" -}}
+{{- $verify := (get $caller "verifyKey") | default "" -}}
+{{- if and (eq (toString .Values.security.allowDevDefaults) "true") (eq (toString $signing) "") (eq (toString $verify) "") -}}
+{{- $verify = include "curie.connectorCallerDevVerifyKey" . -}}
+{{- end -}}
+{{- $verify -}}
+{{- end -}}
+
+{{/* What rolls the api and worker when the caller pair they trust changes.
+     Both read it as env at boot, so leaving dev mode, supplying a first pair,
+     or replacing one would otherwise leave them on the old key, still trusting
+     the published dev pair after dev defaults are off. Public material and
+     references only: the effective public key, the previous one, and the BYO
+     Secret name and keys. A BYO Secret's content rotated in place under the
+     same name still needs a manual rollout, as every existingSecret here does. */}}
+{{- define "curie.connectorCallerChecksumSource" -}}
+{{- $caller := .Values.connectorCaller | default dict -}}
+{{- printf "%s|%s|%s|%s|%s" (include "curie.connectorCallerVerifyKey" .) ((get $caller "previousVerifyKey") | default "") ((get $caller "existingSecret") | default "") ((get $caller "signingKeyKey") | default "") ((get $caller "verifyKeyKey") | default "") -}}
+{{- end -}}
+
 {{- define "curie.adapterCredentialsChecksumSource" -}}
 {{- $creds := include "curie.adapterCredentials" . -}}
 {{- if not (empty .Values.worker.adapterCredentialsExistingSecret) -}}
