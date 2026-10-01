@@ -455,8 +455,9 @@ def test_observe_counts_each_message_id_once() -> None:
 
     The Agent SDK cost guide says that when Claude uses multiple tools in one
     turn, all messages in that turn share the same ID and the same usage, so
-    callers deduplicate by ID. A missing id is not a shared response, so those
-    messages still add.
+    callers deduplicate by ID. The posted reviewer share is that once-count,
+    capped by the result total. A missing id is not a shared response, so
+    those messages still add. A distinct id adds too.
     https://code.claude.com/docs/en/agent-sdk/cost-tracking
     """
 
@@ -470,17 +471,40 @@ def test_observe_counts_each_message_id_once() -> None:
             reporter = UsageReporter(url, TOKEN)
             repeated = _sdk_usage(100, 10, cached=4, write=2)
             for _ in range(3):
-                reporter.observe(_assistant(PRIMARY, repeated, message_id="msg_example_repeat"))
-            reporter.observe(_assistant(PRIMARY, _sdk_usage(7, 1), message_id="msg_example_other"))
+                reporter.observe(
+                    _assistant(
+                        PRIMARY,
+                        repeated,
+                        parent="toolu_example",
+                        message_id="msg_example_repeat",
+                    )
+                )
+            reporter.observe(
+                _assistant(
+                    PRIMARY,
+                    _sdk_usage(7, 1),
+                    parent="toolu_example",
+                    message_id="msg_example_other",
+                )
+            )
+            for _ in range(2):
+                reporter.observe(_assistant(PRIMARY, _sdk_usage(1, 0), parent="toolu_example"))
             await reporter.report(
                 _result(
-                    model_usage={PRIMARY: _model_usage(107, 11, cached=4, write=2)},
+                    model_usage={PRIMARY: _model_usage(200, 20, cached=10, write=4)},
                     uuid="t-dedupe",
                 ),
                 PRIMARY,
             )
             # The seen set is per turn. The same id on the next turn counts again.
-            reporter.observe(_assistant(PRIMARY, _sdk_usage(5, 1), message_id="msg_example_repeat"))
+            reporter.observe(
+                _assistant(
+                    PRIMARY,
+                    _sdk_usage(5, 1),
+                    parent="toolu_example",
+                    message_id="msg_example_repeat",
+                )
+            )
             await reporter.report(
                 _result(model_usage={PRIMARY: _model_usage(5, 1)}, uuid="t-dedupe-next"),
                 PRIMARY,
@@ -491,12 +515,16 @@ def test_observe_counts_each_message_id_once() -> None:
     anyio.run(go)
     assert len(recorder.received) == 2
     got = _by_role_model(recorder.received[0][0])
-    assert set(got) == {("implementer", PRIMARY)}
+    assert set(got) == {("implementer", PRIMARY), ("reviewer", PRIMARY)}
+    assert {k: got[("reviewer", PRIMARY)][k] for k in _wire(0, 0)} == _wire(
+        109, 11, cached=4, write=2
+    )
     assert {k: got[("implementer", PRIMARY)][k] for k in _wire(0, 0)} == _wire(
-        107, 11, cached=4, write=2
+        91, 9, cached=6, write=2
     )
     nxt = _by_role_model(recorder.received[1][0])
-    assert nxt[("implementer", PRIMARY)]["input_tokens"] == 5
+    assert set(nxt) == {("reviewer", PRIMARY)}
+    assert nxt[("reviewer", PRIMARY)]["input_tokens"] == 5
 
 
 def test_shared_model_split_uses_deduplicated_message_counts() -> None:
