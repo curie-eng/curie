@@ -287,6 +287,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
 
+      # Prove the compute-plane PodDisruptionBudgets (issue #1574): off by
+      # default, each enabled budget selects exactly its own Deployment's pods
+      # (a selector mutated onto another component fails the checker), an
+      # unacknowledged blocking budget refuses the render, and the dispatcher
+      # accepts only an acknowledged blocking budget.
+      - name: helm render assertions (compute-plane PodDisruptionBudgets)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/compute-pdb-assertions.sh
+
       - name: helm render assertions (otel collector durable delivery)
         run: |
           set -euo pipefail
