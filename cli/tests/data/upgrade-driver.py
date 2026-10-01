@@ -560,10 +560,12 @@ pod = {
 FIRST_VALUES = {
     "config": {"schemaVersion": "0.8.4"},
     "api": {"extraEnv": [{"name": "FIRST_READ_ONLY", "value": "1"}]},
+    "connectorCaller": {"existingSecret": "acme-caller-pair"},
 }
 DRIFTED_VALUES = {
     "config": {"schemaVersion": "0.8.4"},
     "api": {"extraEnv": [{"name": "SECOND_READ_MUST_NOT_WIN", "value": "1"}]},
+    "connectorCaller": {"existingSecret": "acme-caller-pair"},
 }
 
 HOOK_NAMES = {
