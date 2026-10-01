@@ -6496,6 +6496,14 @@ impl crate::ui::CliOutput for BudgetOutput {
 /// `--dry-run` returns the plan and makes no request.
 pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
     let ui = crate::ui::ui();
+    // Validated before the dry-run early return (#3710): a dry run shows what
+    // the real command would do, so it must refuse a --limit the real command
+    // would refuse instead of printing a plan for it.
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(crate::exit::usage(format!(
+            "--limit must be a finite value greater than 0 (got {limit})"
+        )));
+    }
     if opts.dry_run {
         return Ok(BudgetOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![format!(
@@ -6503,11 +6511,6 @@ pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
                 opts.api_url, opts.agent
             )],
         }));
-    }
-    if !limit.is_finite() || limit <= 0.0 {
-        return Err(crate::exit::usage(format!(
-            "--limit must be a finite value greater than 0 (got {limit})"
-        )));
     }
     let cfg = BudgetConfig {
         max_output_tokens_per_run: None,

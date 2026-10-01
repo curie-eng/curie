@@ -248,6 +248,71 @@ async fn budget_handler_resolves_then_puts_the_limit() {
 }
 
 #[tokio::test]
+async fn budget_dry_run_refuses_a_limit_the_real_command_refuses() {
+    // #3710: a dry run shows what the real command would do, so it must not
+    // report a plan for a --limit the real command would refuse. The limit
+    // validation fires before the dry-run early return, so an invalid limit
+    // never reaches the plan, dry run or not.
+    let server = serve(|req| panic!("budget must not request, got {} {}", req.method, req.path));
+    let base = &server.base_url;
+    for (limit, shown) in [(-5.0, "-5"), (0.0, "0"), (f64::NAN, "NaN")] {
+        let err = commands::budget(opts(base, "deal-desk", true), limit)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "--limit must be a finite value greater than 0 (got {shown})"
+            )),
+            "dry run with {shown}: {err}"
+        );
+        assert_eq!(
+            curie::exit::classify(&err).0,
+            curie::exit::ExitClass::Usage,
+            "dry run with {shown} must exit 2 like the real command"
+        );
+    }
+    // Without --dry-run the refusal is the same error and the same class.
+    let err = commands::budget(opts(base, "deal-desk", false), -5.0)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("--limit must be a finite value greater than 0 (got -5)"),
+        "{err}"
+    );
+    assert_eq!(curie::exit::classify(&err).0, curie::exit::ExitClass::Usage);
+    assert!(
+        server.recorded().is_empty(),
+        "a refused limit must make no request, dry run or not"
+    );
+}
+
+#[tokio::test]
+async fn budget_dry_run_valid_limit_keeps_the_plan() {
+    // #3710: a valid --limit under --dry-run prints the same plan line as
+    // before the fix -- the validation must not change the plan text.
+    let server = serve(|req| panic!("dry-run must not request, got {} {}", req.method, req.path));
+    let base = &server.base_url;
+    let out = commands::budget(opts(base, "deal-desk", true), 5.0)
+        .await
+        .unwrap();
+    match out {
+        commands::BudgetOutput::DryRun(plan) => assert_eq!(
+            plan.lines,
+            vec![format!(
+                "PUT {}/agents/<id>/budget  {{\"max_usd_per_day\":5}}  (would resolve agent {:?} first)",
+                base, "deal-desk"
+            )]
+        ),
+        other => panic!("expected dry run plan, got {other:?}"),
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "budget dry run must make no request"
+    );
+}
+
+#[tokio::test]
 async fn reset_thread_handler_resolves_then_resets_and_waits_for_release() {
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => agent_list(),
