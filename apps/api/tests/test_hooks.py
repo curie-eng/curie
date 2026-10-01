@@ -1194,6 +1194,46 @@ def test_a_previous_signature_scheme_is_refused_before_claim_or_quota(
     assert valkey.xlen(runs_stream) == 1
 
 
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
+def test_a_retired_signature_cannot_reinterpret_body_as_authenticated_context(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    tool_access: str | None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="acme-retired-context")
+    body = b'{"run":"new-body"}'
+    timestamp = _now()
+    delivery_id = "retired-context-1"
+    context = json.dumps(
+        ["issues", tool_access], ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    # The retired signer treated this context frame as ordinary body bytes.
+    # Reusing its signature must not turn those bytes into authenticated fields.
+    old_body = f"{len(context)}:".encode() + context + body
+    old_material = f"{timestamp}.{delivery_id}.".encode() + old_body
+    signature = "sha256=" + hmac.new(
+        _secret_for(agent_id).encode(), old_material, hashlib.sha256
+    ).hexdigest()
+
+    refused = hooks_client.post(
+        f"/hooks/{agent_id}/issues",
+        params={} if tool_access is None else {"tool_access": tool_access},
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Curie-Timestamp": timestamp,
+            "X-Curie-Delivery-Id": delivery_id,
+            "X-Curie-Signature-256": signature,
+        },
+    )
+    assert refused.status_code == 401, refused.text
+    assert valkey.xlen(runs_stream) == 0
+    assert list(valkey.scan_iter(match=f"curie:hook:*:{agent_id}:*")) == []
+
+
 def test_a_retry_re_signed_with_a_fresh_timestamp_is_a_duplicate(
     hooks_client: TestClient,
     auth_headers: dict[str, str],
