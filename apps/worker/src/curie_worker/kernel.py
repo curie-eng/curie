@@ -665,11 +665,13 @@ _CLASSIFICATION_GUIDANCE = {
         "effects; inspect the result. The run can be retried; if one turn is over the "
         "cap, raise api.transcriptMaxThreadBytes (TRANSCRIPT_MAX_THREAD_BYTES)."
     ),
-    # Read by the person who approved. No quota detail (#2434): the worker's
-    # "sandbox capacity exhausted" warning carries it for the operator.
+    # Read by the person who decided the approval. One event id resumes an
+    # approved, a rejected and an expired approval, so it names no decision.
+    # No quota detail (#2434): the worker's "sandbox capacity exhausted"
+    # warning carries it for the operator.
     "sandbox-capacity": (
-        "The agent was at capacity, so the approved request did not run. "
-        "Send it again in a few minutes."
+        "The agent was at capacity, so it could not continue after the approval "
+        "decision. Send the request again in a few minutes if it is still needed."
     ),
 }
 
@@ -3283,7 +3285,7 @@ class Kernel:
                 retryable = retryable and qevent.source is not TurnSource.CRON
                 if not retryable or attempt >= self._config.max_attempts:
                     if (
-                        outcome.classification == "runner-error"
+                        outcome.classification in {"runner-error", "sandbox-capacity"}
                         and termination_detail is not None
                     ):
                         # Keep the final attempt's classification truthful while
