@@ -160,8 +160,8 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
 # The break between two text blocks of one turn (#3694). Each text_delta the
 # runner emits is one whole TextBlock, and consumers join deltas with "", so the
 # boundary is known only here. It is added here rather than in translation so a
-# secret split across two blocks is still matched whole: a break is kept only
-# where it changes nothing the scrub would do to the unbroken text.
+# secret split across two blocks is still matched whole: the unbroken text is
+# scrubbed, and breaks are placed into that result.
 _BLOCK_BREAK = "\n\n"
 
 
@@ -215,28 +215,39 @@ class OutboundRedactor:
     def _scrub_with_breaks(self, text: str, breaks: list[int], before: str) -> str:
         """Scrub ``text``, with a block break at each break that may take one.
 
-        A break is kept only when scrubbing the text on either side of it gives
-        exactly what scrubbing them together gives. With its breaks removed the
-        result is therefore ``_text(text)``, whatever the held values and rules
-        match, including a match that appears only after an earlier replacement.
-        ``before`` is the raw character ahead of ``text``.
+        The whole text is scrubbed once, and a break goes into that result only
+        where the text before it scrubs to exactly the result's next stretch.
+        With its breaks removed the result is ``_text(text)`` by construction,
+        whatever the held values and rules match, so a break can move no secret
+        out of a placeholder. Skipping joins inside a held value or a rule match
+        on the raw text only keeps a break from landing beside a placeholder
+        that covers both blocks. ``before`` is the raw character ahead of
+        ``text``.
         """
 
+        scrubbed = self._text(text)
+        spans = self._literal_intervals(text) + [
+            match.span() for rule in REDACTION_RULES for match in rule.pattern.finditer(text)
+        ]
         parts: list[str] = []
         cursor = 0
-        remaining = self._text(text)
+        offset = 0
         for at in breaks:
             prior = text[at - 1] if at else before
-            if not prior or prior.isspace() or text[at].isspace():
+            if (
+                not prior
+                or prior.isspace()
+                or text[at].isspace()
+                or any(start < at < stop for start, stop in spans)
+            ):
                 continue
             head = self._text(text[cursor:at])
-            tail = self._text(text[at:])
-            if head + tail != remaining:
+            if not scrubbed.startswith(head, offset):
                 continue
             parts.extend((head, _BLOCK_BREAK))
             cursor = at
-            remaining = tail
-        parts.append(remaining)
+            offset += len(head)
+        parts.append(scrubbed[offset:])
         return "".join(parts)
 
     def _stream_text(self, text: str, breaks: list[int]) -> str:
