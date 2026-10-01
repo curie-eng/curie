@@ -111,6 +111,12 @@ class RecordingReader:
     Separate from ``RecordingApprovals`` for the same reason the kernel takes two
     parameters (#1084): most tests need only the create half, and a combined fake
     would make every one of them carry a read they never exercise.
+
+    Those responses answer only for an approval the test has resolved. Until
+    then the record reads back ``pending``, as the API's does, because the pause
+    reads its own record back once its card is registered (#3637). A test that
+    resolves before a resume calls ``resolve`` first, which is the API's order:
+    the row is resolved, then the resume is enqueued.
     """
 
     def __init__(self, *records: SettledApproval | None) -> None:
@@ -119,11 +125,20 @@ class RecordingReader:
         # is how you spell "the read came back empty".
         assert records, "RecordingReader needs at least one record; use RecordingReader(None)"
         self.records = records
+        # Every read, pending or not, in order.
         self.reads: list[str] = []
+        self.resolved: set[str] = set()
+        self._settled_reads = 0
+
+    def resolve(self, approval_id: str) -> None:
+        self.resolved.add(approval_id)
 
     async def get(self, approval_id: str) -> SettledApproval | None:
         self.reads.append(approval_id)
-        return self.records[min(len(self.reads), len(self.records)) - 1]
+        if approval_id not in self.resolved:
+            return SettledApproval(status="pending", resolved_by=None, resolution_note=None)
+        self._settled_reads += 1
+        return self.records[min(self._settled_reads, len(self.records)) - 1]
 
 
 _qevent = functools.partial(qevent, thread="th-appr", received_at="2026-07-14T00:00:00+00:00")
@@ -3823,6 +3838,7 @@ def test_the_resumed_answer_is_posted_below_an_in_thread_card(make_harness) -> N
         thread = "th-order"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             card_index = _card_post_index(h)
             paused_events = len(h.sink.events)
 
@@ -3867,6 +3883,7 @@ def test_the_answer_goes_below_the_card_even_after_the_card_ref_is_consumed(
         thread = "th-order-consumed"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             await h.async_redis.delete(h.config.approval_card_key("appr-1"))
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
@@ -3935,6 +3952,7 @@ def test_a_resume_without_the_memory_edits_the_notice_as_before(make_harness) ->
         thread = "th-order-forgotten"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             assert await h.async_redis.exists(h.config.approval_reply_below_card_key("appr-1"))
             await h.async_redis.delete(h.config.approval_reply_below_card_key("appr-1"))
 
@@ -3984,6 +4002,7 @@ def test_a_card_acknowledged_without_a_ref_keeps_todays_reply(make_harness) -> N
             assert not await h.async_redis.exists(
                 h.config.approval_reply_below_card_key("appr-1")
             )
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -4074,6 +4093,7 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
         thread = "th-resolve-card"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -4099,8 +4119,10 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
             # is exactly what `approval_card` rendered as "Requested by".
             assert settled.requested_by == "U1"
 
-            # The read was keyed off the resume turn's deterministic event id.
-            assert reader.reads == ["appr-1"]
+            # The pause read its record back once the card was registered and
+            # found it pending (#3637); the resume's read was keyed off the
+            # resume turn's deterministic event id.
+            assert reader.reads == ["appr-1", "appr-1"]
 
             # The memory is still consumed, so a later approval cannot collide.
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
@@ -4136,6 +4158,7 @@ def test_a_resolve_resume_carries_the_records_decision_time_to_the_card(
         thread = "th-decided"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
                 _resume_turn(
@@ -4175,6 +4198,7 @@ def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
         thread = "th-unreadable-record"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -4284,6 +4308,7 @@ def test_a_transient_record_read_leaves_the_ref_for_a_later_pass(make_harness) -
         thread = "th-transient-read"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             resume = _resume_turn(
                 "[approval resolved] approved by U9",
@@ -4342,6 +4367,7 @@ def test_a_failed_card_edit_keeps_the_ref_and_a_reclaimed_pass_settles(
         thread = "th-card-edit-recovery"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             key = h.config.approval_card_key("appr-1")
             original_raw = await h.async_redis.get(key)
             assert original_raw is not None
@@ -4400,8 +4426,13 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
     async def go() -> None:
         request_started = asyncio.Event()
         release_response = asyncio.Event()
+        resolved = False
 
         async def hang(_request: web.Request) -> web.Response:
+            # Before the resolve, the pause's read after card registration
+            # (#3637) finds the record pending, as the API answers it.
+            if not resolved:
+                return web.json_response({"status": "pending"})
             request_started.set()
             await release_response.wait()
             return web.json_response(
@@ -4429,6 +4460,7 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
                 ) as h:
                     thread = "th-bounded-approval-read"
                     await _pause_awaiting_approval(h, thread)
+                    resolved = True
                     key = h.config.approval_card_key("appr-1")
                     original_raw = await h.async_redis.get(key)
                     assert original_raw is not None
@@ -4465,6 +4497,156 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
     asyncio.run(go())
 
 
+# --- A verdict that lands before the card is registered (#3637) ----------------
+
+_REJECTED = SettledApproval(
+    status="rejected", resolved_by="U9", resolution_note="not this quarter"
+)
+_EXPIRED = SettledApproval(status="expired", resolved_by=None, resolution_note=None)
+
+
+def _hold_the_card_post(h, monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:  # noqa: ANN001
+    """The external Slack barrier: hold the card post's acknowledgement.
+
+    ``posting`` is set once the card post has been handed to the transport.
+    Until the test sets ``release`` the kernel has no ref for it, so it cannot
+    have registered the card.
+    """
+
+    posting = asyncio.Event()
+    release = asyncio.Event()
+    original_emit = h.sink.emit
+
+    async def held(event: ReplyEvent, **kwargs: Any) -> ReplyAck:
+        if isinstance(event, ReplyPost) and isinstance(event.message.interaction, ConfirmIntent):
+            posting.set()
+            await release.wait()
+        return await original_emit(event, **kwargs)
+
+    monkeypatch.setattr(h.sink, "emit", held)
+    return posting, release
+
+
+def _runs_of(h, text: str) -> int:  # noqa: ANN001
+    """How many times the runner was handed a turn carrying ``text``."""
+
+    return sum(text in opened for opened in h.runner.opened)
+
+
+@pytest.mark.parametrize(
+    ("record", "resume_text", "author", "decision"),
+    [
+        (_APPROVED, "[approval resolved] approved by U9", "U9", "approved"),
+        (_REJECTED, "[approval resolved] rejected by U9", "U9", "rejected"),
+        (_EXPIRED, "[approval expired] not approved in time", "system", None),
+    ],
+    ids=["approved", "rejected", "expired"],
+)
+def test_resolve_before_card_registration_settles_the_card(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    record: SettledApproval,
+    resume_text: str,
+    author: str,
+    decision: str | None,
+) -> None:
+    """#3637: a verdict recorded before the card is registered still settles it.
+
+    The row is durable before any delivery, so an operator can resolve it (or the
+    sweeper expire it) while the card's post is still waiting on Slack. The resume
+    then runs, finds no card ref, and finishes. The card is posted and registered
+    afterwards, so the pause itself must settle it from the durable record.
+
+    THE MUTATION THIS CATCHES: registering the card without reading its record
+    back leaves Approve and Reject live on a decided approval, with its ref
+    stored until the TTL.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(record)
+        thread = f"th-settled-before-card-{record.status}"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            key = h.config.approval_card_key("appr-1")
+            posting, release = _hold_the_card_post(h, monkeypatch)
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            pause = asyncio.create_task(h.kernel.process_event(_qevent("refund?", thread=thread)))
+            await asyncio.wait_for(posting.wait(), timeout=5.0)
+
+            # The session is suspended and its row exists, but its card is not
+            # registered. The verdict lands now and its resume runs to the end.
+            assert not await h.async_redis.exists(key)
+            reader.resolve("appr-1")
+            resume = _resume_turn(resume_text, thread=thread, approval_id="appr-1", author=author)
+            h.runner.default_script = [Final(text="Continued.", status=DONE)]
+            await asyncio.wait_for(h.kernel.process_event(resume), timeout=10.0)
+            assert await h.async_redis.exists(h.config.done_key(resume.event_id))
+            assert h.sink.card_updates == [], "the resume had no registered card to settle"
+
+            # Slack acknowledges the post; the pause registers the card.
+            release.set()
+            await asyncio.wait_for(pause, timeout=10.0)
+
+            assert len(h.sink.card_updates) == 1
+            channel, ts, message, endpoint, settled = h.sink.card_updates[0]
+            assert (channel, ts, endpoint) == ("C1", "posted-1", None)
+            assert message.text == "Refund order 42"
+            assert settled is not None
+            assert settled.decision == decision
+            assert settled.requested_by == "U1"
+            assert settled.resolver == record.resolved_by
+            assert settled.note == record.resolution_note
+            assert not await h.async_redis.exists(key)
+            assert _runs_of(h, resume_text) == 1
+
+            # A redelivered resume stops at its done marker: no second edit and
+            # no second continuation.
+            await h.kernel.process_event(resume)
+            assert len(h.sink.card_updates) == 1
+            assert _runs_of(h, resume_text) == 1
+
+    asyncio.run(go())
+
+
+def test_registration_before_resolve_still_settles_once(make_harness) -> None:
+    """#3637, the ordinary order: a card registered while pending stays live.
+
+    The pause's read back finds the record pending and leaves the card for the
+    resume, which settles it exactly once.
+
+    THE MUTATION THIS CATCHES: settling on anything but a decided record stamps
+    a card nobody has decided, or edits it twice.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-card-before-resolve"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            assert h.sink.card_updates == [], "a pending card must stay live"
+            live = await _peek_card_ref(h, "appr-1")
+            assert live is not None and live["ts"] == "posted-1"
+
+            reader.resolve("appr-1")
+            resume_text = "[approval resolved] approved by U9"
+            resume = _resume_turn(resume_text, thread=thread, approval_id="appr-1", author="U9")
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(resume)
+
+            assert len(h.sink.card_updates) == 1
+            _channel, ts, _message, _endpoint, settled = h.sink.card_updates[0]
+            assert ts == "posted-1"
+            assert settled is not None and settled.decision == "approved"
+            assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
+            assert _runs_of(h, resume_text) == 1
+
+            # The crash-before-done redelivery finds no ref to settle again.
+            await h.async_redis.delete(h.config.done_key(resume.event_id))
+            await h.kernel.process_event(resume)
+            assert len(h.sink.card_updates) == 1
+
+    asyncio.run(go())
+
+
 def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness) -> None:
     """A successful card edit consumes its exact ref before redelivery.
 
@@ -4477,6 +4659,7 @@ def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness)
         thread = "th-redelivered-stamp"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             resume = _resume_turn(
                 "[approval resolved] approved by U9",
@@ -5420,6 +5603,7 @@ def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harnes
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
             await h.kernel.process_event(_email_qevent("send it", thread="th-mail-settle"))
             assert len(h.sink.posts) == 1
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Sent.", status=DONE)]
             await h.kernel.process_event(
@@ -5596,6 +5780,9 @@ def test_three_gate_requester_survives_restart_and_consumed_cards(make_harness) 
                     resolved_at=datetime(2026, 9, 30, 10, index, tzinfo=UTC),
                 )
             )
+            # Only the approval this resume answers is resolved. The one its
+            # continuation raises next is still pending when its card lands.
+            reader.resolve(f"appr-{index}")
             async with make_harness(approvals=approvals, approval_reader=reader) as h:
                 h.runner.default_script = _awaiting_script(f"Next action {index}")
                 await h.kernel.process_event(

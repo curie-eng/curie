@@ -259,6 +259,9 @@ and the requester stay. An approved or rejected card names who decided and when,
 the note under it. The time is a Slack date token, so each reader sees it in their own
 time zone. An expired card states that the request expired without a decision time.
 A resolve from the CLI or the Console settles the card the same way a click does.
+That holds when the decision lands before the card has finished posting: once the
+worker registers the card it reads the approval back, and a decided or expired record
+settles the card there instead of on the resume.
 
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra
