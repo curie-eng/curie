@@ -68,6 +68,16 @@ conversation, reconstructed through the selected harness adapter.
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
+- **A turn's own message.** The user message a turn records is the prompt the
+  runner sent for it, and the attachments a boot found ride on the first prompt
+  that runner sends: the person's text, then a notice naming each file by its
+  absolute path. Later prompts to the same runner carry no notice, because
+  `attachments-init` only runs when a sandbox boots and the worker boots one for
+  every turn that carries a file. The portable prefix and a native checkpoint
+  therefore both show which message carried which files, so a file re-attached
+  under an unchanged name is announced even when this boot's system prompt is
+  the one the checkpoint recorded. The legacy `user` projection stays the
+  person's text.
 - **Append side.** `append(record)` durably writes one turn. A serving runner
   holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
   within its 15 second budget. A dangling denied tool call gets an explicit
