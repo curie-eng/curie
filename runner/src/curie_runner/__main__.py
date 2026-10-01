@@ -84,6 +84,7 @@ from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resol
 from .memory_facts import (
     DEFAULT_GUIDANCE,
     MAX_FACTS_PER_MEMORY,
+    WRITES_OFF_NOTICE,
     Fact,
     MemoryTurn,
     format_facts_preamble,
@@ -612,13 +613,21 @@ def build_runner(
     # which is the only path that mounts platform MCP servers at all. The
     # toolPolicy exemption below reads this same flag, so the claim matches
     # the mount. The guidance block rides with the tools and only with them;
-    # the facts block does not, because reading memory needs no switch.
+    # the facts block does not, because reading memory needs no switch. With
+    # writes off, a short notice takes the guidance's place so the agent never
+    # claims to have saved anything.
     memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
     channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
-    if config.channel_memory_ref and channel_facts_store is None:
-        logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
-    if config.channel_memory_ref and memory_token is None:
-        logger.warning("memory tools not mounted: no memory token")
+    channel_memory_readable = channel_facts_store is not None and memory_token is not None
+    if config.channel_memory_ref and config.memory_writes_on:
+        # These point at a broken config, so they fire only when the tools
+        # would otherwise have mounted.
+        if channel_facts_store is None:
+            logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
+        if memory_token is None:
+            logger.warning("memory tools not mounted: no memory token")
+    elif config.channel_memory_ref and not channel_memory_readable:
+        logger.info("channel facts not loaded: no memory token or unsupported ref scheme")
     memory_tools_mounted = (
         config.memory_writes_on
         and channel_facts_store is not None
@@ -634,7 +643,13 @@ def build_runner(
         attachment_preamble=format_attachment_preamble(attachment_paths),
         progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
         facts_preamble=memory_facts_preamble,
-        guidance_preamble=(memory_guidance or DEFAULT_GUIDANCE) if memory_tools_mounted else None,
+        guidance_preamble=(
+            (memory_guidance or DEFAULT_GUIDANCE)
+            if memory_tools_mounted
+            else WRITES_OFF_NOTICE
+            if channel_memory_readable and not config.memory_writes_on
+            else None
+        ),
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.

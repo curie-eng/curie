@@ -343,10 +343,12 @@ class BootEnv(_AciModel):
     # namespace scoped to the turn's channel binding on the same state API
     # (``.../agents/<id>/state/bindings/<kind>/<address>/memory``), minted from
     # the runner-facing API base like ``memory_ref`` and read and written with
-    # ``memory_token``. The worker sets it only when an operator has turned
-    # memory writes on for the agent and the turn has a binding, and never for
-    # an eval-isolated turn, which carries no memory at all. Its presence is
-    # also the runner's signal to mount the memory tools.
+    # ``memory_token``. The worker sets it whenever the turn has a binding,
+    # whether or not memory writes are on, so channel facts can be read; it
+    # never sets it for an eval-isolated turn, which carries no memory at all.
+    # ``memory_writes`` below decides whether the memory tools mount. A ref
+    # with no ``memory_writes`` means writes on, because only an older worker
+    # sends one without the other.
     channel_memory_ref: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_CHANNEL_MEMORY_REF", "worker")
     )
@@ -471,9 +473,7 @@ class BootEnv(_AciModel):
     #
     # Unset is the pre-#1182 behavior verbatim: the runner sends no thinking
     # configuration and the model's own default stands.
-    thinking: str | None = Field(
-        default=None, json_schema_extra=_env("CURIE_THINKING", "worker")
-    )
+    thinking: str | None = Field(default=None, json_schema_extra=_env("CURIE_THINKING", "worker"))
     # The active deployment's environment (``prod`` or ``dev``, #3166). The
     # runner's telemetry maps it onto the ``deployment.environment.name``
     # resource attribute, which Langfuse stores as the trace ``environment``

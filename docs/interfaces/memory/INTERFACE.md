@@ -111,13 +111,23 @@ platform `curie` server and inject the guidance block (`guidance` if stored,
 else `DEFAULT_GUIDANCE`) before the bundle prompt. Writes are on when
 `CURIE_MEMORY_WRITES` is `1`, or when it is absent and
 `CURIE_CHANNEL_MEMORY_REF` is set (an older worker, which only sent the ref
-with writes on). The
+with writes on). With a channel ref and token but writes off, a short notice
+(`WRITES_OFF_NOTICE`) takes the guidance block's place: saving memory is turned
+off for this agent, nothing said here is kept for later conversations, and the
+agent must never say it saved, noted or will remember something. The
 tools take `memory: agent|channel`; the author is the turn's sender, never a
 tool argument. A write the state API refuses at its cap is reported to the model
 as refused. So is a `remember` into a memory that already holds 200 facts, the
 most boot loads, so no fact silently leaves the prompt; `update` and `forget`
 still work there. The tools are exempt from bundle toolPolicy by published
 name, and the worker leaves them out of change receipts.
+
+Upgrade order: a runner older than `CURIE_MEMORY_WRITES` ignores the flag and
+mounts the memory tools whenever it gets a channel ref. A newer worker sends
+that ref with writes off too, so an older runner behind it would mount the tools
+against the operator's setting. Upgrade runners with or before workers (one
+`helm upgrade` does both), and don't pin runner images separately across this
+change.
 
 ## Known leakage
 

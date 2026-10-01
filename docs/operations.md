@@ -1642,7 +1642,16 @@ curie cluster memory <agent> --reset-guidance
 A new thread picks up changed guidance. A live thread keeps what it booted
 with. `--memory-writes off` unmounts the tools and drops the guidance at the
 next boot. It stops saving only: facts already saved, in agent memory and in
-each channel's memory, are still shown to the agent.
+each channel's memory, are still shown to the agent. Instead of the guidance, the
+agent is told that saving is off, so it doesn't claim to have remembered
+anything.
+
+Upgrade runners with or before workers across this change. An older runner
+doesn't understand `CURIE_MEMORY_WRITES`, so behind a newer worker it would
+mount the memory tools even for an agent with writes off. One `helm upgrade`
+moves both together. Don't pin the runner image (`agentSandbox.runner.digest`
+or a per-agent `agentSandbox.runnerImages` layer) separately from the worker
+while you roll this out.
 
 ### Connecting Slack
 
