@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -749,6 +750,71 @@ def test_block_break_reaches_a_final_led_by_a_connector_notice() -> None:
 
     assert stream == "First.\n\nSecond."
     assert final == "Connector notice.\n\nFirst.\n\nSecond."
+
+
+@pytest.mark.parametrize(
+    ("held", "blocks"),
+    [
+        pytest.param(
+            frozenset({"conn_HELD"}),
+            ["conn_HELDpostgres://app:hunter2", "pass@db/prod"],
+            id="match_appears_after_the_held_value_is_replaced",
+        ),
+        pytest.param(
+            frozenset(),
+            ['eyJhbGc.eyJzdWI.sigvalue"password', '": "hunter2pass"'],
+            id="match_appears_after_an_earlier_rule_runs",
+        ),
+    ],
+)
+def test_block_break_never_splits_a_match_made_while_scrubbing(
+    held: frozenset[str], blocks: list[str]
+) -> None:
+    """#3694 review: a rule can match only after an earlier replacement, so the
+    raw text alone cannot say where a break is safe."""
+
+    _, final = _redacted_turn(held, blocks, "".join(blocks))
+
+    assert "hunter2" not in final
+
+
+def test_block_breaks_add_nothing_but_breaks_to_the_final() -> None:
+    """With its breaks removed, the final is exactly what one unbroken block scrubs to."""
+
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    rng = random.Random(3694)
+
+    def body(size: int) -> str:
+        return "".join(rng.choice(alphabet) for _ in range(size))
+
+    fillers = ["Done.", "Here", " is ", "the", "value", ":", " ", "x", "ok", "-", ".", "_"]
+    for _ in range(400):
+        secrets = [
+            "sk-ant-api03-" + body(24),
+            "ghp_" + body(30),
+            "eyJ" + body(10) + "." + body(10) + "." + body(12),
+            "Bearer " + body(20),
+            "token=" + body(14),
+            "Authorization: Basic " + body(16),
+            "postgres://u:" + body(10) + "@h/db",
+            '"password": "' + body(10) + '"',
+        ]
+        held = frozenset(
+            {rng.choice(secrets) for _ in range(rng.randint(0, 2))}
+            | {rng.choice(secrets)[: rng.randint(1, 6)] + body(8) for _ in range(rng.randint(0, 2))}
+        )
+        text = "".join(
+            rng.choice(fillers) + rng.choice(secrets) + rng.choice(fillers)
+            for _ in range(rng.randint(1, 3))
+        )
+        cuts = sorted(rng.sample(range(1, len(text)), k=rng.randint(1, 4)))
+        blocks = [text[a:b] for a, b in zip([0, *cuts], [*cuts, len(text)], strict=True)]
+        lead = rng.choice(["", "Connector notice.\n\n"])
+
+        _, broken = _redacted_turn(held, blocks, lead + text)
+        _, unbroken = _redacted_turn(held, [lead + text], lead + text)
+
+        assert broken.replace("\n\n", "") == unbroken.replace("\n\n", ""), (held, blocks)
 
 
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
