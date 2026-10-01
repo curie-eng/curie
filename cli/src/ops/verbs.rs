@@ -4088,53 +4088,120 @@ async fn read_direct_passthrough_secret(
     }
 }
 
-/// Build the UI `/api` proxy base URL (`http://<host>:<ui-nodeport>/api`) from
-/// the UI service JSON and a resolved node host, or an actionable usage error.
-/// `cluster deploy` reaches the platform API through this proxy (the UI pod
-/// serves `/api`), so it never falls back to a port-forward.
-fn ui_api_url_from_parts(ui_svc_json: &str, host: Option<&str>) -> Result<String> {
-    match parse_service(ui_svc_json) {
-        Some((svc_type, node_port, _)) if svc_type == "NodePort" => {
-            let np = node_port.ok_or_else(|| {
-                api_url_usage_err(
-                    "the UI service is NodePort but has not been assigned a nodePort yet; wait for the release to settle or pass --api-url to target the API directly",
-                )
-            })?;
-            let host = host.ok_or_else(|| {
-                api_url_usage_err(
-                    "could not determine a node host to reach the UI /api proxy; pass --api-url to target the API directly",
-                )
-            })?;
-            Ok(node_http_url(host, np, "/api"))
-        }
-        Some(_) => Err(api_url_usage_err(
-            "the UI service is not NodePort-exposed (installed with --no-expose?); re-run `cluster up` without --no-expose or pass --api-url to target the API directly",
-        )),
-        None => Err(api_url_usage_err(
-            "could not read the UI service to discover the platform API URL; pass --api-url to target the API directly",
-        )),
-    }
+/// Where the platform API can be reached from outside the cluster (#1130).
+///
+/// One structural answer for both `discover_api_url` and the `cluster
+/// observability` API row, so the two cannot take different fallback paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApiEndpoint {
+    /// The UI's `/api` proxy on the UI Service's NodePort. `cluster deploy`
+    /// historically reached the API this way on a default install.
+    UiProxy(String),
+    /// The api Service's own NodePort. No `/api` suffix: this is the API
+    /// itself, not the UI proxy.
+    ApiNodePort(String),
+    /// A Service was read but neither yields a URL; only a port-forward to the
+    /// api Service reaches it.
+    PortForward(ApiUnreachable),
+    /// Neither Service could be read.
+    Unreadable,
 }
 
-/// Build a direct platform-API base URL from the api service, used when the UI
-/// is not deployed. No `/api` suffix: this is the API itself, not the UI proxy.
-fn api_url_from_parts(api_svc_json: &str, host: Option<&str>) -> Option<String> {
-    match parse_service(api_svc_json) {
-        Some((svc_type, Some(np), _)) if svc_type == "NodePort" => {
-            host.map(|h| node_http_url(h, np, ""))
-        }
+/// Why no NodePort route exists, phrased around the UI Service because that is
+/// the route a default install takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiUnreachable {
+    /// A NodePort route exists but no node host could be determined.
+    NoHost,
+    UiNodePortUnassigned,
+    /// ClusterIP or another non-NodePort type (`--no-expose`).
+    UiNotExposed,
+    UiUnreadable,
+    /// No UI Service (`ui.deploy=false`).
+    UiAbsent,
+}
+
+/// Resolve the platform API endpoint from the UI and api Service JSON (`None`
+/// when kubectl could not read that Service) and the node host. Precedence: UI
+/// NodePort, then api NodePort, then a port-forward hint.
+fn resolve_api_endpoint(ui: Option<&str>, api: Option<&str>, host: Option<&str>) -> ApiEndpoint {
+    let ui_service = ui.map(parse_service);
+    let api_service = api.map(parse_service);
+    let node_port = |service: &Option<Option<(String, Option<u16>, u16)>>| match service {
+        Some(Some((svc_type, Some(np), _))) if svc_type == "NodePort" => Some(*np),
         _ => None,
+    };
+    let (ui_node_port, api_node_port) = (node_port(&ui_service), node_port(&api_service));
+    if let Some(host) = host {
+        if let Some(np) = ui_node_port {
+            return ApiEndpoint::UiProxy(node_http_url(host, np, "/api"));
+        }
+        if let Some(np) = api_node_port {
+            return ApiEndpoint::ApiNodePort(node_http_url(host, np, ""));
+        }
     }
+    if ui.is_none() && api.is_none() {
+        return ApiEndpoint::Unreadable;
+    }
+    if ui_node_port.is_some() || api_node_port.is_some() {
+        return ApiEndpoint::PortForward(ApiUnreachable::NoHost);
+    }
+    ApiEndpoint::PortForward(match ui_service {
+        None => ApiUnreachable::UiAbsent,
+        Some(None) => ApiUnreachable::UiUnreadable,
+        Some(Some((svc_type, _, _))) if svc_type == "NodePort" => {
+            ApiUnreachable::UiNodePortUnassigned
+        }
+        Some(Some(_)) => ApiUnreachable::UiNotExposed,
+    })
+}
+
+/// `discover_api_url`'s reading of an [`ApiEndpoint`]: a URL, or a usage error
+/// in `cluster deploy`'s vocabulary, where `--api-url` is a real escape hatch.
+fn discovered_api_url(
+    endpoint: ApiEndpoint,
+    o: &CommonOpts,
+    fullname: &ReleaseFullname,
+) -> Result<String> {
+    let ui_svc = fullname.resource("ui");
+    let api_svc = fullname.resource("api");
+    // The port-forward hint names 8000:8000, not the old 8123: `cluster
+    // deploy` no longer binds 8123 for its own tunnel, and a hint naming that
+    // exact port would send the operator at the thing #1533 fixed.
+    let api_route = format!(
+        "{api_svc} is not NodePort-exposed either; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{api_svc} {API_SERVICE_PORT}:{API_SERVICE_PORT}`)"
+    );
+    let reason = match endpoint {
+        ApiEndpoint::UiProxy(url) | ApiEndpoint::ApiNodePort(url) => return Ok(url),
+        ApiEndpoint::Unreadable => format!(
+            "could not read the {ui_svc} or {api_svc} service in namespace {} to discover the platform API URL; pass --api-url to target the API directly",
+            o.namespace
+        ),
+        ApiEndpoint::PortForward(ApiUnreachable::NoHost) => {
+            "could not determine a node host to reach the UI /api proxy or the api NodePort; pass --api-url to target the API directly".to_string()
+        }
+        ApiEndpoint::PortForward(ApiUnreachable::UiNodePortUnassigned) => format!(
+            "the UI service is NodePort but has not been assigned a nodePort yet, so wait for the release to settle; {api_route}"
+        ),
+        ApiEndpoint::PortForward(ApiUnreachable::UiNotExposed) => format!(
+            "the UI service is not NodePort-exposed (installed with --no-expose?), so re-run `cluster up` without --no-expose; {api_route}"
+        ),
+        ApiEndpoint::PortForward(ApiUnreachable::UiUnreadable) => {
+            "could not read the UI service to discover the platform API URL; pass --api-url to target the API directly".to_string()
+        }
+        ApiEndpoint::PortForward(ApiUnreachable::UiAbsent) => format!(
+            "the {ui_svc} service is absent (ui.deploy=false?) and {api_route}"
+        ),
+    };
+    Err(api_url_usage_err(reason))
 }
 
 /// Discover the platform API URL for a release.
 ///
-/// Prefers the UI's `/api` proxy, which is how a default install is reached
-/// with no port-forward. Falls back to the api service directly when the UI is
-/// absent: `ui.deploy=false` is a legitimate way to run a Slack-only bot with a
-/// smaller footprint, and it used to break EVERY `cluster` verb -- deploy,
-/// versions, kill, delete -- with an error naming only the UI, which reads like
-/// a broken release rather than a supported configuration (#1068).
+/// Reads the UI and api Services together and resolves them with
+/// [`resolve_api_endpoint`]. `ui.deploy=false` is a legitimate way to run a
+/// Slack-only bot with a smaller footprint, and a UI that is present but not
+/// NodePort-exposed must not hide an api NodePort (#1068, #1130).
 pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> {
     let common = CommonOpts {
         namespace: namespace.to_string(),
@@ -4150,29 +4217,15 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
     // `cluster_observability_endpoints`. Only the Service reads below have to
     // wait for the name.
     let (fullname, host) = tokio::join!(release_fullname(namespace, release), resolve_node_host());
-    let ui_svc = fullname.resource("ui");
-    let api_svc = fullname.resource("api");
-
-    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
-        return ui_api_url_from_parts(&ui_json, host.as_deref());
-    }
-
-    // No UI. The api service may still be reachable on its own NodePort.
-    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, &fullname, "api")).await {
-        if let Some(url) = api_url_from_parts(&api_json, host.as_deref()) {
-            return Ok(url);
-        }
-        // The port-forward hint names 8000:8000, not the old 8123: `cluster
-        // deploy` no longer binds 8123 for its own tunnel, and a hint naming
-        // that exact port would send the operator at the thing #1533 fixed.
-        return Err(api_url_usage_err(format!(
-            "the {ui_svc} service is absent (ui.deploy=false?) and {api_svc} is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{api_svc} 8000:8000`)"
-        )));
-    }
-
-    Err(api_url_usage_err(format!(
-        "could not read the {ui_svc} or {api_svc} service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
-    )))
+    let (ui_svc, api_svc) = tokio::join!(
+        fetch_service(&common, &fullname, "ui"),
+        fetch_service(&common, &fullname, "api"),
+    );
+    discovered_api_url(
+        resolve_api_endpoint(ui_svc.as_deref(), api_svc.as_deref(), host.as_deref()),
+        &common,
+        &fullname,
+    )
 }
 
 /// First node InternalIP from `kubectl get nodes -o json`.
@@ -4420,20 +4473,22 @@ fn port_forward_hint(ns: &str, name: &str, local: u16, port: u16, path: &str) ->
 /// chart). Owned here so the port-forward hint carries no bare literal.
 const API_SERVICE_PORT: u16 = 8000;
 
-/// Map the UI service JSON + node host to the cluster's **API base** endpoint:
-/// the UI `/api` proxy URL (the in-cluster way to reach the platform API, #360),
-/// which is never browsable. Degrades to a `note` endpoint on any error.
+/// Map the UI and api Service JSON + node host to the cluster's **API base**
+/// endpoint through [`resolve_api_endpoint`], the resolver `discover_api_url`
+/// uses. The row is never browsable, and degrades to a `note` when no URL
+/// exists.
 ///
-/// The notes are minted here rather than borrowed from `ui_api_url_from_parts`
-/// on purpose: that helper speaks `cluster deploy`'s error vocabulary, where
-/// `--api-url` is a real escape hatch. `cluster observability` has no such flag,
-/// so its rows must never name it. Instead the row reports the true condition
-/// (`ui` service missing) or hands back an actionable port-forward for the API
+/// The notes are minted here rather than borrowed from `discovered_api_url` on
+/// purpose: that speaks `cluster deploy`'s error vocabulary, where `--api-url`
+/// is a real escape hatch. `cluster observability` has no such flag, so its
+/// rows must never name it. Instead the row reports the true condition (both
+/// Services missing) or hands back an actionable port-forward for the API
 /// service -- plain text, since `--json` serializes this note.
 fn api_base_endpoint(
     o: &CommonOpts,
     fullname: &ReleaseFullname,
     ui_svc_json: Option<&str>,
+    api_svc_json: Option<&str>,
     host: Option<&str>,
 ) -> crate::observability::Endpoint {
     let row = |url, note| crate::observability::Endpoint {
@@ -4442,20 +4497,22 @@ fn api_base_endpoint(
         note,
         browsable: false,
     };
-    let Some(ui_svc_json) = ui_svc_json else {
-        return row(
+    match resolve_api_endpoint(ui_svc_json, api_svc_json, host) {
+        ApiEndpoint::UiProxy(url) | ApiEndpoint::ApiNodePort(url) => row(Some(url), None),
+        ApiEndpoint::Unreadable => row(
             None,
-            Some(format!("service {} not found", fullname.resource("ui"))),
-        );
-    };
-    match ui_api_url_from_parts(ui_svc_json, host) {
-        Ok(url) => row(Some(url), None),
-        // Any other failure -- ClusterIP / `--no-expose` (a supported install
-        // mode), an unassigned nodePort, an unreadable service, or an
-        // unresolvable host -- still leaves a way in: port-forward the API
-        // service directly. The operator copies and runs that line, so it must
-        // name the object the chart actually rendered.
-        Err(_) => row(
+            Some(format!(
+                "services {} and {} not found",
+                fullname.resource("ui"),
+                fullname.resource("api")
+            )),
+        ),
+        // ClusterIP / `--no-expose` (a supported install mode), an unassigned
+        // nodePort, an unreadable service, or an unresolvable host still leave
+        // a way in: port-forward the API service directly. The operator copies
+        // and runs that line, so it must name the object the chart actually
+        // rendered.
+        ApiEndpoint::PortForward(_) => row(
             None,
             Some(port_forward_hint(
                 &o.namespace,
@@ -4527,7 +4584,8 @@ async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str)
 
 /// The cluster tier's three observability surfaces (payload parity with local):
 /// Console via the `ui` service, Langfuse via `langfuse-web`, and the API base
-/// via the UI `/api` proxy. Degrades per endpoint; never hard-fails.
+/// via [`resolve_api_endpoint`] over the `ui` and `api` services. Degrades per
+/// endpoint; never hard-fails.
 pub async fn cluster_observability_endpoints(
     opts: &CommonOpts,
 ) -> Vec<crate::observability::Endpoint> {
@@ -4542,7 +4600,7 @@ pub async fn cluster_observability_endpoints(
     // row. `cluster status` stays human-facing and keeps its display
     // convenience.
     //
-    // Resolved once, before the fan-out: both service reads and all three rows
+    // Resolved once, before the fan-out: every service read and all three rows
     // must agree on the release's rendered name. This is a live path only --
     // `observability`'s `--dry-run` branch returns before reaching here.
     // `resolve_node_host()` needs no fullname, so it runs alongside the
@@ -4551,9 +4609,10 @@ pub async fn cluster_observability_endpoints(
         release_fullname(&opts.namespace, &opts.release),
         resolve_node_host(),
     );
-    let (ui_svc, langfuse_svc) = tokio::join!(
+    let (ui_svc, langfuse_svc, api_svc) = tokio::join!(
         fetch_service(opts, &fullname, "ui"),
         fetch_service(opts, &fullname, "langfuse-web"),
+        fetch_service(opts, &fullname, "api"),
     );
     vec![
         service_surface(
@@ -4574,7 +4633,13 @@ pub async fn cluster_observability_endpoints(
             host.as_deref(),
             false,
         ),
-        api_base_endpoint(opts, &fullname, ui_svc.as_deref(), host.as_deref()),
+        api_base_endpoint(
+            opts,
+            &fullname,
+            ui_svc.as_deref(),
+            api_svc.as_deref(),
+            host.as_deref(),
+        ),
     ]
 }
 
@@ -4589,6 +4654,7 @@ pub fn observability_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec
         nodes_cmd(),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
+        svc_cmd(o, fullname, "api"),
     ]
 }
 

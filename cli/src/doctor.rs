@@ -5520,7 +5520,30 @@ pub async fn resolve_api(
             }
         },
     );
-    Some((url?, key?))
+    let key_discovered = nonempty(api_key).is_none();
+    if key_discovered
+        && key.is_some()
+        && url.as_deref().is_some_and(crate::api::is_insecure_endpoint)
+    {
+        crate::ui::ui().warn(&format!(
+            "not sending the auto-discovered release key over cleartext HTTP to {}; pass \
+             --api-key explicitly to acknowledge, or --api-url with an https:// or loopback URL",
+            url.as_deref().unwrap_or_default()
+        ));
+    }
+    pair_api_connection(url, key, key_discovered)
+}
+
+/// Pair a platform API URL with the key doctor would send it. An auto-discovered
+/// release key never travels over cleartext HTTP to a non-loopback host, the
+/// rule `cluster deploy` enforces with the same classifier.
+fn pair_api_connection(
+    url: Option<String>,
+    key: Option<String>,
+    key_discovered: bool,
+) -> Option<(String, String)> {
+    let (url, key) = (url?, key?);
+    (!key_discovered || !crate::api::is_insecure_endpoint(&url)).then_some((url, key))
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
