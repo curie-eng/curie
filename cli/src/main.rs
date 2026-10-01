@@ -8512,8 +8512,8 @@ mod tests {
     async fn resolve_cluster_conn_prefers_explicit_over_discovery() {
         // #524: an explicit --api-url/--api-key (or env) wins and short-circuits
         // discovery entirely -- no kubectl is shelled, so this resolves with no
-        // cluster. (The discovery branch is covered by ops::ui_api_url_from_parts
-        // unit tests + the actionable release-named errors.)
+        // cluster. (The discovery branch self-plumbs a loopback tunnel through
+        // commands::deploy_api_tunnel.)
         let conn = ClusterConn {
             api_url: Some("https://api.example.test".into()),
             api_key: Some("real-release-key".into()),
