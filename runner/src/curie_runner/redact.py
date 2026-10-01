@@ -160,8 +160,8 @@ def _collect_header_value(values: set[str], name: str, value: str) -> None:
 # The break between two text blocks of one turn (#3694). Each text_delta the
 # runner emits is one whole TextBlock, and consumers join deltas with "", so the
 # boundary is known only here. It is added here rather than in translation so a
-# secret split across two blocks is still matched whole: a break never goes
-# inside a held value or a redaction rule's match on the unbroken text.
+# secret split across two blocks is still matched whole: a break is kept only
+# where it changes nothing the scrub would do to the unbroken text.
 _BLOCK_BREAK = "\n\n"
 
 
@@ -212,38 +212,38 @@ class OutboundRedactor:
         parts.append(text[cursor:])
         return redact_text("".join(parts))
 
-    def _with_breaks(self, text: str, breaks: list[int], before: str) -> str:
-        """Raw ``text`` with a block break at each break that may take one.
+    def _scrub_with_breaks(self, text: str, breaks: list[int], before: str) -> str:
+        """Scrub ``text``, with a block break at each break that may take one.
 
-        A kept break is outside every held value and every rule match on the
-        unbroken text, so scrubbing the result finds every secret the unbroken
-        text had. ``before`` is the raw character ahead of ``text``.
+        A break is kept only when scrubbing the text on either side of it gives
+        exactly what scrubbing them together gives. With its breaks removed the
+        result is therefore ``_text(text)``, whatever the held values and rules
+        match, including a match that appears only after an earlier replacement.
+        ``before`` is the raw character ahead of ``text``.
         """
 
-        spans = self._literal_intervals(text) + [
-            match.span() for rule in REDACTION_RULES for match in rule.pattern.finditer(text)
-        ]
         parts: list[str] = []
         cursor = 0
+        remaining = self._text(text)
         for at in breaks:
             prior = text[at - 1] if at else before
-            if (
-                not prior
-                or prior.isspace()
-                or text[at].isspace()
-                or any(start < at < stop for start, stop in spans)
-            ):
+            if not prior or prior.isspace() or text[at].isspace():
                 continue
-            parts.extend((text[cursor:at], _BLOCK_BREAK))
+            head = self._text(text[cursor:at])
+            tail = self._text(text[at:])
+            if head + tail != remaining:
+                continue
+            parts.extend((head, _BLOCK_BREAK))
             cursor = at
-        parts.append(text[cursor:])
+            remaining = tail
+        parts.append(remaining)
         return "".join(parts)
 
     def _stream_text(self, text: str, breaks: list[int]) -> str:
-        broken = self._with_breaks(text, breaks, self._last_raw)
+        clean = self._scrub_with_breaks(text, breaks, self._last_raw)
         if text:
             self._last_raw = text[-1]
-        return self._text(broken)
+        return clean
 
     def _content(self, value: object) -> object:
         if isinstance(value, str):
@@ -320,12 +320,9 @@ class OutboundRedactor:
                 and isinstance(final_text, str)
                 and final_text.endswith(self._streamed)
             ):
-                lead = final_text[: len(final_text) - len(self._streamed)]
-                streamed_final = self._text(
-                    lead
-                    + self._with_breaks(
-                        self._streamed, self._streamed_breaks, lead[-1:] if lead else ""
-                    )
+                lead = len(final_text) - len(self._streamed)
+                streamed_final = self._scrub_with_breaks(
+                    final_text, [lead + at for at in self._streamed_breaks], ""
                 )
         for name in _CONTENT_FIELDS & record.keys():
             record[name] = self._content(record[name])
