@@ -69,6 +69,12 @@ overlapping matches may remain buffered until the overlap ends or the turn
 completes. Recognition of unknown token patterns does not guarantee protection
 for fragments split across chunks.
 
+Each `text_delta` the runner emits is one whole assistant text block, and a
+consumer joins deltas as they come. The same boundary therefore starts a later
+block of the turn on its own paragraph (a blank line), unless the model already
+put whitespace at the join or the join falls inside a held value. A `final`
+whose text falls back to the streamed text carries the same breaks.
+
 The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
 `/v1/snapshot`, and `/v1/status`) require an `Authorization: Bearer <token>`
 header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
