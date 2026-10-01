@@ -332,7 +332,9 @@ def test_native_checkpoint_under_another_system_prompt_replays_the_portable_pref
         curie_session_id="curie-thread-attachment",
         cwd=str(tmp_path),
         harness_replay=checkpoint,
-        system_prompt="bundle prompt\n\nThe message you are answering carried file attachments.",
+        system_prompt=(
+            "bundle prompt\n\nFiles attached in this conversation are on disk in this sandbox."
+        ),
     )
 
     assert resume.resume == resume.session_id

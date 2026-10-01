@@ -179,6 +179,10 @@ class TurnState:
     # conversation transcript (#20/#1902); left None for failure, budget, auth,
     # and idle outcomes so those turns are not persisted as history.
     final_text: str | None = None
+    # The prompt this turn sent the harness, recorded as the turn's user message
+    # so the history shows which message carried this boot's attachments
+    # (#3691). None until the turn queries; the inbound text is then the default.
+    prompt_text: str | None = None
     # Ordered provider-neutral messages captured from the harness stream for
     # durable replay. The inbound user message is prepended by SessionRunner;
     # this list holds assistant output and user-shaped tool results.
