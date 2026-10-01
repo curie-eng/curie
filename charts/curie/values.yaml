@@ -1867,9 +1867,10 @@ worker:
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
   # Inbound channel attachments (#2567). The worker downloads a referenced file
-  # with the channel bot token, parks it in the private workspace bucket and
-  # mints a short-lived one-object read capability that the sandbox's
-  # attachments-init container redeems. These three numbers are ONE envelope
+  # with the channel bot token (Slack) or from the adapter that sent it, with
+  # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
+  # it in the private workspace bucket and mints a short-lived one-object read
+  # capability that the sandbox's attachments-init container redeems. These three numbers are ONE envelope
   # expressed twice: they become the worker's CURIE_ATTACHMENT_* env AND (for
   # maxFileBytes) the literal cap inside the rendered init-container program, so
   # the pod can never accept what the worker refused or refuse what it accepted.

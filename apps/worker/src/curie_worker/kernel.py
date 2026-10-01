@@ -5618,6 +5618,9 @@ class Kernel:
             agent_id=str(agent_id) if agent_id is not None else None,
             attachments=list(qevent.attachments),
             identity=identity,
+            # ADR-0153: a channel-port turn's files come from its own adapter,
+            # and the server-minted handle is what names that adapter.
+            handle=handle,
         )
         return {**(boot_env or {}), **prepared.claim_env()}, prepared
 
