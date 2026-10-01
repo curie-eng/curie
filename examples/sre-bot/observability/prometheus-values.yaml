@@ -148,8 +148,9 @@ serverFiles:
     groups:
       - name: curie-reliability
         # CurieTaskFailure, CurieWorkerSupervisedRestartLoop,
-        # CurieReplyDeliveryRefused, CurieChannelTokenRotationFailed and
-        # CurieConnectorToolErrors each have a second term for a new series.
+        # CurieReplyDeliveryRefused, CurieChannelTokenRotationFailed,
+        # CurieConnectorToolErrors and CurieConnectorToolsUnavailable each have
+        # a second term for a new series.
         # The SDK exports a counter only after its first measurement, so a
         # series arrives at its first value with no zero before it, and
         # increase() cannot see a first sample. Each process exports under its
@@ -805,14 +806,13 @@ serverFiles:
             # minutes and errors at least half of the connector's success and
             # error results, so an occasional model mistake, such as a
             # connector refusing a wrong argument, does not page. A call the
-            # runner's approval gate held (awaiting_approval), the runner
-            # refused by policy or grant-argument check (refused), an operator
-            # stop cut off (cancelled), or the CLI rejected as an unavailable
-            # tool (unavailable) counts toward neither. An error is a
-            # connector's isError result or JSON-RPC error, or a call the turn
-            # deadline cut off, and rarely a runner-side deny outside the
-            # approval gate, as docs/interfaces/telemetry-otel/INTERFACE.md
-            # lists. A connector
+            # runner's approval gate held (awaiting_approval), a runner-side
+            # callback denied before it ran (refused), an operator stop cut off
+            # (cancelled), or that could not reach its connector (unavailable)
+            # counts toward neither; CurieConnectorToolsUnavailable below pages
+            # on the last. An error is a connector's isError result or JSON-RPC
+            # error, or a call the turn deadline cut off, as
+            # docs/interfaces/telemetry-otel/INTERFACE.md lists. A connector
             # that reports failure inside a success-shaped payload counts as a
             # success, and this rule cannot see it. The metric carries no
             # connector name. The runner logs one WARNING per failed call
@@ -937,6 +937,143 @@ serverFiles:
                 the connector success and error results, counting a series' first
                 sample as an increase from zero. The runner logs one WARNING per
                 failed call naming the connector server and tool.
+          - alert: CurieConnectorToolsUnavailable
+            # An agent calling a connector it cannot reach at all. The runner
+            # counts a connector call as unavailable when its connector exclusion
+            # denied it, because the connector failed its startup probe in that
+            # sandbox, or when the CLI answered that no server advertises the
+            # tool, as after a connector deploy that dropped or renamed a tool
+            # the bundle still calls. The connector never saw these calls, so
+            # CurieConnectorToolErrors does not count them, and
+            # CurieConnectorNotReady sees only a Deployment with no replica, not
+            # a sandbox that cannot dial a serving connector or a missing tool.
+            # Same new-series term, window and thresholds as
+            # CurieConnectorToolErrors: three or more in 15 minutes, and at
+            # least half of the connector's success, error and unavailable
+            # results, so one model call to a tool name its connector never
+            # offered does not page while the connector answers everything
+            # else. A refusal (refused) is the agent's own policy working and
+            # counts toward neither side.
+            expr: |
+              sum without (instance, outcome) (
+                (
+                  increase(
+                    curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                  )
+                  unless
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="unavailable"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                or
+                (
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                  )
+                  unless
+                  last_over_time(
+                    curie_tool_result_total{origin="connector",outcome="unavailable"}[1h]
+                    offset 15m
+                  )
+                )
+              ) >= 3
+              and
+              (
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{origin="connector",outcome="unavailable"}[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="unavailable"}[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{origin="connector",outcome="unavailable"}[1h]
+                      offset 15m
+                    )
+                  )
+                )
+                /
+                sum without (instance, outcome) (
+                  (
+                    increase(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error|unavailable"
+                      }[15m]
+                    )
+                    unless
+                    (
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error|unavailable"
+                        }[15m]
+                      )
+                      unless
+                      last_over_time(
+                        curie_tool_result_total{
+                          origin="connector",
+                          outcome=~"success|error|unavailable"
+                        }[1h]
+                        offset 15m
+                      )
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error|unavailable"
+                      }[15m]
+                    )
+                    unless
+                    last_over_time(
+                      curie_tool_result_total{
+                        origin="connector",
+                        outcome=~"success|error|unavailable"
+                      }[1h]
+                      offset 15m
+                    )
+                  )
+                )
+              ) >= 0.5
+            for: 5m
+            labels:
+              severity: page
+              component: curie-connector
+            annotations:
+              summary: Connector tools are unavailable to their agents
+              description: >-
+                curie_tool_result_total with origin connector and outcome
+                unavailable increased by three or more in 15 minutes and was at
+                least half of the connector success, error and unavailable
+                results, counting a series' first sample as an increase from
+                zero. The agent is calling a connector that failed its startup
+                probe in the sandbox, or a tool its server no longer advertises.
           - alert: CurieDispatcherRestartLoop
             # Pod restarts, not CurieWorkerSupervisedRestartLoop's in-process
             # counter: a dispatcher that crashes takes its counter with it.

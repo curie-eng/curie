@@ -64,6 +64,7 @@ from .history import (
     close_suspended_tool_calls,
     is_tool_result_message,
 )
+from .hooks import RefusalLedger
 from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
 from .memory import (
     ConsolidationResult,
@@ -303,6 +304,7 @@ class SessionRunner:
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
         tool_access: TurnToolAccess | None = None,
+        refusal_ledger: RefusalLedger | None = None,
     ) -> None:
         self._factory = session_factory
         self._held_secrets = held_secrets
@@ -316,6 +318,11 @@ class SessionRunner:
         # on, so the session never again runs a restricted turn. Cleared only
         # by a new SDK session (reset).
         self._unrestricted_prompt_sent = False
+        # The runner-side PreToolUse denials outside the approval gate (#3580),
+        # recorded by the callbacks that decided them and read by the tool
+        # result counter. None records nothing, and those results count as
+        # the tool's own.
+        self._refusal_ledger = refusal_ledger
         # Whether a read-only prompt has been sent on this SDK session; the next
         # unrestricted prompt then gets a fresh one (RUNNER-TOOL-ACCESS-11).
         self._read_only_prompt_sent = False
@@ -1407,6 +1414,8 @@ class SessionRunner:
         if self._tool_access is not None:
             # @spec RUNNER-TOOL-ACCESS-4: in force from this prompt until the next.
             self._tool_access.begin(event.tool_access)
+        if self._refusal_ledger is not None:
+            self._refusal_ledger.begin()
         if event.tool_access is None:
             self._unrestricted_prompt_sent = True
         else:
@@ -1765,17 +1774,19 @@ class SessionRunner:
         halt. A result that is not an error is ``success``. An error after an
         operator stop is ``cancelled``: the CLI answers the call it cut off
         itself. An error on a call the approval gate held is
-        ``awaiting_approval``; a policy or grant-argument refusal is ``refused``.
-        Both match the exact call ID, so another call of the same tool can still
-        be counted independently. The CLI's exact unknown-tool envelope is
-        ``unavailable`` only when its init catalog never advertised the name;
-        without that corroboration, it remains ``error``. Anything else is ``error``, a turn
-        deadline included on purpose: a connector that holds a call until the
-        deadline is failing.
+        ``awaiting_approval``; a call a runner-side callback denied is
+        ``refused`` (the gate's policy, grant-argument or publication refusal, a
+        bundle PreToolUse command, the factory guard) or ``unavailable`` (the
+        connector exclusion). Each matches the exact call ID, so another call of
+        the same tool can still be counted independently. The CLI's exact
+        unknown-tool envelope is ``unavailable`` only when its init catalog
+        never advertised the name; without that corroboration, it remains
+        ``error``. Anything else is ``error``, a turn deadline included on
+        purpose: a connector that holds a call until the deadline is failing.
 
         So a connector ``error`` is any is_error result on a non-platform
-        ``mcp__`` tool that the gate did not hold or refuse, no operator stop
-        cut off, and the catalog did not confirm unavailable. Each connector
+        ``mcp__`` tool that no runner-side callback held or denied, no operator
+        stop cut off, and the catalog did not confirm unavailable. Each connector
         error logs one WARNING naming the server and the tool,
         because the metric may carry no identifier; the line never carries the
         call's arguments or its result. Like ``_observe_publication_calls`` it
@@ -1783,6 +1794,7 @@ class SessionRunner:
         """
 
         gate = self._approval_gate
+        ledger = self._refusal_ledger
         while state.tool_results_observed < len(state.tool_results):
             call_id, tool_name, errored, unknown_marker = state.tool_results[
                 state.tool_results_observed
@@ -1801,6 +1813,14 @@ class SessionRunner:
                 outcome = "awaiting_approval"
             elif gate is not None and call_id in gate.refused_call_ids:
                 outcome = "refused"
+            elif ledger is not None and call_id in ledger.refused_call_ids:
+                # A bundle's own guardrail or the factory guard denied this call
+                # before it ran (#3580); a hold above still reads as the hold.
+                outcome = "refused"
+            elif ledger is not None and call_id in ledger.unavailable_call_ids:
+                # The connector exclusion denied it: its connector failed the
+                # startup probe and never saw the call.
+                outcome = "unavailable"
             elif (
                 unknown_marker
                 and self._advertised_tools is not None
