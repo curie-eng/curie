@@ -60,7 +60,11 @@ from curie_api.schemas.console import (
 )
 
 from .. import oidc
-from ..approval_auth import CONSOLE_SESSION_COOKIE, set_console_session_cookie
+from ..approval_auth import (
+    CONSOLE_SESSION_COOKIE,
+    enforce_console_cookie_origin,
+    set_console_session_cookie,
+)
 from ..auth import require_platform_key, require_principal_session
 from ..config import get_settings
 from ..deps import SessionDep
@@ -171,6 +175,7 @@ async def current_session(
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 async def logout(
+    request: Request,
     session: SessionDep,
     console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
 ) -> Response:
@@ -180,9 +185,12 @@ async def logout(
     one session this can end, and ``X-API-Key`` is not a way to name one.
     Always the same 204, whether the cookie was live, unknown, already revoked
     or absent, so logout is idempotent and says nothing about which it was.
-    SameSite=Strict keeps a cross-site page from logging someone out.
+    SameSite=Strict keeps a cross-site page from logging someone out, but not a
+    same-site cross-origin form (#3000), so a present cookie's origin must also
+    match before the session is touched.
     """
     if console_session:
+        enforce_console_cookie_origin(request)
         row = await crud_console.live_console_session(session, console_session)
         if row is not None:
             await crud_console.revoke_console_session(session, row)

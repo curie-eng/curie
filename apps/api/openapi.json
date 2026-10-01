@@ -20241,7 +20241,7 @@
     },
     "/console/logout": {
       "post": {
-        "description": "Revoke the session in the cookie, whichever login minted it, and clear it.\n\nDeliberately no credential beyond the cookie itself: the cookie names the\none session this can end, and ``X-API-Key`` is not a way to name one.\nAlways the same 204, whether the cookie was live, unknown, already revoked\nor absent, so logout is idempotent and says nothing about which it was.\nSameSite=Strict keeps a cross-site page from logging someone out.",
+        "description": "Revoke the session in the cookie, whichever login minted it, and clear it.\n\nDeliberately no credential beyond the cookie itself: the cookie names the\none session this can end, and ``X-API-Key`` is not a way to name one.\nAlways the same 204, whether the cookie was live, unknown, already revoked\nor absent, so logout is idempotent and says nothing about which it was.\nSameSite=Strict keeps a cross-site page from logging someone out, but not a\nsame-site cross-origin form (#3000), so a present cookie's origin must also\nmatch before the session is touched.",
         "operationId": "logout_console_logout_post",
         "parameters": [
           {
