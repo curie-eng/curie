@@ -646,6 +646,57 @@ def test_http_redacts_held_secret_split_at_every_offset(
         assert any(frame["type"] == "tool_note" for frame in frames)
 
 
+def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3694: two progress sentences around a tool call must not be glued.
+
+    Covers the stream and the empty-result final, which falls back to the
+    streamed text (#107).
+    """
+
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="Staging the files.")], model="fake"),
+        AssistantMessage(content=[ToolUseBlock(id="read", name="Read", input={})], model="fake"),
+        AssistantMessage(content=[TextBlock(text="All three files staged.")], model="fake"),
+        _result(""),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "Staging the files.\n\nAll three files staged."
+    assert frames[-1]["text"] == _assistant_text(frames)
+    assert frames[-1]["status"] == "done"
+
+
+def test_http_reply_does_not_pad_text_blocks_the_model_already_separated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="One.\n")], model="fake"),
+        AssistantMessage(content=[TextBlock(text="Two.")], model="fake"),
+        AssistantMessage(content=[TextBlock(text=" Three.")], model="fake"),
+        _result(""),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "One.\nTwo. Three."
+    assert frames[-1]["text"] == _assistant_text(frames)
+
+
+def test_http_reply_keeps_the_authoritative_result_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages: list[object] = [
+        AssistantMessage(content=[TextBlock(text="Looking.")], model="fake"),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="fake"),
+        _result("Done."),
+    ]
+    _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
+
+    assert _assistant_text(frames) == "Looking.\n\nDone."
+    assert frames[-1]["text"] == "Done."
+
+
 @pytest.mark.parametrize(("name", "vector"), VECTORS)
 def test_http_reply_applies_every_shared_redaction_rule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, vector: str
