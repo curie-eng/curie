@@ -4371,6 +4371,30 @@
             },
             {
               "global": false,
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of your personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Helm `--timeout` in seconds for the upgrade. Default: the release's own drain contract, the `curie.ai/minimum-helm-timeout-seconds` annotation on its pre-upgrade worker drain hook (worker deliveryBudgetSeconds + reserve + Job and grace slack), never below 900. A factory install with a 10800s budget needs about 21900s",
               "id": "timeout",
               "long": "timeout",

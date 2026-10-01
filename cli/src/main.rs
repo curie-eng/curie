@@ -2995,6 +2995,20 @@ enum ClusterAction {
         /// Turn the factory intake off; changes nothing else.
         #[arg(long)]
         disable: bool,
+        /// The factory GitHub App's numeric App ID. Pair with
+        /// --private-key-file. Without both, and with no App recorded on the
+        /// release, the command prints the App registration link and applies
+        /// nothing. Mention, allowlist, and label default from the App.
+        #[arg(long, value_name = "ID", requires = "private_key_file")]
+        app_id: Option<String>,
+        /// File holding the App's PEM private key. Stored in a Kubernetes
+        /// Secret through kubectl stdin; the key never enters argv.
+        #[arg(long, value_name = "PATH", requires = "app_id")]
+        private_key_file: Option<PathBuf>,
+        /// Print the registration link for this GitHub organization instead
+        /// of your personal account.
+        #[arg(long, value_name = "ORG")]
+        org: Option<String>,
         /// Helm `--timeout` in seconds for the upgrade. Default: the release's
         /// own drain contract, the `curie.ai/minimum-helm-timeout-seconds`
         /// annotation on its pre-upgrade worker drain hook (worker
@@ -5767,6 +5781,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 webhook_secret_file,
                 github_api_egress,
                 disable,
+                app_id,
+                private_key_file,
+                org,
                 timeout,
                 namespace,
                 release,
@@ -5786,7 +5803,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     std::path::Path::new("charts/curie").is_dir(),
                 )?;
                 let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                emit(
+                emit_boxed(
                     curie::factory_intake::factory_intake(curie::factory_intake::FactoryIntakeOpts {
                         common: CommonOpts {
                             namespace,
@@ -5802,6 +5819,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                         github_api_egress,
                         disable,
                         timeout_seconds: timeout,
+                        app_id,
+                        private_key_file,
+                        org,
                     })
                     .await?,
                 )

@@ -148,10 +148,22 @@
       "version": "1.3"
     },
     {
+      "result": "FactoryAppRegistrationOutput",
+      "kind": "CliOutput",
+      "schema": "factory.schema.json",
+      "version": "2.0"
+    },
+    {
+      "result": "FactoryAppSetupOutput",
+      "kind": "CliOutput",
+      "schema": "factory.schema.json",
+      "version": "2.0"
+    },
+    {
       "result": "FactoryIntakeOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "1.0"
+      "version": "2.0"
     },
     {
       "result": "GithubAppOutput",

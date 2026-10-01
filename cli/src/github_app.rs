@@ -1523,7 +1523,7 @@ struct GitHubAppJwtClaims {
 /// `apps/api/src/curie_api/github_app.py`): RS256, `iss` = App id, `iat`
 /// backdated 60s, `exp` 480s. The two cannot share code across Python/Rust;
 /// the constants and claim names are the sibling.
-fn sign_app_jwt(app_id: &str, pem: &str) -> Result<String> {
+pub(crate) fn sign_app_jwt(app_id: &str, pem: &str) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| {
@@ -2214,7 +2214,7 @@ fn is_github_app_id(value: &str) -> bool {
 /// regression than the false-positive this function exists to close -- so any
 /// label ending in `PRIVATE KEY` is accepted as long as BEGIN and END agree on
 /// it.
-fn is_pem_private_key(body: &str) -> bool {
+pub(crate) fn is_pem_private_key(body: &str) -> bool {
     let marker_label = |line: &str, marker: &str| -> Option<String> {
         line.trim()
             .strip_prefix(marker)?

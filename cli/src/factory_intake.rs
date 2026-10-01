@@ -36,6 +36,12 @@ pub struct FactoryIntakeOpts {
     pub disable: bool,
     /// Explicit helm `--timeout` seconds; `None` derives it from the release.
     pub timeout_seconds: Option<u64>,
+    /// The factory GitHub App id; paired with `private_key_file` (#3746).
+    pub app_id: Option<String>,
+    /// File holding the App's PEM private key. Its contents never enter argv.
+    pub private_key_file: Option<std::path::PathBuf>,
+    /// Organization whose registration form the printed link opens.
+    pub org: Option<String>,
 }
 
 /// Helm's floor for this command, matching `curie cluster upgrade`'s default.
@@ -304,7 +310,7 @@ async fn fetch_github_api_cidrs() -> Result<Vec<String>> {
 
 /// True for a bare GitHub login: alphanumeric runs joined by single hyphens
 /// (the API's `valid_github_login`). A leading '@' is not part of a login.
-fn valid_github_login(value: &str) -> bool {
+pub(crate) fn valid_github_login(value: &str) -> bool {
     !value.is_empty()
         && value
             .split('-')
@@ -342,6 +348,8 @@ pub fn intake_gate_offenders(
     {
         bad.push("GITHUB_APP_PRIVATE_KEY");
     }
+    // The webhook secret stays required until polling intake ships a chart
+    // value; ADR 0187 is where this requirement drops for poll mode.
     let secret = api_str(&api, "githubWebhookSecret");
     if secret.is_empty() || secret == "dev-webhook-secret" {
         bad.push("GITHUB_WEBHOOK_SECRET");
@@ -410,7 +418,9 @@ pub fn card_base_url_valid(raw: &str, environment: &str) -> bool {
 
 fn offender_flag(name: &str) -> &'static str {
     match name {
-        "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY" => "`curie cluster github-app` (App id and key)",
+        "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY" => {
+            "--app-id <ID> --private-key-file <PATH> (run without them for the App registration link)"
+        }
         "GITHUB_WEBHOOK_SECRET" => "--webhook-secret-file",
         "GITHUB_FACTORY_LABEL" => "--label (no whitespace, 50 chars max)",
         "GITHUB_FACTORY_MENTION" => "--mention <app-slug> (the App login, no '@')",
@@ -421,7 +431,137 @@ fn offender_flag(name: &str) -> &'static str {
     }
 }
 
-pub async fn factory_intake(opts: FactoryIntakeOpts) -> Result<FactoryIntakeOutput> {
+/// The App-derived settings resolved before any mutation (#3746).
+struct AppPlan {
+    app: crate::factory_app::InstalledApp,
+    api: crate::factory_app::GithubApi,
+    app_id: String,
+    secret_name: String,
+    secret_key: String,
+    secret: crate::factory_app::SecretPlan,
+    mention: crate::factory_app::Chosen<String>,
+    repos: crate::factory_app::Chosen<Vec<String>>,
+    label: crate::factory_app::Chosen<String>,
+}
+
+fn recorded_api_str(recorded: &serde_json::Value, key: &str) -> Option<String> {
+    recorded
+        .pointer(&format!("/api/{key}"))
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn app_values(plan: &AppPlan) -> serde_json::Value {
+    serde_json::json!({
+        "githubAppId": plan.app_id,
+        "githubAppExistingSecret": plan.secret_name,
+        "githubAppExistingSecretKey": plan.secret_key,
+        "githubAppPrivateKey": "",
+        "githubCloneBase": crate::github_app::DEFAULT_CLONE_BASE,
+    })
+}
+
+fn merge_api(values: &mut serde_json::Value, extra: &serde_json::Value) {
+    if let (Some(api), Some(extra)) = (
+        values.get_mut("api").and_then(|v| v.as_object_mut()),
+        extra.as_object(),
+    ) {
+        for (k, v) in extra {
+            api.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Every GitHub read and the Secret ownership check; mutates nothing.
+async fn plan_app(
+    opts: &mut FactoryIntakeOpts,
+    recorded: &serde_json::Value,
+    app_id: &str,
+    key_file: &Path,
+) -> Result<AppPlan> {
+    let pem = crate::factory_app::read_private_key(key_file)?;
+    let api = crate::factory_app::GithubApi::new()?;
+    let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
+    let repos_inferred = opts.repos.is_empty();
+    let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app)?;
+    opts.repos = repos.clone();
+    let mention_inferred = opts.mention.is_none();
+    let mention = opts.mention.clone().unwrap_or_else(|| app.slug.clone());
+    opts.mention = Some(mention.clone());
+    let (label, label_inferred) = match opts.label.clone() {
+        Some(label) => (label, false),
+        None => match recorded_api_str(recorded, "githubFactoryLabel") {
+            Some(label) => (label, false),
+            None => (crate::factory_app::DEFAULT_LABEL.to_string(), true),
+        },
+    };
+    opts.label = Some(label.clone());
+    let secret_name = recorded_api_str(recorded, "githubAppExistingSecret")
+        .unwrap_or_else(|| crate::factory_app::DEFAULT_SECRET_NAME.to_string());
+    let secret_key = recorded_api_str(recorded, "githubAppExistingSecretKey")
+        .unwrap_or_else(|| crate::github_app::DEFAULT_APP_KEY_DATA_KEY.to_string());
+    let secret = crate::factory_app::plan_secret(
+        &api,
+        &opts.common.namespace,
+        &secret_name,
+        &secret_key,
+        app_id,
+        &pem,
+    )
+    .await?;
+    Ok(AppPlan {
+        app,
+        api,
+        app_id: app_id.to_string(),
+        secret_name,
+        secret_key,
+        secret,
+        mention: crate::factory_app::Chosen {
+            value: mention,
+            inferred: mention_inferred,
+        },
+        repos: crate::factory_app::Chosen {
+            value: repos,
+            inferred: repos_inferred,
+        },
+        label: crate::factory_app::Chosen {
+            value: label,
+            inferred: label_inferred,
+        },
+    })
+}
+
+fn app_dry_run_lines(opts: &FactoryIntakeOpts, key_file: &Path) -> Vec<String> {
+    let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+    let ns = &opts.common.namespace;
+    vec![
+        format!(
+            "# read the App private key from {} (never printed)",
+            key_file.display()
+        ),
+        format!("# GET {api}/app with an App JWT (slug, id check)"),
+        format!("# GET {api}/app/installations"),
+        format!(
+            "# POST {api}/app/installations/<id>/access_tokens, then GET {api}/installation/repositories per installation"
+        ),
+        format!(
+            "kubectl -n {ns} get secret <api.githubAppExistingSecret or {}> -o json",
+            crate::factory_app::DEFAULT_SECRET_NAME
+        ),
+        format!(
+            "{} (Secret manifest on stdin, annotated {})",
+            crate::factory_app::secret_apply_command(ns).display(),
+            crate::factory_app::APP_ID_ANNOTATION
+        ),
+        format!("# GET/POST {api}/repos/<owner>/<repo>/labels for each allowlisted repo"),
+    ]
+}
+
+pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate::ui::CliOutput>> {
     if let Some(mention) = opts.mention.as_deref() {
         if !opts.disable && !valid_github_login(mention) {
             return Err(
@@ -434,11 +574,86 @@ pub async fn factory_intake(opts: FactoryIntakeOpts) -> Result<FactoryIntakeOutp
             );
         }
     }
-    if !opts.common.dry_run && !opts.disable {
+    if let Some(org) = opts.org.as_deref() {
+        if !valid_github_login(org) {
+            return Err(
+                CliError::usage(format!("--org {org:?} is not a GitHub login"))
+                    .with_fix("pass the organization login as it appears in its GitHub URL")
+                    .into(),
+            );
+        }
+    }
+    let app_args = match (opts.app_id.clone(), opts.private_key_file.clone()) {
+        (Some(id), Some(file)) => {
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+                return Err(CliError::usage(format!("--app-id {id:?} is not a number"))
+                    .with_fix("pass the numeric App ID from the App's settings page")
+                    .into());
+            }
+            Some((id, file))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(CliError::usage(
+                "--app-id and --private-key-file go together; pass both or neither",
+            )
+            .with_fix("add the missing --app-id <ID> or --private-key-file <PATH>")
+            .into())
+        }
+    };
+    if opts.disable && app_args.is_some() {
+        return Err(CliError::usage(
+            "--disable changes nothing else; drop --app-id/--private-key-file",
+        )
+        .into());
+    }
+    if opts.common.dry_run {
+        let placeholder = Path::new("<private-values-file>");
+        let mut lines = Vec::new();
+        if let Some((_, file)) = &app_args {
+            lines.extend(app_dry_run_lines(&opts, file));
+        }
+        if !opts.disable && !opts.github_api_egress.is_empty() {
+            let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+            lines.push(format!(
+                "# fetch {}/meta for the GitHub API egress CIDRs",
+                api
+            ));
+        }
+        let timeout = effective_helm_timeout(opts.timeout_seconds, None);
+        lines.extend(
+            intake_commands(&opts, placeholder, timeout)
+                .iter()
+                .map(|c| c.display()),
+        );
+        return Ok(Box::new(FactoryIntakeOutput::DryRun(
+            crate::ui::DryRunPlan { lines },
+        )));
+    }
+    let mut app_plan = None;
+    if !opts.disable {
         let recorded = fetch_release_values(&opts.common)
             .await?
             .unwrap_or(serde_json::Value::Null);
-        let planned = intake_values(&opts, &[]);
+        match &app_args {
+            None if recorded_api_str(&recorded, "githubAppId").is_none() => {
+                // No App anywhere: print the registration link, apply nothing.
+                // The CLI never opens a browser and never runs `gh`.
+                let name = crate::factory_app::random_app_name();
+                return Ok(Box::new(crate::factory_app::FactoryAppRegistrationOutput {
+                    url: crate::factory_app::registration_url(opts.org.as_deref(), &name),
+                    steps: crate::factory_app::registration_steps(),
+                }));
+            }
+            None => {}
+            Some((id, file)) => {
+                app_plan = Some(plan_app(&mut opts, &recorded, id, file).await?);
+            }
+        }
+        let mut planned = intake_values(&opts, &[]);
+        if let Some(plan) = &app_plan {
+            merge_api(&mut planned, &app_values(plan));
+        }
         let offenders = intake_gate_offenders(&recorded, &planned);
         if !offenders.is_empty() {
             let fixes: Vec<String> = offenders
@@ -456,24 +671,6 @@ pub async fn factory_intake(opts: FactoryIntakeOpts) -> Result<FactoryIntakeOutp
             .into());
         }
     }
-    if opts.common.dry_run {
-        let placeholder = Path::new("<private-values-file>");
-        let mut lines = Vec::new();
-        if !opts.disable && !opts.github_api_egress.is_empty() {
-            let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
-            lines.push(format!(
-                "# fetch {}/meta for the GitHub API egress CIDRs",
-                api
-            ));
-        }
-        let timeout = effective_helm_timeout(opts.timeout_seconds, None);
-        lines.extend(
-            intake_commands(&opts, placeholder, timeout)
-                .iter()
-                .map(|c| c.display()),
-        );
-        return Ok(FactoryIntakeOutput::DryRun(crate::ui::DryRunPlan { lines }));
-    }
     require_on_path("helm")?;
     require_on_path("kubectl")?;
     let cidrs = if !opts.disable && !opts.github_api_egress.is_empty() {
@@ -481,13 +678,36 @@ pub async fn factory_intake(opts: FactoryIntakeOpts) -> Result<FactoryIntakeOutp
     } else {
         Vec::new()
     };
-    let values = intake_values(&opts, &cidrs);
+    let mut values = intake_values(&opts, &cidrs);
+    if let Some(plan) = &app_plan {
+        merge_api(&mut values, &app_values(plan));
+    }
     let timeout = match opts.timeout_seconds {
         Some(explicit) => explicit,
         None => effective_helm_timeout(None, release_minimum_helm_timeout(&opts.common).await),
     };
     let ui = crate::ui::ui();
     let cl = ui.checklist();
+    let mut labels_created = Vec::new();
+    let mut secret_written = false;
+    if let Some(plan) = &app_plan {
+        if let crate::factory_app::SecretPlan::Write(manifest) = &plan.secret {
+            let step = cl.step(&format!(
+                "storing the App private key in Secret {}",
+                plan.secret_name
+            ));
+            crate::factory_app::apply_secret(&opts.common.namespace, manifest).await?;
+            step.done("stored");
+            secret_written = true;
+        }
+        for repo in plan.repos.value.iter().filter(|r| !r.ends_with("/*")) {
+            if crate::factory_app::ensure_label(&plan.api, &plan.app, repo, &plan.label.value)
+                .await?
+            {
+                labels_created.push(repo.clone());
+            }
+        }
+    }
     {
         let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
         let cmd = helm_upgrade(&opts, file.path(), timeout);
@@ -526,9 +746,21 @@ pub async fn factory_intake(opts: FactoryIntakeOpts) -> Result<FactoryIntakeOutp
         }
         step.done("rolled");
     }
-    Ok(FactoryIntakeOutput::Done {
+    if let Some(plan) = app_plan {
+        return Ok(Box::new(crate::factory_app::FactoryAppSetupOutput {
+            app_id: plan.app_id,
+            slug: plan.app.slug,
+            mention: plan.mention,
+            repos: plan.repos,
+            label: plan.label,
+            labels_created,
+            secret: plan.secret_name,
+            secret_written,
+        }));
+    }
+    Ok(Box::new(FactoryIntakeOutput::Done {
         enabled: !opts.disable,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -555,6 +787,9 @@ mod tests {
             github_api_egress: vec!["dark-factory".into()],
             disable: false,
             timeout_seconds: None,
+            app_id: None,
+            private_key_file: None,
+            org: None,
         }
     }
 
