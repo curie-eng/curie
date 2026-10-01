@@ -1269,7 +1269,17 @@ class WorkerConfig(BaseSettings):
         default="/tmp/curie-worker.heartbeat",
         validation_alias=HEARTBEAT_FILE_ENV,
     )
-    heartbeat_interval_s: float = Field(default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV)
+    # Strictly positive and finite (#3726). The loop waits
+    # ``asyncio.wait_for(stop.wait(), timeout=interval_s)`` between touches, and
+    # a timeout of 0 or below expires at once, so the heartbeat would spin the
+    # event loop on file writes -- loading the very loop the heartbeat exists to
+    # watch. ``nan`` reaches the same end by making every timeout comparison
+    # meaningless, so it is refused alongside 0, negatives and infinities rather
+    # than clamped: an operator who asked for a broken cadence should learn at
+    # boot, not run a worker whose liveness signal is silently nonsense.
+    heartbeat_interval_s: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False, validation_alias=HEARTBEAT_INTERVAL_ENV
+    )
 
     # Supervised in-process task restarts (#2637): exponential backoff from the
     # base up to the cap, and a task that crashes this many times in a row is
