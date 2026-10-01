@@ -310,6 +310,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # so Bash drops them; they are not BootEnv keys.
         "ANTHROPIC_FOUNDRY_API_KEY",
         "ANTHROPIC_CUSTOM_HEADERS",
+        # The runner image's constructor library path. The image sets it and
+        # the worker never renders it into a claim, so it is not a session
+        # boot key.
+        "CURIE_PROC_DUMPABLE_PRELOAD",
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",

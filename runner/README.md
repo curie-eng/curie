@@ -60,14 +60,14 @@ proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
 At boot, the runner snapshots held credential values before hosted connector
-environment cleanup. A common outbound boundary replaces those exact values
-and recognized secret patterns with placeholders in assistant replies and
-structured tool results. Protocol keys, control metadata and approval argument
-carriers retain their original values. A buffer shared across `TextDelta`
-chunks protects held values split between chunks. Clean text streams normally;
-overlapping matches may remain buffered until the overlap ends or the turn
-completes. Recognition of unknown token patterns does not guarantee protection
-for fragments split across chunks.
+environment cleanup. A common outbound boundary replaces those exact values,
+their standard and URL-safe base64 forms when that encoding is at least 8 characters, and recognized secret patterns
+with placeholders in assistant replies and structured tool results. Protocol
+keys, control metadata and approval argument carriers retain their original
+values. A buffer shared across `TextDelta` chunks protects held values split
+between chunks. Clean text streams normally; overlapping matches may remain
+buffered until the overlap ends or the turn completes. Recognition of unknown
+token patterns does not guarantee protection for fragments split across chunks.
 
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later

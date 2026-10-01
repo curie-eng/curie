@@ -9,6 +9,7 @@ held credential inventory.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -1442,3 +1443,49 @@ def test_turn_close_drops_pending_secret_text_and_followup_is_independent(
             await runner.close()
 
     anyio.run(go)
+
+
+def test_outbound_redactor_scrubs_base64_of_a_short_held_token() -> None:
+    """Encoded forms of a 10 character held token are replaced."""
+
+    secret = "acme-token"
+    encoded = base64.standard_b64encode(secret.encode()).decode()
+    redactor = OutboundRedactor(frozenset({secret}))
+    raw = json.dumps({"type": "text_delta", "text": f"before {encoded} after"})
+    emitted = redactor.push(raw + "\n")
+    assert encoded not in "".join(emitted)
+    assert "[REDACTED:held_secret]" in "".join(emitted)
+    finished = redactor.finish()
+    assert finished is None or encoded not in finished
+
+
+def test_http_reply_scrubs_base64_of_a_held_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply scrubs both base64 forms of a held secret and keeps an unrelated blob."""
+
+    standard = "Pj4+PmhlbGQtc2VjcmV0LXZhbHVl"
+    urlsafe = "Pj4-PmhlbGQtc2VjcmV0LXZhbHVl"
+    unrelated = "QU5PTkVYRElGRkVSRU5U"
+    text = f"before {standard} middle {urlsafe} after b64:{unrelated}"
+    raw, frames = _http_reply(
+        _boot_reply_runner(
+            tmp_path,
+            monkeypatch,
+            [
+                AssistantMessage(content=[TextBlock(text=text)], model="fake-model"),
+                _result(text),
+            ],
+            config_env={"CURIE_RUNNER_TOKEN": ">>>>held-secret-value"},
+        )
+    )
+    assistant = _assistant_text(frames)
+    assert standard not in raw
+    assert urlsafe not in raw
+    assert standard not in assistant
+    assert urlsafe not in assistant
+    assert "[REDACTED:held_secret]" in raw
+    assert "[REDACTED:held_secret]" in assistant
+    assert unrelated in raw
+    assert unrelated in assistant
+    assert frames[-1]["status"] == "done"

@@ -6,12 +6,19 @@ commands and other runner subprocesses receive a copy without those
 credentials. The Bash tool inherits the CLI process, so a ``BASH_ENV`` prelude
 unsets the same names before the command runs.
 
+The runner process locks its environ, and the CLI parent env loads the
+constructor library because exec clears the lock. The prelude unsets names
+from the shell export list.
+
 Declared connector secrets are not platform credentials. ADR-0009 remote
 ``${VAR}`` expansion still reads them from this env.
 """
 
 from __future__ import annotations
 
+import ctypes
+import subprocess
+import tempfile
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
@@ -98,12 +105,49 @@ def release_platform_credentials(env: MutableMapping[str, str]) -> None:
             env.pop(key, None)
 
 
+def lock_process_environ() -> None:
+    """Same-uid peers cannot read this process environ."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno())
+
+
+def proc_dumpable_library(source: Mapping[str, str]) -> str:
+    """Constructor library the CLI parent loads. exec clears the environ lock.
+
+    The path comes from ``source``. ``connect`` clears ``os.environ`` before
+    building the parent env, and the image path is root owned. A missing
+    configured path fails closed. Hosts without the image variable compile a
+    fresh library in a private temp directory, not a stable home cache.
+    """
+
+    configured = source.get("CURIE_PROC_DUMPABLE_PRELOAD", "").strip()
+    if configured:
+        if Path(configured).is_file():
+            return configured
+        raise FileNotFoundError(configured)
+    library_dir = Path(tempfile.mkdtemp(prefix="curie-proc-dumpable-"))
+    library = library_dir / "libproc_dumpable.so"
+    c_source = Path(__file__).with_name("proc_dumpable.c")
+    # connect has already cleared os.environ. gcc needs PATH to find cc1.
+    compile_env = dict(source)
+    compile_env.setdefault("PATH", "/usr/bin:/bin")
+    subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(c_source)],
+        check=True,
+        env=compile_env,
+    )
+    return str(library)
+
+
 def cli_parent_env(source: Mapping[str, str]) -> dict[str, str]:
     """Env to install for the moment the CLI is spawned.
 
     Same as the shell env, plus model SDK variables that were already set, plus
-    ``BASH_ENV`` pointing at the credential prelude. Callers restore the
-    previous process env after spawn. The CLI copies this mapping at start.
+    ``BASH_ENV`` pointing at the credential prelude. ``LD_PRELOAD`` loads the
+    constructor library because exec clears the environ lock. Callers restore
+    the previous process env after spawn. The CLI copies this mapping at start.
     """
 
     parent = shell_and_hook_env(source)
@@ -112,4 +156,8 @@ def cli_parent_env(source: Mapping[str, str]) -> dict[str, str]:
         if value:
             parent[key] = value
     parent["BASH_ENV"] = str(BASH_CREDENTIAL_PRELUDE)
+    library = proc_dumpable_library(source)
+    existing = source.get("LD_PRELOAD", "")
+    kept = [entry for entry in existing.split(":") if entry and entry != library]
+    parent["LD_PRELOAD"] = ":".join([library, *kept])
     return parent
