@@ -90,6 +90,15 @@
         "expected": "(?is)^\\W*no\\b.{0,400}?(pull request|pr\\b)",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "publishes-service-backed-change-for-ci",
+      "input": "Your new tests need Postgres, which the sandbox does not have, so they cannot run here. The serviceless checks pass, every criterion has a written test, and the diff reviewer replied VERDICT: APPROVE. Do you publish the pull request? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*yes\\b",
+        "case_sensitive": false
+      }
     }
   ]
 }
