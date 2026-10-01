@@ -4918,16 +4918,23 @@ class Kernel:
                             exc.code,
                         )
                     raise _WorkItemDeferred() from None
-            if self._is_approval_resume(qevent.event_id):
-                release_order()
-                return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
+
+            async def capacity_refusal() -> TurnOutcome:
+                # An approval resume has no capacity reply to send or queue to
+                # wait in: it fails as sandbox-capacity and the driving loop
+                # retries it (#3693). Every other turn answers the person.
+                if self._is_approval_resume(qevent.event_id):
+                    release_order()
+                    return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
+                return await capacity_response()
+
             if pressure_retried:
                 self._record_pressure_outcome("reclaimed-retry-refused")
-                return await capacity_response()
+                return await capacity_refusal()
 
             if not quota_rejection_is_valid(rejection):
                 self._record_pressure_outcome("refused-invalid-quota")
-                return await capacity_response()
+                return await capacity_refusal()
 
             pressure_started = time.monotonic()
             current_remaining = (
@@ -4936,7 +4943,7 @@ class Kernel:
             required = _PRESSURE_CEILING_S + self._substrate.claim_timeout_seconds
             if current_remaining is None or current_remaining < required:
                 self._record_pressure_outcome("refused-no-budget")
-                return await capacity_response()
+                return await capacity_refusal()
 
             reclaimed = await self._reclaim_idle_route(
                 thread_key,
@@ -4945,12 +4952,12 @@ class Kernel:
             )
             if not reclaimed.reclaimed:
                 self._record_pressure_outcome(reclaimed.outcome)
-                return await capacity_response()
+                return await capacity_refusal()
 
             retry_remaining = current_remaining - (time.monotonic() - pressure_started)
             if retry_remaining <= 0:
                 self._record_pressure_outcome("timeout")
-                return await capacity_response()
+                return await capacity_refusal()
             logger.info(
                 "idle route reclamation freed sandbox capacity; retrying event %s",
                 qevent.event_id,
