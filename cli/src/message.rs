@@ -7471,10 +7471,12 @@ mod tests {
             "a named agent must not be reported as channel C123: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("a named identity's route is refused")),
-            "the plan must say a named identity is refused on cluster message: {lines:?}"
+            lines.iter().any(|l| l.contains("reply_handle.identity")),
+            "the plan must say a named identity rides the relay turn: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("is refused here")),
+            "the disconnected relay no longer refuses a named identity: {lines:?}"
         );
 
         // No --agent still prints the plain --channel line, unchanged.

@@ -936,6 +936,41 @@ mod tests {
         );
     }
 
+    // @spec WORKER-CANARY-3. A relay turn keeps the relay as its delivery
+    // adapter and names its binding in `identity`; the worker scopes the thread
+    // by that identity, so the eval reset must SADD the same key.
+    #[test]
+    fn thread_key_for_turn_scopes_a_relay_turn_by_its_identity() {
+        let mut turn = eval_case_turn(
+            "slack",
+            "C0EXAMPLE1",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            None,
+        );
+        let handle = turn
+            .reply_handle
+            .as_mut()
+            .expect("an eval turn is targeted");
+        handle.adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:C0EXAMPLE1:eval%3A1720000000.000100",
+            "no identity is the default binding"
+        );
+        let handle = turn
+            .reply_handle
+            .as_mut()
+            .expect("an eval turn is targeted");
+        handle.identity = Some("second-bot".to_string());
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:second-bot:C0EXAMPLE1:eval%3A1720000000.000100"
+        );
+    }
+
     #[test]
     fn thread_key_for_turn_reads_the_handles_identity() {
         let mut turn = eval_case_turn(
