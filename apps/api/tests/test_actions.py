@@ -52,6 +52,7 @@ def _complete_body(**overrides: Any) -> dict[str, Any]:
         "failed": False,
         "result": {"ok": True, "summary": "scaled 3 to 10"},
         "prior_state": {"spec": {"replicas": 3}},
+        "post_state": {"spec": {"replicas": 10}},
         "target": {"kind": "Deployment", "namespace": "public", "name": "api"},
         "detail": "non-idempotent tool completed",
     }
@@ -133,7 +134,7 @@ def test_a_completion_that_reported_nothing_stores_sql_null_not_json_null(
     action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
     response = client.post(
         f"/actions/{action_id}/complete",
-        json=_complete_body(result=None, prior_state=None, target=None),
+        json=_complete_body(result=None, prior_state=None, post_state=None, target=None),
         headers=auth_headers,
     )
     assert response.status_code == 200

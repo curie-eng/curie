@@ -12,9 +12,11 @@ that has nothing for the control to do -- a button that authorizes a restore
 which never runs is the platform telling a user an action was put back when it
 was not.
 
-The line still says which actions could be put back. That is the thing an
-operator is buying: not a bot that cannot make mistakes, but a platform that
-knows which mistakes it can take back.
+The line still says which actions the ledger holds restore information for.
+That is the thing an operator is buying: not a bot that cannot make mistakes, but
+a platform that knows which mistakes it could take back. It does not say "can be
+undone": nothing executes a restore yet (#1867), so that would promise what no
+part of the platform can deliver.
 """
 
 from __future__ import annotations
@@ -82,7 +84,8 @@ def _verdict(action: dict[str, Any]) -> str:
         # reported failure, and a failed write is not the same as no write.
         return "failed — check before retrying"
     if action.get("undoable"):
-        return "can be undone"
+        # The ledger holds what a restore needs; nothing performs one yet (#1867).
+        return "restore information recorded"
     detail = action.get("detail")
     # Runner bookkeeping is not a connector explanation of irreversibility.
     if isinstance(detail, str) and detail.strip() and detail not in _GENERIC_DETAILS:
@@ -128,8 +131,9 @@ def render_receipt(
 
     Both kinds of line are here on purpose. A receipt listing only the undoable
     actions would hide the ones that matter most: the value of showing
-    "restarting pods cannot be undone" beside "scaled 3 to 10, can be undone" is
-    that an operator sees the system knows the difference.
+    "restarting pods cannot be undone" beside "scaled 3 to 10, restore
+    information recorded" is that an operator sees the system knows the
+    difference.
 
     ``mode`` is the install's choice (ADR-0180): ``failures`` renders this same
     receipt for the failed actions alone, and ``off`` renders none. It decides
