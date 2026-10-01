@@ -409,6 +409,11 @@ spec:
               value: {{ .Values.worker.routeTtlSeconds | quote }}
             - name: CURIE_SUSPENDED_ROUTE_TTL_SECONDS
               value: {{ .Values.worker.suspendedRouteTtlSeconds | quote }}
+            # Settled stream retention window (ADR 0184). Read through dig so
+            # a release whose retained values predate the block, or carry it
+            # as null, still renders the default.
+            - name: CURIE_STREAM_RETENTION_MIN_AGE_S
+              value: {{ dig "streamRetention" "minAgeSeconds" 86400 (.Values.worker | default dict) | quote }}
             # Delivery budget and ownership lease (ADR-0131, #1971). The
             # overall wall-clock deadline for one delivery -- claim, every
             # runner request, every retry backoff, reclaim, and terminal

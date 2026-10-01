@@ -166,6 +166,11 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
+      # bounded by the schema, and defaults on a release with no such block.
+      - name: helm render assertions (stream retention window)
+        run: bash charts/curie/ci/stream-retention-assertions.sh
+
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
       - name: helm render assertions (api service NodePort)

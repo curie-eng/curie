@@ -285,6 +285,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_HOOK_CLAIM_LEASE_S",
         # WorkItem orphan sweep cadence (#3076), read by the worker process only.
         "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
+        # Settled stream retention window and cadence (ADR 0184), read by the
+        # worker process only.
+        "CURIE_STREAM_RETENTION_MIN_AGE_S",
+        "CURIE_STREAM_RETENTION_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",

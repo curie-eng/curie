@@ -59,6 +59,7 @@ worker:
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   CURIE_SLACK_TRUSTED_ORIGINS: worker.slackTrustedOrigins
   CURIE_STATUS_TEXT: worker.statusText
+  CURIE_STREAM_RETENTION_MIN_AGE_S: worker.streamRetention.minAgeSeconds
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS: worker.suspendedRouteTtlSeconds
   CURIE_TERMINATION_GRACE_PERIOD_S: worker.terminationGracePeriodSeconds
   CURIE_TURN_RECEIPT: worker.turnReceipt
