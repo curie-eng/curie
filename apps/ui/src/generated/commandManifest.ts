@@ -2532,7 +2532,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
               "positional": false,
@@ -5176,7 +5176,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
               "positional": false,
