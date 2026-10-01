@@ -712,7 +712,7 @@ class _RaiseOnceClient(AgentMailClient):
         super().__init__(config)
         self.calls = 0
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("injected")
@@ -837,6 +837,7 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
     # Reconstruct the released v1 database shape, preserving real admitted rows.
     with sqlite3.connect(adapter.config.state_path) as connection:
         connection.execute("ALTER TABLE completion_events DROP COLUMN deleted")
+        connection.execute("DROP TABLE approval_refs")
         connection.execute("PRAGMA user_version=1")
     replacement = MailAdapter(adapter.config)
     try:

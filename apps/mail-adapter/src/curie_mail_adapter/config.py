@@ -18,6 +18,7 @@ Env mapping:
                                                (CURIE_API_BASE_URL: deprecated alias)
     CURIE_CHANNEL_TOKEN                     -> channel_token
     CURIE_EGRESS_SECRET                     -> egress_secret
+    CURIE_ADAPTER_PRINCIPAL                 -> adapter_principal
     ADAPTER_INGRESS_ENABLED                 -> ingress_enabled
     CURIE_MAIL_POLL_INTERVAL_SECONDS        -> poll_interval_seconds
     CURIE_MAIL_INGRESS_ATTEMPTS             -> ingress_attempts
@@ -33,8 +34,10 @@ Env mapping:
     CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS -> discovery_unready_after_seconds
 
 The adapter holds no platform API key, queue credential, or platform database
-access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its only Curie
-credentials, and ``AGENTMAIL_API_KEY`` its only provider one. Its local SQLite
+access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its Curie
+credentials, plus the optional ``CURIE_ADAPTER_PRINCIPAL`` (ADR-0156) that turns
+on answering approvals by email (ADR-0177), and ``AGENTMAIL_API_KEY`` its only
+provider one. Its local SQLite
 file is a single-replica delivery journal, not a platform capability.
 """
 
@@ -90,6 +93,12 @@ class MailAdapterConfig(BaseSettings):
     )
     channel_token: str = Field(default="", validation_alias="CURIE_CHANNEL_TOKEN")
     egress_secret: str = Field(default="", validation_alias="CURIE_EGRESS_SECRET")
+    # The adapter principal credential (ADR-0156), scoped to this adapter's
+    # bindings. Set, it turns on ADR-0177: the adapter renders an approval card
+    # as an email a listed approver can answer, and carries that answer to the
+    # platform's resolver. Empty keeps approvals as they were: shown, never
+    # answerable by email, expiring.
+    adapter_principal: str = Field(default="", validation_alias="CURIE_ADAPTER_PRINCIPAL")
 
     # The neutral adapter-pattern name, documented in
     # docs/guides/building-a-channel-adapter.md; it gates the poller only, never
