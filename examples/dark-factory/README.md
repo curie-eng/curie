@@ -132,16 +132,29 @@ helm upgrade curie <chart> -n curie --reuse-values \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
-# Intake, plus runner egress to the GitHub API for the MCP server. The
-# webhook secret comes from the file (or CURIE_GITHUB_WEBHOOK_SECRET). The
-# egress flag fetches api.github.com/meta and opens the agent's runner egress
-# to the IPv4 api ranges. Before applying anything, the command checks the
-# merged config against the API boot gate (GitHub App id and key from
-# `curie cluster github-app`, a non-default webhook secret, the label, the
-# mention as a bare login, and the repo allowlist), and it applies nothing if
-# one is missing. The values survive a later `curie cluster up`.
-curie cluster factory --repo acme-corp/acme-bot \
-  --label curie-factory --mention <app-slug> \
+# Intake, plus runner egress to the GitHub API for the MCP server. On a
+# release with no GitHub App, the first run prints a prefilled App
+# registration link (add --org <org> for an organization) and four manual
+# steps, and applies nothing. It never opens a browser. Click Create, copy the
+# App ID, generate a private key, install the App on the repositories, and in
+# the App settings turn the webhook on, set its URL and secret, and subscribe
+# to Issues, Issue comment, Pull request review, and Pull request review
+# comment. Then rerun with the App's details.
+curie cluster factory
+
+# The rerun confirms the App with GET /app, takes the mention from its slug,
+# and uses its installed repositories as the allowlist (--repo, repeatable,
+# is checked against them instead). The label defaults to curie-factory and
+# is created in each repository. The key goes into the Secret
+# curie-github-app (key privateKey) through kubectl stdin; a Secret that
+# holds another App's key is refused. The webhook secret comes from the file
+# (or CURIE_GITHUB_WEBHOOK_SECRET) and is still required until polling intake
+# ships. The egress flag fetches api.github.com/meta and opens the agent's
+# runner egress to the IPv4 api ranges. Before applying anything, the command
+# checks the merged config against the API boot gate and applies nothing if
+# one value is missing. The values survive a later `curie cluster up`.
+curie cluster factory \
+  --app-id <app-id> --private-key-file ./app.pem \
   --webhook-secret-file ./webhook-secret \
   --github-api-egress dark-factory
 
@@ -186,7 +199,7 @@ kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Point the App webhook at `<tunnel>/github/webhook`, and pass
+Set the App's webhook URL to `<tunnel>/github/webhook`, and pass
 `--card-base-url <tunnel>` to `curie cluster factory` so links in status
 comments resolve. The port-forward and the tunnel both die when the laptop
 sleeps or the api restarts. Restart them, and update the App webhook URL if

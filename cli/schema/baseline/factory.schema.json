@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/factory/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/factory/v2.json",
   "title": "curie cluster factory --json",
-  "description": "The agent-facing payload of `curie cluster factory`: the dry-run plan, or whether the GitHub factory intake is now enabled. Never carries the webhook secret.",
+  "description": "The agent-facing payload of `curie cluster factory`: the dry-run plan, the GitHub App registration link when no App is configured, whether the GitHub factory intake is now enabled, and the App-derived settings when --app-id was given. Never carries the webhook secret or the App private key.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -38,6 +38,96 @@
       },
       "required": [
         "factory_intake_enabled"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "github_app_registration_url": {
+          "type": "string"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "github_app_registration_url",
+        "steps"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "factory_intake_enabled": {
+          "const": true
+        },
+        "github_app": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "app_id": {
+              "type": "string"
+            },
+            "slug": {
+              "type": "string"
+            },
+            "mention": {
+              "type": "string"
+            },
+            "mention_inferred": {
+              "type": "boolean"
+            },
+            "repos": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "repos_inferred": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "label_inferred": {
+              "type": "boolean"
+            },
+            "labels_created": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "secret": {
+              "type": "string"
+            },
+            "secret_written": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "app_id",
+            "slug",
+            "mention",
+            "mention_inferred",
+            "repos",
+            "repos_inferred",
+            "label",
+            "label_inferred",
+            "labels_created",
+            "secret",
+            "secret_written"
+          ]
+        }
+      },
+      "required": [
+        "factory_intake_enabled",
+        "github_app"
       ]
     }
   ]

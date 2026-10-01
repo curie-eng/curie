@@ -35,7 +35,6 @@ separate trusted job with your GitHub App's identity.
 |---|---|
 | Docker | kind nodes, the local registry, the runner layer build |
 | `kind` v0.24 or later, `kubectl`, `helm` | the local cluster. kind's network plugin enforces NetworkPolicy from v0.24, which the sandbox lockdown relies on. |
-| `jq` | building the GitHub egress values in Step 6 |
 | `cloudflared` | a public URL for the GitHub webhook |
 | `gh` | creating the repository, label and issue (the web UI works too) |
 | `curie` v0.11.1 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
@@ -68,67 +67,19 @@ repository needs one commit. It does not need CI. See
 **You should now see** the repository with one `README.md` commit, and a
 `curie-factory` label under Issues > Labels.
 
-## Step 2: Create your own GitHub App
+## Step 2: Generate the webhook secret
 
 There is no shared Curie App to install. Each self hosted Curie needs its own
 App, because an App has exactly one webhook URL (yours) and one private key
-(which only your cluster may hold). A shared App only works for a hosted
-service.
-
-Open **Settings > Developer settings > GitHub Apps > New GitHub App** on your
-account (or your organization) and fill in:
-
-| Field | Value |
-|---|---|
-| GitHub App name | anything unique, for example `curie-factory-<you>`. Its slug is the login the factory answers to. |
-| Homepage URL | any URL, for example your repository |
-| Webhook | Active. Leave the URL as `https://example.com` for now; Step 5 sets it. |
-| Webhook secret | a long random string. Save it: `openssl rand -hex 32 > ~/.curie-factory-webhook-secret` |
-| Where can this App be installed | Only on this account |
-
-Repository permissions:
-
-| Permission | Access | Why |
-|---|---|---|
-| Metadata | Read | Mandatory for every App. Also covers the check that the labelling user has write access. |
-| Issues | Read and write | Re-read the issue, keep one status comment, set the `curie-factory:*` state labels. |
-| Contents | Read and write | Push the factory's branch. |
-| Pull requests | Read and write | Open and update the pull request. |
-| Checks | Read | Wait on the pull request's check runs. |
-| Commit statuses | Read | Wait on commit statuses. With only one of Checks or Commit statuses, the run ends `ci_unverified`. |
-| Actions | Read (optional) | Lets a CI repair round include the failing job's log tail. Without it the repair prompt says `Job log unavailable.` |
-
-Administration is not needed: the labelling user's permission is read with
-Metadata alone. This guide's proof run used an App with exactly the first six
-rows and no Actions or Administration permission.
-
-Subscribe to these events:
-
-| Event | Why |
-|---|---|
-| Issues | The label that starts a run, and unlabel or close that cancels it |
-| Issue comment | A revision request that mentions the App |
-| Pull request review | Review feedback on the factory's pull request |
-| Pull request review comment | Inline review feedback |
-
-Create the App, then on its settings page:
-
-1. Note the **App ID** (a number) and the **slug** in the public page URL
-   (`https://github.com/apps/<slug>`).
-2. Under **Private keys**, generate a key and save the downloaded `.pem`.
-3. Under **Install App**, install it on your account and pick
-   **Only select repositories** with your trial repository, or
-   **All repositories**. This is a click in the web UI; the REST API refuses
-   it for a user token.
+(which only your cluster may hold). `curie cluster factory` prints a prefilled
+registration link for it in Step 5, once a release exists to apply the intake
+to. Until then, make the secret that signs the App's webhook deliveries:
 
 ```bash
-export APP_ID=<app-id>
-export APP_SLUG=<app-slug>
-export APP_PEM=<path-to-downloaded.pem>
+openssl rand -hex 32 > ~/.curie-factory-webhook-secret
 ```
 
-**You should now see** the App under **Settings > Applications > Installed
-GitHub Apps** with access to the trial repository.
+**You should now see** a 64 character line in that file.
 
 ## Step 3: Start a kind cluster with a local registry
 
@@ -173,7 +124,7 @@ and `kubectl -n kube-system get pods -l k8s-app=kube-dns` show one pod.
 
 ## Step 4: Open the tunnel
 
-Start the tunnel before the install so its URL can go into the install. Leave
+Start the tunnel before the App is registered so its URL can go into the App. Leave
 it running in a second terminal:
 
 ```bash
@@ -188,48 +139,17 @@ export TUNNEL_URL=https://<words>.trycloudflare.com
 
 A quick tunnel gets a new URL every time it starts, and dies when the laptop
 sleeps. `kubectl port-forward` can also drop a request now and then; a
-delivery that failed that way can be redelivered from the App's delivery log. If it restarts, repeat Step 5 and the `githubFactoryCardBaseUrl` value
-below with the new URL.
+delivery that failed that way can be redelivered from the App's delivery log. If it restarts, set the new URL as the App's Webhook URL and rerun the
+`curie cluster factory` command in Step 5 with `--card-base-url` set to it.
 
-## Step 5: Install Curie with factory intake on
+## Step 5: Install Curie, then register the App and turn intake on
 
-Factory intake is off by default and has no CLI flags yet, so it is set with
-`--set`. The API refuses to start with intake on unless the App, a
-non-default webhook secret, the label, the mention login and a repository
-allowlist are all set, so set them in one install. The App's private key goes
-into a Secret first, so it never passes through Helm values. Because that
-Secret already sits in the `curie` namespace, `cluster up` needs `--adopt` to
-take the namespace over.
+Install Curie with no factory settings first. Factory intake is turned on in a
+second command, `curie cluster factory`, which needs a release to apply to.
 
 ```bash
-kubectl create namespace curie
-kubectl -n curie create secret generic curie-github-app \
-  --from-file=privateKey="$APP_PEM"
-
-curie cluster up --context kind-curie-factory --adopt --model z-ai/glm-5.3-flash \
-  --set api.githubAppId="$APP_ID" \
-  --set api.githubAppExistingSecret=curie-github-app \
-  --set api.githubFactoryIngressEnabled=true \
-  --set api.githubFactoryLabel=curie-factory \
-  --set api.githubFactoryMention="$APP_SLUG" \
-  --set "api.githubRepoAllowlist[0]=$REPO" \
-  --set "api.githubWebhookSecret=$(cat ~/.curie-factory-webhook-secret)" \
-  --set "api.githubFactoryCardBaseUrl=$TUNNEL_URL"
+curie cluster up --context kind-curie-factory --model z-ai/glm-5.3-flash
 ```
-
-What each factory value does:
-
-| Value | Meaning |
-|---|---|
-| `api.githubFactoryIngressEnabled` | Turns factory intake on. |
-| `api.githubFactoryLabel` | The admission label. Use `curie-factory`; there is no default. |
-| `api.githubFactoryMention` | The App slug a revision comment must mention. |
-| `api.githubRepoAllowlist` | Repositories the factory may work on. |
-| `api.githubWebhookSecret` | The App's webhook secret, which signs every delivery. |
-| `api.githubFactoryCardBaseUrl` | The public origin GitHub fetches the live card image from. Empty shows a text checklist instead. |
-
-The webhook secret passes through the command line here. `cluster up` cannot
-read it from a file yet ([#3619](https://github.com/curie-eng/curie/issues/3619)).
 
 On kind the first install stops with `RuntimeClass "gvisor" not found` on
 `Job/curie-preflight-gvisor`, after it has already switched gVisor off. Delete
@@ -262,37 +182,94 @@ kubectl --kubeconfig "$HOME/.kube/curie-factory" --context kind-curie-factory \
   -n curie port-forward svc/curie-api 18000:8000
 ```
 
-Point the App at it: on the App's settings page set **Webhook URL** to
-`$TUNNEL_URL/github/webhook` and save.
-
 **You should now see** `curl -s -o /dev/null -w '%{http_code}\n' "$TUNNEL_URL/health"`
 print `200`.
+
+### Register the GitHub App
+
+Run `curie cluster factory` with no App flags (add `--org <org>` to register
+the App on an organization instead of your account):
+
+```bash
+curie cluster factory --context kind-curie-factory
+```
+
+On a release with no App it prints a prefilled GitHub registration link and
+four manual steps, and applies nothing. It never opens a browser. Open the
+link and click **Create GitHub App**. The link fills in the name
+(`curie-factory-<8 hex>`), a private App, and these repository permissions:
+Metadata read, Contents write, Issues write, Pull requests write, Checks read,
+Commit statuses write, and Actions read. Actions lets a CI repair round include
+the failing job's log tail; without it the repair prompt says
+`Job log unavailable.` With only one of Checks or Commit statuses a run ends
+`ci_unverified`, which is why both are set.
+
+The link registers the App with the webhook off and no event subscriptions.
+Webhook intake is still required, so on the new App's settings page:
+
+1. Note the **App ID** (a number).
+2. Under **General > Webhook**, tick **Active**, set **Webhook URL** to
+   `$TUNNEL_URL/github/webhook`, and set **Secret** to the contents of
+   `~/.curie-factory-webhook-secret`.
+3. Under **Permissions & events > Subscribe to events**, check **Issues**,
+   **Issue comment**, **Pull request review**, and **Pull request review
+   comment**. (They are the label that starts a run, a revision request that
+   mentions the App, and review feedback.)
+4. Under **Private keys**, click **Generate a private key** and save the
+   downloaded `.pem`.
+5. Under **Install App**, install it on your account with **Only select
+   repositories** and your trial repository, or **All repositories**. This is
+   a click in the web UI; the REST API refuses it for a user token.
+
+```bash
+export APP_ID=<app-id>
+export APP_PEM=<path-to-downloaded.pem>
+```
+
+Rerun with the App's details, which turns intake on. Step 6 explains the
+egress flag:
+
+```bash
+curie cluster factory --context kind-curie-factory \
+  --app-id "$APP_ID" --private-key-file "$APP_PEM" \
+  --webhook-secret-file ~/.curie-factory-webhook-secret \
+  --github-api-egress dark-factory \
+  --card-base-url "$TUNNEL_URL"
+```
+
+The command reads everything from GitHub before it changes anything:
+
+| What it does | Detail |
+|---|---|
+| Confirms the App | `GET /app` with a JWT signed by the key. A key or ID that does not match refuses the run. |
+| Sets the mention | The App's slug, so a revision comment mentions `@<slug>`. |
+| Sets the allowlist | The repositories the App is installed on. Pass `--repo owner/repo` (repeatable) to check specific repositories against them instead. |
+| Sets the label | `curie-factory`, created in each allowlisted repository (pass `--label` to change it). |
+| Stores the key | In Secret `curie-github-app`, key `privateKey`, written through `kubectl` stdin so it never enters argv or Helm values. A Secret that holds another App's key is refused. |
+| Applies intake | A Helm upgrade that turns the factory intake on. |
+
+The webhook secret and webhook URL are still required today. Once polling
+intake ships (ADR 0187) a poll mode will not need them. `--card-base-url` is
+the public origin GitHub fetches the live card image from; empty shows a text
+checklist instead.
+
+**You should now see** the command finish with intake applied, and
+`kubectl -n curie get secret curie-github-app` list the Secret. In the
+repository, **Issues > Labels** lists `curie-factory`. The App appears under
+**Settings > Applications > Installed GitHub Apps** with access to the trial
+repository.
 
 ## Step 6: Let the agent reach the GitHub API
 
 The sandbox has no network access by default. The agent reads its issue
-through the GitHub MCP server, so open egress to GitHub's API addresses. A
-NetworkPolicy matches addresses, not names, so the list comes from
-`https://api.github.com/meta`. `cluster up` has no values file option yet, so
-this one step uses `helm` directly with the chart `cluster up` installed:
+through the GitHub MCP server, so it needs egress to GitHub's API addresses. A
+NetworkPolicy matches addresses, not names. The `--github-api-egress
+dark-factory` flag in Step 5 fetches `https://api.github.com/meta` and opens
+port 443 from the `dark-factory` agent's sandbox to the IPv4 API ranges, so no
+separate Helm step is needed. The values survive a later `cluster up`.
 
-```bash
-set -o pipefail
-curl -fsSL https://api.github.com/meta \
-  | jq -r '"agentSandbox:\n  connectorEgress:\n    dark-factory:",
-           (.api[] | select(contains(":") | not)
-             | "      - { cidr: \"\(.)\", ports: [{ protocol: TCP, port: 443 }] }")' \
-  > factory-egress.yaml
-grep -c cidr factory-egress.yaml   # must be more than 0
-
-gh release download v0.11.1 -R curie-eng/curie -p 'curie-0.11.1.tgz'
-helm upgrade curie curie-0.11.1.tgz -n curie --kube-context kind-curie-factory \
-  --reuse-values --timeout 21900s -f factory-egress.yaml
-```
-
-Use the chart that matches your `curie --version`.
-
-**You should now see** `STATUS: deployed` from Helm.
+**You should now see** `kubectl -n curie get networkpolicy` list a policy for
+the `dark-factory` connector egress after the agent is deployed in Step 7.
 
 ## Step 7: Build and deploy the factory agent
 
@@ -457,11 +434,13 @@ label.
 
 | What you see | Cause | Fix |
 |---|---|---|
-| Delivery log shows `401` | The webhook secret in the App differs from `api.githubWebhookSecret` | Set the same secret in both, then redeliver |
+| Delivery log shows `401` | The webhook secret in the App differs from the file passed as `--webhook-secret-file` | Set the same secret in both, then redeliver |
 | Delivery log shows `404` or `502` | The App webhook URL is wrong, or the tunnel or port-forward is down or dropped that request. GitHub never retries a failed delivery. | Check `curl $TUNNEL_URL/health`; restart the tunnel or port-forward and update the App URL if needed; then open the failed delivery and click **Redeliver** |
-| Delivery is `200` but no work item appears | The labelling user lacks write access, the repository is not in `api.githubRepoAllowlist`, the label name differs, or no agent has the `github=<owner/repo>` surface | Fix the setting and relabel |
-| `403` when installing the App on a repository through the API | GitHub refuses that call for a user token | Install it in the web UI (Step 2) |
-| `curie-api` crash loops after `cluster up` | Intake is on but a required value is missing | `kubectl -n curie logs deploy/curie-api` names it; set it and rerun `cluster up` |
+| Delivery is `200` but no work item appears | The labelling user lacks write access, the App is not installed on the repository (so it is not on the allowlist), the label name differs, or no agent has the `github=<owner/repo>` surface | Fix the setting and relabel |
+| `403` when installing the App on a repository through the API | GitHub refuses that call for a user token | Install it in the web UI (Step 5) |
+| `curie cluster factory` refuses with `not installed on any repository` | The App has no installation yet | Install it in the web UI (Step 5) and rerun |
+| `curie cluster factory` refuses a key or Secret | The key does not authenticate as `--app-id`, or Secret `curie-github-app` holds another App's key | Pass the matching ID and key, or delete the Secret if it is stale |
+| `curie-api` crash loops after `cluster factory` | Intake is on but a required value is missing | `kubectl -n curie logs deploy/curie-api` names it; set it and rerun `curie cluster factory` |
 | `cluster up` fails on `Job/curie-preflight-gvisor` | A stale preflight Job on kind ([#3618](https://github.com/curie-eng/curie/issues/3618)) | `kubectl -n curie delete job curie-preflight-gvisor`, then rerun |
 | `curie build` fails with `Multi-platform build is not supported` | Docker's default driver builds one platform | Edit `platforms` in `connectors.yaml` (Step 7) |
 | Work item stays `waiting for sandbox capacity` | Another run holds the sandbox, or the runner pod cannot start | `kubectl -n curie get pods`; the run starts when capacity frees |
@@ -470,8 +449,7 @@ label.
 | `Could not complete: the pull request could not be opened.` with `Cause: publication_failed` | The publication Job could not push; `kubectl -n curie logs deploy/curie-worker` shows the git error. On kind, `Could not resolve host: github.com` is the CoreDNS race | Scale CoreDNS to one replica (Step 3), then label a new issue |
 | A `curie-thread-*` pod restarts with `verification preflight report was not accepted` or `configured structured history could not be loaded` | Its first start lost a DNS lookup (the CoreDNS race), and later restarts are refused | Scale CoreDNS to one replica (Step 3), remove the label, then label a new issue |
 | A label delivery shows `200` but nothing happens for five minutes | The delivery went to another URL (someone else repointed the App), or was lost | Check the App's webhook URL. The reconciler admits a labelled issue whose delivery never arrived after about five minutes |
-| `cluster up` refuses: `namespace curie contains non-default objects` | The App key Secret was created first | Add `--adopt` (Step 5) |
-| Card shows as a text checklist | `api.githubFactoryCardBaseUrl` is empty or stale | Set it to the current tunnel URL |
+| Card shows as a text checklist | The card base URL is empty or stale | Rerun `curie cluster factory` with `--card-base-url` set to the current tunnel URL |
 
 ## Moving to a real cluster
 
@@ -480,7 +458,7 @@ The factory pieces stay the same. What changes:
 1. The registry is one your nodes can pull from, and `curie build` builds every
    platform your nodes run (keep both platforms in `connectors.yaml`).
 2. The webhook URL is a stable ingress for the `curie-api` Service instead of a
-   tunnel, and `api.githubFactoryCardBaseUrl` is that origin.
+   tunnel, and `--card-base-url` is that origin.
 3. gVisor stays on where the cluster has the `gvisor` RuntimeClass.
 4. A larger repository needs bigger workspace and runner limits, a longer
    execution deadline, and package registry egress for dependency installs.
