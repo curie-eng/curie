@@ -76,6 +76,7 @@ cargo test --locked --manifest-path "$REPO/cli/Cargo.toml" --test cluster_up_inf
 # in the installed release. JSON is YAML, and JSON has no bare scalars, so the
 # fixture itself cannot be the thing that loses the quoting.
 RETAINED='{
+  "connectorCaller": {"existingSecret": "acme-caller-pair"},
   "security": {"gvisor": {"mode": "off"}},
   "api": {"extraEnv": [
     {"name": "CURIE_FIXTURE_FLAG", "value": "yes"},
