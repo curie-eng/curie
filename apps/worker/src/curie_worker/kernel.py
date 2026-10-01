@@ -5323,16 +5323,19 @@ class Kernel:
                     )
                 repository_requested = workspace_inference.repo is not None
                 if not repository_requested and workspace_deployment_id is not None:
-                    repository_requested = (
-                        trusted_repository_fact(
-                            event.text,
-                            ignore_message=(
-                                verified_review is not None
-                                or source is TurnSource.WEBHOOK
-                                or self._is_approval_resume(qevent.event_id)
-                            ),
-                        )
-                        is not None
+                    retained_fact = trusted_repository_fact(
+                        event.text,
+                        ignore_message=(
+                            verified_review is not None
+                            or source is TurnSource.WEBHOOK
+                            or self._is_approval_resume(qevent.event_id)
+                        ),
+                    )
+                    # With workspaces off a bare token has no allowlist to
+                    # confirm it, so it names no repository (#3671), exactly
+                    # as on the new-turn path below.
+                    repository_requested = retained_fact is not None and not (
+                        self._workspace is None and retained_fact.bare
                     )
                 selected_repository = None
                 if workspace_deployment_id is not None and self._workspace is not None:
@@ -5691,6 +5694,15 @@ class Kernel:
                 # this delivery, or verified feedback whose authority is bound to
                 # a repository. Ambiguity still raises from
                 # trusted_repository_fact above before any route is adopted.
+                #
+                # A bare owner/repo token is a guess (#2947) that only the
+                # allowlist can confirm, and with workspaces off there is none.
+                # So it names no repository and the turn runs generic (#3671),
+                # rather than answering `Swap/Exchange` with chart settings. A
+                # github.com URL, the carried inference and verified feedback
+                # still refuse.
+                if getattr(repo_fact, "bare", False):
+                    repo_fact = None
                 if (
                     repo_fact is not None
                     or workspace_inference.repo is not None

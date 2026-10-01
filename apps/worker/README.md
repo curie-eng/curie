@@ -267,7 +267,11 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
   answers the user, and logs at INFO instead. A turn that names a repository
-  while the coordinator is off for the worker is such a refusal (#2659). Generic
+  by github.com URL while the coordinator is off for the worker is such a
+  refusal (#2659). A bare `owner/repo` token is only a guess (#2947) and with
+  the coordinator off there is no allowlist to confirm it, so it names no
+  repository and the turn stays generic, on a new thread and on a retained
+  route alike (#3671). Generic
   turns continue through the normal claim path while it is off. A retained live
   or suspended route that already has a repository workspace and verified review
   feedback are also terminal refusals, because both require repository authority.

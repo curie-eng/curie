@@ -689,6 +689,58 @@ def test_repository_named_with_workspace_coordinator_off_keeps_main_refusal(
     asyncio.run(go())
 
 
+def test_bare_slash_pair_on_a_retained_file_turn_with_workspaces_off_hands_off_the_file(
+    make_harness,
+) -> None:
+    """A bare `word/word` token is not a repository request when workspaces are off.
+
+    The retained-route twin of the new-turn case (#3671): with no coordinator
+    there is no allowlist to confirm the guess, so it names no repository and
+    the file reaches a runner. The github.com URL case above still refuses.
+    """
+
+    message = "Can you check the Swap/Exchange reservation for next week?"
+
+    async def go() -> None:
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            assert h.kernel._workspace is None  # noqa: SLF001
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="ok", status=DONE)]
+
+            await h.kernel.process_event(_qevent("first", thread="tSlashPairFile"))
+            first = h.substrate.lookup(_thread_key("tSlashPairFile"))
+            assert first is not None and first.workspace_repo is None
+            first_port = h.fake_k8s.assigned_ports[first.sandbox_name]
+            file_event = _qevent(
+                message,
+                thread="tSlashPairFile",
+                event_id="slash-pair-file",
+                placeholder="p-file",
+                attachments=[Attachment(id="F2E", name="reservation.pdf")],
+            )
+
+            await h.kernel.process_event(file_event)
+
+            file_updates = [
+                text for _channel, ref, text in h.sink.updates if ref == "p-file"
+            ]
+            assert WORKSPACES_OFF_REPLY not in file_updates
+            second = h.substrate.lookup(_thread_key("tSlashPairFile"))
+            assert second is not None and second.workspace_repo is None
+            assert second.claim_name != first.claim_name
+            assert h.fake_k8s.claim_envs[-1] is not None
+            assert h.fake_k8s.claim_envs[-1][ATTACHMENTS_REF_ENV] == REF_VALUE
+            second_port = h.fake_k8s.assigned_ports[second.sandbox_name]
+            assert h.runners[first_port].opened == ["first"]
+            assert h.runners[second_port].opened == [message]
+            assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
+
+    asyncio.run(go())
+
+
 def test_sticky_repository_on_generic_retained_route_refuses_before_resolve(
     make_harness,
 ) -> None:
