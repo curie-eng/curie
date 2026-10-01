@@ -1,0 +1,495 @@
+/* Base styles.
+ *
+ * The job of this file is to stop the renderer from behaving like a document.
+ * A web page scrolls as a whole, shows permanent scrollbars, lets you drag-select
+ * across the chrome, and rasterises text the way a browser does. An app does
+ * none of those, and each one left in place is a tell.
+ */
+
+:root {
+  /* The palette, and the only place a literal colour is written.
+   *
+   * `src/tokens.ts` holds no colours of its own any more: every token is a
+   * reference into this block. That is what makes a second theme a matter of
+   * redefining variables rather than editing sixteen screens, and it is why a
+   * component must never hardcode a colour -- a hardcoded white stays white when
+   * the surface under it turns white.
+   *
+   * The theme is set explicitly by the shell (`data-theme` on <html>), never by
+   * a media query alone: the main process owns the preference, including
+   * "follow the system", and the renderer is told the answer. One source of
+   * truth beats two that can disagree. */
+  color-scheme: dark;
+
+  --accent: #3ecf8e;
+  --accent-deep: #2bb377;
+  --on-accent: #062015;
+
+  --s-window: #1c1c1e;
+  /* Transparent in both themes: the window has real vibrancy and painting here
+     would defeat it. */
+  --s-sidebar: transparent;
+  --s-sidebar-fallback: #1f1f21;
+  --s-content: #242426;
+  /* What the content pane actually paints. `--s-content` stays opaque because
+     the theme swatch and the no-vibrancy fallback both need a real colour; this
+     is the same colour with the window's vibrancy allowed through, so the
+     desktop reads faintly behind the pane the way it does behind the sidebar.
+     Light is the riskier direction if you push this further -- dark text over a
+     bright wallpaper loses contrast faster than light text does -- so check a
+     light theme before a dark one. */
+  --s-content-fill: rgba(32, 32, 34, 0.6);
+  --s-raised: #2c2c2e;
+  /* A sheet and a row menu float over arbitrary content, so they cannot be as
+     translucent as a card -- but fully opaque reads as a system dialog dropped
+     on the app rather than as part of it. A thin film over `raised`, with the
+     card blur under it: enough that the page is felt behind the panel, not
+     enough that its text competes with the panel's own. */
+  --sheet-fill: rgba(44, 44, 46, 0.93);
+  --s-hover: #333336;
+  --s-selected: #3a3a3d;
+  --s-well: #1a1a1c;
+  /* A text input. Recessed on dark; on light it is the paper, with the border
+     doing the work of defining it. */
+  --s-field: rgba(0, 0, 0, 0.22);
+  --s-overlay: #2e2e31;
+  /* A filled control sitting on a raised surface, and its hover. */
+  --s-control: rgba(255, 255, 255, 0.1);
+  --s-control-hover: rgba(255, 255, 255, 0.15);
+  --s-subtle: rgba(255, 255, 255, 0.06);
+  --s-stripe: rgba(255, 255, 255, 0.018);
+
+  /* The ink ladder: 1.0 / 0.88 / 0.68 / 0.5, matching `gen-themes.mjs` so the
+     hand-tuned base is not the faintest theme in the app.
+
+     These sit far higher than the platform's own dark label alphas, on purpose.
+     Apple's ladder is tuned for text on an OPAQUE dark surface; this window is
+     translucent, so every surface brightens toward whatever is behind it and
+     dim ink loses the contrast it was budgeted. Two earlier passes at this were
+     still too dark to read -- 0.62 and then 0.7 for secondary, which carries
+     most of the body copy in the app. Most text in dark mode should simply read
+     as white; the ladder exists to rank it, not to hide it. */
+  --t-primary: #ffffff;
+  --t-secondary: rgba(235, 235, 245, 0.88);
+  --t-tertiary: rgba(235, 235, 245, 0.68);
+  --t-quaternary: rgba(235, 235, 245, 0.5);
+
+  --line-separator: rgba(255, 255, 255, 0.07);
+  --line-border: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  --status-ok: #32d74b;
+  --status-warn: #ffd426;
+  --status-danger: #ff453a;
+  --status-info: #0a84ff;
+  --status-neutral: rgba(235, 235, 245, 0.62);
+
+  /* The travelling dot on a switch, and the ring on a focused control. */
+  --knob: #ffffff;
+  --focus-ring: rgba(62, 207, 142, 0.5);
+
+  --accent-hover: #4bdc9a;
+  /* Behind a modal overlay, and under the travelling dot of a switch. */
+  --scrim: rgba(0, 0, 0, 0.4);
+  /* Dark needs no card elevation: a lighter surface on a darker one already
+     reads as raised. Light does, which is why this is a token and not a literal
+     in `Group`. */
+  /* What a grouped list actually paints. Separate from `--s-raised` because that
+     one has to stay a plain colour: the canvas uses it as an SVG fill, and a
+     gradient there is invalid. Dark keeps the flat surface -- a lighter panel on a
+     darker pane already reads as raised. */
+  /* A clear step ABOVE the pane, not a pane sunk below the card. Depth wants a
+     gap; taking it out of the pane makes the whole window gloomy, and dark mode
+     has no headroom to spare downward. */
+  /* Glass, not paper. A card is a thin film with the window's vibrancy coming
+     through it rather than an opaque panel laid on top -- which is what the
+     sidebar has always been, and what made the panes beside it look like
+     printed sheets. In dark the film is LIGHT: tinting a dark surface darker
+     reads as a hole, tinting it lighter reads as glass catching the light. */
+  --card-fill: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.1) 0%,
+    rgba(255, 255, 255, 0.045) 100%
+  );
+  /* What makes it glass rather than merely faint: the backdrop is blurred and
+     its colour pushed, so what shows through reads as something seen THROUGH a
+     surface rather than as a weaker version of the surface. */
+  --card-backdrop: blur(22px) saturate(180%);
+  /* Dark used to be flat, on the reasoning that a lighter panel on a darker
+     pane already reads as raised. Translucency weakened that: the pane now
+     brightens toward whatever is behind the window, so the panel's edge can
+     land on something close to its own value and the card flattens out. It
+     gets the same four jobs as light, in dark's register -- a faint top
+     highlight, a dark hairline, a tight seat, a wide lift. */
+  --shadow-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 0 0 0.5px rgba(0, 0, 0, 0.5),
+    0 1px 3px rgba(0, 0, 0, 0.28),
+    0 10px 28px -10px rgba(0, 0, 0, 0.5);
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
+  --shadow-sheet: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+
+  /* Categorical hues, for container roles and canvas node kinds. These identify
+     rather than rank, so they need to stay distinguishable from each other AND
+     legible on the surface behind them -- which is why light has its own set
+     rather than reusing these at a different opacity. */
+  --hue-blue: #0a84ff;
+  --hue-blue-soft: #5e9eff;
+  --hue-purple: #bf5af2;
+  --hue-violet: #da8fff;
+  --hue-orange: #ff9f0a;
+  --hue-orange-soft: #ffb340;
+  --hue-cyan: #64d2ff;
+  --hue-teal: #66d4cf;
+  --hue-yellow: #ffd426;
+  --hue-red: #ff6961;
+  --hue-grey: #98989d;
+  --hue-grey-dim: #8e8e93;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* The accent darkens: the dark theme's green is a light colour, and light text
+     on it fails on white while it fails as text itself. Darkening lets it serve
+     both as a fill (with white on top) and as text. */
+  --accent: #0f8f62;
+  --accent-deep: #0b6f4c;
+  --on-accent: #ffffff;
+
+  /* The surfaces carry more separation than the dark set, because the eye reads
+     a light stack by contrast against white and there is far less headroom above
+     #ffffff than there is below #1c1c1e. A content pane three percent off its
+     own cards is why the first attempt read as one flat sheet. */
+  --s-window: #d6d8de;
+  --s-sidebar: transparent;
+  --s-sidebar-fallback: #e4e6eb;
+  --s-content: #eaecf1;
+  --s-content-fill: rgba(222, 226, 235, 0.62);
+  --s-raised: #ffffff;
+  --sheet-fill: rgba(255, 255, 255, 0.93);
+  --s-hover: #f1f3f7;
+  --s-selected: #e0e5ee;
+  /* Recessed, and clearly below the card it sits on rather than beside it. */
+  --s-well: #e3e6ec;
+  --s-field: #ffffff;
+  --s-overlay: #ffffff;
+  /* Black at low alpha, not white: a translucent white control on a white
+     surface is invisible, which is the single most common way a dark-first
+     palette breaks when it is inverted. */
+  --s-control: rgba(0, 0, 0, 0.07);
+  --s-control-hover: rgba(0, 0, 0, 0.12);
+  --s-subtle: rgba(0, 0, 0, 0.05);
+  --s-stripe: rgba(0, 0, 0, 0.022);
+
+  /* Each level is darker than the dark theme's mirror image. Grey-on-white at
+     the alpha that works on black is washed out, and the labels that carry the
+     structure -- section headers, field names, units -- are the first to go. */
+  --t-primary: rgba(0, 0, 0, 0.9);
+  --t-secondary: rgba(48, 48, 54, 0.76);
+  --t-tertiary: rgba(48, 48, 54, 0.56);
+  --t-quaternary: rgba(48, 48, 54, 0.4);
+
+  --line-separator: rgba(0, 0, 0, 0.09);
+  --line-border: rgba(0, 0, 0, 0.14);
+  --line-strong: rgba(0, 0, 0, 0.26);
+
+  /* Darkened for contrast on white. The dark theme's status colours are all
+     light, and yellow especially is unreadable on a white surface. */
+  --status-ok: #17803a;
+  --status-warn: #7a5600;
+  --status-danger: #c9000f;
+  --status-info: #0057c8;
+  --status-neutral: rgba(48, 48, 54, 0.56);
+
+  --knob: #ffffff;
+  --focus-ring: rgba(15, 143, 98, 0.5);
+
+  --accent-hover: #0b7a53;
+  --scrim: rgba(0, 0, 0, 0.22);
+  /* Flat white with a hairline is the thing that reads as unstyled. A card gets
+     three treatments instead, all of them subtle: a vertical gradient, real
+     translucency so the bottom edge picks up the pane behind it, and a layered
+     shadow. */
+  --card-fill: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.52) 0%,
+    rgba(255, 255, 255, 0.32) 100%
+  );
+  --card-backdrop: blur(22px) saturate(180%);
+  /* Four layers, each doing one job: an inner top highlight so the edge catches
+     the light, a hairline to define it, a tight shadow to seat it, and a wide
+     soft one to lift it off the pane. A single 1px shadow is what made the first
+     attempt look printed rather than placed. */
+  --shadow-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    0 0 0 0.5px rgba(16, 24, 40, 0.14),
+    0 1px 3px rgba(16, 24, 40, 0.06),
+    0 10px 28px -8px rgba(16, 24, 40, 0.18);
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
+  --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
+  /* A top highlight, not a hard line. At 0.7 this drew a bright white streak
+     across the top of every default button: the fill under it is only
+     `rgba(0,0,0,0.07)`, so a near-opaque white edge on top of it is the highest
+     contrast thing on the control. Light from above should be felt, not read. */
+  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+
+  /* Categorical hues are FILLS -- canvas rails, chart strokes, dots, and the
+     tint behind a badge. They were darkened so they could double as badge text,
+     which `readable()` now derives instead, and that darkening had squeezed all
+     seventeen into one muddy band: seventeen colliding pairs under an RGB
+     distance of 60, with status-warn and hue-yellow only 15 apart. A category
+     colour that cannot be told from the next category is not carrying anything.
+     Vivid and separated; `--status-*` and `--accent` stay text-legible because
+     they ARE used as raw text in about fifteen places. */
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  /* Transparent so the window's real vibrancy shows through. The sidebar is
+     the only region that stays translucent; the content pane paints over it. */
+  background: transparent;
+  color: var(--t-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui,
+    sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  letter-spacing: -0.08px;
+
+  /* The window never scrolls; panes inside it do. */
+  overflow: hidden;
+
+  /* This is an app, not an article. A stray drag that selects the sidebar and
+     half the toolbar reads as a bug. Anything meant to be copied opts back in. */
+  user-select: none;
+  cursor: default;
+
+  /* Match AppKit's text rendering rather than the browser's heavier default. */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Platforms without window vibrancy get solid surfaces instead of see-through
+   ones over nothing: the sidebar falls back to the window colour, and the
+   content pane to its own opaque value. */
+@supports not (backdrop-filter: blur(1px)) {
+  body {
+    background: var(--s-window);
+  }
+
+  :root {
+    --s-content-fill: var(--s-content);
+  }
+}
+
+input,
+textarea,
+[data-selectable],
+pre {
+  user-select: text;
+  cursor: auto;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+}
+
+/* Overlay scrollbars: thin, dark, and only while the pane is hovered. A
+   permanently visible scrollbar track is the most recognisable web-page tell
+   there is. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3) !important;
+  background-clip: content-box;
+}
+
+/* Keyboard-only focus. A ring on every mouse click is noise in a dense UI;
+   losing it for keyboard users is an accessibility bug. */
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 5px;
+}
+
+/* Drag regions. Electron reads `-webkit-app-region`; Tauri reads the data
+   attribute. Both are declared so the same markup works under either shell. */
+.drag,
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+@keyframes curie-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes curie-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* A radar ping: an expanding ring that fades, on a slow loop.
+   
+   This is what a running system gets INSTEAD of a spinner, and the distinction
+   is the whole point of having it. A spinner means "wait for me" -- it is a
+   promise that something will finish -- so leaving one on screen after the work
+   is done tells the operator the opposite of the truth. A ping finishes nothing
+   and is not trying to; it just keeps saying "still here", which is exactly what
+   a healthy stack has to communicate and cannot communicate by disappearing. */
+@keyframes curie-ping {
+  0% {
+    transform: scale(0.65);
+    opacity: 0.5;
+  }
+  70%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+@keyframes curie-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: curie-rise 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  [class*="curie-"] {
+    animation: none !important;
+  }
+}
+
+/* A control that should not stand in its container permanently: present in the
+   DOM, invisible until the container is hovered or something inside it has
+   focus. Mark the control `data-reveal` and the container `data-reveals` -- a
+   `[data-row]` is already one.
+
+   Not `display: none` until hover -- that would take it out of the tab order,
+   which puts it out of reach entirely for anyone driving by keyboard. Opacity
+   keeps it focusable, and `:focus-within` on the container is what makes tabbing
+   to it reveal it.
+
+   Two controls use this, for the same reason in two shapes. A delete control
+   standing beside every row is a mis-click waiting to happen on a list you point
+   at to SWITCH agents far more often than to remove one. And the console's hide
+   button is a permanent invitation to dismiss the panel you are reading, sitting
+   in the corner of every screenful of output. */
+[data-reveal] {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+[data-row]:hover [data-reveal],
+[data-row]:focus-within [data-reveal],
+[data-reveals]:hover [data-reveal],
+[data-reveals]:focus-within [data-reveal] {
+  opacity: 1;
+}
+.row-delete:hover {
+  color: var(--status-danger);
+}
+
+/* The theme preview eases between themes instead of cutting.
+
+   Changing a theme changes every colour in the panel at once, and switching them
+   instantly reads as a flash even when it is the theme you asked for. Easing the
+   colours across turns it into one movement. Only colour is animated, so nothing
+   moves or reflows.
+
+   Gradients cannot be transitioned by `background-color`, so the card fill still
+   swaps outright. That is one element among many and it does not read as a flash
+   on its own.
+
+   Anybody who has asked their system to reduce motion gets the cut, which is
+   what that setting means here: no animation rather than a gentler one. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-theme-preview],
+  [data-theme-preview] * {
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease,
+      color 140ms ease,
+      fill 140ms ease;
+  }
+}

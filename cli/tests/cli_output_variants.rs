@@ -40,8 +40,8 @@ use curie::api::{
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
+    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, ConsoleLoginOutput, DeleteOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
     ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput,
     WorkItemsOutput,
 };
@@ -746,6 +746,19 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     value: 3.0,
                 }],
             }),
+        ],
+    );
+    m.insert(
+        "ConsoleLoginOutput",
+        samples![
+            "DryRun" => ConsoleLoginOutput::DryRun(plan()),
+            "Minted" => ConsoleLoginOutput::Minted {
+                // A sample, so a made-up code: the real one is single-use and
+                // exists only between the terminal and one browser.
+                code: "AAAABBBBCCCCDDDD".to_string(),
+                expires_at: "2026-01-01T00:05:00".to_string(),
+                console_url: "http://localhost:28080".to_string(),
+            },
         ],
     );
     m.insert(

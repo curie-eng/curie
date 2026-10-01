@@ -1,0 +1,32 @@
+{
+  "name": "squawk",
+  "cases": [
+    {
+      "id": "push-acknowledges-and-says-nothing-else",
+      "input": "the deploy is blocked on the migration",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Squawk!\\s*$",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "pop-answers-in-one-of-the-two-valid-shapes",
+      "input": "",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*(Squawk!\\s+\\S|Squawk stack is empty\\.)",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "whitespace-only-is-empty-and-pops",
+      "input": "   ",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*(Squawk!\\s+\\S|Squawk stack is empty\\.)",
+        "case_sensitive": true
+      }
+    }
+  ]
+}

@@ -18,14 +18,14 @@ from urllib.parse import urlsplit
 from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 
 from . import adapter_principal, approval_principal, crud
-from .auth import require_api_key
+from .auth import SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
+CONSOLE_SESSION_COOKIE = SESSION_COOKIE
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
@@ -287,13 +287,14 @@ def platform_key_or_adapter(
     """
 
     async def dependency(
+        request: Request,
         x_api_key: Annotated[str | None, Header()] = None,
         x_curie_adapter_principal: Annotated[
             str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
         ] = None,
     ) -> adapter_principal.AdapterClaims | None:
         if x_curie_adapter_principal is None:
-            await require_api_key(x_api_key)
+            await require_api_key(request, x_api_key, None)
             return None
         if x_api_key is not None:
             raise _unauthorized("ambiguous credentials")
