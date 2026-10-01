@@ -853,7 +853,9 @@ def test_granted_tool_with_different_arguments_is_refused_with_a_reason() -> Non
 
         other = await callback("share_asset", {"asset": "a-2"}, ToolPermissionContext())
         assert isinstance(other, PermissionResultDeny)
-        assert "exact arguments" in other.message
+        assert "approved details" in other.message
+        assert "share asset" in other.message
+        assert "share_asset" not in other.message
         assert other.interrupt is False
         # A refused mismatch mints no new approval and leaves the grant unspent.
         assert gate.pending_summary is None
@@ -3263,3 +3265,15 @@ def test_permission_display_preserves_argument_content_even_if_it_names_a_tool()
     gate.block(tool, arguments)
     assert "mcp__example__read.txt" in gate.pending_display
     assert tool not in gate.pending_display
+@pytest.mark.parametrize("name,label", [("mcp__acme__shareAsset", "share asset"), ("Bash", "shell request"), ("Skill", "instruction request"), ("mcp__acme__", "action")])
+def test_mismatch_feedback_uses_action_words(name: str, label: str) -> None:
+    async def go() -> None:
+        gate = ApprovalGate(required=frozenset({name}), grant_tool=name, grant_arguments={"asset": "a-1"})
+        refusal = await build_can_use_tool(gate)(name, {"asset": "a-2"}, ToolPermissionContext())
+        assert isinstance(refusal, PermissionResultDeny)
+        assert f"The approval for {label}" in refusal.message
+        assert "mcp__" not in refusal.message
+        assert "was not run" in refusal.message
+        assert gate.grant_tool == name
+        assert gate.pending_summary is None
+    anyio.run(go)

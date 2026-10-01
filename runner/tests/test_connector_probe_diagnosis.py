@@ -75,7 +75,7 @@ def test_vector_cases_match_diagnose_derived_connector_headers() -> None:
         assert failure.connector == case["connector"]
         assert failure.reason == case["expected_reason"]
         assert list(failure.credential_names) == case["expected_credentials"]
-        assert failure.caller_message() == case["expected_message"]
+        assert failure.diagnostic_message() == case["expected_message"]
         assert _PLANTED not in failure.caller_message()
         for value in case["env"].values():
             if value.strip():
@@ -216,8 +216,8 @@ def test_probe_exception_on_nonempty_expansion_is_probe_failed(
     assert result.has_potential_write_tool
     message = result.connector_failures[0].caller_message()
     assert planted not in message
-    assert "github" in message
-    assert "GITHUB_TOKEN" in message
+    assert "github" not in message
+    assert "GITHUB_TOKEN" not in message
 
 
 def test_bundle_config_abort_still_reports_derived_empty_expansion(tmp_path: Path) -> None:
@@ -267,8 +267,8 @@ def test_caller_message_never_contains_a_planted_secret() -> None:
         reason="empty_expansion",
     )
     message = failure.caller_message()
-    assert "GITHUB_TOKEN" in message
-    assert "github" in message
+    assert "GITHUB_TOKEN" not in message
+    assert "github" not in message
     assert "ghp-" not in message
     assert "${" not in message
 
@@ -306,3 +306,15 @@ def test_reprobe_never_redials_expansion_failures(monkeypatch: pytest.MonkeyPatc
         missing,
     )
     assert dialed == ["dial"]
+
+
+@pytest.mark.parametrize("reason,phrase", [("missing_credential", "sign-in settings"), ("empty_expansion", "sign-in settings"), ("probe_misconfigured", "connection settings"), ("probe_failed", "could not be reached"), ("caller_refused", "access was refused")])
+def test_caller_feedback_keeps_technical_details_in_diagnostics(reason: str, phrase: str) -> None:
+    from curie_runner.mcp_tool_capability import ConnectorCapabilityFailure
+    failure = ConnectorCapabilityFailure(connector="acme-internal", credential_names=("ACME_TOKEN",), reason=reason, refusal="invalid" if reason == "caller_refused" else None, attempts=3)
+    caller = failure.caller_message()
+    diagnostic = failure.diagnostic_message()
+    assert phrase in caller
+    assert "acme-internal" in diagnostic
+    for internal in ("acme-internal", "ACME_TOKEN", "MCP", "sandbox", "capability probe"):
+        assert internal not in caller
