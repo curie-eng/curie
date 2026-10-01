@@ -368,7 +368,10 @@ class Settings(BaseSettings):
     # guarantee needs a worker-side in-flight lease (follow-up); 900s covers the
     # common single-attempt case with margin.
     resume_reconciler_enabled: bool = True
-    resume_reconciler_interval_seconds: int = 30
+    # A zero or negative interval turns run_forever into a busy spin (a
+    # graveyard scan plus a Postgres query per iteration, back to back), so
+    # boot refuses it (#3725). enabled is the off-switch, not this field.
+    resume_reconciler_interval_seconds: int = Field(default=30, gt=0)
     resume_reconciler_grace_seconds: int = 900
     resume_reconciler_batch_limit: int = 100
 
