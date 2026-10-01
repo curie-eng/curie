@@ -7225,6 +7225,11 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+/// One bare email address, mirroring the API's `_EMAIL_CALLER`: no display name,
+/// list, or wildcard (ADR-0177 amendment approver emails, ADR 0175 callers).
+static BARE_EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$"#).expect("bare email re")
+});
 static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
 });
@@ -7293,6 +7298,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: None,
                 users: Some(users),
+                emails: None,
             })
         }
         "group" => {
@@ -7314,6 +7320,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: Some(group),
                 users: None,
+                emails: None,
             })
         }
         other => Err(crate::exit::usage(format!(
@@ -7439,6 +7446,25 @@ fn build_route_bindings(
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
+            // ADR-0177 amendment, mirroring the API: only a requesting_surface route shows
+            // its card in an email thread. On a fixed Slack target an address
+            // can never be verified, so the list could only admit nobody.
+            if approvers.emails.is_some()
+                && matches!(
+                    binding.resolution,
+                    crate::api::ApprovalResolutionWrite::Fixed(_)
+                )
+            {
+                return Err(crate::exit::CliError::usage(format!(
+                    "route {name:?}: approvers emails need a requesting_surface resolution"
+                ))
+                .with_fix(
+                    "write the route's resolution as {\"mode\": \"requesting_surface\"} in \
+                     --routes-from, or list Slack users instead: a fixed target shows its \
+                     card in Slack, where an email address cannot be verified",
+                )
+                .into());
+            }
         }
     }
 
@@ -7594,11 +7620,27 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
 /// Re-run the flag-path approver checks over a `--routes-from` block, so the two
 /// input forms cannot disagree about what a valid binding is.
 fn validate_parsed_approvers(route: &str, approvers: &crate::api::ApprovalApprovers) -> Result<()> {
-    if approvers.group.is_none() && approvers.users.is_none() {
+    if approvers.group.is_none() && approvers.users.is_none() && approvers.emails.is_none() {
         return Err(crate::exit::usage(format!(
-            "route {route:?}: an approvers block must declare group or users; omit the \
-             block entirely to keep card-channel membership"
+            "route {route:?}: an approvers block must declare group, users or emails; omit \
+             the block entirely to keep card-channel membership"
         )));
+    }
+    if let Some(emails) = &approvers.emails {
+        if emails.is_empty() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: approvers emails, when present, must contain at least \
+                 one address"
+            )));
+        }
+        for email in emails {
+            if !BARE_EMAIL.is_match(email) {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: approvers email {email:?} is not one bare email address \
+                     (e.g. approver@example.com, with no display name or wildcard)"
+                )));
+            }
+        }
     }
     if let Some(group) = &approvers.group {
         if !SLACK_USERGROUP_ID.is_match(group) {
@@ -7991,27 +8033,39 @@ fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> Str
                 target.kind, target.address
             ),
             crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
-                "the asking channel's members in Slack, or only the person who asked on any \
-                 other channel (the default: no approvers block declared)"
+                "the asking channel's members in Slack, and nobody on any other channel \
+                 (the default: no approvers block declared)"
                     .to_string()
             }
         },
-        Some(a) => match (&a.users, &a.group) {
-            // Mirror the API's precedence in the wording rather than hiding it:
-            // `users` wins over `group`, so a binding carrying both must not read
-            // as though the group also decides.
-            (Some(users), Some(group)) => format!(
-                "users {} (an explicit list wins over group {group}; the click channel is ignored)",
-                users.join(", ")
-            ),
-            (Some(users), None) => {
-                format!("users {} (the click channel is ignored)", users.join(", "))
+        Some(a) => {
+            let slack = describe_slack_approvers(a);
+            match &a.emails {
+                Some(emails) => format!("{slack}; on email, {}", emails.join(", ")),
+                None => slack,
             }
-            (None, Some(group)) => {
-                format!("members of Slack user group {group} (the click channel is ignored)")
-            }
-            (None, None) => "unreadable: the block declares neither users nor group".to_string(),
-        },
+        }
+    }
+}
+
+/// The Slack half of an approvers block: who may answer a card shown in Slack.
+fn describe_slack_approvers(a: &crate::api::ApprovalApprovers) -> String {
+    match (&a.users, &a.group) {
+        // Mirror the API's precedence in the wording rather than hiding it:
+        // `users` wins over `group`, so a binding carrying both must not read
+        // as though the group also decides.
+        (Some(users), Some(group)) => format!(
+            "users {} (an explicit list wins over group {group}; the click channel is ignored)",
+            users.join(", ")
+        ),
+        (Some(users), None) => {
+            format!("users {} (the click channel is ignored)", users.join(", "))
+        }
+        (None, Some(group)) => {
+            format!("members of Slack user group {group} (the click channel is ignored)")
+        }
+        (None, None) if a.emails.is_some() => "nobody in Slack".to_string(),
+        (None, None) => "unreadable: the block declares neither users nor group".to_string(),
     }
 }
 

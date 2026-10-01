@@ -2363,8 +2363,11 @@ def test_the_created_record_carries_the_turns_kind_and_adapter(make_harness) -> 
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Send the quote to ACME")
+        # An email approval is created only for a route that lists approver
+        # emails (ADR-0177 amendment); a routeless one escalates.
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote to ACME", "approve")
             ev = _qevent(
                 "send it",
                 event_id="ev-appr-kind",
@@ -2439,8 +2442,9 @@ def test_null_placeholder_turn_persists_its_approval_before_any_delivery(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Give ACME a 20% discount", "approve")
             event = _qevent(
                 "please discount",
                 placeholder=None,
@@ -2723,8 +2727,9 @@ def test_no_edit_placeholderless_approval_tolerates_a_notice_without_a_ref(
 def test_stream_minted_ref_survives_a_booting_delivery_failure(make_harness) -> None:
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Give ACME a 20% discount", "approve")
             booting = h.config.booting_text
             original_emit = h.sink.emit
             booting_failures = 0
@@ -5515,6 +5520,9 @@ def test_tool_approval_card_reaches_the_cluster_message_caller(
 # --- ADR-0177: a route may show its card where the request was asked ----------
 
 _REQUESTING_SURFACE = {"resolution": {"mode": "requesting_surface"}}
+# ADR-0177 amendment: an email card needs a route that lists approver emails, or the
+# approval escalates when raised.
+_LISTED_EMAIL_ROUTE = {**_REQUESTING_SURFACE, "approvers": {"emails": ["approver@example.com"]}}
 _MAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 _MAIL_ADAPTER = "agentmail-sandbox"
 _MAIL_INBOX = "bot@example.com"
@@ -5537,11 +5545,11 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
 ) -> None:
     """ADR-0177 decision 1: the card joins the conversation that asked, over
     that conversation's own transport, and the record says so, which is what
-    the API's served check and requester-only set read back."""
+    the API's served check and approver email list read back (ADR-0177 amendment)."""
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        binding = RoutedBinding({"confirm": _LISTED_EMAIL_ROUTE})
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
             await h.kernel.process_event(_email_qevent("send it", thread="th-mail"))
@@ -5588,6 +5596,46 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
     asyncio.run(go())
 
 
+def test_an_email_card_names_every_listed_approver_and_a_slack_card_names_none(
+    make_harness,
+) -> None:
+    """ADR-0177 amendment A5: the email card carries the route's listed addresses,
+    so the mail adapter can tell the requester who can approve. Every address,
+    lowercased, once, in list order. A Slack card on a route that also lists
+    emails carries none: an address means nothing on Slack."""
+
+    async def go() -> None:
+        route = {
+            **_REQUESTING_SURFACE,
+            "approvers": {
+                "emails": [
+                    "approver@example.com",
+                    "Second.Approver@Example.com",
+                    "approver@example.com",
+                ],
+                "users": ["U0EXAMPLE1"],
+            },
+        }
+        binding = RoutedBinding({"confirm": route})
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_email_qevent("send it", thread="th-mail-names"))
+            (_address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert [(f.label, f.value) for f in message.fields] == [
+                ("Approver", "approver@example.com"),
+                ("Approver", "second.approver@example.com"),
+            ]
+
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_qevent("send it", thread="th-slack-names"))
+            (address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert address == "C1"
+            assert message.fields == []
+
+    asyncio.run(go())
+
+
 def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harness) -> None:
     """ADR-0177 decision 6: whatever ends the approval, the resume settles the
     one card. For email the adapter turns the settled update into a follow-up,
@@ -5596,7 +5644,7 @@ def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harnes
 
     async def go() -> None:
         reader = RecordingReader(_APPROVED)
-        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        binding = RoutedBinding({"confirm": _LISTED_EMAIL_ROUTE})
         async with make_harness(
             approvals=RecordingApprovals(), approval_reader=reader, binding=binding
         ) as h:
@@ -5655,12 +5703,55 @@ def test_a_requesting_surface_route_asked_in_slack_joins_the_slack_thread(
     asyncio.run(go())
 
 
-def test_approvers_on_a_route_that_lands_on_email_escalate_at_raise_time(
+@pytest.mark.parametrize(
+    ("route", "routes"),
+    [
+        # Routeless: no binding, so no list (ADR-0177 amendment A3).
+        (None, None),
+        # The mode alone lists nobody; the requester is not a default.
+        ("confirm", {"confirm": _REQUESTING_SURFACE}),
+        # Slack users nobody on an email thread can prove to be (ADR-0177).
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"users": ["U0EXAMPLE1"]}}}),
+        # An empty list written around the API, and a malformed one.
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"emails": []}}}),
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"emails": "a@example.com"}}}),
+    ],
+)
+def test_an_email_approval_nobody_is_listed_for_escalates_at_raise_time(
+    make_harness, route: str | None, routes: dict | None
+) -> None:
+    """ADR-0177 amendment A3: on email only an address on the route's approver
+    list may answer. Rather than create an approval nobody there can answer,
+    the turn escalates and says why."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding(routes)
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = (
+                _awaiting_script("Send the quote")
+                if route is None
+                else _awaiting_routed_script("Send the quote", route)
+            )
+            ev = _email_qevent("send it", thread=f"th-mail-nobody-{route}")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "approval-no-email-approvers" in h.sink.last_text
+            assert "approver list" in h.sink.last_text
+            if route is not None:
+                assert repr(route) in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_slack_approvers_on_a_route_that_lands_on_another_channel_still_escalate(
     make_harness,
 ) -> None:
-    """ADR-0177 decision 3: approver lists hold Slack users, and nobody on an
-    email thread can prove to be one. Rather than create an approval nobody
-    there can answer, the turn escalates and says why."""
+    """ADR-0177 decision 3 for a non-Slack channel that has no email list."""
 
     async def go() -> None:
         approvals = RecordingApprovals()
@@ -5669,16 +5760,20 @@ def test_approvers_on_a_route_that_lands_on_email_escalate_at_raise_time(
         )
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
-            ev = _email_qevent("send it", thread="th-mail-approvers")
+            ev = _qevent(
+                "send it",
+                thread="th-webchat-approvers",
+                kind="webchat",
+                channel="chat-room-1",
+                endpoint=_MAIL_ENDPOINT,
+                adapter="webchat-adapter",
+                placeholder=None,
+            )
             await h.kernel.process_event(ev)
 
             assert approvals.requests == []
-            assert h.sink.posts == []
             assert h.sink.last_text is not None
-            assert "confirm" in h.sink.last_text
-            assert "approvers" in h.sink.last_text
-            assert "email" in h.sink.last_text
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert "approval-approvers-unverifiable" in h.sink.last_text
 
     asyncio.run(go())
 
