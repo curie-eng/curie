@@ -49,13 +49,13 @@ helm template alloy grafana/alloy \
   --version 1.11.1 \
   --namespace observability \
   -f "$ASSETS/alloy-values.yaml" >"$TMP/alloy.yaml"
-sed -e 's/dockercontainers: false/dockercontainers: true/' \
-  -e 's/stage.cri { }/stage.docker { }/' \
-  "$ASSETS/alloy-values.yaml" >"$TMP/alloy-docker-values.yaml"
+# The Docker-runtime variant is what the CLI's render_alloy_values writes; the
+# Rust test alloy_docker_variant_matches_ci_fixture keeps this fixture equal to
+# it, so the gate never re-implements the rewrite.
 helm template alloy grafana/alloy \
   --version 1.11.1 \
   --namespace observability \
-  -f "$TMP/alloy-docker-values.yaml" >"$TMP/alloy-docker.yaml"
+  -f "$SCRIPT_DIR/fixtures/alloy-docker-values.yaml" >"$TMP/alloy-docker.yaml"
 helm template prometheus prometheus-community/prometheus \
   --version "$PROMETHEUS_CHART_VERSION" \
   --namespace observability \

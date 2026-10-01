@@ -298,10 +298,9 @@ def test_lock_vectors(vector: dict) -> None:
 
 
 def test_lock_model_field_names_match_the_frozen_vector() -> None:
-    # See tests/vectors/connector-fields.json: the schema-driven field-parity
-    # gate compares nothing for these structs because plugin-format.schema.json
-    # carries no Connector* $defs, so this pair of assertions plus the Rust half
-    # is the only thing that keeps the two languages in step.
+    # See tests/vectors/connector-fields.json: this pair of assertions plus the
+    # Rust half keeps the two languages in step, alongside the schema-driven
+    # field-parity gate that has compared these structs since #1128.
     from plugin_format.connector_lock import ConnectorLockEntry, ConnectorLockFile
 
     fields = _vector_file("connector-fields.json")["models"]

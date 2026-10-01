@@ -45,7 +45,7 @@
           },
           "fix": {
             "type": "string",
-            "description": "The exact command that resolves it. Absent when there is nothing to fix."
+            "description": "The exact command that resolves it. Present on a check that is not ok when a fix is known, and on an ok check that works but carries an advisory fix, such as a floating model pin; read it whatever the state. Absent when there is nothing to fix."
           }
         },
         "required": [

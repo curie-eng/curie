@@ -658,6 +658,56 @@ def test_http_reply_applies_every_shared_redaction_rule(
     assert _placeholder(name) in frames[-1]["text"]
     closing = next(frame for frame in frames if frame.get("result") is not None)
     assert _placeholder(name) in closing["result"]["observed"]
+    assert closing["redacted"] is True
+
+
+def test_http_marks_a_side_effect_redacted_when_its_prior_state_held_a_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scrubbed snapshot is not a restore, so the frame has to say it was scrubbed.
+
+    The worker builds the ledger's prior state from this result. Without the
+    marker, a record whose prior state reads ``[REDACTED:held_secret]`` looks
+    exactly as undoable as a clean one (#1873).
+    """
+
+    secret = "FAKESNAPSHOTTOKENVALUE0000"
+    monkeypatch.setenv("ACME_API_TOKEN", secret)
+    snapshot = {
+        "prior": {"env": [{"name": "API_TOKEN", "value": secret}]},
+        "post": {"env": [{"name": "API_TOKEN", "value": "rotated"}]},
+        "target": {"kind": "Deployment", "name": "acme-api"},
+    }
+    raw, frames = _http_reply(
+        _boot_reply_runner(tmp_path, monkeypatch, _reply_script("Rotated.", snapshot))
+    )
+
+    assert secret not in raw
+    flags = [frame for frame in frames if frame["type"] == "side_effect_flag"]
+    closing = next(frame for frame in flags if frame.get("result") is not None)
+    assert closing["result"]["prior"]["env"][0]["value"] == "[REDACTED:held_secret]"
+    assert closing["redacted"] is True
+    # The opening frame carries no result, so there is nothing to have scrubbed.
+    assert all(frame.get("redacted") is None for frame in flags if frame.get("result") is None)
+
+
+def test_http_leaves_a_clean_side_effect_result_unmarked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a replacement marks the frame; a clean snapshot stays restorable."""
+
+    snapshot = {
+        "prior": {"spec": {"replicas": 3}},
+        "post": {"spec": {"replicas": 10}},
+        "target": {"kind": "Deployment", "name": "acme-api"},
+    }
+    _, frames = _http_reply(
+        _boot_reply_runner(tmp_path, monkeypatch, _reply_script("Scaled.", snapshot))
+    )
+
+    closing = next(frame for frame in frames if frame.get("result") is not None)
+    assert closing["result"] == snapshot
+    assert closing.get("redacted") is None
 
 
 def test_http_redacts_repeated_overlapping_and_escaped_values_without_losing_result_entries(

@@ -2162,7 +2162,8 @@ worker:
   # What the receipt beneath a turn's reply shows (ADR-0180), rendered as
   # CURIE_TURN_RECEIPT. A turn that ran a tool outside the read-only allowlist
   # ends its reply with a "What I changed:" list of those actions (ADR-0117).
-  #   all       every action, each saying whether it can be undone (default)
+  #   all       every action, each saying whether restore information was
+  #             recorded (default)
   #   failures  only actions that reported failure, the ones a person must
   #             check before asking again; no receipt when nothing failed
   #   off       no receipt at all, even when an action failed

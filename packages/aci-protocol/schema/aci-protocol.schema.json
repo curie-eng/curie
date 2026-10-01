@@ -1648,6 +1648,18 @@
           "default": null,
           "title": "Failed"
         },
+        "redacted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Redacted"
+        },
         "result": {
           "anyOf": [
             {
@@ -1776,6 +1788,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.8",
-  "title": "ACI Protocol v0.5.8"
+  "protocolVersion": "0.5.9",
+  "title": "ACI Protocol v0.5.9"
 }

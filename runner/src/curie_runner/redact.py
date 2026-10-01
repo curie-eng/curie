@@ -251,7 +251,16 @@ class OutboundRedactor:
             if pending is not None:
                 emitted.append(pending)
         for name in _CONTENT_FIELDS & record.keys():
-            record[name] = self._content(record[name])
+            scrubbed = self._content(record[name])
+            if (
+                name == "result"
+                and record.get("type") == "side_effect_flag"
+                and scrubbed != record[name]
+            ):
+                # The worker builds the ledger's restore state from this result;
+                # a placeholder in it is not a state anything can put back (#1873).
+                record["redacted"] = True
+            record[name] = scrubbed
         emitted.append(self._encode(record))
         return tuple(emitted)
 

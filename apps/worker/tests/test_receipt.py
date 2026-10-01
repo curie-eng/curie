@@ -145,12 +145,20 @@ def test_repeated_named_actions_keep_the_count_and_distinct_verdicts() -> None:
     assert "scaled public/web from 2 to 4" in receipt
 
 
-def test_an_undoable_action_says_it_can_be_put_back() -> None:
+def test_an_undoable_action_says_its_restore_was_recorded_not_that_it_can_be_undone() -> None:
+    """Nothing performs a restore yet (#1867), so the line cannot promise one.
+
+    ``undoable`` means the ledger holds what a restore needs. Saying "can be
+    undone" to the person who asked would claim a capability no part of the
+    platform has, which is the overclaim ADR-0117 exists to prevent (#1861).
+    """
+
     receipt = render_receipt([_action()])
 
     assert receipt is not None
     assert "scaled public/api from 3 to 10" in receipt
-    assert "can be undone" in receipt
+    assert "restore information recorded" in receipt
+    assert "can be undone" not in receipt
 
 
 def test_an_irreversible_action_states_its_own_reason() -> None:
@@ -203,7 +211,7 @@ def test_both_kinds_appear_together() -> None:
     )
 
     assert receipt is not None
-    assert "can be undone" in receipt
+    assert "restore information recorded" in receipt
     assert "restarting pods cannot be undone" in receipt
 
 
@@ -316,7 +324,7 @@ def _mixed_turn() -> list[dict[str, Any]]:
 
 _MIXED_TURN_GOLDEN = (
     "_What I changed:_\n"
-    "• scaled public/api from 3 to 10 — can be undone (2 calls)\n"
+    "• scaled public/api from 3 to 10 — restore information recorded (2 calls)\n"
     "• called `restart_deployment` — restarting pods cannot be undone\n"
     "• called `stage_file` — cannot be undone: nothing reported a prior state\n"
     "• Shell request completed; changes were not summarized and undo information "
@@ -337,7 +345,7 @@ def _long_turn() -> list[dict[str, Any]]:
 _LONG_TURN_GOLDEN = "\n".join(
     [
         "_What I changed:_",
-        *(f"• read thread {i} — can be undone" for i in range(9)),
+        *(f"• read thread {i} — restore information recorded" for i in range(9)),
         "• posted probe — failed — check before retrying",
         "• …and 31 more actions not listed",
     ]
@@ -488,7 +496,7 @@ def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: s
     "overrides,verdict",
     [
         ({"status": "failed", "undoable": False}, "failed — check before retrying"),
-        ({"undoable": True}, "can be undone"),
+        ({"undoable": True}, "restore information recorded"),
     ],
 )
 def test_generic_detail_does_not_replace_failure_or_undoability(
@@ -550,7 +558,7 @@ def test_native_request_with_prior_snapshot_and_no_target_does_not_deny_prior_st
     "overrides,line",
     [
         ({"status": "failed"}, "called `{tool}` — failed — check before retrying"),
-        ({"undoable": True}, "called `{tool}` — can be undone"),
+        ({"undoable": True}, "called `{tool}` — restore information recorded"),
         (
             {"detail": "external changes require manual restoration"},
             "called `{tool}` — external changes require manual restoration",
@@ -588,7 +596,7 @@ def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> 
         "is incomplete (3 calls)\n"
         "• Shell request completed; changes were not summarized and undo information "
         "is incomplete (2 calls)\n"
-        "• scaled public/api from 3 to 10 — can be undone\n"
+        "• scaled public/api from 3 to 10 — restore information recorded\n"
         "• called `Skill` — failed — check before retrying\n"
         "• called `Skill` — failed — check before retrying"
     )

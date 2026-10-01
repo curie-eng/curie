@@ -401,6 +401,10 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+# One aggregate series: the count of agents the connector reconciler is
+# skipping right now (#1215). Which agents, and why, is in the log line each
+# skip transition emits; an agent label here would be a deployment identifier.
+_CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
 # Removals and rewrites of an agent's stored state (#3673). Namespaces are
 # caller-chosen, so every one the platform does not own shares ``other``; the
 # agent, scope and key are in the log line, never on the metric.
@@ -642,6 +646,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.connector.reconcile.skipped_agents": _definition(
+        "gauge",
+        "{agent}",
+        "Agents whose connector applies the reconciler is skipping.",
+        False,
+        _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
     ),
     "curie.state.mutation": _definition(
         "counter",
