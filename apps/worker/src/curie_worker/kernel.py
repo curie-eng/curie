@@ -509,8 +509,18 @@ def _exception_reason(exc: BaseException) -> str:
 # blip was transient before it had a name and still is, and the side-effect
 # check above still runs first, so a workspace failure that somehow arrives
 # after a side-effect frame escalates rather than replaying it.
+# ``sandbox-capacity`` (#3693) is a ResourceQuota refusal on an approval resume,
+# which retries rather than taking the ordinary capacity reply. It is named
+# apart from ``runner-error`` because no runner was reached: the agent was busy.
 RETRYABLE_CLASSIFICATIONS = frozenset(
-    {"rate-limit", "runner-error", "runner-timeout", "sandbox-terminated", "workspace-error"}
+    {
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "sandbox-capacity",
+        "sandbox-terminated",
+        "workspace-error",
+    }
 )
 
 #: The class a restricted turn fails under when its runner cannot enforce it.
@@ -546,7 +556,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
-    {"runner-timeout-unconfirmed", "sandbox-terminated"}
+    {"runner-timeout-unconfirmed", "sandbox-capacity", "sandbox-terminated"}
 )
 
 _ESCALATION_DETAIL_MAX = 300
@@ -654,6 +664,12 @@ _CLASSIFICATION_GUIDANCE = {
         "Conversation history capacity exceeded. Work already performed may have side "
         "effects; inspect the result. The run can be retried; if one turn is over the "
         "cap, raise api.transcriptMaxThreadBytes (TRANSCRIPT_MAX_THREAD_BYTES)."
+    ),
+    # Read by the person who approved. No quota detail (#2434): the worker's
+    # "sandbox capacity exhausted" warning carries it for the operator.
+    "sandbox-capacity": (
+        "The agent was at capacity, so the approved request did not run. "
+        "Send it again in a few minutes."
     ),
 }
 
@@ -4861,7 +4877,7 @@ class Kernel:
                     raise _WorkItemDeferred() from None
             if self._is_approval_resume(qevent.event_id):
                 release_order()
-                return TurnOutcome(terminal_ok=False, classification="runner-error")
+                return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             if pressure_retried:
                 self._record_pressure_outcome("reclaimed-retry-refused")
                 return await capacity_response()
