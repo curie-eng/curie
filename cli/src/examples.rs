@@ -878,23 +878,49 @@ pub struct DarkFactoryRenderOpts {
     pub out: PathBuf,
 }
 
+/// The dark factory runner layer each release publishes (#3747). Under ADR
+/// 0173 the bundle's owner builds its runner layer, and for this example that
+/// owner is the project, so `release.yaml` pushes it tagged by version.
+pub const DARK_FACTORY_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-dark-factory-runner";
+/// The platform runner the published layer is built on, at the same version.
+const PLATFORM_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-runner";
+
 pub struct DarkFactoryRenderOutput {
     pub path: PathBuf,
+    /// The published runner layer the lock records, when one exists.
+    pub runner_image: Option<String>,
+    /// Why no published layer was locked, naming the build that replaces it.
+    pub runner_note: Option<String>,
 }
 
 impl CliOutput for DarkFactoryRenderOutput {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({"bundle_dir": self.path, "rendered": true})
+        serde_json::json!({
+            "bundle_dir": self.path,
+            "rendered": true,
+            "runner_image": self.runner_image,
+            "runner_note": self.runner_note,
+        })
     }
 
     fn render(&self, ui: &Ui) {
+        if let Some(image) = &self.runner_image {
+            ui.note(&format!("runner layer locked to the published {image}"));
+        }
+        if let Some(note) = &self.runner_note {
+            ui.note(note);
+        }
         ui.payload(&format!("Dark factory bundle: {}", self.path.display()));
     }
 }
 
 /// Write the embedded dark-factory bundle into `opts.out`. Touches no cluster.
 /// Refuses an existing non-empty directory before writing anything.
-pub fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
+///
+/// A release build then locks the runner layer the release published for its
+/// own version, so `cluster deploy` needs no build step (#3747). A source build
+/// has no published layer to name, and says so instead of failing at deploy.
+pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
     let out = opts.out;
     if out.exists() {
         let non_empty = !out.is_dir()
@@ -923,7 +949,77 @@ pub fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRen
                 .with_context(|| format!("marking {} executable", path.display()))?;
         }
     }
-    Ok(DarkFactoryRenderOutput { path: out })
+    let version = crate::artifacts::version();
+    let published = match crate::artifacts::Channel::current() {
+        crate::artifacts::Channel::Dev => Err(format!(
+            "this curie {version} is a source build, so no dark factory runner layer is \
+             published for it."
+        )),
+        crate::artifacts::Channel::Release => {
+            let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, version).await?;
+            let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, version).await?;
+            match (layer, base) {
+                (Some(layer), Some(base)) => Ok((layer, base)),
+                _ => Err(format!(
+                    "no dark factory runner layer is published for curie {version} \
+                     ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
+                     {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
+                )),
+            }
+        }
+    };
+    match published {
+        Ok((layer, base)) => {
+            let image = format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}");
+            lock_published_runner(
+                &out,
+                &image,
+                &format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
+            )?;
+            Ok(DarkFactoryRenderOutput {
+                path: out,
+                runner_image: Some(image),
+                runner_note: None,
+            })
+        }
+        Err(reason) => Ok(DarkFactoryRenderOutput {
+            runner_note: Some(format!(
+                "{reason} Build the runner layer before deploying: `curie build --plugin-dir {} \
+                 --registry <ref>`.",
+                out.display()
+            )),
+            path: out,
+            runner_image: None,
+        }),
+    }
+}
+
+/// Record the published layer in the rendered bundle's lock, exactly as
+/// `curie build --registry` would have: the same entry shape, and the
+/// `source_digest` of the tree just written so the deploy's freshness check
+/// passes until someone edits the layer.
+fn lock_published_runner(out: &Path, image: &str, base: &str) -> Result<()> {
+    use crate::connector_build as cb;
+    let runner = cb::load(out)?
+        .runner
+        .context("the embedded dark factory connectors.yaml declares no runner layer")?;
+    let (context, _) = cb::check_runner_source(out, &runner)?;
+    let source_digest = cb::source_digest_of(&context, &runner.build).context("runner")?;
+    cb::write_lock(
+        out,
+        &cb::ConnectorLockFileDecl {
+            version: cb::LOCK_VERSION,
+            connectors: Default::default(),
+            runner: Some(cb::RunnerLockEntryDecl {
+                image: image.to_string(),
+                base: base.to_string(),
+                delivery: cb::Delivery::Registry,
+                platforms: runner.build.platforms.clone(),
+                source_digest,
+            }),
+        },
+        false,
+    )
 }
 
 pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
@@ -1468,6 +1564,18 @@ async fn resolve_tempo_index_digest() -> Result<String> {
 /// in one machine's Docker daemon -- so keeping the connector without resolving a
 /// published digest produces a bundle whose write path can never come up.
 async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
+    match published_index_digest(repository, tag).await? {
+        Some(digest) => Ok(digest),
+        None => bail!(
+            "could not resolve {repository}:{tag}: OCI index request returned HTTP 404 Not Found"
+        ),
+    }
+}
+
+/// [`resolve_index_digest`], with "this tag was never published" as `None`
+/// rather than an error. Any other failure, an unreachable registry included,
+/// stays an error: absence is a fact about the release, an outage is not.
+async fn published_index_digest(repository: &str, tag: &str) -> Result<Option<String>> {
     let path = repository
         .strip_prefix("ghcr.io/")
         .with_context(|| format!("{repository} is not a ghcr.io repository"))?
@@ -1513,6 +1621,9 @@ async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
         .send()
         .await
         .with_context(|| format!("fetching the OCI image index for {tagged}"))?;
+    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !manifest_response.status().is_success() {
         bail!(
             "could not resolve {tagged}: OCI index request returned HTTP {}",
@@ -1552,7 +1663,7 @@ async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
         .collect::<String>();
     let digest = format!("sha256:{digest_hex}");
     validate_sha256_digest(&digest)?;
-    Ok(digest)
+    Ok(Some(digest))
 }
 
 fn validate_sha256_digest(digest: &str) -> Result<()> {
@@ -4737,11 +4848,12 @@ mod dark_factory_render_tests {
     }
 
     // A2
-    #[test]
-    fn render_writes_every_file_and_keeps_the_review_gate_executable() {
+    #[tokio::test]
+    async fn render_writes_every_file_and_keeps_the_review_gate_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("factory");
         let rendered = render_dark_factory(DarkFactoryRenderOpts { out: out.clone() })
+            .await
             .expect("render into a new directory");
         assert_eq!(rendered.path, out);
         for (name, bytes) in DARK_FACTORY_BUNDLE_FILES {
@@ -4769,13 +4881,13 @@ mod dark_factory_render_tests {
     }
 
     // A3
-    #[test]
-    fn render_into_a_non_empty_directory_is_refused_and_writes_nothing() {
+    #[tokio::test]
+    async fn render_into_a_non_empty_directory_is_refused_and_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("busy");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("keep.txt"), b"mine").unwrap();
-        let error = match render_dark_factory(DarkFactoryRenderOpts { out: out.clone() }) {
+        let error = match render_dark_factory(DarkFactoryRenderOpts { out: out.clone() }).await {
             Ok(_) => panic!("a non-empty out dir must be refused"),
             Err(error) => format!("{error:#}"),
         };

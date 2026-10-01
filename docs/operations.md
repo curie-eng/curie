@@ -991,9 +991,12 @@ this execution and the WorkItem's issue, reads the issue and its comments with
 the GitHub App installation token (minted fresh per read), and returns them
 verbatim without storing anything. The sandbox holds no GitHub credential, so
 the bundle needs no token or runner egress to the GitHub API. The bundle's
-runner layer still carries the uv, Rust and pnpm toolchains, so run
-`curie build --plugin-dir examples/dark-factory --registry <ref>` before the
-deploy; the deploy refuses the bundle until its lock records the layer. After a
+runner layer still carries the uv, Rust and pnpm toolchains. Each release
+publishes it as `ghcr.io/curie-eng/curie-dark-factory-runner:<version>`, and
+`curie example dark-factory render --out <dir>` from a release CLI records its
+digest in the bundle's lock. A source built CLI has no published layer, says
+so, and names `curie build --plugin-dir <dir> --registry <ref>` instead; the
+deploy refuses the bundle until its lock records the layer. After a
 failed or capped review the agent ends its reply with `Could not complete:` and
 the unresolved findings, and the factory status comment on the issue carries
 that result. The chart now ships
