@@ -401,6 +401,10 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+# One aggregate series: the count of agents the connector reconciler is
+# skipping right now (#1215). Which agents, and why, is in the log line each
+# skip transition emits; an agent label here would be a deployment identifier.
+_CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
 _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "step": [
@@ -634,6 +638,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.connector.reconcile.skipped_agents": _definition(
+        "gauge",
+        "{agent}",
+        "Agents whose connector applies the reconciler is skipping.",
+        False,
+        _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
     ),
     "curie.work_item.reconciler.step.failure": _definition(
         "counter",
