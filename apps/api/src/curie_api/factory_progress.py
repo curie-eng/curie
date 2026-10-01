@@ -484,6 +484,15 @@ async def record_ci_rerun(session: AsyncSession, request_id: uuid.UUID, note: st
 
     if not 1 <= len(note) <= 280:
         raise ValueError("ci rerun note length")
+    found = await session.scalar(
+        select(ExecutionRequestPhaseReport.id).where(
+            ExecutionRequestPhaseReport.execution_request_id == request_id,
+            ExecutionRequestPhaseReport.note == note,
+        )
+    )
+    if found is not None:
+        await session.rollback()
+        return
     session.add(
         ExecutionRequestPhaseReport(
             execution_request_id=request_id,

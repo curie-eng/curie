@@ -1038,7 +1038,12 @@ def test_failing_actions_jobs_skip_other_apps_and_incomplete_runs() -> None:
     )
 
     assert factory_ci.failing_actions_jobs(detail) == [
-        {"id": 7, "name": "chart", "started_at": "2026-10-01T00:00:00Z"}
+        {
+            "id": 7,
+            "name": "chart",
+            "started_at": "2026-10-01T00:00:00Z",
+            "details_url": None,
+        }
     ]
 
 

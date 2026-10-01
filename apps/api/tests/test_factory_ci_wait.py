@@ -1563,6 +1563,9 @@ def _actions_failure(
 ) -> dict[str, Any]:
     run = check_run(name, conclusion=conclusion, run_id=run_id, started_at=started_at)
     run["app"] = {"slug": "github-actions"}
+    # The check run's details URL carries the workflow run id GitHub reruns.
+    # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    run["details_url"] = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{run_id}"
     return run
 
 
@@ -1716,3 +1719,52 @@ def test_a_refused_actions_rerun_falls_back_to_the_implementer_round(
 
     assert sink.reruns == [job_id]
     assert len(_ci_turns(request_id)) == 1
+
+
+def test_an_accepted_rerun_is_not_posted_again_when_a_later_run_retries(
+    admitted: Any,
+) -> None:
+    """A 201 is kept when a second workflow run returns 500."""
+
+    _client, _github, sink = admitted
+    number = 9813
+    first = _actions_failure("unit-tests", 88131, "2026-10-01T00:00:00Z")
+    second = _actions_failure("lint", 88132, "2026-10-01T00:00:00Z")
+    sink.ci_script = [ci_entry(first, second)]
+    sink.rerun_statuses = [201, 500, 201]
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+    # The second workflow run answered 500. Its id is recorded, then the batch stops.
+    assert sink.reruns == [88131, 88132]
+    assert _ci_turns(published["id"]) == []
+
+    _reconcile()
+    # Only the run that was not accepted is posted again.
+    assert sink.reruns == [88131, 88132, 88132]
+    assert _ci_turns(published["id"]) == []
+
+
+def test_an_outstanding_rerun_times_out_without_an_implementer_round(
+    admitted: Any,
+) -> None:
+    """The pre-rerun failure does not spend a wait_ci round when the budget ends."""
+
+    _client, _github, sink = admitted
+    number = 9814
+    job_id = 88141
+    sink.ci_script = [ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))]
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+    assert sink.reruns == [job_id]
+    assert _ci_turns(request_id) == []
+
+    _reconcile_later(1300)
+
+    assert _ci_turns(request_id) == []
+    assert sink.reruns == [job_id]
+    assert _terminal(number) == ("failed", "ci_timeout")
+    assert "Reason: ci_rerun_outstanding" in _body(sink, request_id)
