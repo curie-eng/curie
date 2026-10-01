@@ -1541,6 +1541,23 @@ pub fn apply_credential_plan(
 /// [`ensure_build_reaches_the_stack`] at the resolve site, rather than as an
 /// assumption made here: it is what decides whether the success line may claim
 /// the stack below runs what was just built.
+/// The `docker build` lines a `--build --dry-run` plan lists ahead of the
+/// compose line (#1929). It walks [`source_images`] with the tag
+/// [`build_source_images`] builds, so the plan names exactly the builds the
+/// real run performs, each rendered as `build_image` announces it.
+fn source_build_plan(o: &LocalOpts) -> Vec<String> {
+    let tag = o.resources.image_tag.as_str();
+    source_images(o)
+        .iter()
+        .map(|image| {
+            crate::commands::build_image_command_line(
+                image.dockerfile,
+                &source_image_ref(image.image, tag),
+            )
+        })
+        .collect()
+}
+
 async fn build_source_images(o: &LocalOpts, reach: BuildReach) -> Result<()> {
     let ui = crate::ui::ui();
     // Same checkout sentinel `curie build` uses: a release binary has nothing
@@ -1591,9 +1608,14 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
         crate::local_stack_keys::compose_secret_env(&stack.credentials),
     );
     if o.dry_run {
-        return Ok(LocalUpOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![cmd.display()],
-        }));
+        // The builds run before compose starts anything, so they lead the plan.
+        let mut lines = if o.build.is_some() {
+            source_build_plan(&o)
+        } else {
+            Vec::new()
+        };
+        lines.push(cmd.display());
+        return Ok(LocalUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     require_on_path("docker")?;
     // #1915: build before compose starts anything, so a failed build never

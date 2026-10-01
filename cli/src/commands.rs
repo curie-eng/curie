@@ -615,6 +615,17 @@ pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
     tags
 }
 
+/// The `docker build` command line [`build_image`] runs from the repo root,
+/// as it announces it and as a `local up --build --dry-run` plan lists it.
+pub(crate) fn build_image_command_line(dockerfile: &str, tag: &str) -> String {
+    let rendered = platform_image_tags(dockerfile, tag)
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("docker build -f {dockerfile} {rendered} .")
+}
+
 /// Build one platform image. The single `docker build` invocation for Curie
 /// images: `curie build` and `curie local up --build` both route here (#1931).
 pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
@@ -640,13 +651,9 @@ pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
         args.push(image_tag.clone());
     }
     args.push(".".to_string());
-    let rendered = tags
-        .iter()
-        .map(|image_tag| format!("-t {image_tag}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     ui.note(&format!(
-        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
+        "=== {} (in {}) ===",
+        build_image_command_line(dockerfile, tag),
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
