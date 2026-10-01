@@ -151,6 +151,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S",
         "CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES",
         "CURIE_WORKER_SUPERVISE_FAILURE_RESET_S",
+        # How many turns one worker runs at once (#760), read from the WORKER's
+        # env by WorkerConfig and consumed by the consumer's in-flight bound.
+        # It sizes the worker's own concurrency; nothing about it reaches a
+        # sandbox.
+        "CURIE_WORKER_MAX_CONCURRENCY",
         # Managed-workspace operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
         # and the internal credential client. They govern worker-side clone,

@@ -422,6 +422,14 @@ class WorkerConfig(BaseSettings):
     # DO NOT CHANGE -- ADR-0039 stands, and weakening the cap is the #505 total
     # stall regression, not a simplification.
     max_delivery: int = Field(default=5, ge=2, validation_alias="CURIE_MAX_DELIVERY")
+    # Turns one worker runs at once on the runs lane (#760): the consumer's
+    # capacity semaphore, and so how many sandboxes one worker can hold busy.
+    # The chart renders it from worker.maxConcurrency; the fleet-wide figure is
+    # worker.replicas times this, which NOTES prints beside the sandbox quota
+    # ceiling. Floor 1, since 0 admits no turn; 256 matches the chart schema.
+    max_concurrency: int = Field(
+        default=16, ge=1, le=256, validation_alias="CURIE_WORKER_MAX_CONCURRENCY"
+    )
     # Empty means "derive ``<stream>:dead``" at the use site; a static Field
     # default cannot reference ``self.stream``. An explicit override equal to
     # ``stream`` is rejected outright -- see ``_reject_self_targeting_graveyard``.

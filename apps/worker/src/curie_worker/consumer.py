@@ -173,7 +173,7 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
-        max_concurrency: int = 16,
+        max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
@@ -197,8 +197,12 @@ class Consumer(StreamConsumer):
         self._kernel = kernel
         self._config = config
         self._waits = CapacityWaitStore(redis, config)
-        self._max_concurrency = max_concurrency
-        self._sem = asyncio.Semaphore(max_concurrency)
+        # None, which the production entry point passes, sizes the lane from
+        # CURIE_WORKER_MAX_CONCURRENCY; an explicit value is for tests.
+        self._max_concurrency = (
+            config.max_concurrency if max_concurrency is None else max_concurrency
+        )
+        self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads. Built
         # after self._config is stored; handler is the bound self._dispatch. The
