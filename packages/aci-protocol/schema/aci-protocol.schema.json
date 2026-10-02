@@ -363,6 +363,22 @@
           ],
           "title": "Bundle Version"
         },
+        "channel_bound": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CHANNEL_BOUND",
+          "producer": [
+            "worker"
+          ],
+          "title": "Channel Bound"
+        },
         "channel_memory_ref": {
           "anyOf": [
             {
@@ -558,6 +574,38 @@
             "worker"
           ],
           "title": "History Token"
+        },
+        "issue_read_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ISSUE_READ_TOKEN",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Issue Read Token"
+        },
+        "issue_read_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ISSUE_READ_URL",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Issue Read Url"
         },
         "max_turns": {
           "anyOf": [
@@ -1848,6 +1896,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.13",
-  "title": "ACI Protocol v0.5.13"
+  "protocolVersion": "0.5.14",
+  "title": "ACI Protocol v0.5.14"
 }
