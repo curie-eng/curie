@@ -32,7 +32,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Require third party action SHA pins and version comments
         run: |
           uv run --no-project --with pyyaml==6.0.3 python3 - <<'PY'
@@ -125,7 +125,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -135,7 +135,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -284,7 +284,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -294,7 +294,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       # Fail fast if uv.lock has drifted from the pyproject.toml files (a
@@ -458,7 +458,7 @@ jobs:
       - name: Schema baseline
         run: bash scripts/refresh-schema-baseline.sh --check
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Schema window gate
@@ -560,7 +560,7 @@ jobs:
           shared-key: rust-test
           save-if: ${{ matrix.partition == 1 }}
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest@0.9.146
       # write_allowlist_bundle_passes_the_real_bundle_validator (AC3) shells out
@@ -571,7 +571,7 @@ jobs:
       # syncs the environment itself, and the test invokes it with an explicit
       # repo-root `current_dir`.
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Install Helm for CLI consumer render tests
@@ -1460,7 +1460,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -1840,7 +1840,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # Kind normally stays on main. Next pull requests and pushes to next
       # omit it except when a PR changes cluster runtime assertions or the
       # released-upgrade jobs; a dispatch (including nightly) keeps it.
@@ -2009,7 +2009,7 @@ jobs:
             kind load docker-image "$img" --name curie-e2e
           done
       - name: Install uv for publication proof
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Prove publication Job adoption and failure reporting
@@ -2311,7 +2311,7 @@ jobs:
       # The connector render needs the workspace. Kept out of the assertion
       # step so that step is only the receipt runner (#3391).
       - name: Install uv for the connector readiness render
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       # Connector readiness (#3338). The script defaults to k8scratch; this
@@ -3412,7 +3412,7 @@ jobs:
           persist-credentials: false
       - name: Install uv for the runtime assertion gate
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
       # receipt runner, and that exact blob left a pass receipt. The negative
