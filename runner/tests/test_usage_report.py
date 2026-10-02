@@ -382,9 +382,10 @@ def test_observe_keys_role_on_parent_tool_use_id_and_report_resets() -> None:
                 _result(model_usage={SHARED: _model_usage(900, 90)}, uuid="turn-a"), SHARED
             )
             # Next turn: no subagent messages, so nothing carries over.
+            # model_usage is the session running total, so this result includes turn A.
             reporter.observe(_assistant(SHARED, _sdk_usage(50, 5)))
             await reporter.report(
-                _result(model_usage={SHARED: _model_usage(50, 5)}, uuid="turn-b"), SHARED
+                _result(model_usage={SHARED: _model_usage(950, 95)}, uuid="turn-b"), SHARED
             )
         finally:
             await server.close()
@@ -508,7 +509,10 @@ def test_observe_counts_each_message_id_once() -> None:
                 )
             )
             await reporter.report(
-                _result(model_usage={PRIMARY: _model_usage(5, 1)}, uuid="t-dedupe-next"),
+                _result(
+                    model_usage={PRIMARY: _model_usage(205, 21, cached=10, write=4)},
+                    uuid="t-dedupe-next",
+                ),
                 PRIMARY,
             )
         finally:
@@ -587,3 +591,155 @@ def test_a_subagent_message_without_usage_still_marks_its_model_reviewer() -> No
     roles = {(e["role"], e["model"]) for e in body["models"]}
     assert ("reviewer", REVIEWER) in roles
     assert ("implementer", REVIEWER) not in roles
+
+
+def test_a_follow_up_turn_posts_only_its_increment_and_keeps_the_reviewer_role() -> None:
+    """A second result repeats the call's running model_usage.
+
+    The Agent SDK cost guide says that in streaming input mode each turn's
+    ``model_usage`` is the running total for the whole call, and that summing
+    those results double-counts. A follow-up that does not see the reviewer
+    must not book the reviewer's earlier tokens to the implementer.
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        server = TestServer(recorder.app())
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, TOKEN)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(1_000_000, 500_000)))
+            reporter.observe(
+                _assistant(REVIEWER, _sdk_usage(200_000, 100_000), parent="toolu_example")
+            )
+            await reporter.report(
+                _result(
+                    model_usage={
+                        PRIMARY: _model_usage(1_000_000, 500_000),
+                        REVIEWER: _model_usage(200_000, 100_000),
+                    },
+                    uuid="turn-a",
+                ),
+                PRIMARY,
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(500_000, 200_000)))
+            await reporter.report(
+                _result(
+                    model_usage={
+                        PRIMARY: _model_usage(1_500_000, 700_000),
+                        REVIEWER: _model_usage(200_000, 100_000),
+                    },
+                    uuid="turn-b",
+                ),
+                PRIMARY,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    first = _by_role_model(recorder.received[0][0])
+    second = _by_role_model(recorder.received[1][0])
+    assert set(first) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert first[("reviewer", REVIEWER)]["output_tokens"] == 100_000
+    assert set(second) == {("implementer", PRIMARY)}
+    assert second[("implementer", PRIMARY)]["input_tokens"] == 500_000
+    assert second[("implementer", PRIMARY)]["output_tokens"] == 200_000
+    posted_output = sum(entry["output_tokens"] for _, entry in (*first.items(), *second.items()))
+    assert posted_output == 800_000
+
+
+def test_a_restarted_session_posts_its_new_total_when_the_running_total_drops() -> None:
+    """``/clear`` and a new session id restart model_usage. The new total is the turn."""
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        server = TestServer(recorder.app())
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, TOKEN)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(900, 90)))
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(900, 90)}, uuid="turn-old"),
+                PRIMARY,
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(40, 4)))
+            await reporter.report(
+                _result(
+                    model_usage={PRIMARY: _model_usage(40, 4)},
+                    uuid="turn-new",
+                    session_id="sdk-session-RESTARTED",
+                ),
+                PRIMARY,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    second = _by_role_model(recorder.received[1][0])
+    assert second[("implementer", PRIMARY)]["input_tokens"] == 40
+    assert second[("implementer", PRIMARY)]["output_tokens"] == 4
+
+
+def test_a_failed_reviewer_report_is_replayed_with_its_role_before_the_next_delta() -> None:
+    """A lost response must not fold that turn into the next one.
+
+    The replay keeps the original turn id and reviewer role. The follow-up
+    then posts only its own increment, so a server that already stored the
+    first body can no-op the replay without a second copy of those tokens.
+    """
+
+    recorder = _Recorder(statuses=[500, 500])
+
+    async def go() -> None:
+        server = TestServer(recorder.app())
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, TOKEN)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(100, 10)))
+            reporter.observe(_assistant(REVIEWER, _sdk_usage(40, 4), parent="toolu_example"))
+            await reporter.report(
+                _result(
+                    model_usage={
+                        PRIMARY: _model_usage(100, 10),
+                        REVIEWER: _model_usage(40, 4),
+                    },
+                    uuid="turn-lost",
+                ),
+                PRIMARY,
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(50, 5)))
+            await reporter.report(
+                _result(
+                    model_usage={
+                        PRIMARY: _model_usage(150, 15),
+                        REVIEWER: _model_usage(40, 4),
+                    },
+                    uuid="turn-kept",
+                ),
+                PRIMARY,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(go)
+    assert [status_body["turn_id"] for status_body, _key in recorder.received] == [
+        "turn-lost",
+        "turn-lost",
+        "turn-lost",
+        "turn-kept",
+    ]
+    replayed = _by_role_model(recorder.received[2][0])
+    assert set(replayed) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert replayed[("reviewer", REVIEWER)]["output_tokens"] == 4
+    kept = _by_role_model(recorder.received[3][0])
+    assert set(kept) == {("implementer", PRIMARY)}
+    assert kept[("implementer", PRIMARY)]["input_tokens"] == 50
+    assert kept[("implementer", PRIMARY)]["output_tokens"] == 5
